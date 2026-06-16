@@ -12,12 +12,12 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
-    minimax_sparse_decode,
-    minimax_sparse_prefill,
+from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
+    topk_index_reduce,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_npu
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
+        self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
         self.max_context_len = int(runner.model_config.context_len)
@@ -57,8 +58,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
+        # assert self.idx_head_dim == head_dim
 
-        # Plain Python int so it is safe inside CUDA graphs (no .item() at graph time).
+        # max_seqlen for the current forward pass, stored as a plain Python int
+        # so that it is safe to use inside CUDA graphs (no .item() at graph time).
+        # Populated by init_forward_metadata* before each forward.
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
 
@@ -80,12 +84,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
-        # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
-        # the kernel is unavailable or its constraints don't hold.
+        # NVIDIA Blackwell (SM100): use MiniMax's MSA kernel (fmha_sm100) only
+        # for the main sparse-attention step when the kernel constraints hold.
+        # The lightning indexer remains unchanged; missing fmha_sm100 keeps the
+        # existing Triton path.
         from sglang.srt.environ import envs
-        from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
-            msa_available,
-        )
+
+        # MSA (fmha_sm100) is bf16/fp16-only. With an fp8 main KV cache
+        # (--kv-cache-dtype fp8_*) keep the sparse path on Triton (it dequants fp8 on
+        # load) rather than feeding fp8 bytes to the bf16 kernel; mirrors vLLM's
+        # select_main_impl_cls (fp8 KV -> Triton, never MSA).
+        if self.is_npu:
+            self.use_msa = False
+        else:
+            from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+                msa_available,
+            )
 
         # MSA (fmha_sm100) runs bf16, or uniform fp8_e4m3 under fp8 attn-GEMM mode
         # (which also casts q to fp8). An fp8 main KV cache WITHOUT the flag
@@ -125,12 +139,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.runtime_context import get_parallel
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
 
+            # Per-rank head counts for the decode plan (== runtime q.shape[1] /
+            # k_cache.shape[1]); needed in out_graph where q/k_cache aren't available.
             self.num_q_heads = (
-                runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+                runner.model_config.num_attention_heads // get_attention_tp_size()
             )
+            # KV head count lives on the main sub-pool (== runtime k_cache.shape[1]).
             self.num_kv_heads = self.kv_pool.main_pool.head_num
+            # CUDA-graph decode: one persistent plan + page-table buffer per batch
+            # size, refreshed in place each step (worklist is length-independent).
             self._msa_nb_max = (
                 self.max_context_len + self.block_size_k - 1
             ) // self.block_size_k
@@ -138,7 +157,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
-            envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
+            (not self.is_npu)
+            and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
             # unit bmm scales — no fp8 handling yet (follow-up).
@@ -154,12 +174,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
-        self._use_msa_decode = self.use_msa and (
-            not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
-        )
+        self._use_msa_decode = self.use_msa and not _decode_cuda_graph
 
-        # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
-        # route to forward_extend, dereferencing absent extend metadata. Fail at startup.
+        # MSA + speculative decode + cuda graph is unsupported: spec verify
+        # (TARGET_VERIFY) batches route to forward_extend and are captured into the
+        # decode graph, which both dereferences extend metadata absent in the capture
+        # batch and would record the MSA prefill kernel into a graph. Fail loudly at
+        # startup instead of crashing mid-capture.
         if (
             self.use_msa
             and _decode_cuda_graph
@@ -170,9 +191,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "CUDA graph. Use --disable-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
                 "disable speculative decoding."
             )
+        # MSA owns the main decode step unless dense-sparse-decode does; the dense
+        # path only engages when k_cache.shape[1] == 1 (see forward_decode).
         self._msa_owns_decode = self._use_msa_decode and not (
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
+        # The page table + effective KV length are allocated and returned by the
+        # fused decode top-k kernel each layer, so the backend keeps no metadata.
         self.dense_backend: Optional[AttentionBackend] = None
 
         logger.info(
@@ -197,6 +222,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
+        # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
@@ -208,12 +234,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
-        # Build plan + page table eager (outside capture) so captured forward_decode
-        # runs only device-side ops; host-side code can't be captured.
+        # Build the MSA decode plan + page table here (eager, outside graph capture)
+        # so forward_decode — captured into the graph — only runs device-side ops.
+        # Runs at capture, replay, and eager, refreshing the persistent buffers the
+        # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
+        """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             build_msa_decode_cg_plan,
             update_msa_decode_cg_meta,
@@ -261,6 +290,274 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def _raise_npu_sparse_not_ready(self, phase: str, reason: str) -> None:
+        raise NotImplementedError(
+            "MiniMax-M3 NPU sparse attention needs native fused operators for "
+            f"{phase}: {reason}. Missing/target operators include "
+            "flash_prefill_with_topk_index, flash_decode_with_topk_idx, "
+            "flash_*_with_gqa_share_sparse, minimax_decode_topk, "
+            "minimax_decode_topk_page_table, topk_index_reduce, and "
+            "minimax_store_kv_index. The current NPU path provides a slow "
+            "PyTorch correctness fallback only for supported score/cache layouts."
+        )
+
+    @staticmethod
+    def _cache_as_slots(cache: torch.Tensor) -> torch.Tensor:
+        if cache.dim() <= 3:
+            return cache
+        return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
+
+    def _block_topk(self, scores: torch.Tensor, seq_len: int) -> torch.Tensor:
+        num_heads = scores.shape[0]
+        num_blocks = (seq_len + self.block_size_k - 1) // self.block_size_k
+        topk_idx = torch.full(
+            (num_heads, self.topk_blocks),
+            -1,
+            dtype=torch.int32,
+            device=scores.device,
+        )
+        if num_blocks == 0:
+            return topk_idx
+
+        block_scores = []
+        for block_id in range(num_blocks):
+            start = block_id * self.block_size_k
+            end = min(start + self.block_size_k, seq_len)
+            block = scores[:, start:end]
+            if self.score_type == "max":
+                reduced = block.max(dim=-1).values
+            elif self.score_type == "sum":
+                reduced = block.sum(dim=-1)
+            elif self.score_type in ("mean", "avg"):
+                reduced = block.mean(dim=-1)
+            else:
+                self._raise_npu_sparse_not_ready(
+                    "top-k block scoring", f"unsupported score_type={self.score_type!r}"
+                )
+            block_scores.append(reduced)
+
+        score_tensor = torch.stack(block_scores, dim=-1)
+        if self.init_blocks > 0:
+            score_tensor[:, : min(self.init_blocks, num_blocks)] = 1e30
+        if self.local_blocks > 0:
+            local_start = max(0, num_blocks - self.local_blocks)
+            score_tensor[:, local_start:num_blocks] = 1e29
+
+        actual_topk = min(self.topk_blocks, num_blocks)
+        _, indices = torch.topk(score_tensor, k=actual_topk, dim=-1)
+        topk_idx[:, :actual_topk] = indices.to(torch.int32)
+        return topk_idx
+
+    def _token_indices_from_blocks(
+        self, block_idx: torch.Tensor, seq_len: int, device: torch.device
+    ) -> torch.Tensor:
+        chunks = []
+        for block in block_idx.tolist():
+            if block < 0:
+                continue
+            start = int(block) * self.block_size_k
+            end = min(start + self.block_size_k, seq_len)
+            if start < end:
+                chunks.append(torch.arange(start, end, device=device))
+        if len(chunks) == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.cat(chunks).to(torch.long)
+
+    @staticmethod
+    def _dense_attention_heads(
+        q_heads: torch.Tensor,
+        k_tokens: torch.Tensor,
+        v_tokens: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        num_q_heads = q_heads.shape[0]
+        num_kv_heads = k_tokens.shape[1]
+        group_size = max(1, num_q_heads // num_kv_heads)
+        out = q_heads.new_zeros((num_q_heads, v_tokens.shape[-1]))
+        if k_tokens.shape[0] == 0:
+            return out
+
+        for qh in range(num_q_heads):
+            kvh = min(qh // group_size, num_kv_heads - 1)
+            scores = torch.matmul(
+                q_heads[qh].float(), k_tokens[:, kvh, :].float().transpose(0, 1)
+            )
+            probs = torch.softmax(scores * scale, dim=-1, dtype=torch.float32)
+            out[qh] = torch.matmul(probs.to(v_tokens.dtype), v_tokens[:, kvh, :])
+        return out
+
+    def _sparse_attention_heads(
+        self,
+        q_heads: torch.Tensor,
+        k_tokens: torch.Tensor,
+        v_tokens: torch.Tensor,
+        topk_idx: torch.Tensor,
+        seq_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        num_q_heads = q_heads.shape[0]
+        num_kv_heads = k_tokens.shape[1]
+        group_size = max(1, num_q_heads // num_kv_heads)
+        out = q_heads.new_zeros((num_q_heads, v_tokens.shape[-1]))
+
+        for qh in range(num_q_heads):
+            kvh = min(qh // group_size, num_kv_heads - 1)
+            token_idx = self._token_indices_from_blocks(
+                topk_idx[kvh], seq_len, q_heads.device
+            )
+            if token_idx.numel() == 0:
+                continue
+            k_selected = k_tokens.index_select(0, token_idx)[:, kvh, :]
+            v_selected = v_tokens.index_select(0, token_idx)[:, kvh, :]
+            scores = torch.matmul(
+                q_heads[qh].float(), k_selected.float().transpose(0, 1)
+            )
+            probs = torch.softmax(scores * scale, dim=-1, dtype=torch.float32)
+            out[qh] = torch.matmul(probs.to(v_selected.dtype), v_selected)
+        return out
+
+    def _npu_sparse_one(
+        self,
+        q_token: torch.Tensor,
+        k_tokens: torch.Tensor,
+        v_tokens: torch.Tensor,
+        idx_q_token: torch.Tensor,
+        idx_k_tokens: torch.Tensor,
+        idx_v_tokens: Optional[torch.Tensor],
+        seq_len: int,
+    ):
+        idx_scale = self.idx_head_dim**-0.5
+        main_scale = q_token.shape[-1] ** -0.5
+        idx_scores = torch.matmul(
+            idx_q_token.float(), idx_k_tokens[:, 0, :].float().transpose(0, 1)
+        )
+        idx_topk = self._block_topk(idx_scores * idx_scale, seq_len)
+
+        idx_o = None
+        if idx_v_tokens is not None:
+            idx_o = self._dense_attention_heads(
+                idx_q_token, idx_k_tokens, idx_v_tokens, idx_scale
+            )
+
+        num_idx_heads = idx_q_token.shape[0]
+        num_kv_heads = k_tokens.shape[1]
+        if num_idx_heads % num_kv_heads != 0:
+            self._raise_npu_sparse_not_ready(
+                "main sparse attention",
+                f"num_idx_heads={num_idx_heads} is not divisible by "
+                f"num_kv_heads={num_kv_heads}",
+            )
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            main_topk = topk_index_reduce(
+                idx_topk.view(num_kv_heads, idx_group_size, -1), dim=1
+            )
+        else:
+            main_topk = idx_topk
+
+        out = self._sparse_attention_heads(
+            q_token, k_tokens, v_tokens, main_topk, seq_len, main_scale
+        )
+        return idx_o, out
+
+    def _forward_npu_sparse_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        k_slots = self._cache_as_slots(k_cache)
+        v_slots = self._cache_as_slots(v_cache)
+        idx_k_slots = self._cache_as_slots(idx_k_cache)
+        idx_v_slots = (
+            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
+        )
+        out = q.new_zeros(q.shape)
+        idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
+
+        for batch_id in range(forward_batch.req_pool_indices.shape[0]):
+            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
+            q_start = int(cu_seqlens[batch_id].item())
+            q_end = int(cu_seqlens[batch_id + 1].item())
+            prefix_len = int(prefix_lens[batch_id].item())
+            total_len = int(seq_lens[batch_id].item())
+            for offset, q_pos in enumerate(range(q_start, q_end)):
+                kv_len = min(prefix_len + offset + 1, total_len)
+                locs = self.req_to_token[req_idx, :kv_len].to(
+                    device=k_slots.device, dtype=torch.long
+                )
+                k_tokens = k_slots.index_select(0, locs)
+                v_tokens = v_slots.index_select(0, locs)
+                idx_k_tokens = idx_k_slots.index_select(0, locs)
+                idx_v_tokens = (
+                    None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+                )
+                cur_idx_o, cur_o = self._npu_sparse_one(
+                    q[q_pos],
+                    k_tokens,
+                    v_tokens,
+                    idx_q[q_pos],
+                    idx_k_tokens,
+                    idx_v_tokens,
+                    kv_len,
+                )
+                out[q_pos] = cur_o
+                if idx_out is not None:
+                    idx_out[q_pos] = cur_idx_o
+        return idx_out, out
+
+    def _forward_npu_sparse_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
+        k_slots = self._cache_as_slots(k_cache)
+        v_slots = self._cache_as_slots(v_cache)
+        idx_k_slots = self._cache_as_slots(idx_k_cache)
+        idx_v_slots = (
+            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
+        )
+        out = q.new_zeros(q.shape)
+        idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
+
+        for batch_id in range(q.shape[0]):
+            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
+            kv_len = int(forward_batch.seq_lens[batch_id].item())
+            locs = self.req_to_token[req_idx, :kv_len].to(
+                device=k_slots.device, dtype=torch.long
+            )
+            k_tokens = k_slots.index_select(0, locs)
+            v_tokens = v_slots.index_select(0, locs)
+            idx_k_tokens = idx_k_slots.index_select(0, locs)
+            idx_v_tokens = (
+                None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+            )
+            cur_idx_o, cur_o = self._npu_sparse_one(
+                q[batch_id],
+                k_tokens,
+                v_tokens,
+                idx_q[batch_id],
+                idx_k_tokens,
+                idx_v_tokens,
+                kv_len,
+            )
+            out[batch_id] = cur_o
+            if idx_out is not None:
+                idx_out[batch_id] = cur_idx_o
+        return idx_out, out
 
     @staticmethod
     def _is_sparse_kv_cached_by_fusion(
@@ -340,14 +637,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
         if forward_batch.extend_prefix_lens is not None:
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
             prefix_lens = torch.zeros_like(seq_lens)
 
-        # DP attention pads q beyond the real token count for collective alignment;
-        # trim to actual tokens so the sparse kernel sees consistent shapes.
+        # In DP attention mode, q may be padded beyond the actual token count
+        # for collective communication alignment. Trim to actual tokens so
+        # the sparse attention kernel sees consistent shapes.
+        #
+        # Source the token count from CPU-side metadata when available so we do
+        # not force a GPU->CPU sync (cu_seqlens[-1].item()) on every sparse
+        # layer of every prefill. extend_seq_lens_cpu is a plain list of ints
+        # (ForwardBatch sets it from extend_seq_lens.cpu()), so sum() is a host
+        # op and the result is identical to cu_seqlens[-1]. Fall back to the
+        # device tensor only when CPU metadata is absent.
         if forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
         else:
@@ -357,45 +662,58 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
 
-        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
-        # the bf16 k/v) and the DP trim.
-        if self.fp8_attn_gemm:
-            q = _quant_q_fp8(q, layer.q_scale_float)
-            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+        if self.is_npu:
+            idx_o, o = self._forward_npu_sparse_prefill(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+            )
+        else:
+            # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+            # the bf16 k/v) and the DP trim.
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-        idx_o, o = minimax_sparse_prefill(
-            q,
-            k_cache,
-            v_cache,
-            None,
-            idx_q,
-            idx_k_cache,
-            idx_v_cache,
-            None,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            cu_seqlens,
-            seq_lens,
-            prefix_lens,
-            self._max_seqlen_q,
-            self._max_seqlen_k,
-            self.block_size_q,
-            self.block_size_k,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            score_type=self.score_type,
-            disable_index_value=disable_value,
-            use_msa=self.use_msa,
-            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
-            q_scale=layer.q_scale_float,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-            idx_q_scale=layer.idx_q_scale_float,
-            idx_k_scale=layer.idx_k_scale_float,
-            idx_v_scale=layer.idx_v_scale_float,
-        )
-
+            idx_o, o = minimax_sparse_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    None,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    None,
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                    self._max_seqlen_q,
+                    self._max_seqlen_k,
+                    self.block_size_q,
+                    self.block_size_k,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    score_type=self.score_type,
+                    disable_index_value=disable_value,
+                    use_msa=self.use_msa,
+                    seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                    q_scale=layer.q_scale_float,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    idx_q_scale=layer.idx_q_scale_float,
+                    idx_k_scale=layer.idx_k_scale_float,
+                    idx_v_scale=layer.idx_v_scale_float,
+                )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
@@ -415,11 +733,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _dense_sparse_main_decode(
         self,
-        q: torch.Tensor,
-        page_table: torch.Tensor,
-        real_seq_lens: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
+        page_table: torch.Tensor,  # [bs, max_sparse_pages] int32 (from the indexer)
+        real_seq_lens: torch.Tensor,  # [bs] int32, effective KV length per query
+        k_cache: torch.Tensor,  # [max_slots, 1, head_dim]
+        v_cache: torch.Tensor,  # [max_slots, 1, head_dim]
         layer,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
@@ -498,6 +816,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch,
                 )
 
+        # The MSA decode page table + plan are built once per forward in
+        # init_forward_metadata_out_graph (eager, outside graph capture) and shared
+        # across all sparse layers; here we just consume the cached metadata.
         msa_kv_indices = msa_plan = None
         if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:
@@ -510,44 +831,55 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
-        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
-        # the bf16 k/v).
-        if self.fp8_attn_gemm:
-            q = _quant_q_fp8(q, layer.q_scale_float)
-            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+        if self.is_npu:
+            idx_o, o = self._forward_npu_sparse_decode(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+            )
+        else:
+            # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+            # the bf16 k/v).
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-        idx_o, o = minimax_sparse_decode(
-            q,
-            None,
-            k_cache,
-            v_cache,
-            idx_q,
-            None,
-            idx_k_cache,
-            idx_v_cache,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            self._max_seqlen_k,
-            1,
-            self.block_size_k,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            score_type=self.score_type,
-            disable_index_value=disable_value,
-            dense_main_attn_fn=attn_fn,
-            page_size=self.page_size,
-            use_msa=self._use_msa_decode,
-            msa_kv_indices=msa_kv_indices,
-            msa_plan=msa_plan,
-            q_scale=layer.q_scale_float,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-            idx_q_scale=layer.idx_q_scale_float,
-            idx_k_scale=layer.idx_k_scale_float,
-            idx_v_scale=layer.idx_v_scale_float,
-        )
+            idx_o, o = minimax_sparse_decode(
+                    q,
+                    None,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    None,
+                    idx_k_cache,
+                    idx_v_cache,
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    self._max_seqlen_k,
+                    1,
+                    self.block_size_k,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    score_type=self.score_type,
+                    disable_index_value=disable_value,
+                    dense_main_attn_fn=attn_fn,
+                    page_size=self.page_size,
+                    use_msa=self._use_msa_decode,
+                    msa_kv_indices=msa_kv_indices,
+                    msa_plan=msa_plan,
+                    q_scale=layer.q_scale_float,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    idx_q_scale=layer.idx_q_scale_float,
+                    idx_k_scale=layer.idx_k_scale_float,
+                    idx_v_scale=layer.idx_v_scale_float,
+                )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
@@ -555,6 +887,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
 
 class MiniMaxHybridAttnBackend(AttentionBackend):
+    """Combines a dense backend and a sparse backend, routing by call site."""
+
     def __init__(
         self,
         dense_backend: AttentionBackend,
@@ -564,9 +898,11 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
+        # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # delegate so the dense (FlashInfer) backend keeps its own eager init.
         self.sparse.init_forward_metadata(forward_batch)
         self.dense.init_forward_metadata(forward_batch)
 
@@ -602,10 +938,13 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
 
-        # DP attention pads q to an even length but flashinfer builds qo_indptr from
-        # extend_seq_lens, so padded q.shape[0] != qo_indptr[-1] and paged-prefill
-        # raises. Trim q and re-pad output; k/v stay untrimmed so KV-cache writes
-        # align with out_cache_loc.
+        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
+        # attention the per-rank token block is padded to an even length
+        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
+        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
+        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
+        # the real token count and re-pad the output; k/v stay untrimmed so the
+        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
         mode = forward_batch.forward_mode
         if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))

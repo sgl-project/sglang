@@ -4609,6 +4609,18 @@ class MHATokenToKOnlyPool(KVCache):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
+    def set_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+        self.k_buffer[layer_id][loc] = cache_k
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4647,6 +4659,9 @@ class MiniMaxSparseKVPool(KVCache):
         index_dtype: Optional[torch.dtype] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        main_pool_cls=MHATokenToKVPool,
+        index_kv_pool_cls=MHATokenToKVPool,
+        index_k_pool_cls=MHATokenToKOnlyPool,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
         self.size = size
@@ -4688,7 +4703,7 @@ class MiniMaxSparseKVPool(KVCache):
             gid: i for i, gid in enumerate(local_k_only_sparse_layer_ids)
         }
 
-        self.main_pool = MHATokenToKVPool(
+        self.main_pool = main_pool_cls(
             size=size,
             page_size=page_size,
             dtype=dtype,
@@ -4702,7 +4717,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (
-            MHATokenToKVPool(
+            index_kv_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
@@ -4717,7 +4732,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_k_pool: Optional[MHATokenToKOnlyPool] = (
-            MHATokenToKOnlyPool(
+            index_k_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
