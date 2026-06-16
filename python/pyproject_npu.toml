@@ -78,7 +78,7 @@ diffusion = [
     "moviepy>=2.0.0",
     "opencv-python==4.10.0.84",
     "remote-pdb",
-    "cache-dit==1.3.5",
+    "cache-dit==1.5.0",
     "addict",
     "scikit-image==0.25.2",
     "trimesh>=4.0.0",
