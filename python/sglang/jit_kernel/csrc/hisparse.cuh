@@ -52,6 +52,62 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   }
 }
 
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
+    void** src_caches,
+    void** dst_caches,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    uint32_t num_items,
+    uint32_t num_layers) {
+  const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int total_warps = gridDim.x * NUM_WARPS;
+
+  for (uint32_t i = global_tid / WARP_SIZE; i < num_items; i += total_warps) {
+    const int32_t src_index = static_cast<int32_t>(src_indices[i]);
+    const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
+    for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      device::hisparse::transfer_item(
+          /*dst_cache=*/dst_caches[layer_id],
+          /*src_cache=*/src_caches[layer_id],
+          /*dst_index=*/dst_index,
+          /*src_index=*/src_index);
+    }
+  }
+}
+
+template <int BLOCK_SIZE>
+void transfer_cache_dsv4_mla(
+    tvm::ffi::TensorView src_ptrs,
+    tvm::ffi::TensorView dst_ptrs,
+    tvm::ffi::TensorView src_indices,
+    tvm::ffi::TensorView dst_indices) {
+  using namespace host;
+  auto N = SymbolicSize{"num_items"};
+  auto L = SymbolicSize{"num_layers"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  TensorMatcher({L}).with_dtype<uint64_t>().with_device(device).verify(src_ptrs).verify(dst_ptrs);
+  TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices).verify(dst_indices);
+
+  const auto num_items = static_cast<uint32_t>(N.unwrap());
+  if (num_items == 0) {
+    return;
+  }
+  const auto num_layers = static_cast<uint32_t>(L.unwrap());
+  const int num_warps = BLOCK_SIZE / WARP_SIZE;
+  const int grid = (num_items + num_warps - 1) / num_warps;
+  LaunchKernel(grid, BLOCK_SIZE, device.unwrap())(
+      transfer_cache_dsv4_mla_kernel<BLOCK_SIZE>,
+      static_cast<void**>(src_ptrs.data_ptr()),
+      static_cast<void**>(dst_ptrs.data_ptr()),
+      static_cast<const int64_t*>(src_indices.data_ptr()),
+      static_cast<const int64_t*>(dst_indices.data_ptr()),
+      num_items,
+      num_layers);
+}
+
 __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
   int idx = lane_id + offset;
   int val = (idx < count) ? s_data[idx] : 0;
@@ -89,7 +145,7 @@ struct SmemLayout {
 //
 // IsDsv4Layout selects the miss-copy addressing:
 //   false -> generic byte-stride: device + host both linear, stride = item_size_bytes
-//   true  -> DSv4 page-padded device + linear host (kvcacheio.cuh hardcoded constants)
+//   true  -> DSv4 page-padded device + page-padded host (kvcacheio.cuh constants)
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -377,9 +433,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
     if constexpr (IsDsv4Layout) {
-      // DSv4 path: page-padded device layout + linear host layout, K-only.
-      // Uses kvcacheio.cuh's hardcoded constants (kGPUPageSize=64, kCPUItemBytes=584).
-      device::hisparse::transfer_item<device::hisparse::TransferDirection::HostToDevice>(
+      // DSv4 path: page-padded device layout + page-padded host layout, K-only.
+      // The host cache is pinned DRAM but uses the same row layout as the GPU C4
+      // cache, so use the page-padded address calculation for both ends.
+      device::hisparse::transfer_item(
           /*dst_cache=*/device_buffer_k,
           /*src_cache=*/const_cast<void*>(host_cache_k),
           /*dst_index=*/static_cast<int32_t>(dst_loc),
