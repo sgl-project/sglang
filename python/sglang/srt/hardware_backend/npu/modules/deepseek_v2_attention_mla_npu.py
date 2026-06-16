@@ -153,7 +153,6 @@ def forward_mla_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
-    prev_topk_indices: torch.Tensor = None,
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
@@ -233,16 +232,13 @@ def forward_mla_prepare_npu(
             )
         topk_indices = None
         if q_lora is not None:
-            if hasattr(q_lora, "indexer"):
-                topk_indices = m.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=m.layer_id,
-                )
-            else:
-                topk_indices = prev_topk_indices
+            topk_indices = m.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=m.layer_id,
+            )
 
     return (
         q_pe,
