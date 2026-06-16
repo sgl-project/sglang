@@ -16,7 +16,7 @@
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.cpp_hash.native_hash import get_native_hash
+from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,

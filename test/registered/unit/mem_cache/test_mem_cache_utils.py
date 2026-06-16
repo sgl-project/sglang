@@ -81,68 +81,58 @@ class _HashKey:
         return _legacy_get_hash_str(self[start:end], prior_hash)
 
 
-class TestOptimizedHashCompatibility(unittest.TestCase):
-    def test_hash_str_matches_pre_optimization_per_token_loop(self):
-        prior_hash = _legacy_get_hash_str([7, 8, 9])
-        cases = [
-            ("list", [1, 2, 3, 4, 5], None),
-            ("array_q", _HashKey(array("q", range(1, 258))), None),
-            ("array_i", _HashKey(array("I", range(1, 258))), prior_hash),
-            (
-                "tuple_bigram",
-                [(10, 20), (20, 30), (30, 40), (40, 50)],
-                prior_hash,
+def _single_hash_compatibility_cases():
+    prior_hash = _legacy_get_hash_str([7, 8, 9])
+    return [
+        ("empty_list", [], None),
+        ("plain_list", [1, 2, 3, 4, 5], None),
+        ("array_q", _HashKey(array("q", range(1, 258))), None),
+        ("array_i_with_prior", _HashKey(array("I", range(1, 258))), prior_hash),
+        (
+            "tuple_bigram_with_prior",
+            [(10, 20), (20, 30), (30, 40), (40, 50)],
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_with_prior",
+            _HashKey(
+                array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
+                is_bigram=True,
             ),
-            (
-                "eagle_bigram",
-                _HashKey(
-                    array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
-                    is_bigram=True,
-                ),
-                prior_hash,
-            ),
-        ]
+            prior_hash,
+        ),
+        ("empty_bigram", _HashKey(array("q"), is_bigram=True), None),
+    ]
 
-        for name, tokens, prior_hash in cases:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    get_hash_str(tokens, prior_hash),
-                    _legacy_get_hash_str(tokens, prior_hash),
-                )
 
-    def test_page_hashes_match_pre_optimization_per_token_loop(self):
-        prior_hash = _legacy_get_hash_str([7, 8, 9])
-        cases = [
-            ("array_q_page_64", _HashKey(array("q", range(1, 258))), 64, None),
-            (
-                "array_i_page_64_with_prior",
-                _HashKey(array("I", range(1, 258))),
-                64,
-                prior_hash,
+def _page_hash_compatibility_cases():
+    prior_hash = _legacy_get_hash_str([7, 8, 9])
+    return [
+        ("empty_list", [], 8, None),
+        ("empty_bigram", _HashKey(array("q"), is_bigram=True), 8, None),
+        ("array_q_page_64", _HashKey(array("q", range(1, 258))), 64, None),
+        (
+            "array_i_page_64_with_prior",
+            _HashKey(array("I", range(1, 258))),
+            64,
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_page_64_with_prior",
+            _HashKey(
+                array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
+                is_bigram=True,
             ),
-            (
-                "eagle_bigram_page_64",
-                _HashKey(
-                    array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
-                    is_bigram=True,
-                ),
-                64,
-                prior_hash,
-            ),
-            (
-                "eagle_bigram_page_1",
-                _HashKey(array("q", [11, 22, 33, 44, 55]), is_bigram=True),
-                1,
-                prior_hash,
-            ),
-        ]
-
-        for name, tokens, page_size, prior_hash in cases:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    get_hash_str(tokens, prior_hash, page_size=page_size),
-                    _legacy_page_hashes(tokens, page_size, prior_hash),
-                )
+            64,
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_page_1_with_prior",
+            _HashKey(array("q", [11, 22, 33, 44, 55]), is_bigram=True),
+            1,
+            prior_hash,
+        ),
+    ]
 
 
 class TestGetEvictionStrategy(unittest.TestCase):
@@ -224,76 +214,41 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
 
 
 class TestGetHashStr(unittest.TestCase):
-    def test_empty_list(self):
-        result = get_hash_str([])
-        self.assertIsInstance(result, str)
-        self.assertEqual(len(result), 64)
-        expected = hashlib.sha256().hexdigest()
-        self.assertEqual(result, expected)
+    def test_hash_str_matches_pre_optimization_per_token_loop(self):
+        for name, tokens, prior_hash in _single_hash_compatibility_cases():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(tokens, prior_hash),
+                    _legacy_get_hash_str(tokens, prior_hash),
+                )
 
-    def test_different_sequence_different_hash(self):
+    def test_page_hashes_match_pre_optimization_per_token_loop(self):
+        for name, tokens, page_size, prior_hash in _page_hash_compatibility_cases():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(tokens, prior_hash, page_size=page_size),
+                    _legacy_page_hashes(tokens, page_size, prior_hash),
+                )
+
+    def test_hash_properties(self):
+        self.assertEqual(get_hash_str([]), hashlib.sha256().hexdigest())
+
         h1 = get_hash_str([1, 2, 3])
         h2 = get_hash_str([3, 2, 1])
         self.assertNotEqual(h1, h2)
 
-    def test_different_values_different_hash(self):
-        h1 = get_hash_str([100])
-        h2 = get_hash_str([200])
-        self.assertNotEqual(h1, h2)
+        self.assertNotEqual(get_hash_str([100]), get_hash_str([200]))
+        self.assertEqual(get_hash_str([1, 2]), get_hash_str([(1, 2)]))
+        self.assertNotEqual(get_hash_str([(1, 2)]), get_hash_str([(2, 1)]))
 
-    def test_bigram_vs_flat_token_equivalent(self):
-        h_flat = get_hash_str([1, 2])
-        h_bigram = get_hash_str([(1, 2)])
-        self.assertEqual(h_flat, h_bigram)
-
-    def test_bigram_order_matters(self):
-        h1 = get_hash_str([(1, 2)])
-        h2 = get_hash_str([(2, 1)])
-        self.assertNotEqual(h1, h2)
-
-    def test_prior_hash_chaining(self):
         chained = get_hash_str([3, 4], prior_hash=get_hash_str([1, 2]))
-        # prior_hash must fold into the digest, so chaining differs from
-        # hashing [3, 4] alone...
         self.assertNotEqual(chained, get_hash_str([3, 4]))
-        # ...and a different prior_hash must yield a different chained digest.
         self.assertNotEqual(
             chained, get_hash_str([3, 4], prior_hash=get_hash_str([9, 9]))
         )
-
-    def test_prior_hash_single_step(self):
-        step1 = get_hash_str([1])
-        step2 = get_hash_str([2], prior_hash=step1)
-        direct = get_hash_str([1, 2])
-        self.assertNotEqual(step2, direct)
-
-    def test_returns_64_char_hex(self):
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
-            result = get_hash_str(tokens)
-            self.assertRegex(result, r"^[0-9a-f]{64}$")
-
-    def test_hash_key_matches_legacy_loop(self):
-        prior_hash = get_hash_str([7, 8, 9])
-        cases = [
-            ("unigram", _HashKey(array("q", range(1, 34))), None),
-            (
-                "bigram",
-                _HashKey(array("q", [10, 20, 30, 40, 50, 60, 70]), is_bigram=True),
-                None,
-            ),
-            (
-                "prior_hash",
-                _HashKey(array("q", [101, 102, 103, 104, 105])),
-                prior_hash,
-            ),
-        ]
-
-        for name, key, prior_hash in cases:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    get_hash_str(key, prior_hash),
-                    _legacy_get_hash_str(key, prior_hash),
-                )
+            with self.subTest(tokens=tokens):
+                self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
 
     def test_hash_key_hash_page_matches_get_hash_str(self):
         key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
@@ -303,39 +258,6 @@ class TestGetHashStr(unittest.TestCase):
             key.hash_page(1, 4, prior_hash),
             get_hash_str(key[1:4], prior_hash),
         )
-
-    def test_empty_bigram_hash_matches_empty_hash(self):
-        key = _HashKey(array("q"), is_bigram=True)
-        self.assertEqual(get_hash_str(key), hashlib.sha256().hexdigest())
-
-
-class TestGetHashStrPageMode(unittest.TestCase):
-    def test_page_mode_matches_legacy_loop(self):
-        prior_hash = get_hash_str([7, 8, 9])
-        cases = [
-            ("empty", [], 8, None),
-            ("empty_bigram", _HashKey(array("q"), is_bigram=True), 8, None),
-            ("unigram", _HashKey(array("q", range(1, 34))), 8, None),
-            (
-                "bigram",
-                _HashKey(array("q", [10, 20, 30, 40, 50, 60, 70]), is_bigram=True),
-                2,
-                None,
-            ),
-            (
-                "prior_hash",
-                _HashKey(array("q", [101, 102, 103, 104, 105])),
-                2,
-                prior_hash,
-            ),
-        ]
-
-        for name, key, page_size, prior_hash in cases:
-            with self.subTest(name=name):
-                self.assertEqual(
-                    get_hash_str(key, prior_hash, page_size=page_size),
-                    _legacy_page_hashes(key, page_size, prior_hash),
-                )
 
 
 class TestHashStrToInt64(unittest.TestCase):
@@ -380,78 +302,60 @@ class TestComputeNodeHashValues(unittest.TestCase):
             parent.hash_value = parent_hash_values
         return node
 
-    def test_single_page_root(self):
-        key = _HashKey(array("q", [1, 2, 3]))
-        node = self._make_node(key)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(result, _legacy_page_hashes(key, page_size=16))
+    def test_root_node_hashes_match_legacy_page_hashes(self):
+        cases = [
+            ("single_page", _HashKey(array("q", [1, 2, 3])), 16),
+            ("multiple_pages", _HashKey(array("q", range(1, 31))), 16),
+            ("page_aligned_boundary", _HashKey(array("q", range(1, 33))), 8),
+            ("shorter_than_page", _HashKey(array("q", [1, 2, 3, 4, 5])), 16),
+        ]
 
-    def test_multiple_pages(self):
-        key = _HashKey(array("q", range(1, 31)))
-        node = self._make_node(key)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(result, _legacy_page_hashes(key, page_size=16))
+        for name, key, page_size in cases:
+            with self.subTest(name=name):
+                node = self._make_node(key)
+                self.assertEqual(
+                    compute_node_hash_values(node, page_size=page_size),
+                    _legacy_page_hashes(key, page_size=page_size),
+                )
 
-    def test_page_aligned_boundary(self):
-        key = _HashKey(array("q", range(1, 33)))
-        node = self._make_node(key)
-        result = compute_node_hash_values(node, page_size=8)
-        self.assertEqual(result, _legacy_page_hashes(key, page_size=8))
-
-    def test_key_shorter_than_page_size(self):
-        key = _HashKey(array("q", [1, 2, 3, 4, 5]))
-        node = self._make_node(key)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(result, _legacy_page_hashes(key, page_size=16))
-
-    def test_chained_parent_hash(self):
+    def test_parent_hash_is_used_only_when_parent_has_nonempty_key_and_hash(self):
         parent = MagicMock()
         parent.key = _HashKey(array("q", range(1, 17)))
         parent.hash_value = _legacy_page_hashes(parent.key, page_size=8)
-
-        child_key = _HashKey(array("q", range(101, 117)))
-        child = self._make_node(
-            child_key, parent=parent, parent_hash_values=parent.hash_value
-        )
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(
-            result,
-            _legacy_page_hashes(
-                child_key, page_size=8, prior_hash=parent.hash_value[-1]
+        child_key = _HashKey(array("q", range(101, 109)))
+        cases = [
+            ("valid_parent_hash", parent, parent.hash_value, parent.hash_value[-1]),
+            (
+                "empty_parent_key",
+                self._make_node(_HashKey(array("q"))),
+                [get_hash_str([1, 2, 3])],
+                None,
             ),
-        )
+            (
+                "empty_parent_hash",
+                self._make_node(_HashKey(array("q", range(1, 9)))),
+                [],
+                None,
+            ),
+            (
+                "none_parent_hash",
+                self._make_node(_HashKey(array("q", range(1, 9)))),
+                None,
+                None,
+            ),
+        ]
 
-    def test_parent_with_empty_key(self):
-        parent = MagicMock()
-        parent.key = _HashKey(array("q"))
-        parent.hash_value = [get_hash_str([1, 2, 3])]
-
-        child_key = _HashKey(array("q", range(1, 9)))
-        child = self._make_node(
-            child_key, parent=parent, parent_hash_values=parent.hash_value
-        )
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, _legacy_page_hashes(child_key, page_size=8))
-
-    def test_parent_without_hash_value(self):
-        parent = MagicMock()
-        parent.key = _HashKey(array("q", range(1, 9)))
-        parent.hash_value = []
-
-        child_key = _HashKey(array("q", range(101, 109)))
-        child = self._make_node(child_key, parent=parent, parent_hash_values=[])
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, _legacy_page_hashes(child_key, page_size=8))
-
-    def test_parent_with_none_hash_value(self):
-        parent = MagicMock()
-        parent.key = _HashKey(array("q", range(1, 9)))
-        parent.hash_value = None
-
-        child_key = _HashKey(array("q", range(101, 109)))
-        child = self._make_node(child_key, parent=parent, parent_hash_values=None)
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, _legacy_page_hashes(child_key, page_size=8))
+        for name, parent, parent_hash_values, expected_prior in cases:
+            with self.subTest(name=name):
+                child = self._make_node(
+                    child_key, parent=parent, parent_hash_values=parent_hash_values
+                )
+                self.assertEqual(
+                    compute_node_hash_values(child, page_size=8),
+                    _legacy_page_hashes(
+                        child_key, page_size=8, prior_hash=expected_prior
+                    ),
+                )
 
 
 class TestSplitNodeHashValue(unittest.TestCase):
