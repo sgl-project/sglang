@@ -69,20 +69,6 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
-def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
-    """Out-variant of swiglustep activation.
-
-    Writes into `out`:
-      silu(x[:d]).clamp(max=limit) * x[d:].clamp(-limit, limit)
-    """
-    gate, up = x.chunk(2, dim=-1)
-    gate = F.silu(gate)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    out = gate * up
-    return out
-
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -673,7 +659,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -729,8 +715,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
             if self.moe_runner_config.gemm1_clamp_limit is not None:
-                hidden_states = swiglustep_and_mul(
-                    hidden_states, self.moe_runner_config.gemm1_clamp_limit
+                from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+                hidden_states, _ = swiglu_quant(
+                    hidden_states,
+                    group_list=expert_tokens,
+                    group_list_type=1,
+                    need_quant=False,
+                    do_limit=True,
+                    limit=self.moe_runner_config.gemm1_clamp_limit,
                 )
             else:
                 hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
@@ -767,7 +760,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def _forward_npu_deepep(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,

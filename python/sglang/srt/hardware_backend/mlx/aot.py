@@ -204,7 +204,7 @@ class MlxAOTKernelContext:
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
         layer_caches: list[list[ContiguousAttentionKVCache]],
-    ) -> "MlxAOTKernelContext":
+    ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:
             return cls()
