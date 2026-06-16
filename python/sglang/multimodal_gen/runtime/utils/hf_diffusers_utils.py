@@ -543,6 +543,42 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     return cast(dict[str, Any], config)
 
 
+def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
+    """Return a local path to a remote repo's ``model_index.json``"""
+    from huggingface_hub.errors import EntryNotFoundError
+
+    try:
+        # Cache-aware: no local_dir, so HF reuses the cache and revalidates the
+        # ETag against the Hub, re-downloading only when the remote changed.
+        return hf_hub_download(repo_id=model_name_or_path, filename="model_index.json")
+    except EntryNotFoundError:
+        # Repo exists but has no model_index.json (single-model repo); let the
+        # caller fall through to the single-model path.
+        raise
+    except Exception as online_err:
+        cached_path = None
+        if not envs.SGLANG_USE_MODELSCOPE.get():
+            from huggingface_hub import try_to_load_from_cache
+
+            cached = try_to_load_from_cache(
+                repo_id=model_name_or_path, filename="model_index.json"
+            )
+            if isinstance(cached, str) and os.path.exists(cached):
+                cached_path = cached
+        if cached_path is not None:
+            logger.warning(
+                "Could not fetch model_index.json for '%s' from the Hugging Face "
+                "Hub (%s); using the locally cached copy at '%s'. The cached copy "
+                "may be out of date — provide an HF token or clear the cache to "
+                "force a refresh.",
+                model_name_or_path,
+                online_err,
+                cached_path,
+            )
+            return cached_path
+        raise
+
+
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     Download and extract just the model_index.json for a Hugging Face model.
@@ -553,8 +589,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     Returns:
         The parsed model_index.json as a dictionary
     """
-    import tempfile
-
     from huggingface_hub.errors import EntryNotFoundError
 
     overlay_config = maybe_load_overlay_model_index(
@@ -578,40 +612,34 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                 return config
             raise
 
-    # For remote models, download just the model_index.json
+    # For remote models, resolve model_index.json (Hub-first, cache fallback).
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            # Download just the model_index.json file
-            model_index_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="model_index.json",
-                local_dir=tmp_dir,
+        model_index_path = _resolve_remote_repo_model_index_path(model_name_or_path)
+
+        # Load the model_index.json
+        with open(model_index_path) as f:
+            config: dict[str, Any] = json.load(f)
+
+        # Verify it has the required fields
+        if "_class_name" not in config:
+            raise ValueError(
+                f"model_index.json for {model_name_or_path} does not contain _class_name field"
             )
 
-            # Load the model_index.json
-            with open(model_index_path) as f:
-                config: dict[str, Any] = json.load(f)
-
-            # Verify it has the required fields
-            if "_class_name" not in config:
-                raise ValueError(
-                    f"model_index.json for {model_name_or_path} does not contain _class_name field"
-                )
-
-            if "_diffusers_version" not in config:
-                raise ValueError(
-                    f"model_index.json for {model_name_or_path} does not contain _diffusers_version field"
-                )
-
-            # Add the pipeline name for downstream use
-            config["pipeline_name"] = config["_class_name"]
-
-            logger.debug(
-                "Downloaded model_index.json for %s, pipeline: %s",
-                model_name_or_path,
-                config["_class_name"],
+        if "_diffusers_version" not in config:
+            raise ValueError(
+                f"model_index.json for {model_name_or_path} does not contain _diffusers_version field"
             )
-            return config
+
+        # Add the pipeline name for downstream use
+        config["pipeline_name"] = config["_class_name"]
+
+        logger.debug(
+            "Resolved model_index.json for %s, pipeline: %s",
+            model_name_or_path,
+            config["_class_name"],
+        )
+        return config
     except EntryNotFoundError:
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",

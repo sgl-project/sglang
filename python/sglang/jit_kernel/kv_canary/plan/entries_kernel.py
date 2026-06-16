@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_plan_entries_module(
     has_swa_lut: bool, has_verify_expected_token_pool: bool
-) -> "Module":
+) -> Module:
     args = make_cpp_args(has_swa_lut, has_verify_expected_token_pool)
     return load_jit(
         "kv_canary_plan_entries",
