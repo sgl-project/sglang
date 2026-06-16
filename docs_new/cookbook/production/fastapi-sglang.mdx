@@ -1,0 +1,149 @@
+---
+title: "FastAPI Service with Monitoring Dashboard"
+description: "Deploy SGLang behind a production-ready FastAPI wrapper with health checks, metrics, and a real-time JS dashboard."
+---
+
+## 1. Overview
+
+Most SGLang guides show you how to start the server. This recipe shows what to build on top of it — a production FastAPI wrapper with health monitoring, error tracking, and a real-time dashboard your team can actually use.
+
+**What you'll build:**
+- FastAPI service with `/health`, `/generate`, and `/metrics` endpoints
+- Real-time JS dashboard showing SGLang status and request KPIs
+- Docker Compose stack tying everything together
+
+## 2. Prerequisites
+
+```bash
+pip install fastapi uvicorn openai httpx
+```
+
+SGLang server running on `localhost:30000`. See the [installation guide](../../../docs/get-started/installation).
+
+## 3. FastAPI Backend
+
+### 3.1 Setup
+
+```python
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+import time, httpx
+
+app = FastAPI(title="SGLang Production Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+metrics = {"total_requests": 0, "total_errors": 0, "total_latency_ms": 0}
+```
+
+### 3.2 Health Check
+
+```python
+@app.get("/health")
+def health():
+    try:
+        r = httpx.get("http://localhost:30000/health", timeout=3)
+        sglang_status = "healthy" if r.status_code == 200 else "degraded"
+    except Exception:
+        sglang_status = "unreachable"
+    return {"status": "ok", "sglang": sglang_status}
+```
+
+### 3.3 Generate Endpoint
+
+```python
+@app.post("/generate")
+def generate(prompt: str, model: str = "default"):
+    start = time.time()
+    metrics["total_requests"] += 1
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512
+        )
+        latency = int((time.time() - start) * 1000)
+        metrics["total_latency_ms"] += latency
+        return {"response": response.choices[0].message.content, "latency_ms": latency}
+    except Exception as e:
+        metrics["total_errors"] += 1
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+### 3.4 Metrics Endpoint
+
+```python
+@app.get("/metrics")
+def get_metrics():
+    total = metrics["total_requests"]
+    return {
+        "total_requests": total,
+        "total_errors": metrics["total_errors"],
+        "error_rate": round(metrics["total_errors"] / total, 3) if total > 0 else 0,
+        "avg_latency_ms": round(metrics["total_latency_ms"] / total) if total > 0 else 0
+    }
+```
+
+## 4. Docker Compose
+
+```yaml
+version: "3.8"
+
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    ports:
+      - "30000:30000"
+    command: >
+      python -m sglang.launch_server
+      --model-path meta-llama/Llama-3.1-8B-Instruct
+      --host 0.0.0.0
+      --port 30000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  fastapi:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - sglang
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./dashboard.html:/usr/share/nginx/html/index.html
+```
+
+Start everything:
+
+```bash
+docker compose up
+```
+
+## 5. Common Errors
+
+**SGLang unreachable**
+Start the SGLang server before launching FastAPI.
+
+**Model not found (404)**
+Pass the exact model name used when launching the server.
+
+**CORS error in dashboard**
+CORS middleware is already included in the setup above.
