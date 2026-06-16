@@ -23,6 +23,7 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
@@ -170,7 +171,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -204,7 +205,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftInputBuffers(
@@ -247,8 +248,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants; key is just bs.
-        return bs
+        # EAGLE doesn't use stream_idx / lora variants.
+        return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
     # can_run
