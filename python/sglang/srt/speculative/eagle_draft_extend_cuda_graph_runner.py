@@ -24,6 +24,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
+    _fused_uint8_foreach_copy_,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
@@ -455,31 +456,43 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        # Fuse the per-field device copies into a single uint8-reinterpreted
+        # foreach copy (one batched async memcpy across all dtypes) to cut launch
+        # overhead on the replay path. seq_lens_cpu is handled separately below
+        # since it lives on host.
+        copy_dsts = [
+            buffers.input_ids[:num_tokens],
+            buffers.seq_lens[:raw_bs],
+            buffers.out_cache_loc[:num_tokens],
+            buffers.positions[:num_tokens],
+            buffers.req_pool_indices[:raw_bs],
+        ]
+        copy_srcs = [
+            forward_batch.input_ids,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+        ]
         if forward_batch.extend_seq_lens is not None:
-            buffers.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+            copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
+            copy_srcs.append(forward_batch.extend_seq_lens)
         else:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
             and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
         ):
-            buffers.hidden_states[:num_tokens].copy_(
-                forward_batch.spec_info.hidden_states
-            )
+            copy_dsts.append(buffers.hidden_states[:num_tokens])
+            copy_srcs.append(forward_batch.spec_info.hidden_states)
         if forward_batch.spec_info.num_correct_drafts is not None:
-            buffers.num_correct_drafts[:raw_bs].copy_(
-                forward_batch.spec_info.num_correct_drafts
-            )
-            buffers.num_accept_tokens[:raw_bs].copy_(
-                forward_batch.spec_info.num_accept_tokens
-            )
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
+            copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
+            copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
+            copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
+        _fused_uint8_foreach_copy_(copy_dsts, copy_srcs)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

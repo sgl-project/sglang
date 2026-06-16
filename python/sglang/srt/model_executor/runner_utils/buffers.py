@@ -60,6 +60,32 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def _fused_uint8_foreach_copy_(
+    dsts: List[torch.Tensor], srcs: List[torch.Tensor]
+) -> None:
+    """View pairs as uint8 so one _foreach_copy_ fuses all dtypes into a single memcpy."""
+    if not _has_foreach_copy:
+        for dst, src in zip(dsts, srcs):
+            dst.copy_(src)
+        return
+
+    u8_dsts: List[torch.Tensor] = []
+    u8_srcs: List[torch.Tensor] = []
+    for dst, src in zip(dsts, srcs):
+        if (
+            dst.dtype == src.dtype
+            and dst.numel() == src.numel()
+            and dst.is_contiguous()
+            and src.is_contiguous()
+        ):
+            u8_dsts.append(dst.view(-1).view(torch.uint8))
+            u8_srcs.append(src.view(-1).view(torch.uint8))
+        else:
+            dst.copy_(src)
+    if u8_dsts:
+        torch._foreach_copy_(u8_dsts, u8_srcs)
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
 

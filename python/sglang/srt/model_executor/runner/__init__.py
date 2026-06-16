@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,
     DeepEPCudaGraphRunnerAdapter,
     PrefillInputBuffers,
+    _fused_uint8_foreach_copy_,
     _grouped_foreach_copy_,
     _set_capture_lora_variant,
     compile_in_capture_mode,
