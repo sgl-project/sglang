@@ -14,13 +14,16 @@ from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_qk
 from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
     is_intel,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -106,8 +109,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         k_orig = k
 
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            if _is_hip:
+                q, k = l2norm_fwd_qk(q, k)
+            else:
+                q = l2norm_fwd(q)
+                k = l2norm_fwd(k)
 
         chunk_indices = (
             prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)

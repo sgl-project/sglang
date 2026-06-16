@@ -71,6 +71,92 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def l2norm_fwd_qk_kernel(
+    q,
+    k,
+    qy,
+    ky,
+    eps,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # program_id(1) selects q (0) or k (1); fuse both l2norms into one launch
+    i_t = tl.program_id(0)
+    i_qk = tl.program_id(1)
+    x = tl.where(i_qk == 0, q, k)
+    y = tl.where(i_qk == 0, qy, ky)
+    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+
+
+def l2norm_fwd_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: Optional[torch.dtype] = None,
+):
+    """Fused batched L2Norm for q and k in a single Triton launch.
+
+    Replaces two separate ``l2norm_fwd`` launches (one for q, one for k) used in
+    the GatedDeltaNet path. Falls back to two independent launches when q and k
+    have different flattened shapes or when the feature dim exceeds the small-D
+    fast path that this fused kernel supports (D <= 512).
+    """
+    q_shape_og = q.shape
+    k_shape_og = k.shape
+    q2 = q.view(-1, q.shape[-1])
+    k2 = k.view(-1, k.shape[-1])
+
+    same_shape = q2.shape == k2.shape
+    D = q2.shape[-1]
+    MAX_FUSED_SIZE = 65536 // q2.element_size()
+    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+
+    # Only the small-D block-pointer path can be batched cleanly. Otherwise fall
+    # back to the original two-launch behavior for byte-identical numerics.
+    if not (same_shape and D <= 512 and D <= BD):
+        return (
+            l2norm_fwd(q, eps=eps, output_dtype=output_dtype),
+            l2norm_fwd(k, eps=eps, output_dtype=output_dtype),
+        )
+
+    if output_dtype is None:
+        qy = torch.empty_like(q2)
+        ky = torch.empty_like(k2)
+    else:
+        qy = torch.empty_like(q2, dtype=output_dtype)
+        ky = torch.empty_like(k2, dtype=output_dtype)
+    assert qy.stride(-1) == 1 and ky.stride(-1) == 1
+
+    T = q2.shape[0]
+    BT = 16
+
+    def grid(meta):
+        return (triton.cdiv(T, meta["BT"]), 2)
+
+    l2norm_fwd_qk_kernel[grid](
+        q2,
+        k2,
+        qy,
+        ky,
+        eps,
+        T=T,
+        D=D,
+        BT=BT,
+        BD=BD,
+        num_warps=8,
+        num_stages=3,
+    )
+    return qy.view(q_shape_og), ky.view(k_shape_og)
+
+
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
