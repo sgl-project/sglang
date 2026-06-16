@@ -606,7 +606,7 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.fill_len = req.get_full_untruncated_fill_len()
+                req.fill_len = len(req.get_full_untruncated_fill_ids())
                 req.logprob_start_len = -1
                 req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
 

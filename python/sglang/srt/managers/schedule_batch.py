@@ -1039,6 +1039,7 @@ class Req(ReqDllmMixin):
         self.token_buf.truncate(self.origin_input_len)
 
     def rebuild_origin_input_ids(self, new_origin_input_ids: Iterable[int]) -> None:
+        assert self.origin_input_len == len(self.token_buf)
         self.token_buf = ViewableArray(new_origin_input_ids)
         self.origin_input_len = len(self.token_buf)
 
@@ -1126,12 +1127,6 @@ class Req(ReqDllmMixin):
             return ids
         return self.token_buf.readonly_view()
 
-    def get_full_untruncated_fill_len(self) -> int:
-        length = len(self.token_buf)
-        if self.is_dllm():
-            length += self.dllm_config.block_size
-        return length
-
     def fill_ids_upto(self, length: int) -> array:
         if self.is_dllm():
             return to_array(self.get_full_untruncated_fill_ids()[:length])
@@ -1150,7 +1145,7 @@ class Req(ReqDllmMixin):
             self.determine_dllm_phase()
 
         full_untruncated_fill_ids = self.get_full_untruncated_fill_ids()
-        input_len = self.get_full_untruncated_fill_len()
+        input_len = len(full_untruncated_fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1542,7 +1537,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = self.get_full_untruncated_fill_len()
+            logprob_start_len = len(self.get_full_untruncated_fill_ids())
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -2391,7 +2386,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_len = req.get_full_untruncated_fill_len()
+            req.fill_len = len(req.get_full_untruncated_fill_ids())
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
