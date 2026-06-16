@@ -217,6 +217,7 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
