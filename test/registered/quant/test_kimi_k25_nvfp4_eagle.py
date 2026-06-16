@@ -58,7 +58,7 @@ class TestKimiK25Nvfp4Eagle(unittest.TestCase):
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[1, 8, 16],
-                spec_accept_length_threshold=2.7,
+                spec_accept_length_threshold=2.8,
                 profile_dir="performance_profiles_kimi_k25_nvfp4_eagle",
             ),
         )
