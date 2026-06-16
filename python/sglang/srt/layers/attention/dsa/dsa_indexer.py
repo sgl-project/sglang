@@ -105,6 +105,12 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
+    "DSA indexer weights_proj LoRA is incompatible with "
+    "piecewise/breakable CUDA graph; remove the explicit "
+    "prefill cuda-graph backend override or drop "
+    "indexer.weights_proj from the LoRA target modules."
+)
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -136,24 +142,15 @@ if _is_cuda:
         indexer = forward_context.dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
-        # slice off padding from piecewise CUDA graph
-        extend_num_tokens = forward_batch.extend_num_tokens
-
-        indexer._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key[:extend_num_tokens],
-            act_quant=act_quant,
-            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
-        )
-        indexer._get_topk_ragged(
-            False,
+        indexer._store_k_cache_and_get_topk_ragged_graph(
             forward_batch,
             layer_id,
-            q_fp8[:extend_num_tokens],
+            key,
+            q_fp8,
             weights,
             metadata,
             topk_result,
+            act_quant,
         )
 
     bcg_k_cache_and_topk_result = eager_on_graph(True)(k_cache_and_topk_result)
@@ -188,24 +185,13 @@ if _is_cuda:
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         extend_num_tokens = forward_batch.extend_num_tokens
-        # Empty buffer (numel == 0) encodes return_indices=False (MHA): the eager
-        # path passes this as a bool; here it is signaled by the buffer shape.
-        if topk_result.numel() == 0:
-            indexer._compute_and_store_k_only(
-                x,
-                positions,
-                forward_batch,
-                layer_id,
-                act_quant,
-                enable_dual_stream=False,
-                num_tokens=extend_num_tokens,
-            )
-            return
-
-        if (
+        # Empty buffer encodes return_indices=False for graph dispatch.
+        return_indices = topk_result.numel() != 0
+        k_only = not return_indices or (
             indexer._should_skip_logits_computation(forward_batch)
             and not indexer.dsa_enable_prefill_cp
-        ):
+        )
+        if k_only:
             indexer._compute_and_store_k_only(
                 x,
                 positions,
@@ -215,6 +201,8 @@ if _is_cuda:
                 enable_dual_stream=False,
                 num_tokens=extend_num_tokens,
             )
+            if not return_indices:
+                return
             raw_topk_result = indexer._get_k_only_topk_result(metadata, x.device)
             # Buffer is padded to the capture shape: fill the valid prefix and
             # leave padded rows at the -1 sentinel.
@@ -231,21 +219,15 @@ if _is_cuda:
         q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
         # Reuse the compiled head-gate util shared with the eager path.
         weights = indexer._get_logits_head_gate(x, q_scale)
-        indexer._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key[:extend_num_tokens],
-            act_quant=act_quant,
-            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
-        )
-        indexer._get_topk_ragged(
-            False,
+        indexer._store_k_cache_and_get_topk_ragged_graph(
             forward_batch,
             layer_id,
-            q_fp8[:extend_num_tokens],
+            key,
+            q_fp8,
             weights,
             metadata,
             topk_result,
+            act_quant,
         )
 
     bcg_dsa_indexer_graph_dispatch = eager_on_graph(True)(dsa_indexer_graph_dispatch)
@@ -552,6 +534,114 @@ class Indexer(MultiPlatformOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _can_use_graph_dsa_dispatch(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            is_graph_dsa_split_op_surface_active(forward_batch)
+            and not self.dsa_enable_prefill_cp
+            and not isinstance(x, tuple)
+        )
+
+    def _new_graph_topk_result(
+        self,
+        token_tensor: torch.Tensor,
+        return_indices: bool,
+    ) -> torch.Tensor:
+        if return_indices:
+            return torch.full(
+                (token_tensor.shape[0], self.index_topk),
+                -1,
+                device=token_tensor.device,
+                dtype=torch.int32,
+            )
+        return torch.empty(
+            (0, self.index_topk), device=token_tensor.device, dtype=torch.int32
+        )
+
+    def _forward_cuda_graph_dispatch(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        layer_id: int,
+        x_meta: torch.Tensor,
+        return_indices: bool,
+        weights_proj_lora: bool,
+    ) -> Optional[torch.Tensor]:
+        if weights_proj_lora:
+            raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
+
+        topk_result = self._new_graph_topk_result(x_meta, return_indices)
+        graph_dispatch = (
+            bcg_dsa_indexer_graph_dispatch
+            if is_in_breakable_cuda_graph()
+            else dsa_indexer_graph_dispatch
+        )
+        graph_dispatch(
+            layer_id=layer_id,
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            topk_result=topk_result,
+        )
+        return maybe_capture_indexer_topk(
+            layer_id, topk_result if return_indices else None
+        )
+
+    def _get_topk_ragged_graph(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_result = self._new_graph_topk_result(q_fp8, return_indices=True)
+        k_cache_topk_fn = (
+            bcg_k_cache_and_topk_result
+            if is_in_breakable_cuda_graph()
+            else k_cache_and_topk_result
+        )
+        k_cache_topk_fn(
+            layer_id=layer_id,
+            key=key,
+            q_fp8=q_fp8,
+            weights=weights,
+            topk_result=topk_result,
+        )
+        return topk_result
+
+    def _store_k_cache_and_get_topk_ragged_graph(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: torch.Tensor,
+        act_quant,
+    ) -> None:
+        extend_num_tokens = forward_batch.extend_num_tokens
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key[:extend_num_tokens],
+            act_quant=act_quant,
+            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        )
+        self._get_topk_ragged(
+            False,
+            forward_batch,
+            layer_id,
+            q_fp8[:extend_num_tokens],
+            weights,
+            metadata,
+            topk_result,
+        )
 
     def _get_q_k_bf16(
         self,
@@ -1546,44 +1636,15 @@ class Indexer(MultiPlatformOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
 
-        if (
-            is_graph_dsa_split_op_surface_active(forward_batch)
-            and not self.dsa_enable_prefill_cp
-            and not isinstance(x, tuple)
-        ):
-            if weights_proj_lora:
-                raise RuntimeError(
-                    "DSA indexer weights_proj LoRA is incompatible with "
-                    "piecewise/breakable CUDA graph; remove the explicit "
-                    "prefill cuda-graph backend override or drop "
-                    "indexer.weights_proj from the LoRA target modules."
-                )
-            topk_result = (
-                torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    device=x_meta.device,
-                    dtype=torch.int32,
-                )
-                if return_indices
-                else torch.empty(
-                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
-                )
-            )
-            graph_dispatch = (
-                bcg_dsa_indexer_graph_dispatch
-                if is_in_breakable_cuda_graph()
-                else dsa_indexer_graph_dispatch
-            )
-            graph_dispatch(
-                layer_id=layer_id,
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                topk_result=topk_result,
-            )
-            return maybe_capture_indexer_topk(
-                layer_id, topk_result if return_indices else None
+        if self._can_use_graph_dsa_dispatch(x, forward_batch):
+            return self._forward_cuda_graph_dispatch(
+                x,
+                q_lora,
+                positions,
+                layer_id,
+                x_meta,
+                return_indices,
+                weights_proj_lora,
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
@@ -1681,12 +1742,7 @@ class Indexer(MultiPlatformOp):
 
             if in_piecewise_or_breakable_cuda_graph:
                 if weights_proj_lora:
-                    raise RuntimeError(
-                        "DSA indexer weights_proj LoRA is incompatible with "
-                        "piecewise/breakable CUDA graph; remove the explicit "
-                        "prefill cuda-graph backend override or drop "
-                        "indexer.weights_proj from the LoRA target modules."
-                    )
+                    raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
                 weights = logits_head_gate_graph(
                     x_for_gate,
                     self.weights_proj.weight,
@@ -1780,24 +1836,11 @@ class Indexer(MultiPlatformOp):
                         "Internal error: piecewise/breakable CUDA graph should not "
                         "be enabled with dual stream"
                     )
-
-                    topk_result = torch.full(
-                        (q_fp8.shape[0], self.index_topk),
-                        -1,
-                        device=q_fp8.device,
-                        dtype=torch.int32,
-                    )
-                    k_cache_topk_fn = (
-                        bcg_k_cache_and_topk_result
-                        if is_in_breakable_cuda_graph()
-                        else k_cache_and_topk_result
-                    )
-                    k_cache_topk_fn(
-                        layer_id=layer_id,
-                        key=key,
-                        q_fp8=q_fp8,
-                        weights=weights,
-                        topk_result=topk_result,
+                    topk_result = self._get_topk_ragged_graph(
+                        layer_id,
+                        key,
+                        q_fp8,
+                        weights,
                     )
                 else:
                     topk_result = self._get_topk_ragged(
