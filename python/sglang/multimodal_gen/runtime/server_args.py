@@ -787,6 +787,17 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_resolutions is not None:
             self.warmup = True
 
+        # BCG captures every graph during a synthetic warmup forward at startup
+        # so that serving never records a fresh graph. That requires
+        # server-based warmup (a real warmup request issued at startup), not
+        # request-based warmup which runs no forward until the first request.
+        if (
+            self.enable_breakable_cuda_graph
+            and self.disagg_role == RoleType.MONOLITHIC
+        ):
+            self.warmup = True
+            self.server_warmup = True
+
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
 
