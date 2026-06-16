@@ -159,13 +159,6 @@ class AWQAscendMoEKernel:
                          "w2_qweight", "w2_qzeros", "w2_scales"):
                 if hasattr(layer, attr):
                     delattr(layer, attr)
-
-            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import NPUUnquantMoEMethod
-            layer.w13_kernel = NPUUnquantMoEMethod()
-            layer.w2_kernel = NPUUnquantMoEMethod()
-            layer.w13_kernel.process_weights_after_loading(layer, weight_prefix="w13")
-            layer.w2_kernel.process_weights_after_loading(layer, weight_prefix="w2")
-
         else:
             # Quantized path: pack weights (original code, not shown for brevity)
             # ... (your existing packing logic) ...
