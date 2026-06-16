@@ -2291,6 +2291,8 @@ async def _run_granian_server(
     ssl_ca_certs=None,
     ssl_keyfile_password=None,
     ssl_verify=False,
+    backlog=2048,
+    backpressure=2048,
 ):
     """Serve the in-process ASGI app with Granian (embedded mode) over HTTP/2.
 
@@ -2299,7 +2301,8 @@ async def _run_granian_server(
     serves the live ``app`` object directly and reuses the already-initialized
     global state (tokenizer manager, templates, ...) through the normal
     single-tokenizer lifespan path -- no shared memory or worker re-init needed.
-    The event loop is uvloop.
+    The event loop is uvloop. The default backlog and backpressure values are set
+    exactly like uvicorn's defaults.
     """
     import signal
 
@@ -2318,6 +2321,8 @@ async def _run_granian_server(
         ssl_key_password=ssl_keyfile_password,
         ssl_ca=ssl_ca_certs,
         ssl_client_verify=ssl_verify,
+        backlog=backlog,
+        backpressure=backpressure,
     )
 
     # The embedded server does not install its own signal handlers, so wire
