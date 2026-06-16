@@ -72,9 +72,13 @@ def _fused_uint8_foreach_copy_(
     u8_dsts: List[torch.Tensor] = []
     u8_srcs: List[torch.Tensor] = []
     for dst, src in zip(dsts, srcs):
+        # Fold only when the byte view is provably identical to copy_(): same
+        # dtype (no cast), shape (no broadcast / transpose), device (foreach is
+        # per-device), and contiguity (view requires it). Else defer to copy_().
         if (
             dst.dtype == src.dtype
-            and dst.numel() == src.numel()
+            and dst.shape == src.shape
+            and dst.device == src.device
             and dst.is_contiguous()
             and src.is_contiguous()
         ):
@@ -355,8 +359,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.out_cache_loc_swa[:raw_num_token])
             srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
 
-        # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
+        # Batch all GPU copies into one uint8-reinterpreted foreach memcpy.
+        _fused_uint8_foreach_copy_(dsts, srcs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
