@@ -240,6 +240,7 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
@@ -638,6 +639,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
+    # Saves the per-step draft forward, but the draft KV goes stale: an upshift
+    # back to steps>0 starts from a cold draft state (low accept until it recovers).
+    SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -775,12 +780,14 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
@@ -1016,7 +1023,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:
