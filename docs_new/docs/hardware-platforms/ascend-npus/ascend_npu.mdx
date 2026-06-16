@@ -127,9 +127,9 @@ pip install memfabric-hybrid==1.0.8
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 ```bash Command
-PYTORCH_VERSION=2.8.0
-TORCHVISION_VERSION=0.23.0
-TORCH_NPU_VERSION=2.8.0.post2
+PYTORCH_VERSION=2.10.0
+TORCHVISION_VERSION=0.25.0
+TORCH_NPU_VERSION=2.10.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
@@ -141,7 +141,7 @@ If you are using other versions of `torch` and install `torch_npu`, check [insta
 We provide our own implementation of Triton for Ascend.
 
 ```bash Command
-pip install triton-ascend
+pip install triton-ascend==3.2.1
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
