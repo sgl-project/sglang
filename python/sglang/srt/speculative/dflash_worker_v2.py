@@ -23,6 +23,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -1851,6 +1852,28 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        # Benchmark knob: pin the accept length to a fixed value so decode
+        # throughput can be measured at a controlled accept length, regardless
+        # of which DFLASH verify path (sampling / triton / eager) ran above.
+        # SGLANG_SIMULATE_ACC_LEN is the accept length INCLUDING the bonus token
+        # (EAGLE convention), so the forced correct-draft count is (acc_len - 1),
+        # clamped to the block. Outputs are intentionally incorrect in this mode.
+        sim_acc_len = envs.SGLANG_SIMULATE_ACC_LEN.get()
+        if sim_acc_len > 0:
+            forced = max(0, min(int(self.block_size) - 1, int(round(sim_acc_len)) - 1))
+            accept_len = torch.full_like(accept_len, forced)
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = torch.empty(
+                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            )
+            if int(self.block_size) > 1:
+                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(
+                1, accept_len.to(torch.int64)[:, None], bonus.to(torch.int64)[:, None]
+            )
+            new_seq_lens = None
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

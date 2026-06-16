@@ -2897,7 +2897,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            _build_step_span_name(forward_batch, self.is_draft_worker)
+        )
 
         canary_ctx = (
             context_tuple(
@@ -3236,14 +3238,32 @@ def _unwrap_tensor(tensor, tp_rank, device):
     return tensor.to(device)
 
 
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
+def _build_step_span_name(
+    forward_batch: ForwardBatch, is_draft_worker: bool = False
+) -> str:
+    """Build a profile-trace span name for one forward step.
+
+    A speculative draft model and the target model can run the *same*
+    forward_mode (e.g. DFLASH runs both the draft and the verify forward with
+    TARGET_VERIFY), which would otherwise collapse to one indistinguishable span
+    name in the trace. Tag draft-worker forwards with a DRAFT role so draft vs
+    target spans stay separable on the (capture-time) GPU timeline.
+    """
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
+    # Role suffix to separate the speculative draft forward from the target
+    # verify forward (both can run TARGET_VERIFY). Normal (non-draft, non-verify)
+    # forwards stay unlabeled to avoid mislabeling regular prefill/decode.
+    if is_draft_worker:
+        role = " DRAFT"
+    elif mode == ForwardMode.TARGET_VERIFY:
+        role = " VERIFY"
+    else:
+        role = ""
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
+        return f"step[EXTEND bs={bs} toks={ext_toks}{role}]"
+    return f"step[{mode.name} bs={bs}{role}]"
 
 
 @dataclass

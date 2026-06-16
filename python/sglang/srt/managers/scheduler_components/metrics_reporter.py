@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -139,6 +139,12 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
+        # Lifetime histogram: num_correct_drafts accepted in a decode step (no
+        # bonus) -> number of such steps, summed across all requests. Reset in
+        # lockstep with spec_total_num_accept_tokens so it matches the window of
+        # avg_spec_accept_length. Exposed via get_internal_state as an
+        # accept-length histogram (accept length = num_correct_drafts + 1 bonus).
+        self.spec_total_correct_drafts_histogram: Counter = Counter()
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -491,6 +497,7 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.spec_total_correct_drafts_histogram = Counter()
 
     def report_prefill_stats(
         self,

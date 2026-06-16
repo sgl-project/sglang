@@ -131,8 +131,12 @@ def run_eval(args):
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
+        from sglang.utils import download_and_cache_file
 
-        filename = (
+        # Use the local cache (/tmp/gpqa_diamond.csv) if present; passing the URL
+        # straight to pandas.read_csv hits the network (urllib) and is blocked
+        # behind restrictive proxies.
+        filename = download_and_cache_file(
             "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
