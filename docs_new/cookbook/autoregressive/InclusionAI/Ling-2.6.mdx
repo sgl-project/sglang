@@ -1,0 +1,223 @@
+---
+title: Ling-2.6
+metatags:
+    description: "Deploy the Ling-2.6 family with SGLang - Ling-2.6-flash (104B total / 7.4B active BF16 MoE) and Ling-2.6-1T (~1T FP8 MoE) with hybrid linear attention and agentic tool calling."
+---
+
+## 1. Model Introduction
+
+The **Ling-2.6** family from inclusionAI is the next iteration of the Ling instant-model series. Continuing the architectural direction set by Ling-2.5, Ling-2.6 doubles down on **inference efficiency**, **token efficiency**, and **agent performance** — staying competitive with frontier instant models while being faster, leaner, and better suited for production agent workloads.
+
+**Key Features:**
+
+- **Hybrid Linear Attention**: A `1:7 MLA + Lightning Linear` hybrid built on top of a highly sparse MoE backbone. Compared with same-class SOTA models, Ling-2.6-flash shows up to ~4× higher prefill and decode throughput in long-context scenarios; Ling-2.6-1T is shipped in FP8 so it fits a single GB300 node with `--tp 4`.
+- **Token Efficiency**: Trained with explicit token-efficiency objectives. On the full Artificial Analysis suite, Ling-2.6-flash uses only ~15M output tokens while remaining competitive — a meaningfully stronger intelligence-per-token profile than long-reasoning peers.
+- **Agentic Capabilities**: Refined for tool use, multi-step planning, and long-horizon execution. Reaches SOTA-class results on **BFCL-V4**, **TAU2-bench**, **SWE-bench Verified**, **Claw-Eval**, and **PinchBench**, and is validated against Claude Code, Kilo Code, Qwen Code, Hermes Agent, and OpenClaw.
+- **Long Context**: Native 128K, extendable to **256K (Ling-2.6-flash)** and **256K → 1M (Ling-2.6-1T via YaRN)**.
+
+**Available Models:**
+
+- **BF16**: [inclusionAI/Ling-2.6-flash](https://huggingface.co/inclusionAI/Ling-2.6-flash) — 104B total / 7.4B active
+- **FP8 (E4M3)**: [inclusionAI/Ling-2.6-1T](https://huggingface.co/inclusionAI/Ling-2.6-1T) — ~1T total
+
+**License:** MIT
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+### 3.1 Ling-2.6-flash
+
+Ling-2.6-flash is a 104B/7.4B-active MoE that runs comfortably on a single 4-GPU node. Use the selector below to generate the launch command for your hardware.
+
+import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flash-deployment.jsx'
+
+<Ling26FlashDeployment />
+
+#### Configuration Tips
+
+- `--trust-remote-code` is required (custom `BailingMoeV2_5ForCausalLM` modeling code).
+- `--tp-size 4` is the reference layout. On 4× H20-3e the model reaches ~340 tokens/s decode at TP=4, batch 32.
+- Native context is 128K. Enable YaRN (`--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 2.0, ...}}'`) to extend to 256K — the snippet does this for you.
+- `--tool-call-parser qwen25` matches the model's `<tool_call>...</tool_call>` schema.
+- The recommended baseline does **not** include `--reasoning-parser qwen3`. Ling-2.6 is a controllable-reasoning model whose chat template defaults to `detailed thinking off`; the SGLang `qwen3` reasoning parser, in contrast, assumes default-thinking semantics and would mis-route normal output into `reasoning_content`. Only enable it if you specifically want `<think>...</think>` blocks split out — see [§4.3 Thinking Mode](#4-3-thinking-mode).
+- **MTP (multi-token prediction)** is supported. Add `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-scheduler-strategy extra_buffer` to enable it — see the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash#run-inference) for the full example.
+
+### 3.2 Ling-2.6-1T
+
+Ling-2.6-1T ships in **FP8 (E4M3)**, so unlike Ling-2.5-1T it fits a **single GB300 node with `--tp 4`**. On smaller GPUs (H200/B200), a 2-node deployment with `--pp-size 2` is required.
+
+import { Ling261TDeployment } from '/src/snippets/autoregressive/ling-26-1t-deployment.jsx'
+
+<Ling261TDeployment />
+
+#### Configuration Tips
+
+- `--trust-remote-code` is required for the custom modeling code.
+- `--model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}'` significantly speeds up the multi-shard FP8 weight load (26 safetensors shards + an MTP layer).
+- Use `--tool-call-parser qwen` for tool calling.
+- The recommended baseline does **not** include `--reasoning-parser qwen3`. Ling-2.6's chat template defaults to `detailed thinking off`, while SGLang's `qwen3` reasoning parser assumes default-thinking semantics — combining the two requires a per-request workaround for tool calls (see [§4.3 Thinking Mode](#4-3-thinking-mode)). Only enable `--reasoning-parser qwen3` if you specifically want `<think>...</think>` blocks split into `reasoning_content`.
+- For 2-node deployments, set `MASTER_IP`, `PORT`, and `DIST_PORT` consistently across both nodes.
+
+## 4. Model Invocation
+
+For example, launch a Ling-2.6-1T server on a single GB300 node:
+
+```bash Command
+sglang serve \
+  --model-path inclusionAI/Ling-2.6-1T \
+  --tp-size 4 \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tool-call-parser qwen \
+  --model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}'
+```
+
+### 4.1 Basic Usage
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
+```
+
+Output:
+```json Config
+{
+  "id": "...",
+  "object": "chat.completion",
+  "model": "auto",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is **Paris**.",
+        "reasoning_content": null,
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+### 4.2 Tool Calling Example
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "search",
+        "description": "Search for information on the internet",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query"}
+          },
+          "required": ["query"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+Output:
+```json Config
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_...",
+            "type": "function",
+            "function": {
+              "name": "search",
+              "arguments": "{\"query\": \"latest news about AI\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}
+```
+
+### 4.3 Thinking Mode
+
+Both Ling-2.6-flash and Ling-2.6-1T are **controllable-reasoning** models. Their chat template uses textual directives in the system message — `detailed thinking on` or `detailed thinking off` — to toggle thinking. The template **defaults to `detailed thinking off`** when neither phrase is present, and it does **not** read the Qwen3-style `enable_thinking` template variable.
+
+#### Enabling thinking
+
+Include `detailed thinking on` in the first system message:
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      {"role": "system", "content": "detailed thinking on"},
+      {"role": "user", "content": "If a box has 12 red balls and 8 blue balls, then 5 red balls are removed, how many balls remain?"}
+    ]
+  }'
+```
+
+If you already have a system prompt, append the directive on its own line:
+
+```json
+{"role": "system", "content": "You are a helpful assistant.\ndetailed thinking on"}
+```
+
+When thinking is on, the model emits `<think>...</think>` blocks before its final answer. To get those split into `message.reasoning_content` automatically, also launch the server with `--reasoning-parser qwen3`.
+
+#### Caveat: `--reasoning-parser qwen3` + tool calling
+
+The SGLang `qwen3` reasoning parser was written for Qwen3, where models are **default-thinking** and clients opt out via `chat_template_kwargs.enable_thinking=false`. Ling-2.6 is the opposite — default-non-thinking, with toggling done in the system message. As a result, when the server is launched with **both** `--tool-call-parser qwen` and `--reasoning-parser qwen3`, every tool-call request must include `chat_template_kwargs.enable_thinking=false`, otherwise the parser routes the `<tool_call>...</tool_call>` block into `reasoning_content` instead of `message.tool_calls`:
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
+    "tools": [...],
+    "tool_choice": "auto",
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+`enable_thinking` here is consumed by the SGLang reasoning parser, **not** by the chat template — Ling-2.6's template ignores it. For the simplest configuration, just omit `--reasoning-parser qwen3` and toggle thinking via the system message.
+
+For more API examples, see the [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request).
+
+## 5. Benchmark
+
+### GSM8K (Ling-2.6-1T, GB300 × 4)
+
+Reference run on a single GB300 node with `--tp 4`:
+
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py
+```
+
+```text Output
+Accuracy: 0.9621 (1269 / 1319)
+```
+
+For Ling-2.6-flash, see the official numbers on the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash) (BFCL-V4, TAU2-bench, SWE-bench Verified, Claw-Eval, PinchBench, Artificial Analysis).

@@ -39,7 +39,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import should_use_flashinfer_cutlass_moe_fp4_allgather
+from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -52,8 +52,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -75,8 +79,9 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from sgl_kernel import bmm_fp8, concat_mla_k, merge_state_v2
+        from sgl_kernel import bmm_fp8, merge_state_v2
 
+        from sglang.jit_kernel.concat_mla import concat_mla_k
         from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
@@ -104,7 +109,8 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
 
@@ -370,11 +376,10 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -413,11 +418,10 @@ class SarvamMoESparseMoeBlock(nn.Module):
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -606,7 +610,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 self.current_attention_backend == "fa3"
                 and self.kv_cache_dtype != "auto"
             ):
-                attn_dtype = forward_batch.token_to_kv_pool.dtype
+                attn_dtype = get_token_to_kv_pool().dtype
             else:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
@@ -669,11 +673,10 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        get_token_to_kv_pool().set_mla_kv_buffer(
             self.attn_mha,
             forward_batch.out_cache_loc,
             k_nope,
@@ -703,8 +706,8 @@ class SarvamMoEMLAAttention(nn.Module):
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
             else:
                 forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         forward_batch.set_attn_attend_prefix_cache(False)
         forward_batch.mha_return_lse = do_prefix_merge
@@ -991,7 +994,6 @@ class SarvamMoEMLAAttention(nn.Module):
 
 
 class SarvamMoEMLADecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1141,7 +1143,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
 
 
 class SarvamMLAModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1225,7 +1226,6 @@ class SarvamMLAModel(nn.Module):
 
 
 class SarvamMLAForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1477,7 +1477,6 @@ class SarvamMLAForCausalLM(nn.Module):
 
 
 class SarvamMoEForCausalLM(BailingMoEForCausalLM):
-
     @torch.no_grad()
     def forward_split_prefill(
         self,

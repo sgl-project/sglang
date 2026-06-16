@@ -18,6 +18,23 @@ class UpdateWeightFromDiskReqInput:
 
 
 @dataclass
+class UpdateWeightFromTensorReqInput:
+    """Request to update model weights from tensor payloads for diffusion models."""
+
+    serialized_named_tensors: list[str | bytes]
+    load_format: str | None = None
+    target_modules: list[str] | None = None
+
+
+@dataclass
+class UpdateWeightFromTensorCheckerReqInput:
+    """Request to verify live module weights against expected SHA-256 values."""
+
+    target_module: str
+    expected_named_tensors_sha256: dict[str, str]
+
+
+@dataclass
 class GetWeightsChecksumReqInput:
     """Compute SHA-256 checksum of loaded module weights for verification."""
 
@@ -27,7 +44,7 @@ class GetWeightsChecksumReqInput:
 class RolloutRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
-    seed: int = 1024
+    seed: Optional[int] = None
     generator_device: str = "cuda"
 
     width: Optional[int] = None
@@ -50,6 +67,10 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+
+    # 0-indexed denoising-loop step filters. None = all steps.
+    rollout_sde_step_indices: Optional[list[int]] = None
+    rollout_return_step_indices: Optional[list[int]] = None
 
     image_path: Optional[list[str]] = None
 

@@ -5,6 +5,10 @@
 Latent preparation stage for diffusion pipelines.
 """
 
+from dataclasses import dataclass
+from typing import Any
+
+import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import (
@@ -22,6 +26,27 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class LatentPreparationFingerprint:
+    height: int | None
+    width: int | None
+    num_frames: int | None
+    latent_num_frames: int | None
+    prompt_dtype: Any
+    generator_device: str | None
+
+
+@dataclass(frozen=True)
+class LatentPreparationSpec:
+    """ "dataclass for controlling the LatentPreparationStage runtime semantics"""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device | str
+    prepare_latent_ids: bool = True
+    pack_latents: bool = True
 
 
 class LatentPreparationStage(PipelineStage):
@@ -46,6 +71,37 @@ class LatentPreparationStage(PipelineStage):
             batch.prompt_embeds[0].dtype
         )
 
+    def get_forward_latent_num_frames(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int:
+        """get the number of frames to generate for the current batch"""
+        return self.adjust_video_length(batch, server_args)
+
+    def get_latent_preparation_spec(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device | str,
+    ) -> LatentPreparationSpec:
+        shape = server_args.pipeline_config.prepare_latent_shape(
+            batch, batch_size, num_frames
+        )
+        return LatentPreparationSpec(
+            shape=shape,
+            dtype=self._get_latent_dtype(batch, server_args),
+            device=device,
+        )
+
+    def should_scale_initial_noise(self, batch: Req, server_args: ServerArgs) -> bool:
+        return True
+
+    def requires_batch_height_width(self, batch: Req, server_args: ServerArgs) -> bool:
+        return True
+
     def forward(
         self,
         batch: Req,
@@ -61,23 +117,21 @@ class LatentPreparationStage(PipelineStage):
         """
 
         # Adjust video length based on VAE version if needed
-        latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.get_forward_latent_num_frames(batch, server_args)
 
         batch_size = batch.batch_size
 
         # Get required parameters
-        dtype = self._get_latent_dtype(batch, server_args)
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
-        num_frames = (
-            latent_num_frames if latent_num_frames is not None else batch.num_frames
-        )
         height = batch.height
         width = batch.width
 
         # TODO(will): remove this once we add input/output validation for stages
-        if height is None or width is None:
+        if self.requires_batch_height_width(batch, server_args) and (
+            height is None or width is None
+        ):
             raise ValueError("Height and width must be provided")
 
         # Validate generator if it's a list
@@ -89,31 +143,193 @@ class LatentPreparationStage(PipelineStage):
 
         # Generate or use provided latents
         if latents is None:
-            shape = server_args.pipeline_config.prepare_latent_shape(
-                batch, batch_size, num_frames
+            spec = self.get_latent_preparation_spec(
+                batch, server_args, batch_size, latent_num_frames, device
             )
             latents = randn_tensor(
-                shape, generator=generator, device=device, dtype=dtype
+                spec.shape,
+                generator=generator,
+                device=spec.device,
+                dtype=spec.dtype,
             )
 
-            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            latent_ids = (
+                server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+                if spec.prepare_latent_ids
+                else None
+            )
 
             if latent_ids is not None:
                 batch.latent_ids = latent_ids.to(device=device)
 
-            latents = server_args.pipeline_config.maybe_pack_latents(
-                latents, batch_size, batch
-            )
+            if spec.pack_latents:
+                latents = server_args.pipeline_config.maybe_pack_latents(
+                    latents, batch_size, batch
+                )
         else:
             latents = latents.to(device)
 
         # Scale the initial noise if needed
-        if hasattr(self.scheduler, "init_noise_sigma"):
+        if self.should_scale_initial_noise(batch, server_args) and hasattr(
+            self.scheduler, "init_noise_sigma"
+        ):
             latents = latents * self.scheduler.init_noise_sigma
         # Update batch with prepared latents
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
         return batch
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        """Group only the deterministic latent-preparation subprocess.
+
+        Latent preparation is not a pure full-stage copy: each request still
+        owns its RNG stream, so raw noise must be drawn once per request with
+        that request's generator. The reusable part is the deterministic work
+        after raw noise generation, such as packing latent tokens and applying
+        scheduler scaling. For that reason this stage uses the common
+        fingerprint grouping helper but implements its own grouped execution
+        instead of ``run_deduplicated_group``.
+        """
+        results: list[Req | None] = [None] * len(batches)
+
+        for _, group in self._group_requests_by_fingerprint(
+            batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
+        ):
+            indexed_batches = group
+            group_batches = [batch for _, batch in indexed_batches]
+            if len(group_batches) == 1 or any(
+                batch.latents is not None for batch in group_batches
+            ):
+                for index, batch in indexed_batches:
+                    results[index] = self(batch, server_args)
+                continue
+
+            first_index, first_batch = indexed_batches[0]
+            first_result = self._prepare_grouped_latents(group_batches, server_args)
+            self._split_batched_latents(first_result, group_batches)
+            results[first_index] = first_batch
+            for index, batch in indexed_batches[1:]:
+                results[index] = batch
+
+        return [result for result in results if result is not None]
+
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> LatentPreparationFingerprint:
+        prompt_dtype = (
+            batch.prompt_embeds[0].dtype
+            if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds
+            else None
+        )
+        latent_num_frames = self.get_forward_latent_num_frames(batch, server_args)
+        return LatentPreparationFingerprint(
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+            latent_num_frames=latent_num_frames,
+            prompt_dtype=prompt_dtype,
+            generator_device=batch.generator_device,
+        )
+
+    @staticmethod
+    def _single_generator(batch: Req):
+        if isinstance(batch.generator, list):
+            assert len(batch.generator) == 1
+            return batch.generator[0]
+        return batch.generator
+
+    def _prepare_grouped_latents(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Req:
+        """Prepare grouped random latents without changing per-request RNG streams.
+
+        ``randn_tensor`` accepts a list of generators, but its batched draw is not
+        guaranteed to match drawing each request independently. For multi-output
+        requests we need exact equivalence to the sequential seed path, so this
+        helper draws one raw latent tensor per request and only batches the
+        deterministic packing/scaling work.
+        """
+        first_batch = batches[0]
+        latent_num_frames = self.get_forward_latent_num_frames(first_batch, server_args)
+        batch_size = len(batches)
+
+        device = get_local_torch_device()
+        first_spec = self.get_latent_preparation_spec(
+            first_batch,
+            server_args,
+            batch_size,
+            latent_num_frames,
+            device,
+        )
+
+        raw_latents = []
+        for batch in batches:
+            spec = self.get_latent_preparation_spec(
+                batch,
+                server_args,
+                1,
+                latent_num_frames,
+                device,
+            )
+            raw_latents.append(
+                randn_tensor(
+                    spec.shape,
+                    generator=self._single_generator(batch),
+                    device=spec.device,
+                    dtype=spec.dtype,
+                )
+            )
+
+        latents = torch.cat(raw_latents, dim=0)
+        latent_ids = (
+            server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            if first_spec.prepare_latent_ids
+            else None
+        )
+        if latent_ids is not None:
+            first_batch.latent_ids = latent_ids.to(device=device)
+
+        if first_spec.pack_latents:
+            original_num_outputs = first_batch.num_outputs_per_prompt
+            try:
+                first_batch.num_outputs_per_prompt = batch_size
+                latents = server_args.pipeline_config.maybe_pack_latents(
+                    latents, batch_size, first_batch
+                )
+            finally:
+                first_batch.num_outputs_per_prompt = original_num_outputs
+
+        if self.should_scale_initial_noise(first_batch, server_args) and hasattr(
+            self.scheduler, "init_noise_sigma"
+        ):
+            latents = latents * self.scheduler.init_noise_sigma
+
+        first_batch.latents = latents
+        first_batch.raw_latent_shape = latents.shape
+        return first_batch
+
+    @staticmethod
+    def _slice_batch_tensor(tensor: torch.Tensor, index: int, total: int):
+        if tensor.shape[0] == total:
+            return tensor[index : index + 1].contiguous()
+        return tensor
+
+    def _split_batched_latents(self, src: Req, batches: list[Req]) -> None:
+        total = len(batches)
+        assert src.latents is not None
+        latents = src.latents
+        latent_ids = src.latent_ids
+        for index, batch in enumerate(batches):
+            batch.latents = self._slice_batch_tensor(latents, index, total)
+            batch.raw_latent_shape = batch.latents.shape
+            if latent_ids is not None:
+                batch.latent_ids = self._slice_batch_tensor(latent_ids, index, total)
 
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
         """

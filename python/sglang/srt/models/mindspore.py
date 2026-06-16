@@ -14,6 +14,10 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.registry import import_model_classes
 from sglang.srt.utils import is_npu
 
@@ -51,7 +55,7 @@ def tensor_torch2ms(x: torch.Tensor):
     return ms_tensor
 
 
-def tensor_ms2torch(x: "ms.Tensor"):
+def tensor_ms2torch(x: ms.Tensor):
     if x is None or not isinstance(x, ms.Tensor):
         return x
 
@@ -148,7 +152,7 @@ class LowerTriangularMask:
     def gen_attention_mask(
         self,
         is_prefill: bool,
-        position_ids: "ms.Tensor",
+        position_ids: ms.Tensor,
         query_lens_np: np.ndarray,
         seq_lens_np: np.ndarray,
     ):
@@ -221,9 +225,9 @@ class MindSporeForCausalLM(torch.nn.Module):
         def prepare_cache(cache_list, is_key_cache):
             for i in range(self.config.num_hidden_layers):
                 if is_key_cache:
-                    cache = forward_batch.token_to_kv_pool.get_key_buffer(i)
+                    cache = get_token_to_kv_pool().get_key_buffer(i)
                 else:
-                    cache = forward_batch.token_to_kv_pool.get_value_buffer(i)
+                    cache = get_token_to_kv_pool().get_value_buffer(i)
                 cache_ms = tensor_torch2ms(cache)
                 if self.use_mla and cache_ms.ndim == 3:
                     cache_ms = mint.unsqueeze(cache_ms, 2)
@@ -249,7 +253,6 @@ class MindSporeForCausalLM(torch.nn.Module):
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_draft_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
         if forward_batch.extend_prefix_lens is not None:
@@ -275,10 +278,10 @@ class MindSporeForCausalLM(torch.nn.Module):
             if forward_batch.forward_mode.is_target_verify():
                 q_seq_lens = q_seq_lens * forward_batch.spec_info.num_tokens_per_req
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         block_tables = tensor_torch2ms(
             (
-                forward_batch.req_to_token_pool.req_to_token[
+                get_req_to_token_pool().req_to_token[
                     forward_batch.req_pool_indices, : batch_valid_length.max()
                 ][:, ::page_size]
                 // page_size
@@ -312,7 +315,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> "ms.Tensor":
+    ) -> ms.Tensor:
         # prepare base inputs
         model_inputs = self.prepare_inputs(input_ids, positions, forward_batch)
         # prepare model inputs

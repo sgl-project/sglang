@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/shm_broadcast.py
 
 import logging
@@ -17,6 +19,7 @@ from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -98,7 +101,9 @@ class ShmRingBuffer:
             # we are creating a buffer
             self.is_creator = True
             self.shared_memory = shared_memory.SharedMemory(
-                create=True, size=self.total_bytes_of_buffer
+                create=True,
+                size=self.total_bytes_of_buffer,
+                name=make_shm_name("mq"),
             )
             # initialize the metadata section to 0
             with memoryview(
