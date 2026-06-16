@@ -237,18 +237,18 @@ class AWQAscendMoEKernel:
         # Ensure integer types for bitwise operations
         qweight = qweight.to(torch.int32)
         qzeros = qzeros.to(torch.int32)
-
+    
         E, K, N_packed = qweight.shape
         N = N_packed * 8
         groups = scales.shape[1]
         group_size = K // groups
         assert K % groups == 0, f"K={K} not divisible by groups={groups}"
-
-        # Output tensor: (E, N, K) so that matmul can be (1, K) x (K, N) -> (1, N)
-        fp_weight = torch.empty((E, N, K), dtype=torch.bfloat16, device=qweight.device)
-
+    
+        # Allocate as (E, K, N) – we will transpose to (E, N, K) later
+        fp_weight = torch.empty((E, K, N), dtype=torch.bfloat16, device=qweight.device)
+    
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-
+    
         for e in range(E):
             # Unpack weight
             qw_e = qweight[e]                         # (K, N_packed)
@@ -257,7 +257,7 @@ class AWQAscendMoEKernel:
                 nib = (qw_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 w_int8[:, i::8] = signed
-
+    
             # Unpack zeros
             qz_e = qzeros[e]                          # (groups, N_packed)
             z_int8 = torch.empty((groups, N), dtype=torch.int8, device=qweight.device)
@@ -265,18 +265,18 @@ class AWQAscendMoEKernel:
                 nib = (qz_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 z_int8[:, i::8] = signed
-
+    
             # Expand scales and zeros to (K, N)
             z_exp = z_int8.repeat_interleave(group_size, dim=0)   # (K, N)
             s_exp = scales[e].repeat_interleave(group_size, dim=0) # (K, N)
-
-            # Dequantize: (w - z) * scale, then transpose to (N, K)
+    
+            # Dequantize: (w - z) * scale, result shape (K, N)
             w_fp = ((w_int8.float() - z_exp.float()) * s_exp.float()).to(torch.bfloat16)
-            fp_weight[e] = w_fp  # (K, N) -> we will transpose later
-
-        # Transpose to (E, N, K) for batched matmul: (E, N, K)
+            fp_weight[e] = w_fp  # assign directly – shape (K, N) matches
+    
+        # Transpose to (E, N, K) for batched matmul
         fp_weight = fp_weight.transpose(-1, -2).contiguous()
-        setattr(layer, f"{prefix}_weight_fp", torch.nn.Parameter(fp_weight, requires_grad=False))
+        setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
 
     def _register_or_replace_parameter(self, layer, name, tensor):
         if hasattr(layer, name):
