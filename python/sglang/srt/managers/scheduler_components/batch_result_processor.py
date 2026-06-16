@@ -795,10 +795,10 @@ class SchedulerBatchResultProcessor:
         accept_tokens = []
         try:
             for token_id in proposed:
+                req.grammar.accept_token(token_id)
                 req.output_ids.append(token_id)
                 accept_tokens.append(token_id)
                 self._maybe_update_reasoning_tokens(req, token_id)
-                req.grammar.accept_token(token_id)
                 req.update_finish_state()
                 if req.finished():
                     break

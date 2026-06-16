@@ -1,7 +1,8 @@
 """Unit test for the Spec V2 + grammar trimming in process_batch_result_decode.
 
 Companion to the GPU regression in
-test/registered/disaggregation/test_disaggregation_spec_grammar.py (PR #24082).
+test/registered/disaggregation/test_disaggregation_basic.py::
+TestDisaggregationSpecV2Grammar (PR #24082).
 
 This drives the real decode result processor on CPU with plain-Python stubs for
 the GPU/IO-bound helpers. The core fix: when Spec V2 proposes several tokens but
@@ -147,6 +148,9 @@ class TestSpecV2GrammarTrimming(CustomTestCase):
         req = self._make_req(terminate_after=2)
         proc = _make_processor()
         result = _make_result([101, 102, 103], [-0.1, -0.2, -0.3])
+        req.kv_committed_len = len(req.origin_input_ids) + len(
+            result.test_next_token_ids[0]
+        )
         batch = _FakeBatch([req], return_logprob=True)
 
         proc.process_batch_result_decode(batch, result)
@@ -162,12 +166,17 @@ class TestSpecV2GrammarTrimming(CustomTestCase):
         # Logprob bookkeeping sees only the retained tokens.
         self.assertEqual(req.logprob.output_token_logprobs_val, [-0.1, -0.2])
         self.assertEqual(req.logprob.output_token_logprobs_idx, [101, 102])
+        # _resolve_spec_v2_tokens committed the full list before grammar trimmed it.
+        self.assertEqual(req.kv_committed_len, len(req.origin_input_ids) + 2)
 
     def test_keeps_all_tokens_when_grammar_not_terminated(self):
         # Grammar never terminates within this list: all proposed tokens retained.
         req = self._make_req(terminate_after=99)
         proc = _make_processor()
         result = _make_result([201, 202, 203], [-0.5, -0.6, -0.7])
+        req.kv_committed_len = len(req.origin_input_ids) + len(
+            result.test_next_token_ids[0]
+        )
         batch = _FakeBatch([req], return_logprob=True)
 
         proc.process_batch_result_decode(batch, result)
@@ -179,6 +188,7 @@ class TestSpecV2GrammarTrimming(CustomTestCase):
         self.assertFalse(req.grammar.finished)
         self.assertEqual(req.logprob.output_token_logprobs_val, [-0.5, -0.6, -0.7])
         self.assertEqual(req.logprob.output_token_logprobs_idx, [201, 202, 203])
+        self.assertEqual(req.kv_committed_len, len(req.origin_input_ids) + 3)
 
 
 if __name__ == "__main__":
