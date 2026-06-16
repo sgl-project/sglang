@@ -2738,14 +2738,19 @@ class Scheduler(
 
         return ret
 
+    def _process_ready_grammar_requests_non_pp(self):
+        if self.ps.pp_size > 1 or not self.grammar_manager.has_waiting_grammars():
+            return
+
+        ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
+        for req in ready_grammar_requests:
+            self._add_request_to_queue(req)
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+        self._process_ready_grammar_requests_non_pp()
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()

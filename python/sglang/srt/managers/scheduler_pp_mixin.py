@@ -77,11 +77,14 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
+        recv/merge ith grammar first-round consensus from previous stage
         recv ith proxy from previous stage
         run ith batch
         recv prev (i+1)% mb_size th outputs
+        recv/forward prev (i+1)% mb_size th grammar final consensus
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
+        send ith grammar first-round consensus to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage(can be stashed and delayed to send later)
 
@@ -90,6 +93,10 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        gmbs = [None] * self.pp_loop_size
+        consensus_grammar_rids: Optional[List[List[str]]] = None
+        send_grammar_work = []
+        send_consensus_grammar_work = []
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -97,16 +104,20 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                next_consensus_grammar_rids = None
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+
+                grammar_rids = None
+                if gmbs[mb_id] is None:
+                    grammar_rids = self._pp_get_grammar_ready_ids()
+                    if grammar_rids is not None:
+                        gmbs[mb_id] = grammar_rids
+                self._pp_commit_comm_work(send_grammar_work)
+
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -139,6 +150,20 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+
+                send_consensus_grammar_work, consensus_grammar_rids = (
+                    self._pp_pd_send_consensus_grammar_ids(
+                        gmbs,
+                        next_first_rank_mb_id,
+                        consensus_grammar_rids,
+                    )
+                )
+                if gmbs[next_mb_id] is not None:
+                    next_consensus_grammar_rids = self._pp_recv_pyobj_from_prev_stage()
+                    self.process_grammar_queue(next_consensus_grammar_rids)
+                    gmbs[next_mb_id] = None
+                self._pp_commit_comm_work(send_consensus_grammar_work)
+
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -148,6 +173,15 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
+                    if grammar_rids is not None:
+                        send_grammar_work = self._pp_send_pyobj_to_next_stage(
+                            grammar_rids, async_send=True
+                        )
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -162,9 +196,19 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+                consensus_grammar_rids = next_consensus_grammar_rids
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle:
+            if not self._pp_has_inflight_grammar_consensus(gmbs):
+                self._pp_commit_comm_work(send_consensus_grammar_work)
+                self._pp_commit_comm_work(send_grammar_work)
+
+            if (
+                server_is_idle
+                and len(self.waiting_queue) == 0
+                and len(self.grammar_manager.grammar_queue) == 0
+                and not self._pp_has_inflight_grammar_consensus(gmbs)
+            ):
                 self.on_idle()
 
     @DynamicGradMode()
@@ -182,17 +226,20 @@ class SchedulerPPMixin:
         recv ith req from previous stage
         recv ith bootstrap req from previous stage
         recv ith transferred req from previous stage
+        recv/merge ith grammar first-round consensus from previous stage
         recv ith proxy from previous stage
         run ith batch
         recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
         local consensus on bootstrapped req
         recv prev (i+1) % mb_size th release req from previous stage
         local consensus on release req
+        recv/forward prev (i+1)% mb_size th grammar final consensus
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
         send ith bootstrap req to next stage
         send ith transferred req to next stage
+        send ith grammar first-round consensus to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
@@ -210,12 +257,16 @@ class SchedulerPPMixin:
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        gmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
+        consensus_grammar_rids: Optional[List[List[str]]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
+        send_grammar_work = []
         send_consensus_bootstrapped_work = []
+        send_consensus_grammar_work = []
         send_release_work = []
 
         while True:
@@ -229,6 +280,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
+                next_consensus_grammar_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -245,6 +297,13 @@ class SchedulerPPMixin:
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+
+                grammar_rids = None
+                if gmbs[mb_id] is None:
+                    grammar_rids = self._pp_get_grammar_ready_ids()
+                    if grammar_rids is not None:
+                        gmbs[mb_id] = grammar_rids
+                self._pp_commit_comm_work(send_grammar_work)
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
@@ -292,6 +351,13 @@ class SchedulerPPMixin:
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
+                send_consensus_grammar_work, consensus_grammar_rids = (
+                    self._pp_pd_send_consensus_grammar_ids(
+                        gmbs,
+                        next_first_rank_mb_id,
+                        consensus_grammar_rids,
+                    )
+                )
 
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = (
@@ -304,6 +370,11 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+                if gmbs[next_mb_id] is not None:
+                    next_consensus_grammar_rids = self._pp_recv_pyobj_from_prev_stage()
+                    self.process_grammar_queue(next_consensus_grammar_rids)
+                    gmbs[next_mb_id] = None
+                self._pp_commit_comm_work(send_consensus_grammar_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -325,6 +396,10 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if grammar_rids is not None:
+                        send_grammar_work = self._pp_send_pyobj_to_next_stage(
+                            grammar_rids, async_send=True
+                        )
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -338,11 +413,23 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
+                consensus_grammar_rids = next_consensus_grammar_rids
 
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+            if not self._pp_has_inflight_grammar_consensus(gmbs):
+                self._pp_commit_comm_work(send_grammar_work)
+                self._pp_commit_comm_work(send_consensus_grammar_work)
+
+            if (
+                server_is_idle
+                and len(self.waiting_queue) == 0
+                and len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                and len(self.disagg_prefill_inflight_queue) == 0
+                and len(self.grammar_manager.grammar_queue) == 0
+                and not self._pp_has_inflight_grammar_consensus(gmbs)
+            ):
                 self.on_idle()
 
     @DynamicGradMode()
@@ -353,14 +440,18 @@ class SchedulerPPMixin:
         rmbs = [None] * self.pp_loop_size
         pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        gmbs = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
+        consensus_grammar_rids: Optional[List[List[str]]] = None
         release_rids: Optional[List[str]] = None  # consensus transferred rids
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
+        send_grammar_work = []
         send_consensus_retract_work = []
         send_consensus_prealloc_work = []
+        send_consensus_grammar_work = []
         send_release_work = []
 
         while True:
@@ -374,6 +465,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_consensus_retract_rids = None
                 next_consensus_prealloc_rids = None
+                next_consensus_grammar_rids = None
                 next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
@@ -396,6 +488,13 @@ class SchedulerPPMixin:
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
+
+                grammar_rids = None
+                if gmbs[mb_id] is None:
+                    grammar_rids = self._pp_get_grammar_ready_ids()
+                    if grammar_rids is not None:
+                        gmbs[mb_id] = grammar_rids
+                self._pp_commit_comm_work(send_grammar_work)
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
@@ -460,6 +559,13 @@ class SchedulerPPMixin:
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
+                send_consensus_grammar_work, consensus_grammar_rids = (
+                    self._pp_pd_send_consensus_grammar_ids(
+                        gmbs,
+                        next_first_rank_mb_id,
+                        consensus_grammar_rids,
+                    )
+                )
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
@@ -484,6 +590,11 @@ class SchedulerPPMixin:
                         next_release_rids
                     )
                 self._pp_commit_comm_work(send_release_work)
+                if gmbs[next_mb_id] is not None:
+                    next_consensus_grammar_rids = self._pp_recv_pyobj_from_prev_stage()
+                    self.process_grammar_queue(next_consensus_grammar_rids)
+                    gmbs[next_mb_id] = None
+                self._pp_commit_comm_work(send_consensus_grammar_work)
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -508,6 +619,10 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if grammar_rids is not None:
+                        send_grammar_work = self._pp_send_pyobj_to_next_stage(
+                            grammar_rids, async_send=True
+                        )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -522,6 +637,7 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
+                consensus_grammar_rids = next_consensus_grammar_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -530,11 +646,20 @@ class SchedulerPPMixin:
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
+                + len(self.grammar_manager.grammar_queue)
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
-            if server_is_idle and queue_size == 0:
+            if not self._pp_has_inflight_grammar_consensus(gmbs):
+                self._pp_commit_comm_work(send_grammar_work)
+                self._pp_commit_comm_work(send_consensus_grammar_work)
+
+            if (
+                server_is_idle
+                and queue_size == 0
+                and not self._pp_has_inflight_grammar_consensus(gmbs)
+            ):
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
@@ -793,6 +918,75 @@ class SchedulerPPMixin:
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
+
+    def _pp_merge_grammar_ready_ids(
+        self: Scheduler,
+        prev_grammar_rids: List[List[str]],
+        curr_grammar_rids: List[List[str]],
+    ):
+        prev_ready_rids, prev_failed_rids = prev_grammar_rids
+        curr_ready_rids, curr_failed_rids = curr_grammar_rids
+        prev_ready_rid_set = set(prev_ready_rids)
+        ready_rids = [rid for rid in curr_ready_rids if rid in prev_ready_rid_set]
+        failed_rids = list(dict.fromkeys(prev_failed_rids + curr_failed_rids))
+        return [ready_rids, failed_rids]
+
+    def _pp_get_grammar_ready_ids(self: Scheduler):
+        if not self.grammar_manager.has_waiting_grammars():
+            return None
+
+        # Queue non-empty is the protocol trigger. The first PP rank may send an
+        # empty ready/failed set, and downstream ranks must still receive/forward
+        # it so an upstream-ready/downstream-not-ready state cannot desync pyobj.
+        curr_ready_rids, curr_failed_rids = (
+            self.grammar_manager.poll_ready_grammar_request_rids()
+        )
+        curr_grammar_rids = [curr_ready_rids, curr_failed_rids]
+        if self.pp_group.is_first_rank:
+            return curr_grammar_rids
+
+        prev_grammar_rids = self._pp_recv_pyobj_from_prev_stage()
+        return self._pp_merge_grammar_ready_ids(prev_grammar_rids, curr_grammar_rids)
+
+    def _pp_pd_send_consensus_grammar_ids(
+        self: Scheduler,
+        gmbs: List[Optional[List[List[str]]]],
+        next_first_rank_mb_id: int,
+        consensus_grammar_rids: Optional[List[List[str]]],
+    ):
+        send_consensus_grammar_work = []
+        if self.pp_group.is_last_rank:
+            if gmbs[next_first_rank_mb_id] is not None:
+                consensus_grammar_rids = gmbs[next_first_rank_mb_id]
+                send_consensus_grammar_work = self._pp_send_consensus_grammar_ids(
+                    consensus_grammar_rids
+                )
+        elif consensus_grammar_rids is not None:
+            send_consensus_grammar_work = self._pp_send_consensus_grammar_ids(
+                consensus_grammar_rids
+            )
+        return send_consensus_grammar_work, consensus_grammar_rids
+
+    def _pp_send_consensus_grammar_ids(self: Scheduler, consensus_grammar_rids):
+        return self._pp_send_pyobj_to_next_stage(
+            consensus_grammar_rids, async_send=True
+        )
+
+    def process_grammar_queue(self: Scheduler, consensus_grammar_rids):
+        if consensus_grammar_rids is None:
+            return
+
+        ready_rids, failed_rids = consensus_grammar_rids
+        ready_reqs = self.grammar_manager.pop_ready_grammar_requests_by_rids(
+            ready_rids, failed_rids
+        )
+        for req in ready_reqs:
+            self._add_request_to_queue(req)
+
+    def _pp_has_inflight_grammar_consensus(
+        self: Scheduler, gmbs: List[Optional[List[List[str]]]]
+    ):
+        return any(grammar_rids is not None for grammar_rids in gmbs)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
