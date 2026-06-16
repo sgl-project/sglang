@@ -1134,12 +1134,6 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
 def _init_throughput_aware_adaptive_params(server_args: ServerArgs) -> None:
     """Validate and resolve throughput-aware adaptive parameters."""
     cfg = resolving_view(server_args)
-    if cfg.speculative_adaptive_config is None:
-        raise ValueError(
-            "--speculative-adaptive-strategy=throughput_aware requires "
-            "--speculative-adaptive-config to point to a JSON config file."
-        )
-
     from sglang.srt.speculative.throughput_aware_controller import (
         resolve_throughput_aware_candidate_steps,
     )
@@ -1169,6 +1163,14 @@ def _init_throughput_aware_adaptive_params(server_args: ServerArgs) -> None:
         server_args,
         "_init_throughput_aware_adaptive_params",
         speculative_num_draft_tokens=cfg.speculative_num_steps + 1,
+    )
+    config_source = cfg.speculative_adaptive_config or "built-in default"
+    logger.info(
+        "throughput_aware adaptive: config loaded from %s, "
+        "candidate_steps=%s, initial_steps=%s",
+        config_source,
+        candidate_steps,
+        cfg.speculative_num_steps,
     )
 
 
