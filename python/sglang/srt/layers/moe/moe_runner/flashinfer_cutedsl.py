@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -238,6 +237,14 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
+def refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
+    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    layer._cutedsl_input_scale = used_input_scale
+
+
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
@@ -301,12 +308,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
         )
-
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
-    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    layer._cutedsl_input_scale = used_input_scale
+    refresh_cutedsl_standard_scales(layer)
 
 
 # ---------------------------------------------------------------------------
@@ -372,16 +374,9 @@ def _quantize_hidden_states_nvfp4(
     if use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
-        e4m3_max = 448.0
-        if (
-            envs.FLASHINFER_NVFP4_4OVER6.get()
-            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-        ):
-            e4m3_max = 256.0
-
         x_fp4_bytes, x_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (e4m3_max * 6.0),
+            input_scale,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",
