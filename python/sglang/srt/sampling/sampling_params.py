@@ -14,6 +14,7 @@
 """Sampling parameters for text generation."""
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
@@ -26,6 +27,36 @@ _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
+
+
+def raise_if_tokenizer_required(
+    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
+):
+    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
+
+    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
+    to convert output token IDs to text for matching. min_new_tokens requires the
+    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
+    be used.
+    """
+    if tokenizer is not None:
+        return
+
+    if stop_strs:
+        raise ValueError(
+            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if stop_regex_strs:
+        raise ValueError(
+            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if min_new_tokens > 0:
+        raise ValueError(
+            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer for eos_token_id)."
+        )
 
 
 class SamplingParams:
@@ -118,9 +149,9 @@ class SamplingParams:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if self.temperature < 0.0:
+        if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}."
+                f"temperature must be a non-negative finite number, got {self.temperature}."
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
@@ -208,6 +239,11 @@ class SamplingParams:
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
+
+        # Validate tokenizer is available for tokenizer-dependent features
+        raise_if_tokenizer_required(
+            tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
+        )
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
