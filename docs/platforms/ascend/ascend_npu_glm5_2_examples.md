@@ -95,6 +95,8 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 
+MODEL_PATH={"weights path"}
+
 python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
         --attention-backend ascend \
@@ -164,6 +166,7 @@ IPS=('your ip1' 'your ip2')
 IP_MASTER="${IPS[0]}:your port"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
+MODEL_PATH={"weights path"}
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -198,7 +201,121 @@ done
 
 ### Prefill-Decode Disaggregation
 
-Not test yet.
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+# pd transfer, prefill master IP
+export ASCEND_MF_STORE_URL="tcp://x.x.x.x:24707"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+P_IP=('your ip1')
+D_IP=('your ip2')
+
+MODEL_PATH={"weights path"}
+
+export TRANSFORMERS_VERBOSITY=error
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+
+        # P节点
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port 8998 --trust-remote-code --nnodes 1 --node-rank $i \
+        --tp-size 16 --mem-fraction-static 0.8 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 64 \
+        --served-model-name glm-5 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --dp-size 4 --enable-dp-attention \
+        --load-balance-method round_robin \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
+        
+        # cp
+        #--enable-nsa-prefill-context-parallel \
+        #--nsa-prefill-cp-mode in-seq-split \
+        #--attn-cp-size 4 \
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=650
+
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+        export TASK_QUEUE_ENABLE=0
+
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+
+        export SGLANG_NPU_USE_MULTI_STREAM=1
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
+        --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
+        --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
+        --cuda-graph-max-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 
+        NODE_RANK=$i
+        break
+    fi
+done
+
+exit 1
+
+```
+
+```shell
+python3 -m sglang_router.launch_router \
+--pd-disaggregation \
+--policy round_robin \
+--prefill http://{P_MASTER_IP}:8000 8998 \
+--decode http://{D_MASTER_IP}:8003 \
+--host {P_MASTER_IP} \
+--port 6688
+```
 
 ### Using Benchmark
 
