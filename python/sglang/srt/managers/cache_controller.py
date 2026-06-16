@@ -259,7 +259,6 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
 
         # Dedicated stop event for storage background threads (prefetch/backup).
-        # Runtime attach/detach should not affect core HiCache device-host transfers.
         self.storage_stop_event = threading.Event()
 
         self.device = self.mem_pool_device.device
