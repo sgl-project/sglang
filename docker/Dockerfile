@@ -21,8 +21,10 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.12
 ARG MOONCAKE_VERSION=0.3.11.post1
+ARG INSTALL_MOONCAKE=1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 ARG INSTALL_MSCCLPP=1
+ARG INSTALL_DEEPEP=1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -192,6 +194,7 @@ FROM base AS torch_deps
 ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
+ARG SGL_DEEP_GEMM_VERSION
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -253,12 +256,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ -n "${BUILD_TYPE}" ]; then \
+           SGLANG_DEP_SPEC=".[${BUILD_TYPE}]"; \
+       else \
+           SGLANG_DEP_SPEC="."; \
+       fi \
+    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} "${SGLANG_DEP_SPEC}" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio --force-reinstall; \
+               "torch==2.11.0+cu${CUINDEX}" \
+               "torchvision==0.26.0+cu${CUINDEX}" \
+               "torchaudio==2.11.0+cu${CUINDEX}" \
+               --force-reinstall && \
+           python3 -c 'import torch; print("torch", torch.__version__, "cuda", torch.version.cuda)' && \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -277,12 +289,16 @@ ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
 ARG GITHUB_ARTIFACTORY
+ARG INSTALL_DEEPEP
 
 WORKDIR /build
 
 # Clone DeepEP
 RUN set -eux; \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+    if [ "${INSTALL_DEEPEP}" != "1" ]; then \
+      mkdir -p /build/DeepEP /wheels && \
+      echo "Skipping DeepEP because INSTALL_DEEPEP=${INSTALL_DEEPEP}" > /build/DeepEP/SKIPPED; \
+    elif [ "$GRACE_BLACKWELL" = "1" ]; then \
       if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
         git clone https://github.com/fzyzcjy/DeepEP.git && \
         cd DeepEP && \
@@ -316,26 +332,31 @@ RUN set -eux; \
 
 # Build DeepEP wheel
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /build/DeepEP && \
-    case "$CUDA_VERSION" in \
-        12.6.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-            ;; \
-        12.8.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-            ;; \
-        12.9.1|13.0.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
-            ;; \
-        *) \
-            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-            ;; \
-    esac && \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-    fi && \
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
-        python3 setup.py bdist_wheel -d /wheels
+    if [ "${INSTALL_DEEPEP}" = "1" ]; then \
+        cd /build/DeepEP && \
+        case "$CUDA_VERSION" in \
+            12.6.1) \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+                ;; \
+            12.8.1) \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+                ;; \
+            12.9.1|13.0.1) \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
+                ;; \
+            *) \
+                echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+                ;; \
+        esac && \
+        if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+            sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+        fi && \
+        TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
+            python3 setup.py bdist_wheel -d /wheels; \
+    else \
+        mkdir -p /wheels && \
+        echo "Skipping DeepEP wheel build because INSTALL_DEEPEP=${INSTALL_DEEPEP}"; \
+    fi
 
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
@@ -457,9 +478,11 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
+ARG INSTALL_MOONCAKE
 ARG MOONCAKE_COMPILE_ARG
 ARG MSCCLPP_VERSION
 ARG INSTALL_MSCCLPP
+ARG INSTALL_DEEPEP
 
 WORKDIR /sgl-workspace
 
@@ -471,7 +494,12 @@ WORKDIR /sgl-workspace
 COPY --from=deepep_builder /wheels /tmp/wheels/deepep
 COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
+    if [ "${INSTALL_DEEPEP}" = "1" ]; then \
+        pip install /tmp/wheels/deepep/*.whl; \
+    else \
+        echo "Skipping DeepEP installation because INSTALL_DEEPEP=${INSTALL_DEEPEP}"; \
+    fi && \
+    rm -rf /tmp/wheels/deepep
 
 # Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
@@ -533,11 +561,15 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 
 # Install Mooncake
 RUN --mount=type=cache,target=/root/.cache/pip \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+    if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+        if [ "$CUDA_MAJOR" -ge 13 ]; then \
+            python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+        else \
+            python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+        fi; \
     else \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+        echo "Skipping Mooncake installation because INSTALL_MOONCAKE=${INSTALL_MOONCAKE}"; \
     fi
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
@@ -633,6 +665,48 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 FROM scratch AS local_src
 COPY . /src
 
+########################################################
+########## PD Flip Experiment Image ####################
+########################################################
+#
+# Lightweight local experiment target for scheduler/router PD flip state-machine
+# smoke tests. It intentionally stops after torch_deps and an editable local
+# install, avoiding optional production components such as DeepEP, MSCCL++,
+# Mooncake, gateway artifacts, dev tools, and the final runtime repack stage.
+FROM torch_deps AS pd_flip_experiment
+
+ARG BRANCH_TYPE
+ARG BUILD_TYPE
+ARG CUDA_VERSION
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+
+WORKDIR /sgl-workspace
+
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    elif [ -z "$SGL_VERSION" ]; then \
+        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+    && rm -rf /tmp/local_src
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /sgl-workspace/sglang \
+    && if [ -n "${BUILD_TYPE}" ]; then \
+           SGLANG_EDITABLE_SPEC="python[${BUILD_TYPE}]"; \
+       else \
+           SGLANG_EDITABLE_SPEC="python"; \
+       fi \
+    && python3 -m pip install --no-deps -e "${SGLANG_EDITABLE_SPEC}" \
+    && python3 -c 'import torch; import sglang; print("torch", torch.__version__, "cuda", torch.version.cuda); print("sglang import ok")'
+
+WORKDIR /sgl-workspace/sglang
+
 FROM framework AS framework_final
 
 ARG BRANCH_TYPE
@@ -659,7 +733,12 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && if [ -n "${BUILD_TYPE}" ]; then \
+           SGLANG_EDITABLE_SPEC="python[${BUILD_TYPE}]"; \
+       else \
+           SGLANG_EDITABLE_SPEC="python"; \
+       fi \
+    && python3 -m pip install --no-deps -e "${SGLANG_EDITABLE_SPEC}" \
     && kernels lock python \
     && ( success=0; \
          # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
