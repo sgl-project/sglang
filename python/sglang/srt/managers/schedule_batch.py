@@ -677,8 +677,6 @@ class Req(ReqDllmMixin):
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
-        token_buf: Optional[ViewableArray] = None,
-        origin_input_len: Optional[int] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -712,15 +710,12 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        assert (origin_input_ids is not None) ^ (
-            token_buf is not None and origin_input_len is not None
+        self.token_buf = (
+            origin_input_ids
+            if isinstance(origin_input_ids, ViewableArray) else
+            ViewableArray(origin_input_ids)
         )
-        if origin_input_ids is not None:
-            self.token_buf = ViewableArray(origin_input_ids)
-            self.origin_input_len: int = len(origin_input_ids)
-        else:
-            self.token_buf = token_buf
-            self.origin_input_len: int = origin_input_len
+        self.origin_input_len: int = len(self.token_buf)
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded if origin_input_ids_unpadded else origin_input_ids
         )  # Before image padding

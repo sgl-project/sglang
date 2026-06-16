@@ -114,8 +114,6 @@ class Session:
 
         last_req_node = None
         last_req = None
-        new_token_buf = None
-        origin_input_len = None
         abort = False
         abort_message = ""
         if self.streaming:
@@ -197,25 +195,23 @@ class Session:
             kept_output = to_array(last_req.output_ids[:kept_output_len])
 
             if self.streaming:
-                new_token_buf = last_req.token_buf
+                input_ids = last_req.token_buf
                 input_ids_unpadded = last_req.origin_input_ids_unpadded
             else:
-                new_token_buf = last_req.token_buf.clone()
+                input_ids = last_req.token_buf.clone()
                 input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
 
             keep_len = last_req.origin_input_len + kept_output_len
             if session_params.offset and session_params.offset != 0:
                 keep_len = min(session_params.offset, keep_len)
 
-            new_token_buf.truncate(keep_len)
-            new_token_buf.extend(req.input_ids)
+            input_ids.truncate(keep_len)
+            input_ids.extend(req.input_ids)
 
             input_ids_unpadded.extend(kept_output)
             if session_params.offset and session_params.offset != 0:
                 del input_ids_unpadded[session_params.offset :]
             input_ids_unpadded.extend(req.input_ids)
-            origin_input_len = len(new_token_buf)
-            input_ids = None
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
@@ -225,8 +221,6 @@ class Session:
             origin_input_text=None,
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
-            token_buf=new_token_buf,
-            origin_input_len=origin_input_len,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
             session=self,
