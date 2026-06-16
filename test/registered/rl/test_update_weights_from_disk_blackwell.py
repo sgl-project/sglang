@@ -2,6 +2,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
 
+import time
 import unittest
 
 import requests
@@ -26,6 +27,7 @@ class UpdateWeightsFromDiskBase:
         "sampling_params": {"temperature": 0, "max_new_tokens": 16},
     }
     backend_test_suites = ()
+    wait_for_idle_before_update = False
     update_test_suites = (
         {"flush_cache": True, "abort_all_requests": False},
         {"flush_cache": False, "abort_all_requests": False},
@@ -109,6 +111,19 @@ class UpdateWeightsFromDiskBase:
     def _get_model_info(self):
         return self._get_json("/get_model_info")["model_path"]
 
+    def _wait_for_idle(self, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            loads = self._get_json("/v1/loads?include=core")["loads"]
+            if all(
+                load["num_running_reqs"] == 0 and load["num_waiting_reqs"] == 0
+                for load in loads
+            ):
+                return
+            time.sleep(0.25)
+
+        self.fail(f"Server did not become idle before weight update: {loads=}")
+
     def _run_update_weights(
         self,
         model_path,
@@ -138,6 +153,8 @@ class UpdateWeightsFromDiskBase:
 
                     for update_test_suite in self.update_test_suites:
                         with self.subTest(case_name=case_name, **update_test_suite):
+                            if self.wait_for_idle_before_update:
+                                self._wait_for_idle()
                             ret = self._run_update_weights(
                                 self.model,
                                 flush_cache=update_test_suite["flush_cache"],
@@ -198,6 +215,7 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    wait_for_idle_before_update = True
     launch_env = {
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
         "FLASHINFER_NVFP4_4OVER6": "1",
@@ -213,10 +231,14 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
                 "0",
                 "--tp-size",
                 "4",
+                "--ep-size",
+                "4",
                 "--fp4-gemm-backend",
                 "flashinfer_cutedsl",
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
+                "--moe-a2a-backend",
+                "none",
             ),
         },
     )
