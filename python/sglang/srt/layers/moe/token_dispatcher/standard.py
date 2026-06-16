@@ -100,6 +100,7 @@ class StandardDispatcher(BaseDispatcher):
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm()
+            or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or self.enable_flashinfer_mxfp4_moe
         )

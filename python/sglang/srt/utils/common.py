@@ -94,6 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -454,7 +455,7 @@ class DynamicGradMode(_DecoratorContextManager):
         else:
             torch.set_grad_enabled(self.prev)
 
-    def clone(self) -> "DynamicGradMode":
+    def clone(self) -> DynamicGradMode:
         r"""
         Create a copy of this class
         """
@@ -658,8 +659,6 @@ def get_available_gpu_memory(
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
     else:
-        from sglang.srt.platforms import current_platform
-
         if not current_platform.is_out_of_tree():
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
@@ -760,6 +759,8 @@ def get_dispatch_device_backend():
         dispatch_key = "CUDA"
     elif is_xpu():
         dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
     else:
         raise RuntimeError("No supported accelerator (CUDA/XPU) available")
     return dispatch_key
@@ -781,6 +782,22 @@ def set_random_seed(seed: int) -> None:
         torch.xpu.manual_seed_all(seed)
 
 
+_mm_http_session = threading.local()
+
+
+def get_mm_http_session() -> requests.Session:
+    """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
+    connections. Pid-checked so a forked worker rebuilds its own, not the parent's.
+    """
+    pid = os.getpid()
+    session = getattr(_mm_http_session, "session", None)
+    if session is None or getattr(_mm_http_session, "pid", None) != pid:
+        session = requests.Session()
+        _mm_http_session.session = session
+        _mm_http_session.pid = pid
+    return session
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -796,7 +813,7 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with requests.get(audio_file, timeout=timeout) as response:
+        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
             response.raise_for_status()
             source = response.content
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
@@ -957,7 +974,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        response = get_mm_http_session().get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
             result = response.content
@@ -989,9 +1006,11 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(video_file, stream=True, timeout=timeout)
-            response.raise_for_status()
-            return response.content
+            with get_mm_http_session().get(
+                video_file, stream=True, timeout=timeout
+            ) as response:
+                response.raise_for_status()
+                return response.content
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -1893,8 +1912,6 @@ def get_mtgpu_memory_capacity():
 
 def get_device_memory_capacity(device: str = None):
     # OOT platforms provide their own memory query via the platform class.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         mem_bytes = current_platform.get_device_total_memory()
         if mem_bytes:
@@ -2079,7 +2096,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    try:
+        return current_platform.get_device(device_id)
+    except Exception:
+        raise RuntimeError(
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        )
 
 
 @lru_cache(maxsize=1)
@@ -2145,8 +2167,6 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
 
@@ -2521,8 +2541,18 @@ def kill_itself_when_parent_died():
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent; the MLX backend provides a
+        # kqueue-based watchdog that SIGKILLs this worker once it is orphaned.
+        from sglang.srt.hardware_backend.mlx.parent_watchdog import (
+            start_parent_death_watcher,
+        )
+
+        start_parent_death_watcher()
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -3072,13 +3102,14 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
-    # we do local import to avoid circular import
-    from sglang.srt.compilation.piecewise_context_manager import (
-        is_in_piecewise_cuda_graph,
+    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
+    # backing storage would invalidate addresses recorded in the graph.
+    # Local import avoids a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -3668,6 +3699,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "kv_a_proj_with_mqa",
     "q_b_proj",
     "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
     "gate_proj",
     "up_proj",
     "down_proj",

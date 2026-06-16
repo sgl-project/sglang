@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -82,6 +83,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
@@ -362,15 +364,20 @@ class RotaryEmbedding(MultiPlatformOp):
 
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
-
-                k_cache_shape = fused_set_kv_buffer_arg["key_cache"].shape
-                qk_head_dim = k_cache_shape[-1]
-                tp_k_head_num = k_cache_shape[-2]
+                k_cache = fused_set_kv_buffer_arg["key_cache"]
+                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+                # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
+                is_shuffle_5d = k_cache.ndim == 5
+                if is_shuffle_5d:
+                    # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
+                    qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
+                    tp_k_head_num = k_cache.shape[1]
+                else:
+                    qk_head_dim = k_cache.shape[-1]
+                    tp_k_head_num = k_cache.shape[-2]
 
                 key = key.view(-1, tp_k_head_num, qk_head_dim)
-
                 tokens = key.shape[0]
-
                 query = query.view(tokens, -1, qk_head_dim)
 
                 query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
@@ -379,7 +386,7 @@ class RotaryEmbedding(MultiPlatformOp):
                     pos=positions,
                     cos_sin=self.cos_sin_cache,
                     is_neox=self.is_neox_style,
-                    flash_layout=True,
+                    flash_layout=not is_shuffle_5d,
                     offs=None,
                     q_out=query,
                     k_out=key,
