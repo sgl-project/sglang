@@ -10,11 +10,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip, is_cuda
+from sglang.srt.utils import is_hip, is_cuda_alike
 
 from .utils import make_name
 
-_is_cuda = is_cuda()
+_is_cuda_alike = is_cuda_alike()
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -135,7 +135,7 @@ class CompressorDecodePlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
     ) -> CompressorDecodePlan:
-        if _is_cuda:
+        if _is_cuda_alike:
             module = _jit_compress_plan_module()
             fn = module.plan_decode
         else:
@@ -159,7 +159,7 @@ class CompressorDecodePlan(NamedTuple):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
-        if _is_cuda:
+        if _is_cuda_alike:
             module = _jit_compress_plan_module()
             fn = module.plan_decode_legacy
         else:
@@ -244,7 +244,7 @@ class CompressorPrefillPlan(NamedTuple):
             )
         module = _jit_compress_plan_module()
         plan_c, plan_w = module.plan_prefill(
-        if is_gpu_input and _is_cuda:
+        if is_gpu_input and _is_cuda_alike:
             module = _jit_compress_plan_module()
             fn = module.plan_prefill
         else:
@@ -266,8 +266,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c) if _is_cuda else plan_c,
-            torch.from_dlpack(plan_w) if _is_cuda else plan_w,
+            torch.from_dlpack(plan_c) if _is_cuda_alike else plan_c,
+            torch.from_dlpack(plan_w) if _is_cuda_alike else plan_w,
             pin_buffer,
         )
 
@@ -286,7 +286,7 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=True,
         )
-        if _is_cuda:
+        if _is_cuda_alike:
             module = _jit_compress_plan_module()
             fn = module.plan_prefill_legacy
         else:
@@ -304,8 +304,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c) if _is_cuda else plan_c,
-            torch.from_dlpack(plan_w) if _is_cuda else plan_w,
+            torch.from_dlpack(plan_c) if _is_cuda_alike else plan_c,
+            torch.from_dlpack(plan_w) if _is_cuda_alike else plan_w,
             pin_buffer,
         )
 
@@ -374,7 +374,7 @@ def compress_forward(
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
     else:
-        if _is_cuda:
+        if _is_cuda_alike:
             dtype_in, dtype_out = kv_score_input.dtype, out.dtype
             module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
         else:
@@ -394,7 +394,7 @@ def compress_forward(
 
                 flash_compress_decode = flash_compress4_decode
                 flash_compress_prefill = flash_compress4_prefill
-    if _is_cuda:
+    if _is_cuda_alike:
         fn = module.decode if plan.is_decode else module.prefill
     else:
         fn = flash_compress_decode if plan.is_decode else flash_compress_prefill
@@ -418,7 +418,7 @@ def compress_norm_rope_store(
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    if _is_cuda:
+    if _is_cuda_alike:
         module = _jit_compress_norm_rope_module(
             kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
         )
