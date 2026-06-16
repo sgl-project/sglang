@@ -114,7 +114,7 @@ Architecture and key features:
 
 - **Tensor parallelism:** BF16 runs `--tp 16` on H100/H200 (a 2-node setup — select **Multi-Nodes** in the panel) and `--tp 8` on B200/B300; NVFP4 runs `--tp 4` on all four Blackwell platforms, with `--tp 8` additionally validated on B200/B300 (raise the **TP** knob in the [Playground](#playground)).
 
-- **Multi-node BF16 on H100/H200:** the 16-GPU BF16 setup spans two nodes. Selecting **Multi-Nodes** injects `--dist-init-addr <head-node-ip>:5000 --nnodes 2 --node-rank <0|1>` — run the emitted command on each node with the matching `--node-rank`.
+- **Multi-node BF16 on H100/H200:** the 16-GPU BF16 setup spans two nodes. Selecting **Multi-Nodes** injects `--dist-init-addr <head-node-ip>:20000 --nnodes 2 --node-rank <0|1>` — run the emitted command on each node with the matching `--node-rank`.
 
 - **DP attention:** by default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the **High-Throughput** strategy, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups, each serving its own slice of requests with its own KV cache. `--dp` must divide `--tp`; DP=2 is validated for BF16 and DP∈{2,4,8} for NVFP4 (capped by TP). Tune the degree with the **DP-Attention** knob in the Playground.
 
