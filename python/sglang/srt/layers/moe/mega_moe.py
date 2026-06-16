@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -35,8 +36,12 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_SYMM_MEM_BACKEND_APPLIED = False
+_MEGA_MOE_TOPK_STATS_CALLS = 0
+_MEGA_MOE_TIMING_CALLS = 0
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -58,6 +63,43 @@ def _apply_mega_moe_dg_env() -> None:
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
+def _apply_mega_moe_symm_mem_backend() -> None:
+    global _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED
+    if _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED:
+        return
+
+    backend = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND.get().strip().upper()
+    if not backend and torch.cuda.is_available():
+        try:
+            if torch.cuda.get_device_capability()[0] >= 10:
+                backend = "NCCL"
+        except RuntimeError:
+            pass
+
+    if backend:
+        if backend not in ("NCCL", "NVSHMEM"):
+            raise ValueError(
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND must be one of "
+                f"NCCL, NVSHMEM, or empty; got {backend!r}"
+            )
+        if backend == "NCCL" and os.environ.get("NCCL_CUMEM_ENABLE") != "1":
+            old_value = os.environ.get("NCCL_CUMEM_ENABLE", "<unset>")
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+            logger.info(
+                "Set NCCL_CUMEM_ENABLE=1 for Mega-MoE NCCL symmetric-memory "
+                "backend (was %s).",
+                old_value,
+            )
+        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+
+        import torch.distributed._symmetric_memory as symm_mem
+
+        symm_mem.set_backend(backend)
+        logger.info("Set torch symmetric-memory backend for Mega-MoE to %s.", backend)
+
+    _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED = True
+
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -69,6 +111,7 @@ def _get_mega_moe_symm_buffer(
     import deep_gemm
 
     _apply_mega_moe_dg_env()
+    _apply_mega_moe_symm_mem_backend()
 
     key = (
         id(group),
@@ -92,6 +135,107 @@ def _get_mega_moe_symm_buffer(
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
+
+
+def pre_initialize_mega_moe_symm_buffers(model: torch.nn.Module) -> None:
+    """Pre-create DeepGEMM Mega-MoE symmetric buffers on every EP rank.
+
+    DeepGEMM's `get_symm_buffer_for_mega_moe` calls torch symmetric-memory
+    rendezvous under the hood. If this happens lazily on the first real
+    request, only the rank that receives work may enter the rendezvous while
+    its EP peers are idle, causing the first request to hang. During model
+    startup all ranks are active, so initialize the buffers there instead.
+    """
+    if not get_moe_a2a_backend().is_megamoe():
+        return
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    ep_group = get_moe_ep_group()
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    initialized = 0
+
+    ep_group.barrier()
+    for module in model.modules():
+        experts = getattr(module, "experts", None)
+        if experts is None or not getattr(experts, "_mega_moe_weights_built", False):
+            continue
+
+        _get_mega_moe_symm_buffer(
+            ep_group.device_group,
+            num_experts=experts.num_experts,
+            num_max_tokens_per_rank=cap,
+            num_topk=module.config.num_experts_per_tok
+            + module.num_fused_shared_experts,
+            hidden=module.config.hidden_size,
+            intermediate_hidden=module.config.moe_intermediate_size,
+        )
+        initialized += 1
+    torch.cuda.synchronize()
+    ep_group.barrier()
+
+    if initialized > 0 and ep_group.rank_in_group == 0:
+        logger.info(
+            "Pre-initialized DeepGEMM Mega-MoE symmetric buffers for %s "
+            "local MoE layers with cap=%s.",
+            initialized,
+            cap,
+        )
+
+
+def pre_initialize_mega_moe_symm_buffers_from_config(model_config) -> None:
+    """Pre-create the common Mega-MoE symmetric buffer before model loading.
+
+    On Blackwell, torch's NCCL symmetric-memory rendezvous is sensitive to the
+    process CUDA/NCCL state. Creating the DeepGEMM buffer immediately after the
+    distributed groups are initialized avoids doing the first rendezvous after
+    weight loading has imported and initialized many CUDA extension libraries.
+    """
+    if not get_moe_a2a_backend().is_megamoe():
+        return
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    hf_config = getattr(model_config, "hf_config", model_config)
+    num_experts = getattr(
+        hf_config, "n_routed_experts", getattr(hf_config, "num_experts", None)
+    )
+    num_topk = getattr(hf_config, "num_experts_per_tok", None)
+    hidden = getattr(hf_config, "hidden_size", None)
+    intermediate_hidden = getattr(hf_config, "moe_intermediate_size", None)
+    if intermediate_hidden is None:
+        intermediate_hidden = getattr(hf_config, "intermediate_size", None)
+    if any(v is None for v in (num_experts, num_topk, hidden, intermediate_hidden)):
+        logger.warning(
+            "Skip early DeepGEMM Mega-MoE symmetric buffer initialization because "
+            "the model config is missing required MoE dimensions."
+        )
+        return
+
+    ep_group = get_moe_ep_group()
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    ep_group.barrier()
+    _get_mega_moe_symm_buffer(
+        ep_group.device_group,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=cap,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+    )
+    torch.cuda.synchronize()
+    ep_group.barrier()
+
+    if ep_group.rank_in_group == 0:
+        logger.info(
+            "Early pre-initialized DeepGEMM Mega-MoE symmetric buffer from "
+            "config with cap=%s, experts=%s, topk=%s, hidden=%s, intermediate=%s.",
+            cap,
+            num_experts,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+        )
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
@@ -173,6 +317,18 @@ def _run_mega_routed(
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
+    timing_call = _should_log_mega_moe_timing()
+    timing_events = []
+
+    def mark_timing(name: str) -> None:
+        if not timing_call:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        timing_events.append((name, event))
+
+    mark_timing("start")
+
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
@@ -193,6 +349,8 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+
+    mark_timing("topk")
 
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
@@ -216,12 +374,17 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
+    mark_timing("buffer")
+
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    mark_timing("cast")
+    _maybe_log_mega_moe_topk_stats(moe, topk_ids_in, num_experts, num_tokens)
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
@@ -251,6 +414,8 @@ def _run_mega_routed(
             buf.topk_weights,
             quant_group_size=32,
         )
+    mark_timing("pre_dispatch")
+
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
@@ -269,11 +434,124 @@ def _run_mega_routed(
         activation_clamp=swiglu_limit,
         fast_math=True,
     )
+    mark_timing("fp8_fp4")
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
+    mark_timing("done")
+    _log_mega_moe_timing(moe, topk_ids_in, num_experts, num_tokens, timing_events)
     return y
+
+
+def _should_log_mega_moe_timing() -> bool:
+    interval = envs.SGLANG_MEGA_MOE_LOG_TIMING_INTERVAL.get()
+    if interval <= 0:
+        return False
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    ep_rank = get_moe_ep_group().rank_in_group
+    if ep_rank != 0 and os.environ.get("SGLANG_MEGA_MOE_LOG_ALL_RANKS") != "1":
+        return False
+
+    global _MEGA_MOE_TIMING_CALLS
+    _MEGA_MOE_TIMING_CALLS += 1
+    return _MEGA_MOE_TIMING_CALLS % interval == 0
+
+
+def _rank_count_summary(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+) -> tuple[list[int], float]:
+    experts_per_rank = max(num_experts // ep_size, 1)
+    valid = topk_ids >= 0
+    ranks = torch.clamp(topk_ids // experts_per_rank, min=0, max=ep_size - 1)
+    counts = torch.bincount(ranks[valid].reshape(-1), minlength=ep_size)[:ep_size]
+    counts_cpu = counts.detach().cpu().tolist()
+    max_count = max(counts_cpu) if counts_cpu else 0
+    min_count = min(counts_cpu) if counts_cpu else 0
+    ratio = float(max_count) / float(min_count) if min_count else float("inf")
+    return counts_cpu, ratio
+
+
+def _log_mega_moe_timing(
+    moe: "DeepseekV2MoE",
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+    timing_events: list[tuple[str, torch.cuda.Event]],
+) -> None:
+    if not timing_events:
+        return
+    timing_events[-1][1].synchronize()
+    elapsed = {
+        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[
+            i - 1
+        ][1].elapsed_time(timing_events[i][1])
+        for i in range(1, len(timing_events))
+    }
+    counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, moe.moe_ep_size)
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    logger.info(
+        "MEGA_MOE_TIMING ep_rank=%s layer=%s tokens=%s waterfill=%s force_local=%s "
+        "counts=%s ratio=%.4f timing=%s",
+        get_moe_ep_group().rank_in_group,
+        moe.layer_id,
+        num_tokens,
+        bool(getattr(moe.topk, "enable_deepep_waterfill", False)),
+        envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get(),
+        counts_cpu,
+        ratio,
+        {k: round(v, 4) for k, v in elapsed.items()},
+    )
+
+
+def _maybe_log_mega_moe_topk_stats(
+    moe: "DeepseekV2MoE",
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+) -> None:
+    interval = envs.SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL.get()
+    if interval <= 0:
+        return
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    ep_rank = get_moe_ep_group().rank_in_group
+    if ep_rank != 0 and os.environ.get("SGLANG_MEGA_MOE_LOG_ALL_RANKS") != "1":
+        return
+
+    global _MEGA_MOE_TOPK_STATS_CALLS
+    _MEGA_MOE_TOPK_STATS_CALLS += 1
+    if _MEGA_MOE_TOPK_STATS_CALLS % interval != 0:
+        return
+
+    ep_size = moe.moe_ep_size
+    experts_per_rank = max(num_experts // ep_size, 1)
+    counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, ep_size)
+    max_count = max(counts_cpu) if counts_cpu else 0
+    min_count = min(counts_cpu) if counts_cpu else 0
+    logger.info(
+        "MEGA_MOE_TOPK_STATS ep_rank=%s layer=%s tokens=%s topk=%s ep_size=%s "
+        "experts_per_rank=%s waterfill=%s force_local=%s counts=%s "
+        "max_min=%s/%s ratio=%.4f",
+        get_moe_ep_group().rank_in_group,
+        moe.layer_id,
+        num_tokens,
+        topk_ids.shape[1],
+        ep_size,
+        experts_per_rank,
+        bool(getattr(moe.topk, "enable_deepep_waterfill", False)),
+        envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get(),
+        counts_cpu,
+        max_count,
+        min_count,
+        ratio,
+    )
 
 
 def build_mega_moe_experts_weights(experts) -> None:

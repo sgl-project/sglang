@@ -574,6 +574,10 @@ class Envs:
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_WATERFILL_LOG_STATS_INTERVAL = EnvInt(0)
+    SGLANG_WATERFILL_FORCE_LOCAL_SHARED = EnvBool(False)
+    SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL = EnvInt(0)
+    SGLANG_MEGA_MOE_LOG_TIMING_INTERVAL = EnvInt(0)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
@@ -818,6 +822,10 @@ class Envs:
     # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    # Optional torch symmetric-memory backend override for DeepGEMM Mega-MoE.
+    # Valid settable torch values are NCCL and NVSHMEM. Leave empty to use
+    # SGLang's auto choice.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND = EnvStr("")
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK
