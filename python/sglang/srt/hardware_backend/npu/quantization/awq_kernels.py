@@ -135,7 +135,7 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional[QuantizationConfig] = None, use_unquantized: bool = True):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None, use_unquantized: bool = False):
         self.quant_config = quant_config
         self.use_unquantized = use_unquantized
 
@@ -150,7 +150,7 @@ class AWQAscendMoEKernel:
         w2_scales_orig  = layer.w2_scales.data
 
         if self.use_unquantized:
-            # Dequantize and store as w13_weight, w2_weight (E, N, K)
+            # Dequantize and store as (E, K, N) – no transpose
             self._dequantize_and_store(layer, "w13", w13_qweight_orig, w13_qzeros_orig, w13_scales_orig)
             self._dequantize_and_store(layer, "w2", w2_qweight_orig, w2_qzeros_orig, w2_scales_orig)
 
@@ -159,9 +159,15 @@ class AWQAscendMoEKernel:
                          "w2_qweight", "w2_qzeros", "w2_scales"):
                 if hasattr(layer, attr):
                     delattr(layer, attr)
+
+            # Assign unquantized kernels (their process_weights_after_loading is NOT called)
+            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import NPUUnquantMoEMethod
+            layer.w13_kernel = NPUUnquantMoEMethod()
+            layer.w2_kernel = NPUUnquantMoEMethod()
+
         else:
-            # Quantized path: pack weights (original code, not shown for brevity)
-            # ... (your existing packing logic) ...
+            # Quantized path (keep original packing logic)
+            # ... (not shown for brevity, unchanged) ...
             pass
 
         torch.npu.empty_cache()
@@ -169,42 +175,44 @@ class AWQAscendMoEKernel:
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def _dequantize_and_store(self, layer, prefix, qweight, qzeros, scales):
+        """Dequantize and store as (E, K, N) – directly usable by GroupedMatmul."""
         qweight = qweight.to(torch.int32)
         qzeros = qzeros.to(torch.int32)
+
         E, K, N_packed = qweight.shape
         N = N_packed * 8
         groups = scales.shape[1]
         group_size = K // groups
         assert K % groups == 0
-    
-        # We need weight shape (E, N, K) for manual matmul (N=output, K=input)
-        fp_weight = torch.empty((E, N, K), dtype=torch.bfloat16, device=qweight.device)
+
+        # Allocate (E, K, N)
+        fp_weight = torch.empty((E, K, N), dtype=torch.bfloat16, device=qweight.device)
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-    
+
         for e in range(E):
-            # Unpack weight (signed int8)
+            # Unpack weight
             qw_e = qweight[e]
             w_int8 = torch.empty((K, N), dtype=torch.int8, device=qweight.device)
             for i, s in enumerate(shifts):
                 nib = (qw_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 w_int8[:, i::8] = signed
-    
-            # Unpack zeros (unsigned int8)
+
+            # Unpack zeros
             qz_e = qzeros[e]
-            z_uint8 = torch.empty((groups, N), dtype=torch.uint8, device=qweight.device)
+            z_int8 = torch.empty((groups, N), dtype=torch.int8, device=qweight.device)
             for i, s in enumerate(shifts):
                 nib = (qz_e >> (s * 4)) & 0xF
-                z_uint8[:, i::8] = nib.to(torch.uint8)
-    
-            # Expand to (K, N)
-            z_exp = z_uint8.repeat_interleave(group_size, dim=0).float()
+                signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
+                z_int8[:, i::8] = signed
+
+            # Expand scales & zeros to (K, N)
+            z_exp = z_int8.repeat_interleave(group_size, dim=0)
             s_exp = scales[e].repeat_interleave(group_size, dim=0)
-    
-            # Dequantize: (w - z) * scale
-            w_fp = ((w_int8.float() - z_exp) * s_exp).to(torch.bfloat16)  # (K, N)
-    
-            # Transpose to (N, K) and store
-            fp_weight[e] = w_fp.contiguous()  # (N, K)
-    
+
+            # Dequantize to BF16
+            w_fp = ((w_int8.float() - z_exp.float()) * s_exp.float()).to(torch.bfloat16)
+            fp_weight[e] = w_fp  # (K, N)
+
+        # Store as (E, K, N) – NO transpose
         setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
