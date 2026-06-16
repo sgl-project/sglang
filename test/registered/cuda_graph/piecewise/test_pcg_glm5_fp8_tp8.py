@@ -39,6 +39,11 @@ class TestBCGGlm5Fp8TP8(CustomTestCase):
                 "0.8",
                 "--disable-flashinfer-autotune",
                 "--cuda-graph-backend-prefill=breakable",
+                # Small chunks => many prefill iterations, each <= the 2048
+                # capture max, so every prefill batch replays the BCG graph and
+                # exercises the DSA split-op / dual-stream / MLA-fusion paths.
+                "--chunked-prefill-size",
+                "512",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
