@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=405, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
