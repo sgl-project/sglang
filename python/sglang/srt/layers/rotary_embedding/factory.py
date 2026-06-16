@@ -252,6 +252,9 @@ def get_rope(
                     "mscale_all_dim",
                 )
             }
+            for key in ("mscale", "mscale_all_dim"):
+                if key in rope_scaling:
+                    extra_kwargs[key] = rope_scaling[key]
             extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
             if "mrope_section" in rope_scaling:
                 rotary_emb = YaRNScalingMRotaryEmbedding(
