@@ -94,7 +94,7 @@ class TestGDNReplaySSMDecode(CustomTestCase):
     NUM_STEPS = 40  # > 16 -> multiple flush cycles for L in {4,8,16}
     L_SWEEP = (1, 4, 8, 16)
 
-    def _run_one(self, cfg, L, dtype):
+    def _run_one(self, cfg, L, dtype, force_flush_steps=()):
         from sglang.srt.layers.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
         )
@@ -153,7 +153,12 @@ class TestGDNReplaySSMDecode(CustomTestCase):
 
             # ---- ReplaySSM buffered decode for this L ----
             rep_out = mixed_qkv.new_empty(B, 1, HV, V)
-            is_flush = bool((write_pos[0].item()) == L - 1)
+            # slice 2: force a flush at a radix track boundary even mid-buffer.
+            force_now = step in force_flush_steps
+            ff_tensor = (
+                torch.ones(B, device=device, dtype=torch.int32) if force_now else None
+            )
+            is_flush = bool((write_pos[0].item()) == L - 1) or force_now
             flush_step_seen = flush_step_seen or is_flush
             fused_recurrent_gdn_replayssm_decode(
                 mixed_qkv=mixed_qkv,
@@ -169,6 +174,7 @@ class TestGDNReplaySSMDecode(CustomTestCase):
                 out=rep_out,
                 ssm_state_indices=cache_indices,
                 write_pos=write_pos,
+                force_flush=ff_tensor,
                 use_qk_l2norm_in_kernel=True,
                 # nk=1 at L=1 keeps the K-reduction in a single tile (no
                 # K-tiling), matching the reference's single-pass reduction;
@@ -226,12 +232,16 @@ class TestGDNReplaySSMDecode(CustomTestCase):
                     )
 
             # Advance the ring cursor (caller's responsibility in this phase):
-            # wrap to 0 after a flush, otherwise increment.
-            write_pos = torch.where(
-                write_pos == L - 1,
-                torch.zeros_like(write_pos),
-                write_pos + 1,
-            )
+            # wrap to 0 after a flush (natural L-1 OR a forced track-boundary
+            # flush), otherwise increment.
+            if force_now:
+                write_pos = torch.zeros_like(write_pos)
+            else:
+                write_pos = torch.where(
+                    write_pos == L - 1,
+                    torch.zeros_like(write_pos),
+                    write_pos + 1,
+                )
 
         # Explicit wrap/flush boundary must have been exercised for L>1; for
         # L=1 every step is a flush.
@@ -248,6 +258,17 @@ class TestGDNReplaySSMDecode(CustomTestCase):
             for L in self.L_SWEEP:
                 with self.subTest(cfg=cfg, L=L, dtype="bf16"):
                     self._run_one(cfg, L, torch.bfloat16)
+
+    def test_force_flush_matches_reference(self):
+        """slice 2: a radix track-boundary forces a flush mid-buffer
+        (write_pos != L-1). The kernel must fold the partial ring + current
+        token into the checkpoint so an external snapshot reads an up-to-date
+        state; output every step and the forced-flush checkpoint must still
+        match the running recurrence."""
+        cfg = dict(B=4, H=8, HV=16, K=128, V=128)
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=str(dtype)):
+                self._run_one(cfg, L=8, dtype=dtype, force_flush_steps=(3, 5, 11, 20))
 
     def test_flush_boundary_state_exact_l1(self):
         """At L=1 every step is a flush; the kernel is algebraically the packed

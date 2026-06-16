@@ -60,6 +60,7 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     g_cache,  # [num_slots, HV, L]    ring: per-step log-decay gates (fp32)
     ssm_state_indices,  # [B] physical state slot per decode row
     write_pos,  # [B] int32 per-row ring cursor (0..L-1)
+    force_flush,  # [B] int32: !=0 forces a flush this step (radix track boundary)
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -79,6 +80,7 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    HAS_FORCE_FLUSH: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -104,6 +106,12 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     # plus the set of valid (already committed) cache positions.
     b_write_pos = tl.load(write_pos + i_n).to(tl.int64)
     b_is_flush = b_write_pos == MAX_CACHE_LEN - 1
+    if HAS_FORCE_FLUSH:
+        # A radix track-boundary (or any caller-forced) flush folds the partial
+        # ring (the real `write_pos` entries, NOT L-1) + current token into the
+        # checkpoint so an external snapshot reads an up-to-date state. cache_valid
+        # below still uses the true write_pos, so only committed entries are read.
+        b_is_flush = b_is_flush | (tl.load(force_flush + i_n) != 0)
     cache_valid = o_c < b_write_pos
 
     # Gate for the current token: decay g, its exp alpha, and the beta weight.
@@ -312,6 +320,7 @@ def fused_recurrent_gdn_replayssm_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     write_pos: torch.Tensor,
+    force_flush: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     block_v: int | None = None,
     num_warps: int = 1,
@@ -353,6 +362,10 @@ def fused_recurrent_gdn_replayssm_decode(
         raise ValueError("`out` must be contiguous.")
     if write_pos.ndim != 1 or write_pos.dtype != torch.int32:
         raise ValueError("`write_pos` must be a 1D int32 tensor.")
+    if force_flush is not None and (
+        force_flush.ndim != 1 or force_flush.dtype != torch.int32
+    ):
+        raise ValueError("`force_flush` must be a 1D int32 tensor or None.")
 
     B = mixed_qkv.shape[0]
     num_state_slots, HV, V, K = initial_state.shape
@@ -426,6 +439,7 @@ def fused_recurrent_gdn_replayssm_decode(
         g_cache=g_cache,
         ssm_state_indices=ssm_state_indices,
         write_pos=write_pos,
+        force_flush=force_flush if force_flush is not None else write_pos,
         scale=scale,
         stride_mixed_qkv_tok=mixed_qkv.stride(0),
         stride_a_tok=a.stride(0),
@@ -445,6 +459,7 @@ def fused_recurrent_gdn_replayssm_decode(
         MAX_CACHE_LEN=max_cache_len,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        HAS_FORCE_FLUSH=force_flush is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
