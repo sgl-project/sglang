@@ -199,7 +199,7 @@ class Session:
                 input_ids_unpadded = last_req.origin_input_ids_unpadded
             else:
                 input_ids = last_req.token_buf.clone()
-                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+                input_ids_unpadded = last_req.origin_input_ids_unpadded.clone()
 
             keep_len = last_req.origin_input_len + kept_output_len
             if session_params.offset and session_params.offset != 0:
@@ -210,7 +210,9 @@ class Session:
 
             input_ids_unpadded.extend(kept_output)
             if session_params.offset and session_params.offset != 0:
-                del input_ids_unpadded[session_params.offset :]
+                input_ids_unpadded.truncate(
+                    min(session_params.offset, len(input_ids_unpadded))
+                )
             input_ids_unpadded.extend(req.input_ids)
         else:
             input_ids = req.input_ids

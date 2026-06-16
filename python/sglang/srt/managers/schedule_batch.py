@@ -676,7 +676,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[array[int]] = None,
+        origin_input_ids_unpadded: Optional[Union[array[int], ViewableArray]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -718,10 +718,14 @@ class Req(ReqDllmMixin):
         self.origin_input_len: int = len(self.token_buf)
         # Before image padding
         if origin_input_ids_unpadded:
-            self.origin_input_ids_unpadded = origin_input_ids_unpadded
+            self.origin_input_ids_unpadded = (
+                origin_input_ids_unpadded
+                if isinstance(origin_input_ids_unpadded, ViewableArray)
+                else ViewableArray(origin_input_ids_unpadded)
+            )
         else:
             assert not isinstance(origin_input_ids, ViewableArray)
-            self.origin_input_ids_unpadded = origin_input_ids
+            self.origin_input_ids_unpadded = ViewableArray(origin_input_ids)
         self.fill_len: int = 0
 
         self.session = session
@@ -1248,9 +1252,9 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = self.origin_input_ids_unpadded[
-                self.surr_offset :
-            ] + to_array(output_ids)
+            self.surr_and_decode_ids = self.origin_input_ids_unpadded.materialize(
+                self.surr_offset
+            ) + to_array(output_ids)
             self.cur_decode_ids_len = len(output_ids)
         else:
             self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
