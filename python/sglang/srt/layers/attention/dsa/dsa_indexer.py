@@ -588,28 +588,6 @@ class Indexer(MultiPlatformOp):
             layer_id, topk_result if return_indices else None
         )
 
-    def _get_topk_ragged_graph(
-        self,
-        layer_id: int,
-        key: torch.Tensor,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        topk_result = self._new_graph_topk_result(q_fp8, return_indices=True)
-        k_cache_topk_fn = (
-            bcg_k_cache_and_topk_result
-            if is_in_breakable_cuda_graph()
-            else k_cache_and_topk_result
-        )
-        k_cache_topk_fn(
-            layer_id=layer_id,
-            key=key,
-            q_fp8=q_fp8,
-            weights=weights,
-            topk_result=topk_result,
-        )
-        return topk_result
-
     def _store_k_cache_and_get_topk_ragged_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1833,11 +1811,20 @@ class Indexer(MultiPlatformOp):
                         "Internal error: piecewise/breakable CUDA graph should not "
                         "be enabled with dual stream"
                     )
-                    topk_result = self._get_topk_ragged_graph(
-                        layer_id,
-                        key,
-                        q_fp8,
-                        weights,
+                    topk_result = self._new_graph_topk_result(
+                        q_fp8, return_indices=True
+                    )
+                    k_cache_topk_fn = (
+                        bcg_k_cache_and_topk_result
+                        if is_in_breakable_cuda_graph()
+                        else k_cache_and_topk_result
+                    )
+                    k_cache_topk_fn(
+                        layer_id=layer_id,
+                        key=key,
+                        q_fp8=q_fp8,
+                        weights=weights,
+                        topk_result=topk_result,
                     )
                 else:
                     topk_result = self._get_topk_ragged(
