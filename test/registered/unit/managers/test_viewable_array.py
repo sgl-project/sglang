@@ -91,22 +91,21 @@ class TestViewableArray(CustomTestCase):
         self.assertEqual(list(clone.readonly_view()), [1, 2, 3, 4, 5, 6])
         self.assertEqual(list(producer.readonly_view()), [1, 2, 3])
 
-    def test_freeze_and_clone_copy_on_write_when_truncating_into_lock(self):
-        """Truncating below the lock then extending detaches a private copy."""
+    def test_freeze_and_clone_rejects_extending_into_locked_prefix(self):
+        """Truncating below the lock then extending raises instead of rewriting history."""
         producer = ViewableArray([1, 2, 3, 4])
         clone = producer.freeze_and_clone()
         clone.truncate(2)
-        clone.extend([99, 99])
-        self.assertEqual(list(clone.readonly_view()), [1, 2, 99, 99])
+        with self.assertRaises(AssertionError):
+            clone.extend([99, 99])
         self.assertEqual(list(producer.readonly_view()), [1, 2, 3, 4])
-        self.assertIsNot(clone._data, producer._data)
 
-    def test_freeze_and_clone_copy_on_write_when_overwriting_lock(self):
-        """Overwriting inside the locked prefix detaches without touching the producer."""
+    def test_freeze_and_clone_rejects_overwriting_locked_prefix(self):
+        """Overwriting inside the locked prefix raises and leaves the producer untouched."""
         producer = ViewableArray([1, 2, 3])
         clone = producer.freeze_and_clone()
-        clone.overwrite(0, 777)
-        self.assertEqual(list(clone.readonly_view()), [777, 2, 3])
+        with self.assertRaises(AssertionError):
+            clone.overwrite(0, 777)
         self.assertEqual(list(producer.readonly_view()), [1, 2, 3])
 
 

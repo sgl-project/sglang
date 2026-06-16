@@ -34,8 +34,7 @@ class ViewableArray:
         return self._size
 
     def append(self, value: int) -> None:
-        if self._size < self._lock_prefix_len:
-            self._detach_locked_prefix()
+        assert self._size >= self._lock_prefix_len, (self._size, self._lock_prefix_len)
         if self._size == len(self._data):
             self._reallocate(self._size + 1)
         self._data[self._size] = value
@@ -46,8 +45,7 @@ class ViewableArray:
         added_size: int = len(materialized)
         if added_size == 0:
             return
-        if self._size < self._lock_prefix_len:
-            self._detach_locked_prefix()
+        assert self._size >= self._lock_prefix_len, (self._size, self._lock_prefix_len)
         new_size: int = self._size + added_size
         if new_size > len(self._data):
             self._reallocate(new_size)
@@ -60,8 +58,7 @@ class ViewableArray:
 
     def overwrite(self, index: int, value: int) -> None:
         assert 0 <= index < self._size, (index, self._size)
-        if index < self._lock_prefix_len:
-            self._detach_locked_prefix()
+        assert index >= self._lock_prefix_len, (index, self._lock_prefix_len)
         self._data[index] = value
 
     def freeze_and_clone(self) -> ViewableArray:
@@ -92,14 +89,6 @@ class ViewableArray:
     def clone(self) -> ViewableArray:
         return ViewableArray(self.materialize())
 
-    def _detach_locked_prefix(self) -> None:
-        capacity: int = self._capacity_for(self._size)
-        private: array = array(_TYPECODE, bytes(_ITEMSIZE * capacity))
-        private[: self._size] = self._data[: self._size]
-        self._data = private
-        self._view = memoryview(self._data).toreadonly()
-        self._lock_prefix_len = 0
-
     @staticmethod
     def _capacity_for(size: int) -> int:
         capacity: int = _MIN_CAPACITY
@@ -113,4 +102,3 @@ class ViewableArray:
         new_data[: self._size] = self._data[: self._size]
         self._data = new_data
         self._view = memoryview(self._data).toreadonly()
-        self._lock_prefix_len = 0
