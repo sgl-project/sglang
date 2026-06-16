@@ -68,9 +68,10 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # backend-specific knob (only meaningful when backend == tc_piecewise).
 # For prefill, bs carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
+# req_slots is prefill-only and only meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
-    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler", "req_slots"),
 }
 
 
@@ -83,6 +84,12 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Only meaningful for the prefill phase with backend == full: number of
+    # request slots baked into each captured graph. Real bs <= req_slots
+    # reuses the graph (unused slots become zero-length sentinels); larger
+    # batches fall back to eager. Ignored by BCG (bs=1 only) and TC_PIECEWISE
+    # (bs-invariant via torch.compile).
+    req_slots: int = 64
 
 
 @dataclass
