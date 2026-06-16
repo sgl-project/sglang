@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Shared scaffolding for the prefill and decode CUDA graph runners."""
 
 from __future__ import annotations
@@ -73,10 +86,14 @@ def get_batch_sizes_to_capture(
     if mul_base % get_attention_cp_size() != 0:
         mul_base *= get_attention_cp_size()
 
+    # pad `num_max_requests` to avoid being filtered out
     num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
     if max(capture_bs) > num_max_requests:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
 
+    # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
