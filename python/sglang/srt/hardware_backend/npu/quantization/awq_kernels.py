@@ -178,41 +178,39 @@ class AWQAscendMoEKernel:
     def _dequantize_and_store(self, layer, prefix, qweight, qzeros, scales):
         qweight = qweight.to(torch.int32)
         qzeros = qzeros.to(torch.int32)
+    
         E, K, N_packed = qweight.shape
         N = N_packed * 8
         groups = scales.shape[1]
         group_size = K // groups
-        assert K % groups == 0
-
-        # Allocate as (E, K, N)
+        assert K % groups == 0, f"K={K} not divisible by groups={groups}"
+    
         fp_weight = torch.empty((E, K, N), dtype=torch.bfloat16, device=qweight.device)
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-
+    
         for e in range(E):
-            # Unpack weight
+            # 1. Unpack weight – signed int8 (sign‑extend)
             qw_e = qweight[e]
             w_int8 = torch.empty((K, N), dtype=torch.int8, device=qweight.device)
             for i, s in enumerate(shifts):
                 nib = (qw_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 w_int8[:, i::8] = signed
-
-            # Unpack zeros
+    
+            # 2. Unpack zeros – unsigned uint8 (0..15)
             qz_e = qzeros[e]
-            z_int8 = torch.empty((groups, N), dtype=torch.int8, device=qweight.device)
+            z_uint8 = torch.empty((groups, N), dtype=torch.uint8, device=qweight.device)
             for i, s in enumerate(shifts):
                 nib = (qz_e >> (s * 4)) & 0xF
-                signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
-                z_int8[:, i::8] = signed
-
-            # Expand scales & zeros to (K, N)
-            z_exp = z_int8.repeat_interleave(group_size, dim=0)
-            s_exp = scales[e].repeat_interleave(group_size, dim=0)
-
-            # Dequantize to BF16
-            w_fp = ((w_int8.float() - z_exp.float()) * s_exp.float()).to(torch.bfloat16)
-            fp_weight[e] = w_fp  # (K, N)
-
-        # Transpose to (E, N, K) and store as prefix_weight
-        fp_weight = fp_weight.transpose(-1, -2).contiguous()
+                z_uint8[:, i::8] = nib.to(torch.uint8)
+    
+            # 3. Expand zeros and scales to (K, N)
+            z_exp = z_uint8.repeat_interleave(group_size, dim=0).float()   # (K, N)
+            s_exp = scales[e].repeat_interleave(group_size, dim=0)         # (K, N)
+    
+            # 4. Dequantize: (weight_signed - zero_unsigned) * scale
+            w_fp = ((w_int8.float() - z_exp) * s_exp).to(torch.bfloat16)   # (K, N)
+            fp_weight[e] = w_fp
+    
+        # Store as (E, K, N) – directly usable by GroupedMatmul
         setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
