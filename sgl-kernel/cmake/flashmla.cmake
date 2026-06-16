@@ -33,7 +33,7 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(SGL_BUILD_ABOVE_SM90 AND ${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )
@@ -89,9 +89,11 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
         message(STATUS "cutlass/arch/config.h already patched for SM103a")
     endif()
 
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_103a,code=sm_103a"
-    )
+    if(SGL_BUILD_ABOVE_SM90)
+        list(APPEND FLASHMLA_CUDA_FLAGS
+            "-gencode=arch=compute_103a,code=sm_103a"
+        )
+    endif()
 endif()
 
 
