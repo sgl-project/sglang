@@ -1,6 +1,6 @@
 ---
 name: ci-workflow-guide
-description: Guide to SGLang CI workflow orchestration — stage ordering, fast-fail, gating, partitioning, execution modes, and debugging CI failures. Use when modifying CI workflows, adding stages, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
+description: Guide to SGLang CI workflow orchestration — stage ordering, fast-fail, gating, partitioning, execution modes, the base/extra label-gated tiers, AMD/ROCm CI (incl. ROCm 7.2 and the extra-a tier), and debugging CI failures. Use when modifying CI workflows, adding stages or suites (CUDA or AMD), debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
 ---
 
 # SGLang CI Workflow Orchestration Guide
@@ -21,9 +21,12 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 | File | Role |
 |------|------|
-| `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
-| `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
-| `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
+| `.github/workflows/pr-test.yml` | Main CUDA workflow — all stages, jobs, conditions, matrix definitions; cron chains `pr-test-extra.yml` |
+| `.github/workflows/pr-test-extra.yml` | CUDA extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
+| `.github/workflows/pr-test-amd.yml` | Main AMD workflow (ROCm default) — 6-hourly cron; chains `pr-test-amd-extra.yml` |
+| `.github/workflows/pr-test-amd-rocm720.yml` | AMD ROCm 7.2 workflow — daily cron; chains `pr-test-amd-extra.yml` with `rocm_version=rocm720` |
+| `.github/workflows/pr-test-amd-extra.yml` | AMD extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels (AMD mirror of `pr-test-extra.yml`) |
+| `.github/workflows/pr-gate.yml` | Reusable PR gate: draft check, `run-ci` (+ optional `run-ci-extra`) label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fast-fail: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
 | `.github/actions/check-maintenance/action.yml` | Maintenance mode check |
@@ -329,6 +332,32 @@ Determines which test suites to run based on file changes.
 
 ---
 
+## AMD CI (ROCm)
+
+AMD CI mirrors the CUDA base/extra split but runs on self-hosted ROCm runners (`linux-mi325-{1,2,4,8}gpu-sglang`) inside a ROCm container. Suites are registered with `register_amd_ci(...)` in `test/run_suite.py`'s `PER_COMMIT_SUITES[HWBackend.AMD]` / `NIGHTLY_SUITES`, and jobs bring up the container via `scripts/ci/amd/amd_ci_start_container.sh` → `amd_ci_install_dependency.sh` → `amd_ci_exec.sh`.
+
+| Workflow | ROCm | Trigger | Gate |
+|----------|------|---------|------|
+| `pr-test-amd.yml` | default | PR (paths), 6-hourly cron, dispatch | `run-ci` (PR only) |
+| `pr-test-amd-rocm720.yml` | 7.2 | daily cron, dispatch | none on schedule |
+| `pr-test-amd-extra.yml` | default or 7.2 | PR `labeled`, dispatch, workflow_call | `run-ci` + `run-ci-extra` (PR only) |
+
+### Extra-a tier (`pr-test-amd-extra.yml`)
+
+AMD mirror of the CUDA `extra-a` opt-in tier. Key properties:
+
+- **Label-gated** per PR via the reusable `call-gate` → `pr-gate.yml` (`require-run-ci: true`, `require-run-ci-extra: true`). On non-`pull_request` events (schedule / workflow_call / dispatch) the label checks are skipped, so the gate passes.
+- **Single unpartitioned job** `extra-a-test-1-gpu-small-amd`: the onboarded unit tests total ~minutes, so per-job container/kernel-build setup dominates — partitioning would just multiply that setup across scarce AMD GPUs. Run the whole suite sequentially on one GPU instead.
+- **`rocm_version` input**: empty = Dockerfile default; `rocm720` = ROCm 7.2 container (passes `--rocm-version` to the container start and suffixes the job name `…-rocm720`).
+- **Dual scheduled cadence** (mirrors NV's `pr-test.yml` → `call-pr-test-extra`): chained into both AMD base schedules via `workflow_call` —
+  - `pr-test-amd.yml` → `call-pr-test-amd-extra` (6-hourly, default ROCm)
+  - `pr-test-amd-rocm720.yml` → `call-pr-test-amd-extra-rocm720` (daily, `rocm_version=rocm720`)
+  Both chain jobs are gated `github.event_name == 'schedule' || inputs.run_all_tests`, exclude targeted `target_stage` dispatches, pass `continue_on_error: true`, and are intentionally **not** part of any `*-finish` aggregator so the base AMD gate never depends on the opt-in tier.
+
+> AMD-able vs NV-only: in-process / mock-model / unit tests generally run on ROCm (`torch.cuda` maps to HIP). Tests that JIT-build CUDA kernels (e.g. the kv_canary `e2e` suites) may fail under `hipcc` and stay CUDA-only until ported — register AMD only for the subset verified green on mi325.
+
+---
+
 ## Concurrency Control
 
 ```
@@ -392,13 +421,15 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
-### Label-gated workflow dispatch (pr-test, pr-test-extra)
+### Label-gated workflow dispatch (extra workflows)
 
-`pr-test.yml` and `pr-test-extra.yml` both listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). The `check-changes.if` gate has two clauses:
+The **extra** workflows — `pr-test-extra.yml` (CUDA) and `pr-test-amd-extra.yml` (AMD) — listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). Their gate `if` (on `check-changes` for CUDA, `call-gate` for AMD) has two effective clauses:
 
-1. **For `labeled` events**: the just-added label must be one of the gating labels (`run-ci` for pr-test, `run-ci` or `run-ci-extra` for pr-test-extra) — otherwise every unrelated label addition would dispatch a full CI run.
-2. **All events**: the PR must currently carry the required labels.
+1. **For `labeled` events**: the just-added label must be a gating label (`run-ci` or `run-ci-extra`) — otherwise every unrelated label addition would dispatch a full extra run.
+2. **All events**: the PR must currently carry the required labels (enforced at runtime by `pr-gate.yml`'s live label fetch — see below).
 
-This is what lets `/tag-run-ci-label` (and the `extra` variant) trigger a fresh CI run without an extra push.
+This is what lets `/tag-run-ci-label extra` (and `/tag-and-rerun-ci extra`) trigger a fresh extra run without an extra push.
+
+> **Note**: `pr-test.yml` (base CUDA) and `pr-test-amd.yml` (base AMD) do **not** listen for `labeled` — they use only the default `pull_request` types. Adding `run-ci` alone therefore fires the extra workflows (if `run-ci-extra` is also present) but does **not** re-fire base CI; recover base CI with `/tag-and-rerun-ci` or a new push.
 
 **Caveat — skipped runs cannot be un-skipped by `run.rerun()`:** GitHub's rerun API reuses the original event payload, so rerunning a `pull_request`-event run that was skipped because of missing labels will skip again (label set in the frozen payload doesn't update). The only way to recover a label-skipped run is to add the missing label, which fires a fresh `labeled` event with the current label set. `handle_rerun_failed_ci` in the slash handler is for rerunning failed/non-label-skipped runs; it cannot revive label-skipped ones.
