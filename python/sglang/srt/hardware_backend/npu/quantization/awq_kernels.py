@@ -192,49 +192,45 @@ class AWQAscendMoEKernel:
         return packed.contiguous()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # 1. Convert weights and register
-        # w13
-        w13_unpacked = self._unpack_awq_int4(layer.w13_qweight.data)  # (E*K, N13) int8
-        E, K13, N13_packed = layer.w13_qweight.shape
-        N13 = N13_packed * 8
-        w13_int8 = w13_unpacked.view(E, K13, N13).permute(0, 2, 1).contiguous()  # (E, N13, K13)
-        w13_packed = self._pack_for_w4a16(w13_int8)   # (E, N13, K13//8) int32
-        self._register_or_replace_parameter(layer, "w13_weight", w13_packed)
-
-        # w2
-        w2_unpacked = self._unpack_awq_int4(layer.w2_qweight.data)
-        E2, K2, N2_packed = layer.w2_qweight.shape
-        N2 = N2_packed * 8
-        w2_int8 = w2_unpacked.view(E2, K2, N2).permute(0, 2, 1).contiguous()
-        w2_packed = self._pack_for_w4a16(w2_int8)
-        self._register_or_replace_parameter(layer, "w2_weight", w2_packed)
-
-        # 2. Scales – transpose from (E, groups, N) to (E, N, groups) and keep as is
+        # 1. Pack weights (already correctly formatted)
         self._register_or_replace_parameter(
-            layer, "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous()
+            layer, "w13_weight",
+            self._convert_awq_weight_to_npu_layout(layer.w13_qweight.data),
         )
         self._register_or_replace_parameter(
-            layer, "w2_weight_scale",
-            layer.w2_scales.data.transpose(1, 2).contiguous()
+            layer, "w2_weight",
+            self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
         )
-
-        # 3. Offsets – correctly computed from zeros
-        for w_prefix in ("w13", "w2"):
-            qzeros = getattr(layer, f"{w_prefix}_qzeros").data   # (E, groups, N//8)
-            unpacked_zeros = self._unpack_awq_int4(qzeros)       # (E*groups, N) int8, value = zero_point - 8
+    
+        # 2. Scales – transpose to (E, N, groups) and use the EXACT field name "weigh_scale"
+        self._register_or_replace_parameter(
+            layer, "w13_weigh_scale",               # <-- note the spelling
+            layer.w13_scales.data.transpose(1, 2).contiguous(),
+        )
+        self._register_or_replace_parameter(
+            layer, "w2_weigh_scale",
+            layer.w2_scales.data.transpose(1, 2).contiguous(),
+        )
+    
+        # 3. Offsets – correctly compute and use "weigh_offset"
+        for prefix in ("w13", "w2"):
+            qzeros = getattr(layer, f"{prefix}_qzeros").data          # (E, groups, N//8)
+            scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
+            # unpack zeros -> signed int8, value = zero_point - 8
+            unpacked_zeros = self._unpack_awq_int4(qzeros)            # (E*groups, N) int8
             E_z, groups, _ = qzeros.shape
             N_z = unpacked_zeros.shape[1]
             offset = unpacked_zeros.view(E_z, groups, N_z).permute(0, 2, 1).contiguous()  # (E, N, groups)
-            offset = -offset  # kernel expects 8 - zero_point
-            dtype = getattr(layer, f"{w_prefix}_scales").data.dtype
+            offset = -offset   # kernel expects 8 - zero_point
             self._register_or_replace_parameter(
-                layer, f"{w_prefix}_weight_offset", offset.to(dtype)
+                layer, f"{prefix}_weigh_offset",                      # <-- note the spelling
+                offset.to(scales_dtype),
             )
-
-        # 4. Set dispatcher output dtype for w13
-        self.w13_kernel._set_dispatcher_output_dtype(layer, "bf16")  # this only sets a config, safe
-
+    
+        # 4. Set dispatcher output dtype for w13 (no weight manipulation needed)
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+    
         # 5. Free original AWQ tensors
         for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
                      "w2_qweight", "w2_qzeros", "w2_scales"):
