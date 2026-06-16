@@ -1567,9 +1567,7 @@ class Indexer(MultiPlatformOp):
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             # The split-op dispatch surface is CUDA-only (the is_cuda() gate in
-            # is_graph_dsa_split_op_surface_active), while fused-quant tuple `x`
-            # only arises on ROCm/aiter -- so here `x` is always the plain
-            # metadata tensor and needs no x_meta unpacking.
+            # is_graph_dsa_split_op_surface_active).
             if return_indices:
                 topk_result = torch.full(
                     (x.shape[0], self.index_topk),
