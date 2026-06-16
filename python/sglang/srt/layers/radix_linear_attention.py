@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 def _zero_linear_attn_padding(
-    attn_output: torch.Tensor, forward_batch: "ForwardBatch", seq_dim: int = 0
+    attn_output: torch.Tensor, forward_batch: ForwardBatch, seq_dim: int = 0
 ) -> torch.Tensor:
     real_num_tokens = forward_batch.get_num_non_padded_tokens(
         attn_output.shape[seq_dim],
