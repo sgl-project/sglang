@@ -100,6 +100,13 @@ RUN python3 -m pip install --no-cache-dir numpy \
 # avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
 RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
 
+# Workaround: various tests crashes in late capture phase with error message:
+#   Assertion `detail::isPresent(Val) && "dyn_cast on a non-existent value"' failed.
+# This happens in MLIR Compilation pass TritonAMDGPUCanonicalizePointers in
+# triton-3.6.0+rocm7.14.0a20260612.  Disabling the use of buffer_ops can bypass
+# the compilation pass.
+ENV AMDGCN_USE_BUFFER_OPS=0
+
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
