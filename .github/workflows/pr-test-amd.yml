@@ -7,7 +7,6 @@ on:
   schedule:
     - cron: '0 */6 * * *' # Run every 6 hours (UTC)
   pull_request:
-    branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
