@@ -132,25 +132,30 @@ def bench_rmsnorm(shape, provider: str):
     out = torch.empty_like(x)
 
     if provider == "pytorch":
-        fn = lambda: F.rms_norm(x, (hidden_size,), weight, EPS)
+        fn = lambda x: F.rms_norm(x, (hidden_size,), weight, EPS)
     elif provider == "sgl_kernel":
-        fn = lambda: sgl_kernel.rmsnorm(x, weight, eps=EPS, out=out)
+        fn = lambda x: sgl_kernel.rmsnorm(x, weight, eps=EPS, out=out)
     elif provider == "flashinfer":
-        fn = lambda: flashinfer_norm.rmsnorm(x, weight, eps=EPS, out=out)
+        fn = lambda x: flashinfer_norm.rmsnorm(x, weight, eps=EPS, out=out)
     elif provider == "jit_rmsnorm":
-        fn = lambda: jit_rmsnorm(x, weight, out, EPS)
+        fn = lambda x: jit_rmsnorm(x, weight, out, EPS)
     elif provider == "triton_rms_norm_fn":
-        fn = lambda: rms_norm_fn(x, weight, bias=None, residual=None, eps=EPS)
+        fn = lambda x: rms_norm_fn(x, weight, bias=None, residual=None, eps=EPS)
     elif provider == "quack":
         quack_rmsnorm_fwd = _load_quack_rmsnorm()
-        fn = lambda: quack_rmsnorm_fwd(x, weight, eps=EPS)
+        fn = lambda x: quack_rmsnorm_fwd(x, weight, eps=EPS)
     else:  # flaggems
         flaggems_rms_norm = _load_flaggems_rmsnorm()
-        fn = lambda: flaggems_rms_norm(x, (hidden_size,), weight, EPS)
+        fn = lambda x: flaggems_rms_norm(x, (hidden_size,), weight, EPS)
 
-    # sgl_kernel / flashinfer / jit write into `out`; count it explicitly so
-    # the in-place (None-returning) providers still report bandwidth.
-    return marker.do_bench(fn, input_args=(), memory_output=(out,))
+    # Pass x as input_args so do_bench rotates (clones) it per iteration to
+    # avoid the L2-hot effect of reusing one buffer. memory_args=() keeps the
+    # bandwidth footprint at `out` only (unchanged); sgl_kernel / flashinfer /
+    # jit write into `out`, counted explicitly so the in-place (None-returning)
+    # providers still report bandwidth.
+    return marker.do_bench(
+        fn, input_args=(x,), memory_args=(), memory_output=(out,)
+    )
 
 
 # ============================================================================
@@ -180,25 +185,36 @@ def bench_fused_add_rmsnorm(shape, provider: str):
     weight = torch.randn(hidden_size, device=DEFAULT_DEVICE, dtype=DTYPE)
 
     if provider == "pytorch":
-        fn = lambda: F.rms_norm(x + residual, (hidden_size,), weight, EPS)
+        fn = lambda x, residual: F.rms_norm(x + residual, (hidden_size,), weight, EPS)
     elif provider == "sgl_kernel":
-        fn = lambda: sgl_kernel.fused_add_rmsnorm(x, residual, weight, eps=EPS)
+        fn = lambda x, residual: sgl_kernel.fused_add_rmsnorm(
+            x, residual, weight, eps=EPS
+        )
     elif provider == "flashinfer":
-        fn = lambda: flashinfer_norm.fused_add_rmsnorm(x, residual, weight, eps=EPS)
+        fn = lambda x, residual: flashinfer_norm.fused_add_rmsnorm(
+            x, residual, weight, eps=EPS
+        )
     elif provider == "jit_fused_add_rmsnorm":
-        fn = lambda: jit_fused_add_rmsnorm(x, residual, weight, EPS)
+        fn = lambda x, residual: jit_fused_add_rmsnorm(x, residual, weight, EPS)
     elif provider == "quack":
         quack_rmsnorm_fwd = _load_quack_rmsnorm()
-        fn = lambda: quack_rmsnorm_fwd(x, weight, residual=residual, eps=EPS)
+        fn = lambda x, residual: quack_rmsnorm_fwd(
+            x, weight, residual=residual, eps=EPS
+        )
     else:  # flaggems
         flaggems_fused_add = _load_flaggems_fused_add()
-        fn = lambda: flaggems_fused_add(x, residual, (hidden_size,), weight, EPS)
+        fn = lambda x, residual: flaggems_fused_add(
+            x, residual, (hidden_size,), weight, EPS
+        )
 
     # sgl_kernel / flashinfer / jit / flaggems fused_add write x + residual in
-    # place; clone both per iter so timing is not L2-hot.
+    # place; passing them as input_args makes do_bench clone both per iter so
+    # timing is not L2-hot (the prior input_args=() silently skipped this).
+    # memory_args=() keeps the bandwidth footprint at x + residual (unchanged).
     return marker.do_bench(
         fn,
-        input_args=(),
+        input_args=(x, residual),
+        memory_args=(),
         memory_output=(x, residual),
     )
 
@@ -226,19 +242,23 @@ def bench_layernorm(shape, provider: str):
     out = torch.empty_like(x)
 
     if provider == "pytorch":
-        fn = lambda: F.layer_norm(x, (hidden_size,), weight, bias, EPS)
+        fn = lambda x: F.layer_norm(x, (hidden_size,), weight, bias, EPS)
     elif provider == "triton_norm_infer":
-        fn = lambda: norm_infer(x, weight, bias, eps=EPS, is_rms_norm=False, out=out)
+        fn = lambda x: norm_infer(x, weight, bias, eps=EPS, is_rms_norm=False, out=out)
     elif provider == "flashinfer":
-        fn = lambda: flashinfer_norm.layernorm(x, fp32_weight, fp32_bias, EPS)
+        fn = lambda x: flashinfer_norm.layernorm(x, fp32_weight, fp32_bias, EPS)
     elif provider == "quack":
         quack_layernorm_fwd = _load_quack_layernorm()
-        fn = lambda: quack_layernorm_fwd(x, fp32_weight, fp32_bias, EPS)
+        fn = lambda x: quack_layernorm_fwd(x, fp32_weight, fp32_bias, EPS)
     else:  # flaggems
         flaggems_layer_norm = _load_flaggems_layernorm()
-        fn = lambda: flaggems_layer_norm(x, (hidden_size,), weight, bias)[0]
+        fn = lambda x: flaggems_layer_norm(x, (hidden_size,), weight, bias)[0]
 
-    return marker.do_bench(fn, input_args=(), memory_output=(out,))
+    # Pass x as input_args so do_bench rotates (clones) it per iteration to
+    # avoid the L2-hot effect; memory_args=() keeps the footprint at `out` only.
+    return marker.do_bench(
+        fn, input_args=(x,), memory_args=(), memory_output=(out,)
+    )
 
 
 SEP = "=" * 80

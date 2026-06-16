@@ -60,7 +60,7 @@ def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: 
 
     if provider == "split":
 
-        def fn():
+        def fn(x):
             normalized = norm_infer(
                 x.view(-1, x.shape[-1]),
                 weight,
@@ -74,7 +74,7 @@ def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: 
 
     else:
 
-        def fn():
+        def fn(x):
             return fuse_layernorm_scale_shift_gate_select01_kernel(
                 x,
                 weight=weight,
@@ -89,7 +89,10 @@ def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: 
                 eps=EPS,
             )
 
-    return marker.do_bench(fn)
+    # Rotate the dominant read tensor x per iteration (do_bench clones
+    # input_args); a zero-arg closure would keep it L2-hot and report wrongly
+    # fast numbers.
+    return marker.do_bench(fn, input_args=(x,))
 
 
 @marker.parametrize("B,S,D", CONFIG, CI_CONFIG)
@@ -105,7 +108,7 @@ def bench_residual_layernorm_scale_shift_gate_select01(
 
     if provider == "split":
 
-        def fn():
+        def fn(x, residual, residual_gate):
             residual_out = residual + residual_gate * x
             normalized = norm_infer(
                 residual_out.view(-1, residual_out.shape[-1]),
@@ -120,7 +123,7 @@ def bench_residual_layernorm_scale_shift_gate_select01(
 
     else:
 
-        def fn():
+        def fn(x, residual, residual_gate):
             return fuse_residual_layernorm_scale_shift_gate_select01_kernel(
                 x,
                 residual=residual,
@@ -137,7 +140,9 @@ def bench_residual_layernorm_scale_shift_gate_select01(
                 eps=EPS,
             )
 
-    return marker.do_bench(fn)
+    # Rotate the read tensors per iteration (do_bench clones input_args); a
+    # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
+    return marker.do_bench(fn, input_args=(x, residual, residual_gate))
 
 
 if __name__ == "__main__":

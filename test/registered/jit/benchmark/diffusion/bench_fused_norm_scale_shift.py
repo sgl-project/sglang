@@ -64,11 +64,13 @@ def bench_fused_norm_scale_shift(
         layer = RMSNormScaleShift(D, EPS, affine, dtype=DTYPE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(x, shift, scale)
+        fn = lambda x, shift, scale: layer.forward_native(x, shift, scale)
     else:
-        fn = lambda: layer.forward_cuda(x, shift, scale)
+        fn = lambda x, shift, scale: layer.forward_cuda(x, shift, scale)
 
-    return marker.do_bench(fn)
+    # Rotate the read tensors per iteration (do_bench clones input_args); a
+    # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
+    return marker.do_bench(fn, input_args=(x, shift, scale))
 
 
 # ============================================================================
@@ -90,11 +92,17 @@ def bench_fused_scale_residual_norm_scale_shift(
         layer = ScaleResidualRMSNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
+        fn = lambda residual, x, gate, shift, scale: layer.forward_native(
+            residual, x, gate, shift, scale
+        )
     else:
-        fn = lambda: layer.forward_cuda(residual, x, gate, shift, scale)
+        fn = lambda residual, x, gate, shift, scale: layer.forward_cuda(
+            residual, x, gate, shift, scale
+        )
 
-    return marker.do_bench(fn)
+    # Rotate the read tensors per iteration (do_bench clones input_args); a
+    # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
+    return marker.do_bench(fn, input_args=(residual, x, gate, shift, scale))
 
 
 SEP = "=" * 80
