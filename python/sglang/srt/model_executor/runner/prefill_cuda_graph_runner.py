@@ -214,16 +214,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # _run_compile_pass before backend resolution returns.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.layer_model = None
+        # Set before resolve_prefill_backend — TcPiecewise's _run_compile_pass
+        # calls back into capture_prepare which reads this. Full overrides below
+        # once the backend type is known.
+        self._capture_req_slots = 1
         self.backend = resolve_prefill_backend(self)
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
-        self._capture_req_slots = (
-            min(
+        if self._is_full_backend:
+            self._capture_req_slots = min(
                 model_runner.server_args.cuda_graph_config.prefill.req_slots,
                 self.max_bs,
             )
-            if self._is_full_backend
-            else 1
-        )
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
