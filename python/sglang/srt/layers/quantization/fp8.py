@@ -602,14 +602,6 @@ class Fp8LinearMethod(LinearMethodBase):
             pad_rows = padded_n - n
 
             if pad_rows:
-                logger.debug(
-                    "Padding dense MXFP8 FlashInfer TRTLLM scale rows from %d to %d "
-                    "for weight shape (%d, %d).",
-                    n,
-                    padded_n,
-                    n,
-                    k,
-                )
                 scale_u8 = F.pad(
                     scale_u8,
                     (0, 0, 0, pad_rows),
