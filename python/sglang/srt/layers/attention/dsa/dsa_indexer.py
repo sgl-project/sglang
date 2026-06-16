@@ -125,8 +125,6 @@ if _is_cuda:
         # Shared preamble for the indexer split ops: resolve the forward batch,
         # this layer's indexer, and its metadata from the captured forward context.
         forward_context = get_tc_piecewise_forward_context()
-        assert forward_context is not None
-        assert forward_context.dsa_indexers is not None
         forward_batch = forward_context.forward_batch
         indexer = forward_context.dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
