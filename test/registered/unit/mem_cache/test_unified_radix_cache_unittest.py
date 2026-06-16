@@ -2960,6 +2960,235 @@ class UnifiedRadixCacheSuite:
 
         tree.sanity_check()
 
+    def test_swa_write_back_internal_node_backed_up_before_tombstone(self):
+        """write_back + SWA: the sliding window force-evicts SWA from device
+        before the FULL leaf is ever evicted/backed-up. An *internal* node's
+        in-window SWA chunk must be backed up to host (not silently dropped),
+        otherwise a later host hit cannot reconstruct a valid SWA window at a
+        boundary inside that node -- the decode-host hicache_kl failure.
+
+        Regression guard: without the backup-before-tombstone, the internal
+        node's SWA goes to None on both device and host (GONE) while its FULL
+        stays live, so this asserts host_value is populated instead.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only keeps the split topology precise")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ps = self.cfg.page_size
+        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        wp = max(1, tail_size // ps)
+
+        # Long enough that _maybe_split_leaf_for_swa_lock splits the insert into
+        # an out-of-window internal node + a window-capped leaf.
+        seq = self._make_seq(1, wp + 3)
+        if allocator.full_available_size() < len(
+            seq
+        ) or allocator.swa_available_size() < len(seq):
+            self.skipTest("kv pool too small for split topology")
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        tree.writing_check(write_back=True)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        parent = leaf.parent
+        self.assertIsNot(parent, tree.root_node, "expected a split internal node")
+
+        ct = ComponentType.SWA
+        # Internal node currently holds SWA on device only, FULL on device.
+        self.assertIsNotNone(parent.component_data[ct].value)
+        self.assertIsNone(parent.component_data[ct].host_value)
+        self.assertFalse(parent.backuped)
+        self.assertIsNotNone(parent.component_data[ComponentType.FULL].value)
+
+        # Force SWA-only device eviction (window pressure) without evicting FULL.
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq)))
+        tree.writing_check(write_back=True)
+
+        pcd = parent.component_data[ct]
+        self.assertIsNone(
+            pcd.value, "SWA device chunk should be tombstoned by window pressure"
+        )
+        self.assertIsNotNone(
+            pcd.host_value,
+            "write_back must back up an internal node's SWA to host before "
+            "tombstoning it, so a later host hit can restore the SWA window",
+        )
+        tree.sanity_check()
+
+    def test_swa_write_back_inflight_backup_pinned_against_host_eviction(self):
+        """write_back + SWA: an internal node's SWA backup is issued async and the
+        node is published into the SWA host LRU *before* the batched
+        ``writing_check`` at the end of ``evict()``. If a later node's
+        ``write_backup`` triggers ``evict_host`` within the same sweep, the
+        in-flight host copy must NOT be freed.
+
+        Regression guard for a host-side use-after-free: ``write_backup(write_back)``
+        pins the host copy (``host_lock_ref``) until its D->H ack, so the SWA
+        host-LRU walker (``get_*_no_host_lock``) skips the in-flight node. Without
+        the pin, ``evict_host`` frees the host slots while the copy is still
+        writing into them -- re-introducing the very SWA loss this path fixes and
+        orphaning the host allocation.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only keeps the split topology precise")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ps = self.cfg.page_size
+        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        wp = max(1, tail_size // ps)
+
+        seq = self._make_seq(1, wp + 3)
+        if allocator.full_available_size() < len(
+            seq
+        ) or allocator.swa_available_size() < len(seq):
+            self.skipTest("kv pool too small for split topology")
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        tree.writing_check(write_back=True)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        parent = m.last_device_node.parent
+        self.assertIsNot(parent, tree.root_node, "expected a split internal node")
+
+        ct = ComponentType.SWA
+        swa_comp = tree.components[ct]
+        self.assertIsNotNone(parent.component_data[ct].value)
+        self.assertIsNone(parent.component_data[ct].host_value)
+        self.assertFalse(parent.backuped)
+
+        # Mirror SWAComponent.drive_eviction's internal-node branch by hand so we
+        # can observe the intra-sweep window: issue the async D->H backup, then
+        # tombstone the SWA device chunk (which publishes the node into the SWA
+        # host LRU) -- all WITHOUT the end-of-sweep drain.
+        tracker = {c: 0 for c in tree.tree_components}
+        swa_comp._maybe_backup_swa_before_tombstone(parent)
+
+        # The fix: the in-flight host copy is pinned for the duration of the copy.
+        self.assertIsNotNone(parent.component_data[ct].host_value)
+        self.assertGreater(
+            parent.component_data[ct].host_lock_ref,
+            0,
+            "write_back must pin its host copy while the D->H copy is in flight",
+        )
+        host_slots = parent.component_data[ct].host_value.clone()
+
+        tree._evict_component_and_detach_lru(
+            parent, swa_comp, target=EvictLayer.DEVICE, tracker=tracker
+        )
+        tree._cascade_evict(parent, swa_comp, tracker)
+        self.assertIsNone(
+            parent.component_data[ct].value, "SWA device chunk should be tombstoned"
+        )
+
+        # Simulate a later node's write_backup hitting host pressure mid-sweep:
+        # force an SWA host eviction large enough to want every host-only chunk.
+        tree.evict_host(len(seq) + ps, ct)
+
+        # Protected: the pinned in-flight backup must survive the host eviction.
+        self.assertIsNotNone(
+            parent.component_data[ct].host_value,
+            "in-flight write_back SWA backup must be pinned against concurrent "
+            "host eviction until its D->H copy is acked",
+        )
+        self.assertTrue(
+            torch.equal(parent.component_data[ct].host_value, host_slots),
+            "host slots must not be freed/reallocated under the in-flight copy",
+        )
+
+        # Drain the copy: the ack releases the pin and the node becomes a normal
+        # host-eviction candidate again.
+        tree.writing_check(write_back=True)
+        self.assertEqual(parent.component_data[ct].host_lock_ref, 0)
+        self.assertIsNotNone(parent.component_data[ct].host_value)
+        tree.sanity_check()
+
+    def test_write_back_inflight_leaf_backup_pinned_against_host_eviction(self):
+        """write_back: ``_evict_device_leaf`` issues the leaf's D->H backup and
+        demotes it to host (publishing it as a host leaf) WITHOUT draining per
+        node -- it relies on the host-lock pin plus the single batched
+        ``writing_check`` at the end of ``evict()``. A later leaf's
+        ``write_backup -> evict_host`` within the same sweep must not free the
+        in-flight host copy.
+
+        Regression guard: removing the per-node ``writing_check`` from
+        ``_evict_device_leaf`` is only safe because ``write_backup(write_back)``
+        pins the host copy (``host_lock_ref``) until its ack. Without the pin the
+        leaf is an unlocked host leaf and ``evict_host`` frees its host slots
+        while the D->H copy is still writing into them.
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+
+        seq = self._make_seq(1, 4)
+        full_avail = (
+            allocator.full_available_size()
+            if self.cfg.has_swa
+            else allocator.available_size()
+        )
+        if full_avail < len(seq) or (
+            self.cfg.has_swa and allocator.swa_available_size() < len(seq)
+        ):
+            self.skipTest("kv pool too small")
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        tree.writing_check(write_back=True)
+
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self.assertIsNot(leaf, tree.root_node)
+        self.assertFalse(leaf.backuped)
+
+        fct = ComponentType.FULL
+        tracker = {c: 0 for c in tree.tree_components}
+
+        # Issue the leaf's D->H backup WITHOUT draining (mirrors _evict_device_leaf
+        # now that the per-node writing_check has been removed).
+        written = tree.write_backup(leaf, write_back=True)
+        self.assertGreater(written, 0)
+        self.assertTrue(leaf.backuped)
+        self.assertGreater(
+            leaf.component_data[fct].host_lock_ref,
+            0,
+            "write_back must pin the leaf's host copy while the D->H copy is in flight",
+        )
+        host_slots = leaf.component_data[fct].host_value.clone()
+
+        # Demote: free device resources and publish the leaf as a host leaf.
+        tree._evict_to_host(leaf, tracker)
+        self.assertIsNone(leaf.component_data[fct].value)
+
+        # Simulate a later leaf's write_backup hitting host pressure mid-sweep.
+        tree.evict_host(len(seq) + max(1, self.cfg.page_size), fct)
+
+        self.assertIsNotNone(
+            leaf.component_data[fct].host_value,
+            "in-flight write_back leaf backup must be pinned against concurrent "
+            "host eviction until its D->H copy is acked",
+        )
+        self.assertTrue(
+            torch.equal(leaf.component_data[fct].host_value, host_slots),
+            "host slots must not be freed/reallocated under the in-flight copy",
+        )
+
+        # Drain the copy: the ack releases the pin.
+        tree.writing_check(write_back=True)
+        self.assertEqual(leaf.component_data[fct].host_lock_ref, 0)
+        self.assertIsNotNone(leaf.component_data[fct].host_value)
+        tree.sanity_check()
+
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [

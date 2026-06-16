@@ -280,6 +280,7 @@ class _OngoingWriteThrough(NamedTuple):
 
     node: UnifiedTreeNode
     lock_params: Optional[DecLockRefParams]
+    host_lock_params: Optional[DecLockRefParams]
     publish_nodes: list[UnifiedTreeNode]
 
 
@@ -1460,7 +1461,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
                     return
-                self.writing_check(write_back=True)
+                # No per-node drain: write_backup pins the host copy until the
+                # batched writing_check at the end of evict().
                 self._evict_to_host(node, tracker)
                 return
             else:
@@ -1557,19 +1559,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         lock_params = None
+        host_lock_params = None
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
-        self._track_write_through_node(node, lock_params)
+        else:
+            # write_back: pin the in-flight host copy until its ack so a later
+            # evict_host() in this sweep can't free the slots mid-copy.
+            host_lock_params = self.inc_host_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params, host_lock_params)
         return len(host_indices)
 
     def _track_write_through_node(
         self,
         node: UnifiedTreeNode,
         lock_params: Optional[DecLockRefParams],
+        host_lock_params: Optional[DecLockRefParams] = None,
     ) -> None:
         node.write_through_pending_id = node.id
         self.ongoing_write_through[node.id] = _OngoingWriteThrough(
-            node, lock_params, [node]
+            node, lock_params, host_lock_params, [node]
         )
 
     def _replace_pending_write_through_node(
@@ -1583,7 +1591,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pending is None:
             return
 
-        lock_node, lock_params, publish_nodes = pending
+        lock_node, lock_params, host_lock_params, publish_nodes = pending
         updated_nodes = []
         replaced = False
         for node in publish_nodes:
@@ -1601,17 +1609,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node,
             lock_params,
+            host_lock_params,
             updated_nodes,
         )
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
-        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        lock_node, lock_params, host_lock_params, publish_nodes = (
+            self.ongoing_write_through.pop(ack_id)
+        )
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             self._record_store_event(node, medium=StorageMedium.CPU)
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
+        if host_lock_params is not None:
+            self.dec_host_lock_ref(lock_node, host_lock_params)
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
@@ -2803,12 +2816,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         # ── PART 5: Ongoing Operations ──
-        for nid, (n, _, _) in self.ongoing_write_through.items():
+        for nid, (n, _, _, _) in self.ongoing_write_through.items():
             if n not in all_node_set:
                 E(f"[Ongoing] write_through node {nid} not in tree")
-            elif n.component_data[FCT].lock_ref <= 0:
+            elif (
+                n.component_data[FCT].lock_ref <= 0
+                and n.component_data[FCT].host_lock_ref <= 0
+            ):
+                # write_through pins the device copy (lock_ref); write_back pins
+                # the in-flight host copy (host_lock_ref). Either is sufficient.
                 E(
-                    f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
+                    f"[Ongoing] write_through node {nid} "
+                    f"lock_ref={n.component_data[FCT].lock_ref} "
+                    f"host_lock_ref={n.component_data[FCT].host_lock_ref}"
                 )
         for nid, (n, _, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
