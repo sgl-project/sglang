@@ -140,40 +140,55 @@ class AWQAscendMoEKernel:
         self.w13_kernel = NPUW4A16Int4MoEMethod()
         self.w2_kernel = NPUW4A16Int4MoEMethod()
 
-    @staticmethod
-    def _register_or_replace_parameter(
-        layer: torch.nn.Module, name: str, tensor: torch.Tensor
-    ) -> None:
-        if hasattr(layer, name):
-            replace_parameter(layer, name, tensor)
-        else:
-            layer.register_parameter(
-                name, torch.nn.Parameter(tensor, requires_grad=False)
-            )
+    # ------------------------------------------------------------------
+    #  Correct AWQ nibble order (0,4,1,5,2,6,3,7) + sign extension
+    # ------------------------------------------------------------------
+    def _unpack_awq_int4(self, packed: torch.Tensor) -> torch.Tensor:
+        """
+        Unpack AWQ int4 weight (nibble order 0,4,1,5,2,6,3,7)
+        to signed int8 tensor of shape (E*K, N).
+        packed: (E, K, N_packed) int32
+        returns: (E*K, N) int8 (signed)
+        """
+        E, K, N_packed = packed.shape
+        pack_factor = 8
+        N = N_packed * pack_factor
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
 
+        flat = packed.flatten(0, 1)          # (E*K, N_packed)
+        out = torch.zeros((E * K, N), dtype=torch.int8, device=packed.device)
+
+        for i, s in enumerate(shifts):
+            nib = (flat >> (s * 4)) & 0xF      # unsigned 0..15
+            # sign‑extend: values >= 8 are negative
+            signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
+            out[:, i::pack_factor] = signed
+        return out
+
+    # ------------------------------------------------------------------
+    #  Conversion to NPU layout (plain int32, no NZ)
+    # ------------------------------------------------------------------
     def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
-        num_experts, input_size, _ = qweight.shape
-        unpacked_weight = (
-            self.w13_kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
-            .view(num_experts, input_size, -1)
-            .transpose(1, 2)
-            .contiguous()
-            .int()
-        )
-        return self.w13_kernel._pack_to_int32(unpacked_weight)
+        E, K, _ = qweight.shape
+        unpacked = self._unpack_awq_int4(qweight)   # (E*K, N) int8
+        N = unpacked.shape[1]
+        weight = unpacked.view(E, K, N).permute(0, 2, 1).contiguous()  # (E, N, K)
+        # Pack 4 int8 values into int32 (no NZ cast)
+        return self.w13_kernel._pack_to_int32(weight)   # (E, N, K//4) int32
 
     def _convert_awq_qzeros_to_npu_offset(
         self, qzeros: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
-        num_experts, num_groups, _ = qzeros.shape
-        offset = (
-            -self.w13_kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
-            .view(num_experts, num_groups, -1)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        E, G, _ = qzeros.shape
+        unpacked = self._unpack_awq_int4(qzeros)       # (E*G, N) int8 (zero - 8)
+        N = unpacked.shape[1]
+        offset = unpacked.view(E, G, N).permute(0, 2, 1).contiguous()  # (E, N, G)
+        offset = -offset  # kernel expects 8 - zero = -(zero - 8)
         return offset.to(dtype)
 
+    # ------------------------------------------------------------------
+    #  Main entry point (unchanged except calls)
+    # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._register_or_replace_parameter(
             layer,
@@ -213,7 +228,7 @@ class AWQAscendMoEKernel:
         self.w13_kernel.process_weights_after_loading(layer, "w13")
         self.w2_kernel.process_weights_after_loading(layer, "w2")
 
-        # --- Free memory: delete original AWQ parameters ---
+        # Free original AWQ tensors
         for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
                      "w2_qweight", "w2_qzeros", "w2_scales"):
             if hasattr(layer, attr):
