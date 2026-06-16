@@ -1,4 +1,4 @@
-"""Unit tests for ``_fused_uint8_foreach_copy_`` — CPU-only.
+"""Unit tests for ``_fused_uint8_foreach_copy_``.
 
 The helper reinterprets each foldable (dst, src) pair as ``uint8`` so a single
 ``torch._foreach_copy_`` fuses all dtypes into one batched memcpy. A pair is
@@ -14,7 +14,11 @@ These tests verify:
     foldable pairs),
   * the no-``_foreach_copy_`` fallback path.
 
-All logic is exercised on CPU; the CUDA-only cross-device case is gated.
+Registered on both CPU and CUDA: the dtype/shape/contiguity logic is
+device-independent and runs on the CPU runner, while the cross-device and
+device-to-device fold cases only execute on the GPU runner (they are
+``skipUnless(torch.cuda.is_available())`` and would silently never run if this
+file were CPU-only).
 """
 
 import unittest
@@ -24,9 +28,10 @@ import torch
 
 from sglang.srt.model_executor.runner_utils import buffers
 from sglang.srt.model_executor.runner_utils.buffers import _fused_uint8_foreach_copy_
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
