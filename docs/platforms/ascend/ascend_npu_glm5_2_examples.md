@@ -10,7 +10,6 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 - `GLM-5.2`(BF16 version): [Download model weight](https://huggingface.co/zai-org/GLM-5.2).
 - `GLM-5.2-w8a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/).
-- `GLM-5.2-w4a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8/).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
 
 
@@ -58,7 +57,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 
 ### Single-node Deployment
 
-- Quantized model `glm5.2_w4a8` can be deployed on 1 Atlas 800 A3 (64G × 16) .
+- Quantized model `glm5.2_w8a8` can be deployed on 1 Atlas 800 A3 (64G × 16) .
 
 **A3 series**
 
@@ -172,7 +171,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node Deployment
 
-- Quantized model `glm5.2_w4a8` can be deployed on 2 Atlas 800 A3 (64G × 16) .
+- Quantized model `glm5.2_w8a8` can be deployed on 2 Atlas 800 A3 (64G × 16) .
 
 **A3 series**
 
