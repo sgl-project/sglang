@@ -1499,6 +1499,524 @@ class ServerArgs:
     ] = "triton"
 
     # -------------------------------------------------------------------------
+    # Speculative decoding
+    # -------------------------------------------------------------------------
+    speculative_algorithm: A[
+        Optional[str],
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+    ] = None
+    speculative_draft_model_path: A[
+        Optional[str],
+        Arg(
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            aliases=["--speculative-draft-model"],
+        ),
+    ] = None
+    speculative_draft_model_revision: A[
+        Optional[str],
+        "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
+    ] = None
+    speculative_draft_load_format: A[
+        Optional[str],
+        Arg(
+            help="The format of the draft model weights to load. If not specified, will use the same format as --load-format. Use 'dummy' to initialize draft model weights with random values for profiling.",
+            choices=LOAD_FORMAT_CHOICES,
+        ),
+    ] = None
+    speculative_num_steps: A[
+        Optional[int],
+        "The number of steps sampled from draft model in Speculative Decoding.",
+    ] = None
+    speculative_eagle_topk: A[
+        Optional[int],
+        "The number of tokens sampled from the draft model in eagle2 each step.",
+    ] = None
+    speculative_num_draft_tokens: A[
+        Optional[int],
+        "The number of tokens sampled from the draft model in Speculative Decoding.",
+    ] = None
+    speculative_dflash_block_size: A[
+        Optional[int],
+        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+    ] = None
+    speculative_accept_threshold_single: A[
+        float,
+        "Accept a draft token if its probability in the target model is greater than this threshold.",
+    ] = 1.0
+    speculative_accept_threshold_acc: A[
+        float,
+        "The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
+    ] = 1.0
+    speculative_use_rejection_sampling: A[
+        bool,
+        "Use rejection sampling for speculative decoding (requires topk=1).",
+    ] = False
+    speculative_token_map: A[
+        Optional[str],
+        "The path of the draft model's small vocab table.",
+    ] = None
+    speculative_attention_mode: A[
+        str,
+        Arg(
+            help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
+            choices=["prefill", "decode"],
+        ),
+    ] = "prefill"
+    speculative_draft_attention_backend: A[
+        Optional[str],
+        "Attention backend for speculative decoding drafting.",
+    ] = None
+    speculative_draft_window_size: A[
+        Optional[int],
+        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+    ] = None
+    speculative_moe_runner_backend: A[
+        Optional[str],
+        Arg(
+            help="Choose the runner backend for MoE in speculative decoding.",
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+        ),
+    ] = None
+    speculative_moe_a2a_backend: A[
+        Optional[str],
+        Arg(
+            help="Choose the backend for MoE A2A in speculative decoding",
+            choices=MOE_A2A_BACKEND_CHOICES,
+        ),
+    ] = None
+    speculative_draft_model_quantization: A[
+        Optional[str],
+        Arg(
+            help="The quantization method for speculative model.",
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+        ),
+    ] = None
+    speculative_skip_dp_mlp_sync: A[
+        bool,
+        "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
+    ] = False
+    enable_multi_layer_eagle: A[
+        bool,
+        "Enable multi-layer Eagle speculative decoding.",
+    ] = False
+    speculative_adaptive: A[
+        bool,
+        "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+    ] = False
+    speculative_adaptive_config: A[
+        Optional[str],
+        "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+    ] = None
+
+    # Decoupled speculative decoding: draft and verify run as
+    # separate engines, currently connected by a ZMQ IPC mesh.
+    decoupled_spec_bind_endpoint: A[
+        Optional[str],
+        "ZMQ endpoint this engine binds for its inbound channel in decoupled "
+        "speculative decoding (verifier: result PULL; drafter: control PULL).",
+    ] = None
+    decoupled_spec_connect_endpoints: A[
+        Optional[List[str]],
+        Arg(
+            help="Peer inbound (bind) endpoints to connect to, ordered by peer "
+            "rank, for decoupled speculative decoding.",
+            type_parser=json_list_type,
+        ),
+    ] = None
+    decoupled_spec_rank: A[
+        Optional[int],
+        "This engine's rank within its own role space (verifier-rank or "
+        "drafter-rank) for decoupled speculative decoding.",
+    ] = None
+    decoupled_spec_role: A[
+        Literal["null", "verifier", "drafter"],
+        "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
+        "runs the target/verify half, 'drafter' runs the draft half.",
+    ] = "null"
+    spec_trace_dir: A[
+        Optional[str],
+        "Directory to write decoupled speculative decoding trace files.",
+    ] = None
+
+    # Speculative decoding (ngram)
+    # -------------------------------------------------------------------------
+    speculative_ngram_min_bfs_breadth: A[
+        int,
+        "The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+    ] = 1
+    speculative_ngram_max_bfs_breadth: A[
+        int,
+        "The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+    ] = 10
+    speculative_ngram_match_type: A[
+        Literal["BFS", "PROB"],
+        "The match type for cache tree.",
+    ] = "BFS"
+    speculative_ngram_max_trie_depth: A[
+        int,
+        "The max trie depth for ngram speculative decoding.",
+    ] = 18
+    speculative_ngram_capacity: A[
+        int,
+        "The cache capacity for ngram speculative decoding.",
+    ] = (
+        10 * 1000 * 1000
+    )
+    speculative_ngram_external_corpus_path: A[
+        Optional[str],
+        "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
+    ] = None
+    speculative_ngram_external_sam_budget: A[
+        int,
+        "Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+    ] = 0
+    speculative_ngram_external_corpus_max_tokens: A[
+        int,
+        "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+    ] = 10000000
+
+    # -------------------------------------------------------------------------
+    # Expert parallelism
+    # -------------------------------------------------------------------------
+    ep_size: A[
+        int,
+        Arg(
+            help="The expert parallelism size.",
+            aliases=["--expert-parallel-size", "--ep"],
+        ),
+    ] = 1
+    moe_a2a_backend: A[
+        Literal[
+            "none",
+            "deepep",
+            "mooncake",
+            "nixl",
+            "mori",
+            "ascend_fuseep",
+            "flashinfer",
+            "megamoe",
+        ],
+        Arg(
+            help="Choose the backend for MoE A2A.",
+            choices=MOE_A2A_BACKEND_CHOICES,
+        ),
+    ] = "none"
+    moe_runner_backend: A[
+        str,
+        Arg(
+            help="Choose the runner backend for MoE.",
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+        ),
+    ] = "auto"
+    flashinfer_mxfp4_moe_precision: A[
+        Literal["default", "bf16"],
+        "Choose the computation precision of flashinfer mxfp4 moe",
+    ] = "default"
+    deepep_mode: A[
+        Literal["auto", "normal", "low_latency"],
+        "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+    ] = "auto"
+    deepep_dispatcher_output_dtype: A[
+        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        "Select DeepEP dispatcher output dtype",
+    ] = "auto"
+    ep_num_redundant_experts: A[
+        int,
+        "Allocate this number of redundant experts in expert parallel.",
+    ] = 0
+    ep_dispatch_algorithm: A[
+        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        "The algorithm to choose ranks for redundant experts in expert parallel.",
+    ] = None
+    init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
+    enable_eplb: A[bool, "Enable EPLB algorithm"] = False
+    eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
+    eplb_rebalance_num_iterations: A[
+        int,
+        "Number of iterations to automatically trigger a EPLB re-balance.",
+    ] = 1000
+    eplb_rebalance_layers_per_chunk: A[
+        Optional[int],
+        "Number of layers to rebalance per forward pass.",
+    ] = None
+    eplb_min_rebalancing_utilization_threshold: A[
+        float,
+        "Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
+    ] = 1.0
+    expert_distribution_recorder_mode: A[
+        Optional[Literal["stat", "stat_approx", "per_pass", "per_token"]],
+        "Mode of expert distribution recorder.",
+    ] = None
+    expert_distribution_recorder_buffer_size: A[
+        Optional[int],
+        "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+    ] = None
+    enable_expert_distribution_metrics: A[
+        bool,
+        "Enable logging metrics for expert balancedness",
+    ] = False
+    deepep_config: A[
+        Optional[str],
+        "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+    ] = None
+    moe_dense_tp_size: A[
+        Optional[int],
+        "TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+    ] = None
+    elastic_ep_backend: A[
+        Literal[None, "mooncake", "nixl"],
+        Arg(
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
+            choices=["none", "mooncake", "nixl"],
+        ),
+    ] = None
+    enable_elastic_expert_backup: A[bool, "Enable elastic expert backup feature."] = (
+        False
+    )
+    mooncake_ib_device: A[
+        Optional[str],
+        "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+    ] = None
+    enable_deepep_waterfill: A[
+        bool,
+        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+    ] = False
+    elastic_ep_rejoin: A[
+        bool,
+        "Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+    ] = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: A[
+        bool,
+        "Disables quantize before all-gather for flashinfer cutlass moe.",
+    ] = False
+    disable_shared_experts_fusion: A[
+        bool,
+        "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+    ] = False
+    enforce_shared_experts_fusion: A[
+        bool,
+        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Mamba cache and linear attn
+    # -------------------------------------------------------------------------
+    max_mamba_cache_size: A[Optional[int], "The maximum size of the mamba cache."] = (
+        None
+    )
+    mamba_ssm_dtype: A[
+        Optional[str],
+        Arg(
+            help="The data type of the SSM states in mamba cache. If not set, will be read from model config (mamba_ssm_dtype).",
+            choices=["float32", "bfloat16", "float16"],
+        ),
+    ] = None
+    mamba_full_memory_ratio: A[
+        float,
+        "The ratio of mamba state memory to full kv cache memory.",
+    ] = 0.9
+    mamba_radix_cache_strategy: A[
+        str,
+        Arg(
+            help="The strategy to use for mamba radix cache.",
+            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+        ),
+    ] = "auto"
+    mamba_track_interval: A[
+        int,
+        "The interval to track the mamba state during decode.",
+    ] = 256
+    enable_int8_mamba_checkpoint: A[
+        bool,
+        "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+    ] = False
+    int8_mamba_ckpt_size: A[
+        Optional[int],
+        "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",
+    ] = None
+    linear_attn_backend: A[
+        str,
+        Arg(
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+    ] = "triton"
+    linear_attn_decode_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+    ] = None
+    linear_attn_prefill_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+    ] = None
+    # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
+    # ring + periodic flush to cut per-step HBM state traffic.
+    enable_linear_replayssm: A[
+        bool,
+        "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
+        "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
+        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
+        "is numerically correct, but KDA decode is SLOWER than the packed "
+        "baseline (the per-K g_cache is K x larger and the reconstruction "
+        "refolds the per-K decay every step), so it is not recommended for KDA "
+        "models. Requires the Triton linear-attn decode backend and "
+        "--mamba-scheduler-strategy no_buffer (the default).",
+    ] = False
+    linear_replayssm_cache_len: A[
+        int,
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+    ] = 16
+
+    # -------------------------------------------------------------------------
+    # Hierarchical cache
+    # -------------------------------------------------------------------------
+    enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    hicache_ratio: A[
+        float,
+        "The ratio of the size of host KV cache memory pool to the size of device pool.",
+    ] = 2.0
+    hicache_size: A[
+        int,
+        "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+    ] = 0
+    hicache_write_policy: A[
+        str,
+        Arg(
+            help="The write policy of hierarchical cache.",
+            choices=["write_back", "write_through", "write_through_selective"],
+        ),
+    ] = "write_through"
+    hicache_io_backend: A[
+        str,
+        Arg(
+            help="The IO backend for KV cache transfer between CPU and GPU",
+            choices=["direct", "kernel", "kernel_ascend"],
+        ),
+    ] = "kernel"
+    hicache_mem_layout: A[
+        str,
+        Arg(
+            help="The layout of host memory pool for hierarchical cache.",
+            choices=[
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_first_kv_split",
+                "page_head",
+            ],
+        ),
+    ] = "page_first"
+    hicache_storage_backend: A[
+        Optional[str],
+        Arg(
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            choices=[
+                "file",
+                "mooncake",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "simm",
+            ],
+        ),
+    ] = None
+    hicache_storage_prefetch_policy: A[
+        str,
+        Arg(
+            help="Control when prefetching from the storage backend should stop.",
+            choices=["best_effort", "wait_complete", "timeout"],
+        ),
+    ] = "timeout"
+    hicache_storage_backend_extra_config: A[
+        Optional[str],
+        "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Hierarchical sparse attention
+    # -------------------------------------------------------------------------
+    enable_hisparse: A[bool, "Enable hierarchical sparse attention"] = False
+    hisparse_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            aliases=["--hierarchical-sparse-attention-extra-config"],
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # LMCache
+    # -------------------------------------------------------------------------
+    enable_lmcache: A[
+        bool,
+        "Using LMCache as an alternative hierarchical cache solution",
+    ] = False
+    lmcache_config_file: A[
+        Optional[str],
+        "Path to the LMCache YAML configuration file",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Ktransformers/AMX expert parallelism
+    # -------------------------------------------------------------------------
+    kt_weight_path: A[
+        Optional[str],
+        "[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+    ] = None
+    kt_method: A[
+        str,
+        "[ktransformers parameter] Quantization formats for CPU execution.",
+    ] = "AMXINT4"
+    kt_cpuinfer: A[
+        Optional[int],
+        "[ktransformers parameter] The number of CPUInfer threads.",
+    ] = None
+    kt_threadpool_count: A[
+        int,
+        "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+    ] = 2
+    kt_num_gpu_experts: A[
+        Optional[int],
+        "[ktransformers parameter] The number of GPU experts.",
+    ] = None
+    kt_max_deferred_experts_per_token: A[
+        Optional[int],
+        "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Diffusion LLM
+    # -------------------------------------------------------------------------
+    dllm_algorithm: A[
+        Optional[str],
+        "The diffusion LLM algorithm, such as LinearSpec or FastDiffuser.",
+    ] = None
+    dllm_algorithm_config: A[
+        Optional[str],
+        "The diffusion LLM algorithm configurations. Must be a YAML file.",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Offloading
+    # -------------------------------------------------------------------------
+    cpu_offload_gb: A[int, "How many GBs of RAM to reserve for CPU offloading."] = 0
+    offload_group_size: A[int, "Number of layers per group in offloading."] = -1
+    offload_num_in_group: A[
+        int,
+        "Number of layers to be offloaded within a group.",
+    ] = 1
+    offload_prefetch_step: A[int, "Steps to prefetch in offloading."] = 1
+    offload_mode: A[str, "Mode of offloading."] = "cpu"
+
+    # -------------------------------------------------------------------------
     # Cuda graphs
     # -------------------------------------------------------------------------
     cuda_graph_config: A[
@@ -6654,39 +7172,56 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
-        # resolution moved to the pipeline: arg_groups/overrides.py
-        # _dllm_attention_backend, invoked below at its legacy slot).
+
+        from sglang.srt.dllm.config import DllmConfig
+
+        config = DllmConfig.from_server_args(self)
+        cuda_graph_config = self.cuda_graph_config
+        cuda_graph_enabled = (
+            cuda_graph_config is not None
+            and cuda_graph_config.decode.backend != Backend.DISABLED
+        )
+
+        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            if (
-                self.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            if cuda_graph_config is not None and (
+                cuda_graph_config.decode.backend != Backend.DISABLED
+                or cuda_graph_config.prefill.backend != Backend.DISABLED
             ):
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-
-        from sglang.srt.arg_groups.overrides import (
-            _dllm_attention_backend,
-            _dllm_overlap_disable,
-            run_post_process_pass,
-        )
-
-        run_post_process_pass(self, _dllm_attention_backend)
-        run_post_process_pass(self, _dllm_overlap_disable)
-
-        # The page-size alignment + block-size cap for dllm moved to the
-        # resolution pipeline (arg_groups/overrides.py: _dllm_page_size).
-        # Invoked outside the radix gate: the alignment fill keeps its radix
-        # gate inside the pass, the block-size cap applies regardless (it
-        # replaces the unconditional scheduler-init fallback).
-        from sglang.srt.arg_groups.overrides import _dllm_page_size
-
-        run_post_process_pass(self, _dllm_page_size)
+                cuda_graph_config.decode.backend = Backend.DISABLED
+                cuda_graph_config.prefill.backend = Backend.DISABLED
+            if self.attention_backend not in ["triton", "aiter"]:
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                )
+                self.attention_backend = "triton"
+        elif is_npu():
+            if self.attention_backend != "ascend":
+                logger.warning(
+                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
+                )
+                self.attention_backend = "ascend"
+        elif cuda_graph_enabled:
+            if self.attention_backend != "flashinfer":
+                logger.warning(
+                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                )
+                self.attention_backend = "flashinfer"
+        if not self.disable_overlap_schedule:
+            logger.warning(
+                "Overlap schedule is disabled because of using diffusion LLM inference"
+            )
+            self.disable_overlap_schedule = True
 
         if not self.disable_radix_cache:
+            if self.page_size % config.block_size != 0:
+                logger.warning(
+                    f"Setting page size to {config.block_size} for diffusion LLM inference"
+                )
+                self.page_size = config.block_size
             if self.enable_hierarchical_cache:
                 logger.warning(
                     "Hierarchical cache is disabled because of using diffusion LLM inference"

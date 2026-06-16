@@ -128,6 +128,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.is_dllm = False
 
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.LAST

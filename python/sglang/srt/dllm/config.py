@@ -12,14 +12,18 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
-        first_done_first_out_mode: bool = False,
+        max_steps: int,
+        causal_context: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
-        self.first_done_first_out_mode = first_done_first_out_mode
+        self.max_steps = max_steps
+        # Causal prefix KV for Nemotron diffusion-style instruct models.
+        # Off for bidirectional-prefix models such as LLaDA2.
+        self.causal_context = causal_context
 
     @staticmethod
     def from_server_args(
@@ -37,6 +41,8 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DiffEncoderModel": {"block_size": 32, "mask_id": 151662},
+            "NemotronLabsDiffusionModel": {"block_size": 32, "mask_id": 100},
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -46,12 +52,6 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
-
-        max_running_requests = (
-            1
-            if server_args.max_running_requests is None
-            else server_args.max_running_requests
-        )
 
         algorithm_config = {}
         if server_args.dllm_algorithm_config is not None:
@@ -63,10 +63,16 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
-
-            # Parse common algorithm configurations
+                algorithm_config = yaml.safe_load(f) or {}
             block_size = algorithm_config.get("block_size", block_size)
+
+        max_steps = algorithm_config.get("max_steps", block_size)
+        causal_context = algorithm_config.get("causal_context", False)
+
+        if server_args.max_running_requests is not None:
+            max_running_requests = server_args.max_running_requests
+        else:
+            max_running_requests = 1
 
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
@@ -74,5 +80,6 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
-            first_done_first_out_mode=server_args.dllm_fdfo,
+            max_steps=max_steps,
+            causal_context=causal_context,
         )
