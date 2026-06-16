@@ -22,10 +22,10 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
-plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
-dispatch are inherited unchanged from the parent.
+Subclasses :class:`TRTLLMMLABackend` and overrides the kernel dispatch plus
+tokenspeed-specific prefill Q/K/V preparation. Metadata, KV-cache layout,
+CUDA-graph plumbing, draft-extend padding, and chunked-prefix dispatch are
+inherited unchanged from the parent.
 """
 
 import logging
@@ -87,7 +87,7 @@ def _get_tokenspeed_workspace(
 # once the same CuteDSL kernels in flashinfer_trtllm are stable
 # and there is no performance gap compared to this backend.
 class TokenspeedMLABackend(TRTLLMMLABackend):
-    """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
+    """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100)."""
 
     def __init__(
         self,
@@ -103,9 +103,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
         )
 
-        if self.data_type != torch.float8_e4m3fn:
+        if self.data_type not in (torch.float8_e4m3fn, torch.bfloat16, torch.float16):
             raise ValueError(
-                "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
+                "tokenspeed_mla backend requires --kv-cache-dtype "
+                "fp8_e4m3, bf16, bfloat16, or fp16, "
                 f"got data_type={self.data_type}."
             )
         if self.page_size not in (32, 64):
@@ -134,9 +135,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     # branch, which always asks for the LSE.
                     if is_causal is False and return_lse is False:
                         continue
-                    # Runtime feeds fp8_e4m3fn q/k/v
+                    # Runtime feeds self.data_type q/k/v
                     config = (
-                        torch.float8_e4m3fn,
+                        self.data_type,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -147,7 +148,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     if config in _compiled_kernels:
                         continue
                     _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.float8_e4m3fn,
+                        self.data_type,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -224,39 +225,54 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         layer: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
+        """Build Q/K/V for the FMHA kernel and write the MLA KV cache."""
         kv = layer.kv_b_proj(kv_a)[0]
         kv = kv.view(
             -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
         )
         k_nope = kv[..., : layer.qk_nope_head_dim]
-        v_bf16 = kv[..., layer.qk_nope_head_dim :]
+        v = kv[..., layer.qk_nope_head_dim :]
         q_nope = q[..., : layer.qk_nope_head_dim]
 
-        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-            positions=positions,
-            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
-            qk_nope_head_dim=layer.qk_nope_head_dim,
-            qk_rope_head_dim=layer.qk_rope_head_dim,
-        )
-        v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
+        if self.data_type == torch.float8_e4m3fn:
+            q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+                q_nope=q_nope,
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+                positions=positions,
+                is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+                qk_nope_head_dim=layer.qk_nope_head_dim,
+                qk_rope_head_dim=layer.qk_rope_head_dim,
+            )
+            v_fp8 = fp8_quantize(v, enable_pdl=is_arch_support_pdl())
 
-        # k_pe is shared across heads (RoPE is position-only), so head 0
-        # reproduces the original [tokens, 1, qk_rope] latent layout.
-        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
-        k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+            # k_pe is shared across heads (RoPE is position-only), so head 0
+            # reproduces the original [tokens, 1, qk_rope] latent layout.
+            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
+            k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer.attn_mha,
+                forward_batch.out_cache_loc,
+                kv_a_fp8.unsqueeze(1),
+                k_pe_fp8,
+            )
+            return q_fp8, k_fp8, v_fp8
+
+        if layer.rotary_emb is not None:
+            q_pe, k_pe = layer.rotary_emb(positions, q_pe, k_pe)
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,
-            kv_a_fp8.unsqueeze(1),
-            k_pe_fp8,
+            kv_a.unsqueeze(1),
+            k_pe,
         )
-        return q_fp8, k_fp8, v_fp8
+        q_out = torch.cat([q_nope, q_pe], dim=-1).to(self.data_type)
+        k_out = torch.cat(
+            [k_nope, k_pe.expand(-1, layer.num_local_heads, -1)], dim=-1
+        ).to(self.data_type)
+        return q_out, k_out, v.to(self.data_type).contiguous()
 
     def pack_prefix_chunk_kv(
         self,
@@ -264,9 +280,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         k_pe: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
-        strided ``v`` into contig FP8 V in a single kernel.
-        """
+        """Pack strided ``k_nope``+``k_pe`` and match the backend KV dtype."""
+        if self.data_type != torch.float8_e4m3fn:
+            if k_pe.dim() == 2:
+                k_pe = k_pe.unsqueeze(1)
+            return (
+                torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1).to(
+                    self.data_type
+                ),
+                v.to(self.data_type).contiguous(),
+            )
         return mla_kv_pack_quantize_fp8(
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
@@ -280,8 +303,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         max_seq_len: int,
         layer: RadixAttention,
     ) -> torch.Tensor:
-        k_scale = getattr(layer, "k_scale_float", None)
-        if k_scale is None:
+        if self.data_type == torch.float8_e4m3fn:
+            k_scale = getattr(layer, "k_scale_float", None)
+            if k_scale is None:
+                k_scale = 1.0
+        else:
             k_scale = 1.0
         softmax_scale = float(layer.scaling) * float(k_scale)
         output_scale = float(k_scale)
