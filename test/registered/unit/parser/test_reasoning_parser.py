@@ -2,6 +2,7 @@
 
 import unittest
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
@@ -15,7 +16,6 @@ from sglang.srt.parser.reasoning_parser import (
     ReasoningParser,
     StreamingParseResult,
 )
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
