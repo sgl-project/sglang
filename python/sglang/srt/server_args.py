@@ -701,7 +701,7 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
-    hicache_mem_layout: str = "layer_first"
+    hicache_mem_layout: str = "page_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -763,18 +763,14 @@ class ServerArgs:
     cuda_graph_bs_decode: Optional[List[int]] = None
     cuda_graph_bs_prefill: Optional[List[int]] = None
     cuda_graph_tc_compiler: Optional[Literal["eager", "inductor"]] = None
+    # Boolean per-phase off-switches; convenience for
+    # --cuda-graph-backend-{prefill,decode}=disabled.
+    disable_prefill_cuda_graph: bool = False
+    disable_decode_cuda_graph: bool = False
 
     # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
-    disable_prefill_cuda_graph: bool = False
-    disable_decode_cuda_graph: bool = False
-    prefill_cuda_graph_backend: Optional[
-        Literal["breakable", "tc_piecewise", "disabled"]
-    ] = None
-    decode_cuda_graph_backend: Optional[
-        Literal["full", "breakable", "tc_piecewise", "disabled"]
-    ] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1414,15 +1410,13 @@ class ServerArgs:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
 
-        # ---- Legacy convenience flags ----
+        # ---- Boolean per-phase off-switches ----
+        # Below the explicit backend selectors so --cuda-graph-backend-*
+        # wins if both are given.
         if self.disable_prefill_cuda_graph:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
         if self.disable_decode_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
-        if self.prefill_cuda_graph_backend is not None:
-            _set(Phase.PREFILL, "backend", self.prefill_cuda_graph_backend)
-        if self.decode_cuda_graph_backend is not None:
-            _set(Phase.DECODE, "backend", self.decode_cuda_graph_backend)
 
         # ---- Per-phase convenience flags ----
         if self.cuda_graph_backend_decode is not None:
@@ -1776,14 +1770,6 @@ class ServerArgs:
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
-
-            if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
-                    reserved_mem += 6 * 1024
-                elif self.speculative_algorithm not in {"NGRAM", "DFLASH"}:
-                    # eagle draft models and cuda graphs
-                    reserved_mem += 4 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -2432,14 +2418,29 @@ class ServerArgs:
                 )
 
             if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
-                )
+                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                    raise ValueError(
+                        "Hierarchical cache for MiMoV2 requires the unified "
+                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
+                        "to enable --enable-hierarchical-cache for this model."
+                    )
+
+                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
+                # asymmetric K/V allocation. Only the kernel/page_first transfer
+                # path has a safe split K/V implementation.
+                if self.hicache_io_backend != "kernel":
+                    logger.warning(
+                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
+                        f"(was {self.hicache_io_backend!r})."
+                    )
+                    self.hicache_io_backend = "kernel"
+                if self.hicache_mem_layout != "page_first":
+                    logger.warning(
+                        f"Force hicache_mem_layout to 'page_first' for "
+                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
+                        f"asymmetric K/V HiCache requires kernel/page_first."
+                    )
+                    self.hicache_mem_layout = "page_first"
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -3986,8 +3987,6 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
-        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
-        4) Re-run step (1) if step (3) changed I/O backend.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -4001,13 +4000,6 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
-
-        # Step 3: IO-decode backend compatibility (may change io backend).
-        io_changed = self._resolve_io_decode_attention_compatibility()
-
-        # Step 4: Re-normalize layout after io backend changes.
-        if io_changed:
-            self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -4048,41 +4040,6 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
-
-    def _resolve_io_decode_attention_compatibility(self) -> bool:
-        if self.hicache_io_backend != "kernel":
-            return False
-
-        # Only patch settings when the effective decode backend is FA3.
-        effective_decode_backend = (
-            self.decode_attention_backend or self.attention_backend
-        )
-        if effective_decode_backend != "fa3":
-            return False
-
-        if self.decode_attention_backend is not None:
-            self.hicache_io_backend = "direct"
-            logger.warning(
-                "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-            )
-            return True
-
-        # If decode backend is implicit, pick a safe backend without changing io backend.
-        if not self.use_mla_backend():
-            # FlashInfer does not support attention sinks.
-            if (
-                is_flashinfer_available()
-                and not self.get_model_config().has_attention_sinks
-            ):
-                self.decode_attention_backend = "flashinfer"
-            else:
-                self.decode_attention_backend = "triton"
-        else:
-            self.decode_attention_backend = (
-                "flashinfer" if is_sm100_supported() else "triton"
-            )
-        return False
 
     def _handle_load_format(self):
         if (
@@ -4352,6 +4309,11 @@ class ServerArgs:
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
                 self.enable_dynamic_batch_tokenizer = False
+
+            logger.info(
+                "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
+                "and min_new_tokens are unavailable."
+            )
 
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -4679,6 +4641,14 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
+
+            # Validate preferred_sampling_params doesn't use tokenizer-dependent features
+            if self.skip_tokenizer_init:
+                from sglang.srt.sampling.sampling_params import SamplingParams
+
+                test_params = SamplingParams(**self.preferred_sampling_params)
+                # raises if tokenizer-dependent features used
+                test_params.normalize(None)
 
     def _handle_crash_dump_env(self):
         if not self.crash_dump_folder:
@@ -6796,6 +6766,18 @@ class ServerArgs:
             default=ServerArgs.cuda_graph_tc_compiler,
             help="Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
         )
+        parser.add_argument(
+            "--disable-prefill-cuda-graph",
+            action="store_true",
+            help="Disable the prefill-phase CUDA graph. Convenience for "
+            "--cuda-graph-backend-prefill=disabled.",
+        )
+        parser.add_argument(
+            "--disable-decode-cuda-graph",
+            action="store_true",
+            help="Disable the decode-phase CUDA graph. Convenience for "
+            "--cuda-graph-backend-decode=disabled.",
+        )
 
         # --- CUDA graph: debug / profiling flags -------------------------
         parser.add_argument(
@@ -6853,34 +6835,6 @@ class ServerArgs:
             const_value=Backend.BREAKABLE,
             new_flag="--cuda-graph-backend-prefill=breakable",
             help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
-        )
-        parser.add_argument(
-            "--prefill-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-backend-prefill",
-            help="Deprecated alias for --cuda-graph-backend-prefill.",
-        )
-        parser.add_argument(
-            "--decode-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-backend-decode",
-            help="Deprecated alias for --cuda-graph-backend-decode.",
-        )
-        parser.add_argument(
-            "--disable-prefill-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated. Use --cuda-graph-backend-prefill=disabled instead.",
-        )
-        parser.add_argument(
-            "--disable-decode-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-decode=disabled",
-            help="Deprecated. Use --cuda-graph-backend-decode=disabled instead.",
         )
         parser.add_argument(
             "--disable-piecewise-cuda-graph",
@@ -7389,7 +7343,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",

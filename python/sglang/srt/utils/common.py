@@ -782,6 +782,22 @@ def set_random_seed(seed: int) -> None:
         torch.xpu.manual_seed_all(seed)
 
 
+_mm_http_session = threading.local()
+
+
+def get_mm_http_session() -> requests.Session:
+    """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
+    connections. Pid-checked so a forked worker rebuilds its own, not the parent's.
+    """
+    pid = os.getpid()
+    session = getattr(_mm_http_session, "session", None)
+    if session is None or getattr(_mm_http_session, "pid", None) != pid:
+        session = requests.Session()
+        _mm_http_session.session = session
+        _mm_http_session.pid = pid
+    return session
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -797,7 +813,7 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with requests.get(audio_file, timeout=timeout) as response:
+        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
             response.raise_for_status()
             source = response.content
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
@@ -958,7 +974,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        response = get_mm_http_session().get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
             result = response.content
@@ -990,9 +1006,11 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(video_file, stream=True, timeout=timeout)
-            response.raise_for_status()
-            return response.content
+            with get_mm_http_session().get(
+                video_file, stream=True, timeout=timeout
+            ) as response:
+                response.raise_for_status()
+                return response.content
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -3681,6 +3699,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "kv_a_proj_with_mqa",
     "q_b_proj",
     "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
     "gate_proj",
     "up_proj",
     "down_proj",

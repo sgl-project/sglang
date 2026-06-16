@@ -1375,7 +1375,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
-            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
