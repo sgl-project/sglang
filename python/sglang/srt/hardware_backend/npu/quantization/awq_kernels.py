@@ -207,17 +207,17 @@ class AWQAscendMoEKernel:
             self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
         )
 
-        # 2. Scales – transpose to (E, N, groups), register as "weigh_scale"
+        # 2. Scales – transpose to (E, N, groups), register as "weight_scale"
         self._register_or_replace_parameter(
-            layer, "w13_weigh_scale",
+            layer, "w13_weight_scale",
             layer.w13_scales.data.transpose(1, 2).contiguous(),
         )
         self._register_or_replace_parameter(
-            layer, "w2_weigh_scale",
+            layer, "w2_weight_scale",
             layer.w2_scales.data.transpose(1, 2).contiguous(),
         )
 
-        # 3. Offsets – correctly computed from zeros, register as "weigh_offset"
+        # 3. Offsets – correctly computed from zeros, register as "weight_offset"
         for prefix in ("w13", "w2"):
             qzeros = getattr(layer, f"{prefix}_qzeros").data
             scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
@@ -227,7 +227,7 @@ class AWQAscendMoEKernel:
             offset = unpacked_zeros.view(E_z, groups, N_z).permute(0, 2, 1).contiguous()  # (E, N, groups)
             offset = -offset  # kernel expects 8 - zero_point
             self._register_or_replace_parameter(
-                layer, f"{prefix}_weigh_offset",
+                layer, f"{prefix}_weight_offset",
                 offset.to(scales_dtype),
             )
 
