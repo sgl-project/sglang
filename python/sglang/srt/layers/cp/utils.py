@@ -12,19 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Context parallel strategy abstractions."""
+"""Public import facade for context parallel strategy helpers."""
 
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
-    get_cp_strategy,
-    get_cp_strategy_kind,
-    init_cp_strategy,
-    is_cp_enabled,
-    is_interleave,
-    is_zigzag,
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
@@ -46,10 +40,4 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "get_cp_strategy",
-    "get_cp_strategy_kind",
-    "init_cp_strategy",
-    "is_cp_enabled",
-    "is_interleave",
-    "is_zigzag",
 ]

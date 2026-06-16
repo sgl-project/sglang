@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,7 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Interleave context parallel strategy shell."""
+"""Interleave context parallel strategy shell.
+
+For ``cp_size = 4``, each rank owns every fourth token:
+
+    dp_attn_tp0: token0, token4, token8,  token12, token16, ...
+    dp_attn_tp1: token1, token5, token9,  token13, token17, ...
+    dp_attn_tp2: token2, token6, token10, token14, token18, ...
+    dp_attn_tp3: token3, token7, token11, token15, token19, ...
+
+After all-gather, tokens are restored to the original order:
+
+    token0, token1, token2, token3, token4, token5, token6, token7, ...
+"""
 
 from __future__ import annotations
 
@@ -53,18 +65,22 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             bs=len(extend_seqs_len or seqs_len or [num_tokens]),
         )
 
-    def shard_tokens(self, x: Any, forward_batch) -> Any:
+    def shard_hidden_states(self, x: Any, forward_batch) -> Any:
         raise NotImplementedError(
-            "Interleave token sharding will land in a follow-up PR"
+            "Interleave hidden-state sharding will land in a follow-up PR"
         )
 
-    def shard_positions(self, positions: Any, forward_batch) -> Any:
+    def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         raise NotImplementedError(
-            "Interleave position sharding will land in a follow-up PR"
+            "Interleave position-id sharding will land in a follow-up PR"
         )
 
-    def gather_tokens(self, x: Any, forward_batch, stream: Optional[Any] = None) -> Any:
-        raise NotImplementedError("Interleave token gather will land in a follow-up PR")
+    def gather_hidden_states(
+        self, x: Any, forward_batch, stream: Optional[Any] = None
+    ) -> Any:
+        raise NotImplementedError(
+            "Interleave hidden-state gather will land in a follow-up PR"
+        )
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None

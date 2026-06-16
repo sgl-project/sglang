@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,7 +12,21 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Zigzag context parallel strategy shell."""
+"""Zigzag context parallel strategy shell.
+
+For ``cp_size = 4``, each sequence is split into ``2 * cp_size`` blocks. Each
+rank owns one early block and one late block:
+
+    dp_attn_tp0: block0, block7
+    dp_attn_tp1: block1, block6
+    dp_attn_tp2: block2, block5
+    dp_attn_tp3: block3, block4
+
+After all-gather, the blocks are reranged back to their original order:
+
+    block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4
+      -> block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7
+"""
 
 from __future__ import annotations
 
@@ -84,16 +98,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             bs=len(extend_seqs_len or seqs_len or [num_tokens]),
         )
 
-    def shard_tokens(self, x: Any, forward_batch) -> Any:
-        raise NotImplementedError("Zigzag token sharding will land in a follow-up PR")
-
-    def shard_positions(self, positions: Any, forward_batch) -> Any:
+    def shard_hidden_states(self, x: Any, forward_batch) -> Any:
         raise NotImplementedError(
-            "Zigzag position sharding will land in a follow-up PR"
+            "Zigzag hidden-state sharding will land in a follow-up PR"
         )
 
-    def gather_tokens(self, x: Any, forward_batch, stream: Optional[Any] = None) -> Any:
-        raise NotImplementedError("Zigzag token gather will land in a follow-up PR")
+    def shard_position_ids(self, positions: Any, forward_batch) -> Any:
+        raise NotImplementedError(
+            "Zigzag position-id sharding will land in a follow-up PR"
+        )
+
+    def gather_hidden_states(
+        self, x: Any, forward_batch, stream: Optional[Any] = None
+    ) -> Any:
+        raise NotImplementedError(
+            "Zigzag hidden-state gather will land in a follow-up PR"
+        )
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None

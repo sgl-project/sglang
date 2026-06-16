@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,7 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Base types for context parallel strategies."""
+"""Base types and process-wide helpers for context parallel strategies.
+
+The strategy implementation is split across:
+
+* ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
+* ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
+* ``interleave.py``: former round-robin-split strategy and interleave metadata.
+* ``utils.py``: public re-exports for import convenience.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 class ContextParallelStrategyKind(IntEnum):
@@ -56,6 +65,15 @@ class CPAttentionBackendKind(IntEnum):
     """Attention backend calling convention used by CP strategy dispatch."""
 
     FLASH_ATTENTION = 0
+
+    @classmethod
+    def from_string(cls, value: str) -> "CPAttentionBackendKind":
+        if value in ("fa3", "flashinfer"):
+            return cls.FLASH_ATTENTION
+        raise ValueError(
+            f"Unsupported attention_backend={value!r} for CP strategy; expected one "
+            "of {'fa3', 'flashinfer'}"
+        )
 
 
 @dataclass
@@ -97,21 +115,21 @@ class ContextParallelStrategy(ABC):
         """Build per-forward metadata for this strategy."""
 
     @abstractmethod
-    def shard_tokens(self, x: Any, forward_batch: "ForwardBatch") -> Any:
-        """Shard a token-major payload to the current CP rank."""
+    def shard_hidden_states(self, x: Any, forward_batch: "ForwardBatch") -> Any:
+        """Shard hidden states to the current CP rank, usually at the first layer."""
 
     @abstractmethod
-    def shard_positions(self, positions: Any, forward_batch: "ForwardBatch") -> Any:
-        """Shard position payloads to the current CP rank."""
+    def shard_position_ids(self, positions: Any, forward_batch: "ForwardBatch") -> Any:
+        """Shard KV-cache slot position IDs for each token to the current CP rank."""
 
     @abstractmethod
-    def gather_tokens(
+    def gather_hidden_states(
         self,
         x: Any,
         forward_batch: "ForwardBatch",
         stream: Optional[Any] = None,
     ) -> Any:
-        """Gather rank-local token payloads back to full token order."""
+        """Gather rank-local hidden states, usually at the last layer."""
 
     @abstractmethod
     def gather_kv_cache(
@@ -140,10 +158,12 @@ class ContextParallelStrategy(ABC):
     ) -> Optional[Any]:
         """Shard model inputs before model.forward in CP-v2 paths."""
         if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_tokens(input_ids, forward_batch)
-        forward_batch.positions = self.shard_positions(positions, forward_batch)
+            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
+                input_ids, forward_batch
+            )
+        forward_batch.positions = self.shard_position_ids(positions, forward_batch)
         if input_embeds is not None:
-            return self.shard_tokens(input_embeds, forward_batch)
+            return self.shard_hidden_states(input_embeds, forward_batch)
         return None
 
     @abstractmethod
@@ -180,3 +200,81 @@ def _is_dsa_active() -> bool:
         getattr(sa, "enable_prefill_cp", False)
         and getattr(sa, "_is_dsa_model_arch", False)
     )
+
+
+_STRATEGY: Optional[ContextParallelStrategy] = None
+
+
+def init_cp_strategy(server_args: "ServerArgs") -> None:
+    """Bind the configured CP strategy for this process."""
+    global _STRATEGY
+
+    if not getattr(server_args, "enable_prefill_cp", False):
+        _STRATEGY = None
+        return
+
+    cp_size = getattr(server_args, "attn_cp_size", 1)
+    if cp_size <= 1:
+        _STRATEGY = None
+        return
+
+    kind = ContextParallelStrategyKind.from_string(server_args.cp_strategy)
+    if kind == ContextParallelStrategyKind.ZIGZAG:
+        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+
+        _STRATEGY = ZigzagCPStrategy(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.INTERLEAVE:
+        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+
+        _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
+    else:
+        raise ValueError(
+            f"Unsupported cp_strategy kind {kind} for "
+            f"cp_strategy={server_args.cp_strategy!r}"
+        )
+
+
+def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
+    """Return the configured strategy, initializing lazily on first call.
+
+    Subprocesses re-import this module with ``_STRATEGY = None`` and never
+    re-run ``ServerArgs.__post_init__`` because the pickled instance bypasses
+    ``__init__``. Lazy init lets worker processes recover the singleton from
+    global server args.
+    """
+    global _STRATEGY
+
+    if _STRATEGY is None:
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return None
+        if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
+            init_cp_strategy(server_args)
+    return _STRATEGY
+
+
+def get_cp_strategy() -> Optional[ContextParallelStrategy]:
+    """Return the configured CP strategy for runtime dispatch."""
+    return _get_cp_strategy()
+
+
+def get_cp_strategy_kind() -> ContextParallelStrategyKind:
+    strategy = _get_cp_strategy()
+    if strategy is None:
+        return ContextParallelStrategyKind.NONE
+    return strategy.kind
+
+
+def is_cp_enabled() -> bool:
+    return _get_cp_strategy() is not None
+
+
+def is_zigzag() -> bool:
+    return get_cp_strategy_kind() == ContextParallelStrategyKind.ZIGZAG
+
+
+def is_interleave() -> bool:
+    return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
