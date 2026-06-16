@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -1128,7 +1129,12 @@ class ReasoningParser:
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
-            kwargs["force_nonempty_content"] = True
+            # Only a subset of detectors (e.g. Nemotron3, Apertus2509) accept
+            # ``force_nonempty_content``. Forwarding it unconditionally would
+            # raise ``TypeError`` for every other detector, so only pass it
+            # when the selected detector actually declares the parameter.
+            if "force_nonempty_content" in inspect.signature(detector_class).parameters:
+                kwargs["force_nonempty_content"] = True
 
         self.detector = detector_class(**kwargs)
 
