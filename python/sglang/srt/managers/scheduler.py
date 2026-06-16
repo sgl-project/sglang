@@ -217,7 +217,7 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     validate_input_length,
 )
-from sglang.srt.managers.viewable_array import to_array
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -1274,7 +1274,7 @@ class Scheduler(
             for req in batch.reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_input_len
-                fill_ids = req.token_buf.readonly_view()
+                fill_ids = memoryview(req.token_buf).toreadonly()
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
@@ -2208,7 +2208,9 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.get_full_untruncated_fill_ids()[matched_len:]
+                new_input_tokens = to_array(
+                    req.get_full_untruncated_fill_ids()[matched_len:]
+                )
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)

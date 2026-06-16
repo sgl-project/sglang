@@ -22,7 +22,6 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -637,7 +636,7 @@ def bench_cache_finished(
             kv_indices = mr.device_indices
 
         req = env.make_req()
-        req.token_buf = ViewableArray(array("q", seq))
+        req.token_buf = array("q", seq)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q"))
         req.fill_len = len(req.token_buf)

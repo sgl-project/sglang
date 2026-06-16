@@ -166,7 +166,7 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             if ngram_size <= 0 or window_size <= 0:
                 continue
 
-            sequence = req.token_buf.readonly_view()
+            sequence = memoryview(req.token_buf).toreadonly()
             if len(sequence) < ngram_size:
                 continue
 

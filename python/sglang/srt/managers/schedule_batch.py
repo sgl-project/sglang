@@ -73,7 +73,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.viewable_array import ViewableArray, to_array
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -669,7 +669,7 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Union[array[int], ViewableArray],
+        origin_input_ids: Union[array[int], List[int]],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -710,18 +710,17 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.token_buf = (
+        self.token_buf: array[int] = (
             origin_input_ids
-            if isinstance(origin_input_ids, ViewableArray)
-            else ViewableArray(origin_input_ids)
+            if isinstance(origin_input_ids, array)
+            else to_array(origin_input_ids)
         )
         self.origin_input_len: int = len(self.token_buf)
         # Before image padding
-        if origin_input_ids_unpadded:
+        if origin_input_ids_unpadded and origin_input_ids_unpadded is not self.token_buf:
             self.origin_input_ids_unpadded = origin_input_ids_unpadded
         else:
-            assert not isinstance(origin_input_ids, ViewableArray)
-            self.origin_input_ids_unpadded = origin_input_ids
+            self.origin_input_ids_unpadded = to_array(origin_input_ids)
         self.fill_len: int = 0
 
         self.session = session
@@ -1017,11 +1016,11 @@ class Req(ReqDllmMixin):
 
     @property
     def origin_input_ids(self) -> memoryview:
-        return self.token_buf.readonly_view(None, self.origin_input_len)
+        return memoryview(self.token_buf).toreadonly()[: self.origin_input_len]
 
     @property
     def output_ids(self) -> memoryview:
-        return self.token_buf.readonly_view(self.origin_input_len, None)
+        return memoryview(self.token_buf).toreadonly()[self.origin_input_len :]
 
     def append_output_id(self, token_id: int) -> None:
         self.token_buf.append(token_id)
@@ -1030,17 +1029,17 @@ class Req(ReqDllmMixin):
         self.token_buf.extend(token_ids)
 
     def overwrite_output_id(self, offset: int, token_id: int) -> None:
-        self.token_buf.overwrite(self.origin_input_len + offset, token_id)
+        self.token_buf[self.origin_input_len + offset] = token_id
 
     def truncate_output_ids(self, length: int) -> None:
-        self.token_buf.truncate(self.origin_input_len + length)
+        del self.token_buf[self.origin_input_len + length :]
 
     def reset_output_ids(self) -> None:
-        self.token_buf.truncate(self.origin_input_len)
+        del self.token_buf[self.origin_input_len :]
 
     def rebuild_origin_input_ids(self, new_origin_input_ids: Iterable[int]) -> None:
         assert self.origin_input_len == len(self.token_buf)
-        self.token_buf = ViewableArray(new_origin_input_ids)
+        self.token_buf = to_array(new_origin_input_ids)
         self.origin_input_len = len(self.token_buf)
 
     @property
@@ -1122,15 +1121,15 @@ class Req(ReqDllmMixin):
 
     def get_full_untruncated_fill_ids(self) -> Union[memoryview, array]:
         if self.is_dllm():
-            ids = self.token_buf.materialize()
+            ids = self.token_buf[:]
             ids += array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
             return ids
-        return self.token_buf.readonly_view()
+        return memoryview(self.token_buf).toreadonly()
 
     def get_fill_ids_sliced(self, slice_len: int) -> array:
         if self.is_dllm():
             return to_array(self.get_full_untruncated_fill_ids()[:slice_len])
-        return self.token_buf.materialize(0, slice_len)
+        return self.token_buf[:slice_len]
 
     def get_fill_ids(self) -> array:
         return self.get_fill_ids_sliced(self.fill_len)

@@ -24,7 +24,7 @@ def compute_req_all_ids_info(
         flattened ``cat(r.origin_input_ids, r.output_ids) for r in reqs``; ``lens`` is
         per-req ``len(origin_input_ids) + len(output_ids)``.
     """
-    parts = [req.token_buf.materialize() for req in reqs]
+    parts = [req.token_buf[:] for req in reqs]
     req_all_ids_flat = flatten_arrays_to_int64_tensor(
         parts, device=torch.device("cpu"), pin=True
     )

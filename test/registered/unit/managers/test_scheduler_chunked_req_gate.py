@@ -14,7 +14,6 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -30,7 +29,7 @@ def _make_req(
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
-    req.token_buf = ViewableArray(array("q", fill_ids))
+    req.token_buf = array("q", fill_ids)
     req.origin_input_len = len(req.token_buf)
     req.fill_len = fill_len
     req.prefix_indices = prefix_indices

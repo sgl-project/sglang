@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.managers.viewable_array import to_array
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -198,14 +198,14 @@ class Session:
                 input_ids = last_req.token_buf
                 input_ids_unpadded = last_req.origin_input_ids_unpadded
             else:
-                input_ids = last_req.token_buf.clone()
+                input_ids = last_req.token_buf[:]
                 input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
 
             keep_len = last_req.origin_input_len + kept_output_len
             if session_params.offset and session_params.offset != 0:
                 keep_len = min(session_params.offset, keep_len)
 
-            input_ids.truncate(keep_len)
+            del input_ids[keep_len:]
             input_ids.extend(req.input_ids)
 
             input_ids_unpadded.extend(kept_output)

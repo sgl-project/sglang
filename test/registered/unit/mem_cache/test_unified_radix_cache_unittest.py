@@ -21,7 +21,6 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -887,7 +886,7 @@ class UnifiedRadixCacheSuite:
         req = self._make_req(req_to_token_pool)
         input_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 1)
-        req.token_buf = ViewableArray(array("q", input_ids))
+        req.token_buf = array("q", input_ids)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q", output_ids))
         kv_len = len(input_ids) + len(output_ids)
@@ -919,7 +918,7 @@ class UnifiedRadixCacheSuite:
         req = self._make_req(req_to_token_pool)
         prompt_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 7)
-        req.token_buf = ViewableArray(array("q", prompt_ids))
+        req.token_buf = array("q", prompt_ids)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q", output_ids))
         req.fill_len = len(req.token_buf)
@@ -966,7 +965,7 @@ class UnifiedRadixCacheSuite:
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 2)
-        req.token_buf = ViewableArray(array("q", tokens))
+        req.token_buf = array("q", tokens)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q"))
         kv_len = len(tokens)
@@ -992,7 +991,7 @@ class UnifiedRadixCacheSuite:
 
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 3)
-        req.token_buf = ViewableArray(array("q", tokens))
+        req.token_buf = array("q", tokens)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q"))
         req.fill_len = len(req.token_buf)
@@ -1119,7 +1118,7 @@ class UnifiedRadixCacheSuite:
         tail_extra = ps // 2
         input_ids = self._make_seq(1, 1) + list(range(8000, 8000 + tail_extra))
         req = self._make_req(req_to_token_pool)
-        req.token_buf = ViewableArray(array("q", input_ids))
+        req.token_buf = array("q", input_ids)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend(array("q"))
         kv_len = len(input_ids)
@@ -1543,7 +1542,7 @@ class UnifiedRadixCacheSuite:
         pre_len = 20
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, pre_len)
-        req.token_buf = ViewableArray(array("q", tokens))
+        req.token_buf = array("q", tokens)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend([])
         req.fill_len = len(req.token_buf)
@@ -1595,7 +1594,7 @@ class UnifiedRadixCacheSuite:
         pre_len = cushion  # exactly at the boundary, nothing slid out
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, pre_len)
-        req.token_buf = ViewableArray(array("q", tokens))
+        req.token_buf = array("q", tokens)
         req.origin_input_len = len(req.token_buf)
         req.token_buf.extend([])
         req.fill_len = len(req.token_buf)
