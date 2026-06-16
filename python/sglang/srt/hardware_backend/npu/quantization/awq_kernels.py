@@ -135,76 +135,95 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None, use_unquantized: bool = False):
         self.quant_config = quant_config
+        self.use_unquantized = use_unquantized
+        if not use_unquantized:
+            self.w13_kernel = NPUW4A16Int4MoEMethod()
+            self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # ----- 1. Quantized path (as before) -----
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-        w13_qzeros_list = []
-        w2_qzeros_list = []
+        # Capture original AWQ tensors (before any modification)
+        w13_qweight_orig = layer.w13_qweight.data
+        w13_qzeros_orig  = layer.w13_qzeros.data
+        w13_scales_orig  = layer.w13_scales.data
+
+        w2_qweight_orig = layer.w2_qweight.data
+        w2_qzeros_orig  = layer.w2_qzeros.data
+        w2_scales_orig  = layer.w2_scales.data
+
+        # Packing function (quantized path)
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            w13_qzeros_list.append(
-                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w2_qzeros_list.append(
-                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
+        pack_factor = self.quant_config.pack_factor
 
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
+        def pack_one(qweight, qzeros):
+            qweight = qweight.to(torch.int32)
+            qzeros = qzeros.to(torch.int32)
+            qweight_tmp = torch.zeros_like(qweight)
+            qzeros_list = []
+            for i in range(pack_factor):
+                shift_num = shifts[i] * 4
+                qzeros_list.append((qzeros.reshape(-1, 1) >> shift_num) & 0xF)
+                qweight_tmp.bitwise_or_(
+                    ((qweight >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
+                )
+            qweight_tmp.bitwise_xor_(0x88888888)
+            qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros.shape[0], qzeros.shape[1], -1)
+            qzeros_tmp = -(qzeros_tmp - 8)
+            qzeros_tmp = qzeros_tmp.to(qweight.device)
+            return qweight_tmp, qzeros_tmp
 
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
-            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
-        )
-        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
-            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
-        )
-        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+        w13_qweight_packed, w13_qzeros_packed = pack_one(w13_qweight_orig, w13_qzeros_orig)
+        w2_qweight_packed, w2_qzeros_packed = pack_one(w2_qweight_orig, w2_qzeros_orig)
 
-        layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
+        # Cast offsets to scale dtype
+        w13_qzeros_packed = w13_qzeros_packed.to(w13_scales_orig.dtype)
+        w2_qzeros_packed   = w2_qzeros_packed.to(w2_scales_orig.dtype)
 
-        # ----- 2. Unquantized path: dequantize to FP -----
-        if True:
-            self._dequantize_and_store(layer, prefix="w13")
-            self._dequantize_and_store(layer, prefix="w2")
+        if self.use_unquantized:
+            # Dequantize using the original tensors (before they are overwritten)
+            self._dequantize_and_store(
+                layer,
+                prefix="w13",
+                qweight=w13_qweight_orig,
+                qzeros=w13_qzeros_orig,
+                scales=w13_scales_orig,
+            )
+            self._dequantize_and_store(
+                layer,
+                prefix="w2",
+                qweight=w2_qweight_orig,
+                qzeros=w2_qzeros_orig,
+                scales=w2_scales_orig,
+            )
+            # Delete original AWQ tensors and packed versions to free memory
+            del w13_qweight_orig, w13_qzeros_orig, w13_scales_orig
+            del w2_qweight_orig, w2_qzeros_orig, w2_scales_orig
+            del w13_qweight_packed, w13_qzeros_packed
+            del w2_qweight_packed, w2_qzeros_packed
+            # Remove scales from the layer (they are no longer needed)
             if hasattr(layer, "w13_scales"):
                 delattr(layer, "w13_scales")
             if hasattr(layer, "w2_scales"):
                 delattr(layer, "w2_scales")
-            if hasattr(layer, "w13_qzeros"):
-                delattr(layer, "w13_qzeros")
-            if hasattr(layer, "w2_qzeros"):
-                delattr(layer, "w2_qzeros")
+            # Remove original packed tensors if they still exist (they were not overwritten)
             if hasattr(layer, "w13_qweight"):
                 delattr(layer, "w13_qweight")
+            if hasattr(layer, "w13_qzeros"):
+                delattr(layer, "w13_qzeros")
             if hasattr(layer, "w2_qweight"):
                 delattr(layer, "w2_qweight")
+            if hasattr(layer, "w2_qzeros"):
+                delattr(layer, "w2_qzeros")
+        else:
+            # Quantized path: register the packed versions
+            self._register_or_replace_parameter(layer, "w13_qweight", w13_qweight_packed)
+            self._register_or_replace_parameter(layer, "w13_qzeros", w13_qzeros_packed)
+            self._register_or_replace_parameter(layer, "w2_qweight", w2_qweight_packed)
+            self._register_or_replace_parameter(layer, "w2_qzeros", w2_qzeros_packed)
+            # Scales remain unchanged
+            del w13_qweight_orig, w13_qzeros_orig, w13_scales_orig
+            del w2_qweight_orig, w2_qzeros_orig, w2_scales_orig
 
         torch.npu.empty_cache()
         if hasattr(layer, "dispatcher"):
@@ -218,18 +237,18 @@ class AWQAscendMoEKernel:
         # Ensure integer types for bitwise operations
         qweight = qweight.to(torch.int32)
         qzeros = qzeros.to(torch.int32)
-    
+
         E, K, N_packed = qweight.shape
         N = N_packed * 8
         groups = scales.shape[1]
         group_size = K // groups
         assert K % groups == 0, f"K={K} not divisible by groups={groups}"
-    
+
         # Output tensor: (E, N, K) so that matmul can be (1, K) x (K, N) -> (1, N)
         fp_weight = torch.empty((E, N, K), dtype=torch.bfloat16, device=qweight.device)
-    
+
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-    
+
         for e in range(E):
             # Unpack weight
             qw_e = qweight[e]                         # (K, N_packed)
@@ -238,7 +257,7 @@ class AWQAscendMoEKernel:
                 nib = (qw_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 w_int8[:, i::8] = signed
-    
+
             # Unpack zeros
             qz_e = qzeros[e]                          # (groups, N_packed)
             z_int8 = torch.empty((groups, N), dtype=torch.int8, device=qweight.device)
@@ -246,15 +265,21 @@ class AWQAscendMoEKernel:
                 nib = (qz_e >> (s * 4)) & 0xF
                 signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
                 z_int8[:, i::8] = signed
-    
+
             # Expand scales and zeros to (K, N)
             z_exp = z_int8.repeat_interleave(group_size, dim=0)   # (K, N)
             s_exp = scales[e].repeat_interleave(group_size, dim=0) # (K, N)
-    
+
             # Dequantize: (w - z) * scale, then transpose to (N, K)
             w_fp = ((w_int8.float() - z_exp.float()) * s_exp.float()).to(torch.bfloat16)
             fp_weight[e] = w_fp  # (K, N) -> we will transpose later
-    
+
         # Transpose to (E, N, K) for batched matmul: (E, N, K)
         fp_weight = fp_weight.transpose(-1, -2).contiguous()
         setattr(layer, f"{prefix}_weight_fp", torch.nn.Parameter(fp_weight, requires_grad=False))
+
+    def _register_or_replace_parameter(self, layer, name, tensor):
+        if hasattr(layer, name):
+            replace_parameter(layer, name, tensor)
+        else:
+            layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
