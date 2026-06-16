@@ -37,6 +37,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
+        # GDN ReplaySSM (slice 1b): per-bs STATIC per-row write-cursor buffers
+        # for cuda-graph. Allocated lazily in init_cuda_graph_state only when
+        # --enable-gdn-replayssm is set; stays None otherwise.
+        self.replayssm_write_pos_list = None
         self.query_start_loc_list = []
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
@@ -218,6 +222,7 @@ class MambaAttnBackendBase(AttentionBackend):
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
+            in_capture=in_capture,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -369,17 +374,39 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info
         )
 
+    def _replayssm_enabled(self) -> bool:
+        """True iff --enable-gdn-replayssm allocated the persistent ring cursor.
+
+        The per-slot ``replayssm_write_pos`` buffer on MambaPool is None unless
+        the flag is set, so it doubles as the on/off gate (same signal that
+        ``_forward_metadata`` / ``GDNAttnBackend.forward_decode`` already use).
+        """
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return False
+        return getattr(mamba_pool, "replayssm_write_pos", None) is not None
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
+        # GDN ReplaySSM (slice 1b): per-batch-size STATIC per-row write-cursor
+        # buffers the kernel reads. Captured into the graph by pointer, so they
+        # must be the SAME tensor objects refreshed in-place each replay. Sized
+        # and indexed like state_indices_list ((i+1,), indexed [bs - 1]). Left
+        # None when the flag is off so the dispatch falls through unchanged.
+        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if self.replayssm_write_pos_list is not None:
+                self.replayssm_write_pos_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
             self.query_start_loc_list.append(
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -446,6 +473,17 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
+        # GDN ReplaySSM (slice 1b): point at the STATIC per-bs write-cursor
+        # buffer (no advance, no snapshot — capture records the pointer; its
+        # zeros are overwritten in-place by _replay_metadata before each
+        # replay). None when the flag is off. Same per-bs tensor object that
+        # _replay_metadata refreshes, so the captured pointer stays valid.
+        replayssm_write_pos = (
+            self.replayssm_write_pos_list[bs - 1]
+            if self.replayssm_write_pos_list is not None
+            else None
+        )
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
@@ -457,11 +495,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
             )
 
     def _replay_metadata(
@@ -472,6 +512,7 @@ class MambaAttnBackendBase(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
+        in_capture: bool = False,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -485,6 +526,42 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
+        # kernel reads, mirroring the eager snapshot-then-advance in
+        # _forward_metadata but writing in-place into the captured per-bs buffer
+        # so the graph's recorded pointer stays valid across replays. Done once
+        # per forward here (out_graph host op), not per layer. Skipped during
+        # capture (in_capture): capture runs on dummy slots, so advancing the
+        # persistent counter then would corrupt real per-slot ring positions;
+        # the captured buffer's contents are irrelevant at capture time anyway.
+        replayssm_write_pos = None
+        if self.replayssm_write_pos_list is not None:
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            write_pos_buf = mamba_pool.replayssm_write_pos
+            static_wp = self.replayssm_write_pos_list[bs - 1]
+            # Hand the full captured per-bs buffer to the kernel, mirroring how
+            # mamba_cache_indices = self.state_indices_list[bs - 1] is the full
+            # (bs,) tensor; the kernel indexes it per decode row.
+            replayssm_write_pos = static_wp
+            if write_pos_buf is not None:
+                # mamba_indices: this replay's per-row physical slots (padded
+                # rows == -1, same tensor fed to state_indices_list above).
+                slots = mamba_indices.to(torch.long)
+                safe_slots = slots.clamp(min=0)
+                # Snapshot THIS step's per-slot cursor into the captured buffer
+                # the kernel reads (in-place copy_, never reassign the object).
+                static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
+                if not in_capture:
+                    L = mamba_pool.gdn_replayssm_cache_len
+                    # Advance only VALID (non-padded) slots, deduped to avoid
+                    # duplicate-index races; padded rows clamp to slot 0, which a
+                    # real row may also hold. This is the NEXT step's cursor.
+                    valid_slots = slots[slots >= 0]
+                    if valid_slots.numel() > 0:
+                        valid_slots = torch.unique(valid_slots)
+                        write_pos_buf[valid_slots] = (
+                            write_pos_buf[valid_slots] + 1
+                        ) % L
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -531,11 +608,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -642,6 +721,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
+            in_capture=in_capture,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1

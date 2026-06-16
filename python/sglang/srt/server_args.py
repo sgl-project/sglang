@@ -5050,24 +5050,19 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode (slice 1a) guards. This slice is
-        # decode-only and deliberately does NOT touch the cuda-graph or
-        # radix-track/COW machinery, so it must run in EAGER mode with radix
-        # cache disabled, on the Triton GDN decode backend.
+        # GDN ReplaySSM buffered decode guards. This feature is decode-only and
+        # does NOT yet touch the radix-track/COW machinery (slice 2), so radix
+        # cache must be disabled. It runs on the Triton GDN decode backend.
+        # cuda-graph is now supported (slice 1b adds CUDA-graph-safe static
+        # write-cursor buffers), so it is no longer restricted to EAGER mode.
         if self.enable_gdn_replayssm:
             if not self.disable_radix_cache:
                 raise ValueError(
-                    "--enable-gdn-replayssm (slice 1a) requires "
-                    "--disable-radix-cache."
-                )
-            if not self.disable_cuda_graph:
-                raise ValueError(
-                    "--enable-gdn-replayssm (slice 1a) requires "
-                    "--disable-cuda-graph."
+                    "--enable-gdn-replayssm requires --disable-radix-cache."
                 )
             if decode != "triton":
                 raise ValueError(
-                    "--enable-gdn-replayssm (slice 1a) requires the Triton "
+                    "--enable-gdn-replayssm requires the Triton "
                     "linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
