@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -43,9 +44,6 @@ elif _is_mps:
     apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
-
-
-from sglang.srt.utils.profile_utils import ProfileManager  # noqa: E402
 
 
 @dataclass(kw_only=True)
