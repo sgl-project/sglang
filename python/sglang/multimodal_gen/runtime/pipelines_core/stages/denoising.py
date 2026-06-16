@@ -1162,6 +1162,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             attn_metadata=attn_metadata,
         )
 
+    def _prepare_step_state(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_host: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+    ) -> DenoisingStepState:
+        return self._build_denoising_step_state(
+            ctx,
+            batch,
+            server_args,
+            step_index,
+            t_host,
+            timesteps_cpu,
+        )
+
     def _prepare_step_attn_metadata(
         self,
         ctx: DenoisingContext,
@@ -1673,6 +1691,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if progress_manager is not None:
             progress_manager.__exit__(None, None, None)
 
+    def cleanup_denoising_context(self, ctx: DenoisingContext) -> None:
+        try:
+            self._finish_active_component_use()
+        finally:
+            self.close_denoising_progress(ctx)
+
     @torch.no_grad()
     def _run_unpacked_denoising_steps(
         self,
@@ -1771,24 +1795,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = int(timesteps_cpu.shape[0])
 
-        denoising_start_time = ctx.extra.get("denoising_start_time")
-        if denoising_start_time is not None and num_timesteps > 0 and not ctx.is_warmup:
-            self.log_info(
-                "average time per step: %.4f seconds",
-                (time.time() - denoising_start_time) / num_timesteps,
-            )
-
-        self._finish_active_component_use()
-
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=ctx.latents,
-                num_inference_steps=num_timesteps,
-                final_timestep=timesteps_cpu.new_zeros(()),
-                server_args=server_args,
-            )
         try:
+            denoising_start_time = ctx.extra.get("denoising_start_time")
+            if (
+                denoising_start_time is not None
+                and num_timesteps > 0
+                and not ctx.is_warmup
+            ):
+                self.log_info(
+                    "average time per step: %.4f seconds",
+                    (time.time() - denoising_start_time) / num_timesteps,
+                )
+
+            self._finish_active_component_use()
+
+            if batch.rollout:
+                self._postprocess_rollout_outputs(
+                    batch=batch,
+                    latents=ctx.latents,
+                    num_inference_steps=num_timesteps,
+                    final_timestep=timesteps_cpu.new_zeros(()),
+                    server_args=server_args,
+                )
             self._finalize_denoising_loop(ctx, batch, server_args)
         finally:
             self.close_denoising_progress(ctx)
@@ -1796,6 +1824,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def can_run_steps_in_one_forward_pass(
         self, states: list[Any], server_args: ServerArgs
     ) -> bool:
+        if not states:
+            return False
         if getattr(server_args, "enable_cfg_parallel", False):
             return False
 
@@ -1805,6 +1835,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if first_step is None:
             return False
         if first.req.image_latent is not None:
+            return False
+        if (first_ctx.extra.get("cfg_gate_state") or {}).get("active"):
             return False
         first_branches = getattr(first_ctx.cfg_policy, "branches", ())
         if not first_branches:
@@ -1823,6 +1855,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if step.current_model is not first_step.current_model:
                 return False
             if state.req.image_latent is not None:
+                return False
+            if (ctx.extra.get("cfg_gate_state") or {}).get("active"):
                 return False
             branches = getattr(ctx.cfg_policy, "branches", ())
             if len(branches) != len(first_branches):
@@ -2102,9 +2136,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return key in {"freqs_cis", "joint_attention_kwargs"}
 
     def _merge_step_input_kwargs(self, branch_kwargs: list[dict[str, Any]]) -> dict:
-        keys = set(branch_kwargs[0])
+        keys = tuple(branch_kwargs[0])
+        key_set = set(keys)
         for kwargs in branch_kwargs[1:]:
-            if set(kwargs) != keys:
+            if set(kwargs) != key_set:
                 raise DenoisingStepPackingError(
                     "step batch branch kwargs have mismatched keys"
                 )
@@ -2245,14 +2280,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     sliced_prediction = packed_inputs.slice_prediction(
                         branch_prediction, index
                     )
-                    if not isinstance(sliced_prediction, tuple):
-                        sliced_prediction = server_args.pipeline_config.slice_noise_pred(
-                            sliced_prediction, ctx.latents
+                    pred_t = _wrap(sliced_prediction)
+                    if len(pred_t) == 1:
+                        pred_t = (
+                            server_args.pipeline_config.slice_noise_pred(
+                                pred_t[0], ctx.latents
+                            ),
                         )
-                    predictions.append(sliced_prediction)
-                cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
-                    req,
-                    step.current_guidance_scale,
+                    predictions.append(_unwrap(pred_t))
+                cfg_scale = (
+                    server_args.pipeline_config.get_classifier_free_guidance_scale(
+                        req,
+                        step.current_guidance_scale,
+                    )
                 )
                 noise_pred = ctx.cfg_policy.combine(
                     predictions,
@@ -2322,7 +2362,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         server_args,
                     )
         except Exception:
-            self.close_denoising_progress(ctx)
+            self.cleanup_denoising_context(ctx)
             raise
         self.finish_denoising_context(ctx, batch, server_args)
         return batch
