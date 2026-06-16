@@ -115,6 +115,7 @@ class Session:
         last_req_node = None
         last_req = None
         new_token_buf = None
+        origin_input_len = None
         abort = False
         abort_message = ""
         if self.streaming:
@@ -213,16 +214,19 @@ class Session:
             if session_params.offset and session_params.offset != 0:
                 del input_ids_unpadded[session_params.offset :]
             input_ids_unpadded.extend(req.input_ids)
+            origin_input_len = len(new_token_buf)
+            input_ids = None
         else:
+            input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
-
-        input_ids = req.input_ids
 
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
+            token_buf=new_token_buf,
+            origin_input_len=origin_input_len,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
             session=self,
@@ -245,9 +249,6 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
-        if new_token_buf is not None:
-            new_req.token_buf = new_token_buf
-            new_req.origin_input_len = len(new_token_buf)
         new_req.tokenizer = tokenizer
 
         if abort:
