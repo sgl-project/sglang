@@ -8,15 +8,19 @@ _ITEMSIZE = 8
 _MIN_CAPACITY = 64
 
 
+def to_array(values: Iterable[int]) -> array:
+    if isinstance(values, memoryview):
+        result: array = array(_TYPECODE)
+        result.frombytes(values.tobytes())
+        return result
+    return array(_TYPECODE, values)
+
+
 class ViewableArray:
     __slots__ = ("_data", "_size", "_view")
 
     def __init__(self, init: Optional[Iterable[int]] = None) -> None:
-        values: array = (
-            init
-            if isinstance(init, array)
-            else array(_TYPECODE, init if init is not None else [])
-        )
+        values: array = array(_TYPECODE) if init is None else to_array(init)
         size: int = len(values)
         capacity: int = self._capacity_for(size)
         self._data: array = array(_TYPECODE, bytes(_ITEMSIZE * capacity))
@@ -35,9 +39,7 @@ class ViewableArray:
         self._size += 1
 
     def extend(self, values: Iterable[int]) -> None:
-        materialized: array = (
-            values if isinstance(values, array) else array(_TYPECODE, values)
-        )
+        materialized: array = to_array(values)
         added: int = len(materialized)
         if added == 0:
             return
@@ -66,7 +68,10 @@ class ViewableArray:
     def materialize(
         self, start: Optional[int] = None, stop: Optional[int] = None
     ) -> array:
-        return array(_TYPECODE, self.readonly_view(start, stop))
+        begin: int = 0 if start is None else start
+        end: int = self._size if stop is None else stop
+        assert 0 <= begin <= end <= self._size, (begin, end, self._size)
+        return self._data[begin:end]
 
     @staticmethod
     def _capacity_for(size: int) -> int:

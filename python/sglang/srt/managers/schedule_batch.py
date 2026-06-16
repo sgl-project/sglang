@@ -73,7 +73,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.viewable_array import ViewableArray
+from sglang.srt.managers.viewable_array import ViewableArray, to_array
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1126,7 +1126,7 @@ class Req(ReqDllmMixin):
         return length
 
     def fill_ids_upto(self, length: int) -> array:
-        return array("q", self.get_full_untruncated_fill_ids()[:length])
+        return to_array(self.get_full_untruncated_fill_ids()[:length])
 
     def get_fill_ids(self) -> array:
         return self.fill_ids_upto(self.fill_len)
@@ -1244,9 +1244,9 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = self.origin_input_ids_unpadded[
-                self.surr_offset :
-            ] + array("q", output_ids)
+            self.surr_and_decode_ids = (
+                self.origin_input_ids_unpadded[self.surr_offset :] + to_array(output_ids)
+            )
             self.cur_decode_ids_len = len(output_ids)
         else:
             self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])

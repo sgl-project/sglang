@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -186,20 +187,20 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            input_ids = array("q", last_req.origin_input_ids) + array(
-                "q", last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+            input_ids = to_array(last_req.origin_input_ids) + to_array(
+                last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             )
 
             if session_params.drop_previous_output:
-                input_ids = array("q", last_req.origin_input_ids)
+                input_ids = to_array(last_req.origin_input_ids)
 
             if session_params.offset and session_params.offset != 0:
                 input_ids = input_ids[: session_params.offset] + req.input_ids
             else:
                 input_ids += req.input_ids
 
-            input_ids_unpadded = last_req.origin_input_ids_unpadded + array(
-                "q", last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+            input_ids_unpadded = last_req.origin_input_ids_unpadded + to_array(
+                last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             )
             if session_params.drop_previous_output:
                 input_ids_unpadded = last_req.origin_input_ids_unpadded[:]

@@ -156,6 +156,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -1928,7 +1929,7 @@ class Scheduler(
             req.rebuild_origin_input_ids(padded_input_ids)
         else:
             req.rebuild_origin_input_ids(
-                array("q", req.origin_input_ids[:prefix_len]) + padded_input_ids
+                to_array(req.origin_input_ids[:prefix_len]) + padded_input_ids
             )
         return True
 
@@ -2106,7 +2107,7 @@ class Scheduler(
                     array(
                         "q",
                         self.pad_input_ids_func(
-                            array("q", req.origin_input_ids), image_inputs
+                            to_array(req.origin_input_ids), image_inputs
                         ),
                     )
                 )
@@ -2388,7 +2389,7 @@ class Scheduler(
                     array(
                         "q",
                         self.pad_input_ids_func(
-                            array("q", req.origin_input_ids), image_inputs
+                            to_array(req.origin_input_ids), image_inputs
                         ),
                     )
                 )

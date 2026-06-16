@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GetLoadsReqInput,
 )
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
@@ -366,7 +367,7 @@ class _GenerationStreamAccumulator:
 
         req.send_decode_id_offset = len(decode_ids)
         self.read_offsets.append(read_offset)
-        self.output_ids.append(array("q", output_ids_[send_token_offset:]))
+        self.output_ids.append(to_array(output_ids_[send_token_offset:]))
         req.send_token_offset = len(output_ids_)
         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
         self.spaces_between_special_tokens.append(
