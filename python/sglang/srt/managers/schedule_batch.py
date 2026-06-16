@@ -1645,13 +1645,19 @@ def retract_all(
 
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
+    vocab_size: int,
 ) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    origin_ids = chunked_req.origin_input_ids
+    if fill_len >= len(origin_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
+    return None
 
 
 @dataclasses.dataclass
@@ -1853,7 +1859,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req
+                chunked_req,
+                model_config.vocab_size,
             ),
             dllm_config=dllm_config,
         )
