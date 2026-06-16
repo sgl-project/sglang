@@ -4,18 +4,40 @@ title: "Diffusion models with AR stage like GLM-Image"
 
 ## Quick Start
 
-The default path currently uses the implementation of the AR model from transformers
+Run model with transformers implementation for AR stage (default)
 ```bash
-sglang generate --model-path /path/to/zai-org/GLM-Image/ --prompt "prompt"
+# Terminal 1 : launch server
+sglang serve --model-path /path/to/zai-org/GLM-Image/ --port ${PORT}
 ```
-To use SGLang as a backend for the AR model, you need to start the SGLang server with AR model.
 ```bash
+# Terminal 2 : launch client
+curl http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "prompt",
+    "n": 1,
+    "size": "widthxheight"
+  }'
+```
+Run model with SGLang srt implementation for AR stage (high performance)
+```bash
+# Terminal 1 : launch server with AR model
 sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
---tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal --port ${PORT}
+--tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal --port ${AR_PORT}
 ```
-And use diffusion as usual with server argument `--srt-encoder-url "http://${HOST}:${PORT}"`
 ```bash
-sglang generate --model-path /path/to/zai-org/GLM-Image/ --prompt "prompt" --srt-encoder-url "http://${HOST}:${PORT}"
+# Terminal 2 : launch server with Diffusion model
+sglang serve --model-path /path/to/zai-org/GLM-Image/ --srt-encoder-url "http://${HOST}:${AR_PORT}"
+```
+```bash
+# Terminal 3 : launch client
+curl http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "prompt",
+    "n": 1,
+    "size": "widthxheight"
+  }'
 ```
 
 ## Support matrix
@@ -47,14 +69,15 @@ sglang generate --model-path /path/to/zai-org/GLM-Image/ --prompt "prompt" --srt
 To run 2 servers on same group of NPU you need to specify env variables
 https://www.hiascend.com/document/detail/zh/canncommercial/850/maintenref/envvar/envref_07_0144.html
 Example:
-First terminal with AR server:
+
 ```bash
+# Terminal 1 : server with AR model
 export HCCL_IF_BASE_PORT=23000
 export HCCL_HOST_SOCKET_PORT_RANGE="23000-23199"
 export HCCL_NPU_SOCKET_PORT_RANGE="23200-23399"
 ```
-Second terminal with diffusion server:
 ```bash
+# Terminal 2 : server with diffusion model
 export HCCL_IF_BASE_PORT=24000
 export HCCL_HOST_SOCKET_PORT_RANGE="24000-24199"
 export HCCL_NPU_SOCKET_PORT_RANGE="24200-24399"
@@ -62,9 +85,9 @@ export HCCL_NPU_SOCKET_PORT_RANGE="24200-24399"
 
 ## Best practices
 
-GLM-Image example for Ascend A3 (`Ascend910_9362`) 2 cards (4 devices)
-First terminal with AR server:
+GLM-Image example for Ascend A3 2 cards (4 devices)
 ```bash
+# Terminal 1 : server with AR model
 export HCCL_IF_BASE_PORT=23000
 export HCCL_HOST_SOCKET_PORT_RANGE="23000-23199"
 export HCCL_NPU_SOCKET_PORT_RANGE="23200-23399"
@@ -75,6 +98,7 @@ sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
 ```
 Second terminal with diffusion server:
 ```bash
+# Terminal 2 : run SGL-Diffusion generate command
 export HCCL_IF_BASE_PORT=24000
 export HCCL_HOST_SOCKET_PORT_RANGE="24000-24199"
 export HCCL_NPU_SOCKET_PORT_RANGE="24200-24399"
