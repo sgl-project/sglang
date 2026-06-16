@@ -137,6 +137,10 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    # Number of key/group heads after TP sharding (== runtime `H` the packed
+    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
+    # buffer (k_cache) to size/stride exactly like the kernel expects.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -149,6 +153,16 @@ class Mamba2StateShape:
         state_size: int,
         conv_kernel: int,
     ) -> "Mamba2StateShape":
+        # The q/k projections are sharded by `num_k_heads // tp` heads (the
+        # ORIGINAL n_groups, before the conv head-shard extension below), so the
+        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
+        # meaningful (and only consumed) for the GDN ReplaySSM path, which
+        # requires evenly divisible heads; fall back to ceil-div otherwise.
+        num_k_heads_per_tp = (
+            divide(n_groups, tp_world_size)
+            if n_groups % tp_world_size == 0
+            else -(-n_groups // tp_world_size)
+        )
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
         if n_groups % tp_world_size != 0:
@@ -174,6 +188,7 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 

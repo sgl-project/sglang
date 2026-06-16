@@ -30,6 +30,10 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
+    # cursor for THIS decode step (gathered from the persistent per-slot
+    # buffer, then advanced once for the next step). int32, length == batch.
+    replayssm_write_pos: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None

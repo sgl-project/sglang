@@ -302,6 +302,15 @@ class MambaPool:
     class State:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
+        # GDN ReplaySSM ring buffers (slice 1a). Only allocated when
+        # `--enable-gdn-replayssm` is set; otherwise None so the legacy path is
+        # byte-identical. Per-layer layout: [num_layers, num_slots, ...].
+        #   replayssm_d: [num_layers, num_slots, HV, L, V]
+        #   replayssm_k: [num_layers, num_slots, H,  L, K]
+        #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
+        replayssm_d: Optional[torch.Tensor] = None
+        replayssm_k: Optional[torch.Tensor] = None
+        replayssm_g: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -309,7 +318,9 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -320,6 +331,7 @@ class MambaPool:
             return sum(
                 get_tensor_size_bytes(getattr(self, f.name))
                 for f in dataclasses.fields(self)
+                if getattr(self, f.name) is not None
             )
 
     @dataclass(frozen=True, kw_only=True)
@@ -338,6 +350,8 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_gdn_replayssm: bool = False,
+        gdn_replayssm_cache_len: int = 16,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -350,6 +364,8 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.enable_gdn_replayssm = enable_gdn_replayssm
+        self.gdn_replayssm_cache_len = gdn_replayssm_cache_len
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -393,6 +409,33 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+
+            # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
+            # flag is on; otherwise left as None so the legacy State is
+            # byte-identical. temporal_state_shape == (HV, V, K).
+            replayssm_d = replayssm_k = replayssm_g = None
+            if enable_gdn_replayssm:
+                hv, v_dim, k_dim = temporal_state_shape
+                h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
+                L = gdn_replayssm_cache_len
+                num_slots = size + 1
+                # Ring records live in the SSM dtype (bf16/fp32) except g (fp32).
+                replayssm_d = torch.zeros(
+                    size=(num_mamba_layers, num_slots, hv, L, v_dim),
+                    dtype=ssm_dtype,
+                    device=device,
+                )
+                replayssm_k = torch.zeros(
+                    size=(num_mamba_layers, num_slots, h_k, L, k_dim),
+                    dtype=ssm_dtype,
+                    device=device,
+                )
+                replayssm_g = torch.zeros(
+                    size=(num_mamba_layers, num_slots, hv, L),
+                    dtype=torch.float32,
+                    device=device,
+                )
+
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
@@ -500,6 +543,9 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    replayssm_d=replayssm_d,
+                    replayssm_k=replayssm_k,
+                    replayssm_g=replayssm_g,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -512,13 +558,35 @@ class MambaPool:
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(
+                    conv=conv_state,
+                    temporal=temporal_state,
+                    replayssm_d=replayssm_d,
+                    replayssm_k=replayssm_k,
+                    replayssm_g=replayssm_g,
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            if enable_gdn_replayssm:
+                logger.info(
+                    f"GDN ReplaySSM ring buffers allocated (L="
+                    f"{gdn_replayssm_cache_len}): "
+                    f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
+                    f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
+                    f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
+                )
+            # Persistent per-slot decode-position cursor for ReplaySSM. Shared
+            # across all GDN layers; advanced once per decode forward by the
+            # backend metadata build. Index 0..size; reset to 0 on slot (re)alloc.
+            self.replayssm_write_pos = (
+                torch.zeros((size + 1,), dtype=torch.int32, device=device)
+                if enable_gdn_replayssm
+                else None
+            )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
@@ -599,7 +667,13 @@ class MambaPool:
             # These buffers have different size (spec_state_size + 1) and should not be transferred
             if field in ("intermediate_ssm", "intermediate_conv_window"):
                 continue
+            # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
+            # scratch, not part of the persistent transferable state.
+            if field in ("replayssm_d", "replayssm_k", "replayssm_g"):
+                continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -628,7 +702,19 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            # Mirror the exclusions in get_contiguous_buf_infos so the returned
+            # dims line up element-wise with the RDMA buffer list.
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+            ):
+                continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -700,6 +786,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
     ):
+        from sglang.srt.server_args import get_global_server_args
+
+        _server_args = get_global_server_args()
         self.mamba_pool = MambaPool(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -709,6 +798,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_gdn_replayssm=_server_args.enable_gdn_replayssm,
+            gdn_replayssm_cache_len=_server_args.gdn_replayssm_cache_len,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -766,6 +857,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
+                # ring. write_pos=0 means "ring empty", so the decode kernel
+                # ignores ring contents and reads only the checkpoint state
+                # (the post-prefill state that prefill wrote into this slot).
+                if self.mamba_pool.replayssm_write_pos is not None:
+                    self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:

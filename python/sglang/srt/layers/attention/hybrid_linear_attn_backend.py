@@ -103,10 +103,36 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
 
+        replayssm_write_pos = None
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
+            # GDN ReplaySSM (slice 1a): the ring cursor is a per-slot
+            # decode-position counter shared by ALL GDN layers in this forward.
+            # Manage it exactly ONCE here (not per-layer): snapshot this step's
+            # value for the batch's slots, hand it to the layers, then advance
+            # the persistent buffer mod L for the next step.
+            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            write_pos_buf = (
+                getattr(mamba_pool, "replayssm_write_pos", None)
+                if mamba_pool is not None
+                else None
+            )
+            if write_pos_buf is not None:
+                slots = mamba_cache_indices.to(torch.long)
+                # Padded rows carry slot == -1; clamp so the per-row gather stays
+                # in-bounds (the kernel zeroes padded rows via state_idx < 0).
+                safe_slots = slots.clamp(min=0)
+                replayssm_write_pos = write_pos_buf[safe_slots].clone()
+                L = mamba_pool.gdn_replayssm_cache_len
+                # Advance only the VALID (non-padded) slots. Scatter over the
+                # unique valid slots to avoid duplicate-index races (padded rows
+                # all clamp to slot 0, which a real row may also occupy).
+                valid_slots = slots[slots >= 0]
+                if valid_slots.numel() > 0:
+                    valid_slots = torch.unique(valid_slots)
+                    write_pos_buf[valid_slots] = (write_pos_buf[valid_slots] + 1) % L
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
@@ -173,6 +199,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             has_mamba_track_mask=has_mamba_track_mask,
+            replayssm_write_pos=replayssm_write_pos,
         )
 
     def init_forward_metadata_out_graph(

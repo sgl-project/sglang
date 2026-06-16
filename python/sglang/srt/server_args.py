@@ -1829,6 +1829,15 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    # GDN ReplaySSM buffered decode (slice 1a: decode-only, EAGER, radix off).
+    enable_gdn_replayssm: A[
+        bool,
+        "Enable the GDN ReplaySSM buffered decode kernel (slice 1a: decode-only). Requires --disable-radix-cache and --disable-cuda-graph and the Triton linear-attn decode backend.",
+    ] = False
+    gdn_replayssm_cache_len: A[
+        int,
+        "Ring-buffer length L for GDN ReplaySSM decode. The full recurrent state is flushed to HBM every L decode steps.",
+    ] = 16
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -5040,6 +5049,33 @@ class ServerArgs:
                 "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
                 f"got CUDA {cuda_version or 'unknown'}"
             )
+
+        # GDN ReplaySSM buffered decode (slice 1a) guards. This slice is
+        # decode-only and deliberately does NOT touch the cuda-graph or
+        # radix-track/COW machinery, so it must run in EAGER mode with radix
+        # cache disabled, on the Triton GDN decode backend.
+        if self.enable_gdn_replayssm:
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "--enable-gdn-replayssm (slice 1a) requires "
+                    "--disable-radix-cache."
+                )
+            if not self.disable_cuda_graph:
+                raise ValueError(
+                    "--enable-gdn-replayssm (slice 1a) requires "
+                    "--disable-cuda-graph."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-gdn-replayssm (slice 1a) requires the Triton "
+                    "linear-attn decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.gdn_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--gdn-replayssm-cache-len must be >= 1, got "
+                    f"{self.gdn_replayssm_cache_len}."
+                )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
