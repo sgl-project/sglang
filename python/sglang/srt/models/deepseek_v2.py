@@ -631,6 +631,7 @@ class DeepseekV2MoE(nn.Module):
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                layer_id=self.layer_id,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -905,7 +906,18 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            deferred_finalize = (
+                shared_output is not None
+                and not self._shared_expert_tp1
+                and topk_output.format == TopKOutputFormat.BYPASSED
+                and self.experts.supports_deferred_finalize
+            )
+            if deferred_finalize:
+                final_hidden_states = self.experts.forward_deferred_finalize(
+                    hidden_states, topk_output
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
             if (
                 not _is_cuda
                 and not _is_musa
@@ -916,12 +928,22 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if deferred_finalize:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                finalize_flashinfer_trtllm_deferred_output,
+            )
+
+            final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
+                final_hidden_states,
+                shared_output,
+            )
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -975,7 +997,9 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             shared_output = None
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -1147,7 +1171,19 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
+            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+                n = self.num_fused_shared_experts
+                topk_output = topk_output._replace(
+                    topk_ids=topk_output.topk_ids.new_empty(
+                        (0, topk_output.topk_ids.shape[-1] + n)
+                    ),
+                    topk_weights=topk_output.topk_weights.new_empty(
+                        (0, topk_output.topk_weights.shape[-1] + n)
+                    ),
+                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1370,7 +1406,9 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+            state.topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
@@ -1705,7 +1743,7 @@ class DeepseekV2AttentionMLA(
             attention_backend = get_global_server_args().decode_attention_backend
         elif (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
             if get_global_server_args().speculative_attention_mode == "decode":

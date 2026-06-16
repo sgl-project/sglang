@@ -77,7 +77,9 @@ def transform_select_experts_inputs(
 
 
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    log2phy_prob: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
@@ -86,6 +88,13 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lp":
+        if log2phy_prob is None:
+            raise RuntimeError(
+                "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
+                f"time (topk_ids.shape={tuple(topk_ids.shape)})."
+            )
+        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -115,3 +124,24 @@ def _topk_ids_logical_to_physical_dynamic(
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
+
+
+def _topk_ids_logical_to_physical_probability(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    log2phy_prob: torch.Tensor,
+) -> torch.Tensor:
+    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+
+    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
+    kernel and there is no torch reference fallback at runtime.
+    """
+    if not topk_ids.is_cuda:
+        raise RuntimeError(
+            "LP dispatch requires CUDA tensors; got topk_ids on " f"{topk_ids.device}."
+        )
+    from sglang.jit_kernel.lplb import cuda_solver
+
+    return cuda_solver.dispatch_probability(
+        topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+    )

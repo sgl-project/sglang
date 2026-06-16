@@ -238,7 +238,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -262,7 +262,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
         # draft KV is materialized from target hidden states, so there is no
-        # BaseDraftWorker draft/draft_extend split to wrap it in.
+        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property
@@ -1524,7 +1524,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
