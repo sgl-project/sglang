@@ -193,52 +193,84 @@ class AWQAscendMoEKernel:
         # Pack for W4A16
         return self._pack_for_w4a16(weight_int8)
 
-    # ------------------------------------------------------------------
-    #  Main entry point
-    # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Helper to expand per-group tensors to per-channel (K)
-        def expand_to_k(tensor: torch.Tensor, groups: int, group_size: int, K: int, N: int) -> torch.Tensor:
-            # tensor shape: (E, groups, N)
-            expanded = tensor.unsqueeze(2).expand(-1, -1, group_size, -1)  # (E, groups, group_size, N)
-            return expanded.reshape(-1, K, N)  # (E, K, N)
-    
+        # ------------------------------------------------------------------
+        # Process w13 and w2 separately
+        # ------------------------------------------------------------------
         for prefix in ("w13", "w2"):
-            # 1. Unpack weight to get K and N
             qweight = getattr(layer, f"{prefix}_qweight").data  # (E, K, N_packed)
-            unpacked = self._unpack_awq_int4(qweight)           # (E*K, N)
-            E, K = qweight.shape[0], qweight.shape[1]
-            N = unpacked.shape[1]
-            weight_int8 = unpacked.view(E, K, N).permute(0, 2, 1).contiguous()  # (E, N, K)
-    
-            # 2. Pack weight for NPU
-            packed_weight = self._pack_for_w4a16(weight_int8)   # (E, N, K//8)
-            self._register_or_replace_parameter(layer, f"{prefix}_weight", packed_weight)
-    
-            # 3. Process scales: expand from (E, groups, N) to (E, N, K)
             scales = getattr(layer, f"{prefix}_scales").data    # (E, groups, N)
+            qzeros = getattr(layer, f"{prefix}_qzeros").data    # (E, groups, N_packed)
+    
+            E, K, N_packed = qweight.shape
+            N = N_packed * 8
             groups = scales.shape[1]
             group_size = K // groups
             assert K % groups == 0, f"K={K} not divisible by groups={groups}"
-            scales_expanded = scales.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(E, K, N)  # (E, K, N)
-            scales_final = scales_expanded.transpose(1, 2).contiguous()  # (E, N, K)
-            self._register_or_replace_parameter(layer, f"{prefix}_weight_scale", scales_final)
     
-            # 4. Process offsets: unpack qzeros, expand, negate (8 - zero), transpose
-            qzeros = getattr(layer, f"{prefix}_qzeros").data    # (E, groups, N_packed)
-            unpacked_zeros = self._unpack_awq_int4(qzeros)      # (E*groups, N)
-            offset_int8 = unpacked_zeros.view(E, groups, N)     # (zero - 8)
-            offset_expanded = offset_int8.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(E, K, N)  # (E, K, N)
-            offset_final = -offset_expanded                     # 8 - zero
-            offset_final = offset_final.transpose(1, 2).contiguous()  # (E, N, K)
-            offset_final = offset_final.to(scales.dtype)        # cast to scale dtype
-            self._register_or_replace_parameter(layer, f"{prefix}_weight_offset", offset_final)
+            # Lists to collect per-expert results
+            packed_weights = []
+            expanded_scales = []
+            expanded_offsets = []
+    
+            # Process each expert sequentially
+            for e in range(E):
+                # ---- weight ----
+                # qweight[e] shape (K, N_packed)
+                qw_e = qweight[e].unsqueeze(0)                 # (1, K, N_packed)
+                unpacked_e = self._unpack_awq_int4(qw_e)       # (K, N)   [since 1*K = K]
+                # reshape to (K, N) and permute to (N, K)
+                weight_int8_e = unpacked_e.view(K, N).permute(1, 0).contiguous()  # (N, K)
+                # pack for NPU: input shape (1, N, K) -> output (1, N, K//8)
+                packed_e = self._pack_for_w4a16(weight_int8_e.unsqueeze(0))      # (1, N, K//8)
+                packed_weights.append(packed_e)
+    
+                # ---- scale ----
+                # scales[e] shape (groups, N)
+                scales_e = scales[e]                            # (groups, N)
+                # expand to (K, N) by repeating each group group_size times
+                scales_exp = scales_e.unsqueeze(1).expand(-1, group_size, -1).reshape(K, N)  # (K, N)
+                # transpose to (N, K) to match weight layout
+                scales_exp = scales_exp.permute(1, 0).contiguous()  # (N, K)
+                expanded_scales.append(scales_exp.unsqueeze(0))     # (1, N, K)
+    
+                # ---- offset (zero-point) ----
+                # qzeros[e] shape (groups, N_packed)
+                qz_e = qzeros[e].unsqueeze(0)                   # (1, groups, N_packed)
+                unpacked_zeros_e = self._unpack_awq_int4(qz_e)  # (groups, N)
+                offset_int8_e = unpacked_zeros_e.view(groups, N)  # (groups, N)
+                # expand to (K, N)
+                offset_exp = offset_int8_e.unsqueeze(1).expand(-1, group_size, -1).reshape(K, N)  # (K, N)
+                # negate: kernel expects (8 - zero)
+                offset_exp = -offset_exp
+                # transpose to (N, K)
+                offset_exp = offset_exp.permute(1, 0).contiguous()  # (N, K)
+                # cast to scale dtype (usually float16 or bfloat16)
+                offset_exp = offset_exp.to(scales.dtype)
+                expanded_offsets.append(offset_exp.unsqueeze(0))    # (1, N, K)
+    
+                # Free per-expert intermediates to keep memory low
+                del qw_e, unpacked_e, weight_int8_e, packed_e, scales_e, scales_exp
+                del qz_e, unpacked_zeros_e, offset_int8_e, offset_exp
+    
+            # Concatenate along expert dimension
+            packed_weight = torch.cat(packed_weights, dim=0)      # (E, N, K//8)
+            scale = torch.cat(expanded_scales, dim=0)             # (E, N, K)
+            offset = torch.cat(expanded_offsets, dim=0)           # (E, N, K)
+    
+            # Register new parameters
+            self._register_or_replace_parameter(layer, f"{prefix}_weight", packed_weight)
+            self._register_or_replace_parameter(layer, f"{prefix}_weight_scale", scale)
+            self._register_or_replace_parameter(layer, f"{prefix}_weight_offset", offset)
     
             # Free original AWQ tensors
             for attr in (f"{prefix}_qweight", f"{prefix}_qzeros", f"{prefix}_scales"):
                 if hasattr(layer, attr):
                     delattr(layer, attr)
     
-        # 5. Set dispatcher output dtype for w13
+            # Force garbage collection (optional)
+            torch.npu.empty_cache()
+    
+        # Set dispatcher output dtype for w13
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
