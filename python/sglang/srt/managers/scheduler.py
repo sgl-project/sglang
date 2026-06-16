@@ -3555,6 +3555,14 @@ class Scheduler(
                 self.metrics_reporter.spec_total_num_accept_tokens
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
+            # Accept-length distribution across all decode steps since the last
+            # reset. Keyed by accept length (= num_correct_drafts + 1 bonus token,
+            # matching avg_spec_accept_length), value = number of steps.
+            hist = self.metrics_reporter.spec_total_correct_drafts_histogram
+            ret["spec_accept_length_histogram"] = {
+                num_correct_drafts + 1: count
+                for num_correct_drafts, count in sorted(hist.items())
+            }
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
@@ -3602,6 +3610,7 @@ class Scheduler(
             self.metrics_reporter.spec_total_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
+            self.metrics_reporter.spec_total_correct_drafts_histogram.clear()
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")

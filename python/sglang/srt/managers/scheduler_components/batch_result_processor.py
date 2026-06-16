@@ -577,6 +577,11 @@ class SchedulerBatchResultProcessor:
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.spec_num_correct_drafts += num_correct_drafts
             req.update_spec_correct_drafts_histogram(num_correct_drafts)
+            # Also fold into the server-wide cumulative histogram exposed by
+            # get_internal_state / get_server_info.
+            self.metrics_reporter.spec_total_correct_drafts_histogram[
+                num_correct_drafts
+            ] += 1
 
         return predict_tokens
 
