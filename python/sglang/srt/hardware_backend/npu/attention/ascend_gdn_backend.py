@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
@@ -8,7 +9,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
-    causal_conv1d_update_v2,
 )
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
@@ -28,6 +28,43 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
+
+
+def causal_conv1d_npu_update(
+    hidden_state: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    silu_activation: bool = True,
+):
+    bsz, hidden_size, seq_len = hidden_state.shape
+    kernel_size = weight.shape[-1]
+
+    target_state_len = (kernel_size - 1) + (seq_len - 1)
+
+    full_context = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
+
+    computation_input = full_context[:, :, -(kernel_size - 1 + seq_len) :]
+    windows = computation_input.unfold(-1, kernel_size, 1)
+
+    out = (windows * weight[None, :, None, :]).sum(dim=-1)
+
+    if bias is not None:
+        out = out + bias[None, :, None]
+
+    if silu_activation:
+        out = F.silu(out)
+
+    out = out.to(hidden_state.dtype)
+
+    if target_state_len > 0:
+        new_conv_state = full_context[:, :, -target_state_len:]
+    else:
+        new_conv_state = torch.empty(
+            bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype
+        )
+
+    return out, new_conv_state
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -202,23 +239,19 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
+            mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
+            conv_states_to_use = conv_states[cache_indices]
+            mixed_qkv_processed, new_conv_state = causal_conv1d_npu_update(
+                mixed_qkv_reshaped.transpose(1, 2).contiguous(),
+                layer.conv_weights,
+                conv_states_to_use.transpose(1, 2).contiguous(),
+                layer.bias,
+                True,
             )
-            mixed_qkv = causal_conv1d_update_v2(
-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
-                conv_state=conv_states.contiguous(),
-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
-                bias=layer.bias,
-                activation=layer.activation,
-                conv_state_indices=cache_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                pad_slot_id=-1,
-                validate_data=False,
-            ).view(seq_len, -1)
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+            )
+            conv_states[cache_indices] = new_conv_state.transpose(1, 2).contiguous()
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
