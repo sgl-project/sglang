@@ -711,6 +711,7 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "cuda_graph_key",
             "padded_static_len",
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
