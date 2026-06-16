@@ -22,16 +22,20 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
-plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
-dispatch are inherited unchanged from the parent.
+Subclasses :class:`TRTLLMMLABackend` and overrides the kernel dispatch plus
+tokenspeed-specific prefill Q/K/V preparation. Metadata, KV-cache layout,
+CUDA-graph plumbing, draft-extend padding, and chunked-prefix dispatch are
+inherited unchanged from the parent.
 """
 
 import logging
+from functools import cache
 from typing import TYPE_CHECKING, Optional
 
+import cutlass
+import cutlass.cute as cute
 import torch
+from cutlass import Float32, Int32
 
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
@@ -47,6 +51,14 @@ if is_flashinfer_available():
 
 if is_tokenspeed_mla_available():
     import tokenspeed_mla
+    import tokenspeed_mla.mla_decode as _tokenspeed_mla_decode_mod
+    from tokenspeed_mla.mla_decode_fp16 import (
+        BlackwellMultiHeadLatentAttentionForwardFP16,
+    )
+    from tokenspeed_mla.utils import (
+        get_max_active_clusters as _tokenspeed_get_max_active_clusters,
+    )
+    from tokenspeed_mla.utils import torch_to_cutlass_dtype
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -63,6 +75,266 @@ logger = logging.getLogger(__name__)
 _TOKENSPEED_MAX_Q_LEN = 8
 
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
+
+
+@cache
+def _get_compiled_tokenspeed_mla_fp16_kernel_with_lse(
+    torch_dtype: torch.dtype,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_persistent: bool,
+    is_var_seq: bool,
+    is_var_split_kv: bool,
+    skip_correction_threshold: float = 0.0,
+    is_workspace_size_zero: bool = False,
+    fold_sq: bool = False,
+    causal_mask: bool = True,
+    num_heads: int = 128,
+    seq_len_q: int = 1,
+    use_pdl: bool = False,
+):
+    del fold_sq, causal_mask, num_heads, seq_len_q
+    assert torch_dtype in (torch.float16, torch.bfloat16)
+
+    mma_qk_tiler_mn = (128, 128)
+    mma_pv_tiler_mn = (128, 256)
+    cluster_shape_mnk = (2, 1, 1)
+    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
+
+    kernel_obj = BlackwellMultiHeadLatentAttentionForwardFP16(
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        mma_qk_tiler_mn=mma_qk_tiler_mn,
+        mma_pv_tiler_mn=mma_pv_tiler_mn,
+        max_active_clusters=_tokenspeed_get_max_active_clusters(
+            cluster_shape_mnk[0] * cluster_shape_mnk[1]
+        ),
+        page_size=page_size,
+        skip_correction_threshold=skip_correction_threshold,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
+        is_var_split_kv=is_var_split_kv,
+    )
+
+    sym_heads = cute.sym_int()
+    sym_latent = cute.sym_int(divisibility=16)
+    sym_seq_q = cute.sym_int()
+    sym_rope = cute.sym_int(divisibility=16)
+    sym_batch = cute.sym_int()
+    sym_kv_batch = cute.sym_int()
+    sym_seq_kv = cute.sym_int()
+    sym_page_count = cute.sym_int()
+    sym_workspace_size = cute.sym_int()
+
+    q_latent_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    q_rope_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_rope),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    c_latent_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_kv_batch, sym_seq_kv, sym_latent),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    c_rope_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_kv_batch, sym_seq_kv, sym_rope),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    page_table_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_batch, sym_page_count),
+        stride_order=(1, 0),
+        assumed_align=4,
+    )
+    o_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=16,
+    )
+    lse_fake = cute.runtime.make_fake_tensor(
+        cutlass.Float32,
+        (sym_batch, sym_seq_q, sym_heads),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=4,
+    )
+    if is_workspace_size_zero:
+        workspace_fake = None
+    else:
+        workspace_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int8,
+            (sym_workspace_size,),
+            assumed_align=32,
+        )
+    cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_batch,),
+        assumed_align=4,
+    )
+    if is_var_split_kv:
+        block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch,),
+            assumed_align=4,
+        )
+    else:
+        block_split_kvs_fake = None
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    return cute.compile(
+        kernel_obj,
+        q_latent_fake,
+        q_rope_fake,
+        c_latent_fake,
+        c_rope_fake,
+        page_table_fake,
+        o_fake,
+        lse_fake,
+        workspace_fake,
+        Int32(1),
+        cache_seqs_fake,
+        block_split_kvs_fake,
+        Float32(1.0),
+        Float32(1.0),
+        stream_fake,
+        use_pdl,
+        options="--enable-tvm-ffi --opt-level 2",
+    )
+
+
+def _tokenspeed_mla_decode_fp16_with_lse(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    output_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    is_var_seq: bool = True,
+    causal_mask: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    assert query.dtype in (torch.float16, torch.bfloat16)
+    assert kv_cache.dtype == query.dtype
+    bsz, q_len, num_heads, d_qk = query.shape
+    assert d_qk == kv_lora_rank + qk_rope_head_dim
+
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    page_size = kv_cache.shape[1]
+
+    q_latent = query[..., :kv_lora_rank]
+    q_rope = query[..., kv_lora_rank:]
+    c_latent = kv_cache[:, :, :kv_lora_rank]
+    c_rope = kv_cache[:, :, kv_lora_rank:]
+
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    mma_m_tile = 128
+    fold_sq = num_heads < mma_m_tile and num_heads * q_len <= mma_m_tile
+    if num_heads < mma_m_tile and not fold_sq:
+        raise ValueError(
+            f"tokenspeed_mla_decode requires num_heads >= {mma_m_tile} or "
+            f"num_heads * q_len <= {mma_m_tile}, got num_heads={num_heads}, "
+            f"q_len={q_len}"
+        )
+
+    num_heads_eff = num_heads * q_len if fold_sq else num_heads
+    q_len_eff = 1 if fold_sq else q_len
+    max_active_blocks = tokenspeed_mla.get_num_sm(query.device)
+    split_kv, workspace_size = (
+        _tokenspeed_mla_decode_mod._get_split_kv_and_workspace_size(
+            bsz, q_len_eff, num_heads_eff, kv_lora_rank, max_active_blocks
+        )
+    )
+
+    assert workspace_buffer.dtype == torch.int8
+    assert workspace_buffer.numel() >= workspace_size, (
+        f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
+        f"need {workspace_size} bytes"
+    )
+    is_workspace_size_zero = workspace_size == 0
+    workspace_bytes = None if is_workspace_size_zero else workspace_buffer[:workspace_size]
+
+    if out is None:
+        out = torch.empty(
+            (bsz, q_len, num_heads, kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
+    lse = torch.empty(
+        (bsz, q_len, num_heads),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+    is_var_split_kv = False
+    block_split_kvs = None
+    is_persistent = not is_var_seq
+
+    _tokenspeed_mla_decode_mod._check_can_implement(
+        torch_dtype=query.dtype,
+        page_size=page_size,
+        num_heads=num_heads,
+        seq_len_q=q_len,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
+        is_var_split_kv=is_var_split_kv,
+    )
+    compiled_kernel = _get_compiled_tokenspeed_mla_fp16_kernel_with_lse(
+        torch_dtype=query.dtype,
+        page_size=page_size,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
+        is_var_split_kv=is_var_split_kv,
+        skip_correction_threshold=0.0,
+        is_workspace_size_zero=is_workspace_size_zero,
+        fold_sq=fold_sq,
+        causal_mask=causal_mask,
+        num_heads=num_heads,
+        seq_len_q=q_len,
+        use_pdl=enable_pdl,
+    )
+
+    import tvm_ffi
+
+    with tvm_ffi.use_torch_stream():
+        compiled_kernel(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            block_tables,
+            out,
+            lse,
+            workspace_bytes,
+            Int32(split_kv),
+            cache_seqs,
+            block_split_kvs,
+            Float32(softmax_scale),
+            Float32(output_scale),
+        )
+    return out
 
 
 def _get_tokenspeed_workspace(
@@ -87,7 +359,7 @@ def _get_tokenspeed_workspace(
 # once the same CuteDSL kernels in flashinfer_trtllm are stable
 # and there is no performance gap compared to this backend.
 class TokenspeedMLABackend(TRTLLMMLABackend):
-    """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
+    """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100)."""
 
     def __init__(
         self,
@@ -103,9 +375,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
         )
 
-        if self.data_type != torch.float8_e4m3fn:
+        if self.data_type not in (torch.float8_e4m3fn, torch.bfloat16, torch.float16):
             raise ValueError(
-                "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
+                "tokenspeed_mla backend requires --kv-cache-dtype "
+                "fp8_e4m3, bf16, bfloat16, or fp16, "
                 f"got data_type={self.data_type}."
             )
         if self.page_size not in (32, 64):
@@ -134,9 +407,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     # branch, which always asks for the LSE.
                     if is_causal is False and return_lse is False:
                         continue
-                    # Runtime feeds fp8_e4m3fn q/k/v
+                    # Runtime feeds self.data_type q/k/v
                     config = (
-                        torch.float8_e4m3fn,
+                        self.data_type,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -147,7 +420,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     if config in _compiled_kernels:
                         continue
                     _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.float8_e4m3fn,
+                        self.data_type,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -224,39 +497,54 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         layer: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
+        """Build Q/K/V for the FMHA kernel and write the MLA KV cache."""
         kv = layer.kv_b_proj(kv_a)[0]
         kv = kv.view(
             -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
         )
         k_nope = kv[..., : layer.qk_nope_head_dim]
-        v_bf16 = kv[..., layer.qk_nope_head_dim :]
+        v = kv[..., layer.qk_nope_head_dim :]
         q_nope = q[..., : layer.qk_nope_head_dim]
 
-        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-            positions=positions,
-            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
-            qk_nope_head_dim=layer.qk_nope_head_dim,
-            qk_rope_head_dim=layer.qk_rope_head_dim,
-        )
-        v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
+        if self.data_type == torch.float8_e4m3fn:
+            q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+                q_nope=q_nope,
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+                positions=positions,
+                is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+                qk_nope_head_dim=layer.qk_nope_head_dim,
+                qk_rope_head_dim=layer.qk_rope_head_dim,
+            )
+            v_fp8 = fp8_quantize(v, enable_pdl=is_arch_support_pdl())
 
-        # k_pe is shared across heads (RoPE is position-only), so head 0
-        # reproduces the original [tokens, 1, qk_rope] latent layout.
-        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
-        k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+            # k_pe is shared across heads (RoPE is position-only), so head 0
+            # reproduces the original [tokens, 1, qk_rope] latent layout.
+            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
+            k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer.attn_mha,
+                forward_batch.out_cache_loc,
+                kv_a_fp8.unsqueeze(1),
+                k_pe_fp8,
+            )
+            return q_fp8, k_fp8, v_fp8
+
+        if layer.rotary_emb is not None:
+            q_pe, k_pe = layer.rotary_emb(positions, q_pe, k_pe)
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,
-            kv_a_fp8.unsqueeze(1),
-            k_pe_fp8,
+            kv_a.unsqueeze(1),
+            k_pe,
         )
-        return q_fp8, k_fp8, v_fp8
+        q_out = torch.cat([q_nope, q_pe], dim=-1).to(self.data_type)
+        k_out = torch.cat(
+            [k_nope, k_pe.expand(-1, layer.num_local_heads, -1)], dim=-1
+        ).to(self.data_type)
+        return q_out, k_out, v.to(self.data_type).contiguous()
 
     def pack_prefix_chunk_kv(
         self,
@@ -264,9 +552,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         k_pe: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
-        strided ``v`` into contig FP8 V in a single kernel.
-        """
+        """Pack strided ``k_nope``+``k_pe`` and match the backend KV dtype."""
+        if self.data_type != torch.float8_e4m3fn:
+            if k_pe.dim() == 2:
+                k_pe = k_pe.unsqueeze(1)
+            return (
+                torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1).to(
+                    self.data_type
+                ),
+                v.to(self.data_type).contiguous(),
+            )
         return mla_kv_pack_quantize_fp8(
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
@@ -280,8 +575,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         max_seq_len: int,
         layer: RadixAttention,
     ) -> torch.Tensor:
-        k_scale = getattr(layer, "k_scale_float", None)
-        if k_scale is None:
+        if self.data_type == torch.float8_e4m3fn:
+            k_scale = getattr(layer, "k_scale_float", None)
+            if k_scale is None:
+                k_scale = 1.0
+        else:
             k_scale = 1.0
         softmax_scale = float(layer.scaling) * float(k_scale)
         output_scale = float(k_scale)
@@ -289,6 +587,20 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        if self.data_type != torch.float8_e4m3fn:
+            return _tokenspeed_mla_decode_fp16_with_lse(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=self._tokenspeed_workspace,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=int(max_seq_len),
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
+                enable_pdl=is_arch_support_pdl(),
+            )
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
