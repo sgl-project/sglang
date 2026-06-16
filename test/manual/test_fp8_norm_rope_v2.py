@@ -64,7 +64,9 @@ _MAX_ABS_TOL = 1.0
 
 
 def _flashmla_page_bytes() -> int:
-    return math.ceil((_MLA_SLOT_BYTES + 8) * PAGE_SIZE / _MLA_SLOT_BYTES) * _MLA_SLOT_BYTES
+    return (
+        math.ceil((_MLA_SLOT_BYTES + 8) * PAGE_SIZE / _MLA_SLOT_BYTES) * _MLA_SLOT_BYTES
+    )
 
 
 def _page_bytes(head_dim: int) -> int:
@@ -161,9 +163,7 @@ def _ref_quant_indexer(x: torch.Tensor) -> torch.Tensor:
     """Per-tensor fp8 quant + dequant of (N, 128), matching the indexer fallback."""
     abs_max = x.abs().amax(dim=-1, keepdim=True)
     scale = abs_max.clamp(min=1e-4) / _FP8_E4M3_MAX  # fp32 scale, stored verbatim
-    fp8 = (
-        (x / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-    )
+    fp8 = (x / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     return fp8.float() * scale
 
 
