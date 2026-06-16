@@ -195,31 +195,31 @@ struct PlanEntriesKernel {
     SymbolicSize Npool_rows = {"req_to_verify_expected_tokens_rows"};
     SymbolicSize Npool_cols = {"req_to_verify_expected_tokens_cols"};
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({Nbs})  //
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(req_pool_indices)
         .verify(prefix_lens);
     TensorMatcher({Nscratch})  //
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(verify_offsets_scratch);
     TensorMatcher({1})  //
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(verify_enable);
     TensorMatcher({Ncap})  //
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(out_verify_slot_indices)
         .verify(out_verify_expected_tokens)
         .verify(out_verify_expected_positions)
         .verify(out_verify_prev_slot_indices);
     TensorMatcher({Nmax_reqs, Nmax_seq_len})  //
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(req_to_token);
     RuntimeCheck(
         full_to_swa_index_mapping.has_value() == HAS_SWA_LUT,
@@ -235,17 +235,17 @@ struct PlanEntriesKernel {
     if constexpr (HAS_SWA_LUT) {
       TensorMatcher({Nlut})  //
           .with_dtype<int64_t>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLGPU>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
     if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
       TensorMatcher({Npool_rows, Npool_cols})  //
           .with_dtype<int32_t>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLGPU>(device_)
           .verify(req_to_verify_expected_tokens.value());
       TensorMatcher({Nbs})  //
           .with_dtype<int64_t>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLGPU>(device_)
           .verify(req_to_verify_expected_tokens_valid_lens.value());
     }
     RuntimeCheck(Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
