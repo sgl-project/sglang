@@ -34,15 +34,10 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
-    run_dsv4_draft_extend_attention_case,
     run_dsv4_target_verify_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
-)
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
-    run_dsv4_eagle_draft_extend_cuda_graph_case,
-    run_dsv4_eagle_draft_extend_cuda_graph_runner_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (  # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
@@ -246,48 +241,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             ):
                 run_dsv4_eagle_verify_cuda_graph_case(self, case, topk=1)
 
-    # EAGLE DRAFT_EXTEND is SWA-only for DSV4 (see runner docstring).
-    DRAFT_EXTEND_CASES = (
-        DSV4AttentionCase(
-            name="dsv4_swa_eagle_draft_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(2, 4),
-        ),
-    )
-
-    def test_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_draft_extend_attention_case(self, case)
-
-    # CUDA-graph capture/replay for EAGLE DRAFT_EXTEND — SWA only
-    # (init_forward_metadata_draft_extend uses need_compress=False; see
-    # `Production-Unsupported` in dsv4/README.md). Uniform `extend_lens`
-    # because DSV4 `forward(compress_ratio=0)` asserts
-    # `swa_page_indices.shape[0] == q.shape[0]` and the graph metadata
-    # builder uses uniform `num_tokens_per_bs = max_num_tokens // max_bs`
-    # (see `deepseek_v4_backend.py:646-647`).
-    EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES = (
-        DSV4AttentionCase(
-            name="runner_cuda_graph_dsv4_swa_eagle_draft_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(4, 4),
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_eagle_draft_extend_cuda_graph_case(self, case)
-
     # Production EAGLE draft graph runner (chain only, SWA only). The runner
     # routes through `DeepseekV4MultiStepBackend` (one `DeepseekV4AttnBackend`
     # per draft step), captures a fixed batch, and replays distinct request
@@ -308,34 +261,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.PRODUCTION_EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
-
-    # Production EAGLE draft-extend graph runner (SWA only). Routes through
-    # the prefill-side `DeepseekV4AttnBackend` (single backend, not
-    # multi-step); `init_forward_metadata_draft_extend` forces
-    # `need_compress=False` so C4/C128 is structurally unreachable for this
-    # path.
-    # Uniform `extend_lens` because the DSV4 graph contract requires
-    # `q.shape[0] == swa_page_indices.shape[0]` and the
-    # `init_forward_metadata_draft_extend` graph path uses
-    # `num_tokens_per_bs = max_num_tokens // max_bs` (see
-    # `deepseek_v4_backend.py:646-647`). Same constraint as the metadata-
-    # style draft_extend CG case.
-    PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
-        DSV4AttentionCase(
-            name="runner_production_eagle_draft_extend_dsv4_swa",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(4, 4),
-        ),
-    )
-
-    def test_runner_mode_production_eagle_draft_extend_cuda_graph_runner_cases(self):
-        for case in self.PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_eagle_draft_extend_cuda_graph_runner_case(self, case)
 
 
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
@@ -394,7 +319,13 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         from sglang.srt.server_args import ServerArgs
 
-        self.assertFalse(ServerArgs(model_path="dummy").enable_breakable_cuda_graph)
+        # cg-refactor folded the legacy enable_breakable_cuda_graph flag
+        # into cuda_graph_config. Verify the per-phase backend selectors
+        # default to None (i.e. nothing opted into BREAKABLE without an
+        # explicit CLI flag).
+        sa = ServerArgs(model_path="dummy")
+        self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
+        self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
         self.assertFalse(
             AttentionBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
