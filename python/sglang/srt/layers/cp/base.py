@@ -42,7 +42,7 @@ class ContextParallelStrategyKind(IntEnum):
     INTERLEAVE = 2
 
     @classmethod
-    def from_string(cls, value: str) -> "ContextParallelStrategyKind":
+    def from_string(cls, value: str) -> ContextParallelStrategyKind:
         if value == "zigzag":
             return cls.ZIGZAG
         if value == "interleave":
@@ -67,7 +67,7 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
 
     @classmethod
-    def from_string(cls, value: str) -> "CPAttentionBackendKind":
+    def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "flashinfer"):
             return cls.FLASH_ATTENTION
         raise ValueError(
@@ -102,7 +102,7 @@ class ContextParallelStrategy(ABC):
         return _is_dsa_active()
 
     @abstractmethod
-    def can_apply(self, num_tokens: int, forward_batch: "ForwardBatch") -> bool:
+    def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
         """Return True if this strategy can shard the current forward."""
 
     @abstractmethod
@@ -115,18 +115,18 @@ class ContextParallelStrategy(ABC):
         """Build per-forward metadata for this strategy."""
 
     @abstractmethod
-    def shard_hidden_states(self, x: Any, forward_batch: "ForwardBatch") -> Any:
+    def shard_hidden_states(self, x: Any, forward_batch: ForwardBatch) -> Any:
         """Shard hidden states to the current CP rank, usually at the first layer."""
 
     @abstractmethod
-    def shard_position_ids(self, positions: Any, forward_batch: "ForwardBatch") -> Any:
+    def shard_position_ids(self, positions: Any, forward_batch: ForwardBatch) -> Any:
         """Shard KV-cache slot position IDs for each token to the current CP rank."""
 
     @abstractmethod
     def gather_hidden_states(
         self,
         x: Any,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         stream: Optional[Any] = None,
     ) -> Any:
         """Gather rank-local hidden states, usually at the last layer."""
@@ -135,7 +135,7 @@ class ContextParallelStrategy(ABC):
     def gather_kv_cache(
         self,
         x: Any,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         stream: Optional[Any] = None,
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
@@ -151,7 +151,7 @@ class ContextParallelStrategy(ABC):
 
     def split_before_forward(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         input_ids: Optional[Any],
         positions: Any,
         input_embeds: Optional[Any] = None,
@@ -170,7 +170,7 @@ class ContextParallelStrategy(ABC):
     def run_attention(
         self,
         q: Any,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         device: Any,
         attn_fn: Callable[[Any, Any, Any, int], Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
@@ -180,7 +180,7 @@ class ContextParallelStrategy(ABC):
     @abstractmethod
     def materialize_full_kv(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         layer: Any,
         k: Any,
         v: Any,
@@ -205,7 +205,7 @@ def _is_dsa_active() -> bool:
 _STRATEGY: Optional[ContextParallelStrategy] = None
 
 
-def init_cp_strategy(server_args: "ServerArgs") -> None:
+def init_cp_strategy(server_args: ServerArgs) -> None:
     """Bind the configured CP strategy for this process."""
     global _STRATEGY
 
