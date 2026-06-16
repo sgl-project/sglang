@@ -1127,13 +1127,13 @@ class Req(ReqDllmMixin):
             return ids
         return self.token_buf.readonly_view()
 
-    def fill_ids_upto(self, length: int) -> array:
+    def get_fill_ids_sliced(self, slice_len: int) -> array:
         if self.is_dllm():
-            return to_array(self.get_full_untruncated_fill_ids()[:length])
-        return self.token_buf.materialize(0, length)
+            return to_array(self.get_full_untruncated_fill_ids()[:slice_len])
+        return self.token_buf.materialize(0, slice_len)
 
     def get_fill_ids(self) -> array:
-        return self.fill_ids_upto(self.fill_len)
+        return self.get_fill_ids_sliced(self.fill_len)
 
     def init_next_round_input(
         self,

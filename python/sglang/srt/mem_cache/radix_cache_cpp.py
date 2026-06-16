@@ -173,7 +173,7 @@ class RadixCacheCpp(BasePrefixCache):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         kv_committed_len = req.pop_committed_kv_cache()
-        token_ids = req.fill_ids_upto(kv_committed_len)
+        token_ids = req.get_fill_ids_sliced(kv_committed_len)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ].to(dtype=torch.int64, copy=True)
