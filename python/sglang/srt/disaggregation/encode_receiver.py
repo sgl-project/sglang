@@ -1512,6 +1512,7 @@ class MMReceiverBase(ABC):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 use_fast=not server_args.disable_fast_image_processor,
+                model_name=server_args.model_path,
                 **extra_kwargs,
             )
         except ValueError as e:
@@ -1526,6 +1527,7 @@ class MMReceiverBase(ABC):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     use_fast=True,
+                    model_name=server_args.model_path,
                     **extra_kwargs,
                 )
             else:
