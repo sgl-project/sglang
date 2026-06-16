@@ -285,6 +285,38 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "minicpm5",
             ),
             (
+                "glm47_compact_tool_call",
+                (
+                    "[gMASK]<sop>\n"
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n"
+                    "{% for tc in m.tool_calls %}\n"
+                    "{{- '<tool_call>' + tc.name -}}\n"
+                    "{% set _args = tc.arguments %}"
+                    "{% for k, v in _args.items() %}"
+                    "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>"
+                    "{% endfor %}</tool_call>\n"
+                    "{% endfor %}"
+                ),
+                ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
+                "glm47",
+            ),
+            (
+                "glm45_newline_tool_call",
+                (
+                    "[gMASK]<sop>\n"
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n"
+                    "{% for tc in m.tool_calls %}\n"
+                    "{{ '\\n<tool_call>' + tc.name }}\n"
+                    "{% set _args = tc.arguments %}\n"
+                    "{% for k, v in _args.items() %}\n"
+                    "<arg_key>{{ k }}</arg_key>\n<arg_value>{{ v }}</arg_value>\n"
+                    "{% endfor %}\n</tool_call>\n"
+                    "{% endfor %}"
+                ),
+                ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
+                "glm45",
+            ),
+            (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
@@ -304,6 +336,7 @@ class TestToolCallParserDetection(unittest.TestCase):
         # xml_kv_tool_call fallback. Both currently map to "glm45", so the
         # value-based test above can't catch a swap — assert positions directly.
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(rule_index["glm47"], rule_index["glm45"])
         self.assertLess(rule_index["glm45"], rule_index["xml_kv_tool_call"])
 
     def test_xml_kv_requires_both_arg_tokens(self):

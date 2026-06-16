@@ -203,6 +203,12 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm47(ctx):
+    return _is_glm45(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    )
+
+
 def _is_xml_kv_tool_call(ctx):
     # Structural signature for the GLM-4.5 / GLM-4.6 style tool-call format
     # (`<tool_call>name<arg_key>k</arg_key>\n<arg_value>v</arg_value>...</tool_call>`).
@@ -289,6 +295,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax-m2", predicate=_is_minimax),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
+    DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(
