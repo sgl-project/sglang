@@ -143,12 +143,16 @@ class GrammarManager:
         """
         Poll grammar_queue and return [ready_rids, failed_rids].
 
-        Rank i returns two sets ready_reqs_i, failed_reqs_i
-        ready_reqs_all = all_gather(ready_reqs_i)
-        failed_reqs_all = all_gather(failed_reqs_i)
+        Each rank first computes local ready/failed grammar queue indices.
+        These indices are synchronized within the TP/DP grammar sync group:
+        ready_idxs_all = all_gather(ready_idxs_i)
+        failed_idxs_all = all_gather(failed_idxs_i)
 
-        ready_reqs = intersect(ready_reqs_all)
-        failed_reqs = union(failed_reqs_all)
+        synced_ready_idxs = intersect(ready_idxs_all)
+        synced_failed_idxs = union(failed_idxs_all)
+
+        The synchronized indices are converted to request RIDs before returning,
+        so PP consensus can merge grammar readiness by stable request identity.
         """
         assert self.grammar_backend
         ready_req_idxs: set[int] = set()

@@ -79,6 +79,50 @@ class TestSchedulerPPGrammarConsensusHelpers(CustomTestCase):
         self.assertFalse(mixin._pp_has_inflight_grammar_consensus([None, None]))
         self.assertTrue(mixin._pp_has_inflight_grammar_consensus([None, [[], []]]))
 
+    def test_last_rank_emits_consensus_only_when_slot_is_ready(self):
+        mixin = self._new_mixin(is_last_rank=True)
+        mixin._pp_send_consensus_grammar_ids = MagicMock(return_value=["work"])
+
+        work, consensus = mixin._pp_pd_send_consensus_grammar_ids(
+            [None, [["rid-1"], []]], 0, None
+        )
+        self.assertEqual(work, [])
+        self.assertIsNone(consensus)
+        mixin._pp_send_consensus_grammar_ids.assert_not_called()
+
+        work, consensus = mixin._pp_pd_send_consensus_grammar_ids(
+            [None, [["rid-1"], []]], 1, None
+        )
+        self.assertEqual(work, ["work"])
+        self.assertEqual(consensus, [["rid-1"], []])
+        mixin._pp_send_consensus_grammar_ids.assert_called_once_with([["rid-1"], []])
+
+    def test_non_last_rank_forwards_prior_consensus(self):
+        mixin = self._new_mixin(is_last_rank=False)
+        mixin._pp_send_consensus_grammar_ids = MagicMock(return_value=["work"])
+
+        work, consensus = mixin._pp_pd_send_consensus_grammar_ids(
+            [[["local-slot"], []]], 0, [["prior"], ["failed"]]
+        )
+
+        self.assertEqual(work, ["work"])
+        self.assertEqual(consensus, [["prior"], ["failed"]])
+        mixin._pp_send_consensus_grammar_ids.assert_called_once_with(
+            [["prior"], ["failed"]]
+        )
+
+    def test_non_last_rank_does_not_send_without_prior_consensus(self):
+        mixin = self._new_mixin(is_last_rank=False)
+        mixin._pp_send_consensus_grammar_ids = MagicMock(return_value=["work"])
+
+        work, consensus = mixin._pp_pd_send_consensus_grammar_ids(
+            [[["local-slot"], []]], 0, None
+        )
+
+        self.assertEqual(work, [])
+        self.assertIsNone(consensus)
+        mixin._pp_send_consensus_grammar_ids.assert_not_called()
+
     def test_duplicate_final_consensus_is_idempotent_at_consumer(self):
         mixin = self._new_mixin()
         req = MagicMock()
