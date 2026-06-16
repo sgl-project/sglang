@@ -15,6 +15,7 @@ from diffusers.models.activations import (
 )
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.fused_linear_act import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -50,6 +51,9 @@ class MLP(nn.Module):
         )
 
         self.act = get_act_fn(act_type)
+        # Fuse the tanh-GELU into the fc_in GEMM epilogue (cublasLt) when the
+        # activation is the tanh-approx GELU; other activations are untouched.
+        self._fuse_gelu_tanh = act_type == "gelu_pytorch_tanh"
         if output_dim is None:
             output_dim = input_dim
         self.fc_out = RowParallelLinear(
@@ -62,8 +66,11 @@ class MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc_in(x)
-        x = self.act(x)
+        if self._fuse_gelu_tanh:
+            x = linear_gelu_tanh(self.fc_in, x)
+        else:
+            x, _ = self.fc_in(x)
+            x = self.act(x)
         x, _ = self.fc_out(x)
         return x
 
