@@ -125,7 +125,7 @@ ns eval \\
 `python3 benchmark/gsm8k/bench_sglang.py \\
   --num-questions 1319 --num-shots 8 \\
   --parallel 32 \\
-  --host http://{{CURL_HOST}} --port {{CURL_PORT}}`,
+  --host {{CURL_HOST}} --port {{CURL_PORT}}`,
     },
     numPromptsByConc: { 1: 10, 100: 500 },
   },
