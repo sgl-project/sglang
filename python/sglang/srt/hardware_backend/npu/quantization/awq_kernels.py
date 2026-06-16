@@ -197,46 +197,48 @@ class AWQAscendMoEKernel:
     #  Main entry point
     # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # 1. Pack weights
-        self._register_or_replace_parameter(
-            layer, "w13_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w13_qweight.data),
-        )
-        self._register_or_replace_parameter(
-            layer, "w2_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
-        )
-
-        # 2. Scales – transpose to (E, N, groups), register as "weight_scale"
-        self._register_or_replace_parameter(
-            layer, "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous(),
-        )
-        self._register_or_replace_parameter(
-            layer, "w2_weight_scale",
-            layer.w2_scales.data.transpose(1, 2).contiguous(),
-        )
-
-        # 3. Offsets – correctly computed from zeros, register as "weight_offset"
+        # Helper to expand per-group tensors to per-channel (K)
+        def expand_to_k(tensor: torch.Tensor, groups: int, group_size: int, K: int, N: int) -> torch.Tensor:
+            # tensor shape: (E, groups, N)
+            expanded = tensor.unsqueeze(2).expand(-1, -1, group_size, -1)  # (E, groups, group_size, N)
+            return expanded.reshape(-1, K, N)  # (E, K, N)
+    
         for prefix in ("w13", "w2"):
-            qzeros = getattr(layer, f"{prefix}_qzeros").data
-            scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
-            unpacked_zeros = self._unpack_awq_int4(qzeros)       # (E*groups, N) int8 (zero - 8)
-            E_z, groups, _ = qzeros.shape
-            N_z = unpacked_zeros.shape[1]
-            offset = unpacked_zeros.view(E_z, groups, N_z).permute(0, 2, 1).contiguous()  # (E, N, groups)
-            offset = -offset  # kernel expects 8 - zero_point
-            self._register_or_replace_parameter(
-                layer, f"{prefix}_weight_offset",
-                offset.to(scales_dtype),
-            )
-
-        # 4. Set dispatcher output dtype for w13
+            # 1. Unpack weight to get K and N
+            qweight = getattr(layer, f"{prefix}_qweight").data  # (E, K, N_packed)
+            unpacked = self._unpack_awq_int4(qweight)           # (E*K, N)
+            E, K = qweight.shape[0], qweight.shape[1]
+            N = unpacked.shape[1]
+            weight_int8 = unpacked.view(E, K, N).permute(0, 2, 1).contiguous()  # (E, N, K)
+    
+            # 2. Pack weight for NPU
+            packed_weight = self._pack_for_w4a16(weight_int8)   # (E, N, K//8)
+            self._register_or_replace_parameter(layer, f"{prefix}_weight", packed_weight)
+    
+            # 3. Process scales: expand from (E, groups, N) to (E, N, K)
+            scales = getattr(layer, f"{prefix}_scales").data    # (E, groups, N)
+            groups = scales.shape[1]
+            group_size = K // groups
+            assert K % groups == 0, f"K={K} not divisible by groups={groups}"
+            scales_expanded = scales.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(E, K, N)  # (E, K, N)
+            scales_final = scales_expanded.transpose(1, 2).contiguous()  # (E, N, K)
+            self._register_or_replace_parameter(layer, f"{prefix}_weight_scale", scales_final)
+    
+            # 4. Process offsets: unpack qzeros, expand, negate (8 - zero), transpose
+            qzeros = getattr(layer, f"{prefix}_qzeros").data    # (E, groups, N_packed)
+            unpacked_zeros = self._unpack_awq_int4(qzeros)      # (E*groups, N)
+            offset_int8 = unpacked_zeros.view(E, groups, N)     # (zero - 8)
+            offset_expanded = offset_int8.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(E, K, N)  # (E, K, N)
+            offset_final = -offset_expanded                     # 8 - zero
+            offset_final = offset_final.transpose(1, 2).contiguous()  # (E, N, K)
+            offset_final = offset_final.to(scales.dtype)        # cast to scale dtype
+            self._register_or_replace_parameter(layer, f"{prefix}_weight_offset", offset_final)
+    
+            # Free original AWQ tensors
+            for attr in (f"{prefix}_qweight", f"{prefix}_qzeros", f"{prefix}_scales"):
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+    
+        # 5. Set dispatcher output dtype for w13
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-
-        # 5. Free original AWQ tensors
-        for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
-                     "w2_qweight", "w2_qzeros", "w2_scales"):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
