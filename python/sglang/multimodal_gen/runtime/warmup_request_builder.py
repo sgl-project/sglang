@@ -257,10 +257,17 @@ def _resolve_warmup_steps(
     server_based_warmup: bool,
 ) -> int:
     warmup_steps = server_args.warmup_steps
+    default_steps = sampling_defaults.num_inference_steps
+
+    # Breakable CUDA graph captures one graph per step-branch at warmup so that
+    # serving never records a fresh graph. Run the model's full recommended
+    # steps (uncapped) so every step-branch signature is captured up front.
+    if server_args.enable_breakable_cuda_graph and default_steps:
+        return max(int(default_steps), warmup_steps)
+
     if not server_based_warmup:
         return warmup_steps
 
-    default_steps = sampling_defaults.num_inference_steps
     if default_steps is None or default_steps <= warmup_steps:
         return warmup_steps
 

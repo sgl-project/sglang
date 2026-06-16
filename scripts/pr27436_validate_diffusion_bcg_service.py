@@ -195,6 +195,19 @@ def second_prompt(model_key: str) -> str:
     )
 
 
+def _model_resolution(cfg: dict[str, Any]) -> str | None:
+    """The WxH this model is requested at, used as the BCG warmup resolution."""
+    width = height = None
+    for key, value in parse_cli_args(list(cfg.get("extra_args", []))):
+        if key == "width":
+            width = int(cli_value(value))
+        elif key == "height":
+            height = int(cli_value(value))
+    if width and height:
+        return f"{width}x{height}"
+    return None
+
+
 def build_server_cmd(
     model_key: str,
     port: int,
@@ -204,6 +217,7 @@ def build_server_cmd(
     no_warmup: bool,
     enable_bcg: bool,
     performance_mode: str | None,
+    text_buckets: str | None = None,
 ) -> list[str]:
     cfg = MODELS[model_key]
     cmd = [
@@ -221,6 +235,13 @@ def build_server_cmd(
     ]
     if enable_bcg:
         cmd.append("--enable-breakable-cuda-graph")
+        # BCG requires explicit resolutions; capture every text bucket at warmup
+        # so serving never records a fresh graph.
+        resolution = _model_resolution(cfg)
+        if resolution is not None:
+            cmd.extend(["--warmup-resolutions", resolution])
+        if text_buckets:
+            cmd.extend(["--bcg-text-buckets", *text_buckets.replace(",", " ").split()])
     if performance_mode:
         cmd.extend(["--performance-mode", performance_mode])
     if no_warmup:
@@ -536,6 +557,7 @@ def run_one(
         no_warmup=args.no_warmup,
         enable_bcg=not args.disable_bcg,
         performance_mode=args.performance_mode,
+        text_buckets=args.text_buckets,
     )
 
     env = os.environ.copy()
@@ -543,7 +565,6 @@ def run_one(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
     env["PYTHONPATH"] = "python"
     env["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
-    env.setdefault("SGLANG_BCG_TEXT_BUCKETS", args.text_buckets)
     if args.offline:
         env["HF_HUB_OFFLINE"] = "1"
 
@@ -606,10 +627,13 @@ def run_one(
                     and captures_after_second == captures_after_first
                 )
             else:
+                # Strict: warmup must capture everything, so neither the first
+                # nor the second serving request may add a new BCG capture.
                 pass_capture_check = (
                     captures_after_warmup > 0
                     and not has_bcg_capture_failed(log_path)
-                    and captures_after_second == captures_after_first
+                    and captures_after_first == captures_after_warmup
+                    and captures_after_second == captures_after_warmup
                 )
 
             result.update(
@@ -634,7 +658,8 @@ def run_one(
                         "eager run completed"
                         if pass_capture_check and args.disable_bcg
                         else (
-                            "second same-shape prompt reused captured graph"
+                            "warmup captured all graphs; both serving prompts "
+                            "added no new capture"
                             if pass_capture_check and not args.no_warmup
                             else (
                                 "no second-request capture"

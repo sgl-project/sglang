@@ -58,6 +58,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     server_args.warmup_steps = 1
     server_args.warmup_resolutions = ["512x512"]
     server_args.enable_cfg_parallel = enable_cfg_parallel
+    server_args.enable_breakable_cuda_graph = False
     server_args.server_warmup = False
 
     task_type = MagicMock()
@@ -89,6 +90,7 @@ def _make_generation_req() -> Req:
 def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
     sa = MagicMock()
     sa.enable_cfg_parallel = enable_cfg_parallel
+    sa.enable_breakable_cuda_graph = False
     sa.pipeline_config.task_type = ModelTaskType.T2I
     return sa
 
@@ -181,6 +183,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_resolutions = ["832x480"]
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -217,6 +220,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -257,6 +261,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -284,6 +289,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -325,6 +331,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -357,6 +364,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.backend = "auto"
 
         task_type = MagicMock()
@@ -385,6 +393,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.backend = "diffusers"
 
         task_type = MagicMock()
@@ -411,6 +420,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -442,6 +452,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -481,6 +492,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.pipeline_class_name = "LTX2TwoStageHQPipeline"
 
         task_type = MagicMock()
@@ -515,6 +527,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
 
         task_type = MagicMock()
         task_type.requires_image_input.return_value = False
@@ -569,6 +582,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.pipeline_config.task_type = ModelTaskType.TI2I
 
         with patch(
@@ -588,6 +602,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.pipeline_config.task_type = ModelTaskType.I2I
 
         with patch(
@@ -607,6 +622,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_breakable_cuda_graph = False
         server_args.pipeline_config.task_type = ModelTaskType.TI2V
 
         with patch(

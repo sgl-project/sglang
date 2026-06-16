@@ -1937,12 +1937,43 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
-            model_output = runner(
-                **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
-            )
+            model_output = self._bcg_run(runner, call_kwargs, current_model)
         else:
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
+
+    @staticmethod
+    def _bcg_is_warmup() -> bool:
+        """True when the current forward is a warmup request."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        try:
+            forward_batch = get_forward_context().forward_batch
+        except Exception:
+            return False
+        return bool(getattr(forward_batch, "is_warmup", False))
+
+    def _bcg_run(self, runner, call_kwargs: dict, current_model):
+        """Run the DiT through the BCG runner.
+
+        During warmup we proactively capture one graph per text bucket (in
+        addition to the request's own bucket) so that serving never records a
+        fresh graph for a different prompt length — every bucket is already
+        captured. Serving just replays (or runs eager for an uncaptured
+        signature, never capturing).
+        """
+        if self._bcg_is_warmup():
+            for bucket in self._bcg_text_buckets():
+                runner.capture(
+                    **self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=current_model, force_bucket=bucket
+                    )
+                )
+        return runner(
+            **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+        )
 
     @staticmethod
     def _bcg_text_buckets() -> tuple[int, ...]:
@@ -1958,14 +1989,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         except Exception:
             return DEFAULT_BCG_TEXT_BUCKETS
 
-    def _bcg_pad_prompt_kwargs(self, call_kwargs: dict, current_model=None):
+    def _bcg_pad_prompt_kwargs(
+        self, call_kwargs: dict, current_model=None, force_bucket: int | None = None
+    ):
         """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
 
         Generic, model-agnostic padding lives in ``bcg_utils``; model-specific
         padders (Qwen, Z-Image, ...) live next to their model and register with
         the ``bcg_utils`` registry, keeping this base stage model-agnostic.
+
+        ``force_bucket`` pads to exactly that bucket (used by warmup to capture
+        every bucket); a prompt already longer than ``force_bucket`` is left
+        unchanged, exactly as the normal bucket selection would do.
         """
-        buckets = self._bcg_text_buckets()
+        buckets = (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
         padder = bcg_utils.select_prompt_padder(current_model, call_kwargs)
         if padder is not None:
             return padder(call_kwargs, current_model, buckets)
