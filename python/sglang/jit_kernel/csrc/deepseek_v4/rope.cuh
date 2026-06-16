@@ -137,40 +137,34 @@ __global__ __launch_bounds__(kBlockSize, 16)  //
   const auto input = static_cast<const DType*>(q) + batch_id * q_stride_batch + head_id * q_stride_head;
   const auto output =
       static_cast<DType*>(out) + batch_id * out_stride_batch + group_id * out_stride_group + head_in_group * head_dim;
-  const auto input2 = reinterpret_cast<const DType2*>(input);
-  const auto output2 = reinterpret_cast<DType2*>(output);
 
   const auto position = static_cast<const IndexType*>(positions)[batch_id];
   const auto freq_ptr = reinterpret_cast<const fp32x2_t*>(freqs_cis + position * kRopeDim);
-  const auto num_pairs = head_dim / 2;
-  const auto rope_pair_start = (head_dim - kRopeDim) / 2;
+  // Non-RoPE prefix that is copied verbatim; always even since head_dim and kRopeDim are even.
+  const auto prefix_dim = head_dim - kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
 
-  const auto prefix_dim = head_dim - kRopeDim;
+  // Copy the un-rotated prefix: vectorized when 16B-aligned, else pairwise (4B, always valid).
   const auto vector_aligned = (reinterpret_cast<uintptr_t>(input) % alignof(CopyVec) == 0) &&
                               (reinterpret_cast<uintptr_t>(output) % alignof(CopyVec) == 0);
   if (prefix_dim % kCopyVecElems == 0 && vector_aligned) {
-    const auto prefix_vecs = prefix_dim / kCopyVecElems;
-    for (auto vec_id = lane_id; vec_id < prefix_vecs; vec_id += kWarpThreads) {
-      const auto data = load_as<CopyVec>(input, vec_id);
-      store_as<CopyVec>(output, data, vec_id);
-    }
-
-    const auto rope_input2 = reinterpret_cast<const DType2*>(input + prefix_dim);
-    auto rope_output2 = reinterpret_cast<DType2*>(output + prefix_dim);
-    for (auto pair_id = lane_id; pair_id < kRopeDim / 2; pair_id += kWarpThreads) {
-      const auto data = rope_input2[pair_id];
-      rope_output2[pair_id] = apply_rope_pair<kInverse>(data, freq_ptr[pair_id]);
+    for (auto vec_id = lane_id; vec_id < prefix_dim / kCopyVecElems; vec_id += kWarpThreads) {
+      store_as<CopyVec>(output, load_as<CopyVec>(input, vec_id), vec_id);
     }
   } else {
-    for (auto pair_id = lane_id; pair_id < num_pairs; pair_id += kWarpThreads) {
-      auto data = input2[pair_id];
-      if (pair_id >= rope_pair_start) {
-        data = apply_rope_pair<kInverse>(data, freq_ptr[pair_id - rope_pair_start]);
-      }
-      output2[pair_id] = data;
+    const auto in2 = reinterpret_cast<const DType2*>(input);
+    const auto out2 = reinterpret_cast<DType2*>(output);
+    for (auto pair_id = lane_id; pair_id < prefix_dim / 2; pair_id += kWarpThreads) {
+      out2[pair_id] = in2[pair_id];
     }
+  }
+
+  // Apply RoPE to the trailing kRopeDim dims -- identical regardless of the prefix-copy path.
+  const auto rope_input2 = reinterpret_cast<const DType2*>(input + prefix_dim);
+  auto rope_output2 = reinterpret_cast<DType2*>(output + prefix_dim);
+  for (auto pair_id = lane_id; pair_id < kRopeDim / 2; pair_id += kWarpThreads) {
+    rope_output2[pair_id] = apply_rope_pair<kInverse>(rope_input2[pair_id], freq_ptr[pair_id]);
   }
 
   PDLTriggerSecondary<kUsePDL>();
