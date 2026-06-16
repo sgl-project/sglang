@@ -20,7 +20,7 @@ v0.5.10 or a later version.
 
 ## Supported features
 
-| Feature                       | Usage                                                                                         |
+| Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
@@ -35,6 +35,13 @@ v0.5.10 or a later version.
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
 | EPLB                          | `--enable-eplb`                                                                               |
 | NZ Weight Format              | `export SGLANG_USE_FIA_NZ=1`                                                                  |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+</Note>
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).

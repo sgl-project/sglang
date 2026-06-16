@@ -21,7 +21,7 @@ v0.5.10 or a later version.
 
 ## Supported features
 
-| Feature                       | Usage                                                                                         |
+| Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
@@ -33,6 +33,13 @@ v0.5.10 or a later version.
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+</Note>
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).

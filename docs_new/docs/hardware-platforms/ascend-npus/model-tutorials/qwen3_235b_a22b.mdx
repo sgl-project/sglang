@@ -22,7 +22,7 @@ v0.5.10 or a later version.
 
 ## Supported features
 
-| Feature                       | Usage                                                                                         |
+| Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--dp-size 16 --enable-dp-attention`                                                          |
@@ -35,6 +35,13 @@ v0.5.10 or a later version.
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 | Prefill Context Parallel      | `--enable-prefill-context-parallel --attn-cp-size 2 --moe-dp-size 2`                          |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+</Note>
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
