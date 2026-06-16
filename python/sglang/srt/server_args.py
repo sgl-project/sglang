@@ -1979,7 +1979,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     dllm_algorithm: A[
         Optional[str],
-        "The diffusion LLM algorithm, such as LowConfidence.",
+        "The diffusion LLM algorithm, such as LinearSpec or FastDiffuser.",
     ] = None
     dllm_algorithm_config: A[
         Optional[str],
@@ -6252,17 +6252,27 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+
+        from sglang.srt.dllm.config import DllmConfig
+
+        config = DllmConfig.from_server_args(self)
+        cuda_graph_config = self.cuda_graph_config
+        cuda_graph_enabled = (
+            cuda_graph_config is not None
+            and cuda_graph_config.decode.backend != Backend.DISABLED
+        )
+
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            if (
-                self.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            if cuda_graph_config is not None and (
+                cuda_graph_config.decode.backend != Backend.DISABLED
+                or cuda_graph_config.prefill.backend != Backend.DISABLED
             ):
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cuda_graph_config.decode.backend = Backend.DISABLED
+                cuda_graph_config.prefill.backend = Backend.DISABLED
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
@@ -6274,7 +6284,7 @@ class ServerArgs:
                     "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
-        elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
+        elif cuda_graph_enabled:
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -6287,9 +6297,6 @@ class ServerArgs:
             self.disable_overlap_schedule = True
 
         if not self.disable_radix_cache:
-            from sglang.srt.dllm.config import DllmConfig
-
-            config = DllmConfig.from_server_args(self)
             if self.page_size % config.block_size != 0:
                 logger.warning(
                     f"Setting page size to {config.block_size} for diffusion LLM inference"
