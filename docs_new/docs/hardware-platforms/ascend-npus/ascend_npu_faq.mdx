@@ -175,11 +175,11 @@ Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the aff
         #     )
 
         # else:
-            out_indices = torch.empty(
-                (extend_num_tokens,),
-                dtype=torch.int32,
-                device=self.device,
-            )
+        out_indices = torch.empty(
+            (extend_num_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         ...
 ```
 
