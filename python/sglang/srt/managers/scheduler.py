@@ -1892,7 +1892,7 @@ class Scheduler(
             - batch_size_lower / batch_size_upper -> B_min / B_max
 
         Initializes the search space [batch_lower_bound, batch_upper_bound],
-        latency history deques, and tracking variables for the online
+        latency history dequeues, and tracking variables for the online
         SLA-constrained dynamic batching algorithm in the paper.
 
         Returns immediately if enable_sla_constraint is False.
