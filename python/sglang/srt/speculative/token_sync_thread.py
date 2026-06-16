@@ -44,12 +44,13 @@ class TokenSyncThread:
     transport: BaseDecoupledSpecTransport
     drafter_rank: int = 0
     _pending_control_inbox: DraftControlInbox = field(default_factory=DraftControlInbox)
-    # protects _pending_control_inbox
+    # Protects _pending_control_inbox (loop writes, scheduler reads).
     _pending_lock: threading.Lock = field(default_factory=threading.Lock)
-    _outgoing_results: "queue.SimpleQueue[DraftTailStreamOutputBatch]" = field(
+    _outgoing_results: queue.SimpleQueue[DraftTailStreamOutputBatch] = field(
         default_factory=queue.SimpleQueue
     )
     _closed: threading.Event = field(default_factory=threading.Event)
+    # Wakes the idle loop the instant a result is queued (latency-critical send).
     _wakeup: threading.Event = field(default_factory=threading.Event)
     _thread: Optional[threading.Thread] = None
 
@@ -72,8 +73,6 @@ class TokenSyncThread:
             self._thread.join(timeout=1.0)
         self.transport.close()
 
-    # ---- scheduler-facing API ------------------------------------------------
-
     def collect_ready_draft_controls(
         self,
         collector: Callable[[DraftControlInbox], ReadyDraftControls],
@@ -85,11 +84,10 @@ class TokenSyncThread:
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
             return
+        # Snapshot the outputs so later caller mutations can't race the queued batch.
         queued_batch = DraftTailStreamOutputBatch(outputs=list(result_batch.outputs))
         self._outgoing_results.put(queued_batch)
         self._wakeup.set()
-
-    # ---- loop ----------------------------------------------------------------
 
     def _step(self) -> bool:
         """Run one drain cycle (outgoing results + incoming controls).
@@ -109,9 +107,8 @@ class TokenSyncThread:
             except TransportClosed:
                 break
 
-    # ---- incoming: verifier -> drafter controls ------------------------------
-
     def _drain_incoming(self) -> bool:
+        # verifier -> drafter controls
         did_work = False
         while (message := self.transport.try_recv()) is not None:
             did_work = True
@@ -137,9 +134,8 @@ class TokenSyncThread:
             return None
         return control_batch
 
-    # ---- outgoing: drafter -> verifier draft tokens --------------------------
-
     def _drain_outgoing_results(self) -> bool:
+        # drafter -> verifier draft tokens
         did_work = False
         while True:
             try:

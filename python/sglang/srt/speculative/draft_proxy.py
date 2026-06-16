@@ -49,7 +49,7 @@ class DraftProxyThread:
         self.transport = transport
         self.verifier_rank = int(verifier_rank)
         self.draft_tail_buffer = draft_tail_buffer
-        self._send_queue: "queue.SimpleQueue[DraftControlBatch]" = queue.SimpleQueue()
+        self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
         self._closed = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -69,14 +69,10 @@ class DraftProxyThread:
             self._thread.join(timeout=1.0)
         self.transport.close()
 
-    # ---- scheduler-facing API ------------------------------------------------
-
     def submit_control_batch(self, batch: DraftControlBatch) -> None:
         # Apply to the verifier's own mirror first, then forward to the drafter.
         self.draft_tail_buffer.apply_control_batch(batch)
         self._send_queue.put(batch)
-
-    # ---- loop ----------------------------------------------------------------
 
     def _step(self) -> bool:
         """Run one drain cycle (outgoing controls + incoming tail tokens).
@@ -95,9 +91,8 @@ class DraftProxyThread:
             except TransportClosed:
                 break
 
-    # ---- outgoing: verifier -> drafter controls ------------------------------
-
     def _drain_send_queue(self) -> bool:
+        # verifier -> drafter controls
         did_work = False
         while True:
             try:
@@ -111,9 +106,8 @@ class DraftProxyThread:
             )
         return did_work
 
-    # ---- incoming: drafter -> verifier draft tokens --------------------------
-
     def _drain_incoming(self) -> bool:
+        # drafter -> verifier draft tokens
         did_work = False
         while (message := self.transport.try_recv()) is not None:
             did_work = True
@@ -131,6 +125,7 @@ class DraftProxyThread:
             or message.tail_stream_output_batch is None
         ):
             raise RuntimeError(f"Unexpected draft proxy message: {message}")
+        # TODO whether need to change this to any()
         output_batch = message.tail_stream_output_batch
         mismatched_outputs = [
             output
