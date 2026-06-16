@@ -3,9 +3,9 @@ import tempfile
 import unittest
 
 from sglang.srt.speculative.adaptive_spec_params import (
+    DEFAULT_ADAPTIVE_CONFIG,
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
-    DEFAULT_ADAPTIVE_CONFIG,
     resolve_candidate_steps_from_config,
     validate_adaptive_initial_steps,
 )
