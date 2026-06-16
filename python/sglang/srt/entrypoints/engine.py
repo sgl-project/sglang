@@ -863,7 +863,7 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in detoken_procs:
             scheduler_init_result.all_child_pids.append(p.pid)
 
-        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
+        if server_args.tokenizer_worker_num == 1:
             # Launch a single tokenizer manager without the router
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args

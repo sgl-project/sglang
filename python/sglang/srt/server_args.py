@@ -922,9 +922,6 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
-    # For grpc
-    enable_grpc: bool = False
-
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -8430,7 +8427,7 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
-        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
+        if server_args.tokenizer_worker_num == 1:
             tokenizer_worker_ipc_name = None
         else:
             tokenizer_worker_ipc_name = (
