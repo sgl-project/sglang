@@ -1,0 +1,116 @@
+// GLM-5.2 per-cell benchmark numbers, keyed by the same `match` tuple as glm-5.2.jsx cells.
+// See _deployment.jsx for the speed/accuracy schema.
+// Numbers pending: each entry is a bare `match` stub (renders "pending") until measured
+// end-to-end on the corresponding hardware, then filled with sglang_version + speed/accuracy.
+export const benchmarks = [
+  // ---- H200 + FP8 ----  (measured on the v0.5.13.post1 release image, flush-cache on every run)
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 740, tpot_ms: 4.06, tokens_per_sec_per_gpu: 26 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 5980, tpot_ms: 13.97, tokens_per_sec_per_gpu: 98 },
+    ],
+  },
+  {
+    // Tuned prefill (chunked-prefill 32768 + max-running 80): +44%/+78% throughput and
+    // -59%/-49% TTFT vs the untuned default-chunked (2048) baseline (152/133 gpu) on post1.
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 8013, tpot_ms: 25.57, tokens_per_sec_per_gpu: 219 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 77790, tpot_ms: 29.08, tokens_per_sec_per_gpu: 236 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 450276, tpot_ms: 86.71, tokens_per_sec_per_gpu: 184 },
+    ],
+  },
+  // ---- B200 + FP8 ----  (measured on the v0.5.13.post1 release image, flush-cache on every run)
+  {
+    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 335, tpot_ms: 3.12, tokens_per_sec_per_gpu: 36 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 2710, tpot_ms: 8.05, tokens_per_sec_per_gpu: 172 },
+    ],
+  },
+  {
+    // Re-measured on v0.5.13.post1 with tuned prefill (chunked-prefill 32768 + max-running 80):
+    // +34%/+44% throughput and -55%/-39% TTFT vs the untuned default-chunked (2048) baseline.
+    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 5680, tpot_ms: 18.76, tokens_per_sec_per_gpu: 285 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 60665, tpot_ms: 23.91, tokens_per_sec_per_gpu: 297 },
+    ],
+  },
+  {
+    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 178249, tpot_ms: 48.28, tokens_per_sec_per_gpu: 449 },
+    ],
+  },
+  // ---- GB300 + FP8 ----  (4-GPU single node, TP4; measured on the v0.5.13.post1 release image, flush-cache on every run)
+  {
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 398, tpot_ms: 3.86, tokens_per_sec_per_gpu: 59 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 3637, tpot_ms: 10.36, tokens_per_sec_per_gpu: 275 },
+    ],
+  },
+  {
+    // Balanced uses the tuned prefill (chunked-prefill 32768 + max-running 80), same lever as H200/B200.
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 7678, tpot_ms: 27.77, tokens_per_sec_per_gpu: 411 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 76359, tpot_ms: 31.08, tokens_per_sec_per_gpu: 483 },
+    ],
+  },
+  {
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 250727, tpot_ms: 68.55, tokens_per_sec_per_gpu: 641 },
+    ],
+  },
+  // ---- B300 + FP8 ----  (inferred from B200; benchmarks pending → render "pending")
+  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" } },
+  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2; benchmarks pending → render "pending")
+  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "single" } },
+  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" } },
+  // ---- BF16 multi-node (inferred) ----  benchmarks pending
+  { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
+  { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
+  { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" } },
+  { match: { hw: "b200",  variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
+  { match: { hw: "b200",  variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
+  { match: { hw: "b200",  variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" } },
+  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
+  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
+  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" } },
+];

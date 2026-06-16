@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> None:
     """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
-    from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
     server_args.attention_backend = "dsv4"
@@ -40,10 +39,6 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         assert (
             server_args.speculative_eagle_topk == 1
         ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
-
-        if not envs.SGLANG_ENABLE_SPEC_V2.get():
-            envs.SGLANG_ENABLE_SPEC_V2.set(True)
-            logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1
