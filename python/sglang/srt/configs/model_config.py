@@ -279,13 +279,7 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
-        # Hybrid FP8 (linear/attn) + NVFP4 (MoE) checkpoints
-        # (e.g. nvidia/DeepSeek-V4-Pro-NVFP4) declare
-        # `quant_algo=MIXED_PRECISION` + `moe_quant_algo=NVFP4` in
-        # `config.json:quantization_config`, alongside the NVFP4 MoE
-        # `group_size` and `ignore` glob list. Stash for
-        # `_get_quantization_config` to consume the same way it carries
-        # `is_fp4_experts`.
+        # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):

@@ -2296,11 +2296,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         skipped_checking_patterns = [
             "attn_mqa.k_scale",
             "attn_mqa.v_scale",
-            # ModelOptNvFp4FusedMoEMethod registers w{13,2}_blockscale_swizzled
-            # as placeholders in create_weights; process_weights_after_loading
-            # either aliases them to w*_weight_scale (TRTLLM) or rebinds them
-            # to the real swizzled content (CUTLASS). PWAL runs after this
-            # warning, so the loader sees them as unloaded — false positive.
             "blockscale_swizzled",
         ]
         if not self.pp_group.is_first_rank:

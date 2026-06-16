@@ -3,11 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-<<<<<<< HEAD
-from typing import TYPE_CHECKING, Generator, cast
-=======
-from typing import TYPE_CHECKING, Optional, cast
->>>>>>> 9f8a06f293 (Support NVFP4 MoE for DeepSeek-V4)
+from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -875,11 +871,6 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
-    # Per-expert SwiGLU clamp threshold in raw-GEMM space; the kernel
-    # multiplies the GEMM output by `output1_scale_gate_scalar` (= g1_alphas)
-    # before clamping, so this value is pre-folded at load time as
-    # ``swiglu_limit / g1_alphas`` by
-    # ``ModelOptNvFp4FusedMoEMethod.process_weights_after_loading``.
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 

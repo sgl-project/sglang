@@ -212,7 +212,7 @@ sglang serve \
   --enable-deepseek-v4-fp4-indexer
 ```
 
-**NVFP4 Hybrid Checkpoints **
+**NVFP4 Hybrid Checkpoints**
 
 The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
 [`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
@@ -233,7 +233,7 @@ sglang serve \
   --tp 8
 ```
 
-Requires Blackwell (SM100, e.g. 8×B200). The MTP layer in this checkpoint stays
+Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
 MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
 automatically.
 

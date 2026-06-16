@@ -245,11 +245,7 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
-            # Hybrid FP8(linear)+NVFP4(MoE) checkpoints (e.g.
-            # nvidia/DeepSeek-V4-Pro-NVFP4): wrap the built Fp8Config in
-            # HybridFp8NvFp4Config (a subclass) so FusedMoE layers dispatch
-            # to ModelOptNvFp4FusedMoEMethod while linear/attention stay on
-            # the FP8 path.
+            # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
                 from sglang.srt.layers.quantization.modelopt_quant import (
