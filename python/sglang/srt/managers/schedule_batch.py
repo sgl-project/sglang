@@ -669,7 +669,7 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Optional[array[int]],
+        origin_input_ids: Union[array[int], ViewableArray],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -716,9 +716,13 @@ class Req(ReqDllmMixin):
             else ViewableArray(origin_input_ids)
         )
         self.origin_input_len: int = len(self.token_buf)
-        self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded if origin_input_ids_unpadded else origin_input_ids
-        )  # Before image padding
+        # Before image padding
+        if origin_input_ids_unpadded:
+            self.origin_input_ids_unpadded = origin_input_ids_unpadded
+        elif isinstance(origin_input_ids, ViewableArray):
+            self.origin_input_ids_unpadded = origin_input_ids.materialize()
+        else:
+            self.origin_input_ids_unpadded = origin_input_ids
         self.fill_len: int = 0
 
         self.session = session
