@@ -534,15 +534,10 @@ class Indexer(MultiPlatformOp):
             return max_kv_len <= self.index_topk
         return False
 
-    def _can_use_graph_dsa_dispatch(
-        self,
-        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        forward_batch: ForwardBatch,
-    ) -> bool:
+    def _can_use_graph_dsa_dispatch(self, forward_batch: ForwardBatch) -> bool:
         return (
             is_graph_dsa_split_op_surface_active(forward_batch)
             and not self.dsa_enable_prefill_cp
-            and not isinstance(x, tuple)
         )
 
     def _forward_cuda_graph_dispatch(
@@ -553,8 +548,10 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         return_indices: bool,
     ) -> Optional[torch.Tensor]:
-        # Reached only via _can_use_graph_dsa_dispatch, which requires a
-        # non-tuple `x`, so `x` is the metadata tensor (no separate x_meta).
+        # The split-op dispatch surface is CUDA-only (the is_cuda() gate in
+        # is_graph_dsa_split_op_surface_active), while fused-quant tuple `x` only
+        # arises on ROCm/aiter -- so here `x` is always the plain metadata tensor
+        # and needs no x_meta unpacking.
         if return_indices:
             topk_result = torch.full(
                 (x.shape[0], self.index_topk),
@@ -1605,7 +1602,7 @@ class Indexer(MultiPlatformOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
 
-        if self._can_use_graph_dsa_dispatch(x, forward_batch):
+        if self._can_use_graph_dsa_dispatch(forward_batch):
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             return self._forward_cuda_graph_dispatch(
