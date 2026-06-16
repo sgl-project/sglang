@@ -89,19 +89,16 @@ def _broadcast_float_from_rank0(value: float) -> float:
     """Broadcast a float from TP rank 0 to all ranks; no-op when TP=1 or dist not active."""
     if not dist.is_initialized():
         return value
-    try:
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_world_size,
-            get_tp_group,
-        )
-        if get_tensor_model_parallel_world_size() <= 1:
-            return value
-        t = torch.tensor([value], dtype=torch.float64,
-                         device=get_tp_group().device)
-        dist.broadcast(t, src=0, group=get_tp_group().device_group)
-        return float(t.item())
-    except Exception:
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+    )
+
+    if get_tensor_model_parallel_world_size() <= 1:
         return value
+    t = torch.tensor([value], dtype=torch.float64, device=get_tp_group().device)
+    dist.broadcast(t, src=0, group=get_tp_group().device_group)
+    return float(t.item())
 
 
 # ---------------------------------------------------------------------------
