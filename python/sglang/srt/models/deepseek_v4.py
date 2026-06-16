@@ -126,8 +126,8 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
 )
