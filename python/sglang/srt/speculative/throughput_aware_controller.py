@@ -280,7 +280,8 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
 
     def _resolve_profile_seq_len(self) -> int:
         """Prefill context length for profiling (config or auto, clamped to context_length)."""
-        ctx = int(getattr(self.worker.server_args, "context_length", None) or 4096)
+        server_args = getattr(self.worker, "server_args", None)
+        ctx = int(getattr(server_args, "context_length", None) or 4096)
         max_step = max(self._all_candidate_steps) if self._all_candidate_steps else 1
         decode_growth = (self._profile_n_warmup + self._profile_n_measure) * (
             max_step + 1
