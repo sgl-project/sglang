@@ -261,18 +261,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             {} if self.use_captured_attn_metadata else None
         )
 
-        # --- BCG: resolve inner layer_model for capture/replay --------
-        # BCG captures only the inner transformer stack (layer_model.forward)
-        # — not the outer model.forward. The outer's tail (logits_processor /
-        # pooler) has bs-shaped kernels that would bake bs=1 into the captured
-        # graph and break multi-req replay. At replay, we monkey-patch
-        # layer_model.forward to replay the captured graph and return the
-        # captured hidden states; the outer model.forward then runs
-        # logits_processor eagerly on top with the live multi-req metadata.
-        # Mirrors main's BreakableCudaGraphRunner. (Slot pre-init lives
-        # above next to _prefill_static_buffers — TcPiecewise's compile
-        # pass runs during backend construction and reads self.layer_model.)
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        # --- BCG / Full: resolve inner layer_model for capture/replay -
+        # Both BCG and Full CG capture only the inner transformer stack
+        # (layer_model.forward), not the outer model.forward tail
+        # (logits_processor / pooler). For BCG that's because the outer
+        # tail's bs-shaped kernels would bake bs=1 into the captured graph
+        # and break multi-req replay; for Full it's because the outer
+        # tail's _copy_logits_to_buffer allocates an (R, vocab) buffer
+        # PER captured bucket which would scale linearly with
+        # FULL_CG_PREFILL_REQ_SLOTS (at R=1024 + vocab=151k that's 622 MB
+        # per bucket × 58 buckets ≈ 36 GB — OOM). Capturing only the
+        # transformer body and running the LM head + logits_processor
+        # eagerly after replay keeps both costs bounded and lets us
+        # raise R freely.
+        # At replay, we monkey-patch layer_model.forward to drive the
+        # captured graph and return its (sliced) hidden states; the outer
+        # model.forward then runs logits_processor on raw multi-req
+        # metadata. (Slot pre-init lives above next to
+        # _prefill_static_buffers — TcPiecewise's compile pass runs
+        # during backend construction and reads self.layer_model.)
+        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
@@ -282,9 +290,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.layer_model = language_model.model
             else:
                 raise RuntimeError(
-                    f"BCG could not resolve inner layer_model on "
-                    f"{type(language_model).__name__}; BCG is unsupported for "
-                    f"this model architecture."
+                    f"{type(self.backend).__name__} could not resolve inner "
+                    f"layer_model on {type(language_model).__name__}; "
+                    f"this backend is unsupported for this model architecture."
                 )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
@@ -885,22 +893,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens = self.raw_num_tokens
 
             if self.layer_model is not None:
-                # BCG path. The captured graph is a bs=1 replay of
-                # layer_model.forward. Monkey-patch layer_model.forward to
-                # call backend.replay (which fires the captured graph and
-                # returns the captured hidden_states), then drive the outer
-                # model.forward eagerly with the live multi-req
-                # static_forward_batch. The outer's logits_processor /
-                # pooler then runs on top with live multi-req metadata.
+                # BCG / Full: replay the captured body, run the LM head +
+                # logits_processor eagerly. For Full, slice hidden_states to
+                # raw_num_tokens and pass the raw forward_batch so the eager
+                # tail runs at raw_bs.
                 shape_key = ShapeKey(size=self._static_num_tokens)
+                full_path = self._is_full_backend
 
                 def replay_layer_forward(*args, **layer_kwargs):
-                    return self.backend.replay(
-                        shape_key, static_forward_batch, **kwargs
-                    )
+                    hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+                    return hs[:raw_num_tokens] if full_path else hs
 
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
+                # For Full, run the eager LM head + logits_processor against
+                # the raw user-facing batch so the tail's R-sized work and
+                # buffers collapse to real bs. For BCG, static_forward_batch
+                # IS the raw batch (bs=1 has no padding), so we keep the
+                # existing call unchanged.
+                tail_batch = forward_batch if full_path else static_forward_batch
                 try:
                     with forward_context(
                         ForwardContext(attn_backend=self.model_runner.attn_backend)
@@ -915,20 +926,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         raw_num_tokens=raw_num_tokens,
                     ):
                         output = self.model_runner.model.forward(
-                            static_forward_batch.input_ids,
-                            static_forward_batch.positions,
-                            static_forward_batch,
+                            tail_batch.input_ids,
+                            tail_batch.positions,
+                            tail_batch,
                             **kwargs,
                         )
                 finally:
                     self.layer_model.forward = original_layer_forward
             else:
-                # TC_PIECEWISE / FULL path. TC_PIECEWISE's backend.replay
-                # calls the compiled outer model.forward directly
-                # (torch.compile handles multi-req via bs-invariant
-                # FX-traced kernels); FULL's fires the captured
-                # whole-forward graph for this bucket (bs=1, gated in
-                # can_run) and returns its captured output.
+                # TC_PIECEWISE path. TC_PIECEWISE's backend.replay calls
+                # the compiled outer model.forward directly: torch.compile
+                # FX-traces produce bs-invariant kernels, so the captured
+                # tail handles multi-req without R-padding bloat.
                 with forward_context(
                     ForwardContext(attn_backend=self.model_runner.attn_backend)
                 ), set_tc_piecewise_forward_context(
