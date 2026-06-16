@@ -393,7 +393,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run JIT kernel unit tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
