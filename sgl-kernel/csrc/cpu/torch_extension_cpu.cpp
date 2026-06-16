@@ -139,6 +139,16 @@ void assign_extend_cache_locs_cpu(
     at::Tensor out_cache_loc,
     int64_t pool_len);
 
+void reconstruct_indices_from_tree_mask_cpu(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    int64_t batch_size,
+    int64_t draft_token_num);
+
 void rotate_input_ids_cpu(
     at::Tensor input_ids,
     const at::Tensor& extend_start_loc,
@@ -617,6 +627,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotate_input_ids_cpu(Tensor(a!) input_ids, Tensor extend_start_loc, "
       "Tensor extend_seq_lens, Tensor topk_index, Tensor? select_index) -> ()");
   m.impl("rotate_input_ids_cpu", torch::kCPU, &rotate_input_ids_cpu);
+
+  m.def(
+      "reconstruct_indices_from_tree_mask_cpu(Tensor tree_mask, Tensor verified_seq_len, "
+      "Tensor(a!) positions, Tensor(a!) retrive_index, "
+      "Tensor(a!) retrive_next_token, Tensor(a!) retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask_cpu", torch::kCPU, &reconstruct_indices_from_tree_mask_cpu);
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");

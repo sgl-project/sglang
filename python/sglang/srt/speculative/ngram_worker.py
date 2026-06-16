@@ -3,7 +3,14 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask_cpu
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -63,12 +70,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.device = server_args.device
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
@@ -285,20 +289,32 @@ class NGRAMWorker(BaseSpecWorker):
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
         # generate positions and some indices using tree_mask
-        reconstruct_indices_from_tree_mask(
-            tree_mask,
-            batch.seq_lens,
-            positions,  # mutable
-            retrieve_index,  # mutable
-            retrieve_next_token,  # mutable
-            retrieve_next_sibling,  # mutable
-            bs,
-            self.draft_token_num,
-        )
+        if _is_cpu:
+            reconstruct_indices_from_tree_mask_cpu(
+                tree_mask,
+                batch.seq_lens,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                bs,
+                self.draft_token_num,
+            )
+        else:
+            reconstruct_indices_from_tree_mask(
+                tree_mask,
+                batch.seq_lens,
+                positions,  # mutable
+                retrieve_index,  # mutable
+                retrieve_next_token,  # mutable
+                retrieve_next_sibling,  # mutable
+                bs,
+                self.draft_token_num,
+            )
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        if USE_FULL_MASK and not _is_cpu:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -517,5 +533,5 @@ class NGRAMWorker(BaseSpecWorker):
             # it via on_publish instead.
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=self.draft_token_num,
         )
