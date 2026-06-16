@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -223,6 +222,14 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
+def refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
+    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    layer._cutedsl_input_scale = used_input_scale
+
+
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
@@ -234,64 +241,63 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     buffers are normal tensors -- inference tensors cannot be inplace-updated
     during later CUDA graph capture, which runs outside inference_mode.
     """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
-        return
+    if getattr(layer, "_cutedsl_wrapper", None) is None:
+        try:
+            from flashinfer import CuteDslMoEWrapper
+        except ImportError as e:
+            raise ImportError(
+                "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
+                "Install with: pip install flashinfer"
+            ) from e
 
-    try:
-        from flashinfer import CuteDslMoEWrapper
-    except ImportError as e:
-        raise ImportError(
-            "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
-            "Install with: pip install flashinfer"
-        ) from e
+        from sglang.srt.runtime_context import get_server_args
 
-    from sglang.srt.runtime_context import get_server_args
-
-    assert layer.intermediate_size_per_partition > 0, (
-        f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
-        f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
-    )
-
-    server_args = get_server_args()
-    # CuteDSL wrapper preallocates CG buffers used by any captured graph
-    # that routes through this MoE — decode and prefill alike.
-    use_cuda_graph = not cuda_graph_fully_disabled()
-
-    # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
-    # single forward can route through this layer.
-    dispatcher = getattr(layer, "dispatcher", None)
-    if hasattr(dispatcher, "max_num_tokens"):
-        # A2A path: bounded by the dispatcher's own workspace limit.
-        max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
-    else:
-        # Standard allgather path: the MoE sees up to dp_size local forwards
-        # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
-    top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
-    # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
-    # buffers are normal tensors.  This call typically happens inside
-    # _dummy_run which runs under inference_mode(); inference tensors cannot
-    # be inplace-updated during later CUDA graph capture (which runs outside
-    # inference_mode), so we must opt out here.
-    with torch.inference_mode(False):
-        layer._cutedsl_wrapper = CuteDslMoEWrapper(
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            hidden_size=layer.hidden_size,
-            intermediate_size=layer.intermediate_size_per_partition,
-            use_cuda_graph=use_cuda_graph,
-            max_num_tokens=max_num_tokens,
-            num_local_experts=layer.num_local_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            output_dtype=layer.moe_runner_config.params_dtype,
-            device=str(layer.w13_weight.device),
+        assert layer.intermediate_size_per_partition > 0, (
+            f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
+            f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
         )
 
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
-    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    layer._cutedsl_input_scale = used_input_scale
+        server_args = get_server_args()
+        # CuteDSL wrapper preallocates CG buffers used by any captured graph
+        # that routes through this MoE — decode and prefill alike.
+        use_cuda_graph = not cuda_graph_fully_disabled()
+
+        # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
+        # single forward can route through this layer.
+        dispatcher = getattr(layer, "dispatcher", None)
+        if hasattr(dispatcher, "max_num_tokens"):
+            # A2A path: bounded by the dispatcher's own workspace limit.
+            max_num_tokens = dispatcher.max_num_tokens * getattr(
+                dispatcher, "ep_size", 1
+            )
+        else:
+            # Standard allgather path: the MoE sees up to dp_size local forwards
+            # gathered together, so scale the per-rank forward bound by dp_size.
+            max_num_tokens = (
+                server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
+            )
+        top_k = (
+            layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+        )
+        # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
+        # buffers are normal tensors.  This call typically happens inside
+        # _dummy_run which runs under inference_mode(); inference tensors cannot
+        # be inplace-updated during later CUDA graph capture (which runs outside
+        # inference_mode), so we must opt out here.
+        with torch.inference_mode(False):
+            layer._cutedsl_wrapper = CuteDslMoEWrapper(
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                hidden_size=layer.hidden_size,
+                intermediate_size=layer.intermediate_size_per_partition,
+                use_cuda_graph=use_cuda_graph,
+                max_num_tokens=max_num_tokens,
+                num_local_experts=layer.num_local_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                output_dtype=layer.moe_runner_config.params_dtype,
+                device=str(layer.w13_weight.device),
+            )
+        refresh_cutedsl_standard_scales(layer)
 
 
 # ---------------------------------------------------------------------------
@@ -357,16 +363,9 @@ def _quantize_hidden_states_nvfp4(
     if use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
-        e4m3_max = 448.0
-        if (
-            envs.FLASHINFER_NVFP4_4OVER6.get()
-            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-        ):
-            e4m3_max = 256.0
-
         x_fp4_bytes, x_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (e4m3_max * 6.0),
+            input_scale,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",

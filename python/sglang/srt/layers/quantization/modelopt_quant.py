@@ -2209,6 +2209,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+        if (
+            self.enable_flashinfer_cutedsl_moe
+            and self.quant_config.use_per_token_activation
+        ):
+            e4m3_max = (
+                256.0
+                if envs.FLASHINFER_NVFP4_4OVER6.get()
+                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+                else 448.0
+            )
+            cutedsl_per_token_input_scale = torch.tensor(
+                1.0 / (e4m3_max * 6.0),
+                device=layer.w13_input_scale_quant.device,
+                dtype=torch.float32,
+            )
+            existing_per_token_input_scale = getattr(
+                layer, "_cutedsl_per_token_input_scale", None
+            )
+            if (
+                isinstance(existing_per_token_input_scale, torch.Tensor)
+                and existing_per_token_input_scale.shape
+                == cutedsl_per_token_input_scale.shape
+                and existing_per_token_input_scale.dtype
+                == cutedsl_per_token_input_scale.dtype
+                and existing_per_token_input_scale.device
+                == cutedsl_per_token_input_scale.device
+            ):
+                existing_per_token_input_scale.copy_(cutedsl_per_token_input_scale)
+            else:
+                layer._cutedsl_per_token_input_scale = cutedsl_per_token_input_scale
 
         swiglu_limit = layer.moe_runner_config.swiglu_limit
         if (
@@ -2297,17 +2327,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     interleave_w13_halves,
                 )
 
-                layer.w13_weight = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight",
                     interleave_w13_halves(
                         layer.w13_weight.view(torch.uint8), group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
-                layer.w13_weight_scale = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight_scale",
                     interleave_w13_halves(
                         layer.w13_weight_scale, group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
 
             # Process w13 weights
@@ -2368,6 +2400,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     _FP4_SF_VEC_SIZE,
+                    refresh_cutedsl_standard_scales,
                 )
 
                 sf_vec_size = _FP4_SF_VEC_SIZE
@@ -2376,7 +2409,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_k = layer.w13_weight.shape[2] * 2
                 w2_m = layer.w2_weight.shape[1]
                 w2_k = layer.w2_weight.shape[2] * 2
-                layer.w13_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w13_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2386,9 +2421,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w2_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w2_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2398,8 +2434,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
+                if getattr(layer, "_cutedsl_wrapper", None) is not None:
+                    refresh_cutedsl_standard_scales(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -2560,7 +2597,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ),
                 w1_alpha=w1_alpha,
                 w2_alpha=w2_alpha,
-                a1_scale=layer._cutedsl_input_scale,
+                a1_scale=(
+                    layer._cutedsl_per_token_input_scale
+                    if self.quant_config.use_per_token_activation
+                    else layer._cutedsl_input_scale
+                ),
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
