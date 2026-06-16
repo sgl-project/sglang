@@ -29,6 +29,7 @@ fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
+
 def causal_conv1d_npu_update(
     hidden_state: torch.Tensor,
     weight: torch.Tensor,
@@ -43,7 +44,7 @@ def causal_conv1d_npu_update(
 
     full_context = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
 
-    computation_input = full_context[:, :, -(kernel_size - 1 + seq_len):]
+    computation_input = full_context[:, :, -(kernel_size - 1 + seq_len) :]
     windows = computation_input.unfold(-1, kernel_size, 1)
 
     out = (windows * weight[None, :, None, :]).sum(dim=-1)
@@ -59,7 +60,9 @@ def causal_conv1d_npu_update(
     if target_state_len > 0:
         new_conv_state = full_context[:, :, -target_state_len:]
     else:
-        new_conv_state = torch.empty(bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype)
+        new_conv_state = torch.empty(
+            bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype
+        )
 
     return out, new_conv_state
 
