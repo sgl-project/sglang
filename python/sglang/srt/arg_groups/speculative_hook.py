@@ -458,17 +458,15 @@ def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
 def _validate_throughput_aware_adaptive(server_args: "ServerArgs") -> None:
     """Validate throughput_aware strategy config at startup."""
     from sglang.srt.speculative.throughput_aware_controller import (
-        load_throughput_aware_config,
         _parse_bs_candidates,
+        load_throughput_aware_config,
     )
 
     cfg = load_throughput_aware_config(server_args.speculative_adaptive_config)
     # This will raise ValueError if the config is malformed.
     _, bs_candidates = _parse_bs_candidates(cfg)
 
-    all_candidate_steps = sorted(
-        {s for steps in bs_candidates.values() for s in steps}
-    )
+    all_candidate_steps = sorted({s for steps in bs_candidates.values() for s in steps})
     initial_steps = server_args.speculative_num_steps
     if initial_steps not in all_candidate_steps:
         raise ValueError(

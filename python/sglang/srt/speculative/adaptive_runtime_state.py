@@ -131,6 +131,8 @@ class AdaptiveController(_SpecAdaptiveBase):
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
-        new_step = self.params.on_verify_complete(num_correct_drafts_per_req, batch_size)
+        new_step = self.params.on_verify_complete(
+            num_correct_drafts_per_req, batch_size
+        )
         if new_step is not None:
             self._activate(new_step)

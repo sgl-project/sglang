@@ -62,7 +62,7 @@ from __future__ import annotations
 import bisect
 import json
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -78,9 +78,6 @@ from sglang.srt.speculative.throughput_aware_spec_params import (
     score_candidates,
 )
 from sglang.srt.utils.common import log_info_on_rank0
-
-if TYPE_CHECKING:
-    from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +171,9 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
     return sorted(bs_candidates), bs_candidates
 
 
-def resolve_throughput_aware_candidate_steps(cfg_path: Optional[str] = None) -> list[int]:
+def resolve_throughput_aware_candidate_steps(
+    cfg_path: Optional[str] = None,
+) -> list[int]:
     """Return the union of all candidate steps across all BS slots.
 
     Used by ``server_args.max_speculative_num_draft_tokens`` to pre-size
@@ -216,7 +215,9 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         )
         self._cost_table = BatchSizeCostTable()
 
-        self._profile_batch_sizes: Optional[list[int]] = cfg.get("profile_run_batch_sizes")
+        self._profile_batch_sizes: Optional[list[int]] = cfg.get(
+            "profile_run_batch_sizes"
+        )
         self._max_profile_bs: Optional[int] = cfg.get("max_profile_run_batch_size")
         self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 5))
         self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 10))
@@ -261,7 +262,8 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         if self._cuda_graph_bs is None:
             return None
         return [
-            bs for bs in self._cuda_graph_bs
+            bs
+            for bs in self._cuda_graph_bs
             if step in self._bs_candidates[self._find_closest_bs_key(bs)]
         ]
 
@@ -371,7 +373,11 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         return {
             steps: profiled
             for steps in self._all_candidate_steps
-            if (profiled := sorted(set(pool) & set(self._cuda_graph_bs_for_step(steps) or [])))
+            if (
+                profiled := sorted(
+                    set(pool) & set(self._cuda_graph_bs_for_step(steps) or [])
+                )
+            )
         }
 
     def activate_step_by_batch(self, batch_size: int) -> None:
@@ -466,6 +472,8 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
             )
             logger.debug(
                 "[ThroughputAware] detail: pos_rates=%s  scores=%s",
-                format_position_rates(self._tracker, max(candidates) if candidates else 0),
+                format_position_rates(
+                    self._tracker, max(candidates) if candidates else 0
+                ),
                 format_score_rows(rows, best_steps),
             )
