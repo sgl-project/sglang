@@ -479,6 +479,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         tp_group: dist.ProcessGroup = None,
     ):
+        self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -490,7 +491,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             tp_group=tp_group,
         )
-        self.output_sizes = output_sizes
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(
