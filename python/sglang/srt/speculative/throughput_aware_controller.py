@@ -32,11 +32,12 @@ adaptive config); non-integer keys are throughput-specific settings::
 
     {
         "window_size": 20,
-        "update_interval": 10,
+        "update_interval": 5,
         "profile_run_batch_sizes": null,
-        "max_profile_run_batch_size": 128,
-        "profile_run_n_warmup": 1,
-        "profile_run_n_measure": 3,
+        "max_profile_run_batch_size": null,
+        "profile_run_n_warmup": 5,
+        "profile_run_n_measure": 10,
+        "switch_hysteresis": 0.1,
         "1":   {"candidate_steps": [1, 3, 5, 7]},
         "8":   {"candidate_steps": [1, 3, 5]},
         "32":  {"candidate_steps": [1, 3]},
@@ -49,6 +50,11 @@ sizes to profile.  When ``null``, the server's ``cuda_graph_bs`` list is used
 
 ``max_profile_run_batch_size`` (optional int): upper bound on which batch
 sizes are profiled (to keep startup time reasonable).
+
+``switch_hysteresis`` (optional float, default ``0.1``): fractional margin
+required before switching steps.  A challenger must satisfy
+``score_new > score_current * (1 + switch_hysteresis)``; at the default,
+the new score must exceed 110% of the current step's score.
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ from sglang.srt.speculative.throughput_aware_spec_params import (
     format_position_rates,
     format_score_rows,
     pick_best_step,
+    pick_best_step_with_hysteresis,
     score_candidates,
 )
 from sglang.srt.utils.common import log_info_on_rank0
@@ -103,9 +110,11 @@ def _broadcast_float_from_rank0(value: float) -> float:
 
 DEFAULT_THROUGHPUT_AWARE_CONFIG: dict = {
     "window_size": 20,
-    "update_interval": 10,
-    "profile_run_n_warmup": 1,
-    "profile_run_n_measure": 3,
+    "update_interval": 5,
+    "max_profile_run_batch_size": None,
+    "profile_run_n_warmup": 5,
+    "profile_run_n_measure": 10,
+    "switch_hysteresis": 0.1,
     "1": {"candidate_steps": [1, 3, 5, 7]},
 }
 
@@ -198,7 +207,7 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         self._all_candidate_steps: list[int] = all_candidate_steps
 
         window_size: int = int(cfg.get("window_size", 20))
-        self._update_interval: int = int(cfg.get("update_interval", 10))
+        self._update_interval: int = int(cfg.get("update_interval", 5))
         self._tracker = PositionAcceptanceTracker(
             max_steps=max(all_candidate_steps),
             window_size=window_size,
@@ -207,9 +216,10 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
 
         self._profile_batch_sizes: Optional[list[int]] = cfg.get("profile_run_batch_sizes")
         self._max_profile_bs: Optional[int] = cfg.get("max_profile_run_batch_size")
-        self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 1))
-        self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 3))
+        self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 5))
+        self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 10))
         self._profile_run_seq_len: Optional[int] = cfg.get("profile_run_seq_len")
+        self._switch_hysteresis: float = float(cfg.get("switch_hysteresis", 0.1))
 
         first_candidates = self._bs_candidates[self._bs_list[0]]
         self._current_steps: int = worker.speculative_num_steps
@@ -225,6 +235,7 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
             f"initial_steps={self._current_steps}, "
             f"window_size={window_size}, "
             f"update_interval={self._update_interval}, "
+            f"switch_hysteresis={self._switch_hysteresis}, "
             f"profile_run_seq_len={self._profile_run_seq_len!r}",
         )
 
@@ -397,15 +408,35 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         """Score all candidates for the given batch size and switch if beneficial."""
         candidates = self._candidates_for_batch(batch_size)
         rows = score_candidates(self._tracker, self._cost_table, candidates, batch_size)
-        best_steps = pick_best_step(rows, fallback=self._current_steps)
+        raw_best = pick_best_step(rows, fallback=self._current_steps)
+        best_steps = pick_best_step_with_hysteresis(
+            rows,
+            current_steps=self._current_steps,
+            hysteresis=self._switch_hysteresis,
+        )
 
         logger.debug(
             "[ThroughputAware] batch_count=%d  bs=%d  pos_rates=%s  scores=%s",
             self._batch_count,
             batch_size,
             format_position_rates(self._tracker, max(candidates) if candidates else 0),
-            format_score_rows(rows, best_steps),
+            format_score_rows(rows, raw_best),
         )
+        if raw_best != best_steps:
+            score_map = {r["steps"]: r["score"] for r in rows}
+            current_score = score_map.get(self._current_steps)
+            raw_score = score_map.get(raw_best)
+            logger.debug(
+                "[ThroughputAware] hysteresis blocked switch: "
+                "raw_best=%d (score=%s) vs current=%d (score=%s), "
+                "need score > %.4f (margin=%.2f)",
+                raw_best,
+                f"{raw_score:.4f}" if raw_score is not None else "n/a",
+                self._current_steps,
+                f"{current_score:.4f}" if current_score is not None else "n/a",
+                (current_score or 0) * (1.0 + self._switch_hysteresis),
+                self._switch_hysteresis,
+            )
 
         if best_steps != self._current_steps:
             old_steps = self._current_steps
