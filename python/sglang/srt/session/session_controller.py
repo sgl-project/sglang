@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_slice_len(stop: int, total: int) -> int:
+    if stop < 0:
+        stop += total
+    return max(0, min(total, stop))
+
+
 class SessionReqNode:
     def __init__(
         self,
@@ -207,13 +213,13 @@ class Session:
             if session_params.offset and session_params.offset != 0:
                 keep_len = min(session_params.offset, keep_len)
 
-            input_ids.truncate(keep_len)
+            input_ids.truncate(_resolve_slice_len(keep_len, len(input_ids)))
             input_ids.extend(req.input_ids)
 
             input_ids_unpadded.extend(kept_output)
             if session_params.offset and session_params.offset != 0:
                 input_ids_unpadded.truncate(
-                    min(session_params.offset, len(input_ids_unpadded))
+                    _resolve_slice_len(session_params.offset, len(input_ids_unpadded))
                 )
             input_ids_unpadded.extend(req.input_ids)
         else:
