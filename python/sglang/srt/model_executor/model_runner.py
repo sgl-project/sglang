@@ -2463,7 +2463,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if self.server_args.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
