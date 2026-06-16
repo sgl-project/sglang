@@ -18,10 +18,34 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _port_free(port: int) -> bool:
+    # No SO_REUSEADDR: match the server's strict check so a TIME_WAIT port (which
+    # SO_REUSEADDR would let us bind) is correctly treated as busy.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("", port))
+            return True
+        except OSError:
+            return False
+
+
+def find_free_base_port(start: int) -> int:
+    """A base port P where P, P+1000 (scheduler) and P+2000 (master) are all
+    free, avoiding the contended-box port collisions the validate script's
+    --strict-ports would otherwise crash on."""
+    p = start
+    while p + 2000 <= 65000:
+        if all(_port_free(p + off) for off in (0, 1000, 2000)):
+            return p
+        p += 100
+    raise RuntimeError("no free port window found")
 
 ROOT = Path(__file__).resolve().parent.parent
 VALIDATE = ROOT / "scripts" / "pr27436_validate_diffusion_bcg_service.py"
@@ -43,7 +67,23 @@ def hub_dir_for(model_path: str) -> Path:
     return cache / ("models--" + model_path.replace("/", "--"))
 
 
-def run_model(model_key: str, args) -> dict:
+PORT_ERROR_MARKERS = (
+    "is unavailable and --strict-ports",
+    "EADDRINUSE",
+    "address already in use",
+    "DistNetworkError",
+)
+
+
+def _server_log_text(result_dir: Path, model_key: str) -> str:
+    log = result_dir / model_key / "server.log"
+    try:
+        return log.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def run_model_once(model_key: str, args, port: int) -> dict:
     result_dir = Path(args.result_root) / model_key
     cmd = [
         sys.executable,
@@ -55,12 +95,11 @@ def run_model(model_key: str, args) -> dict:
         "--result-dir",
         str(result_dir),
         "--port-start",
-        str(args.port_start),
+        str(port),
         "--startup-timeout",
         str(args.startup_timeout),
         "--performance-mode",
         args.performance_mode,
-        "--prefer-local-cache",
     ]
     env = dict(os.environ, PYTHONPATH="python", FLASHINFER_DISABLE_VERSION_CHECK="1")
     t0 = time.time()
@@ -87,6 +126,29 @@ def run_model(model_key: str, args) -> dict:
     return summary
 
 
+def run_model(model_key: str, args) -> dict:
+    """Run a model, retrying on transient port collisions (the box is shared and
+    a probed-free port can be grabbed before the server binds it)."""
+    result_dir = Path(args.result_root) / model_key
+    attempts = 4
+    port_hint = args.port_start
+    for attempt in range(1, attempts + 1):
+        port = find_free_base_port(port_hint)
+        summary = run_model_once(model_key, args, port)
+        if summary.get("status") == "passed":
+            return summary
+        log = _server_log_text(result_dir, model_key)
+        if not any(marker in log for marker in PORT_ERROR_MARKERS):
+            return summary  # genuine (non-port) outcome; do not retry
+        print(
+            f"[campaign] {model_key}: port collision on {port} "
+            f"(attempt {attempt}/{attempts}); retrying on a higher port",
+            flush=True,
+        )
+        port_hint = port + 200
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", nargs="+", required=True)
@@ -109,14 +171,13 @@ def main() -> int:
         summaries = json.loads(summary_path.read_text())
 
     done = {s["model"] for s in summaries}
-    for i, model_key in enumerate(args.models):
+    for model_key in args.models:
         if model_key in done:
             print(f"[campaign] skip already-done {model_key}", flush=True)
             continue
         if model_key not in V.MODELS:
             print(f"[campaign] unknown model {model_key}; skipping", flush=True)
             continue
-        args.port_start += 50 * i
         print(f"[campaign] === {model_key} ===", flush=True)
         summary = run_model(model_key, args)
         summaries.append(summary)
