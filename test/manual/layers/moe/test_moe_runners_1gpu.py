@@ -73,6 +73,24 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_flashinfer_cutlass_fp8": {
+            # FP8 [128x128] block-scale MoE (DeepSeek-V2-Lite) through the
+            # flashinfer_cutlass backend: exercises the block_quant ->
+            # cutlass_fused_moe(use_deepseek_fp8_block_scale=True) dispatch and the
+            # w13 gate/up half-swap. Mirrors moe_runner_cutlass_fp8's server config.
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "timeout": 3600,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_cutlass",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+            ],
+        },
         "moe_runner_deep_gemm": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
