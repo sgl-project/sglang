@@ -121,6 +121,18 @@ if _is_cuda:
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
+    def _resolve_indexer_split_op_context(layer_id: int):
+        # Shared eager preamble for the indexer split ops. Metadata is fetched
+        # here (inside the op) instead of being passed in, so Dynamo cannot
+        # guard on the forward-metadata identity that changes every graph replay.
+        forward_context = get_tc_piecewise_forward_context()
+        assert forward_context is not None
+        assert forward_context.dsa_indexers is not None
+        forward_batch = forward_context.forward_batch
+        indexer = forward_context.dsa_indexers[layer_id]
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        return forward_batch, indexer, metadata
+
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
     def k_cache_and_topk_result(
@@ -135,12 +147,7 @@ if _is_cuda:
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_context = get_tc_piecewise_forward_context()
-        assert forward_context is not None
-        assert forward_context.dsa_indexers is not None
-        forward_batch = forward_context.forward_batch
-        indexer = forward_context.dsa_indexers[layer_id]
-        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        forward_batch, indexer, metadata = _resolve_indexer_split_op_context(layer_id)
 
         indexer._store_k_cache_and_get_topk_ragged_graph(
             forward_batch,
@@ -177,12 +184,7 @@ if _is_cuda:
         ), "Internal error: indexer graph dispatch is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_context = get_tc_piecewise_forward_context()
-        assert forward_context is not None
-        assert forward_context.dsa_indexers is not None
-        forward_batch = forward_context.forward_batch
-        indexer = forward_context.dsa_indexers[layer_id]
-        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        forward_batch, indexer, metadata = _resolve_indexer_split_op_context(layer_id)
 
         extend_num_tokens = forward_batch.extend_num_tokens
         # Empty buffer encodes return_indices=False for graph dispatch.
@@ -568,14 +570,11 @@ class Indexer(MultiPlatformOp):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         layer_id: int,
-        x_meta: torch.Tensor,
         return_indices: bool,
-        weights_proj_lora: bool,
     ) -> Optional[torch.Tensor]:
-        if weights_proj_lora:
-            raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
-
-        topk_result = self._new_graph_topk_result(x_meta, return_indices)
+        # Reached only via _can_use_graph_dsa_dispatch, which requires a
+        # non-tuple `x`, so `x` is the metadata tensor (no separate x_meta).
+        topk_result = self._new_graph_topk_result(x, return_indices)
         graph_dispatch = (
             bcg_dsa_indexer_graph_dispatch
             if is_in_breakable_cuda_graph()
@@ -1611,6 +1610,7 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
+        # We can only skip the logits computation when no CUDA graph is involved.
         skip_logits_computation = False
         if not in_piecewise_or_breakable_cuda_graph:
             skip_logits_computation = self._should_skip_logits_computation(
@@ -1637,14 +1637,14 @@ class Indexer(MultiPlatformOp):
         weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
 
         if self._can_use_graph_dsa_dispatch(x, forward_batch):
+            if weights_proj_lora:
+                raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             return self._forward_cuda_graph_dispatch(
                 x,
                 q_lora,
                 positions,
                 layer_id,
-                x_meta,
                 return_indices,
-                weights_proj_lora,
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
