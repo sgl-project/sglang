@@ -1011,32 +1011,128 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                 )
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft"),
-            ):
-                verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            if self.speculative_num_steps == 0:
+                # Drafting disabled (high batch size). _draft_extend below still
+                # runs, keeping draft KV warm for when the batch shrinks.
+                verify_input = self._build_trivial_verify_input(batch)
+            else:
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
+            if (
+                self.speculative_num_steps == 0
+                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
-                self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                self._stub_skipped_draft_extend(batch, batch_output)
+            else:
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft_extend"),
+                ):
+                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
+
+        Used when ``speculative_num_steps == 0`` to skip drafting while still
+        routing through the existing TARGET_VERIFY graph captured at
+        ``draft_token_num=1``: the kernel always accepts the root and samples
+        one new bonus token from target logits -- functionally a plain decode.
+        """
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                topk=self.topk, spec_steps=0, num_verify_tokens=1
+            )
+
+        draft_input: EagleDraftInput = batch.spec_info
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+
+        retrieve_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
+        retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+        retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+
+        attn_backend = self._target_worker.model_runner.attn_backend
+        mask_buf, position_buf = attn_backend.get_verify_buffers_to_fill_after_draft()
+        if mask_buf is not None:
+            custom_mask = mask_buf
+            custom_mask.fill_(True)
+        else:
+            if batch.seq_lens_sum is not None:
+                seq_lens_sum = batch.seq_lens_sum
+            elif batch.seq_lens_cpu is not None:
+                seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                seq_lens_sum = bs * attn_backend.max_context_len
+            custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
+
+        if position_buf is not None:
+            positions = position_buf
+            positions[:bs].copy_(batch.seq_lens)
+        else:
+            positions = batch.seq_lens.to(torch.int64)
+
+        return EagleVerifyInput(
+            draft_token=draft_input.bonus_tokens,
+            custom_mask=custom_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=0,
+            topk=self.topk,
+            draft_token_num=1,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+
+    def _stub_skipped_draft_extend(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Fill shape-valid stubs on next_draft_input when draft_extend is skipped.
+
+        ``verify`` already set ``bonus_tokens`` (the only field the next steps=0
+        verify reads). The overlap FutureMap still stashes topk_p/topk_index/
+        hidden_states, so provide zeroed tensors of the right shape. They are never
+        consumed while at steps=0; an upshift to steps>0 would draft from this stale
+        state (cold recovery), which is the documented cost of this experimental flag.
+        """
+        next_draft_input: EagleDraftInput = batch_output.next_draft_input
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+        next_draft_input.topk_p = torch.zeros(
+            (bs, self.topk), dtype=torch.float32, device=device
+        )
+        next_draft_input.topk_index = torch.zeros(
+            (bs, self.topk), dtype=torch.int64, device=device
+        )
+        hidden_size = EagleDraftInput.hidden_size_for(self.draft_worker)
+        if hidden_size is not None:
+            next_draft_input.hidden_states = torch.zeros(
+                (bs, hidden_size),
+                dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                device=device,
+            )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
