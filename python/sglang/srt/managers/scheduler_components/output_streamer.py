@@ -15,6 +15,7 @@ import zmq
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
@@ -24,7 +25,6 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
-from sglang.srt.managers.array_utils import to_array
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

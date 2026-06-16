@@ -74,9 +74,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
-from sglang.srt.managers.array_utils import to_array
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

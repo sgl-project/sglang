@@ -10,8 +10,8 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.array_utils import to_array
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
