@@ -195,8 +195,8 @@ class Session:
             kept_output = to_array(last_req.output_ids[:kept_output_len])
 
             if self.streaming:
-                input_ids = last_req.token_buf
-                input_ids_unpadded = last_req.origin_input_ids_unpadded
+                input_ids = last_req.token_buf.freeze_and_clone()
+                input_ids_unpadded = last_req.origin_input_ids_unpadded.freeze_and_clone()
             else:
                 input_ids = last_req.token_buf.clone()
                 input_ids_unpadded = last_req.origin_input_ids_unpadded.clone()
