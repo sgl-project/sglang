@@ -619,6 +619,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        pooled_projections: torch.Tensor | None = None,
         guidance=None,
         **kwargs,
     ):
@@ -648,8 +649,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         # Split text embeddings - first token is global, rest are per-token
         if isinstance(encoder_hidden_states, torch.Tensor):
-            txt = encoder_hidden_states[:, 1:]
-            text_states_2 = encoder_hidden_states[:, 0, : self.text_states_dim_2]
+            if pooled_projections is None:
+                txt = encoder_hidden_states[:, 1:]
+                text_states_2 = encoder_hidden_states[:, 0, : self.text_states_dim_2]
+            else:
+                txt = encoder_hidden_states
+                text_states_2 = pooled_projections
         else:
             txt = encoder_hidden_states[0]
             text_states_2 = encoder_hidden_states[1]
