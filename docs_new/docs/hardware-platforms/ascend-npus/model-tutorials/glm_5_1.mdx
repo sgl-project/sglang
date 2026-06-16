@@ -6,11 +6,12 @@ metatags:
 
 ## Introduction
 
-GLM-5.1 is a Mixture-of-Experts (MoE) large language model developed by Zhipu AI and Tsinghua University, adopting the
-DeepSeek-V3/V3.2 architecture with sparse attention (DSA) and multi-token prediction (MTP) for speculative decoding.
+GLM-5.1 is a Mixture-of-Experts (MoE) large language model developed by Z.ai, featuring 744B total parameters with 40B
+active parameters. It uses 256 routed experts (top-8) plus one shared expert, with Multi-head Latent Attention (MLA)
+and DeepSeek Sparse Attention (DSA), and a built-in multi-token prediction (MTP) head for speculative decoding.
 The model features built-in bilingual (Chinese-English) capabilities with a unified pre-training framework, excelling at
 reasoning, math, code, and tool calling tasks. GLM-5.1 supports both Thinking mode (step-by-step reasoning) and Instruct
-mode (direct response).
+mode (direct response), with a native context window of approximately 200K tokens.
 
 This document demonstrates the deployment of GLM-5.1 on Ascend NPUs using SGLang, including single-node and multi-node
 deployment, feature configuration, and performance optimization.

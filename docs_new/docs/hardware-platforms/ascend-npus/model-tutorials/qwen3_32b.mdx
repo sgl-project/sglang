@@ -7,9 +7,9 @@ metatags:
 ## Introduction
 
 Qwen3-32B is a dense model in the Qwen3 series developed by Alibaba, featuring 32B parameters with Grouped-Query
-Attention (GQA) and up to 256K context length. It delivers significant improvements in instruction following, logical
+Attention (GQA) and up to 128K (131K with YaRN) context length. It delivers significant improvements in instruction following, logical
 reasoning, text comprehension, mathematics, science, coding, and tool usage. The model supports EAGLE3 speculative
-decoding for accelerated inference and is available in both standard and thinking/reasoning-enhanced editions.
+decoding for accelerated inference and supports both standard and thinking/reasoning modes.
 
 This document demonstrates the deployment of Qwen3-32B on Ascend NPUs using SGLang, including single-node PD mixed mode,
 feature configuration, and performance optimization.
