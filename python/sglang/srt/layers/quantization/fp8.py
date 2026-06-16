@@ -597,32 +597,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 epilogue_tile_m
             )
 
-            weight_u8 = weight.contiguous().view(torch.uint8)
             scale_matrix = scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32)
 
             if padded_n != n:
                 logger.debug(
-                    "Padding dense MXFP8 FlashInfer TRTLLM weight rows from %d to %d "
+                    "Padding dense MXFP8 FlashInfer TRTLLM scale rows from %d to %d "
                     "for weight shape (%d, %d).",
                     n,
                     padded_n,
                     n,
                     k,
                 )
-                padded_weight_u8 = weight_u8.new_zeros((padded_n, k))
-                padded_weight_u8[:n] = weight_u8
-                weight_u8 = padded_weight_u8
-
                 padded_scale_matrix = scale_matrix.new_zeros((padded_n, k // 32))
                 padded_scale_matrix[:n] = scale_matrix
                 scale_matrix = padded_scale_matrix
 
-            layer._mxfp8_logical_output_size = n if padded_n != n else None
-
             copy_or_rebind_param(
                 layer,
-                "weight_shuffled",
-                shuffle_matrix_a(weight_u8, epilogue_tile_m).view(torch.float8_e4m3fn),
+                "weight",
+                shuffle_matrix_a(
+                    weight.contiguous().view(torch.uint8), epilogue_tile_m
+                ).view(torch.float8_e4m3fn),
             )
             copy_or_rebind_param(
                 layer,
@@ -799,37 +794,26 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_mxfp8:
             if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-                weight = layer.weight
                 weight_scale = layer.weight_scale_inv_swizzled
             elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-                weight = layer.weight_shuffled
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
-                weight = layer.weight
                 weight_scale = layer.weight_scale_inv
-            logical_output_size = getattr(layer, "_mxfp8_logical_output_size", None)
-            gemm_bias = bias if logical_output_size is None else None
             if isinstance(x, tuple):
-                output = self.w8a8_mxfp8_linear(
+                return self.w8a8_mxfp8_linear(
                     input=x[0],
-                    weight=weight,
+                    weight=layer.weight,
                     weight_scale=weight_scale,
                     input_scale=x[1],
-                    bias=gemm_bias,
+                    bias=bias,
                 )
-            else:
-                output = self.w8a8_mxfp8_linear(
-                    input=x,
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    bias=gemm_bias,
-                )
-            if logical_output_size is not None:
-                output = output[..., :logical_output_size]
-                if bias is not None:
-                    output += bias
-            return output
+            return self.w8a8_mxfp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=weight_scale,
+                input_scale=None,
+                bias=bias,
+            )
 
         if self.block_quant:
             if use_intel_amx_backend(layer):
