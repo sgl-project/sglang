@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_sync_client_warmup,
+    should_run_explicit_client_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
@@ -43,8 +47,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+    init_diffusion_tracing,
+    trace_req,
+)
 
 logger = init_logger(__name__)
 
@@ -123,20 +129,18 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-            trace_set_thread_info("DiffGenerator")
+        init_diffusion_tracing(server_args, "DiffGenerator")
 
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
+            instance.owns_scheduler_client = True
+            instance._run_client_warmup_if_needed()
         else:
             # In remote mode, we just need to connect and check.
             sync_scheduler_client.initialize(server_args)
             instance._check_remote_scheduler()
-
-        # In both modes, this DiffGenerator instance is responsible for the client's lifecycle.
-        instance.owns_scheduler_client = True
+            instance.owns_scheduler_client = True
         return instance
 
     def _start_local_server_if_needed(
@@ -149,6 +153,12 @@ class DiffGenerator:
         processes = launch_server(self.server_args, launch_http_server=False)
 
         return processes
+
+    def _run_client_warmup_if_needed(self) -> None:
+        if not should_run_explicit_client_warmup(self.server_args):
+            return
+
+        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""
@@ -222,6 +232,12 @@ class DiffGenerator:
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
+            # `dataclasses.replace` drops non-field attrs; restore
+            # `_explicit_fields` so InputValidationStage honors user-supplied
+            # width/height, and mark the keys overridden above as explicit.
+            sampling_params._explicit_fields = getattr(
+                sampling_params_orig, "_explicit_fields", set()
+            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
@@ -456,6 +472,7 @@ class DiffGenerator:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -471,12 +488,14 @@ class DiffGenerator:
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
             lora_path=lora_path,
             target=target,
             strength=strength,
+            merge_mode=merge_mode,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

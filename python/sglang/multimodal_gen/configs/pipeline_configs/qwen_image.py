@@ -148,6 +148,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
     vae_sp: bool = False
 
+    vae_precision: str = "bf16"
+
     dit_config: DiTConfig = field(default_factory=QwenImageDitConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
@@ -168,6 +170,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_postprocess_text,)
     )
+
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(

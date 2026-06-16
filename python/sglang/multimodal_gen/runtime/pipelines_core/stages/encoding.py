@@ -8,7 +8,9 @@ Encoding stage for diffusion pipelines.
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -21,7 +23,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled,
+    resolve_precision,
+    temporary_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -41,7 +47,9 @@ class EncodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -81,11 +89,11 @@ class EncodingStage(PipelineStage):
         """
         assert batch.latents is not None and isinstance(batch.latents, torch.Tensor)
 
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        # Setup VAE precision from user policy.
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         # Normalize input to [-1, 1] range (reverse of decoding normalization)
         latents = (batch.latents * 2.0 - 1.0).clamp(-1, 1)
@@ -107,9 +115,13 @@ class EncodingStage(PipelineStage):
                     self.vae.enable_tiling()
                 # if server_args.vae_sp:
                 #     self.vae.enable_parallel()
+                should_cast_vae = not vae_autocast_enabled
                 if not vae_autocast_enabled:
                     latents = latents.to(vae_dtype)
-                latents = self.vae.encode(latents).mean
+                with temporary_module_dtype(
+                    self.vae, vae_dtype, enabled=should_cast_vae
+                ) as vae:
+                    latents = vae.encode(latents).mean
 
         # Update batch with encoded latents
         batch.latents = latents

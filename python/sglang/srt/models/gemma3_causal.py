@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -855,6 +857,16 @@ class Gemma3ForCausalLM(PreTrainedModel):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+            if remapped_name is None:
+                continue
+            if remapped_name != name:
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(remapped_name)
+                continue
+
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 # if param_name in name:
                 # print(f"{param_name} is already in {name}")
