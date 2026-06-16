@@ -748,10 +748,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             - 1
         )
 
-        # Prepare for draft extend in a separate stream
         # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
         # gather requires input_ids to have a consistent integer dtype across ranks.
         predicts = batch_result.next_token_ids.to(torch.int64)
+
+        # The cast kernel runs on the default stream; plan_stream must wait
+        # for it before reading predicts, otherwise the two streams race.
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
+        # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,

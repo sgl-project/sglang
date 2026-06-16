@@ -111,6 +111,9 @@ class EagleDraftWorkerBase(ABC):
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = draft_extend_input
+        assert (
+            predict.dtype == torch.int64
+        ), f"predict must be torch.int64, current dtype is {predict.dtype}"
         batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
