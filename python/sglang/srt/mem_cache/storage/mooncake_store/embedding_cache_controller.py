@@ -467,16 +467,14 @@ class EmbeddingCacheController:
                 op = None
             if op is not None:
                 try:
-                    results = self.mooncake_store.batch_get(
-                        op.keys, op.ptrs, op.sizes
-                    )
+                    results = self.mooncake_store.batch_get(op.keys, op.ptrs, op.sizes)
                     success_count = sum(results)
                     logger.info(
                         f"Mooncake GET Finished: Req {op.req_id}, Successfully fetched {success_count}/{len(op.keys)} images."
                     )
                     op.mark_done(all(results))
                 except Exception:
-                    logger.exception(
+                    logger.error(
                         f"Mooncake GET failed for req {op.req_id}; marking prefetch as failed."
                     )
                     # Signal failure so the consumer fails fast instead of
@@ -502,7 +500,7 @@ class EmbeddingCacheController:
                         f"Mooncake PUT Finished: Successfully stored {len(op.keys)} keys in cluster."
                     )
                 except Exception:
-                    logger.exception(
+                    logger.error(
                         "Mooncake PUT failed; embeddings not stored in cluster."
                     )
                 finally:
