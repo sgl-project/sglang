@@ -916,10 +916,13 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Enter the all_reduce unconditionally -- do NOT early-return on an empty
+        # ongoing_write_through. write_backup() enqueues only on the ranks whose
+        # host-pool alloc succeeds, so the dict can diverge across TP ranks; an
+        # empty rank that skipped this collective while a peer entered it would
+        # desync the NCCL op sequence -> permanent deadlock. An empty rank now
+        # contributes finish_count=0 and MIN(0, ...) keeps the drain loop a no-op.
+        # Mirrors loading_check() and the UnifiedRadixCache fix in #27489.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
