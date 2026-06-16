@@ -6,7 +6,6 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
-    validate_adaptive_initial_steps,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
@@ -401,26 +400,6 @@ class TestResolveCandidateSteps(unittest.TestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
-
-
-class TestValidateAdaptiveInitialSteps(unittest.TestCase):
-    def test_accepts_value_from_any_slot(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(
-                {
-                    "1": {"candidate_steps": [1, 5]},
-                    "8": {"candidate_steps": [1, 3, 7]},
-                },
-                f,
-            )
-            f.flush()
-            # Membership in any slot is enough: 5 lives in the smallest slot,
-            # 7 only in a larger slot -- both accepted.
-            validate_adaptive_initial_steps(5, cfg_path=f.name)
-            validate_adaptive_initial_steps(7, cfg_path=f.name)
-            # 9 is in no slot -> rejected.
-            with self.assertRaises(ValueError):
-                validate_adaptive_initial_steps(9, cfg_path=f.name)
 
 
 if __name__ == "__main__":

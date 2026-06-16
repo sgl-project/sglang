@@ -44,8 +44,21 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
+def _cuda_host_register(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    n_bytes = buffer.numel() * buffer.element_size()
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    if int(rc) != 0:
+        raise RuntimeError(
+            f"cudaHostRegister failed (rc={int(rc)}, "
+            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+            f"size={n_bytes}; host buffer is not pinned and device transfers "
+            f"may silently return stale data."
+        )
+
+
 def alloc_with_host_register(
-    dims,
+    dims: tuple,
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
@@ -57,21 +70,12 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        cudart = torch.cuda.cudart()
-        n_bytes = buffer.numel() * buffer.element_size()
-        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-        if int(rc) != 0:
-            raise RuntimeError(
-                f"cudaHostRegister failed (rc={int(rc)}, "
-                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-                f"size={n_bytes}; host buffer is not pinned and device transfers "
-                f"may silently return stale data."
-            )
+        _cuda_host_register(buffer)
     return buffer
 
 
 def alloc_with_pin_memory(
-    dims,
+    dims: tuple,
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
