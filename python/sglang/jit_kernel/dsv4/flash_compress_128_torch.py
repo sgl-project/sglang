@@ -72,17 +72,20 @@ def c128_forward_torch(
     buffer_len: int,
 ) -> None:
     head_dim = kv_out.numel()
-    dev = kv_input.device
     P = ragged_id
 
-    kv_start = kv_input[P - 127 : P + 1]  # [128, 2*head_dim]
+    # Window = first ``buffer_len`` rows from the state buffer page, then the
+    # ``128 - buffer_len`` fresh tokens ending at row P. The fresh slice starts at
+    # ``P - 127 + buffer_len`` (== P - 127 when buffer_len == 0). Concatenating
+    # avoids slicing kv_input with a negative start when P < 127, which happens
+    # for the first compress event of a short / non-ratio-aligned extend chunk.
     if buffer_len <= 0:
-        window = kv_start
+        window = kv_input[P - 127 : P + 1]  # [128, 2*head_dim]
     elif buffer_len >= 128:
         window = kv_buf_page
     else:
-        m = (torch.arange(128, device=dev) < buffer_len)[:, None]
-        window = torch.where(m, kv_buf_page, kv_start)
+        fresh = kv_input[P - 127 + buffer_len : P + 1]  # [128 - buffer_len, ...]
+        window = torch.cat([kv_buf_page[:buffer_len], fresh], dim=0)
 
     kv = window[:, :head_dim]
     sc = window[:, head_dim : 2 * head_dim] + ape
