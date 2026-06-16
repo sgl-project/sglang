@@ -176,9 +176,15 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
+            # ``tool_index`` is the per-response 0-based position of the call
+            # (OpenAI spec); enumerate parsed calls locally and ignore the
+            # model's ``:N`` suffix, which is a conversation-level counter.
+            # ``serving_chat._process_tool_call_id()`` later offsets these by
+            # ``history_tool_calls_cnt`` for multi-turn responses.
+            local_tool_index = 0
             for match in function_call_tuples:
                 function_id, function_args = match
-                function_name, function_idx = self._parse_tool_call_id(
+                function_name, _ = self._parse_tool_call_id(
                     function_id, tools, function_args
                 )
                 if function_name is None:
@@ -188,11 +194,12 @@ class KimiK2Detector(BaseFormatDetector):
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,
+                        tool_index=local_tool_index,
                         name=function_name,
                         parameters=function_args,
                     )
                 )
+                local_tool_index += 1
 
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)

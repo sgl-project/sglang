@@ -111,6 +111,32 @@ class TestKimiK2DetectorBasic(unittest.TestCase):
         self.assertEqual(result.calls[1].name, "get_weather")
         self.assertEqual(result.calls[1].parameters, '{"city": "Tokyo"}')
 
+    def test_non_streaming_tool_index_is_local(self):
+        """tool_index is the per-response 0-based position, not the model's :N suffix.
+
+        The model may emit conversation-level ``:N`` counters (e.g. ``:5``, ``:6``)
+        in a multi-turn conversation. The non-streaming parser must enumerate
+        parsed calls locally (0, 1, ...) so that
+        ``serving_chat._process_tool_call_id()`` can offset them by
+        ``history_tool_calls_cnt`` without double-counting.
+        """
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.ReadFile:5"
+            '<|tool_call_argument_begin|>{"path": "/a.py"}'
+            "<|tool_call_end|>"
+            "<|tool_call_begin|>functions.get_weather:6"
+            '<|tool_call_argument_begin|>{"city": "Tokyo"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].tool_index, 0)
+        self.assertEqual(result.calls[0].name, "ReadFile")
+        self.assertEqual(result.calls[1].tool_index, 1)
+        self.assertEqual(result.calls[1].name, "get_weather")
+
     def test_normal_text_before_tool_call(self):
         """Normal text before tool call markers is preserved."""
         text = (
