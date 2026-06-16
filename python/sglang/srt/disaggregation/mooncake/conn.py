@@ -1492,70 +1492,79 @@ class MooncakeKVManager(CommonKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
+                try:
+                    if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                        self._handle_aux_data(msg)
+                        continue
 
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
-                    handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
-                    handler.handle_chunk_arrived(
-                        room,
-                        chunk_idx,
-                        page_start,
-                        num_pages,
-                        session_id,
-                        self._chunk_writer_counts,
-                    )
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-
-                # Prefill acknowledges abort notification
-                if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
-                    ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    continue
-
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
-
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
+                    # Staging: prefill notifies a chunk written to staging buffer
+                    if msg[0] == b"CHUNK_READY":
+                        room = int(msg[1].decode("ascii"))
+                        chunk_idx = int(msg[2].decode("ascii"))
+                        page_start = int(msg[3].decode("ascii"))
+                        num_pages = int(msg[4].decode("ascii"))
+                        session_id = msg[5].decode("ascii")
+                        handler = self._staging_handler
+                        assert (
+                            handler is not None
+                        ), "CHUNK_READY received before staging handler initialized"
+                        handler.handle_chunk_arrived(
+                            room,
+                            chunk_idx,
+                            page_start,
+                            num_pages,
+                            session_id,
+                            self._chunk_writer_counts,
                         )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
+                        continue
+
+                    # Staging: prefill pre-requests staging allocation before forward
+                    if msg[0] == b"STAGING_REQ":
+                        self._handle_staging_req(msg)
+                        continue
+
+                    # Prefill acknowledges abort notification
+                    if msg[0] == b"ABORT_ACK":
+                        # TODO(shangming): use this info to implement the deferred release mechanism if needed
+                        ack_aborted_room = int(msg[1].decode("ascii"))
+                        logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                        continue
+
+                    bootstrap_room, status, prefill_rank = msg
+                    status = int(status.decode("ascii"))
+                    bootstrap_room = int(bootstrap_room.decode("ascii"))
+                    prefill_rank = int(prefill_rank.decode("ascii"))
+
+                    if status == KVPoll.Success:
+                        if bootstrap_room in self.request_status:
+                            self.prefill_response_tracker[bootstrap_room].add(
+                                prefill_rank
+                            )
+                            expected_response_num = (
+                                self.required_prefill_response_num_table[bootstrap_room]
+                            )
+                            arrived_response_num = len(
+                                self.prefill_response_tracker[bootstrap_room]
+                            )
+                            if arrived_response_num == expected_response_num:
+                                if self.enable_staging:
+                                    handler = self._staging_handler
+                                    if handler.is_staging_room(bootstrap_room):
+                                        handler.submit_last_scatter_async(
+                                            bootstrap_room
+                                        )
+                                    self._chunk_writer_counts.pop(bootstrap_room, None)
+                                self.update_status(bootstrap_room, KVPoll.Success)
+                    elif status == KVPoll.Failed:
+                        self.record_failure(
+                            bootstrap_room,
+                            "Failed to get kvcache from prefill instance, it might be dead",
                         )
-                        if arrived_response_num == expected_response_num:
-                            if self.enable_staging:
-                                handler = self._staging_handler
-                                if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                elif status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
-                    )
-                    self.update_status(bootstrap_room, status)
+                        self.update_status(bootstrap_room, status)
+                except Exception:
+                    # Keep one malformed control message from terminating the
+                    # decode-side status worker.
+                    logger.exception("Mooncake decode status thread iteration failed")
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
