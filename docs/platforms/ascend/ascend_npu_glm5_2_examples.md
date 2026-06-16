@@ -8,8 +8,9 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 ### Model Weight
 
-- `GLM-5.2`(BF16 version): [Download model weight](https://www.modelscope.cn/models/ZhipuAI/GLM-5.2).
-- `GLM-5.2-w4a8`(Quantized version without mtp): [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5.2-w4a8).
+- `GLM-5.2`(BF16 version): [Download model weight](https://huggingface.co/zai-org/GLM-5.2).
+- `GLM-5.2-w8a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/).
+- `GLM-5.2-w4a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8/).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
 
 
