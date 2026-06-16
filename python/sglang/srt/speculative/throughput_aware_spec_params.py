@@ -213,6 +213,34 @@ def pick_best_step(rows: list[dict], fallback: int) -> int:
     return best_step
 
 
+def pick_best_step_with_hysteresis(
+    rows: list[dict],
+    current_steps: int,
+    hysteresis: float = 0.1,
+) -> int:
+    """Pick highest-scoring step, but keep *current_steps* unless challenger wins by margin.
+
+    A switch to step S requires ``score(S) > score(current) * (1 + hysteresis)``.
+    With the default ``hysteresis=0.1``, the challenger must exceed 110% of the
+    current step's score.
+    """
+    raw_best = pick_best_step(rows, fallback=current_steps)
+    if raw_best == current_steps:
+        return current_steps
+
+    score_map = {r["steps"]: r["score"] for r in rows}
+    current_score = score_map.get(current_steps)
+    challenger_score = score_map.get(raw_best)
+
+    if challenger_score is None:
+        return current_steps
+    if current_score is None or current_score <= 0:
+        return raw_best
+    if challenger_score > current_score * (1.0 + hysteresis):
+        return raw_best
+    return current_steps
+
+
 def format_position_rates(
     tracker: PositionAcceptanceTracker, num_positions: int
 ) -> str:
