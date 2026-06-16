@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _resolve_sound_duration,
     _resolve_video_path,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
+    SchedulerLoader,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     DomainAwareLinear,
@@ -37,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
+    Cosmos3TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
@@ -218,6 +223,89 @@ class TestCosmos3AdjustNumFrames(unittest.TestCase):
     def test_minimum_video_frame_count(self):
         # 2 frames: (2-1)=1, 1//4=0, 0*4+1=1 → rounds to 1, but 1 is T2I — still valid
         self.assertEqual(self.cfg.adjust_num_frames(2), 1)
+
+
+class TestCosmos3SchedulerConfig(unittest.TestCase):
+    """Verify Cosmos3 scheduler class and flow-shift defaults."""
+
+    def test_config_overrides_checkpoint_scheduler_class(self):
+        cfg = Cosmos3Config()
+        self.assertEqual(cfg.scheduler_class_override, "FlowUniPCMultistepScheduler")
+        self.assertIsNone(cfg.flow_shift)
+
+    def test_scheduler_loader_uses_configured_class_override(self):
+        class FakeScheduler:
+            def __init__(self, **config):
+                self.config = config
+
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                scheduler_class_override="FlowUniPCMultistepScheduler",
+                flow_shift=None,
+            )
+        )
+        with (
+            mock.patch.object(
+                scheduler_loader,
+                "get_diffusers_component_config",
+                return_value={"_class_name": "CheckpointScheduler", "foo": "bar"},
+            ),
+            mock.patch.object(
+                scheduler_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(FakeScheduler, None),
+            ) as resolve,
+        ):
+            scheduler = SchedulerLoader().load_customized("unused", server_args)
+
+        resolve.assert_called_once_with("FlowUniPCMultistepScheduler")
+        self.assertEqual(scheduler.config["foo"], "bar")
+
+    @staticmethod
+    def _stage():
+        stage = Cosmos3TimestepPreparationStage.__new__(Cosmos3TimestepPreparationStage)
+        stage.scheduler = types.SimpleNamespace(
+            config=types.SimpleNamespace(flow_shift=1.0)
+        )
+        return stage
+
+    @staticmethod
+    def _batch(**kwargs):
+        sp_kwargs = kwargs.pop("sp_kwargs", {})
+        return types.SimpleNamespace(
+            sampling_params=Cosmos3SamplingParams(prompt="t", **sp_kwargs),
+            data_type=kwargs.pop("data_type", DataType.VIDEO),
+            preprocessed_image=kwargs.pop("preprocessed_image", None),
+            preprocessed_video=kwargs.pop("preprocessed_video", None),
+        )
+
+    def test_per_mode_flow_shift_defaults(self):
+        stage = self._stage()
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(data_type=DataType.IMAGE)
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_image=torch.empty(1))
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_video=torch.empty(1))
+            ),
+            10.0,
+        )
+        self.assertEqual(stage._default_flow_shift_for_mode(self._batch()), 10.0)
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(sp_kwargs={"action_mode": "policy"})
+            ),
+            10.0,
+        )
 
 
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):

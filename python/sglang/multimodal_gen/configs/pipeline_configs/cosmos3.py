@@ -40,7 +40,11 @@ class Cosmos3Config(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    # Sourced from scheduler_config.json in the checkpoint.
+    # Cosmos3 reference inference uses FlowUniPC even when the checkpoint
+    # scheduler_config.json advertises a different scheduler class.
+    scheduler_class_override: str | None = "FlowUniPCMultistepScheduler"
+
+    # Per-request mode defaults are applied in Cosmos3TimestepPreparationStage.
     flow_shift: float | None = None
 
     precision: str = "bf16"

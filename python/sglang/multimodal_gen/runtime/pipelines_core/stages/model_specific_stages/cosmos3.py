@@ -73,11 +73,12 @@ COSMOS3_IMAGE_SYSTEM_PROMPT = (
 )
 
 # Per-mode flow-shift defaults, applied only when the request and pipeline
-# config leave flow_shift unset. T2V/I2V fall back to the checkpoint scheduler
-# config instead of a hard-coded value.
+# config leave flow_shift unset.
 COSMOS3_T2I_FLOW_SHIFT = 3.0
+COSMOS3_I2V_FLOW_SHIFT = 10.0
+COSMOS3_T2V_FLOW_SHIFT = 10.0
 COSMOS3_V2V_FLOW_SHIFT = 10.0
-COSMOS3_ACTION_FLOW_SHIFT = 5.0
+COSMOS3_ACTION_FLOW_SHIFT = 10.0
 
 
 def _resize_crop_pil(
@@ -678,23 +679,21 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler):
         super().__init__()
         self.scheduler = scheduler
-        self.default_flow_shift = getattr(
-            getattr(scheduler, "config", None), "flow_shift", None
-        )
 
     def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
         """Resolve the per-mode default flow_shift for the request.
 
-        T2V and I2V keep the checkpoint scheduler's flow_shift; T2I, V2V, and
-        action use their own defaults.
+        Matches cosmos-framework's built-in per-mode sample defaults.
         """
         if getattr(batch.sampling_params, "action_mode", None) is not None:
             return COSMOS3_ACTION_FLOW_SHIFT
         if batch.data_type == DataType.IMAGE:
             return COSMOS3_T2I_FLOW_SHIFT
+        if batch.preprocessed_image is not None:
+            return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
             return COSMOS3_V2V_FLOW_SHIFT
-        return self.default_flow_shift
+        return COSMOS3_T2V_FLOW_SHIFT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
