@@ -10,7 +10,9 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 namespace {
 
