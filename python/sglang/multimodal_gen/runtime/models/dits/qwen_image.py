@@ -1037,12 +1037,6 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
-    @staticmethod
-    def _expand_mod_param(param: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        while param.dim() < x.dim():
-            param = param.unsqueeze(1)
-        return param
-
     def _norm_scale_shift(
         self,
         norm_module: LayerNormScaleShift,
@@ -1050,12 +1044,7 @@ class QwenImageTransformerBlock(nn.Module):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        if not is_in_breakable_cuda_graph():
-            return norm_module(x=x, shift=shift, scale=scale)
-
-        shift = self._expand_mod_param(shift, x)
-        scale = self._expand_mod_param(scale, x)
-        return (norm_module.norm(x) * (1 + scale) + shift).to(x.dtype)
+        return norm_module(x=x, shift=shift, scale=scale)
 
     def _scale_residual_norm_scale_shift(
         self,
@@ -1067,37 +1056,18 @@ class QwenImageTransformerBlock(nn.Module):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not is_in_breakable_cuda_graph():
-            return norm_module(
-                residual=residual,
-                x=x,
-                gate=gate,
-                shift=shift,
-                scale=scale,
-            )
-
-        if isinstance(gate, int):
-            residual_out = residual + x
-        elif gate.dim() == 4:
-            num_frames = gate.shape[1]
-            frame_seqlen = x.shape[1] // num_frames
-            residual_out = residual + (
-                x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-            ).flatten(1, 2)
-        else:
-            residual_out = residual + x * gate
-
-        shift = self._expand_mod_param(shift, residual_out)
-        scale = self._expand_mod_param(scale, residual_out)
-        modulated = norm_module.norm(residual_out) * (1 + scale) + shift
-        return modulated.to(x.dtype), residual_out
+        return norm_module(
+            residual=residual,
+            x=x,
+            gate=gate,
+            shift=shift,
+            scale=scale,
+        )
 
     def _mul_add(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ) -> torch.Tensor:
-        if not is_in_breakable_cuda_graph():
-            return self.fuse_mul_add(a, b, c, k)
-        return self.fuse_mul_add.forward_native(a, b, c, k)
+        return self.fuse_mul_add(a, b, c, k)
 
     def _modulate(
         self,
