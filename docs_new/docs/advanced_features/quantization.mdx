@@ -30,7 +30,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <th>Method</th>
       <th>NVIDIA GPUs</th>
       <th>AMD GPUs (MI300X/MI325X/MI350X)</th>
-      <th>Ascend NPUs (A2/A3)</th>
+      <th>Ascend NPUs (A2/A3/A5)</th>
       <th>Notes</th>
     </tr>
   </thead>
@@ -48,6 +48,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>WIP</td>
       <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+    </tr>
+    <tr>
+      <td><code>mxfp8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5 for Diffusion and LLM Dense Linear)</td>
+      <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -182,13 +189,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Ascend quantization; Uses CANN kernels</td>
     </tr>
-    <tr>
-      <td><code>mxfp8</code> (diffusion)</td>
-      <td>No</td>
-      <td>No</td>
-      <td>Yes (A2/A3)</td>
-      <td>Ascend NPU only; online MXFP8 quantization for diffusion models (e.g., Wan2.2); requires CANN ≥ 8.0.RC3</td>
-    </tr>
+
   </tbody>
 </table>
 
