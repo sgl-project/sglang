@@ -218,12 +218,12 @@ These arguments and environment variables are critical for tuning decode perform
   </thead>
   <tbody>
     <tr>
-      <td>`--dp-size`</td>
+      <td>`--dp-size` / `--data-parallel-size`</td>
       <td>Sets the data parallelism degree for the decode server. With DP attention enabled, attention layers are sharded across DP ranks while FFN/MoE layers use tensor parallelism. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides evenly into your total card count, with remaining cards used for TP/EP.</td>
       <td>`8`</td>
     </tr>
     <tr>
-      <td>`--ep`</td>
+      <td>`--ep` / `--ep-size` / `--expert-parallel-size`</td>
       <td>Sets the expert parallelism degree. For MoE models, this distributes experts across cards, reducing per-card expert loading overhead and enabling all-to-all dispatch. The code default is `1`; set explicitly for MoE models. The optimal value depends on your model's expert count and architecture. DeepSeek V3.2 with 256 routed experts uses `ep=32`. For models with fewer experts, use a proportionally smaller value.</td>
       <td>`32`</td>
     </tr>

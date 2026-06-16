@@ -67,7 +67,8 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
-_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+_QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+_ANGLE_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*<(sgl_kernel/[^>]+)>", re.MULTILINE)
 
 
 def _local_jit_source_hash(source_files: List[str]) -> str:
@@ -75,6 +76,7 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
     digest = hashlib.sha256()
     seen: set[pathlib.Path] = set()
     stack = [pathlib.Path(path).resolve() for path in source_files]
+    include_dir = KERNEL_PATH / "include"
 
     while stack:
         path = stack.pop()
@@ -95,8 +97,12 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
         digest.update(b"\0")
 
         text = data.decode("utf-8", errors="ignore")
-        for include in _LOCAL_INCLUDE_RE.findall(text):
+        for include in _QUOTED_INCLUDE_RE.findall(text):
             include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+        for include in _ANGLE_INCLUDE_RE.findall(text):
+            include_path = (include_dir / include).resolve()
             if include_path.is_file():
                 stack.append(include_path)
 

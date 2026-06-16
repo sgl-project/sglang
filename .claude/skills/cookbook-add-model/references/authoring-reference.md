@@ -131,6 +131,7 @@ schemas (full reference in the `_playground.jsx` header):
 | `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a separate companion block and retargets the cURL modal to `router.port` (clients hit the router, not the role servers). |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
 | `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
+| `flagSelects` | A config-declared **list** of single-selects, each `{ id, title, stripPrefixes, options }` (option = `{ id, label, flags?, hide?, disable?, disableReason? }`); a flagless option is the "none"/accuracy-safe choice | A titled single-select that picks one value of a flag family the other axes don't model — e.g. KV-cache dtype (`--kv-cache-dtype`), mamba scheduler strategy (`--mamba-scheduler-strategy`). Generic: no engine change to add another. |
 
 **Per-chip constraints**: any chip entry in any axis can be wrapped with
 `hide` / `disable` constraint objects:
@@ -202,6 +203,15 @@ The `benchmarks` prop is **optional**. It points at a sibling
 box; omit the import and the prop if the cookbook has no measured numbers
 yet. See the `_deployment.jsx` header and `deepseek-v4-benchmarks.jsx` for
 the full speed/accuracy schema.
+
+Each entry's `sglang_version` must be a **reproducible anchor** — a release
+tag/version (`v0.5.9`), a commit hash, or (for **Day-0 support**, before the
+enabling PR merges or a release is cut) a specific PR (`PR #27944`) or commit
+you can `gh pr checkout` / `git checkout`. Never a moving ref like `"main"` /
+`"main (2026-06-11)"` (not reproducible). A spec-decoding model whose cell
+carries `--speculative-algorithm` but no `--max-running-requests` auto-shows
+an amber Deploy + Playground callout (SGLang otherwise caps it at 48) — it is
+flag-driven, so no per-page prose is needed.
 
 To let users *reproduce* those numbers, add a `benchmarkCommands` block to
 the config (§2.1, next to `curl`). When present alongside `benchmarks`, the
