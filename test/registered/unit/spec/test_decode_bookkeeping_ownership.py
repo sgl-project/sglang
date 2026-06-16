@@ -69,13 +69,6 @@ _OWNER_SITES = {
         "DFlashDraftInputV2.prepare_for_decode",
         "kv_allocated_len",
     ): 1,
-    # spec v1: each verify path owns its own settlement
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_committed_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_allocated_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "spec_verify_ct"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_committed_len"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_allocated_len"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "spec_verify_ct"): 1,
     # disaggregation decode prealloc
     (
         "disaggregation/decode.py",
@@ -161,7 +154,7 @@ def _scan_srt():
 
 
 def _draft_worker_classes():
-    """All transitive BaseDraftWorker subclasses under speculative/."""
+    """All transitive EagleDraftWorkerBase subclasses under speculative/."""
     by_name = {}
     for path in sorted(_SPECULATIVE_DIR.glob("*.py")):
         rel = path.relative_to(_SRT_DIR).as_posix()
@@ -173,7 +166,7 @@ def _draft_worker_classes():
                 }
                 by_name[node.name] = (rel, node, bases)
 
-    workers = {"BaseDraftWorker"}
+    workers = {"EagleDraftWorkerBase"}
     changed = True
     while changed:
         changed = False
@@ -184,7 +177,7 @@ def _draft_worker_classes():
     return [
         (rel, node)
         for name, (rel, node, _) in sorted(by_name.items())
-        if name in workers and name != "BaseDraftWorker"
+        if name in workers and name != "EagleDraftWorkerBase"
     ]
 
 

@@ -88,18 +88,29 @@ class CompressStatePool:
         ratio: int,
         online: bool = False,
         swa_page_size: int = 0,
+        online_mtp_max_draft_tokens: int = 0,
     ):
+        self.ratio = ratio
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
         self.enable_memory_saver = enable_memory_saver
+        self.online_mtp_state_slot_offset = 0
+        self.online_mtp_max_draft_tokens = 0
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
-            self._size = size + self.ring_size + 1
+            self._logical_size = size + self.ring_size + 1
+            if online_mtp_max_draft_tokens > 0:
+                # Bank 0 is the committed state. Banks 1..N cache per-draft
+                # prefix states for lazy commit after target verify.
+                self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+                self.online_mtp_state_slot_offset = self._logical_size
+            self._size = self._logical_size * (1 + self.online_mtp_max_draft_tokens)
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1
             self._size = (self._size + ratio - 1) // ratio * ratio
+            self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
 
         if _is_hip:

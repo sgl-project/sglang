@@ -25,12 +25,10 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (  # noqa: F401
-    _make_graph_key as _default_make_graph_key,
-)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
     PrefillCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
     TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
