@@ -712,8 +712,8 @@ class Req(ReqDllmMixin):
         self.rid = rid
         self.token_buf = (
             origin_input_ids
-            if isinstance(origin_input_ids, ViewableArray) else
-            ViewableArray(origin_input_ids)
+            if isinstance(origin_input_ids, ViewableArray)
+            else ViewableArray(origin_input_ids)
         )
         self.origin_input_len: int = len(self.token_buf)
         self.origin_input_ids_unpadded = (
