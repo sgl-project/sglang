@@ -907,54 +907,64 @@ class MMEncoder:
         missing_indices = [i for i, e in enumerate(exist_mask) if not e]
         hit_indices = [i for i, e in enumerate(exist_mask) if e]
 
-        # Step 2: All ranks run ViT together on cache-miss images.
+        # Step 2: Rank 0 initiates storage->host prefetch (non-blocking).
+        if self.rank == 0 and hit_indices:
+            hit_hashes = [str_mm_hashes[i] for i in hit_indices]
+            hit_tokens = [
+                self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
+            ]
+            self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens, modality)
+
+        # Step 3: All ranks run ViT together on cache-miss items.
         new_slices = []
         if missing_indices:
             new_slices = self._encode_missing(
-                mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
+                mm_feature,
+                mm_inputs,
+                missing_indices,
+                modality,
+                get_feature_fn,
+                grid_thw,
+                keep_on_gpu=True,
             )
 
-        # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+        # Step 4: Rank 0 launches async D2H into host pool.
+        miss_d2h_handles = []
+        if self.rank == 0 and new_slices:
+            miss_hashes = [str_mm_hashes[i] for i in missing_indices]
+            miss_d2h_handles = self.mm_global_cache.store_to_pool_async(
+                miss_hashes, new_slices, modality
+            )
+
+        # Step 5: Rank 0 waits for prefetch and builds fallback_mask.
         fallback_mask = torch.zeros(num_items, dtype=torch.int32)
-        cached_slices = []
+        if self.rank == 0 and hit_indices:
+            try:
 
-        if self.rank == 0:
-            if hit_indices:
-                hit_hashes = [str_mm_hashes[i] for i in hit_indices]
-                hit_tokens = [
-                    self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
-                ]
-                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens, modality)
+                async def _wait_prefetch():
+                    while not self.mm_global_cache.check_prefetch_progress(req_id):
+                        await asyncio.sleep(0.005)
 
-                try:
+                await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
 
-                    async def _wait_prefetch():
-                        while not self.mm_global_cache.check_prefetch_progress(req_id):
-                            await asyncio.sleep(0.005)
-
-                    await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
-
-                    # Prefetch IO completed; check which items actually loaded.
-                    cached_slices = self.mm_global_cache.get_embeddings(hit_hashes)
-                    for i, idx in enumerate(hit_indices):
-                        if cached_slices[i] is None:
-                            fallback_mask[idx] = 1
-                    num_partial_fail = int(fallback_mask.sum().item())
-                    if num_partial_fail > 0:
-                        logger.warning(
-                            f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
-                            f"cache-hit items failed to load (pool full), "
-                            f"falling back to ViT"
-                        )
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.error(
-                        f"Prefetch failed for req {req_id}: {e}. "
-                        f"Falling back to ViT for {len(hit_indices)} hit items."
-                    )
-                    for idx in hit_indices:
+                for i, idx in enumerate(hit_indices):
+                    if not self.mm_global_cache.has_local_embedding(hit_hashes[i]):
                         fallback_mask[idx] = 1
+                num_partial_fail = int(fallback_mask.sum().item())
+                if num_partial_fail > 0:
+                    logger.warning(
+                        f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
+                        f"cache-hit items failed to load, falling back to ViT"
+                    )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.error(
+                    f"Prefetch failed for req {req_id}: {e}. "
+                    f"Falling back to ViT for {len(hit_indices)} hit items."
+                )
+                for idx in hit_indices:
+                    fallback_mask[idx] = 1
 
-        # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
+        # Broadcast fallback_mask to all ranks.
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
                 fallback_mask,
@@ -962,57 +972,90 @@ class MMEncoder:
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: All ranks run ViT for items that need fallback recomputation.
+        # Step 6: All ranks run ViT for fallback items + Rank 0 launches async D2H.
+        fallback_slices = []
+        fallback_d2h_handles = []
         fallback_indices = [i for i in range(num_items) if fallback_mask[i].item() == 1]
-        fallback_slices = None
         if fallback_indices:
             logger.info(
                 f"Req {req_id}: All ranks running ViT fallback "
                 f"for {len(fallback_indices)} items."
             )
             fallback_slices = self._encode_missing(
-                mm_feature, mm_inputs, fallback_indices, modality, get_feature_fn
+                mm_feature,
+                mm_inputs,
+                fallback_indices,
+                modality,
+                get_feature_fn,
+                grid_thw,
+                keep_on_gpu=True,
+            )
+            if self.rank == 0:
+                fallback_hashes = [str_mm_hashes[i] for i in fallback_indices]
+                fallback_d2h_handles = self.mm_global_cache.store_to_pool_async(
+                    fallback_hashes, fallback_slices, modality
+                )
+
+        # Step 7: Rank 0 waits for D2H, then assembles final embedding.
+        if self.rank == 0:
+            self.mm_global_cache.wait_store_to_pool(
+                miss_d2h_handles + fallback_d2h_handles
             )
 
-        # Step 6: Rank 0 assembles final embedding and prepares for sending.
-        if self.rank == 0:
-            final_slices = [None] * num_items
+            # Collect slices: pool views for hits, GPU tensors for miss/fallback.
+            # Each slot holds a list of tensor slices (usually one, but may be
+            # multiple page-run slices for fragmented pool entries).
+            item_slices = [None] * num_items
+            hit_view_hashes = []
 
+            # Fill miss/fallback slices (already on GPU from ViT)
             for i, idx in enumerate(missing_indices):
-                final_slices[idx] = new_slices[i]
+                src = new_slices[i]
+                if src.ndim != 2:
+                    src = src.reshape(-1, src.shape[-1])
+                item_slices[idx] = [src.cpu()]
+            for i, idx in enumerate(fallback_indices):
+                src = fallback_slices[i]
+                if src.ndim != 2:
+                    src = src.reshape(-1, src.shape[-1])
+                item_slices[idx] = [src.cpu()]
 
-            # Fill in successfully loaded cache-hit embeddings
-            if cached_slices:
-                for i, idx in enumerate(hit_indices):
-                    if cached_slices[i] is not None:
-                        final_slices[idx] = cached_slices[i]
-
-            # Fill in ViT fallback results for failed items
-            if fallback_slices is not None:
-                for i, idx in enumerate(fallback_indices):
-                    final_slices[idx] = fallback_slices[i]
-
-            mm_embedding = torch.cat(final_slices, dim=0)
-
-            # Release embedding cache references now that torch.cat has
-            # copied the data into a new tensor.  This allows the cache
-            # entries to be evicted under memory pressure.
-            if cached_slices:
-                loaded_hashes = [
+            # Fill hit slices with zero-copy pool views (slice lists)
+            if hit_indices:
+                hit_hashes_for_view = [
                     str_mm_hashes[idx]
                     for idx in hit_indices
                     if fallback_mask[idx].item() == 0
                 ]
-                if loaded_hashes:
-                    self.mm_global_cache.release_embeddings(loaded_hashes)
+                cached_slice_lists = self.mm_global_cache.get_pool_views(
+                    hit_hashes_for_view
+                )
+                view_idx = 0
+                for idx in hit_indices:
+                    if fallback_mask[idx].item() == 0:
+                        slices = cached_slice_lists[view_idx]
+                        view_idx += 1
+                        if slices is not None:
+                            item_slices[idx] = slices
+                        else:
+                            raise InternalError(
+                                f"Cached embedding {str_mm_hashes[idx]} "
+                                f"not available for req {req_id}"
+                            )
+                hit_view_hashes = hit_hashes_for_view
 
-            # Background insert: store newly computed embeddings into global cache.
-            # Includes both original misses and fallback-recomputed hits.
+            # Flatten and concat in one shot — no intermediate copies.
+            flat_slices = [s for parts in item_slices for s in parts]
+            mm_embedding = torch.cat(flat_slices, dim=0)
+
+            # Release pool views now that torch.cat has copied the data.
+            if hit_view_hashes:
+                self.mm_global_cache.release_pool_views(hit_view_hashes)
+
+            # Background: push pool-resident embeddings to storage.
             all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
-            all_new_slices = list(new_slices)
-            if fallback_slices is not None:
+            if fallback_indices:
                 all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
-                all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
 
@@ -1020,7 +1063,7 @@ class MMEncoder:
                     await asyncio.to_thread(
                         self.mm_global_cache.insert_batch,
                         all_new_hashes,
-                        all_new_slices,
+                        modality,
                     )
 
                 task = asyncio.create_task(_background_insert())
@@ -1067,7 +1110,7 @@ class MMEncoder:
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             num_items = len(grid_thw)
-            aux_data = _build_mm_aux_data(mm_inputs)
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
 
             # Setup metadata and event management
             nbytes, total_tokens, embedding_dim, event = (
@@ -1075,6 +1118,13 @@ class MMEncoder:
                     req_id, num_parts, part_idx, grid_thw, modality, aux_data
                 )
             )
+
+            if hashes is not None and len(hashes) != num_items:
+                raise BadRequestError(
+                    f"User-supplied hashes length {len(hashes)} != grid count "
+                    f"{num_items} for {self.model_type}/{modality.name}; hashes "
+                    f"must be in grid space (1 per encoder grid entry)."
+                )
 
             # Rank 0: compute hashes
             if self.rank == 0:
@@ -1115,10 +1165,19 @@ class MMEncoder:
                     exist_mask = [m.item() == 1 for m in mask_tensor]
                     missing_indices = [i for i, e in enumerate(exist_mask) if not e]
                     hit_indices = [i for i, e in enumerate(exist_mask) if e]
-                    final_slices = [None] * num_items
 
-                    # Step 2: All ranks run VIT forward for cache misses
-                    # (runs in event loop to preserve session context)
+                    # Step 2: Rank 0 initiates storage->host prefetch (non-blocking)
+                    if self.rank == 0 and hit_indices:
+                        hit_hashes = [str_mm_hashes[i] for i in hit_indices]
+                        hit_tokens = [
+                            self.get_num_tokens(grid_thw[i], modality)
+                            for i in hit_indices
+                        ]
+                        self.mm_global_cache.prefetch(
+                            req_id, hit_hashes, hit_tokens, modality
+                        )
+
+                    # Step 3: All ranks run ViT on cache-miss items.
                     new_slices = []
                     if missing_indices:
                         new_slices = self._encode_missing(
@@ -1131,19 +1190,9 @@ class MMEncoder:
                             keep_on_gpu=True,
                         )
 
-                    # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+                    # Step 4: Rank 0 waits for prefetch and builds fallback_mask.
                     fallback_mask = torch.zeros(num_items, dtype=torch.int32)
-                    cached_slices = []
-
                     if self.rank == 0 and hit_indices:
-                        hit_hashes = [str_mm_hashes[i] for i in hit_indices]
-                        hit_tokens = [
-                            self.get_num_tokens(grid_thw[i], modality)
-                            for i in hit_indices
-                        ]
-                        self.mm_global_cache.prefetch(
-                            req_id, hit_hashes, hit_tokens, modality
-                        )
                         try:
 
                             async def _wait_prefetch():
@@ -1153,18 +1202,16 @@ class MMEncoder:
                                     await asyncio.sleep(0.005)
 
                             await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
-
-                            cached_slices = self.mm_global_cache.get_embeddings(
-                                hit_hashes
-                            )
                             for i, idx in enumerate(hit_indices):
-                                if cached_slices[i] is None:
+                                if not self.mm_global_cache.has_local_embedding(
+                                    hit_hashes[i]
+                                ):
                                     fallback_mask[idx] = 1
                             num_partial_fail = int(fallback_mask.sum().item())
                             if num_partial_fail > 0:
                                 logger.warning(
                                     f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
-                                    f"cache-hit items failed to load (pool full), "
+                                    f"cache-hit items failed to load, "
                                     f"falling back to ViT"
                                 )
                         except (asyncio.TimeoutError, Exception) as e:
@@ -1176,7 +1223,7 @@ class MMEncoder:
                             for idx in hit_indices:
                                 fallback_mask[idx] = 1
 
-                    # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
+                    # Broadcast fallback_mask to all ranks
                     if self.server_args.tp_size > 1:
                         torch.distributed.broadcast(
                             fallback_mask,
@@ -1184,11 +1231,11 @@ class MMEncoder:
                             group=self.mm_global_cache.prefetch_tp_group,
                         )
 
-                    # Step 5: All ranks run ViT for items that need fallback recomputation.
+                    # Step 5: All ranks run ViT for fallback items.
+                    fallback_slices = []
                     fallback_indices = [
                         i for i in range(num_items) if fallback_mask[i].item() == 1
                     ]
-                    fallback_slices = None
                     if fallback_indices:
                         logger.info(
                             f"Req {req_id}: All ranks running ViT fallback "
@@ -1204,68 +1251,91 @@ class MMEncoder:
                             keep_on_gpu=True,
                         )
 
-                    # Step 6: Rank 0 assembles final embedding.
+                    # Step 6: Rank 0 launches async D2H for miss/fallback embeddings.
+                    d2h_handles = []
+                    if self.rank == 0 and new_slices:
+                        miss_hashes = [str_mm_hashes[i] for i in missing_indices]
+                        miss_handles = self.mm_global_cache.store_to_pool_async(
+                            miss_hashes, new_slices, modality
+                        )
+                        d2h_handles.extend(miss_handles)
+                    if self.rank == 0 and fallback_slices:
+                        fallback_hashes = [str_mm_hashes[i] for i in fallback_indices]
+                        fb_handles = self.mm_global_cache.store_to_pool_async(
+                            fallback_hashes, fallback_slices, modality
+                        )
+                        d2h_handles.extend(fb_handles)
+
+                    # Step 7: Rank 0 assembles final embedding (GPU for RDMA send)
                     if self.rank == 0:
-                        for i, idx in enumerate(missing_indices):
-                            final_slices[idx] = new_slices[i]
+                        # item index → position in new_slices / fallback_slices
+                        miss_slice_pos = {
+                            missing_indices[i]: i for i in range(len(missing_indices))
+                        }
+                        fallback_slice_pos = {
+                            fallback_indices[i]: i for i in range(len(fallback_indices))
+                        }
 
-                        # Fill in successfully loaded cache-hit embeddings
-                        if cached_slices:
-                            for i, idx in enumerate(hit_indices):
-                                if cached_slices[i] is not None:
-                                    final_slices[idx] = cached_slices[i]
-
-                        # Fill in ViT fallback results for failed items
-                        if fallback_slices is not None:
-                            for i, idx in enumerate(fallback_indices):
-                                final_slices[idx] = fallback_slices[i]
-
-                        # Move cached CPU slices to GPU and match model dtype
-                        device = torch.device(f"cuda:{self.gpu_id}")
-                        final_slices = [
-                            (
-                                s.to(device=device, dtype=self._embedding_dtype)
-                                if s.device.type == "cpu"
-                                else s
-                            )
-                            for s in final_slices
+                        token_counts = [
+                            self.get_num_tokens(grid, modality) for grid in grid_thw
                         ]
-                        mm_embedding = torch.cat(final_slices, dim=0)
-                        # Wait for any pending VIT / cat kernels to finish
-                        # before publishing to /send: mooncake transfer_sync
-                        # is a host-side RDMA read that bypasses CUDA streams
-                        # and would otherwise race with in-flight kernels.
+                        embedding_dim = self.mm_global_cache.get_embedding_dim(modality)
+                        mm_embedding = torch.empty(
+                            (sum(token_counts), embedding_dim),
+                            dtype=self._embedding_dtype,
+                            device=self.device,
+                        )
+                        offset = 0
+                        copy_handles = []
+                        for idx, num_tokens in enumerate(token_counts):
+                            if idx in miss_slice_pos:
+                                mm_embedding[offset : offset + num_tokens].copy_(
+                                    new_slices[miss_slice_pos[idx]],
+                                    non_blocking=True,
+                                )
+                            elif idx in fallback_slice_pos:
+                                mm_embedding[offset : offset + num_tokens].copy_(
+                                    fallback_slices[fallback_slice_pos[idx]],
+                                    non_blocking=True,
+                                )
+                            else:
+                                handle = self.mm_global_cache.load_to_device_async(
+                                    str_mm_hashes[idx], mm_embedding, offset
+                                )
+                                if handle is None:
+                                    raise InternalError(
+                                        f"Cached embedding {str_mm_hashes[idx]} "
+                                        f"disappeared during assembly "
+                                        f"for req {req_id}"
+                                    )
+                                copy_handles.append(handle)
+                            offset += num_tokens
+                        self.mm_global_cache.wait_load_to_device(copy_handles)
                         torch.cuda.current_stream(mm_embedding.device).synchronize()
 
-                        # Release cache refs after data is copied to GPU
-                        if cached_slices:
-                            loaded_hashes = [
-                                str_mm_hashes[idx]
-                                for idx in hit_indices
-                                if fallback_mask[idx].item() == 0
-                            ]
-                            if loaded_hashes:
-                                self.mm_global_cache.release_embeddings(loaded_hashes)
-
-                        # Background insert: store newly computed embeddings into global cache.
-                        # Includes both original misses and fallback-recomputed hits.
+                        # Background: wait for D2H, then push to storage
                         all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
-                        all_new_slices = list(new_slices)
-                        if fallback_slices is not None:
+                        if fallback_slices:
                             all_new_hashes += [
                                 str_mm_hashes[i] for i in fallback_indices
                             ]
-                            all_new_slices += list(fallback_slices)
                         if all_new_hashes:
+                            captured_handles = d2h_handles
 
-                            async def _background_insert():
+                            async def _background_store_and_insert():
+                                await asyncio.to_thread(
+                                    self.mm_global_cache.wait_store_to_pool,
+                                    captured_handles,
+                                )
                                 await asyncio.to_thread(
                                     self.mm_global_cache.insert_batch,
                                     all_new_hashes,
-                                    all_new_slices,
+                                    modality,
                                 )
 
-                            insert_task = asyncio.create_task(_background_insert())
+                            insert_task = asyncio.create_task(
+                                _background_store_and_insert()
+                            )
                             self.background_tasks.add(insert_task)
                             insert_task.add_done_callback(self.background_tasks.discard)
 
