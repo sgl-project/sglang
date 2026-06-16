@@ -7,7 +7,6 @@ on:
   schedule:
     - cron: '0 */6 * * *' # Run every 6 hours (UTC)
   pull_request:
-    branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -94,6 +93,17 @@ on:
         required: false
         type: boolean
         default: false
+
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
+# pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
