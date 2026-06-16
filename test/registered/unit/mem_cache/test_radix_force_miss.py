@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -30,7 +31,7 @@ class _StubReq:
     def __init__(self, token_ids):
         self.origin_input_ids = array("q", token_ids)
         self.output_ids = array("q")
-        self.token_buf = array("q", token_ids)
+        self.token_buf = ViewableArray(array("q", token_ids))
         self.extra_key = None
         self.prefix_indices = None
         self.last_node = None

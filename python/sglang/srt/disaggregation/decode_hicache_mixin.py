@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.managers.array_utils import to_array
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
@@ -113,11 +112,9 @@ class DecodeHiCachePreallocMixin:
         try:
             node = prefix_match.last_host_node
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = to_array(
-                req.origin_input_ids[
-                    matched_len : matched_len + prefix_match.l3_storage_hit_length
-                ]
-            )
+            suffix = req.origin_input_ids[
+                matched_len : matched_len + prefix_match.l3_storage_hit_length
+            ]
             last_hash = node.get_last_hash_value()
             prefix_keys = (
                 node.get_prefix_hash_values(node.parent)

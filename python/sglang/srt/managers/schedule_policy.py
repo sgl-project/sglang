@@ -37,7 +37,6 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.array_utils import to_array
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -92,7 +91,7 @@ def match_prefix_for_req(
     include_req: bool = False,
 ):
     if token_ids is None:
-        token_ids = memoryview(req.token_buf).toreadonly()
+        token_ids = req.token_buf.readonly_view()
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -256,7 +255,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = memoryview(r.token_buf).toreadonly()
+            prefix_ids = r.token_buf.readonly_view()
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
@@ -287,9 +286,7 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(
-                                token_ids=to_array(prefix_ids), extra_key=extra_key
-                            ),
+                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )
                     )

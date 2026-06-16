@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
@@ -30,7 +31,7 @@ def _make_req(origin_input_ids=None, output_ids=None):
     output = array("q", output_ids or [])
     req.origin_input_ids = origin
     req.output_ids = output
-    req.token_buf = origin + output
+    req.token_buf = ViewableArray(origin + output)
     return req
 
 

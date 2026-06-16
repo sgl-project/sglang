@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, Req
+from sglang.srt.managers.viewable_array import ViewableArray
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -19,7 +20,7 @@ def _make_req(*, output_ids: list, eos_token_ids: set, stop_token_ids: set) -> R
     # Build a bare Req without running __init__; only the fields touched by
     # _check_vocab_boundary_finish are populated.
     req = Req.__new__(Req)
-    req.token_buf = array("q", [])
+    req.token_buf = ViewableArray(array("q", []))
     req.origin_input_len = 0
     req.token_buf.extend(output_ids)
     req.vocab_size = VOCAB_SIZE
