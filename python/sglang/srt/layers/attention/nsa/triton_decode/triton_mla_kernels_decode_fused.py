@@ -17,11 +17,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils.common import is_gfx95_supported
+from sglang.srt.utils.common import is_gfx942_supported
 
-# gfx950/MI350 stores fp8 KV as OCP e4m3fn (bias 7);
-# gfx942/MI300/MI325 stores e4m3fnuz (bias 8).
-_KV_FP8_TY = tl.float8e4nv if is_gfx95_supported() else tl.float8e4b8
+# gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
+# gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
+_KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
 
 
 def _bucket_total_tokens(total_tokens: int) -> int:
