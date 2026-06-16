@@ -73,6 +73,10 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 }
 
 
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     if (
         quant_method is None
@@ -87,11 +91,45 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
     # Some draft models share an unquantized target lm_head tensor while still
     # carrying the draft model's stale ModelOpt quant_method. Only use the
-    # ModelOpt lm_head kernel when the actual weight layout matches it.
-    if method_name in ("ModelOptFp4LinearMethod", "ModelOptNvFp4A16LinearMethod"):
-        return lm_head.weight.dtype == torch.uint8
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
     if method_name == "ModelOptFp8LinearMethod":
-        return lm_head.weight.dtype == torch.float8_e4m3fn
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
 
     return True
 

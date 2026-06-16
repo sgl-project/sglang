@@ -8,15 +8,19 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4A16LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -696,6 +700,48 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         config = ModelOptFp4Config(use_per_token_activation=False)
 
         self.assertFalse(config.use_per_token_activation)
+
+    def test_lm_head_guard_accepts_modelopt_fp4_marlin_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 496640, dtype=torch.int32), requires_grad=False
+        )
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertTrue(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptFp4LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_attrs_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
 
     def test_mixed_precision_uses_nvfp4_min_capability(self):
         self.assertEqual(
