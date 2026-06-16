@@ -5,9 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.compilation.compilation_config import (
-    is_graph_dsa_split_op_fusion_enabled,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -22,13 +19,15 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 # Cached once at import. Master switch for the graph DSA split-op fusions
 # (`is_cuda and SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION`), shared by the indexer
 # split-op dispatch and the MLA BMM-into-attention fusion.
-_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled()
+_enable_graph_dsa_split_op_fusion = (
+    is_cuda() and envs.SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION.get()
+)
 
 
 @lru_cache(maxsize=1)
