@@ -207,12 +207,8 @@ class AWQAscendMoEKernel:
             if hasattr(layer, "w2_scales"):
                 delattr(layer, "w2_scales")
             # Remove original packed tensors if they still exist (they were not overwritten)
-            if hasattr(layer, "w13_qweight"):
-                delattr(layer, "w13_qweight")
             if hasattr(layer, "w13_qzeros"):
                 delattr(layer, "w13_qzeros")
-            if hasattr(layer, "w2_qweight"):
-                delattr(layer, "w2_qweight")
             if hasattr(layer, "w2_qzeros"):
                 delattr(layer, "w2_qzeros")
         else:
