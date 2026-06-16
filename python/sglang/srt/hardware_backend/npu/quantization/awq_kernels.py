@@ -196,47 +196,40 @@ class AWQAscendMoEKernel:
         return offset.to(dtype)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # 1. Convert and register new NPU-compatible parameters
+        # 1. Convert and register weights (already packed correctly)
         self._register_or_replace_parameter(
-            layer,
-            "w13_weight",
+            layer, "w13_weight",
             self._convert_awq_weight_to_npu_layout(layer.w13_qweight.data),
         )
         self._register_or_replace_parameter(
-            layer,
-            "w2_weight",
+            layer, "w2_weight",
             self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
         )
+    
+        # 2. Register scales (keep as (E, N, groups))
         self._register_or_replace_parameter(
-            layer,
-            "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous(),   # (E, N, groups)
+            layer, "w13_weight_scale",
+            layer.w13_scales.data.transpose(1, 2).contiguous(),
         )
         self._register_or_replace_parameter(
-            layer,
-            "w2_weight_scale",
+            layer, "w2_weight_scale",
             layer.w2_scales.data.transpose(1, 2).contiguous(),
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w13_weight_offset",
-            self._convert_awq_qzeros_to_npu_offset(
-                layer.w13_qzeros.data, layer.w13_scales.data.dtype
-            ),
-        )
-        self._register_or_replace_parameter(
-            layer,
-            "w2_weight_offset",
-            self._convert_awq_qzeros_to_npu_offset(
-                layer.w2_qzeros.data, layer.w2_scales.data.dtype
-            ),
-        )
-
-        # 2. Post‑processing specific to W4A16 kernel (squeeze, etc.)
-        self.w13_kernel.process_weights_after_loading(layer, "w13")
-        self.w2_kernel.process_weights_after_loading(layer, "w2")
-
-        # 3. Remove original AWQ tensors to free memory
+    
+        # 3. Register offsets
+        for prefix in ("w13", "w2"):
+            qzeros = getattr(layer, f"{prefix}_qzeros").data
+            scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
+            self._register_or_replace_parameter(
+                layer, f"{prefix}_weight_offset",
+                self._convert_awq_qzeros_to_npu_offset(qzeros, scales_dtype),
+            )
+    
+        # 4. Set dispatcher output dtype for w13 (no weight unpacking needed)
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+    
+        # 5. Free original AWQ tensors to reclaim memory immediately
         for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
                      "w2_qweight", "w2_qzeros", "w2_scales"):
             if hasattr(layer, attr):
