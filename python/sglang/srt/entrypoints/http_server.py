@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -1473,6 +1474,21 @@ async def load_lora_adapter_from_tensors(
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_lora_adapter_from_distributed", methods=["POST"])
+async def load_lora_adapter_from_distributed(
+    obj: LoadLoRAAdapterFromDistributedReqInput, request: Request
+):
+    """Load a new LoRA adapter broadcast over a process group without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_distributed(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
