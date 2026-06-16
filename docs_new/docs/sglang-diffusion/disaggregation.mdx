@@ -93,7 +93,7 @@ curl http://127.0.0.1:22000/v1/videos \
 > **Tested result (8×H200):**
 > Encoder 2.3 s (TextEncoding) → Denoiser 312.8 s (50 steps, layerwise offload) → Decoder 7.1 s (VAE decode).
 > Total ~322 s for 81-frame 1024×1024 video.
-
+> 
 > **Tip:** `--base-gpu-id` controls which physical GPU the role uses.
 > Encoder and Decoder can share a GPU (e.g. both `--base-gpu-id 0`) to save resources,
 > but make sure the combined GPU memory is sufficient.
@@ -335,7 +335,7 @@ launch_pool_disagg_server(
 
 ## Architecture
 
-```
+```txt
 Client ─── HTTP (port 30000) ──► FastAPI Server
                                       │
                                       ▼
@@ -354,7 +354,7 @@ Client ─── HTTP (port 30000) ──► FastAPI Server
 
 ### Request State Machine
 
-```
+```txt
 PENDING → ENCODER_WAITING → ENCODER_RUNNING → ENCODER_DONE
                                                     │
                         DENOISING_WAITING → DENOISING_RUNNING → DENOISING_DONE

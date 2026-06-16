@@ -94,13 +94,14 @@ PCG is enabled by default but is still in an experimental stage. Since PCG relie
 
 If you see an error message like the following during server startup, it is a PCG bug:
 
-```
+```txt
 Piecewise CUDA Graph is enabled by default as an experimental feature.
 To work around this error, add --disable-piecewise-cuda-graph to your launch command.
 Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose
 ```
 
 To work around it, add `--disable-piecewise-cuda-graph` to your launch command. When filing a bug report, please include:
+
 1. The full error traceback
 2. Model name and quantization method
 3. Launch command with all arguments
@@ -144,7 +145,7 @@ For wrapping external library functions (e.g., FlashInfer kernels), use `registe
 
 PCG uses `torch.compile` with a custom backend (`SGLangBackend`) to split and compile the model's forward pass. The flow is:
 
-```
+```txt
 model.forward wrapper
 → torch.compile(..., backend=SGLangBackend)
 → FX graph

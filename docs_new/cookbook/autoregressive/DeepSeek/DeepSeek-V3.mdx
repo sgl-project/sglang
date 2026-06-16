@@ -70,9 +70,11 @@ import { DeepSeekV3Deployment } from "/src/snippets/autoregressive/deepseek-v3-d
 > The official DeepSeek-V3 checkpoint is already in FP8 format — do **not** add `--quantization fp8` when serving it.
 
 **DeepGEMM precompilation (NVIDIA Hopper / Blackwell):** Precompile GEMM kernels before the first server run to avoid JIT overhead (~10 min):
+
 ```bash
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
+
 DeepGEMM is enabled by default on Hopper/Blackwell and can be disabled with `SGLANG_ENABLE_JIT_DEEPGEMM=0`.
 
 **Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios with large batch sizes. Reduces KV-cache duplication across TP ranks. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node. Not recommended for low-latency, small-batch workloads.
@@ -202,7 +204,6 @@ python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000
 ```
-
 
 **Quick Test (curl):**
 
@@ -602,6 +603,7 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
 
 - **Test Results**:
   - DeepSeek-V3
+
     ```text Output
     Accuracy: 0.960
     Invalid: 0.000
@@ -621,6 +623,7 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 8000
 
 - **Test Results**:
   - DeepSeek-V3
+  
     ```text Output
     subject: abstract_algebra, #q:100, acc: 0.800
     subject: anatomy, #q:135, acc: 0.874

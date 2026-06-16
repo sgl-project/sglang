@@ -244,6 +244,7 @@ print(response.choices[0].message.tool_calls)
 ### GSM8K
 
 - Deployment Command
+
 ```bash Command
 sglang serve \
   --model-path inclusionAI/Ring-2.5-1T \
@@ -252,11 +253,13 @@ sglang serve \
 ```
 
 - Benchmark Command
+
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --temperature 1.2 --top-p 0.8 --max-new-tokens 32768 --num-questions 200 --tokenizer-path inclusionAI/Ring-2.5-1T --enable-thinking
 ```
 
 - Test Result
+
 ```text Output
 Accuracy: 0.955
 Invalid: 0.010

@@ -43,20 +43,24 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 ### 3.2 Configuration Tips
 
 **AMD (MI300X/MI325X/MI355X):**
+
 * **Memory Management**: We have verified successful deployment on MI300X/MI325X/MI355X with `--context-length 8192`. Larger context lengths may be supported but require additional memory.
 * **Expert Parallelism**: For 480B-A35B with FP8 quantization, `--ep 2` is required to satisfy the dimension alignment requirement.
 * **Page Size**: `--page-size 32` is recommended for MoE models to optimize memory usage.
 * **Environment Variable**: If you encounter aiter-related issues, try setting `SGLANG_USE_AITER=0`.
 
 **NVIDIA (B200/GB200):**
+
 * **GB200 Parallelism**: Use `--tp 4 --ep 4` on GB200. B200 uses the default NVIDIA settings generated above.
 * **NVFP4 Quantization**: Requires `--quantization modelopt_fp4` and uses a different model path (`nvidia/Qwen3-Coder-...`).
 * **DP Attention**: NVFP4 configuration supports `--enable-dp-attention` for improved throughput.
 
 **General:**
+
 * **Tool Use**: To enable tool calling capabilities, add `--tool-call-parser qwen3_coder` to the launch command.
 
 **Intel Xeon CPU:**
+
 * For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
@@ -760,7 +764,8 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 - **Results**:
 
   - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-    ```
+
+    ```text
     Accuracy: 0.965
     Invalid: 0.000
     Latency: 23.084 s
@@ -772,7 +777,8 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 For deployment commands, see [Section 3.1](#31-configuration).
 
   - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-    ```
+
+    ```text
     Accuracy: 0.965
     Invalid: 0.000
     Latency: 14.870 s
@@ -780,7 +786,8 @@ For deployment commands, see [Section 3.1](#31-configuration).
     ```
 
   - nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP (NVFP4)
-    ```
+
+    ```text
     Accuracy: 0.960
     Invalid: 0.000
     Latency: 13.948 s

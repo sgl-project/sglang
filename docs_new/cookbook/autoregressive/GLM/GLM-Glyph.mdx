@@ -316,6 +316,7 @@ We use industry-standard benchmark configurations to ensure results are comparab
 #### 5.1.1 Standard Scenario Benchmark
 
 - **Model Deployment**
+
 ```bash Command
 python -m sglang.launch_server \
   --model zai-org/Glyph \
@@ -323,7 +324,9 @@ python -m sglang.launch_server \
 ```
 
 ##### 5.1.1.1 Low Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -337,6 +340,7 @@ python -m sglang.bench_serving \
 ```
 
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -377,7 +381,9 @@ Max ITL (ms):                            7.46
 ```
 
 ##### 5.1.1.2 Medium Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -391,6 +397,7 @@ python -m sglang.bench_serving \
 ```
 
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -431,7 +438,9 @@ Max ITL (ms):                            25.14
 ```
 
 ##### 5.1.1.3 High Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -443,7 +452,9 @@ python -m sglang.bench_serving \
   --max-concurrency 100 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -486,7 +497,9 @@ Max ITL (ms):                            52.93
 #### 5.1.2 Reasoning Scenario Benchmark
 
 ##### 5.1.2.1 Low Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -498,7 +511,9 @@ python -m sglang.bench_serving \
   --max-concurrency 1 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -539,7 +554,9 @@ Max ITL (ms):                            5.67
 ```
 
 ##### 5.1.2.2 Medium Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -551,7 +568,9 @@ python -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -592,7 +611,9 @@ Max ITL (ms):                            522.26
 ```
 
 ##### 5.1.2.3 High Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -604,7 +625,9 @@ python -m sglang.bench_serving \
   --max-concurrency 64 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -647,7 +670,9 @@ Max ITL (ms):                            136.00
 #### 5.1.3 Summarization Scenario Benchmark
 
 #### 5.1.3.1 Low Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -659,7 +684,9 @@ python -m sglang.bench_serving \
   --max-concurrency 1 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -700,7 +727,9 @@ Max ITL (ms):                            4.95
 ```
 
 ##### 5.1.3.2 Medium Concurrency
+
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -712,7 +741,9 @@ python -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -755,6 +786,7 @@ Max ITL (ms):                            36.01
 ##### 5.1.3.3 High Concurrency
 
 - **Benchmark Command**:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -766,7 +798,9 @@ python -m sglang.bench_serving \
   --max-concurrency 64 \
   --request-rate inf
 ```
+
 - **Test Results**:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang

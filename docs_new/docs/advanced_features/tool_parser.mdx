@@ -5,8 +5,7 @@ metatags:
 ---
 This guide demonstrates how to use SGLang’s [Function calling](https://platform.openai.com/docs/guides/function-calling) functionality.
 
-
-## Currently supported parsers:
+## Currently supported parsers
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -95,14 +94,9 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
   </tbody>
 </table>
 
-
-
 ## OpenAI Compatible API
 
-
 ### Launching the Server
-
-
 
 ```python Example
 import json
@@ -118,11 +112,9 @@ wait_for_server(f"http://localhost:{port}")
 
 Note that `--tool-call-parser` defines the parser used to interpret responses.
 
-
 ### Define Tools for Function Call
+
 Below is a Python snippet that shows how to define a tool as a dictionary. The dictionary includes a tool name, a description, and property defined Parameters.
-
-
 
 ```python Example
 # Define tools
@@ -159,8 +151,6 @@ tools = [
 
 ### Define Messages
 
-
-
 ```python Example
 def get_messages():
     return [
@@ -176,17 +166,13 @@ messages = get_messages()
 
 ### Initialize the Client
 
-
-
 ```python Example
 # Initialize OpenAI-like client
 client = OpenAI(api_key="None", base_url=f"http://0.0.0.0:{port}/v1")
 model_name = client.models.list().data[0].id
 ```
 
-###  Non-Streaming Request
-
-
+### Non-Streaming Request
 
 ```python Example
 # Non-streaming mode test
@@ -208,9 +194,8 @@ print_highlight(response_non_stream.choices[0].message.tool_calls)
 ```
 
 #### Handle Tools
+
 When the engine determines it should call a particular tool, it will return arguments or partial arguments through the response. You can parse these arguments and later invoke the tool accordingly.
-
-
 
 ```python Example
 name_non_stream = response_non_stream.choices[0].message.tool_calls[0].function.name
@@ -223,8 +208,6 @@ print_highlight(f"Final streamed function call arguments: {arguments_non_stream}
 ```
 
 ### Streaming Request
-
-
 
 ```python Example
 # Streaming mode test
@@ -257,9 +240,8 @@ for tool_call in tool_calls:
 ```
 
 #### Handle Tools
+
 When the engine determines it should call a particular tool, it will return arguments or partial arguments through the response. You can parse these arguments and later invoke the tool accordingly.
-
-
 
 ```python Example
 # Parse and combine function call arguments
@@ -278,8 +260,6 @@ print_highlight(f"streamed function call arguments: {full_arguments}")
 
 ### Define a Tool Function
 
-
-
 ```python Example
 # This is a demonstration, define real function according to your usage.
 def get_current_weather(city: str, state: str, unit: "str"):
@@ -292,10 +272,7 @@ def get_current_weather(city: str, state: str, unit: "str"):
 available_tools = {"get_current_weather": get_current_weather}
 ```
 
-
 ### Execute the Tool
-
-
 
 ```python Example
 messages.append(response_non_stream.choices[0].message)
@@ -321,8 +298,6 @@ print_highlight(f"Updated message history: {messages}")
 
 ### Send Results Back to Model
 
-
-
 ```python Example
 final_response = client.chat.completions.create(
     model=model_name,
@@ -340,8 +315,6 @@ print_highlight(final_response.choices[0].message.content)
 ```
 
 ## Native API and SGLang Runtime (SRT)
-
-
 
 ```python Example
 from transformers import AutoTokenizer
@@ -389,14 +362,11 @@ print("function name: ", function_call_response_json["calls"][0]["name"])
 print("function arguments: ", function_call_response_json["calls"][0]["parameters"])
 ```
 
-
 ```python Example
 terminate_process(server_process)
 ```
 
 ## Offline Engine API
-
-
 
 ```python Example
 import sglang as sgl
@@ -456,7 +426,6 @@ for call in calls:
 # 3) If needed, perform additional logic on the parsed functions, such as automatically calling the corresponding function to obtain a return value, etc.
 ```
 
-
 ```python Example
 llm.shutdown()
 ```
@@ -475,8 +444,6 @@ SGLang supports OpenAI's `tool_choice` parameter to control when and which tools
 Tool choice is fully supported with the **Xgrammar backend**, which is the default grammar backend (`--grammar-backend xgrammar`). However, it may not be fully supported with other backends such as `outlines`.
 
 ### Example: Required Tool Choice
-
-
 
 ```python Example
 from openai import OpenAI
@@ -542,9 +509,6 @@ print("Tool calls:", response_required.choices[0].message.tool_calls)
 
 ### Example: Specific Function Choice
 
-
-
-
 ```python Example
 # Example with specific function choice - forces the model to call a specific function
 messages_specific = [
@@ -573,7 +537,6 @@ if response_specific.choices[0].message.tool_calls:
     print_highlight(f"Arguments: {tool_call.function.arguments}")
 ```
 
-
 ```python Example
 terminate_process(server_process_tool_choice)
 ```
@@ -588,6 +551,7 @@ Some Llama models (such as Llama-3.2-1B, Llama-3.2-3B, Llama-3.3-70B, and Llama-
 
 - The output is a Python list of function calls, with arguments as Python literals (not JSON).
 - Multiple tool calls can be returned in the same list:
+
 ```python Example
 [get_current_weather(city="San Francisco", state="CA", unit="celsius"),
  get_current_weather(city="New York", state="NY", unit="fahrenheit")]
@@ -598,14 +562,14 @@ For more information, refer to Meta’s documentation on  [Zero shot function ca
 Note that this feature is still under development on Blackwell.
 
 ### How to enable
+
 - Launch the server with `--tool-call-parser pythonic`
 - You may also specify --chat-template with the improved template for the model (e.g., `--chat-template=examples/chat_template/tool_chat_template_llama4_pythonic.jinja`).
 This is recommended because the model expects a special prompt format to reliably produce valid pythonic tool call outputs. The template ensures that the prompt structure (e.g., special tokens, message boundaries like `<|eom|>`, and function call delimiters) matches what the model was trained or fine-tuned on. If you do not use the correct chat template, tool calling may fail or produce inconsistent results.
 
 #### Forcing Pythonic Tool Call Output Without a Chat Template
+
 If you don't want to specify a chat template, you must give the model extremely explicit instructions in your messages to enforce pythonic output. For example, for `Llama-3.2-1B-Instruct`, you need:
-
-
 
 ```python Example
 import openai
@@ -726,20 +690,24 @@ terminate_process(server_process)
 > **Note:**
 > The model may still default to JSON if it was heavily finetuned on that format. Prompt engineering (including examples) is the only way to increase the chance of pythonic output if you are not using a chat template.
 
-
 ## How to support a new model?
+
 1. Update the TOOLS_TAG_LIST in sglang/srt/function_call_parser.py with the model’s tool tags. Currently supported tags include:
-```text Output
-	TOOLS_TAG_LIST = [
-	    “<|plugin|>“,
-	    “<function=“,
-	    “<tool_call>“,
-	    “<|python_tag|>“,
-	    “[TOOL_CALLS]”
-	]
-```
+
+    ```text Output
+        TOOLS_TAG_LIST = [
+            “<|plugin|>“,
+            “<function=“,
+            “<tool_call>“,
+            “<|python_tag|>“,
+            “[TOOL_CALLS]”
+        ]
+    ```
+
 2. Create a new detector class in sglang/srt/function_call_parser.py that inherits from BaseFormatDetector. The detector should handle the model’s specific function call format. For example:
-```text Output
-    class NewModelDetector(BaseFormatDetector):
-```
+
+    ```text Output
+        class NewModelDetector(BaseFormatDetector):
+    ```
+
 3. Add the new detector to the MultiFormatParser class that manages all the format detectors.

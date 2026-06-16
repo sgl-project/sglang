@@ -184,7 +184,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
   --host 0.0.0.0 --port 30000
 ```
 
-#### Speculative Decoding (MTP) Server Commands
+### Speculative Decoding (MTP) Server Commands
 
 Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#31-basic-configuration).
 
@@ -598,6 +598,7 @@ For speech translation (AST), ask for the transcription in the source language f
 #### gemma-4-E2B-it (1x H200, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-E2B-it
 ```
@@ -719,6 +720,7 @@ Median ITL (ms):                         5.68
 #### gemma-4-E4B-it (1x H200, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-E4B-it
 ```
@@ -812,6 +814,7 @@ Median ITL (ms):                         8.64
 #### gemma-4-31B-it (2x H200, TP=2)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-31B-it --tp 2
 ```
@@ -905,6 +908,7 @@ Median ITL (ms):                         26.81
 #### gemma-4-26B-A4B-it (MoE, 1x H200, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-26B-A4B-it
 ```
@@ -1000,6 +1004,7 @@ Median ITL (ms):                         19.08
 #### gemma-4-31B-it (1x MI300X, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-31B-it
 ```
@@ -1063,6 +1068,7 @@ Median ITL (ms):                         63.45
 #### gemma-4-26B-A4B-it (MoE, 1x MI300X, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-26B-A4B-it
 ```
@@ -1124,6 +1130,7 @@ Median ITL (ms):                         29.31
 #### gemma-4-12B-it (1x H200, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 sglang serve --model-path google/gemma-4-12B-it
 ```
@@ -1232,6 +1239,7 @@ Median ITL (ms):                         19.16
 #### gemma-4-12B-it (1x B200, TP=1)
 
 Server Launch Command:
+
 ```bash Command
 # Text/audio: the sm100 default (trtllm_mha) is fastest.
 # For image workloads add --attention-backend triton (bidirectional image attention).

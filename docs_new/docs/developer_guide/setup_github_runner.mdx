@@ -5,12 +5,12 @@ metatags:
 ---
 ## Add a Runner
 
-### Step 1: Start a docker container.
+### Step 1: Start a docker container
 
-**You can mount a folder for the shared huggingface model weights cache. **
+**You can mount a folder for the shared huggingface model weights cache.**
 The command below uses `/tmp/huggingface` as an example.
 
-```
+```bash
 docker pull nvidia/cuda:12.9.1-devel-ubuntu22.04
 # Nvidia
 docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.9.1-devel-ubuntu22.04 /bin/bash
@@ -30,9 +30,10 @@ pip install --upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
-Then follow https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners to run `config.sh`
+Then follow [https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners) to run `config.sh`
 
 **Notes**
+
 - Do not need to specify the runner group
 - Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-h100`). The labels can be edited later in Github Settings.
 - Do not need to change the work folder.
@@ -40,6 +41,7 @@ Then follow https://docs.github.com/en/actions/hosting-your-own-runners/managing
 ### Step 3: Run the runner by `run.sh`
 
 - Set up environment variables
+
 ```text Output
 export HF_HOME=/hf_home
 export SGLANG_IS_IN_CI=true
@@ -49,6 +51,7 @@ export CUDA_VISIBLE_DEVICES=0
 ```
 
 - Run it forever
+
 ```text Output
 while true; do ./run.sh; echo "Restarting..."; sleep 2; done
 ```

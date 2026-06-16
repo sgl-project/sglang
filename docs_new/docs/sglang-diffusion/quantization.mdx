@@ -145,6 +145,7 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
 ### Skipping Layers
@@ -442,6 +443,7 @@ transformer weights.
 
 If the basename of `--transformer-weights-path` contains the pattern
 `svdq-(int4|fp4)_r{rank}`, SGLang will automatically:
+
 - enable SVDQuant
 - infer `--quantization-precision`
 - infer `--quantization-rank`
@@ -592,6 +594,7 @@ sglang generate \
   or SM12x GPUs. Hopper (SM90) is currently rejected.
 
 ## [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
+
 MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
 
 - **Installation**

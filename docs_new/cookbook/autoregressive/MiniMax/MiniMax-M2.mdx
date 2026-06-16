@@ -29,10 +29,13 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions. The AMD environment is currently available in SGLang via Docker image install.
 
 ### 2.1 AMD Docker
+
 #### 2.1.1 Launch docker
+
 ```shell Command
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 ```
+
 ```shell Command
 docker run -d -it --ipc=host --network=host --privileged \
   --cap-add=CAP_SYS_ADMIN \
@@ -54,7 +57,9 @@ mv /sgl-workspace/sglang/python/sglang/srt/models/transformers.py \
 ```
 
 #### 2.1.3 Fix torch compile
+
 Comment out the following line: @torch.compile(dynamic=True, backend=get_compiler_backend()) in /sgl-workspace/sglang/python/sglang/srt/models/minimax_m2.py
+
 ```shell Command
 #@torch.compile(dynamic=True, backend=get_compiler_backend())
 ```
@@ -152,7 +157,9 @@ For basic API usage and request examples, please refer to:
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Reasoning Parser
+
 Server Command:
+
 ```shell Command
     sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
@@ -161,7 +168,9 @@ Server Command:
     --trust-remote-code \
     --mem-fraction-static 0.85
 ```
+
 Test Code:
+
 ```python Example
 from openai import OpenAI
 
@@ -208,7 +217,9 @@ for chunk in response:
 
 print()
 ```
+
 Output Example:
+
 ```text Output
 <think>First, the user asks: "What is 15% of 240?" This is a straightforward percentage calculation. I need to solve it step by step as per the instruction.
 
@@ -274,6 +285,7 @@ Both methods confirm the result.
 ### 4.2.2 Tool Calling
 
 Server Command:
+
 ```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
@@ -282,7 +294,9 @@ sglang serve \
     --trust-remote-code \
     --mem-fraction-static 0.85
 ```
+
 Test Code:
+
 ```python Example
 from openai import OpenAI
 
@@ -377,7 +391,9 @@ for index, tool_call in sorted(tool_calls_accumulator.items()):
 
 print()
 ```
+
 Output Example:
+
 ```text Output
 Alright, the user is asking about the weather in Beijing. This is a straightforward request that I can help with using the get_weather tool that's available to me.
 
@@ -403,7 +419,9 @@ This should return the current weather information for Beijing, which I can then
 ```
 
 ## 5. Benchmark
+
 ### 5.1 Speed Benchmark
+
 **Test Environment**:
 
 - Hardware: AMD MI300X GPU(4x)
@@ -425,7 +443,9 @@ sglang serve \
 ```
 
 ### 5.1.1 Low Concurrency (Latency-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -440,6 +460,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -480,7 +501,9 @@ Max ITL (ms):                            23.64
 ```
 
 ### 5.1.2 Medium Concurrency (Balanced)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -493,7 +516,9 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -534,7 +559,9 @@ Max ITL (ms):                            1192.51
 ```
 
 ### 5.1.3 High Concurrency (Throughput-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -548,6 +575,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -588,9 +616,11 @@ Max ITL (ms):                            986.14
 ```
 
 ### 5.2 Accuracy Benchmark
+
 #### 5.2.1 GSM8K Benchmark
 
 - **Server Command**:
+
 ```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
@@ -600,11 +630,14 @@ sglang serve \
 ```
 
 - **Benchmark Command**:
+
 ```shell Command
   python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
+
 - **Result**:
   - MiniMax-M2
+  
 ```text Output
  Accuracy: 0.950
  Invalid: 0.000

@@ -39,6 +39,7 @@ import { GLM45VDeployment } from "/src/snippets/autoregressive/glm-45v-deploymen
 <GLM45VDeployment />
 
 ### 3.2 Configuration Tips
+
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder`.
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
@@ -52,6 +53,7 @@ import { GLM45VDeployment } from "/src/snippets/autoregressive/glm-45v-deploymen
   - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
 
 **Example with full multimodal optimizations:**
+
 ```bash Command
 SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \

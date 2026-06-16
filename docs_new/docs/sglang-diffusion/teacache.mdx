@@ -12,6 +12,7 @@ TeaCache (Temporal similarity-based caching) accelerates diffusion inference by 
 ## Overview
 
 TeaCache works by:
+
 1. Tracking the L1 distance between modulated inputs across consecutive timesteps
 2. Accumulating the rescaled L1 distance over steps
 3. When accumulated distance is below a threshold, reusing the cached residual
@@ -142,7 +143,6 @@ TeaCache support status by model family:
     </tr>
   </tbody>
 </table>
-
 
 ## References
 

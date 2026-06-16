@@ -38,7 +38,9 @@ Notes:
 # Layer-first
 --hicache-mem-layout layer_first
 ```
+
 **Layout Compatibility:**
+
 - `page_first`: Only compatible with `kernel` I/O backend, automatically switches to `layer_first` with `direct` backend
 - `page_first_direct`: Specifically designed for `direct` I/O backend with optimized memory organization
 
@@ -122,7 +124,6 @@ python3 -m sglang.launch_server \
   --disaggregation-transfer-backend mooncake
 ```
 
-
 ### Deployment with HF3FS
 
 Here is an example of deploying DeepSeek-R1 with HiCache-HF3FS. For more details, see the [HF3FS Documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/README.md).
@@ -174,7 +175,6 @@ python3 -m sglang.launch_server \
   --hicache-storage-prefetch-policy timeout
 ```
 
-
 ## Custom Storage Backend Integration
 
 To integrate a new storage backend:
@@ -201,13 +201,13 @@ python3 -m sglang.launch_server \
 ```
 
 **Configuration Parameters:**
+
 - `--hicache-storage-backend`: Set to `dynamic`
 - `--hicache-storage-backend-extra-config`: JSON configuration with:
   - `backend_name`: Custom backend identifier
   - `module_path`: Python module path to your implementation
   - `class_name`: Your HiCache implementation class name
   - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
-
 
 ## Community and Support
 

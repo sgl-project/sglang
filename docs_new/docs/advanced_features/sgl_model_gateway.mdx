@@ -6,6 +6,7 @@ metatags:
 SGLang Model Gateway is a high-performance model-routing gateway for large-scale LLM deployments. It centralizes worker lifecycle management, balances traffic across heterogeneous protocols (HTTP, gRPC, OpenAI-compatible), and provides enterprise-ready control over history storage, MCP tooling, and privacy-sensitive workflows. The gateway is deeply optimized for the SGLang serving runtime, but can route to any OpenAI-compatible backend.
 
 ***
+
 ## Table of Contents
 
 1. [Overview](#overview)
@@ -61,6 +62,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 21. [Troubleshooting](#troubleshooting)
 
 ***
+
 ## Overview
 
 - **Unified control plane** for registering, monitoring, and orchestrating regular, prefill, and decode workers across heterogeneous model fleets.
@@ -73,6 +75,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 - **Comprehensive observability**: 40+ Prometheus metrics, OpenTelemetry distributed tracing, structured logging, and request ID propagation.
 
 ***
+
 ## Architecture
 
 ### Control Plane
@@ -95,6 +98,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 - `/v1/responses` agentic flows, MCP sessions, and conversation APIs share the same storage layer, enabling compliance for regulated workloads.
 
 ***
+
 ## Installation
 
 ### Docker
@@ -108,12 +112,14 @@ docker pull lmsysorg/sgl-model-gateway:latest
 ### Prerequisites
 
 - **Rust and Cargo**
+
   ```bash Command
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   source "$HOME/.cargo/env"
   rustc --version
   cargo --version
   ```
+
 - **Python** with `pip` and virtualenv tooling available.
 
 ### Rust Binary
@@ -138,6 +144,7 @@ pip install --force-reinstall dist/*.whl
 ```
 
 ***
+
 ## Quick Start
 
 ### Regular HTTP Routing
@@ -166,6 +173,7 @@ python -m sglang_router.launch_router \
 ```
 
 ***
+
 ## Deployment Modes
 
 ### Co-launch Router and Workers
@@ -286,6 +294,7 @@ curl -X POST http://localhost:30000/workers \
 ```
 
 ***
+
 ## API Reference
 
 ### Inference Endpoints
@@ -448,6 +457,7 @@ curl -X POST http://localhost:30000/v1/tokenizers \
 ```
 
 Response:
+
 ```json Config
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
@@ -457,6 +467,7 @@ Response:
 ```
 
 Check status:
+
 ```bash Command
 curl http://localhost:30000/v1/tokenizers/550e8400-e29b-41d4-a716-446655440000/status
 ```
@@ -736,6 +747,7 @@ curl http://localhost:30000/workers
 ```
 
 Response:
+
 ```json Config
 {
   "workers": [
@@ -845,6 +857,7 @@ Response:
 </table>
 
 ***
+
 ## Load Balancing Policies
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -942,6 +955,7 @@ Response:
 </table>
 
 ***
+
 ## Reliability and Flow Control
 
 ### HTTP Client
@@ -1104,6 +1118,7 @@ python -m sglang_router.launch_router \
 </table>
 
 **Circuit Breaker States:**
+
 - **Closed**: Normal operation, requests allowed
 - **Open**: Failing, requests rejected immediately
 - **Half-Open**: Testing recovery, limited requests allowed
@@ -1120,6 +1135,7 @@ python -m sglang_router.launch_router \
 ```
 
 Requests beyond the concurrency limit wait in a FIFO queue. Returns:
+
 - `429 Too Many Requests` when queue is full
 - `408 Request Timeout` when queue timeout expires
 
@@ -1134,6 +1150,7 @@ Requests beyond the concurrency limit wait in a FIFO queue. Returns:
 ```
 
 ***
+
 ## Reasoning Parser Integration
 
 The gateway includes built-in reasoning parsers for models that use Chain-of-Thought (CoT) reasoning with explicit thinking blocks.
@@ -1202,12 +1219,14 @@ python -m sglang_router.launch_router \
 ```
 
 The gRPC router automatically:
+
 1. Detects reasoning blocks in streaming output
 2. Separates reasoning content from normal text
 3. Applies incremental streaming parsing with buffer management
 4. Handles partial token detection for correct streaming behavior
 
 ***
+
 ## Tool Call Parsing
 
 The gateway supports parsing function/tool calls from LLM outputs in multiple formats.
@@ -1256,11 +1275,13 @@ python -m sglang_router.launch_router \
 ```
 
 ***
+
 ## Tokenizer Management
 
 ### Tokenizer Sources
 
 The gateway supports multiple tokenizer backends:
+
 - **HuggingFace**: Load from HuggingFace Hub by model ID
 - **Local**: Load from local `tokenizer.json` or directory
 - **Tiktoken**: Auto-detect OpenAI GPT models (gpt-4, davinci, etc.)
@@ -1317,6 +1338,7 @@ Two-level caching for optimal performance:
 ```
 
 ***
+
 ## MCP Integration
 
 The gateway provides native Model Context Protocol (MCP) client integration for tool execution.
@@ -1395,6 +1417,7 @@ inventory:
 ```
 
 ***
+
 ## Service Discovery (Kubernetes)
 
 Enable automatic worker discovery via Kubernetes pod selectors:
@@ -1419,6 +1442,7 @@ python -m sglang_router.launch_router \
 Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annotation. RBAC must allow `get`, `list`, and `watch` on pods.
 
 ***
+
 ## History and Data Connectors
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1513,6 +1537,7 @@ python -m sglang_router.launch_router \
 Use `--redis-retention-days -1` for persistent storage (default is 30 days).
 
 ***
+
 ## WASM Middleware
 
 The gateway supports WebAssembly (WASM) middleware modules for custom request/response processing. This enables organization-specific logic for authentication, rate limiting, billing, logging, and more—without modifying or recompiling the gateway.
@@ -1693,6 +1718,7 @@ curl -X DELETE http://localhost:30000/wasm/{module_uuid}
 **Note:** Rate limiting state is per-worker thread and not shared across gateway replicas. For production, consider implementing rate limiting at a shared layer (e.g., Redis)
 
 ***
+
 ## Language Bindings
 
 SGLang Model Gateway provides official language bindings for Python and Go, enabling integration with different technology stacks and organizational requirements.
@@ -1717,6 +1743,7 @@ pip install maturin && maturin develop --features vendored-openssl
 The Python bindings are used throughout this documentation. See the [Quick Start](#quick-start) and [Deployment Modes](#deployment-modes) sections for detailed examples.
 
 Key components:
+
 - `RouterArgs` dataclass with 50+ configuration options
 - `Router.from_args()` for programmatic startup
 - CLI commands: `smg launch`, `smg server`, `python -m sglang_router.launch_router`
@@ -1744,6 +1771,7 @@ The Go bindings provide a high-performance gRPC client library for organizations
 ```
 
 **Key Features:**
+
 - Native Rust tokenization via FFI (thread-safe, lock-free)
 - Full streaming support with context cancellation
 - Configurable channel buffer sizes for high concurrency
@@ -1858,6 +1886,7 @@ go test -tags=integration -v ./...
 **When to Use Go:** Building custom client applications, integration with Go microservices, OpenAI-compatible proxy servers
 
 ***
+
 ## Security and Authentication
 
 ### Router API Key
@@ -1963,6 +1992,7 @@ python -m sglang_router.launch_router \
 </table>
 
 **Key Points:**
+
 - Client certificate and key must be provided together
 - Multiple CA certificates can be added with multiple `--ca-cert-path` flags
 - Uses rustls backend when TLS is configured
@@ -1986,6 +2016,7 @@ python -m sglang_router.launch_router \
 ```
 
 ***
+
 ## Observability
 
 ### Prometheus Metrics
@@ -2139,6 +2170,7 @@ Structured tracing with optional file sink. Log levels: `debug`, `info`, `warn`,
 Responses include `x-request-id` header for correlation.
 
 ***
+
 ## Production Recommendations
 
 This section provides guidance for deploying SGLang Model Gateway in production environments.
@@ -2159,6 +2191,7 @@ python -m sglang_router.launch_router \
 ```
 
 **Security Checklist:**
+
 - Enable TLS for gateway HTTPS termination
 - Enable mTLS for worker communication when workers are on untrusted networks
 - Set `--api-key` to protect router endpoints
@@ -2217,6 +2250,7 @@ The gateway supports running multiple replicas behind a load balancer for high a
    - Easier capacity planning
 
 2. **Use Kubernetes Service Discovery**: Let the gateway automatically discover and manage workers:
+
    ```bash Command
    python -m sglang_router.launch_router \
      --service-discovery \
@@ -2233,6 +2267,7 @@ The gateway supports running multiple replicas behind a load balancer for high a
 4. **Configure session affinity (optional)**: If cache efficiency is critical, configure your load balancer for session affinity based on a consistent hash of the request (e.g., user ID or API key).
 
 **Example HA Architecture:**
+
 ```text Output
                     +-------------------+
                     |   Load Balancer   |
@@ -2279,6 +2314,7 @@ python -m sglang_router.launch_router \
 ```
 
 **Performance Benefits of gRPC:**
+
 - Native Rust tokenization (no Python overhead)
 - Streaming with lower latency
 - Built-in reasoning parser execution
@@ -2361,6 +2397,7 @@ spec:
 ```
 
 **Gateway configuration for discovery:**
+
 ```bash Command
 python -m sglang_router.launch_router \
   --service-discovery \
@@ -2388,6 +2425,7 @@ metadata:
 ```
 
 **Gateway configuration for PD discovery:**
+
 ```bash Command
 python -m sglang_router.launch_router \
   --service-discovery \
@@ -2434,6 +2472,7 @@ Configure Prometheus to scrape the gateway metrics endpoint (default: `:29000/me
 **Essential Dashboards:**
 
 **1. Request Rate and Latency:**
+
 ```sql Example
 # Request rate by endpoint
 sum(rate(smg_http_requests_total[5m])) by (path, method)
@@ -2449,6 +2488,7 @@ sum(rate(smg_http_responses_total{status=~"5.."}[5m])) / sum(rate(smg_http_respo
 ```
 
 **2. Worker Health:**
+
 ```sql Example
 # Healthy workers
 sum(smg_worker_pool_size)
@@ -2461,6 +2501,7 @@ sum(rate(smg_worker_health_checks_total{result="failure"}[5m])) by (worker_id)
 ```
 
 **3. Circuit Breaker Status:**
+
 ```sql Example
 # Circuit breaker states (0=closed, 1=open, 2=half-open)
 smg_worker_cb_state
@@ -2473,6 +2514,7 @@ count(smg_worker_cb_state == 1)
 ```
 
 **4. Inference Performance (gRPC mode):**
+
 ```sql Example
 # Time to first token (P50)
 histogram_quantile(0.50, sum(rate(smg_router_ttft_seconds_bucket[5m])) by (le, model))
@@ -2488,6 +2530,7 @@ histogram_quantile(0.95, sum(rate(smg_router_generation_duration_seconds_bucket[
 ```
 
 **5. Rate Limiting and Queuing:**
+
 ```sql Example
 # Rate limit rejections
 sum(rate(smg_http_rate_limit_total{decision="rejected"}[5m]))
@@ -2503,6 +2546,7 @@ sum(rate(smg_worker_retries_exhausted_total[5m]))
 ```
 
 **6. MCP Tool Execution:**
+
 ```sql Example
 # Tool call rate
 sum(rate(smg_mcp_tool_calls_total[5m])) by (server, tool)
@@ -2557,6 +2601,7 @@ groups:
 ```
 
 ***
+
 ## Configuration Reference
 
 ### Core Settings
@@ -2773,6 +2818,7 @@ groups:
 </table>
 
 ***
+
 ## Troubleshooting
 
 ### Workers Never Ready

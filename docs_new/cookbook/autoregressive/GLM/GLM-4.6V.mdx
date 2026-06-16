@@ -67,6 +67,7 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 <GLM46VDeployment />
 
 ### 3.2 Configuration Tips
+
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder` (which the generator above handles automatically).
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
@@ -80,6 +81,7 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
   - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
 
 **Example with full multimodal optimizations:**
+
 ```bash Command
 SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \
@@ -388,10 +390,13 @@ print(response)
 ### 5.1. Text Benchmark: Latency, Throughput and Accuracy
 
 #### Command
+
 ```shell Command
 python3 ./benchmark/gsm8k/bench_sglang.py
 ```
+
 #### Result Output
+
 ```text Output
 Accuracy: 0.925
 Invalid: 0.000
@@ -402,6 +407,7 @@ Output throughput: 1788.375 token/s
 ### 5.2. Multimodal Benchmark - Latency and Throughput
 
 #### Command
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
@@ -417,6 +423,7 @@ python3 -m sglang.bench_serving \
 ```
 
 #### Result Output
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
@@ -456,15 +463,16 @@ Max ITL (ms):                            173.48
 ==================================================
 ```
 
-
 ### 5.3. Multimodal Accuracy Benchmark - MMMU
 
 #### Command
+
 ```shell Command
 python3 benchmark/mmmu/bench_sglang.py --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of_box\|>" --port 30000 --concurrency 64 --extra-request-body '{"max_tokens": 4096}'
 ```
 
 #### Result Output
+
 ```text Output
 Benchmark time: 487.2229107860476
 answers saved to: ./answer_sglang.json

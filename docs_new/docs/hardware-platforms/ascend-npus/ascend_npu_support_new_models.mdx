@@ -64,7 +64,7 @@ Please note all your testing and benchmarking results in PR description.
 
 ### Benchmark
 
-- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow https://docs.sglang.io/developer_guide/benchmark_and_profiling.html to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
+- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow [https://docs.sglang.io/developer_guide/benchmark_and_profiling.html](https://docs.sglang.io/developer_guide/benchmark_and_profiling.html) to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
 - **(Optional) Other evals**: If you ran other evals, please note the results in PR description.
 
 <Tip>
@@ -332,93 +332,93 @@ Using the same Llama wrapper from the previous section, here is how to package a
 
 1. Create your project
 
-```
-sglang_custom_project/
-|----setup.py
-|----custom_llm/
-     |----__init__.py
-     |----llama_wrapper.py
-```
+    ```txt
+    sglang_custom_project/
+    |----setup.py
+    |----custom_llm/
+        |----__init__.py
+        |----llama_wrapper.py
+    ```
 
-Write the `setup.py`:
+    Write the `setup.py`:
 
-```python Example
-# sglang_custom_project/setup.py
+    ```python Example
+    # sglang_custom_project/setup.py
 
-from setuptools import setup, find_packages
-setup(
-    name="sglang-custom-plugins",
-    version="0.1",
-    packages=find_packages(),
-)
-```
+    from setuptools import setup, find_packages
+    setup(
+        name="sglang-custom-plugins",
+        version="0.1",
+        packages=find_packages(),
+    )
+    ```
 
 2. Write your model code
 
-Inside `llama_wrapper.py`, write your model and include `EntryClass`:
+    Inside `llama_wrapper.py`, write your model and include `EntryClass`:
 
-```python Example
-# sglang_custom_project/custom_llm/llama_wrapper.py
+    ```python Example
+    # sglang_custom_project/custom_llm/llama_wrapper.py
 
-import torch
-from typing import Optional
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.llama import LlamaForCausalLM
+    import torch
+    from typing import Optional
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+    from sglang.srt.models.llama import LlamaForCausalLM
 
-class LlamaWrapper(LlamaForCausalLM):
-    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "") -> None:
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-    @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch,
-                pp_proxy_tensors=None, input_embeds=None, get_embedding=False):
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-        res: LogitsProcessorOutput = self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch,
-        )
+    class LlamaWrapper(LlamaForCausalLM):
+        def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
+                    prefix: str = "") -> None:
+            super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        @torch.no_grad()
+        def forward(self, input_ids, positions, forward_batch,
+                    pp_proxy_tensors=None, input_embeds=None, get_embedding=False):
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            res: LogitsProcessorOutput = self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch,
+            )
 
-        orig = res.next_token_logits
-        res.next_token_logits = torch.where(orig > 0, orig.sqrt(), orig)
-        return res
+            orig = res.next_token_logits
+            res.next_token_logits = torch.where(orig > 0, orig.sqrt(), orig)
+            return res
 
-# Don't forget to add EntryClass
-EntryClass = LlamaWrapper
-```
+    # Don't forget to add EntryClass
+    EntryClass = LlamaWrapper
+    ```
 
 3. Install your package
 
-Run this inside your `sglang_custom_project` directory to install your code into the active Python environment:
+    Run this inside your `sglang_custom_project` directory to install your code into the active Python environment:
 
-```bash Command
-pip install -e .
-```
+    ```bash Command
+    pip install -e .
+    ```
 
 4. Update your `config.json`
 
-Update the `config.json` under your HuggingFace model checkpoint directory so the `architectures` field matches your class name:
+    Update the `config.json` under your HuggingFace model checkpoint directory so the `architectures` field matches your class name:
 
-```json Config
-{
-  "architectures": ["LlamaWrapper"],
-  ...
-}
-```
+    ```json Config
+    {
+    "architectures": ["LlamaWrapper"],
+    ...
+    }
+    ```
 
 5. Launch the server
 
-Set the environment variable before running the CLI:
+    Set the environment variable before running the CLI:
 
-```bash Command
-export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_llm
-python -m sglang.launch_server \
-    --model-path /path/to/Llama-3.1-8B-Instruct \
-    --port 8000
-```
+    ```bash Command
+    export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_llm
+    python -m sglang.launch_server \
+        --model-path /path/to/Llama-3.1-8B-Instruct \
+        --port 8000
+    ```
 
 The `SGLANG_EXTERNAL_MODEL_PACKAGE` should be the parent folder name containing your model-related code. In this example, it should be `custom_llm`.
 
@@ -435,7 +435,7 @@ For example, let's build a custom model based on Qwen2-VL-Instruct that takes th
 
 Create the project:
 
-```
+```txt
 sglang_custom_project_vl/
 |----setup.py
 |----custom_vlm/

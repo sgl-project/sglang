@@ -70,7 +70,6 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
   </tbody>
 </table>
 
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -482,12 +481,12 @@ For each concurrency level, configure `num_prompts` to simulate realistic user l
 **Scenario 1: Chat (1K/1K) - Most Important**
 
 - **Model Deployment**
+
 ```bash Command
 python -m sglang.launch_server \
   --model zai-org/GLM-4.7 \
   --tp 8
 ```
-
 
 - Low Concurrency (Latency-Optimized)
 
@@ -504,6 +503,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency (Balanced)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -517,6 +517,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency (Throughput-Optimized)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -546,6 +547,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -559,6 +561,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -574,6 +577,7 @@ python -m sglang.bench_serving \
 **Scenario 3: Summarization (8K/1K)**
 
 - Low Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -587,6 +591,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -600,6 +605,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -940,6 +946,7 @@ Document model accuracy on standard benchmarks:
 #### 5.2.1 GSM8K Benchmark
 
 - Benchmark Command
+
 ```bash Command
 python -m sglang.test.few_shot_gsm8k \
   --num-shots 5 \
@@ -948,6 +955,7 @@ python -m sglang.test.few_shot_gsm8k \
 ```
 
 - Test Result (NVIDIA B200, TP=2 NVFP4)
+
 ```text Output
 Accuracy: 0.946
 Latency: 178.284 s
@@ -955,6 +963,7 @@ Output throughput: 769.204 token/s
 ```
 
 - Test Result (NVIDIA GB200, TP=2 NVFP4)
+
 ```text Output
 Accuracy: 0.951
 Latency: 175.190 s

@@ -21,7 +21,7 @@ The highly capable Llama 4 Maverick with 17B active parameters out of ~400B tota
 The efficient Llama 4 Scout also has 17B active parameters out of ~109B total, using just 16 experts.
 Both models leverage early fusion for native multimodality, enabling them to process text and image inputs. Maverick and Scout are both trained on up to 40 trillion tokens on data encompassing 200 languages (with specific fine-tuning support for 12 languages including Arabic, Spanish, German, and Hindi).
 
-For more details, please refer to the official llama4 Repository:https://www.llama.com/models/llama-4/
+For more details, please refer to the official llama4 Repository:[https://www.llama.com/models/llama-4/](https://www.llama.com/models/llama-4/)
 
 ## 2. SGLang Installation
 
@@ -67,6 +67,7 @@ For basic API usage and request examples, please refer to:
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Launch the docker
+
 ```shell Command
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 ```
@@ -87,6 +88,7 @@ docker run -d -it --ipc=host --network=host --privileged \
 #### 4.2.2 Launch the server
 
 ### Llama-4-Scout
+
 8-GPU deployment command:
 
 ```bash Command
@@ -98,6 +100,7 @@ sglang serve \
 ```
 
 ### Llama-4-Maverick
+
 8-GPU deployment command:
 
 ```bash Command
@@ -124,7 +127,9 @@ python3 -m sglang.launch_server \
 ```
 
 ## 5. Benchmark
+
 ### 5.1 Speed Benchmark (Scout)
+
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -136,6 +141,7 @@ Tensor Parallelism: 8
 sglang version: 0.5.9
 
 - **Model Deployment**
+
 ```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
@@ -145,7 +151,9 @@ sglang serve \
 ```
 
 ### 5.1.1 Low Concurrency (Latency-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -159,6 +167,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -197,8 +206,11 @@ P99 ITL (ms):                            7.52
 Max ITL (ms):                            10.44
 ==================================================
 ```
+
 ### 5.1.2 Medium Concurrency (Balanced)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -210,7 +222,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -249,8 +263,11 @@ P99 ITL (ms):                            67.88
 Max ITL (ms):                            74.05
 ==================================================
 ```
+
 ### 5.1.3 High Concurrency (Throughput-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -262,7 +279,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 100 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -303,6 +322,7 @@ Max ITL (ms):                            226.06
 ```
 
 ### 5.2 Speed Benchmark (Maverick)
+
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -314,6 +334,7 @@ Tensor Parallelism: 8
 sglang version: 0.5.9
 
 - **Model Deployment**
+
 ```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
@@ -323,7 +344,9 @@ sglang serve \
 ```
 
 ### 5.2.1 Low Concurrency (Latency-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -335,7 +358,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 1 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -374,8 +399,11 @@ P99 ITL (ms):                            6.08
 Max ITL (ms):                            7.02
 ==================================================
 ```
+
 ### 5.2.2 Medium Concurrency (Balanced)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -387,7 +415,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -426,8 +456,11 @@ P99 ITL (ms):                            55.62
 Max ITL (ms):                            868.54
 ==================================================
 ```
+
 ### 5.2.3 High Concurrency (Throughput-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -439,7 +472,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 100 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -478,6 +513,7 @@ P99 ITL (ms):                            78.82
 Max ITL (ms):                            268.17
 ==================================================
 ```
+
 ### 5.3 Accuracy Benchmark
 
 #### 5.3.1 GSM8K Benchmark
@@ -487,14 +523,18 @@ Max ITL (ms):                            268.17
 ```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
+
  - Llama-4-Scout-17B-16E-Instruct
+
 ```text Output
 Accuracy: 0.945
 Invalid: 0.000
 Latency: 12.731 s
 Output throughput: 1595.418 token/s
 ```
+
  - Llama-4-Maverick-17B-128E-Instruct
+ 
 ```text Output
 Accuracy: 0.895
 Invalid: 0.000

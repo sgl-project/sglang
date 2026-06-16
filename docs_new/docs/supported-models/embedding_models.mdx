@@ -37,7 +37,6 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
 
-
 ## Multimodal Embedding Example
 
 For multimodal models like GME that support both text and images:
@@ -113,7 +112,6 @@ payload = {
 response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
-
 
 ## Supported Models
 

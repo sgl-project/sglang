@@ -19,11 +19,7 @@ If no backend is specified, XGrammar will be used as the default.
 
 For better output quality, **It's advisable to explicitly include instructions in the prompt to guide the model to generate the desired format.** For example, you can specify, 'Please generate the output in the following JSON format: ...'.
 
-
-
 ## OpenAI Compatible API
-
-
 
 ```python Example
 import openai
@@ -47,10 +43,7 @@ client = openai.Client(base_url=f"http://127.0.0.1:{port}/v1", api_key="None")
 
 you can directly define a JSON schema or use [Pydantic](https://docs.pydantic.dev/latest/) to define and validate the response.
 
-
 **Using Pydantic**
-
-
 
 ```python Example
 from pydantic import BaseModel, Field
@@ -90,9 +83,6 @@ print_highlight(f"Validated response: {capital_info.model_dump_json()}")
 
 **JSON Schema Directly**
 
-
-
-
 ```python Example
 import json
 
@@ -128,8 +118,6 @@ print_highlight(response.choices[0].message.content)
 
 ### EBNF
 
-
-
 ```python Example
 ebnf_grammar = """
 root ::= city | description
@@ -158,8 +146,6 @@ print_highlight(response.choices[0].message.content)
 
 ### Regular expression
 
-
-
 ```python Example
 response = client.chat.completions.create(
     model="meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -175,8 +161,6 @@ print_highlight(response.choices[0].message.content)
 ```
 
 ### Structural Tag
-
-
 
 ```python Example
 tool_get_current_weather = {
@@ -291,7 +275,6 @@ response = client.chat.completions.create(
 print_highlight(response.choices[0].message.content)
 ```
 
-
 ```python Example
 # Support for XGrammar latest structural tag format
 # https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html
@@ -333,13 +316,9 @@ print_highlight(response.choices[0].message.content)
 
 ## Native API and SGLang Runtime (SRT)
 
-
 ### JSON
 
-
 **Using Pydantic**
-
-
 
 ```python Example
 import requests
@@ -389,8 +368,6 @@ print_highlight(f"Validated response: {capital_info.model_dump_json()}")
 
 **JSON Schema Directly**
 
-
-
 ```python Example
 json_schema = json.dumps(
     {
@@ -420,8 +397,6 @@ print_highlight(response.json())
 ```
 
 ### EBNF
-
-
 
 ```python Example
 messages = [
@@ -459,8 +434,6 @@ print_highlight(response.json())
 
 ### Regular expression
 
-
-
 ```python Example
 messages = [
     {
@@ -486,8 +459,6 @@ print_highlight(response.json())
 ```
 
 ### Structural Tag
-
-
 
 ```python Example
 from transformers import AutoTokenizer
@@ -527,7 +498,6 @@ payload = {
 response = requests.post(f"http://localhost:{port}/generate", json=payload)
 print_highlight(response.json())
 ```
-
 
 ```python Example
 # Support for XGrammar latest structural tag format
@@ -574,14 +544,11 @@ response = requests.post(f"http://localhost:{port}/generate", json=payload)
 print_highlight(response.json())
 ```
 
-
 ```python Example
 terminate_process(server_process)
 ```
 
 ## Offline Engine API
-
-
 
 ```python Example
 import sglang as sgl
@@ -593,10 +560,7 @@ llm = sgl.Engine(
 
 ### JSON
 
-
 **Using Pydantic**
-
-
 
 ```python Example
 import json
@@ -632,8 +596,6 @@ for prompt, output in zip(prompts, outputs):
 
 **JSON Schema Directly**
 
-
-
 ```python Example
 prompts = [
     "Give me the information of the capital of China in the JSON format.",
@@ -662,9 +624,6 @@ for prompt, output in zip(prompts, outputs):
 
 ### EBNF
 
-
-
-
 ```python Example
 prompts = [
     "Give me the information of the capital of France.",
@@ -692,8 +651,6 @@ for prompt, output in zip(prompts, outputs):
 
 ### Regular expression
 
-
-
 ```python Example
 prompts = [
     "Please provide information about London as a major global city:",
@@ -709,8 +666,6 @@ for prompt, output in zip(prompts, outputs):
 ```
 
 ### Structural Tag
-
-
 
 ```python Example
 text = tokenizer.apply_chat_template(
@@ -749,7 +704,6 @@ for prompt, output in zip(prompts, outputs):
     print_highlight("===============================")
     print_highlight(f"Prompt: {prompt}\nGenerated text: {output['text']}")
 ```
-
 
 ```python Example
 # Support for XGrammar latest structural tag format
@@ -796,7 +750,6 @@ for prompt, output in zip(prompts, outputs):
     print_highlight("===============================")
     print_highlight(f"Prompt: {prompt}\nGenerated text: {output['text']}")
 ```
-
 
 ```python Example
 llm.shutdown()

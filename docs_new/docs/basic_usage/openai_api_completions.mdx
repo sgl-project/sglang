@@ -118,6 +118,7 @@ Some models support internal reasoning or thinking processes that can be exposed
 #### Basic Usage
 
 To enable reasoning output, you need to:
+
 1. Launch the server with the appropriate reasoning parser
 2. Set the model-specific parameter in `chat_template_kwargs`
 3. Optionally use `separate_reasoning: False` to not get reasoning content separately (default to `True`)
@@ -157,6 +158,7 @@ print("Answer:", response.choices[0].message.content)
 ```
 
 **ExampleOutput:**
+
 ```text Output
 Reasoning: Okay, so the user is asking how many 'r's are in the word 'strawberry'. Let me think. First, I need to make sure I have the word spelled correctly. Strawberry... S-T-R-A-W-B-E-R-R-Y. Wait, is that right? Let me break it down.
 
@@ -175,6 +177,7 @@ Thus, the total count is **3**.
 
 **Answer:** 3.
 ```
+
 <Note>
 Setting `"enable_thinking": False` (or omitting it) will result in `reasoning_content` being `None`. Qwen3-Thinking models always generate reasoning content and don't support the `enable_thinking` parameter.
 </Note>
@@ -208,6 +211,7 @@ print(f"Token IDs for '{word}': {token_ids}")
 # For SGLang models, you can access the tokenizer through the client
 # and get token IDs for bias
 ```
+
 <Tip>
 **Important:** The `logit_bias` parameter uses token IDs as string keys, not the actual words.
 </Tip>
@@ -245,6 +249,7 @@ print("Answer:", response.choices[0].message.content)
 ```
 
 **Example Output:**
+
 ```text Output
 Reasoning: First, the question is: "How many r's are in 'strawberry'?"
 
@@ -265,6 +270,7 @@ Answer: The word "strawberry" contains **3** instances of the letter "r". Here's
 - The word is spelled: S-T-R-A-W-B-E-R-R-Y
 - The "r" appears at the 3rd, 8th, and 9th positions.
 ```
+
 <Note>
 DeepSeek-V3 models use the `thinking` parameter (not `enable_thinking`) to control reasoning output.
 </Note>
@@ -366,6 +372,7 @@ print_highlight(f"Response with logit bias: {response.choices[0].text}")
 ## Completions
 
 ### Usage
+
 Completions API is similar to Chat Completions API, but without the `messages` parameter or chat templates.
 
 ```python Example
@@ -417,6 +424,7 @@ For OpenAI compatible structured outputs API, refer to [Structured Outputs](../a
 SGLang supports LoRA (Low-Rank Adaptation) adapters with OpenAI-compatible APIs. You can specify which adapter to use directly in the `model` parameter using the `base-model:adapter-name` syntax.
 
 **Server Setup:**
+
 ```bash Command
 python -m sglang.launch_server \
     --model-path qwen/qwen2.5-0.5b-instruct \
@@ -429,6 +437,7 @@ For more details on LoRA serving configuration, see the [LoRA documentation](../
 **API Call:**
 
 (Recommended) Use the `model:adapter` syntax to specify which adapter to use:
+
 ```python Example
 response = client.chat.completions.create(
     model="qwen/qwen2.5-0.5b-instruct:adapter_a",  # ← base-model:adapter-name
@@ -440,6 +449,7 @@ response = client.chat.completions.create(
 **Backward Compatible: Using `extra_body`**
 
 The old `extra_body` method is still supported for backward compatibility:
+
 ```python Example
 # Backward compatible method
 response = client.chat.completions.create(
@@ -449,6 +459,7 @@ response = client.chat.completions.create(
     max_tokens=50,
 )
 ```
+
 **Note:** When both `model:adapter` and `extra_body["lora_path"]` are specified, the `model:adapter` syntax takes precedence.
 
 ```python Example

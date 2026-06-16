@@ -106,6 +106,7 @@ Suitable for targeted debugging (e.g., only collect statistics data for specific
 reconstruction + numerical comparison) and root cause analysis via **problem vs. benchmark comparison**.
 
 #### Step 1: Enable
+
 ##### Prepare Custom Configuration JSON
 
 Create `msprobe-config.json` (dump statistics data for rank0/1, step0/1, mix level):
@@ -146,7 +147,9 @@ python3 -m sglang.launch_server \
  --port 1027 \
  --msprobe-dump-config /home/msprobe-config.json
 ```
+
 #### Step 2: Collect Data
+
 ##### Collect Dump Data for Problem & Benchmark Sides
 
 Send normal inference requests to trigger model running (MSProbe automatically collects data during request processing):
@@ -185,6 +188,7 @@ Dump files are saved to `./problem_dump` and `./bench_dump` you defined and incl
 - `construct.json`: hierarchical structure description, required for visualization, its content is not empty.
 
 #### Step 3: Visualize
+
 ##### Visualize Problem vs. Benchmark Comparison (Multi-Rank)
 
 Generate a multi-rank comparison visualization file (mix level generates `construct.json` for graph reconstruction):
@@ -210,13 +214,17 @@ The dumped data can be used to visualize and analyze differences using tables or
 ##### Launch TensorBoard
 
 Start TensorBoard:
+
 ```bash
 tensorboard --logdir ./graph_output --bind_all --port 6006
 ```
+
 #### Step 4: Analyze Root Cause
+
 ##### Locate Root Cause
 
 Root Cause Analysis in TensorBoard:
+
 - Divergent nodes (with accuracy/numerical differences) are highlighted in **red** (darker red = larger difference).
 - Click on divergent nodes to view detailed tensor data (inputs/outputs, parameters) and API/module call stacks.
 - Use the **search/filter** function to quickly locate key layers/APIs (e.g., "relu", "conv").

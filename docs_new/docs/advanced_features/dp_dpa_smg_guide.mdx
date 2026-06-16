@@ -305,27 +305,27 @@ For distributed deployments across multiple machines:
 
 1. Launch workers on each node
 
-```bash
-# Node 1
-python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --port 8000
+    ```bash
+    # Node 1
+    python -m sglang.launch_server \
+        --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+        --port 8000
 
-# Node 2
-python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --port 8000
-```
+    # Node 2
+    python -m sglang.launch_server \
+        --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+        --port 8000
+    ```
 
 2. Launch SMG pointing to workers
 
-```bash
-python -m sglang_router.launch_router \
-    --worker-urls http://node1:8000 http://node2:8000 \
-    --policy cache_aware \
-    --host 0.0.0.0 \
-    --port 30000
-```
+    ```bash
+    python -m sglang_router.launch_router \
+        --worker-urls http://node1:8000 http://node2:8000 \
+        --policy cache_aware \
+        --host 0.0.0.0 \
+        --port 30000
+    ```
 
 **Option C: Dynamic Worker Registration**
 
@@ -499,11 +499,13 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
 </table>
 
 **Recommended production setup for DeepSeek:**
+
 1. Enable **DPA** for attention layers (`--dp-size 8 --enable-dp-attention`)
 2. Enable **EP** for MoE layers (`--ep 8 --moe-a2a-backend deepep`)
 3. Use **SMG** with **cache_aware** policy
 
 **Related documentation:**
+
 - [Expert Parallelism](./expert_parallelism) - DeepEP, Two-Batch Overlap, EPLB
 - [SGLang Model Gateway Documentation](./sgl_model_gateway) - SMG configuration & troubleshooting
 - [Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/) - 96 GPU deployment guide

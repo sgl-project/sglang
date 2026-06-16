@@ -120,6 +120,7 @@ A black SUV drives past a Chinese-style gate with a red stop sign and traditiona
 ### 4.2 High-Resolution / Sliced Images
 
 The image processor automatically picks a slice grid (up to 9 tiles) for high-resolution inputs. A 1280×720 source produces grid `[2, 3]`
+
 + 7 patches with `tgt_sizes=[(24, 44), 6×(28, 36)]`, byte-for-byte matching the HF reference implementation.
 
 ```python Example
@@ -246,7 +247,6 @@ Pass `--tool-call-parser qwen3_coder` to the server (toggle "Tool Call Parser" o
 Do **not** use `--tool-call-parser qwen` for MiniCPM-V 4.6 — that parser expects the older Qwen2.5 JSON format `<tool_call>{"name":..., "arguments":...}</tool_call>`, but both public 4.6 variants emit the Qwen3.5-style XML format with nested `<function=…>` and `<parameter=…>` tags. With `qwen` the outer `<tool_call>` markers match but the inner JSON parse fails, so `tool_calls` returns empty and the raw markup is left in `content`.
 </Warning>
 
-
 ```python Example
 from openai import OpenAI
 
@@ -326,7 +326,7 @@ python3 benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 48 --max-new-t
 
 - Test Result
 
-```
+```text
 {'Accounting': {'acc': 0.767, 'num': 30},
  'Agriculture': {'acc': 0.533, 'num': 30},
  'Architecture_and_Engineering': {'acc': 0.4, 'num': 30},

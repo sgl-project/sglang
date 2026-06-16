@@ -6,6 +6,7 @@ metatags:
 ## Why Deterministic Inference Matters
 
 Deterministic inference ensures consistent LLM outputs across runs, which is critical for:
+
 - **Reinforcement Learning**: Ensures consistent logprobs across runs, reducing stochastic noise and making RL training more stable, reproducible, and debuggable.
 - **Testing & Debugging**: Enables reproducible validation
 - **Production**: Improves reliability and user experience
@@ -15,7 +16,6 @@ Even with `temperature=0`, standard LLM inference can produce different outputs 
 ## The Root Cause of Non-Determinism
 
 The main source is **varying batch sizes**. Different batch sizes cause GPU kernels to split reduction operations differently, leading to different addition orders. Due to floating-point non-associativity (`(a + b) + c ≠ a + (b + c)`), this produces different results even for identical inputs.
-
 
 ## SGLang's Solution
 
@@ -114,6 +114,7 @@ python3 -m sglang.launch_server \
 ### Example Configurations
 
 #### Qwen3-8B
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
@@ -122,6 +123,7 @@ python3 -m sglang.launch_server \
 ```
 
 #### Llama Models
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -130,6 +132,7 @@ python3 -m sglang.launch_server \
 ```
 
 #### Qwen3-30B-A3B (MoE Model)
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-30B-A3B \
@@ -192,10 +195,10 @@ for seed in sampling_seeds:
 ```
 
 This approach ensures that:
+
 - Different seeds produce diverse responses
 - The same seed always produces the same response across different runs
 - Results are reproducible for debugging and evaluation
-
 
 ## Verification
 

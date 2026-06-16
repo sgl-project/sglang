@@ -41,7 +41,7 @@ import { MOVADeployment } from '/src/snippets/diffusion/mova-deployment.jsx'
 
 ### 3.2 Configuration Tips
 
-Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+Current supported optimization all listed [herein](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
 
 - `--num-gpus`: Number of GPUs to use
 - `--tp`: Tensor parallelism size (should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
@@ -227,6 +227,7 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 ```
 
 **Result**:
+
 ```text Output
 ================= Serving Benchmark Result =================
 Task:                                    image-to-video

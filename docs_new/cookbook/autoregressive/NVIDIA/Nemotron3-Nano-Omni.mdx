@@ -28,11 +28,13 @@ Architecture and key features:
 **Supported GPUs:** NVIDIA B200, H100, H200, A100, L40S, DGX Spark, RTX 6000
 
 Available model variants on HuggingFace:
+
 - [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16)
 - [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8)
 - [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
 
 **Agentic workloads this model enables:**
+
 - **Computer Use Agent:** Perception loop for agents navigating GUIs — reads screens, understands UI state over time, validates outcomes. Collapses vision and reasoning into a single loop.
 - **Document Intelligence:** Interprets documents, charts, tables, screenshots, and mixed media inputs for enterprise analysis and compliance workflows.
 - **Audio & Video Understanding Agents:** Maintains continuous audio-video context for customer service, research, and monitoring workflows, tying what was said, shown, and documented into a single reasoning stream.
@@ -125,6 +127,7 @@ print(resp.choices[0].message.reasoning_content, resp.choices[0].message.content
 ```
 
 Output:
+
 ```text Output
 Reasoning: SGLang is a serving framework I know from my training data. Let me recall the key features...
 
@@ -366,6 +369,7 @@ print(f"Content:\n{resp.choices[0].message.content}")
 ```
 
 Output:
+
 ```text Output
 Reasoning on
 Reasoning:
@@ -430,6 +434,7 @@ print(completion.choices[0].message.tool_calls)
 ```
 
 Output:
+
 ```text Output
 The user is asking about weather in Santa Clara, CA. I have a get_weather function that takes a location and optional unit. I should call it with location="Santa Clara, CA".
 
@@ -475,6 +480,7 @@ Nemotron 3 Nano Omni achieves **9x higher throughput** than other open omni mode
 ### 5.2 Speed Benchmark
 
 **Test Environment:**
+
 - Hardware: B200 (8×)
 - Model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
 - Tensor Parallelism: 4
@@ -553,12 +559,14 @@ Max ITL (ms):                            2171.93
 ### 5.3 Accuracy Benchmark
 
 **Environment**
+
 - Hardware: B200 (8×)
 - Model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
 - Tensor Parallelism: 4
 - SGLang Version: main branch
 
 **Launch Model**
+
 ```shell Command
 sglang serve \
   --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
@@ -571,11 +579,13 @@ sglang serve \
 #### 5.3.1 GSM8K Benchmark
 
 **Run Benchmark**
+
 ```shell Command
 python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 
 **Test Results:**
+
 ```text Output
 Accuracy: 0.830
 Invalid: 0.000
@@ -586,11 +596,13 @@ Output throughput: 1611.623 token/s
 #### 5.3.2 MMLU Benchmark
 
 **Run Benchmark**
+
 ```shell Command
 python3 benchmark/mmlu/bench_sglang.py --port 30000
 ```
 
 **Test Results:**
+
 ```text Output
 subject: abstract_algebra, #q:100, acc: 0.510
 subject: anatomy, #q:135, acc: 0.711

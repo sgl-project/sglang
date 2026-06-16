@@ -101,7 +101,9 @@ curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
 ```
+
 Output:
+
 ```json Config
 {
   "id": "e82af153da844ee6aed7a27a3187f2f4",
@@ -161,7 +163,9 @@ curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
     "tool_choice": "auto"
   }'
 ```
+
 Output:
+
 ```json Config
 {
   "id": "b968e45c7d414f7482c8ffc0f9c6b688",
@@ -207,11 +211,13 @@ Output:
 ### GSM8K
 
 - Benchmark Command
+
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py
 ```
 
 - Test Result
+
 ```text Output
 Accuracy: 0.960
 Invalid: 0.000

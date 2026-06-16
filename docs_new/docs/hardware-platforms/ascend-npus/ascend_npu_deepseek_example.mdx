@@ -10,9 +10,9 @@ metatags:
 If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
-### Running DeepSeek in PD mixed mode on 1 x Atlas 800I A3.
+### Running DeepSeek in PD mixed mode on 1 x Atlas 800I A3
 
-W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
+W4A8 Model weights could be found [herein](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
 
 ```shell Launch Server
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -55,58 +55,58 @@ python3 -m sglang.launch_server \
     --dtype bfloat16
 ```
 
-### Running DeepSeek with PD disaggregation mode on 2 x Atlas 800I A3.
+### Running DeepSeek with PD disaggregation mode on 2 x Atlas 800I A3
 
-W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
+W4A8 Model weights could be found [herein](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
 
 1. Prefill:
 
-```bash Command
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export STREAMS_PER_DEVICE=32
+    ```bash Command
+    export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+    export STREAMS_PER_DEVICE=32
 
-#memfabric config store
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
+    #memfabric config store
+    export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
-#Deepep communication settings
-export HCCL_BUFFSIZE=1536
+    #Deepep communication settings
+    export HCCL_BUFFSIZE=1536
 
-#npu acceleration operator
-export SGLANG_NPU_USE_MLAPO=1
-export SGLANG_USE_FIA_NZ=1
-export TASK_QUEUE_ENABLE=2
+    #npu acceleration operator
+    export SGLANG_NPU_USE_MLAPO=1
+    export SGLANG_USE_FIA_NZ=1
+    export TASK_QUEUE_ENABLE=2
 
-python -m sglang.launch_server \
-    --model-path ${MODEL_PATH} \
-    --host $PREFILL_HOST_IP \
-    --port 8000 \
-    --disaggregation-mode prefill \
-    --disaggregation-bootstrap-port 8996 \
-    --disaggregation-transfer-backend ascend \
-    --trust-remote-code \
-    --nnodes 1 \
-    --node-rank 0 \
-    --tp-size 16 \
-    --mem-fraction-static 0.6 \
-    --attention-backend ascend \
-    --device npu \
-    --load-balance-method round_robin \
-    --max-running-requests 8 \
-    --context-length 8192 \
-    --disable-radix-cache \
-    --chunked-prefill-size -1 \
-    --max-prefill-tokens 28680 \
-    --moe-a2a-backend deepep \
-    --deepep-mode normal \
-    --speculative-algorithm NEXTN \
-    --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4 \
-    --dp-size 2 \
-    --enable-dp-attention \
-    --disable-shared-experts-fusion \
-    --dtype bfloat16
-```
+    python -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --host $PREFILL_HOST_IP \
+        --port 8000 \
+        --disaggregation-mode prefill \
+        --disaggregation-bootstrap-port 8996 \
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --nnodes 1 \
+        --node-rank 0 \
+        --tp-size 16 \
+        --mem-fraction-static 0.6 \
+        --attention-backend ascend \
+        --device npu \
+        --load-balance-method round_robin \
+        --max-running-requests 8 \
+        --context-length 8192 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 28680 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --dp-size 2 \
+        --enable-dp-attention \
+        --disable-shared-experts-fusion \
+        --dtype bfloat16
+    ```
 
 2. Decode:
 
@@ -163,19 +163,19 @@ python -m sglang.launch_server \
 
 3. SGLang Model Gateway (former Router)
 
-```bash Command
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8996 \
-    --decode http://<DECODE_HOST_IP>:8001 \
-    --host 127.0.0.1 \
-    --port 6688
-```
+    ```bash Command
+    python -m sglang_router.launch_router \
+        --pd-disaggregation \
+        --policy cache_aware \
+        --prefill http://<PREFILL_HOST_IP>:8000 8996 \
+        --decode http://<DECODE_HOST_IP>:8001 \
+        --host 127.0.0.1 \
+        --port 6688
+    ```
 
-### Running DeepSeek with PD disaggregation on 4 x Atlas 800I A3.
+### Running DeepSeek with PD disaggregation on 4 x Atlas 800I A3
 
-W8A8 Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
+W8A8 Model weights could be found [herein](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
 
 1. Prefill & Decode:
 
@@ -260,17 +260,17 @@ done
 
 2. SGLang Model Gateway (former Router):
 
-```bash Command
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
-```
+    ```bash Command
+    python -m sglang_router.launch_router \
+        --pd-disaggregation \
+        --policy cache_aware \
+        --prefill http://P_IP:8000 8998 \
+        --prefill http://P_IP:8000 8999 \
+        --decode http://D_IP:8001 \
+        --host 127.0.0.1 \
+        --port 6688 \
+        --mini-lb
+    ```
 
 ## Testing the Service
 

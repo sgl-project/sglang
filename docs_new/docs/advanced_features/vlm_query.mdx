@@ -14,17 +14,20 @@ This tutorial demonstrates how to use SGLang's **offline Engine API** to query V
 SGLang supports three ways to pass visual data, each optimized for different scenarios:
 
 ### 1. **Raw Images** - Simplest approach
+
 - Pass PIL Images, file paths, URLs, or base64 strings directly
 - SGLang handles all preprocessing automatically
 - Best for: Quick prototyping, simple applications
 
 ### 2. **Processor Output** - For custom preprocessing
+
 - Pre-process images with HuggingFace processor
 - Pass the complete processor output dict with `format: "processor_output"`
 - Best for: Custom image transformations, integration with existing pipelines
 - Requirement: Must use `input_ids` instead of text prompt
 
 ### 3. **Precomputed Embeddings** - For maximum performance
+
 - Pre-calculate visual embeddings using the vision encoder
 - Pass embeddings with `format: "precomputed_embedding"`
 - Best for: Repeated queries on same images, caching, high-throughput serving

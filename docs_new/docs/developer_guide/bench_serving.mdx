@@ -103,53 +103,53 @@ SPEED-Bench flags (for `speed-bench`):
 
 1. To benchmark image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
 
-```bash Command
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disable-radix-cache
-```
+    ```bash Command
+    python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disable-radix-cache
+    ```
 
-```bash Command
-python -m sglang.bench_serving \
-    --backend sglang-oai-chat \
-    --dataset-name image \
-    --num-prompts 500 \
-    --image-count 3 \
-    --image-resolution 720p \
-    --random-input-len 512 \
-    --random-output-len 512
-```
+    ```bash Command
+    python -m sglang.bench_serving \
+        --backend sglang-oai-chat \
+        --dataset-name image \
+        --num-prompts 500 \
+        --image-count 3 \
+        --image-resolution 720p \
+        --random-input-len 512 \
+        --random-output-len 512
+    ```
 
 2. To benchmark random dataset with 3000 prompts, 1024 input length, and 1024 output length, you can run:
 
-```bash Command
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-3B-Instruct
-```
+    ```bash Command
+    python -m sglang.launch_server --model-path Qwen/Qwen2.5-3B-Instruct
+    ```
 
-```bash Command
-python3 -m sglang.bench_serving \
-    --backend sglang \
-    --dataset-name random \
-    --num-prompts 3000 \
-    --random-input 1024 \
-    --random-output 1024 \
-    --random-range-ratio 0.5
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --backend sglang \
+        --dataset-name random \
+        --num-prompts 3000 \
+        --random-input 1024 \
+        --random-output 1024 \
+        --random-range-ratio 0.5
+    ```
 
 3. To benchmark speculative decoding throughput using SPEED-Bench (mixed-entropy category, 1K ISL), you can run:
 
-```bash Command
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --speculative-algorithm EAGLE --speculative-draft-model-path <draft-model-path>
-```
+    ```bash Command
+    python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --speculative-algorithm EAGLE --speculative-draft-model-path <draft-model-path>
+    ```
 
-```bash Command
-python3 -m sglang.bench_serving \
-    --backend sglang \
-    --dataset-name speed-bench \
-    --dataset-path /path/to/throughput_1k.jsonl \
-    --speed-bench-category mixed \
-    --speed-bench-output-len 512 \
-    --num-prompts 512
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --backend sglang \
+        --dataset-name speed-bench \
+        --dataset-path /path/to/throughput_1k.jsonl \
+        --speed-bench-category mixed \
+        --speed-bench-output-len 512 \
+        --num-prompts 512
+    ```
 
 ### Choosing model and tokenizer
 
@@ -221,209 +221,209 @@ With `--output-details`, an extended object also includes arrays:
 
 ### End-to-end examples
 
-1) sglang native `/generate` (streaming):
+1. sglang native `/generate` (streaming):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name random \
-  --random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.5 \
-  --num-prompts 2000 \
-  --request-rate 100 \
-  --max-concurrency 512 \
-  --output-file sglang_random.jsonl --output-details
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name random \
+      --random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.5 \
+      --num-prompts 2000 \
+      --request-rate 100 \
+      --max-concurrency 512 \
+      --output-file sglang_random.jsonl --output-details
+    ```
 
-2) OpenAI-compatible Completions (e.g., vLLM):
+2. OpenAI-compatible Completions (e.g., vLLM):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend vllm \
-  --base-url http://127.0.0.1:8000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name sharegpt \
-  --num-prompts 1000 \
-  --sharegpt-output-len 256
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend vllm \
+      --base-url http://127.0.0.1:8000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name sharegpt \
+      --num-prompts 1000 \
+      --sharegpt-output-len 256
+    ```
 
-3) OpenAI-compatible Chat Completions (streaming):
+3. OpenAI-compatible Chat Completions (streaming):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend vllm-chat \
-  --base-url http://127.0.0.1:8000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name random \
-  --num-prompts 500 \
-  --apply-chat-template
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend vllm-chat \
+      --base-url http://127.0.0.1:8000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name random \
+      --num-prompts 500 \
+      --apply-chat-template
+    ```
 
-4) Images (VLM) with chat template:
+4. Images (VLM) with chat template:
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model your-vlm-model \
-  --dataset-name image \
-  --image-count 2 \
-  --image-resolution 720p \
-  --random-input-len 128 --random-output-len 256 \
-  --num-prompts 200 \
-  --apply-chat-template
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model your-vlm-model \
+      --dataset-name image \
+      --image-count 2 \
+      --image-resolution 720p \
+      --random-input-len 128 --random-output-len 256 \
+      --num-prompts 200 \
+      --apply-chat-template
+    ```
 
-4a) Images with custom resolution:
+    4a. Images with custom resolution:
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model your-vlm-model \
-  --dataset-name image \
-  --image-count 1 \
-  --image-resolution 512x768 \
-  --random-input-len 64 --random-output-len 128 \
-  --num-prompts 100 \
-  --apply-chat-template
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model your-vlm-model \
+      --dataset-name image \
+      --image-count 1 \
+      --image-resolution 512x768 \
+      --random-input-len 64 --random-output-len 128 \
+      --num-prompts 100 \
+      --apply-chat-template
+    ```
 
-4b) 1080p images with PNG format and blank content:
+    4b. 1080p images with PNG format and blank content:
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model your-vlm-model \
-  --dataset-name image \
-  --image-count 1 \
-  --image-resolution 1080p \
-  --image-format png \
-  --image-content blank \
-  --random-input-len 64 --random-output-len 128 \
-  --num-prompts 100 \
-  --apply-chat-template
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model your-vlm-model \
+      --dataset-name image \
+      --image-count 1 \
+      --image-resolution 1080p \
+      --image-format png \
+      --image-content blank \
+      --random-input-len 64 --random-output-len 128 \
+      --num-prompts 100 \
+      --apply-chat-template
+    ```
 
-5) Generated shared prefix (long system prompts + short questions):
+5. Generated shared prefix (long system prompts + short questions):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name generated-shared-prefix \
-  --gsp-num-groups 64 --gsp-prompts-per-group 16 \
-  --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
-  --num-prompts 1024
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name generated-shared-prefix \
+      --gsp-num-groups 64 --gsp-prompts-per-group 16 \
+      --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
+      --num-prompts 1024
+    ```
 
-Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
+    Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name generated-shared-prefix \
-  --gsp-num-groups 64 --gsp-prompts-per-group 16 \
-  --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
-  --gsp-group-distribution zipf --gsp-zipf-alpha 1.2 \
-  --seed 42
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name generated-shared-prefix \
+      --gsp-num-groups 64 --gsp-prompts-per-group 16 \
+      --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
+      --gsp-group-distribution zipf --gsp-zipf-alpha 1.2 \
+      --seed 42
+    ```
 
-`zipf` mode samples each request's prefix group from the rank-based distribution `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)` with rank starting at 1, so group index 0 is the hottest. The total request count stays `num_groups * prompts_per_group` — identical to `uniform` mode — and only the per-request group assignment changes. `alpha` must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups.
+    `zipf` mode samples each request's prefix group from the rank-based distribution `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)` with rank starting at 1, so group index 0 is the hottest. The total request count stays `num_groups * prompts_per_group` — identical to `uniform` mode — and only the per-request group assignment changes. `alpha` must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups.
 
-The on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` includes `group_distribution` and `zipf_alpha` in its key, so uniform-mode and zipf-mode runs (or two zipf runs with different alpha) never share a cache file. Uniform-mode filenames are unchanged from the legacy format, so existing caches remain valid.
+    The on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` includes `group_distribution` and `zipf_alpha` in its key, so uniform-mode and zipf-mode runs (or two zipf runs with different alpha) never share a cache file. Uniform-mode filenames are unchanged from the legacy format, so existing caches remain valid.
 
-This flag controls prefix-popularity shape only. It does not by itself reproduce any production trace or guarantee an observed cache-hit rate for a given engine.
+    This flag controls prefix-popularity shape only. It does not by itself reproduce any production trace or guarantee an observed cache-hit rate for a given engine.
 
-6) Tokenized prompts (ids) for strict length control (sglang only):
+6. Tokenized prompts (ids) for strict length control (sglang only):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name random \
-  --tokenize-prompt \
-  --random-input-len 2048 --random-output-len 256 --random-range-ratio 0.2
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name random \
+      --tokenize-prompt \
+      --random-input-len 2048 --random-output-len 256 --random-range-ratio 0.2
+    ```
 
-7) Profiling and cache flush (sglang):
+7. Profiling and cache flush (sglang):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --profile \
-  --flush-cache
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --profile \
+      --flush-cache
+    ```
 
-8) TensorRT-LLM streaming endpoint:
+8. TensorRT-LLM streaming endpoint:
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend trt \
-  --base-url http://127.0.0.1:8000 \
-  --model your-trt-llm-model \
-  --dataset-name random \
-  --num-prompts 100 \
-  --disable-ignore-eos
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend trt \
+      --base-url http://127.0.0.1:8000 \
+      --model your-trt-llm-model \
+      --dataset-name random \
+      --num-prompts 100 \
+      --disable-ignore-eos
+    ```
 
-9) Evaluating large-scale KVCache sharing with mooncake trace (sglang only):
+9. Evaluating large-scale KVCache sharing with mooncake trace (sglang only):
 
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30000 \
-  --model model-name \
-  --dataset-name mooncake \
-  --mooncake-slowdown-factor 1.0 \
-  --mooncake-num-rounds 1000 \
-  --mooncake-workload conversation|mooncake|agent|synthetic
-  --use-trace-timestamps true \
-  --random-output-len 256
-```
+    ```bash Command
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30000 \
+      --model model-name \
+      --dataset-name mooncake \
+      --mooncake-slowdown-factor 1.0 \
+      --mooncake-num-rounds 1000 \
+      --mooncake-workload conversation|mooncake|agent|synthetic
+      --use-trace-timestamps true \
+      --random-output-len 256
+    ```
 
-10) Fake decode stress testing (PD disaggregation, decode-only):
+10. Fake decode stress testing (PD disaggregation, decode-only):
 
-When benchmarking pure decode performance in a PD disaggregation setup, you can bypass the prefill node entirely by using `--fake-prefill`. This requires the decode server to be started with `--disaggregation-transfer-backend fake`:
+    When benchmarking pure decode performance in a PD disaggregation setup, you can bypass the prefill node entirely by using `--fake-prefill`. This requires the decode server to be started with `--disaggregation-transfer-backend fake`:
 
-```bash Command
-# Step 1: Start a decode-only server with fake transfer backend
-python -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --disaggregation-mode decode \
-  --disaggregation-transfer-backend fake \
-  --port 30001
+    ```bash Command
+    # Step 1: Start a decode-only server with fake transfer backend
+    python -m sglang.launch_server \
+      --model-path meta-llama/Llama-3.1-8B-Instruct \
+      --disaggregation-mode decode \
+      --disaggregation-transfer-backend fake \
+      --port 30001
 
-# Step 2: Run bench_serving with --fake-prefill
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 --port 30001 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset-name random \
-  --num-prompts 500 \
-  --random-input-len 1024 --random-output-len 256 \
-  --fake-prefill
-```
+    # Step 2: Run bench_serving with --fake-prefill
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --host 127.0.0.1 --port 30001 \
+      --model meta-llama/Llama-3.1-8B-Instruct \
+      --dataset-name random \
+      --num-prompts 500 \
+      --random-input-len 1024 --random-output-len 256 \
+      --fake-prefill
+    ```
 
-Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
+    Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
 
-```bash Command
-python3 -m sglang.bench_one_batch_server \
-  --base-url http://127.0.0.1:30001 \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --batch-size 32 --input-len 1024 --output-len 256 \
-  --fake-prefill
-```
+    ```bash Command
+    python3 -m sglang.bench_one_batch_server \
+      --base-url http://127.0.0.1:30001 \
+      --model-path meta-llama/Llama-3.1-8B-Instruct \
+      --batch-size 32 --input-len 1024 --output-len 256 \
+      --fake-prefill
+    ```
 
-The `--fake-prefill` flag automatically injects special sentinel values into each request, telling the decode server to skip real KV transfer and generate fake KV data locally.
+    The `--fake-prefill` flag automatically injects special sentinel values into each request, telling the decode server to skip real KV transfer and generate fake KV data locally.
 
 ### Troubleshooting
 

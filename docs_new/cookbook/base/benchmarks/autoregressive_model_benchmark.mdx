@@ -119,18 +119,18 @@ Controls the source of the prompts used for benchmarking.
 
 Parameters to control the shape of requests (context length and generation length).
 
-#### For Random/Image Datasets:
+#### For Random/Image Datasets
 
 - `--random-input-len`: Number of input tokens per request.
 - `--random-output-len`: Number of output tokens per request.
 - `--random-range-ratio`: Range ratio for sampling input/output lengths.
 
-#### For ShareGPT Dataset:
+#### For ShareGPT Dataset
 
 - `--sharegpt-output-len`: Overrides the output length defined in the dataset for each request.
 - `--sharegpt-context-len`: Max context length. Requests exceeding this are dropped.
 
-#### General Request Modifiers:
+#### General Request Modifiers
 
 - `--extra-request-body`: Appends a JSON object to the request payload (e.g., \{"key": "value"\}). Useful for passing sampling parameters.
 - `--prompt-suffix`: A string suffix appended to all user prompts.
@@ -260,7 +260,7 @@ For benchmarking Prefill-Decode (PD) separated architectures.
 
 ### 2.7 Specialized Datasets
 
-#### 2.7.1 Generated Shared Prefix (GSP):
+#### 2.7.1 Generated Shared Prefix (GSP)
 
 Designed to test system prompt caching/prefix sharing performance.
 

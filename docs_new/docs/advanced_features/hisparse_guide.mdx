@@ -34,7 +34,7 @@ Each decode step follows this flow:
 
 In PD disaggregation mode, the prefill instance transfers KV cache directly into the decode instance's host pool via RDMA, bypassing the GPU entirely on the decode side. This eliminates the transient GPU memory spike during KV transfer and removes the staging DMA step.
 
-```
+```txt
 Prefill GPU  ──RDMA──▶  Decode Host Pool (CPU pinned memory)
                               │
                               ▼

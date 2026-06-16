@@ -111,6 +111,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 # Start text model server
 sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
 ```
+
 For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
 
 #### Execute Accuracy Evaluation
@@ -129,7 +130,7 @@ evalscope eval \
 
 Upon completion, results similar to the following will be displayed:
 
-```
+```text
 +---------------------+-----------+----------+----------+-------+---------+---------+
 | Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
 +=====================+===========+==========+==========+=======+=========+=========+
@@ -236,8 +237,10 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
 
 ### EvalScope SSL certificate verification failed
+
 When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
-```
+
+```bash command
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
     return self.request("GET", url, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -252,11 +255,14 @@ When using EvalScope commands without specifying a dataset or model path, it wil
 requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
+
 You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
 
 ### Download Dataset Error
+
 For this error
-```
+
+```bash command
 root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 --2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 Connecting to 141.5.152.215:6688... connected.
@@ -264,8 +270,10 @@ ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web
   Self-signed certificate encountered.
 To connect to www.modelscope.cn insecurely, use `--no-check-certificate'.
 ```
+
 You can add `--no-check-certificate'
-```
+
+```bash command
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
 ```
 
