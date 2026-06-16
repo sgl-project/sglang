@@ -104,7 +104,15 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ### 3.1 Reasoning
 
-GLM-5.2 is a hybrid-reasoning model. Enable the `glm45` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Thinking is on by default; turn it off with `chat_template_kwargs: {"thinking": False}`.
+GLM-5.2 is a hybrid-reasoning model. Enable the `glm45` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Thinking is on by default; turn it off with `chat_template_kwargs: {"enable_thinking": False}` (the template variable is `enable_thinking`, not `thinking`).
+
+**Reasoning effort.** Pass `chat_template_kwargs: {"reasoning_effort": ...}` to inject a `Reasoning Effort: <level>` system line (only while thinking is on). **The template wires only two effective levels — `Max` and `High` — and if you don't pass `reasoning_effort` at all you get `Max`, the highest.** `"high"` is the *only* value that lowers effort; every other value (including `"low"` and `"medium"`) falls through to `Max`:
+
+| `reasoning_effort` | Injected system line | Effect |
+|---|---|---|
+| *(not passed / unset)* | `Reasoning Effort: Max` | **default — highest reasoning** |
+| `"high"` | `Reasoning Effort: High` | dials reasoning **down** |
+| `"low"`, `"medium"`, any other value | `Reasoning Effort: Max` | falls through to `Max` (not a distinct level) |
 
 <Accordion title="Reasoning Example (Python)">
 
@@ -115,7 +123,7 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 resp = client.chat.completions.create(
     model="zai-org/GLM-5.2-FP8",
     messages=[{"role": "user", "content": "What is 15% of 240?"}],
-    extra_body={"chat_template_kwargs": {"thinking": True}},
+    extra_body={"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}},
 )
 msg = resp.choices[0].message
 print("Reasoning:", getattr(msg, "reasoning_content", None))
