@@ -1810,6 +1810,12 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        init_process_group_kwargs = {}
+        if backend == "nccl" and local_rank >= 0:
+            init_process_group_kwargs["device_id"] = torch.device(
+                "cuda", local_rank
+            )
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1818,6 +1824,7 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
+            **init_process_group_kwargs,
         )
 
         # Create a global TCPStore for coordination (used by NIXL)

@@ -538,6 +538,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
+        if self._should_pre_initialize_mega_moe_symm_buffers():
+            from sglang.srt.layers.moe.mega_moe import (
+                pre_initialize_mega_moe_symm_buffers_from_config,
+            )
+
+            pre_initialize_mega_moe_symm_buffers_from_config(self.model_config)
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -2378,6 +2384,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        if self._should_pre_initialize_mega_moe_symm_buffers():
+            from sglang.srt.layers.moe.mega_moe import (
+                pre_initialize_mega_moe_symm_buffers,
+            )
+
+            pre_initialize_mega_moe_symm_buffers(self.model)
+
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2410,6 +2423,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hidden_dim=self.model_config.hidden_size,
             dtype=self.dtype,
         )
+
+    def _should_pre_initialize_mega_moe_symm_buffers(self) -> bool:
+        if self.server_args.moe_a2a_backend != "megamoe" or self.device != "cuda":
+            return False
+
+        override = os.getenv("SGLANG_MEGA_MOE_PREINIT_SYMM_BUFFERS")
+        if override:
+            return override == "1"
+
+        try:
+            return torch.cuda.get_device_capability()[0] >= 10
+        except RuntimeError:
+            return False
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
