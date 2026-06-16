@@ -311,9 +311,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
+            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
             mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                self.server_args.pipeline_config,
-                "dit_torch_compile_mode",
+                dit_config,
+                "torch_compile_mode",
                 "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode

@@ -187,7 +187,6 @@ class LTX2PipelineConfig(PipelineConfig):
     vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
     audio_vae_precision: str = "bf16"
-    dit_torch_compile_mode: str = "default"
 
     @property
     def vae_scale_factor(self):
@@ -714,8 +713,6 @@ class LTX2PipelineConfig(PipelineConfig):
 @dataclasses.dataclass
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
-
-    dit_torch_compile_mode: str = "default"
 
 
 @dataclasses.dataclass

@@ -274,9 +274,6 @@ class PipelineConfig:
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 
-    # Compilation
-    dit_torch_compile_mode: str = "max-autotune-no-cudagraphs"
-
     # calculate the adjust size for condition image
     # width: original condition image width
     # height: original condition image height
