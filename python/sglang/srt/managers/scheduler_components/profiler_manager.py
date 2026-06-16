@@ -233,7 +233,11 @@ class SchedulerProfilerManager:
                     )
                 ),
             )
-            self.torch_profiler.start()
+            try:
+                self.torch_profiler.start()
+            except RuntimeError as e:
+                self.torch_profiler = None
+                return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
 
         if "MEM" in activities:
