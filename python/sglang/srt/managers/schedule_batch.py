@@ -1126,7 +1126,9 @@ class Req(ReqDllmMixin):
         return length
 
     def fill_ids_upto(self, length: int) -> array:
-        return to_array(self.get_full_untruncated_fill_ids()[:length])
+        if self.is_dllm():
+            return to_array(self.get_full_untruncated_fill_ids()[:length])
+        return self.token_buf.materialize(0, length)
 
     def get_fill_ids(self) -> array:
         return self.fill_ids_upto(self.fill_len)
