@@ -24,12 +24,12 @@ v0.5.13 or a later version.
 | Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 2`                                                                                 |
+| Data Parallelism              | `--enable-dp-attention --dp-size 2`                                                           |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
 | NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
-| Disable Radix Cache           | `--disable-radix-cache`                                                                       |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                   |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -154,7 +154,13 @@ deployment commands and benchmark data, see
 After the service is started, you can invoke the model by sending a prompt:
 
 ```shell
-curl http://localhost:7239/generate \
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 6688)
+# ============================================================
+
+curl http://${HOST}:${PORT}/generate \
     -H "Content-Type: application/json" \
     -d '{
         "text": "What is the capital of France?",

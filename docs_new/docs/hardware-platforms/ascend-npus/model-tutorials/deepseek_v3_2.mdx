@@ -30,7 +30,8 @@ recommended to use v0.5.13 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| NPU Graph                     | `--cuda-graph-bs 1 2 3 4 5 6 7 8`                                                              |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                   |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
 <Note>
@@ -155,7 +156,13 @@ deployment commands and benchmark data, see
 After the service is started, you can invoke the model by sending a prompt:
 
 ```shell
-curl http://localhost:6688/generate \
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 6689)
+# ============================================================
+
+curl http://${HOST}:${PORT}/generate \
     -H "Content-Type: application/json" \
     -d '{
         "text": "What is the capital of France?",

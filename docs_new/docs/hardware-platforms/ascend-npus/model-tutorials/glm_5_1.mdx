@@ -26,11 +26,14 @@ v0.5.13 or a later version.
 | Tensor Parallelism            | `--tp-size 16`                                                                    |
 | Data Parallelism              | `--dp-size 16 --enable-dp-attention`                                              |
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                     |
+| Context Parallelism           | `--enable-nsa-prefill-context-parallel --attn-cp-size 32`                          |
+| PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`          |
 | Quantization                  | `--quantization modelslim`                                                        |
 | Chunked Prefill               | `--chunked-prefill-size 16384 --max-prefill-tokens 280000`                        |
 | NPU Graph                     | `--cuda-graph-bs 16`                                                              |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`              |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                      |
+| DP LM Head                    | `--enable-dp-lm-head`                                                             |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                            |
 
 <Note>
@@ -172,7 +175,13 @@ deployment commands and benchmark data, see
 After the service is started, you can invoke the model by sending a prompt:
 
 ```shell
-curl http://localhost:8000/generate \
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 6689)
+# ============================================================
+
+curl http://${HOST}:${PORT}/generate \
     -H "Content-Type: application/json" \
     -d '{
         "text": "What is the capital of France?",

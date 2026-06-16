@@ -32,9 +32,9 @@ v0.5.13 or a later version.
 | Chunked Prefill               | `--chunked-prefill-size 94208 --max-prefill-tokens 458880`                                    |
 | NPU Graph                     | `--cuda-graph-bs 1 2 4 8 16 20 24 26 27`                                                      |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                   |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| Prefill Context Parallel      | `--enable-prefill-context-parallel --attn-cp-size 2 --moe-dp-size 2`                          |
+| Context Parallelism           | `--enable-prefill-context-parallel --attn-cp-size 2 --moe-dp-size 2`                          |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -386,7 +386,13 @@ PCP is a prefill-only feature; the decode side needs no CP-related flags.
 After the service is started, you can invoke the model by sending a prompt:
 
 ```shell
-curl http://localhost:7439/generate \
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 6689)
+# ============================================================
+
+curl http://${HOST}:${PORT}/generate \
     -H "Content-Type: application/json" \
     -d '{
         "text": "What is the capital of France?",
