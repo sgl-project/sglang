@@ -8,7 +8,7 @@ from array import array
 from collections import defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 
 import torch
 
@@ -243,11 +243,27 @@ class UnifiedLRUList:
             return None
         return x
 
+    def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+        """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
+        if check_id:
+            assert node.id in self.cache
+        pt = self._pt
+        ct = self.component_type
+        x = node.lru_prev[pt]
+        while x.component_data[ct].host_lock_ref > 0:
+            x = x.lru_prev[pt]
+        if x == self.head:
+            return None
+        return x
+
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
 
     def get_leaf_lru_no_lock(self):
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
+
+    def get_lru_no_host_lock(self):
+        return self.get_prev_no_host_lock(self.tail, check_id=False)
 
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
@@ -257,6 +273,33 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+class _OngoingWriteThrough(NamedTuple):
+    """Tracks an in-flight D→H write-through operation."""
+
+    node: UnifiedTreeNode
+    lock_params: Optional[DecLockRefParams]
+    publish_nodes: list[UnifiedTreeNode]
+
+
+class _OngoingLoadBack(NamedTuple):
+    """Tracks an in-flight H→D load-back operation."""
+
+    node: UnifiedTreeNode
+    lock_params: DecLockRefParams
+    host_lock_params: DecLockRefParams
+
+
+class _OngoingPrefetch(NamedTuple):
+    """Tracks an in-flight storage→host prefetch operation."""
+
+    anchor_node: UnifiedTreeNode
+    prefetch_key: RadixKey
+    host_indices: torch.Tensor
+    operation: PrefetchOperation
+    anchor_lock_params: DecLockRefParams
+    comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
@@ -421,28 +464,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
-        self.ongoing_write_through: dict[
-            int,
-            tuple[
-                UnifiedTreeNode,
-                Optional[DecLockRefParams],
-                list[UnifiedTreeNode],
-            ],
-        ] = {}
-        self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        self.ongoing_prefetch: dict[
-            str,
-            tuple[
-                UnifiedTreeNode,
-                RadixKey,
-                torch.Tensor,
-                PrefetchOperation,
-                DecLockRefParams,
-                dict[ComponentType, list[PoolTransfer]],
-            ],
-        ] = {}
+        self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
         if self.cache_controller is not None:
@@ -1542,7 +1568,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params: Optional[DecLockRefParams],
     ) -> None:
         node.write_through_pending_id = node.id
-        self.ongoing_write_through[node.id] = (node, lock_params, [node])
+        self.ongoing_write_through[node.id] = _OngoingWriteThrough(
+            node, lock_params, [node]
+        )
 
     def _replace_pending_write_through_node(
         self, old_node: UnifiedTreeNode, new_nodes: list[UnifiedTreeNode]
@@ -1570,7 +1598,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for node in new_nodes:
             node.write_through_pending_id = ack_id
-        self.ongoing_write_through[ack_id] = (
+        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node,
             lock_params,
             updated_nodes,
@@ -1601,7 +1629,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
         start_time = time.perf_counter()
-
+        host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
@@ -1633,6 +1661,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
         if self.supports_swa():
@@ -1644,6 +1673,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
 
         # Load H→D
@@ -1657,6 +1687,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
         # Commit: each component gets only its own transfers
@@ -1676,9 +1707,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
-        self.ongoing_load_back[best_match_node.id] = (
+        self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
+            host_anchor_params,
         )
 
         if self.metrics_collector is not None:
@@ -1882,7 +1914,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_prefetch[req_id] = (
+        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
             host_indices,
@@ -2016,7 +2048,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:
             return
-        _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
+        operation = self.ongoing_prefetch[req_id].operation
         if operation.host_indices is None:
             return
         operation.mark_terminate()
@@ -2329,8 +2361,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, lock_params = self.ongoing_load_back.pop(ack_id)
+                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
+                self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -2780,7 +2813,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, (n, _) in self.ongoing_load_back.items():
+        for nid, (n, _, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:

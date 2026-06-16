@@ -60,6 +60,7 @@ class DiTConfig(ModelConfig):
     # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
+    torch_compile_mode: str = "max-autotune-no-cudagraphs"
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "dit-config") -> Any:
@@ -78,6 +79,13 @@ class DiTConfig(ModelConfig):
             dest=f"{prefix.replace('-', '_')}.quant_config",
             default=None,
             help="Quantization configuration for the DiT model",
+        )
+        parser.add_argument(
+            f"--{prefix}.torch-compile-mode",
+            type=str,
+            dest=f"{prefix.replace('-', '_')}.torch_compile_mode",
+            default=DiTConfig.torch_compile_mode,
+            help="torch.compile mode for the DiT model",
         )
 
         return parser
