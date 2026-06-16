@@ -25,8 +25,7 @@ class MultimodalCache(abc.ABC):
 
     @staticmethod
     def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
-        # Single element: return as-is (stable across processes).
-        # Multiple elements: deterministic binary hash via struct.pack.
+        # Deterministic across processes (plain hash() is randomized).
         if not mm_hashes:
             return None
         if len(mm_hashes) == 1:
@@ -75,6 +74,23 @@ def _get_tensor_size(embedding: torch.Tensor):
 @dataclass(kw_only=True)
 class EmbeddingResult:
     embedding: torch.Tensor
+    # Optional grid/aux carried alongside the embedding; both default to None.
+    grid: Optional[torch.Tensor] = None
+    aux: Optional[dict] = None
+
+
+def _to_cpu_meta(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous()
+    if isinstance(value, dict):
+        return {k: _to_cpu_meta(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_cpu_meta(v) for v in value)
+    return value
+
+
+# Aux tensors above this get their own SHM segment; smaller ones stay inline.
+_AUX_SHM_TENSOR_MAX_BYTES = 64 * 1024
 
 
 class MultiModalStaticCache(MultimodalCache):
@@ -115,8 +131,7 @@ class MultiModalStaticCache(MultimodalCache):
             self._local_size = value
 
     @staticmethod
-    def _write_to_shm(embedding: torch.Tensor) -> Tuple[SharedMemory, dict]:
-        t = embedding
+    def _write_tensor_segment(t: torch.Tensor) -> Tuple[SharedMemory, dict]:
         if t.dtype == torch.bfloat16:
             arr = t.contiguous().cpu().view(torch.uint16).numpy()
             dtype_str = "bfloat16"
@@ -141,13 +156,13 @@ class MultiModalStaticCache(MultimodalCache):
         }
 
     @staticmethod
-    def _read_from_shm(meta: dict) -> torch.Tensor:
-        shm = SharedMemory(name=meta["shm_name"], create=False)
+    def _read_tensor_segment(seg: dict) -> torch.Tensor:
+        shm = SharedMemory(name=seg["shm_name"], create=False)
         try:
-            ds = meta["dtype_str"]
+            ds = seg["dtype_str"]
             np_dt = "uint16" if ds == "bfloat16" else ds
             t = torch.from_numpy(
-                np.ndarray(meta["shape"], dtype=np_dt, buffer=shm.buf, offset=0).copy()
+                np.ndarray(seg["shape"], dtype=np_dt, buffer=shm.buf, offset=0).copy()
             )
             if ds == "bfloat16":
                 t = t.view(torch.bfloat16)
@@ -156,32 +171,72 @@ class MultiModalStaticCache(MultimodalCache):
         return t
 
     @staticmethod
-    def _unlink_shm(meta: dict):
+    def _write_to_shm(embedding: torch.Tensor) -> Tuple[SharedMemory, dict]:
+        return MultiModalStaticCache._write_tensor_segment(embedding)
+
+    @staticmethod
+    def _read_from_shm(meta: dict) -> torch.Tensor:
+        return MultiModalStaticCache._read_tensor_segment(meta)
+
+    @classmethod
+    def _write_aux_to_shm(cls, aux: Optional[dict]) -> Tuple[dict, list, list, int]:
+        # Returns (inline_aux, aux_segments, shm_objects, extra_bytes); caller closes shm_objects.
+        if not aux:
+            return None, [], [], 0
+        inline: dict = {}
+        segments: list = []
+        shms: list = []
+        extra = 0
         try:
-            shm = SharedMemory(name=meta["shm_name"], create=False)
-            shm.close()
-            shm.unlink()
-        except FileNotFoundError:
-            pass
+            for name, v in aux.items():
+                if (
+                    isinstance(v, torch.Tensor)
+                    and v.element_size() * v.numel() > _AUX_SHM_TENSOR_MAX_BYTES
+                ):
+                    shm, seg = cls._write_tensor_segment(v)
+                    shms.append(shm)
+                    seg["aux_key"] = name
+                    segments.append(seg)
+                    extra += seg["total_bytes"]
+                    inline[name] = None  # placeholder; filled from segment on read
+                else:
+                    inline[name] = _to_cpu_meta(v)
+        except BaseException:
+            for s in shms:
+                try:
+                    s.close()
+                    s.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        return inline, segments, shms, extra
+
+    @classmethod
+    def _read_aux_from_shm(cls, meta: dict) -> Optional[dict]:
+        inline = meta.get("aux")
+        if inline is None:
+            return None
+        aux = dict(inline)
+        for seg in meta.get("aux_segments", []):
+            aux[seg["aux_key"]] = cls._read_tensor_segment(seg)
+        return aux
+
+    @staticmethod
+    def _unlink_shm(meta: dict):
+        names = [meta.get("shm_name")]
+        names += [seg["shm_name"] for seg in meta.get("aux_segments", [])]
+        for name in names:
+            if not name:
+                continue
+            try:
+                shm = SharedMemory(name=name, create=False)
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
 
     def _idx(self):
         return self._shm_index if self._shared else self.mm_cache
-
-    def _store(self, k: int, embedding: EmbeddingResult) -> bool:
-        if self._shared:
-            try:
-                shm, meta = self._write_to_shm(embedding.embedding)
-                shm.close()
-            except OSError as e:
-                logger.error(f"MultiModalStaticCache: shm alloc failed: {e}")
-                return False
-            self._shm_index[k] = meta
-            self._lru_order.append(k)
-            self.current_size += meta["total_bytes"]
-        else:
-            self.mm_cache[k] = embedding
-            self.current_size += _get_tensor_size(embedding.embedding)
-        return True
 
     def _remove(self, k: int) -> bool:
         if k not in self._idx():
@@ -219,7 +274,6 @@ class MultiModalStaticCache(MultimodalCache):
         return True
 
     def _get_by_hash(self, key: int) -> Optional[EmbeddingResult]:
-        """Shared get logic for both get() and get_single()."""
         with self._lock:
             if key not in self._idx():
                 return None
@@ -228,10 +282,21 @@ class MultiModalStaticCache(MultimodalCache):
                 meta = self._shm_index[key]
                 try:
                     tensor = self._read_from_shm(meta)
+                    aux = self._read_aux_from_shm(meta)
                 except FileNotFoundError:
+                    # Index hit but backing SHM segment gone: evict, treat as miss.
+                    logger.warning(
+                        f"[mm_cache] read HIT-FAIL key=0x{key:x} "
+                        f"shm={meta.get('shm_name')} reason=shm_segment_missing; "
+                        f"evicting stale entry"
+                    )
                     self._remove(key)
                     return None
-                return EmbeddingResult(embedding=tensor)
+                return EmbeddingResult(
+                    embedding=tensor,
+                    grid=meta.get("grid"),
+                    aux=aux,
+                )
             return self.mm_cache[key]
 
     def get(
@@ -255,12 +320,29 @@ class MultiModalStaticCache(MultimodalCache):
             except OSError as e:
                 logger.error(f"MultiModalStaticCache: shm alloc failed: {e}")
                 return False
+            try:
+                inline_aux, aux_segments, aux_shms, aux_bytes = self._write_aux_to_shm(
+                    embedding.aux
+                )
+            except OSError as e:
+                logger.error(f"MultiModalStaticCache: shm alloc failed (aux): {e}")
+                self._unlink_shm(meta)
+                return False
+            for s in aux_shms:
+                s.close()
+            meta["grid"] = (
+                _to_cpu_meta(embedding.grid) if embedding.grid is not None else None
+            )
+            meta["aux"] = inline_aux
+            meta["aux_segments"] = aux_segments
+            # total_bytes drives LRU accounting; include the aux segments.
+            data_size = meta["total_bytes"] + aux_bytes
+            meta["total_bytes"] = data_size
             with self._lock:
                 if mm_hash in self._idx():
                     self._move_to_end(mm_hash)
                     self._unlink_shm(meta)
                     return True
-                data_size = meta["total_bytes"]
                 while self.current_size + data_size > self.max_size:
                     if not self._evict_one():
                         self._unlink_shm(meta)
@@ -312,7 +394,3 @@ class MultiModalStaticCache(MultimodalCache):
     def __len__(self):
         with self._lock:
             return len(self._idx())
-
-    def get_state(self) -> Tuple[int, int]:
-        with self._lock:
-            return self.current_size, len(self._idx())

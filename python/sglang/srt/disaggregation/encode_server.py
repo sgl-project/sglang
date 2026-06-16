@@ -3804,12 +3804,17 @@ def _launch_server_dp(server_args: ServerArgs):
             from multiprocessing.shared_memory import SharedMemory
 
             for meta in list(shm_resources["index"].values()):
-                try:
-                    shm = SharedMemory(name=meta["shm_name"], create=False)
-                    shm.close()
-                    shm.unlink()
-                except (FileNotFoundError, KeyError):
-                    pass
+                names = [meta.get("shm_name")]
+                names += [seg.get("shm_name") for seg in meta.get("aux_segments", [])]
+                for name in names:
+                    if not name:
+                        continue
+                    try:
+                        shm = SharedMemory(name=name, create=False)
+                        shm.close()
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
 
     atexit.register(_kill_workers)
 
