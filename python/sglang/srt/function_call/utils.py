@@ -1,3 +1,5 @@
+import ast
+import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -217,6 +219,26 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+def safe_literal_eval(value: str) -> Any:
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=SyntaxWarning)
+            warnings.filterwarnings("error", category=DeprecationWarning)
+            return ast.literal_eval(value)
+    except (SyntaxWarning, DeprecationWarning) as e:
+        raise SyntaxError(str(e)) from e
+
+
+def safe_ast_parse(source: str) -> ast.Module:
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=SyntaxWarning)
+            warnings.filterwarnings("error", category=DeprecationWarning)
+            return ast.parse(source)
+    except (SyntaxWarning, DeprecationWarning) as e:
+        raise SyntaxError(str(e)) from e
 
 
 def _get_tool_schema_defs(tools: List[Tool]) -> dict:

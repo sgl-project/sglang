@@ -1,5 +1,6 @@
 import json
 import unittest
+import warnings
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -3051,6 +3052,23 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>"\\C|\\."</arg_value>\n'
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3359,6 +3377,23 @@ class TestGlm47MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather<arg_key>city</arg_key><arg_value>"\\C|\\."</arg_value>'
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
 
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""

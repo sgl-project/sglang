@@ -1,4 +1,3 @@
-import ast
 import json
 import re
 from enum import Enum, auto
@@ -12,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import safe_literal_eval
 
 
 class _ParseState(Enum):
@@ -179,7 +179,7 @@ class PoolsideV1Detector(BaseFormatDetector):
         if param_type in PoolsideV1Detector._STRING_TYPES:
             return raw
 
-        decoders = (json.loads,) if not param_type else (json.loads, ast.literal_eval)
+        decoders = (json.loads,) if not param_type else (json.loads, safe_literal_eval)
         for decoder in decoders:
             try:
                 result = decoder(raw)
