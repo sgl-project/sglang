@@ -24,6 +24,9 @@ from :class:`AdaptiveController` and overrides only the decision logic:
 
 Config JSON format
 ------------------
+Optional.  When ``--speculative-adaptive-config`` is omitted, a built-in
+default is used (``candidate_steps=[1,3,5,7]`` at BS ``>=1``).
+
 Integer-string keys are batch-size lower bounds (same as the standard
 adaptive config); non-integer keys are throughput-specific settings::
 
@@ -32,8 +35,8 @@ adaptive config); non-integer keys are throughput-specific settings::
         "update_interval": 10,
         "profile_run_batch_sizes": null,
         "max_profile_run_batch_size": 128,
-        "profile_run_n_warmup": 5,
-        "profile_run_n_measure": 10,
+        "profile_run_n_warmup": 1,
+        "profile_run_n_measure": 3,
         "1":   {"candidate_steps": [1, 3, 5, 7]},
         "8":   {"candidate_steps": [1, 3, 5]},
         "32":  {"candidate_steps": [1, 3]},
@@ -98,15 +101,22 @@ def _broadcast_float_from_rank0(value: float) -> float:
 # Config helpers
 # ---------------------------------------------------------------------------
 
+DEFAULT_THROUGHPUT_AWARE_CONFIG: dict = {
+    "window_size": 20,
+    "update_interval": 10,
+    "profile_run_n_warmup": 1,
+    "profile_run_n_measure": 3,
+    "1": {"candidate_steps": [1, 3, 5, 7]},
+}
+
 
 def load_throughput_aware_config(path: Optional[str]) -> dict:
     """Load and validate the throughput-aware JSON config.
 
-    Returns an empty dict when *path* is ``None`` (caller should handle the
-    missing-config case).
+    Uses ``DEFAULT_THROUGHPUT_AWARE_CONFIG`` when *path* is ``None``.
     """
     if path is None:
-        return {}
+        return DEFAULT_THROUGHPUT_AWARE_CONFIG
     with open(path) as f:
         cfg = json.load(f)
     if not isinstance(cfg, dict):
@@ -153,7 +163,7 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
     return sorted(bs_candidates), bs_candidates
 
 
-def resolve_throughput_aware_candidate_steps(cfg_path: str) -> list[int]:
+def resolve_throughput_aware_candidate_steps(cfg_path: Optional[str] = None) -> list[int]:
     """Return the union of all candidate steps across all BS slots.
 
     Used by ``server_args.max_speculative_num_draft_tokens`` to pre-size
@@ -197,8 +207,8 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
 
         self._profile_batch_sizes: Optional[list[int]] = cfg.get("profile_run_batch_sizes")
         self._max_profile_bs: Optional[int] = cfg.get("max_profile_run_batch_size")
-        self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 5))
-        self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 10))
+        self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 1))
+        self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 3))
         self._profile_run_seq_len: Optional[int] = cfg.get("profile_run_seq_len")
 
         first_candidates = self._bs_candidates[self._bs_list[0]]
