@@ -26,6 +26,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
     _make_modelopt_ci_case,
@@ -44,6 +45,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
@@ -95,16 +97,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
-    ),
-    DiffusionTestCase(
-        "ideogram4_fp8_t2i",
-        DiffusionServerArgs(
-            model_path="ideogram-ai/ideogram-4-fp8",
-        ),
-        IDEOGRAM4_CI_sampling_params,
-        run_perf_check=True,
-        run_consistency_check=True,
-        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -386,6 +378,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
         ),
     ),
+    DiffusionTestCase(
+        "sana_wm_ti2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
     # flaky
     # === Helios T2V ===
     # DiffusionTestCase(
@@ -576,6 +579,21 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "ideogram4_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            tp_size=2,
+            extras=[
+                "--attention-backend",
+                "fa",
+            ],
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(

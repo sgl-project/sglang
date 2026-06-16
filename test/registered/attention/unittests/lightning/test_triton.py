@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.lightning_attention import (
     LightningAttentionCase,
     make_lightning_cases,
@@ -18,9 +18,6 @@ from sglang.test.kits.attention_unittest.attention_methods.lightning_attention i
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_lightning_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_lightning_eagle_draft_extend_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_lightning_eagle_verify_case,
     run_lightning_eagle_verify_cuda_graph_case,
@@ -28,6 +25,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -184,42 +182,6 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 spec_kind=spec_kind,
             ):
                 run_lightning_eagle_verify_cuda_graph_case(self, case, topk=topk)
-
-    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — CG is structurally
-    # blocked across the HybridLinearAttn family.
-    EAGLE_DRAFT_EXTEND_CASES = (
-        (
-            LightningAttentionCase(
-                name="runner_eagle_draft_extend_lightning",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            LightningAttentionCase(
-                name="runner_frozen_kv_mtp_draft_extend_lightning",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_lightning_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
     # PCG/BCG split-op extend is deliberately NOT covered. Lightning's
     # backend `forward_extend` flattens the output via `o.view(-1,

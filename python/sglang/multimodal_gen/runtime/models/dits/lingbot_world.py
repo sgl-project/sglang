@@ -82,12 +82,26 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+
+def _safe_tensor_version(tensor: torch.Tensor) -> int:
+    """Return ``tensor._version``, or ``0`` for inference-mode tensors.
+
+    Tensors created under ``torch.inference_mode`` do not track a version
+    counter, so reading ``tensor._version`` raises ``RuntimeError``. The value
+    is only used as a cache-invalidation hint for the camera conditioner, so a
+    constant fallback is safe for such tensors.
+    """
+    return 0 if tensor.is_inference() else tensor._version
+
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -977,7 +991,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()
@@ -1204,7 +1218,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             return None
         session = getattr(forward_batch, "session", None)
         if session is not None:
-            state = session.get_or_create_state(RealtimeCausalDiTState)
+            state = get_realtime_causal_dit_state(session)
             return state.runtime_cache.setdefault(name, {})
         extra = getattr(forward_batch, "extra", None)
         if extra is None:
@@ -1400,7 +1414,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()

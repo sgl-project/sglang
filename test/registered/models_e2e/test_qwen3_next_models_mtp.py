@@ -14,6 +14,9 @@ QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 class TestQwen3NextMTPTopk(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
+    # topk > 1 (tree) MTP on a hybrid-GDN model, on spec v2: the tree-aware mamba
+    # state update lives in the spec v2 verify path, so mamba + topk > 1 no longer
+    # falls back to spec v1.
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93

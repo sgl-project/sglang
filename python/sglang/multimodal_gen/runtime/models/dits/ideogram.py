@@ -8,15 +8,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+    WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -44,6 +52,11 @@ class Ideogram4QuantizedLinear(ReplicatedLinear):
         return super().forward(x)[0]
 
 
+class Ideogram4ColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
 def _linear(
     in_features: int,
     out_features: int,
@@ -51,8 +64,26 @@ def _linear(
     quant_config: QuantizationConfig | None = None,
     prefix: str = "",
 ):
+    tp_size = get_tp_world_size() if model_parallel_is_initialized() else 1
+    use_column_parallel = tp_size > 1 and out_features % tp_size == 0
     if quant_config is None:
+        if use_column_parallel:
+            return WeightOnlyFP8ColumnParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                gather_output=True,
+            )
         return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+    if use_column_parallel:
+        return Ideogram4ColumnParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
     return Ideogram4QuantizedLinear(
         in_features,
         out_features,
@@ -393,6 +424,8 @@ class Ideogram4Transformer2DModel(BaseDiT):
         position_ids: torch.Tensor,
         segment_ids: torch.Tensor,
         indicator: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         param_dtype = self.embed_image_indicator.weight.dtype
@@ -421,8 +454,10 @@ class Ideogram4Transformer2DModel(BaseDiT):
         cos = cos.unsqueeze(2)
         sin = sin.unsqueeze(2)
         # ideogram uses -1 padding; varlen meta enables fa packed attention
-        attn_mask = segment_ids > 0
-        attn_mask_meta = build_varlen_mask_meta(attn_mask)
+        if attn_mask is None:
+            attn_mask = segment_ids > 0
+        if attn_mask_meta is None:
+            attn_mask_meta = build_varlen_mask_meta(attn_mask)
         for layer in self.layers:
             h = layer(
                 h,

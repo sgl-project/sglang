@@ -6,12 +6,27 @@ from typing import Any, Callable
 
 import zmq
 
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
+
+_WORK_REQ_TYPES = (
+    TokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    BatchTokenizedEmbeddingReqInput,
+)
+
 
 class ScriptedTokenizerRecvProxy:
 
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()
+        self.work_reqs_seen: int = 0
 
     def recv_pyobj(self, flags: int = 0) -> Any:
         self._drain_underlying()
@@ -52,4 +67,6 @@ class ScriptedTokenizerRecvProxy:
                 req = self._underlying.recv_pyobj(zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
+            if isinstance(req, _WORK_REQ_TYPES):
+                self.work_reqs_seen += 1
             self._buffer.append(req)
