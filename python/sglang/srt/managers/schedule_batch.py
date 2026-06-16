@@ -1244,9 +1244,9 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + to_array(output_ids)
-            )
+            self.surr_and_decode_ids = self.origin_input_ids_unpadded[
+                self.surr_offset :
+            ] + to_array(output_ids)
             self.cur_decode_ids_len = len(output_ids)
         else:
             self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])

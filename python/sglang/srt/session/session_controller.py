@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (

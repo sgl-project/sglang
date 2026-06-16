@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from array import array
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -21,11 +20,11 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GetLoadsReqInput,
 )
-from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

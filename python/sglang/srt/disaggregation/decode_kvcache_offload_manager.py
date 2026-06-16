@@ -4,7 +4,6 @@ import json
 import logging
 import threading
 import time
-from array import array
 from typing import TYPE_CHECKING
 
 import torch
