@@ -158,7 +158,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             group_list_type=group_list_type,
         )
 
-        print(hidden_states)
+        #print(hidden_states)
 
         return TorchNpuRunnerOutput(hidden_states=hidden_states)
 
