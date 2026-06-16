@@ -36,13 +36,14 @@ export const benchmarks = [
   },
   // ---- B200 + FP8 ----  (measured on the v0.5.13.post1 release image, flush-cache on every run)
   {
+    // EAGLE MTP 5-1-6 (was 3-1-4): accept length ~5.98/6 → +33%/+22% throughput, -26%/-15% TPOT vs 3-1-4.
     match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.13.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 335, tpot_ms: 3.12, tokens_per_sec_per_gpu: 36 },
+        ttft_ms: 334, tpot_ms: 2.30, tokens_per_sec_per_gpu: 48 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 2710, tpot_ms: 8.05, tokens_per_sec_per_gpu: 172 },
+        ttft_ms: 2777, tpot_ms: 6.84, tokens_per_sec_per_gpu: 209 },
     ],
   },
   {
