@@ -695,7 +695,7 @@ class ServerArgs:
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
     # int8-compress radix-cached linear-attn (mamba) checkpoints -> ~2x cached
-    # prefixes at fixed memory (quality-safe; see mem_cache/int8_checkpoint_store.py).
+    # prefixes at fixed memory (quality-safe; see mem_cache/mamba_checkpoint_pool.py).
     enable_int8_mamba_checkpoint: bool = False
     int8_mamba_ckpt_size: Optional[int] = (
         None  # #int8 checkpoint slots; default 2x the active pool

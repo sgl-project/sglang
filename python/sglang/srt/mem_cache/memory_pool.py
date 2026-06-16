@@ -615,47 +615,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # Optional int8 checkpoint pool: the radix caches states here (int8) instead
         # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
         # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
-        self.mamba_ckpt_pool = None
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_int8_mamba_checkpoint_pool,
+        )
 
-        try:
-            _sa = get_global_server_args()
-        except ValueError:
-            # Some unit-test / mock runners construct HybridReqToTokenPool
-            # directly without a global server-args context. The int8
-            # checkpoint pool is opt-in via a CLI flag, so an unset context
-            # unambiguously means the feature is off -> skip building it.
-            _sa = None
-        if getattr(_sa, "enable_int8_mamba_checkpoint", False):
-            from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointPool
-
-            H, d_v, d_k = cache_params.shape.temporal
-            ckpt_size = _sa.int8_mamba_ckpt_size or (2 * mamba_size)
-            self.mamba_ckpt_pool = MambaCheckpointPool(
-                num_layers=len(mamba_layer_ids),
-                num_slots=ckpt_size,
-                num_heads=H,
-                head_v_dim=d_v,
-                head_k_dim=d_k,
-                conv_shapes=list(cache_params.shape.conv),
-                conv_dtype=cache_params.dtype.conv,
-                device=device,
-            )
-            ckpt_gb = self.mamba_ckpt_pool.mem_usage_bytes() / GB
-            logger.info(
-                f"int8 mamba checkpoint pool: {ckpt_size} slots, {ckpt_gb:.2f}GB "
-                f"(active mamba pool: {mamba_size} bf16 slots)"
-            )
-            # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
-            # (max_total_num_tokens); it is allocated from --mem-fraction-static
-            # headroom. Fine at the default size (2x the active pool); if you raise
-            # --int8-mamba-ckpt-size on a memory-tight box and hit OOM, lower it or
-            # reduce --mem-fraction-static. (Accounting it in the budget is a TODO.)
-            logger.warning(
-                f"int8 mamba checkpoint pool ({ckpt_gb:.2f}GB) is allocated from "
-                f"--mem-fraction-static headroom and is not reflected in "
-                f"max_total_num_tokens; ensure headroom covers it."
-            )
+        self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
+            mamba_size=mamba_size,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=device,
+        )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]

@@ -12,7 +12,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.int8_checkpoint_store import Int8CheckpointStore
+from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+    Int8CheckpointStore,
+    MambaCheckpointPool,
+)
 
 H, V, K = 32, 128, 128
 L = 4
@@ -73,9 +76,9 @@ class TestInt8CheckpointCodec(unittest.TestCase):
         active = torch.zeros(L, 10, H, V, K)  # bf16/fp32 active pool
         active[:, 2] = _rand_state(1).squeeze(1)
         # store active slot 2 -> ckpt slot 4
-        store.store_from_bf16_pool(active, torch.tensor([2]), torch.tensor([4]))
+        store.store_from_pool(active, torch.tensor([2]), torch.tensor([4]))
         # load ckpt slot 4 -> active slot 6 (cache-hit COW)
-        store.copy_to_bf16_pool(active, torch.tensor([4]), torch.tensor([6]))
+        store.copy_to_pool(active, torch.tensor([4]), torch.tensor([6]))
         rel = (active[:, 6] - active[:, 2]).norm() / active[:, 2].norm()
         self.assertLess(rel.item(), 1e-2)
 
@@ -91,6 +94,25 @@ class TestInt8CheckpointCodec(unittest.TestCase):
         bf16_per_slot = L * H * V * K * 2
         # int8 data (1B) + small per-(head,k) bf16 scale -> well under bf16; ~2x slots
         self.assertLess(store.bytes_per_slot(), bf16_per_slot * 0.6)
+
+    def test_estimate_matches_actual_mem(self):
+        # the pre-allocation estimate (used to fit-check HBM before building the
+        # pool) must equal the real allocated footprint, for any temporal dtype
+        for tdt in (torch.bfloat16, torch.float32):
+            kw = dict(
+                num_layers=L,
+                num_slots=64,
+                num_heads=H,
+                head_v_dim=V,
+                head_k_dim=K,
+                conv_shapes=[(4, K)],
+                conv_dtype=torch.bfloat16,
+                temporal_dtype=tdt,
+            )
+            est = MambaCheckpointPool.estimate_mem_usage_bytes(**kw)
+            pool = MambaCheckpointPool(**kw, device="cpu")
+            self.assertEqual(est["qdata"] + est["scale"] + est["conv"], est["total"])
+            self.assertEqual(est["total"], pool.mem_usage_bytes())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA + fla kernels")
