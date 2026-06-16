@@ -10,6 +10,7 @@
 #include <tvm/ffi/container/tuple.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -213,6 +214,95 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     m_is_graph_capturing = enabled;
   }
 
+  tvm::ffi::Array<int64_t> get_graph_capture_ptrs() {
+    tvm::ffi::Array<int64_t> result;
+    const auto new_count = registered_count() - m_cum_registered_count;
+    result.reserve(new_count);
+    for (const auto ptr : std::span(m_graph_capture_inputs).subspan(m_cum_registered_count)) {
+      result.push_back(reinterpret_cast<int64_t>(ptr));
+    }
+    return result;
+  }
+
+  using BaseInfo = tvm::ffi::Tuple<int64_t, int64_t>;  // (base_ptr, size)
+
+  /// Returns (unique_bases, per_input_base_indices, per_input_offset).
+  /// unique_bases[i] = (base_ptr, alloc_size) for each unique allocation.
+  /// per_input_base_indices[j] = indices of VMM allocations covering input j.
+  /// per_input_offset[j] = byte offset from the first allocation base for input j.
+  tvm::ffi::Tuple<tvm::ffi::Array<BaseInfo>, tvm::ffi::Array<tvm::ffi::Array<int64_t>>, tvm::ffi::Array<int64_t>>
+  get_graph_capture_bases() {
+    const auto new_inputs = std::span(m_graph_capture_inputs).subspan(m_cum_registered_count);
+    const auto new_input_bytes = std::span(m_graph_capture_input_bytes).subspan(m_cum_registered_count);
+    std::unordered_map<uintptr_t, int64_t> base_to_idx;
+    tvm::ffi::Array<BaseInfo> bases;
+    tvm::ffi::Array<tvm::ffi::Array<int64_t>> input_indices;
+    tvm::ffi::Array<int64_t> offsets;
+    input_indices.reserve(new_inputs.size());
+    offsets.reserve(new_inputs.size());
+    RuntimeCheck(new_inputs.size() == new_input_bytes.size(), "graph input metadata mismatch");
+    for (const auto input_idx : irange(new_inputs.size())) {
+      const auto ptr = new_inputs[input_idx];
+      auto remaining = new_input_bytes[input_idx];
+      RuntimeCheck(remaining > 0, "Invalid graph capture input size: ", remaining);
+
+      auto cursor = reinterpret_cast<CUdeviceptr>(ptr);
+      CUdeviceptr first_base = 0;
+      tvm::ffi::Array<int64_t> chunks;
+      while (remaining > 0) {
+        CUdeviceptr base = 0;
+        size_t size = 0;
+        const auto r = cuMemGetAddressRange(&base, &size, cursor);
+        RuntimeCheck(r == CUDA_SUCCESS, "cuMemGetAddressRange failed: ", r);
+        if (first_base == 0) first_base = base;
+        const auto byte_offset = static_cast<int64_t>(cursor - base);
+        RuntimeCheck(
+            byte_offset >= 0 && static_cast<size_t>(byte_offset) < size,
+            "graph capture input at ",
+            reinterpret_cast<uintptr_t>(ptr),
+            " is outside VMM allocation [base=",
+            base,
+            ", size=",
+            size,
+            "]");
+
+        auto [it, inserted] = base_to_idx.try_emplace(base, bases.size());
+        if (inserted) {
+          bases.push_back(BaseInfo{static_cast<int64_t>(base), static_cast<int64_t>(size)});
+        }
+        chunks.push_back(it->second);
+
+        const auto available = static_cast<int64_t>(size) - byte_offset;
+        const auto advance = std::min(remaining, available);
+        RuntimeCheck(advance > 0, "Failed to advance VMM graph capture span");
+        remaining -= advance;
+        cursor += advance;
+      }
+      input_indices.push_back(chunks);
+      offsets.push_back(reinterpret_cast<CUdeviceptr>(ptr) - first_base);
+    }
+    using Result =
+        tvm::ffi::Tuple<tvm::ffi::Array<BaseInfo>, tvm::ffi::Array<tvm::ffi::Array<int64_t>>, tvm::ffi::Array<int64_t>>;
+    return Result(bases, input_indices, offsets);
+  }
+
+  void register_peer_mapped_inputs(tvm::ffi::Array<tvm::ffi::Array<int64_t>> peer_ptrs_per_input) {
+    const auto new_count = registered_count() - m_cum_registered_count;
+    RuntimeCheck(int64_t(peer_ptrs_per_input.size()) == new_count, "peer_ptrs count mismatch");
+    if (new_count == 0) return;
+    std::vector<AllReduceData> data(new_count);
+    for (const auto j : irange(new_count)) {
+      const auto& ptrs = peer_ptrs_per_input[j];
+      RuntimeCheck(ptrs.size() == m_num_gpu, "peer count mismatch");
+      for (const auto i : irange(m_num_gpu)) {
+        data[j].input[i] = reinterpret_cast<void*>(static_cast<int64_t>(ptrs[i]));
+      }
+    }
+    const auto dst_ptr = get_data_ptr(m_cum_registered_count);
+    m_cum_registered_count += new_count;
+    RuntimeDeviceCheck(cudaMemcpy(dst_ptr, data.data(), sizeof(AllReduceData) * new_count, cudaMemcpyHostToDevice));
+  }
+
   void free_ipc_handles() {
     for (const auto& pair : m_ipc_cache) {
       host::RuntimeDeviceCheck(cudaIpcCloseMemHandle(pair.second));
@@ -238,10 +328,11 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   }
 
  protected:
-  AllReduceData* allocate_graph_capture_input(void* data_ptr) {
+  AllReduceData* allocate_graph_capture_input(void* data_ptr, int64_t input_bytes) {
     const auto count = registered_count();
     RuntimeCheck(count < m_graph_buffer_count, "Graph buffer overflow, increase `graph_buffer_count`!");
     m_graph_capture_inputs.push_back(data_ptr);
+    m_graph_capture_input_bytes.push_back(input_bytes);
     return get_data_ptr(count);
   }
   AllReduceData* get_data_ptr(int64_t which = -1) {
@@ -316,6 +407,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   std::optional<PushController> m_push_ctrl;
   void* m_storage = nullptr;
   std::vector<void*> m_graph_capture_inputs;
+  std::vector<int64_t> m_graph_capture_input_bytes;
   std::vector<void*> m_peer_storage;
   std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> m_ipc_cache;
 };
