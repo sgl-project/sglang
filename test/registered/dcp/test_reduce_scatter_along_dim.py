@@ -31,11 +31,6 @@ register_cuda_ci(
     est_time=120,
     suite="base-b-kernel-unit-8-gpu-h200",
 )
-register_cuda_ci(
-    est_time=120,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
-)
 
 # ---------------------------------------------------------------------------
 # Test parameters
