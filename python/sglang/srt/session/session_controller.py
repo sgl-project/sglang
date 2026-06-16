@@ -114,7 +114,7 @@ class Session:
 
         last_req_node = None
         last_req = None
-        reuse_buf = None
+        new_token_buf = None
         abort = False
         abort_message = ""
         if self.streaming:
@@ -187,47 +187,35 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
+            max_new_tokens = last_req.sampling_params.max_new_tokens
+            output_len = len(last_req.token_buf) - last_req.origin_input_len
+            kept_output_len = (
+                0
+                if session_params.drop_previous_output
+                else min(max_new_tokens, output_len)
+            )
+            kept_output = to_array(last_req.output_ids[:kept_output_len])
+
             if self.streaming:
-                max_new_tokens = last_req.sampling_params.max_new_tokens
-                output_len = len(last_req.token_buf) - last_req.origin_input_len
-                kept_output = to_array(last_req.output_ids[:max_new_tokens])
-
-                reuse_buf = last_req.token_buf
-                reuse_buf.truncate(
-                    last_req.origin_input_len + min(max_new_tokens, output_len)
-                )
-                reuse_buf.extend(req.input_ids)
-                input_ids = req.input_ids
-
-                reuse_unpadded = last_req.origin_input_ids_unpadded
-                reuse_unpadded.extend(kept_output)
-                reuse_unpadded.extend(req.input_ids)
-                input_ids_unpadded = reuse_unpadded
+                new_token_buf = last_req.token_buf
+                input_ids_unpadded = last_req.origin_input_ids_unpadded
             else:
-                input_ids = to_array(last_req.origin_input_ids) + to_array(
-                    last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-                )
+                new_token_buf = last_req.token_buf.clone()
+                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
 
-                if session_params.drop_previous_output:
-                    input_ids = to_array(last_req.origin_input_ids)
+            keep_len = last_req.origin_input_len + kept_output_len
+            if session_params.offset and session_params.offset != 0:
+                keep_len = min(session_params.offset, keep_len)
 
-                if session_params.offset and session_params.offset != 0:
-                    input_ids = input_ids[: session_params.offset] + req.input_ids
-                else:
-                    input_ids += req.input_ids
+            new_token_buf.truncate(keep_len)
+            new_token_buf.extend(req.input_ids)
 
-                input_ids_unpadded = last_req.origin_input_ids_unpadded + to_array(
-                    last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-                )
-                if session_params.drop_previous_output:
-                    input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+            input_ids_unpadded.extend(kept_output)
+            if session_params.offset and session_params.offset != 0:
+                del input_ids_unpadded[session_params.offset :]
+            input_ids_unpadded.extend(req.input_ids)
 
-                if session_params.offset and session_params.offset != 0:
-                    input_ids_unpadded = (
-                        input_ids_unpadded[: session_params.offset] + req.input_ids
-                    )
-                else:
-                    input_ids_unpadded += req.input_ids
+            input_ids = req.input_ids
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
@@ -259,9 +247,9 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
-        if reuse_buf is not None:
-            new_req.token_buf = reuse_buf
-            new_req.origin_input_len = len(reuse_buf)
+        if new_token_buf is not None:
+            new_req.token_buf = new_token_buf
+            new_req.origin_input_len = len(new_token_buf)
         new_req.tokenizer = tokenizer
 
         if abort:

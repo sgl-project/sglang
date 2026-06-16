@@ -73,6 +73,9 @@ class ViewableArray:
         assert 0 <= begin <= end <= self._size, (begin, end, self._size)
         return self._data[begin:end]
 
+    def clone(self) -> ViewableArray:
+        return ViewableArray(self.materialize())
+
     @staticmethod
     def _capacity_for(size: int) -> int:
         capacity: int = _MIN_CAPACITY
