@@ -103,7 +103,6 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16BF16F32 = auto()
-    TF32_HC_PRENORM_GEMM = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -236,7 +235,6 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
-            DeepGemmKernelType.TF32_HC_PRENORM_GEMM: _TF32HcPrenormWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -270,11 +268,6 @@ class _BaseWarmupExecutor:
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM:
-            # The generic hook's fourth dimension is num_splits for MHC.
-            # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-            num_splits = num_groups if num_groups > 0 else 1
-            return (max_m * k * 2 + n * k * 4 + num_splits * max_m * (n + 1) * 4) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -402,37 +395,6 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
-        )
-
-
-class _TF32HcPrenormWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.x = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
-        self.fn = torch.empty((n, k), device="cuda", dtype=torch.float32)
-        self.n = n
-        # The generic warmup executor's num_groups argument is num_splits here.
-        # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-        self.num_splits = num_groups if num_groups > 0 else None
-
-    def execute(self, m):
-        if self.num_splits is None:
-            out = torch.empty((m, self.n), device="cuda", dtype=torch.float32)
-            sqrsum = torch.empty((m,), device="cuda", dtype=torch.float32)
-        else:
-            # Slicing the middle dimension of a preallocated
-            # (num_splits, max_m, n) output would create a strided view.
-            out = torch.empty(
-                (self.num_splits, m, self.n), device="cuda", dtype=torch.float32
-            )
-            sqrsum = torch.empty(
-                (self.num_splits, m), device="cuda", dtype=torch.float32
-            )
-        deep_gemm.tf32_hc_prenorm_gemm(
-            self.x[:m],
-            self.fn,
-            out,
-            sqrsum,
-            num_splits=self.num_splits,
         )
 
 

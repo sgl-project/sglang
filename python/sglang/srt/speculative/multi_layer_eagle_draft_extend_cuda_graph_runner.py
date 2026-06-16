@@ -327,9 +327,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size

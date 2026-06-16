@@ -42,15 +42,22 @@ your dispatch prompt, or ask for it.
    (the recipe was measured with it, and fp8 KV halves KV memory —
    stripping could OOM it). See dimension-mapping.md §2 caveats.
 2. **Never invent versions or numbers.** Benchmark numbers only from the
-   legacy page's measured blocks. **Speed measurements migrate ONLY when the
-   legacy page pins an exact, reproducible build** (a release tag or a commit
-   hash) — drifting strings like "main branch" are no version anchor: drop the
-   speed numbers AND the entry's `sglang_version`, keep accuracy (far less
-   build-sensitive) and `benchmarkCommands` so ⚡Reproduce guides
-   re-measurement against a pinned release; confirm ambiguous strings (e.g.
-   "0.5.8+") with the maintainer. When kept, `sglang_version` is the legacy
-   page's string verbatim. Docker tags only the ones the legacy page pinned
-   (unmapped hw falls back to `:dev`).
+   legacy page's measured blocks, and a result migrates ONLY when its
+   `sglang_version` is a **reproducible anchor** — the bar is reproducibility,
+   not "must be a release":
+   - ✅ release tag/version (`v0.5.9` / `0.5.9`), commit hash, OR — for
+     **Day-0 support** (the enabling PR isn't merged and no release is cut
+     yet) — a specific **PR (`PR #27944`) or commit** you can `gh pr checkout`
+     / `git checkout <sha>`. Commit is most precise; a PR pin is fine for day-0.
+   - ❌ a moving ref — `"main branch"`, `"main (2026-06-11)"`, open-ended
+     `"0.5.8+"` — is NOT reproducible: **drop the WHOLE result (speed AND
+     accuracy)**, not just speed. Keep `benchmarkCommands` so ⚡Reproduce still
+     guides re-measurement against a pinned build.
+   **Never inherit cross-model numbers** — measurements the legacy page
+   attributes to a *different model* (e.g. a K2.6 page carrying K2.5-measured
+   speed) are dropped regardless of version. When kept, `sglang_version` is the
+   legacy page's string verbatim. Docker tags only the ones the legacy page
+   pinned (unmapped hw falls back to `:dev`).
 3. **Verified policy (strictest tier).** `verified: true` ONLY when (a) the
    legacy page has concrete measured data for that exact 5-dim combo AND
    (b) the cell's flags equal the deployment command used for that measurement
@@ -63,10 +70,15 @@ your dispatch prompt, or ask for it.
    including combos that look memory-infeasible; keep them verbatim and list
    them in the PR body for the re-verification track.
 4. **Engines are read-only.** `_deployment.jsx` / `_playground.jsx` must not
-   change in a migration PR. If the model needs an engine capability (a new
-   axis, accuracy labels, …), that is a separate prior PR. The every-feature
-   rule (step 2) triggers this routinely: a legacy control no built-in axis
-   covers means an engine-axis PR lands first.
+   change in a migration PR. Model-specific features are config DATA consumed
+   by generic axis handlers (MegaMoE precedent), so they need NO engine change.
+   A **titled single-select that strips a flag family** — KV Cache DType
+   (`--kv-cache-dtype`), mamba (`--mamba-scheduler-strategy`), … — is already
+   covered by the merged generic **`flagSelects`** axis: declare it in the
+   config (a list of `{ id, title, stripPrefixes, options }`; see the Qwen3.5
+   mamba example), **no engine PR**. Only a genuinely new control *shape* that
+   `flagSelects` can't express would need a one-time generic primitive (never a
+   model-named handler) on a separate prior PR (engine-axis.md).
 5. **`github.cookbookModel` must be set** (`<hf-org>/<page-slug>`, e.g.
    `qwen/qwen3.5`) and the block never pruned — without it Submit ↗ mislabels
    as deepseek-v4. The issue template itself needs NO edits (free-form input).
@@ -113,10 +125,15 @@ ON — EXCEPT parsers:
 `--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
 Playground-only (DSv4 convention). **Every legacy control survives as an
 interactive control** — a dimension or a Playground axis, never a tips-only
-mention. A feature none of the built-in axes covers (Nemotron3's "KV Cache
-DType" radio is the precedent) still lands in the Playground: add the axis
-via a separate PRIOR engine PR (engine-axis.md), keeping the migration PR
-itself data-only (hard rule 4). The strategy count follows the page's
+mention — and a model-specific control is **config data, not engine code**
+(MegaMoE W4A4 is all DSv4 config on the existing `moe` axis). It's pure
+config whenever it fits an existing axis's data schema. A **titled
+single-select that strips a flag family** (Nemotron3's "KV Cache DType",
+mamba `--mamba-scheduler-strategy`, …) fits the merged generic **`flagSelects`**
+axis — so it too is config-only (declare a `flagSelects` list). Only a control
+whose *shape* `flagSelects` still can't express would need a ONE-TIME generic
+primitive (never a model-named handler) on a separate PRIOR engine PR, keeping
+the migration PR data-only (hard rule 4, engine-axis.md). The strategy count follows the page's
 operating points: **one recipe → a single `balanced`; two → `low-latency` +
 `high-throughput`; three → the full trio (the ideal)**. The tiers apply per
 (hw × variant × quant) combination — a single-recipe combination on a

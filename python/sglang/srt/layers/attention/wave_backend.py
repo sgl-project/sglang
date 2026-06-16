@@ -284,23 +284,6 @@ class WaveAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
-        elif forward_batch.forward_mode.is_draft_extend():
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    self.req_to_token,
-                )
-            )
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accept_tokens_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0

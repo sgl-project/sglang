@@ -1,4 +1,5 @@
 import functools
+import logging
 import math
 from typing import Tuple
 
@@ -11,7 +12,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
+logger = logging.getLogger(__name__)
+
 tilelang.set_log_level("WARNING")
+
+# Set once mhc_pre() has compiled every n_splits bucket at startup.
+_mhc_pre_warmed = False
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -450,6 +456,65 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """One representative token count per distinct mhc_pre n_splits bucket over
+    [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    reps = {}
+    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+    return tuple(sorted(reps.values()))
+
+
+def _prewarm_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+    n_splits_pre: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+):
+    """Compile the prenorm kernel for every n_splits bucket by replaying the
+    prenorm with the call's real weights. The compiled kernels are written to
+    the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
+    cache; later server runs hit the cache. Runs once (gated in mhc_pre)."""
+    from sglang.srt.server_args import get_global_server_args
+
+    hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+    max_num_tokens = get_global_server_args().chunked_prefill_size
+    buckets = get_mhc_pre_token_count_representatives(
+        max_num_tokens, hc_mult * hidden_size
+    )
+
+    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    with torch.inference_mode():
+        for num_tokens in buckets:
+            _mhc_pre_impl(
+                residual.new_zeros(num_tokens, hc_mult, hidden_size),
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                n_splits_pre,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -638,7 +703,64 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # One-shot startup prewarm: on the first non-capturing call, compile every
+    # n_splits bucket up front so it isn't JIT-compiled lazily on the first
+    # prefill. Replays the prenorm via _mhc_pre_impl (no re-entry into mhc_pre).
+    global _mhc_pre_warmed
+    if (
+        not _mhc_pre_warmed
+        and envs.SGLANG_DSV4_MHC_PREWARM.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _mhc_pre_warmed = True
+        _prewarm_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            n_splits_pre,
+            norm_weight,
+            norm_eps,
+        )
+    return _mhc_pre_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        n_splits_pre,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
 
+
+def _mhc_pre_impl(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    n_splits_pre: int = 32,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
