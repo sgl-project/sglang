@@ -8,7 +8,7 @@
 # correctly invalidates the clone layer when the branch HEAD moves.
 # (Official release builds use --no-cache and don't need this.)
 #   docker build --build-arg SGL_BRANCH=main \
-#     --build-arg SGL_COMMIT=$(git ls-remote https://github.com/sgl-project/sglang.git main | cut -f1) \
+#     --build-arg SGL_COMMIT=$(git ls-remote https://github.com/sgl-project/sglang.git refs/heads/main | cut -f1) \
 #     --build-arg GPU_ARCH=gfx942 -t sglang-rocm-pinned -f rocm.Dockerfile .
 # Note: passing SGL_COMMIT pins to a detached HEAD; this is expected for reproducible builds.
 
