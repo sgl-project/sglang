@@ -135,10 +135,8 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional[QuantizationConfig] = None, use_unquantized: bool = False):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
-        self.use_unquantized = use_unquantized
-        # Only keep the quant kernel if needed
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # ----- 1. Quantized path (as before) -----
