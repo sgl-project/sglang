@@ -132,9 +132,9 @@ class PositionAcceptanceTracker:
         # p[i] = p[0] * alpha^i  ⟹  alpha = (p[N-1] / p[0])^(1/(N-1))
         p0, pn = known_rates[0], known_rates[-1]
         if p0 <= 0:
-            return None
+            return 0.0
         alpha = (pn / p0) ** (1.0 / (len(known_rates) - 1))
-        return known_rates[-1] * alpha
+        return max(0.0, min(pn, known_rates[-1] * alpha))
 
 
 class BatchSizeCostTable:
