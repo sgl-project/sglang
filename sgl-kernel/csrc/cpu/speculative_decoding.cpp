@@ -387,6 +387,97 @@ void assign_extend_cache_locs_cpu(
   });
 }
 
+void reconstruct_indices_from_tree_mask_cpu(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    int64_t batch_size,
+    int64_t draft_token_num) {
+  TORCH_CHECK(tree_mask.is_contiguous(), "tree_mask must be contiguous");
+  TORCH_CHECK(verified_seq_len.is_contiguous(), "verified_seq_len must be contiguous");
+  TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
+  TORCH_CHECK(retrive_index.is_contiguous(), "retrive_index must be contiguous");
+  TORCH_CHECK(retrive_next_token.is_contiguous(), "retrive_next_token must be contiguous");
+  TORCH_CHECK(retrive_next_sibling.is_contiguous(), "retrive_next_sibling must be contiguous");
+
+  TORCH_CHECK(tree_mask.scalar_type() == at::kBool, "tree_mask must be bool");
+
+  auto* mask_ptr = tree_mask.data_ptr<bool>();
+  auto* seq_len_ptr = verified_seq_len.data_ptr<int64_t>();
+  auto* pos_ptr = positions.data_ptr<int64_t>();
+  auto* ri_ptr = retrive_index.data_ptr<int64_t>();
+  auto* rnt_ptr = retrive_next_token.data_ptr<int64_t>();
+  auto* rns_ptr = retrive_next_sibling.data_ptr<int64_t>();
+
+  int64_t base_offset = draft_token_num * draft_token_num;
+
+  at::parallel_for(0, batch_size * draft_token_num, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t idx = begin; idx < end; ++idx) {
+      int64_t bid = idx / draft_token_num;
+      int64_t tid = idx % draft_token_num;
+
+      int64_t token_idx = bid * draft_token_num;
+      int64_t tree_mask_offset = bid * base_offset;
+
+      // Step 1: depth and parent via backward scan
+      int64_t depth = 0;
+      int64_t parent_idx = -1;
+      for (int64_t i = tid - 1,
+                   start_idx = tree_mask_offset + tid * draft_token_num;
+           i >= 0; --i) {
+        if (mask_ptr[start_idx + i]) {
+          depth++;
+          if (parent_idx == -1) {
+            parent_idx = i;
+          }
+        }
+      }
+
+      // Step 2: retrive_index (identity)
+      ri_ptr[token_idx + tid] = token_idx + tid;
+
+      // Step 3: position = depth + verified_seq_len
+      pos_ptr[token_idx + tid] = depth + seq_len_ptr[bid];
+
+      // Step 4: first child (next_token)
+      int64_t next_token_idx = -1;
+      for (int64_t i = tid + 1; i < draft_token_num; ++i) {
+        if (mask_ptr[tree_mask_offset + i * draft_token_num + tid]) {
+          next_token_idx = i;
+          break;
+        }
+      }
+      rnt_ptr[token_idx + tid] = next_token_idx;
+
+      // Step 5: next sibling (shares parent, no intervening ancestors)
+      int64_t next_sibling_idx = -1;
+      if (parent_idx != -1) {
+        for (int64_t i = tid + 1; i < draft_token_num; ++i) {
+          int64_t si = tree_mask_offset + i * draft_token_num + parent_idx;
+          if (mask_ptr[si]) {
+            bool is_sibling = true;
+            int64_t ei = tree_mask_offset + i * draft_token_num + i;
+            for (int64_t j = si + 1; j < ei; ++j) {
+              if (mask_ptr[j]) {
+                is_sibling = false;
+                break;
+              }
+            }
+            if (is_sibling) {
+              next_sibling_idx = i;
+              break;
+            }
+          }
+        }
+      }
+      rns_ptr[token_idx + tid] = next_sibling_idx;
+    }
+  });
+}
+
 void rotate_input_ids_cpu(
     at::Tensor input_ids,
     const at::Tensor& extend_start_loc,

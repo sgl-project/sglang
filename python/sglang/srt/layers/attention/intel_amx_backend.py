@@ -159,14 +159,17 @@ class IntelAMXAttnBackend(AttentionBackend):
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
                 )
                 seq_lens = forward_batch.seq_lens + draft_token_num
-                # EAGLE topk > 1 verifies a token tree: each draft token may only
-                # attend to its ancestors among the draft tokens (the committed
-                # prefix stays fully visible). spec_info.custom_mask is built with
-                # TreeMaskMode.QLEN_ONLY on CPU: a flat
-                # [bs * draft_token_num * draft_token_num] bool tensor.
-                # topk == 1 is a chain, which equals the kernel's built-in causal
-                # masking, so no mask is passed (same for non-spec extend).
-                if getattr(spec_info, "topk", 1) > 1:
+                # Speculative verify with a token tree: each draft token may
+                # only attend to its ancestors among the draft tokens (the
+                # committed prefix stays fully visible).
+                #
+                # tree_topk == 1 means a simple chain, which equals the
+                # kernel's built-in causal masking, so no explicit mask is
+                # needed.  EAGLE has tree_topk == topk (>1 for trees); NGRAM
+                # has tree_topk == -1 (irregular tree).
+                topk = getattr(spec_info, "topk", 1)
+                tree_topk = getattr(spec_info, "tree_topk", topk)
+                if tree_topk != 1:
                     custom_mask = getattr(spec_info, "custom_mask", None)
                     if custom_mask is not None and custom_mask.numel() > 0:
                         tree_mask = custom_mask
