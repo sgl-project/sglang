@@ -36,6 +36,7 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
 # Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: AITER indexer + triton attn + ROCm700A).
 COMMON_ENV_VARS = {
@@ -46,7 +47,7 @@ COMMON_ENV_VARS = {
     "SGLANG_USE_ROCM700A": "1",
     "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
     "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
+    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "SGLANG_OPT_FP8_WO_A_GEMM": "false",
     "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
     "SGLANG_OPT_USE_TOPK_V2": "false",
@@ -128,7 +129,7 @@ class TestDeepseekV4ProFp4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-pro-fp4)\n"
+                f"### test_gsm8k (deepseek-v4-pro-fp4, {FLASHMLA_BACKEND})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.92)
@@ -187,7 +188,7 @@ class TestDeepseekV4ProFp4(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            "### test_perf_8k_1k (deepseek-v4-pro-fp4)",
+            f"### test_perf_8k_1k (deepseek-v4-pro-fp4, {FLASHMLA_BACKEND})",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",
