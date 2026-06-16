@@ -870,6 +870,9 @@ class Envs:
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
     SGLANG_DISABLE_MSA = EnvBool(False)
+    # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
+    SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+    SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

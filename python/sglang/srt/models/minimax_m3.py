@@ -109,6 +109,10 @@ _FP8_KV_DTYPES = (
     torch.float8_e4m3fnuz,
 )
 
+# rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
+# equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
+_M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
+
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
@@ -242,7 +246,6 @@ class MiniMaxM3MLP(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
@@ -291,7 +294,6 @@ class MiniMaxM3MLP(nn.Module):
     def forward(
         self,
         x,
-        forward_batch=None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
@@ -377,7 +379,6 @@ class MiniMaxM3MoE(nn.Module):
             shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
-                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
@@ -555,7 +556,6 @@ class MiniMaxM3Attention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
-        self.attention_output_gate = getattr(config, "attention_output_gate", False)
 
         # Sparse-attention-specific config (read from sparse_attention_config).
         # Only the index-branch dimensions are needed at module level; all
@@ -565,9 +565,6 @@ class MiniMaxM3Attention(nn.Module):
                 f"sparse attention only supports qk_norm_type='per_head', "
                 f"got {self.qk_norm_type!r}"
             )
-            assert (
-                not self.attention_output_gate
-            ), "sparse attention does not support attention_output_gate"
             sparse_cfg = config.sparse_attention_config
             self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
             self.idx_head_dim = sparse_cfg["sparse_index_dim"]
@@ -589,7 +586,7 @@ class MiniMaxM3Attention(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
-            self.total_num_heads * (1 + self.attention_output_gate),
+            self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
@@ -730,7 +727,7 @@ class MiniMaxM3Attention(nn.Module):
         # Fused GemmaRMSNorm + partial NeoX RoPE (minimax_qknorm_rope) is a CUDA
         # JIT kernel, valid only for the exact verified config: per-head gemma
         # norm, head_dim=128, rotary_dim=64 (so rotary_dim/2 == warpSize), NeoX
-        # style, no output gate. Everything else (incl. ROCm) falls back to the
+        # style. Everything else (incl. ROCm) falls back to the
         # _qk_norm_rope path. The fp32 cos_sin_cache requirement is re-checked at
         # call time.
         self._use_fused_qknorm_rope = (
@@ -739,8 +736,7 @@ class MiniMaxM3Attention(nn.Module):
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and self.head_dim == 128
-            and self.rotary_dim == 64
-            and not self.attention_output_gate
+            and self.rotary_dim == _M3_FUSED_QKNORM_ROPE_ROTARY_DIM
             and getattr(self.rotary_emb, "is_neox_style", False)
         )
 
@@ -754,7 +750,7 @@ class MiniMaxM3Attention(nn.Module):
         )
         self._fused_qkv_index = None
         # Per-token main width (q | k | v), in elements; index columns follow it
-        # in the fused output. Sparse layers never use the attention output gate.
+        # in the fused output.
         self._fused_main_size = self.q_size + 2 * self.kv_size
 
         # A single combined GemmaRMSNorm+RoPE launch over the fused output (main
@@ -787,7 +783,6 @@ class MiniMaxM3Attention(nn.Module):
             _has_rocm_qk_norm_rope
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
-            and not self.attention_output_gate
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
             and hasattr(self.rotary_emb, "cos_sin_cache")
             and self.rotary_emb.rotary_dim == self.rotary_dim
@@ -1150,26 +1145,12 @@ class MiniMaxM3Attention(nn.Module):
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 idx_qkv = fused_out[:, self._fused_main_size :]
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
-                inner_state = (q, k, v, None, idx_q, idx_k, idx_v, forward_batch)
+                inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
                 return None, forward_batch, inner_state
         else:
             qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attention_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(
-                *orig_shape, -1, self.num_heads_per_group, self.head_dim
-            )
-            q = q_gate[..., ::2, :, :]
-            gate = q_gate[..., 1::2, :, :]
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
-            q, k = self._qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
-        elif self._use_fused_qknorm_rope:
+        if self._use_fused_qknorm_rope:
             # Fused per-head GemmaRMSNorm + partial NeoX RoPE, in place on qkv.
             from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
 
@@ -1185,11 +1166,9 @@ class MiniMaxM3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            gate = None
             main_qk_already_normed = True
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            gate = None
             main_qk_already_normed = False
 
         if self.is_sparse_attention_layer:
@@ -1241,18 +1220,18 @@ class MiniMaxM3Attention(nn.Module):
                     positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
                 )
 
-            inner_state = (q, k, v, gate, idx_q, idx_k, idx_v, forward_batch)
+            inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
         else:
             if not main_qk_already_normed:
                 q, k = self._qk_norm_rope(positions, q, k)
-            inner_state = (q, k, v, gate, forward_batch)
+            inner_state = (q, k, v, forward_batch)
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         _, _, inner_state = intermediate_state
 
         if self.is_sparse_attention_layer:
-            q, k, v, gate, idx_q, idx_k, idx_v, forward_batch = inner_state
+            q, k, v, idx_q, idx_k, idx_v, forward_batch = inner_state
             # The sparse attention backend expects 3D shapes; the dense
             # backend accepts 2D q (it reshapes k/v internally). The shapes
             # are equivalent flat-vs-grouped views, see RadixAttention.forward.
@@ -1282,11 +1261,8 @@ class MiniMaxM3Attention(nn.Module):
             idx_output, _ = self.index_o_proj(idx_o)
             return output + idx_output
 
-        q, k, v, gate, forward_batch = inner_state
+        q, k, v, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
-        if self.attention_output_gate:
-            gate = torch.sigmoid(gate.float())
-            attn_output = (attn_output * gate).to(attn_output.dtype)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1375,7 +1351,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = MiniMaxM3MLP(
                 config=config,
-                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 intermediate_size=config.dense_intermediate_size,
@@ -1690,7 +1665,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.num_fused_shared_experts = self.config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
+        ), "Only 1 fused shared expert is supported for MiniMax-M3"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
@@ -1720,7 +1695,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # _print_tensor_info(input_ids, "input_ids")
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )

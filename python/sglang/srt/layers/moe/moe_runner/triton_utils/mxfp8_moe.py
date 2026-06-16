@@ -16,21 +16,17 @@ gather, a materialized intermediate, a separate activation quant, and a
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
 from sglang.srt.layers.quantization.mxfp8_native import mxfp8_e4m3_quantize
-
-
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 @triton.jit
@@ -260,7 +256,6 @@ def fused_moe_mxfp8_native(
     alpha: float,
     beta: float,
     limit: Optional[float],
-    global_num_experts: int,
     no_combine: bool = False,
     expert_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -308,7 +303,7 @@ def fused_moe_mxfp8_native(
         a_div=top_k,
     )  # [M, 2I]
 
-    if _env_enabled("SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8"):
+    if envs.SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get():
         # SwiGLU-OAI (split layout) + MiniMax MXFP8 quant in one kernel, fp32 all
         # the way to the E8M0 scale (no bf16 activation round-trip; matches the
         # vLLM/ame fused kernel). Opt-in until full-model accuracy is re-qualified.
@@ -355,7 +350,7 @@ def fused_moe_mxfp8_native(
         mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
     )  # [M, H] == [T*top_k, H]
 
-    if _env_enabled("SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE"):
+    if envs.SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE.get():
         return _combine_topk_routes(g2, T, top_k, H, hidden_states.dtype)
     return g2.view(T, top_k, H).sum(dim=1).to(hidden_states.dtype)
 
@@ -406,6 +401,7 @@ def fused_experts_mxfp8(
             "native MXFP8 MoE expects uninterleaved (split) gate/up layout."
         )
 
+    # SwiGLU-OAI default activation alpha (gpt-oss); M3 may override via gemm1_alpha.
     alpha = 1.702 if gemm1_alpha is None else float(gemm1_alpha)
     beta = 1.0
     limit = None if gemm1_limit is None else float(gemm1_limit)
@@ -414,7 +410,6 @@ def fused_experts_mxfp8(
     # already folded into topk_weights by the topk kernel; re-applying would
     # double-count it. This matches the prior SGLang MXFP8 behaviour.
 
-    num_experts = w1.shape[0]
     out = fused_moe_mxfp8_native(
         hidden_states,
         w1,
@@ -426,7 +421,6 @@ def fused_experts_mxfp8(
         alpha=alpha,
         beta=beta,
         limit=limit,
-        global_num_experts=num_experts,
         no_combine=no_combine,
         expert_map=expert_map,
     )

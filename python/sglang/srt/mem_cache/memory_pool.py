@@ -1584,7 +1584,7 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         # No-op pool keeps tiny NHD placeholders regardless of SGLANG_USE_HND_KVCACHE
         # (no real KV is stored), so force NHD here to keep the store/move fast paths.
         self.use_hnd = False
-        self.kv_cache_layout = "NHD"
+        self.kv_cache_layout = "nhd"
         # Allocate minimal placeholder buffers. They exist purely so that code
         # paths holding `k_buffer` / `v_buffer` references (pointer tables,
         # layer-transfer counters, stride arithmetic) keep working without

@@ -134,7 +134,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
-        if get_global_server_args().disable_shared_experts_fusion:
+        server_args = get_global_server_args()
+        if server_args.disable_shared_experts_fusion:
             return
 
         disable_reason = None
@@ -142,7 +143,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             disable_reason = "No shared experts are defined in the config."
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
+        elif (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = (
@@ -156,7 +157,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
 
         if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
+            server_args.disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

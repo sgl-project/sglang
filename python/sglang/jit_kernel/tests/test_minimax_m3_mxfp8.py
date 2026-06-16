@@ -191,7 +191,6 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
         alpha=alpha,
         beta=beta,
         limit=limit,
-        global_num_experts=E,
     )
     # Reference consumes the dequantized weights (same bits the kernel reads).
     w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
@@ -210,7 +209,7 @@ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
 
     torch.manual_seed(0)
     T, H, inter = 4, 256, 512
-    local_E, global_E = 3, 6
+    local_E = 3
     alpha, beta, limit = 1.702, 1.0, 7.0
 
     w13_bf16 = (
@@ -249,7 +248,6 @@ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
         alpha=alpha,
         beta=beta,
         limit=limit,
-        global_num_experts=global_E,
         expert_map=expert_map,
     )
 

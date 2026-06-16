@@ -177,7 +177,6 @@ if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
     try:
-        # from sgl_kernel import topk_sigmoid
         from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
     except ImportError:
         pass

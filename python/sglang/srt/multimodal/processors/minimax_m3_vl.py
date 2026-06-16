@@ -22,6 +22,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import round_up
 
 
 def get_hw_multiple_of(
@@ -48,20 +49,14 @@ def get_hw_multiple_of(
         max_dim = max(w, h)
         if max_dim > max_size:
             ratio = max_size / max_dim
-        new_w = round(w * ratio)
-        new_h = round(h * ratio)
-        # ceil-align to multiple
-        new_w = (
-            new_w if new_w % multiple == 0 else new_w + (multiple - new_w % multiple)
-        )
-        new_h = (
-            new_h if new_h % multiple == 0 else new_h + (multiple - new_h % multiple)
-        )
+        # ceil-align the rounded dims to the patch multiple
+        new_w = round_up(round(w * ratio), multiple)
+        new_h = round_up(round(h * ratio), multiple)
         return new_w, new_h
 
     # Round up to nearest multiple
-    new_w = w if w % multiple == 0 else w + (multiple - w % multiple)
-    new_h = h if h % multiple == 0 else h + (multiple - h % multiple)
+    new_w = round_up(w, multiple)
+    new_h = round_up(h, multiple)
 
     if max_size is not None:
         assert isinstance(max_size, (list, tuple)) and len(max_size) == 2

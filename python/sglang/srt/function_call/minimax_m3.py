@@ -465,8 +465,8 @@ class MinimaxM3Detector(BaseFormatDetector):
         if schema_types & STRING_TYPES and not null_permitted:
             return value
 
-        # Only exact-case null literals become JSON null, and only when the schema
-        # is nullable. "none"/"nil" are valid strings and must never be coerced.
+        # Nullable schema: coerce exact-case null literals (NULL_STRINGS) and the
+        # empty string to JSON null. "none"/"nil" are valid strings, never coerced.
         if null_permitted:
             if value in NULL_STRINGS:
                 return None
