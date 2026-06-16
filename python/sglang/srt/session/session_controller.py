@@ -188,14 +188,21 @@ class Session:
                             ]
 
             if self.streaming:
+                max_new_tokens = last_req.sampling_params.max_new_tokens
                 output_len = len(last_req.token_buf) - last_req.origin_input_len
+                kept_output = to_array(last_req.output_ids[:max_new_tokens])
+
                 reuse_buf = last_req.token_buf
                 reuse_buf.truncate(
-                    last_req.origin_input_len
-                    + min(last_req.sampling_params.max_new_tokens, output_len)
+                    last_req.origin_input_len + min(max_new_tokens, output_len)
                 )
                 reuse_buf.extend(req.input_ids)
                 input_ids = req.input_ids
+
+                reuse_unpadded = last_req.origin_input_ids_unpadded
+                reuse_unpadded.extend(kept_output)
+                reuse_unpadded.extend(req.input_ids)
+                input_ids_unpadded = reuse_unpadded
             else:
                 input_ids = to_array(last_req.origin_input_ids) + to_array(
                     last_req.output_ids[: last_req.sampling_params.max_new_tokens]
@@ -209,18 +216,18 @@ class Session:
                 else:
                     input_ids += req.input_ids
 
-            input_ids_unpadded = last_req.origin_input_ids_unpadded + to_array(
-                last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
-            if session_params.drop_previous_output:
-                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
+                input_ids_unpadded = last_req.origin_input_ids_unpadded + to_array(
+                    last_req.output_ids[: last_req.sampling_params.max_new_tokens]
                 )
-            else:
-                input_ids_unpadded += req.input_ids
+                if session_params.drop_previous_output:
+                    input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+
+                if session_params.offset and session_params.offset != 0:
+                    input_ids_unpadded = (
+                        input_ids_unpadded[: session_params.offset] + req.input_ids
+                    )
+                else:
+                    input_ids_unpadded += req.input_ids
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
