@@ -43,7 +43,14 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     enable_breakable_cuda_graph,
 )
 
-logger = logging.getLogger(__name__)
+# Log under the multimodal_gen namespace so the diffusion server's logging
+# config (which configures sglang.multimodal_gen.* at INFO and writes them to
+# the server log) surfaces the "[Diffusion BCG] captured ..." lines. A plain
+# __name__ logger lives under sglang.srt.* and is not written to the diffusion
+# server log, which would hide BCG capture/eviction diagnostics.
+logger = logging.getLogger(
+    "sglang.multimodal_gen.runtime.breakable_cuda_graph_runner"
+)
 
 
 def _env_int(name: str, default: int) -> int:
