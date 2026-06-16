@@ -417,6 +417,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    def _forward_shared_experts_deferred_gate(self, hidden_states: torch.Tensor):
+        """Compute the ungated shared-expert output and the raw gate logits.
+
+        Returns ``(shared_output, gate)`` so that the sigmoid gate, broadcast
+        multiply, and the residual add into the router output can be fused into a
+        single Triton kernel (see ``sigmoid_gate_mul_broadcast_add``). Only used
+        on the AMD AITER path where ``shared_expert_gate`` is a plain Linear.
+        """
+        shared_output = self.shared_expert(hidden_states)
+        gate = self.shared_expert_gate(hidden_states)
+        return shared_output, gate
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         enable_dual_stream = (
             is_npu()
@@ -517,6 +529,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
+        # Fuse sigmoid-gate + broadcast-mul + residual add into one Triton kernel
+        # on the AITER path. Only valid when the shared expert + gate exist and we
+        # are on the single-stream (non capture-mode) path; deepep and dual-stream
+        # have their own shared-output handling.
+        fuse_shared_gate_add = (
+            _use_aiter
+            and hidden_states.shape[0] != 0
+            and self.shared_expert is not None
+            and self.shared_expert_gate is not None
+            and not use_intel_amx_backend(self.shared_expert_gate)
+            and not (self.alt_stream is not None and get_is_capture_mode())
+        )
+
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -528,6 +553,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
             )
+        elif fuse_shared_gate_add:
+            shared_output_pre_gate, shared_gate = (
+                self._forward_shared_experts_deferred_gate(hidden_states)
+            )
+            final_hidden_states = self._forward_router_experts(hidden_states)
+            # Fused: final_hidden_states += shared_output_pre_gate * sigmoid(gate)
+            from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                sigmoid_gate_mul_broadcast_add,
+            )
+
+            final_hidden_states = sigmoid_gate_mul_broadcast_add(
+                final_hidden_states, shared_output_pre_gate, shared_gate
+            )
+            shared_output = None
         else:
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)

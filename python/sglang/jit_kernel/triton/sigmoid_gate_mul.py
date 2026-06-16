@@ -85,3 +85,59 @@ def sigmoid_gate_mul_broadcast(x: torch.Tensor, gate: torch.Tensor) -> torch.Ten
         num_warps=num_warps,
     )
     return out
+
+
+@triton.jit
+def _sigmoid_gate_mul_broadcast_add_kernel(
+    acc_ptr,
+    gate_ptr,
+    x_ptr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    g = tl.load(gate_ptr + row).to(tl.float32)
+    g = tl.sigmoid(g)
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_dim
+    idx = row * hidden_dim + offs
+    x = tl.load(x_ptr + idx, mask=mask).to(tl.float32)
+    acc = tl.load(acc_ptr + idx, mask=mask).to(tl.float32)
+    out = acc + x * g
+    tl.store(
+        acc_ptr + idx,
+        out.to(acc_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def sigmoid_gate_mul_broadcast_add(
+    acc: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Fused ``acc += x * sigmoid(gate)`` (gate is ``(N, 1)``, x/acc are ``(N, D)``).
+
+    Computes the shared-expert sigmoid gate, the broadcast multiply, and the
+    residual add into ``acc`` in a single Triton kernel. ``acc`` is updated
+    in-place and also returned.
+    """
+    bs, hidden_dim = x.shape
+    # The kernel addresses both tensors row-major; ensure contiguity.
+    if not acc.is_contiguous():
+        acc = acc.contiguous()
+    if not x.is_contiguous():
+        x = x.contiguous()
+    BLOCK_SIZE = triton.next_power_of_2(hidden_dim)
+    max_warps = 16 if _is_hip else 32
+    num_warps = max(
+        min(triton.next_power_of_2(triton.cdiv(hidden_dim, 8 * 32)), max_warps), 4
+    )
+    _sigmoid_gate_mul_broadcast_add_kernel[(bs,)](
+        acc,
+        gate,
+        x,
+        hidden_dim=hidden_dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return acc
