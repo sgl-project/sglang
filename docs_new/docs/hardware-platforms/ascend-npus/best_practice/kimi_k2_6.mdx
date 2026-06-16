@@ -29,6 +29,8 @@ This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 
 ## Optimal Configuration
 
+<a id="multi-node" title="Referenced by external docs. Verify before removing."></a>
+
 ### Kimi-K2.6 W4A8 16P IN64K OUT1K 100ms
 
 **Model**: Kimi-K2.6
@@ -131,6 +133,8 @@ python -m sglang.bench_serving \
     --num-prompts 32 \
     --random-range-ratio 1
 ```
+
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
 ### Kimi-K2.6 W4A8 1P1D 16P IN128K OUT1K 100ms
 

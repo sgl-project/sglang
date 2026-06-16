@@ -154,6 +154,21 @@ with limited hardware resources. This scenario is already covered in the best pr
 deployment commands and benchmark data, see
 [Kimi K2.6 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6#single-node).
 
+### Multi-node online deployment
+
+Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism while keeping
+prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
+node can provide. This scenario is already covered in the best practice. For the complete, optimized
+deployment commands and benchmark data, see
+[Kimi-K2.6 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6#multi-node).
+
+### Multi-node PD disaggregation deployment
+
+PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
+throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
+deployment commands and benchmark data, see
+[Kimi-K2.6 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6#pd-disaggregation).
+
 ## Functional verification
 
 After the service is started, you can invoke the model by sending a prompt:
