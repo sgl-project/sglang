@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
+    causal_conv3d_cat_pad,
     chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
@@ -87,11 +88,7 @@ class QwenImageCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        x = causal_conv3d_cat_pad(x, cache_x, padding)
         return super().forward(x)
 
 
