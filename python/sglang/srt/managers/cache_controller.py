@@ -726,9 +726,15 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        # For now, kernel write-back keeps host indices on CPU only for page_first.
+        # More layouts can use this path once their write-back kernels accept CPU
+        # destination indices.
+        if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
+            host_indices, device_indices = op.host_indices, op.device_indices
+        else:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
         self.write_queue.clear()
 
         start_event = device_module.Event()

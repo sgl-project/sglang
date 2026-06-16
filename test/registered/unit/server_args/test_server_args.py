@@ -621,6 +621,14 @@ class TestHiCacheArgs(unittest.TestCase):
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
+                "name": "default_kernel_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
                 "name": "kernel_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -660,8 +668,9 @@ class TestHiCacheArgs(unittest.TestCase):
                     "attention_backend": "triton",
                     "decode_attention_backend": "fa3",
                 },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+                "expected_decode_backend": "fa3",
             },
         ]
 
@@ -673,13 +682,10 @@ class TestHiCacheArgs(unittest.TestCase):
                     args,
                     expected_io_backend=case["expected_io_backend"],
                     expected_mem_layout=case["expected_mem_layout"],
+                    expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
-    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
-    def test_decode_attention_backend_with_implicit_fa3(
-        self, _mock_flashinfer, _mock_use_mla_backend
-    ):
+    def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
@@ -689,7 +695,9 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_hicache()
 
-        self.assertEqual(args.decode_attention_backend, "triton")
+        self.assertEqual(args.hicache_io_backend, "kernel")
+        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertIsNone(args.decode_attention_backend)
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
