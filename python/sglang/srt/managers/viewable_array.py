@@ -17,7 +17,7 @@ def to_array(values: Iterable[int]) -> array:
 
 
 class ViewableArray:
-    __slots__ = ("_data", "_size", "_view")
+    __slots__ = ("_data", "_size", "_view", "_lock_prefix_len")
 
     def __init__(self, init: Optional[Iterable[int]] = None) -> None:
         values: array = array(_TYPECODE) if init is None else to_array(init)
@@ -28,11 +28,14 @@ class ViewableArray:
             self._data[:size] = values
         self._size: int = size
         self._view: memoryview = memoryview(self._data).toreadonly()
+        self._lock_prefix_len: int = 0
 
     def __len__(self) -> int:
         return self._size
 
     def append(self, value: int) -> None:
+        if self._size < self._lock_prefix_len:
+            self._detach_locked_prefix()
         if self._size == len(self._data):
             self._reallocate(self._size + 1)
         self._data[self._size] = value
@@ -43,6 +46,8 @@ class ViewableArray:
         added_size: int = len(materialized)
         if added_size == 0:
             return
+        if self._size < self._lock_prefix_len:
+            self._detach_locked_prefix()
         new_size: int = self._size + added_size
         if new_size > len(self._data):
             self._reallocate(new_size)
@@ -55,7 +60,18 @@ class ViewableArray:
 
     def overwrite(self, index: int, value: int) -> None:
         assert 0 <= index < self._size, (index, self._size)
+        if index < self._lock_prefix_len:
+            self._detach_locked_prefix()
         self._data[index] = value
+
+    def freeze_and_clone(self) -> ViewableArray:
+        self._lock_prefix_len = self._size
+        clone: ViewableArray = ViewableArray.__new__(ViewableArray)
+        clone._data = self._data
+        clone._size = self._size
+        clone._view = memoryview(self._data).toreadonly()
+        clone._lock_prefix_len = self._size
+        return clone
 
     def readonly_view(
         self, start: Optional[int] = None, stop: Optional[int] = None
@@ -76,6 +92,14 @@ class ViewableArray:
     def clone(self) -> ViewableArray:
         return ViewableArray(self.materialize())
 
+    def _detach_locked_prefix(self) -> None:
+        capacity: int = self._capacity_for(self._size)
+        private: array = array(_TYPECODE, bytes(_ITEMSIZE * capacity))
+        private[: self._size] = self._data[: self._size]
+        self._data = private
+        self._view = memoryview(self._data).toreadonly()
+        self._lock_prefix_len = 0
+
     @staticmethod
     def _capacity_for(size: int) -> int:
         capacity: int = _MIN_CAPACITY
@@ -89,3 +113,4 @@ class ViewableArray:
         new_data[: self._size] = self._data[: self._size]
         self._data = new_data
         self._view = memoryview(self._data).toreadonly()
+        self._lock_prefix_len = 0
