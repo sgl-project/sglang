@@ -981,6 +981,7 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
                       "cookbook/autoregressive/GLM/GLM-OCR",

@@ -2562,9 +2562,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._all_component_values_flatten(ComponentType.MAMBA)
 
-    def all_swa_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentType.SWA)
-
     def available_and_evictable_str(self) -> str:
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
@@ -2882,28 +2879,3 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
-
-    def _rebuild_host_leaf_sets(self) -> None:
-        """Rebuild evictable_host_leaves after L1-only reset."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                self._update_evictable_leaf_sets(node)
-            stack.extend(node.children.values())
-
-    def _rebuild_host_lru_lists(self) -> None:
-        """Rebuild host_lru_lists for extra components after L1-only reset.
-        Walks the tree and adds nodes with host component data to the
-        appropriate host LRU list."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                for ct in self.tree_components:
-                    if ct == BASE_COMPONENT_TYPE:
-                        continue  # Full uses evictable_host_leaves, not host LRU
-                    cd = node.component_data[ct]
-                    if cd.host_value is not None:
-                        self.host_lru_lists[ct].insert_mru(node)
-            stack.extend(node.children.values())
