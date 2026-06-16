@@ -17,7 +17,6 @@ on:
   #     - ".github/workflows/pr-test-amd-rocm720.yml"
   #     - "docker/rocm.Dockerfile"
   pull_request:
-    branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -98,6 +97,17 @@ on:
         required: false
         type: boolean
         default: true
+
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720
+# -> pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}

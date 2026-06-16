@@ -25,6 +25,12 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
 )
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
 from sglang.jit_kernel.hicache import (
@@ -69,6 +75,8 @@ logger = logging.getLogger(__name__)
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
 def synchronized(func):
@@ -428,6 +436,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -475,6 +484,28 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator=self.allocator,
         )
         return buffer
+
+    def _init_write_back_staging_buffers(self):
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_k_buffer = None
+        self.staging_v_buffer = None
+        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+            return
+
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_k_buffer = torch.empty(
+            (
+                self.staging_token_capacity,
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
+        self.staging_v_buffer = torch.empty_like(self.staging_k_buffer)
 
     @property
     def k_buffer(self):
@@ -631,18 +662,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
-                    # Use transposed data ptrs so the kernel writes to
-                    # [layer, page, item] view with stride layout_dim per token.
-                    jit_transfer_hicache_all_layer(
-                        k_ptr_dst=self.k_data_ptrs,
-                        v_ptr_dst=self.v_data_ptrs,
-                        indices_dst=host_indices,
+                    jit_transfer_hicache_all_layer_staged_lf_pf(
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
-                        indices_src=device_indices,
-                        kv_cache_src_stride_bytes=self.token_stride_size,
-                        kv_cache_dst_stride_bytes=self.layout_dim,
-                        element_size=self.element_dim * self.dtype.itemsize,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        staging_k=self.staging_k_buffer,
+                        staging_v=self.staging_v_buffer,
+                        dst_k=self.k_buffer,
+                        dst_v=self.v_buffer,
+                        page_size=self.page_size,
                     )
                 else:
                     transfer_kv_all_layer_lf_pf(
@@ -1194,6 +1223,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self._init_write_back_staging_buffers()
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -1288,6 +1318,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             allocator=self.allocator,
         )
         return buffer
+
+    def _init_write_back_staging_buffers(self):
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_buffer = None
+        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+            return
+
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_buffer = torch.empty(
+            (
+                self.staging_token_capacity,
+                self.layer_num,
+                1,
+                self.kv_cache_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -1398,14 +1448,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
-                    jit_transfer_hicache_all_layer_mla(
-                        ptr_dst=self.data_ptrs,
-                        indices_dst=host_indices,
+                    jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
-                        indices_src=device_indices,
-                        cache_src_stride_bytes=self.token_stride_size,
-                        cache_dst_stride_bytes=self.layout_dim,
-                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        staging=self.staging_buffer,
+                        dst=self.kv_buffer,
+                        page_size=self.page_size,
                     )
                 else:
                     transfer_kv_all_layer_mla_lf_pf(

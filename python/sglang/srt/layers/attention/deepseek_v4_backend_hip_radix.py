@@ -93,6 +93,59 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
 
 
 @dataclass
+class UnifiedKvMetadata:
+    """
+    unified-kv per-forward metadata
+    """
+
+    # SWA ring write target (req_slot*ring + pos%ring)
+    swa_loc: Optional[torch.Tensor] = None
+
+    # ragged decode index streams
+    swa_indices: Optional[torch.Tensor] = None
+    swa_indptr: Optional[torch.Tensor] = None
+    hca_indices: Optional[torch.Tensor] = None
+    hca_indptr: Optional[torch.Tensor] = None
+    csa_indices: Optional[torch.Tensor] = None
+    csa_indptr: Optional[torch.Tensor] = None
+
+    # prefill/extend per-token mapping
+    pf_state_slot: Optional[torch.Tensor] = None
+    pf_chunk_start: Optional[torch.Tensor] = None
+    pf_cu_q: Optional[torch.Tensor] = None
+    pf_final_pos: Optional[torch.Tensor] = None
+
+    # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
+    # precomputed once per step to drop the per-layer int add in the store path.
+    c4_out_loc: Optional[torch.Tensor] = None
+    c128_out_loc: Optional[torch.Tensor] = None
+
+    def copy_(self, other: UnifiedKvMetadata) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "c4_out_loc",
+                "c128_out_loc",
+            ],
+            # swa_loc is recomputed each forward (recorded inside cuda graphs),
+            # so it is rebound rather than copied across replays.
+            assign_fields=["swa_loc"],
+        )
+
+
+@dataclass
 class DSV4AttnMetadata:
     page_size: int
     page_table: torch.Tensor
@@ -122,22 +175,8 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
-    # unified_kv: per-forward prebuilt ragged decode index
-    # SWA ring write target (req_slot*ring + pos%ring), computed once per
-    # forward in _attach_unified_kv_decode_streams, read by every layer's store.
-    unified_swa_loc: Optional[torch.Tensor] = None
-    unified_swa_indices: Optional[torch.Tensor] = None
-    unified_swa_indptr: Optional[torch.Tensor] = None
-    unified_hca_indices: Optional[torch.Tensor] = None
-    unified_hca_indptr: Optional[torch.Tensor] = None
-    unified_csa_indices: Optional[torch.Tensor] = None
-    unified_csa_indptr: Optional[torch.Tensor] = None
-
-    # unified_kv: per-forward prefill/extend per-token mapping
-    unified_pf_state_slot: Optional[torch.Tensor] = None
-    unified_pf_chunk_start: Optional[torch.Tensor] = None
-    unified_pf_cu_q: Optional[torch.Tensor] = None
-    unified_pf_final_pos: Optional[torch.Tensor] = None
+    # unified-kv metadata
+    unified: Optional[UnifiedKvMetadata] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -184,29 +223,19 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths_raw",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
-                "unified_swa_indices",
-                "unified_swa_indptr",
-                "unified_hca_indices",
-                "unified_hca_indptr",
-                "unified_csa_indices",
-                "unified_csa_indptr",
-                "unified_pf_state_slot",
-                "unified_pf_chunk_start",
-                "unified_pf_cu_q",
-                "unified_pf_final_pos",
+                "unified",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
-                "unified_swa_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
             ],
         )
 
-    def init_compression_metadata(self):
+    def init_compression_metadata(self, unified_swa_pages: int = 0):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -233,6 +262,12 @@ class DSV4AttnMetadata:
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+
+        if unified_swa_pages:
+            if self.unified is None:
+                self.unified = UnifiedKvMetadata()
+            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
+            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -285,7 +320,7 @@ class DSV4AttnMetadata:
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self):
+    def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -307,6 +342,8 @@ class DSV4AttnMetadata:
             device=self.c4_topk_lengths_clamp1.device,
         )
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
+        if is_prefill:
+            self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
@@ -1013,13 +1050,15 @@ class DeepseekV4HipRadixBackend(
 
         pool = self.token_to_kv_pool
         N = core.positions_casual.shape[0]
+        if core.unified is None:
+            core.unified = UnifiedKvMetadata()
         (
-            core.unified_swa_indices,
-            core.unified_swa_indptr,
-            core.unified_hca_indices,
-            core.unified_hca_indptr,
-            core.unified_csa_indices,
-            core.unified_csa_indptr,
+            core.unified.swa_indices,
+            core.unified.swa_indptr,
+            core.unified.hca_indices,
+            core.unified.hca_indptr,
+            core.unified.csa_indices,
+            core.unified.csa_indptr,
         ) = runtime.build_decode_streams(
             state_slot=req_pool_indices[:N],
             positions=core.positions_casual,
@@ -1035,7 +1074,7 @@ class DeepseekV4HipRadixBackend(
         # SWA ring write target, same value for every layer this forward.
         # Decode: N tokens == N reqs, positions already aligned (no repeat).
         req_slot = req_pool_indices[:N].to(torch.int64)
-        core.unified_swa_loc = (
+        core.unified.swa_loc = (
             req_slot * pool.unified_swa_ring_size
             + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
         ).to(torch.int32)
@@ -1061,11 +1100,13 @@ class DeepseekV4HipRadixBackend(
         bid = torch.repeat_interleave(
             torch.arange(bs, device=device, dtype=torch.int64), extend_seq_lens
         )
-        core.unified_pf_state_slot = req_pool_indices[bid]
-        core.unified_pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
+        if core.unified is None:
+            core.unified = UnifiedKvMetadata()
+        core.unified.pf_state_slot = req_pool_indices[bid]
+        core.unified.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
         cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
-        core.unified_pf_cu_q = cu_q_per_req[bid]
-        core.unified_pf_final_pos = (seq_lens - 1)[bid]
+        core.unified.pf_cu_q = cu_q_per_req[bid]
+        core.unified.pf_final_pos = (seq_lens - 1)[bid]
 
     def _forward_unified_kv(
         self,
@@ -1113,15 +1154,16 @@ class DeepseekV4HipRadixBackend(
                     ring_stride=ring_stride,
                     final_pos=positions,
                 )
+            unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
-                kv_indices = core_attn_metadata.unified_swa_indices
-                kv_indptr = core_attn_metadata.unified_swa_indptr
+                kv_indices = unified_metadata.swa_indices
+                kv_indptr = unified_metadata.swa_indptr
             elif compress_ratio == 128:
-                kv_indices = core_attn_metadata.unified_hca_indices
-                kv_indptr = core_attn_metadata.unified_hca_indptr
+                kv_indices = unified_metadata.hca_indices
+                kv_indptr = unified_metadata.hca_indptr
             elif compress_ratio == 4:
-                kv_indices = core_attn_metadata.unified_csa_indices
-                kv_indptr = core_attn_metadata.unified_csa_indptr
+                kv_indices = unified_metadata.csa_indices
+                kv_indptr = unified_metadata.csa_indptr
                 runtime.fill_compress_tail(
                     indices=kv_indices,
                     indptr=kv_indptr,
@@ -1142,10 +1184,53 @@ class DeepseekV4HipRadixBackend(
             )
 
         # prefill / extend
-        state_slot = core_attn_metadata.unified_pf_state_slot
-        chunk_start = core_attn_metadata.unified_pf_chunk_start
-        cu_q = core_attn_metadata.unified_pf_cu_q
-        final_pos = core_attn_metadata.unified_pf_final_pos
+        state_slot = core_attn_metadata.unified.pf_state_slot
+        chunk_start = core_attn_metadata.unified.pf_chunk_start
+        cu_q = core_attn_metadata.unified.pf_cu_q
+        final_pos = core_attn_metadata.unified.pf_final_pos
+
+        # DSA CP (round-robin/interleave): unified_pf_* are built over the GLOBAL
+        # token layout, but under CP each rank owns only 1/cp_size of the queries
+        # (q/positions are local) while kv was all-gathered to the full sequence.
+        # Slice the per-query fields to this rank's tokens so their length matches
+        # the local query count T; values stay global so each local query still
+        # attends over the full all-gathered KV.
+        from sglang.srt.layers.attention.dsa.utils import (
+            is_dsa_prefill_cp_round_robin_split,
+        )
+
+        # NOTE (AMD/HIP only): this whole DSA-CP prefill handling lives in the
+        # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
+        # The NVIDIA path uses DeepseekV4AttnBackend and never reaches here, so
+        # these CP changes do not affect B200/H200 execution.
+        _cp_size = get_attention_cp_size()
+        _cp_active = (
+            _cp_size > 1
+            and is_dsa_prefill_cp_round_robin_split()
+            and kv.shape[0] == _cp_size * T
+            and state_slot.shape[0] != T
+        )
+        state_slot_full = state_slot
+        final_pos_full = final_pos
+        positions_full = positions
+        if _cp_active:
+            _sl = slice(get_attention_cp_rank(), None, _cp_size)
+            state_slot = state_slot[_sl].contiguous()
+            chunk_start = chunk_start[_sl].contiguous()
+            cu_q = cu_q[_sl].contiguous()
+            final_pos = final_pos[_sl].contiguous()
+            # positions for the local queries are this rank's round-robin global
+            # positions {r, r+cp, r+2cp, ...}; forward_batch.positions is the full
+            # (padded) global layout, so slice it the same way instead of taking
+            # the first T entries (which would be the wrong, sequential 0..T-1).
+            positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
+            # The SWA ring must hold the FULL window on EVERY rank (decode and
+            # later chunks read this rank's ring). kv was all-gathered to the full
+            # sequence, so write the full kv with full global positions/state_slot
+            # instead of only this rank's 1/cp_size tokens.
+            positions_full = forward_batch.positions.to(torch.int64)[
+                : state_slot_full.shape[0]
+            ].contiguous()
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -1179,15 +1264,21 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            n_real = state_slot.shape[0]
+            # Under CP, write the FULL all-gathered window so every rank's ring is
+            # complete (decode / later chunks read the local ring). Without CP this
+            # is just the local kv + local metadata as before.
+            _ring_state_slot = state_slot_full if _cp_active else state_slot
+            _ring_final_pos = final_pos_full if _cp_active else final_pos
+            _ring_positions = positions_full if _cp_active else positions
+            n_real = _ring_state_slot.shape[0]
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
-                state_slot=state_slot,
-                positions=positions[:n_real],
+                state_slot=_ring_state_slot,
+                positions=_ring_positions[:n_real],
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=final_pos,
+                final_pos=_ring_final_pos,
             )
         return o
 
@@ -1228,7 +1319,8 @@ class DeepseekV4HipRadixBackend(
         """
         positions = forward_batch.positions
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
-        cached = core.unified_swa_loc if core is not None else None
+        unified = getattr(core, "unified", None) if core is not None else None
+        cached = unified.swa_loc if unified is not None else None
         if (
             cached is not None
             and not forward_batch.forward_mode.is_idle()
@@ -1495,7 +1587,9 @@ class DeepseekV4HipRadixBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata()
+            core_attn_metadata.init_compression_metadata(
+                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+            )
             core_attn_metadata.init_flashmla_related()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
