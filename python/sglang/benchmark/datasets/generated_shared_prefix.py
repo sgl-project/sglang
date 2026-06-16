@@ -55,8 +55,8 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
         assert not getattr(args, "tokenize_prompt", False)
-        group_distribution = args.gsp_group_distribution
-        zipf_alpha = args.gsp_zipf_alpha
+        group_distribution = getattr(args, "gsp_group_distribution", "uniform")
+        zipf_alpha = getattr(args, "gsp_zipf_alpha", None)
 
         # Defensive validation for in-process callers that construct a
         # Namespace by hand and bypass the argparse boundary in

@@ -20,6 +20,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+    SanaWMPipelineConfig,
+    SanaWMRealtimeConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
     TurboWanT2V480PConfig,
@@ -492,6 +496,132 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertFalse(server_args.server_warmup)
 
 
+class TestWarmupModeNormalization(unittest.TestCase):
+    """`_adjust_warmup` resolves the canonical warmup_mode and its derived booleans."""
+
+    def _resolve(
+        self,
+        *,
+        warmup_mode=None,
+        warmup=False,
+        server_warmup=False,
+        warmup_resolutions=None,
+        disagg_role=None,
+        explicit=(),
+    ):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.warmup_mode = warmup_mode
+        sa.warmup = warmup
+        sa.server_warmup = server_warmup
+        sa.warmup_resolutions = warmup_resolutions
+        sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
+        sa._explicit_arg_names = set(explicit)
+        sa._adjust_warmup()
+        return sa
+
+    def test_explicit_mode_off_disables_all(self):
+        sa = self._resolve(warmup_mode="off", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_request(self):
+        sa = self._resolve(warmup_mode="request", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_server(self):
+        sa = self._resolve(warmup_mode="server", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_explicit_mode_overrides_explicit_legacy(self):
+        sa = self._resolve(
+            warmup_mode="request",
+            warmup=True,
+            server_warmup=True,
+            explicit=("warmup_mode", "warmup", "server_warmup"),
+        )
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_legacy_false_beats_defaulted_mode(self):
+        # serve defaults warmup_mode="server" (not explicit); `--warmup false` wins.
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=False,
+            server_warmup=False,
+            explicit=("warmup",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_defaulted_mode_applies_without_legacy_flags(self):
+        # bare `sglang serve`: warmup_mode="server" defaulted, no legacy override.
+        sa = self._resolve(warmup_mode="server")
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_only_maps_to_request(self):
+        sa = self._resolve(warmup_mode=None, warmup=True, explicit=("warmup",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_resolutions_force_warmup_on(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            warmup_resolutions=["512x512"],
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_disagg_role_disables_server_warmup(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(
+            warmup_mode="server",
+            disagg_role=RoleType.DENOISER,
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_invalid_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._resolve(warmup_mode="bogus", explicit=("warmup_mode",))
+
+
+class TestWarmupImageIsModelValid(unittest.TestCase):
+    """The server-warmup placeholder image must be large enough for real pipelines."""
+
+    def test_minimum_warmup_image_is_at_least_64px(self):
+        import base64
+        import struct
+
+        from sglang.multimodal_gen.runtime.server_warmup import (
+            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+        )
+
+        payload = MINIMUM_PICTURE_BASE64_FOR_WARMUP.split(",", 1)[-1]
+        raw = base64.b64decode(payload)
+        self.assertEqual(raw[:8], b"\x89PNG\r\n\x1a\n")
+        # IHDR width/height are the two big-endian uint32 after the chunk header.
+        width, height = struct.unpack(">II", raw[16:24])
+        self.assertGreaterEqual(width, 64)
+        self.assertGreaterEqual(height, 64)
+
+
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(
         self,
@@ -665,6 +795,7 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -685,6 +816,35 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_streaming",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -1345,6 +1505,10 @@ class TestModelIdResolution(unittest.TestCase):
         )
         info = _get_config_info(path)
         self.assertIsNotNone(info)
+
+    def test_sana_wm_model_path_resolves_registry(self):
+        info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
+        self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
 
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection

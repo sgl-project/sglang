@@ -125,7 +125,7 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
 
 def dispatch_experimental_sgl_trtllm_lora(
     dispatch_output, quant_info, base_layer, lora_info
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     """Call the trtllm fused-experts LoRA function for a single layer.
 
     Looked up at call time so the install-time monkey-patch in
