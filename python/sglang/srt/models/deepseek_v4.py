@@ -1019,11 +1019,18 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
-                group_size=128,
-            )
-            o_s = deep_gemm.ceil_to_ue8m0(o_s)
+            # Compute UE8M0 (power-of-2) scale first, then quantize with it.
+            # This matches the official DeepSeek-V4 kernel.py act_quant(scale_fmt="ue8m0")
+            # and avoids the ~14x error amplification from post-hoc ceil_to_ue8m0 rounding.
+            _gs = 128
+            o_flat = o.reshape(T * G, D).contiguous()
+            o_groups = o_flat.float().view(-1, D // _gs, _gs)
+            amax = o_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            _fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            o_s = torch.pow(2.0, torch.ceil(torch.log2(amax / _fp8_max)))
+            o_fp8 = (o_groups / o_s).clamp(-_fp8_max, _fp8_max).to(torch.float8_e4m3fn)
+            o_fp8 = o_fp8.view(T * G, D)
+            o_s = o_s.view(T * G, D // _gs)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
