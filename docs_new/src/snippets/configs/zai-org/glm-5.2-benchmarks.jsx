@@ -5,13 +5,16 @@
 export const benchmarks = [
   // ---- H200 + FP8 ----  (measured on the v0.5.13.post1 release image, flush-cache on every run)
   {
+    // EAGLE MTP 5-1-6 (was 3-1-4): accept ~5.96/6 → +31%/+15% throughput, -25%/-11% TPOT vs 3-1-4.
+    // KV stays bf16 (Hopper auto-default). fp8 KV measured worse on H200 (slower flashmla_kv prefill
+    // + lower decode throughput): conc=1 31 gpu / TTFT 838, conc=16 96 gpu / TTFT 6650.
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.13.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 740, tpot_ms: 4.06, tokens_per_sec_per_gpu: 26 },
+        ttft_ms: 662, tpot_ms: 3.03, tokens_per_sec_per_gpu: 34 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 5980, tpot_ms: 13.97, tokens_per_sec_per_gpu: 98 },
+        ttft_ms: 5080, tpot_ms: 12.44, tokens_per_sec_per_gpu: 113 },
     ],
   },
   {
