@@ -1,0 +1,40 @@
+---
+description: AMD-vs-NV CI coverage dashboard (ROCm/sglang-ci) and how test registration drives it
+globs: .github/workflows/**,test/run_suite.py,test/registered/**,python/sglang/test/ci/**
+alwaysApply: false
+---
+
+# AMD CI Coverage (ROCm/sglang-ci)
+
+AMD-vs-NVIDIA test coverage is tracked by the [ROCm/sglang-ci](https://github.com/ROCm/sglang-ci)
+dashboard, published at <https://rocm.github.io/sglang-ci/>:
+
+- [`/coverage`](https://rocm.github.io/sglang-ci/coverage/) — current AMD vs NV registered-test coverage.
+- `/upstream-ci` — AMD / NV registration-count trends and the per-PR change log.
+
+## How coverage is computed
+
+Coverage comes from `register_cuda_ci(...)` / `register_amd_ci(...)` markers in
+`test/registered/**`, collected by `collect_tests()` (`test/run_suite.py`,
+`python/sglang/test/ci/ci_register.py`). A coverage drop is almost always
+**registration lag** — NV-first tests not yet registered for AMD — not a model
+regression.
+
+## When editing CI / registering tests
+
+- Adding NV tests under `test/registered/**`? Register the **AMD-able** subset too
+  (`register_amd_ci(...)` beside `register_cuda_ci(...)`). In-process / mock-model /
+  unit tests usually run on ROCm (`torch.cuda` maps to HIP); tests that JIT-build
+  CUDA kernels (e.g. kv_canary `e2e`) may fail under `hipcc` — keep those CUDA-only
+  until ported, and register AMD only for tests verified green on mi325.
+- Opt-in (`extra-*`), benchmark, and NV-only-hardware tiers should not be counted as
+  core gating coverage — check the tier before treating a dip as a regression.
+- For tier/gating/schedule mechanics, see the `ci-workflow-guide` skill
+  (`.claude/skills/ci-workflow-guide/SKILL.md`).
+
+## Onboarding workflow (Cursor)
+
+This AMD onboarding is typically done with Cursor agents: open a worktree off latest
+`origin/main`, add `register_amd_ci(...)`, validate with `collect_tests(...)`, then
+open a PR and dispatch the AMD extra workflow (label-gated or `workflow_dispatch`) to
+verify green on mi325 before merge.

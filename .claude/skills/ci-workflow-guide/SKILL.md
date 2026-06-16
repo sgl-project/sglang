@@ -356,6 +356,15 @@ AMD mirror of the CUDA `extra-a` opt-in tier. Key properties:
 
 > AMD-able vs NV-only: in-process / mock-model / unit tests generally run on ROCm (`torch.cuda` maps to HIP). Tests that JIT-build CUDA kernels (e.g. the kv_canary `e2e` suites) may fail under `hipcc` and stay CUDA-only until ported — register AMD only for the subset verified green on mi325.
 
+### Coverage dashboard ([ROCm/sglang-ci](https://github.com/ROCm/sglang-ci))
+
+AMD-vs-NVIDIA registration coverage is tracked by the [ROCm/sglang-ci](https://github.com/ROCm/sglang-ci) dashboard (published at <https://rocm.github.io/sglang-ci/>):
+
+- **[`/coverage`](https://rocm.github.io/sglang-ci/coverage/)** — current AMD vs NV registered-test coverage (the headline % that drops when NV adds tests AMD hasn't registered).
+- **`/upstream-ci`** — AMD / NV registration-count trends over time and the per-PR change log.
+
+Coverage is computed from `register_*_ci(...)` markers collected by `collect_tests()` (`test/run_suite.py` / `ci_register.py`), so a coverage "regression" is usually **registration lag** (NV-first tests not yet onboarded for AMD), not a model regression. When the dashboard dips, check whether NV-only additions landed in `test/registered/**` and onboard the AMD-able subset (see "AMD-able vs NV-only" above). Note that opt-in / benchmark / NV-only-hardware tiers can be over-counted as if they were core gating coverage.
+
 ---
 
 ## Concurrency Control
