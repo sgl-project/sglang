@@ -42,7 +42,8 @@ class NgramVerifyInput(SpecInput):
         self.accept_lens = accept_lens
 
         self.device = (
-            custom_mask.device if custom_mask is not None else new_seq_lens.device
+            custom_mask.device if custom_mask is not None
+            else new_seq_lens.device
         )
 
     @property
