@@ -226,6 +226,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
+        if self.server_args.speculative_use_rejection_sampling:
+            target_vocab_size = self.target_worker.model_config.vocab_size
+            draft_vocab_size = (
+                self.hot_token_id.shape[0]
+                if self.hot_token_id is not None
+                else target_vocab_size
+            )
+            # FIXME: support reduced (hot) draft vocab by scattering draft probs
+            # into the target vocab via the d2t map before the sampling kernel.
+            if draft_vocab_size != target_vocab_size:
+                raise ValueError(
+                    "--speculative-use-rejection-sampling requires the draft and "
+                    f"target to share one vocab, but the draft vocab "
+                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+                )
+
     def init_backends(self):
         with self.draft_tp_context(
             self.draft_runner.tp_group
