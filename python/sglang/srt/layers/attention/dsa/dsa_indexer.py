@@ -545,22 +545,6 @@ class Indexer(MultiPlatformOp):
             and not isinstance(x, tuple)
         )
 
-    def _new_graph_topk_result(
-        self,
-        token_tensor: torch.Tensor,
-        return_indices: bool,
-    ) -> torch.Tensor:
-        if return_indices:
-            return torch.full(
-                (token_tensor.shape[0], self.index_topk),
-                -1,
-                device=token_tensor.device,
-                dtype=torch.int32,
-            )
-        return torch.empty(
-            (0, self.index_topk), device=token_tensor.device, dtype=torch.int32
-        )
-
     def _forward_cuda_graph_dispatch(
         self,
         x: torch.Tensor,
@@ -571,7 +555,17 @@ class Indexer(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         # Reached only via _can_use_graph_dsa_dispatch, which requires a
         # non-tuple `x`, so `x` is the metadata tensor (no separate x_meta).
-        topk_result = self._new_graph_topk_result(x, return_indices)
+        if return_indices:
+            topk_result = torch.full(
+                (x.shape[0], self.index_topk),
+                -1,
+                device=x.device,
+                dtype=torch.int32,
+            )
+        else:
+            topk_result = torch.empty(
+                (0, self.index_topk), device=x.device, dtype=torch.int32
+            )
         graph_dispatch = (
             bcg_dsa_indexer_graph_dispatch
             if is_in_breakable_cuda_graph()
@@ -1811,8 +1805,11 @@ class Indexer(MultiPlatformOp):
                         "Internal error: piecewise/breakable CUDA graph should not "
                         "be enabled with dual stream"
                     )
-                    topk_result = self._new_graph_topk_result(
-                        q_fp8, return_indices=True
+                    topk_result = torch.full(
+                        (q_fp8.shape[0], self.index_topk),
+                        -1,
+                        device=q_fp8.device,
+                        dtype=torch.int32,
                     )
                     k_cache_topk_fn = (
                         bcg_k_cache_and_topk_result
