@@ -901,24 +901,25 @@ class GptOssForCausalLM(nn.Module):
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
 
-    # Regex matching `model.layers.{L}.mlp.experts.{N}.{gate_up_proj|down_proj}.{suffix}`
-    # used by the AMD Quark GPT-OSS per-expert checkpoint layout.
-    _QUARK_EXPERT_PAT = re.compile(
-        r"^(.*\.mlp\.experts)\.(\d+)\.(gate_up_proj|down_proj)\."
-        r"(weight|weight_scale|input_scale|bias)$"
-    )
-
     def _load_weights_quark(self, weights, is_nextn, weight_name_mapping):
+        # Regex matching `model.layers.{L}.mlp.experts.{N}.{gate_up_proj|down_proj}.{suffix}`
+        # used by the AMD Quark GPT-OSS per-expert checkpoint layout.
+        quark_expert_pat = re.compile(
+            r"^(.*\.mlp\.experts)\.(\d+)\.(gate_up_proj|down_proj)\."
+            r"(weight|weight_scale|input_scale|bias)$"
+        )
         quark_experts_weights = []
         normal_weights = []
 
         for name, weight in weights:
-            if self._QUARK_EXPERT_PAT.match(name) is not None:
+            if quark_expert_pat.match(name) is not None:
                 quark_experts_weights.append((name, weight))
             else:
                 normal_weights.append((name, weight))
 
-        quark_loaded = self._load_quark_experts_weights(quark_experts_weights)
+        quark_loaded = self._load_quark_experts_weights(
+            quark_experts_weights, quark_expert_pat
+        )
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
@@ -926,7 +927,7 @@ class GptOssForCausalLM(nn.Module):
             other_loaded_param_names=quark_loaded,
         )
 
-    def _load_quark_experts_weights(self, weights):
+    def _load_quark_experts_weights(self, weights, quark_expert_pat):
         """Copy per-expert Quark MoE tensors into the padded fused buffers.
 
         Quark stores each expert separately:
@@ -976,7 +977,7 @@ class GptOssForCausalLM(nn.Module):
             # Quark stores experts separately as
             # `experts.{N}.{gate_up_proj|down_proj}.{suffix}`; pull the
             # expert id out of the name (mxfp4 has it as axis 0 instead).
-            m = self._QUARK_EXPERT_PAT.match(name)
+            m = quark_expert_pat.match(name)
             if m is None:
                 continue
             prefix, expert_str, proj, suffix = m.groups()

@@ -257,6 +257,8 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 layer.w2_weight.data = shuffle_weight_a16w4(
                     layer.w2_weight.contiguous(), 16, False
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
             shuffled_w13_scale = shuffle_scale_a16w4(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
                 self.num_experts,
@@ -279,6 +281,8 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                     is_guinterleave=False,
                     gate_up=False,
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
             shuffled_w13_scale = shuffle_scale(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
                 experts_cnt=self.num_experts,
@@ -291,9 +295,6 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 is_guinterleave=False,
                 gate_up=False,
             )
-
-        layer.w13_weight.is_shuffled = True
-        layer.w2_weight.is_shuffled = True
 
         layer.w13_weight_scale = torch.nn.Parameter(
             shuffled_w13_scale, requires_grad=False
