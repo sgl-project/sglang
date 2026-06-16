@@ -5050,21 +5050,33 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode guards. This feature is decode-only and
-        # does NOT yet touch the radix-track/COW machinery (slice 2), so radix
-        # cache must be disabled. It runs on the Triton GDN decode backend.
-        # cuda-graph is now supported (slice 1b adds CUDA-graph-safe static
-        # write-cursor buffers), so it is no longer restricted to EAGER mode.
+        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
+        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # write-cursor buffers). The RADIX prefix cache is now supported (slice
+        # 2b: the decode kernel force-flushes the ring into temporal[slot] on
+        # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
+        # the COW copy-into-slot path resets the ring cursor) -- so the
+        # --disable-radix-cache requirement is dropped.
+        #
+        # Slice 2b only wires the no_buffer mamba scheduler strategy (the
+        # default). The extra_buffer strategy donates the track snapshot via
+        # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
+        # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
+        # cursor of the donated/kept slot would not be reset there. Handling
+        # that donation path is a follow-up; for now require no_buffer.
         if self.enable_gdn_replayssm:
-            if not self.disable_radix_cache:
-                raise ValueError(
-                    "--enable-gdn-replayssm requires --disable-radix-cache."
-                )
             if decode != "triton":
                 raise ValueError(
                     "--enable-gdn-replayssm requires the Triton "
                     "linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.enable_mamba_extra_buffer():
+                raise ValueError(
+                    "--enable-gdn-replayssm requires --mamba-scheduler-strategy "
+                    "no_buffer (the default); the extra_buffer ping-pong "
+                    "donation path is not yet supported (follow-up). Got "
+                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
                 )
             if self.gdn_replayssm_cache_len < 1:
                 raise ValueError(

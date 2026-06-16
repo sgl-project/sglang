@@ -318,6 +318,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # per-row write cursor. All None unless --enable-gdn-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
         replayssm_write_pos = self.forward_metadata.replayssm_write_pos
+        # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
+        # boundaries (None unless --enable-gdn-replayssm). When present the
+        # kernel folds the ring into temporal[slot] on the snapshot steps.
+        replayssm_force_flush = self.forward_metadata.replayssm_force_flush
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
@@ -350,6 +354,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices

@@ -89,6 +89,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
         replayssm_k = kwargs.get("replayssm_k")
         replayssm_g = kwargs.get("replayssm_g")
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
+        # GDN ReplaySSM (slice 2b): optional per-row force-flush (radix track
+        # boundary). None when radix tracking is off / flag off; the kernel
+        # treats None as "no forced flush" (byte-identical to slice 1a/1b).
+        replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
             replayssm_d is not None
             and replayssm_k is not None
@@ -109,6 +113,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 out=out,
                 ssm_state_indices=cache_indices,
                 write_pos=replayssm_write_pos,
+                force_flush=replayssm_force_flush,
                 use_qk_l2norm_in_kernel=True,
             )
             return out.transpose(0, 1)

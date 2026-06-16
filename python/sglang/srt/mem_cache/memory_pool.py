@@ -632,6 +632,16 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
             :, src_indices
         ]
+        # GDN ReplaySSM (slice 2b): the copied `temporal` is a fully-flushed
+        # checkpoint (radix track snapshots are taken at force-flush boundaries,
+        # so they carry no pending ring entries). The destination slot's ring
+        # must therefore start empty -> reset its write cursor to 0. This covers
+        # the prefix-hit deferred-COW (mamba_cow_src/dst -> a request's working
+        # slot) and any other copy-into-slot path; track-slot destinations never
+        # decode, so resetting them is harmless. Slot ALLOC already resets, so
+        # this only matters for the copy-into-EXISTING-slot case.
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[dst_indices] = 0
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
