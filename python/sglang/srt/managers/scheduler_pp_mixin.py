@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import P2PWork, _use_torchcomms_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -40,6 +40,12 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+# Sentinel: when passed as the `prev_rids` of a `_pp_pd_get_*` consensus helper,
+# the helper does its own blocking `_pp_recv_pyobj_from_prev_stage()` (default,
+# NCCL/Gloo path). The TorchComms consolidated loops instead pass the value that
+# arrived in the ring-exchange bundle, so the helper skips the deadlocking recv.
+_PP_RECV_FROM_PREV = object()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -89,9 +95,21 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        # TorchComms P2P deadlocks with the default loop's deferred async sends,
+        # so under TorchComms each step runs the consolidated single-exchange
+        # body (self._tc_pp_step) and skips the default scattered-comm body.
+        tc = _use_torchcomms_enabled()
+        if tc:
+            assert (
+                self.server_args.pp_async_batch_depth == 0
+            ), "pp_async_batch_depth must be 0 for TorchComms PP"
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if tc:
+                    if self._tc_pp_step(mb_id, "default"):
+                        server_is_idle = False
+                    continue
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -166,6 +184,315 @@ class SchedulerPPMixin:
             if server_is_idle:
                 self.on_idle()
 
+    # ------------------------------------------------------------------
+    # TorchComms PP: shared consolidated single-exchange-per-step machinery
+    # ------------------------------------------------------------------
+    # All three PP event loops (main + disagg prefill/decode) deadlock under
+    # TorchComms with the default deferred-async-send comm. They share one fix:
+    # per microbatch step every rank issues exactly ONE aligned ring exchange
+    # (pp_group.pipeline_send_recv_tensor_dict) carrying the PREVIOUS step's
+    # already-computed payload. A payload "bundle" packs an arbitrary set of
+    # named pyobj channels (requests, and for disagg the bootstrap / transfer /
+    # consensus / release rid lists) alongside the proxy hidden-state tensors and
+    # the ring output tensors, all flattened into one flat dict (non-tensor
+    # values ride in the metadata) and demuxed on the receiver by key prefix.
+    _TC_PYOBJ_KEYS = "__pp_pyobj_keys__"  # names of present pyobj channels
+    _TC_PROXY_KEYS = "__pp_proxy_keys__"
+    _TC_OUTPUT_KEYS = "__pp_output_keys__"
+
+    def _tc_pack_bundle(
+        self: Scheduler,
+        pyobjs: Optional[Dict[str, Any]] = None,
+        proxy_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        output_tensors: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Flatten named pyobj channels + proxy + output into one ring-exchange
+        dict. Returns None when empty (warmup / idle), serialized as an empty
+        payload by the primitive. Only non-None pyobj channels are carried so the
+        receiver can tell "channel absent" from "channel present but empty".
+        """
+        send_dict: Dict[str, Any] = {}
+        if pyobjs:
+            present = [k for k, v in pyobjs.items() if v is not None]
+            if present:
+                send_dict[self._TC_PYOBJ_KEYS] = present
+                for k in present:
+                    send_dict[f"obj::{k}"] = pyobjs[k]
+        if proxy_tensors:
+            send_dict[self._TC_PROXY_KEYS] = list(proxy_tensors.keys())
+            for k, v in proxy_tensors.items():
+                send_dict[f"proxy::{k}"] = v
+        if output_tensors:
+            send_dict[self._TC_OUTPUT_KEYS] = list(output_tensors.keys())
+            for k, v in output_tensors.items():
+                send_dict[f"output::{k}"] = v
+        return send_dict or None
+
+    def _tc_unpack_bundle(self: Scheduler, recv_dict: Optional[Dict]):
+        """Inverse of _tc_pack_bundle -> (pyobjs dict, proxy_tensors, output_tensors).
+
+        ``pyobjs`` maps channel name -> value for every channel the sender
+        included (missing channels are simply absent from the dict).
+        """
+        if not recv_dict:
+            return {}, None, None
+        pyobjs: Dict[str, Any] = {}
+        if self._TC_PYOBJ_KEYS in recv_dict:
+            pyobjs = {k: recv_dict[f"obj::{k}"] for k in recv_dict[self._TC_PYOBJ_KEYS]}
+        proxy_tensors = None
+        if self._TC_PROXY_KEYS in recv_dict:
+            proxy_tensors = {
+                k: recv_dict[f"proxy::{k}"] for k in recv_dict[self._TC_PROXY_KEYS]
+            }
+        output_tensors = None
+        if self._TC_OUTPUT_KEYS in recv_dict:
+            output_tensors = {
+                k: recv_dict[f"output::{k}"] for k in recv_dict[self._TC_OUTPUT_KEYS]
+            }
+        return pyobjs, proxy_tensors, output_tensors
+
+    def _tc_ring_exchange(
+        self: Scheduler, bundle: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Issue the one aligned ring exchange for this step: ship ``bundle`` to
+        the next stage and receive the previous stage's bundle. dst/src are the
+        pp-group-local next/prev ranks computed in init_pp_loop_state."""
+        with torch.profiler.record_function("pp_tc_exchange"):
+            return self.pp_group.pipeline_send_recv_tensor_dict(
+                bundle, dst=self._tc_pp_dst, src=self._tc_pp_src
+            )
+
+    def _tc_pp_consume_output(
+        self: Scheduler, mb_id: int, in_output: Optional[Dict]
+    ) -> Optional[Dict]:
+        """Process this slot's prior batch (``mbs[mb_id]``, built pp_loop_size
+        steps ago) with the ring output that arrived this step, and return the
+        output to relay onward (non-last ranks). Also sets ``last_batch`` /
+        ``last_mbs[mb_id]`` for the upcoming build. Shared by all three
+        TorchComms PP loops."""
+        prev_batch = self.mbs[mb_id]
+        if prev_batch is not None and not prev_batch.forward_mode.is_prebuilt():
+            if _pp_can_skip_output_comm(prev_batch):
+                _, prev_result, d2h_event = self._pp_make_skip_output_result(
+                    prev_batch, self.mb_metadata[mb_id]
+                )
+            else:
+                assert (
+                    in_output is not None
+                ), "TorchComms PP: missing ring output from prev stage"
+                prev_pp_outputs = PPProxyTensors(in_output)
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    prev_result = self._pp_prep_batch_result(
+                        prev_batch, self.mb_metadata[mb_id], prev_pp_outputs
+                    )
+                    d2h_event = self.device_module.Event()
+                    d2h_event.record(self.device_module.current_stream())
+            d2h_event.synchronize()
+            with torch.profiler.record_function("process_batch_result"):
+                self._pp_process_batch_result(prev_batch, prev_result)
+        # Non-last ranks relay the output they received around the ring.
+        to_send_output = (
+            in_output
+            if (not self.pp_group.is_last_rank and in_output is not None)
+            else None
+        )
+        self.last_mbs[mb_id] = prev_batch
+        self.last_batch = prev_batch
+        return to_send_output
+
+    def _tc_pp_compute(
+        self: Scheduler, mb_id: int, in_proxy: Optional[Dict]
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Launch ``self.cur_batch`` (already set to ``mbs[mb_id]``) using the
+        proxy that arrived this step, and return ``(to_send_proxy,
+        to_send_output)`` to ship next step: non-last ranks forward the freshly
+        computed proxy; the last rank injects its freshly computed output into
+        the ring. ``cur_batch`` may be None (idle) or prebuilt (decode), in which
+        case nothing is computed/shipped. Shared by all three TorchComms loops."""
+        to_send_proxy = None
+        to_send_output = None
+        if not self.cur_batch:
+            return to_send_proxy, to_send_output
+        is_prebuilt = self.cur_batch.forward_mode.is_prebuilt()
+        pp_proxy_tensors = None
+        if not self.pp_group.is_first_rank and not is_prebuilt:
+            assert (
+                in_proxy is not None
+            ), "TorchComms PP: missing proxy tensors from prev stage"
+            pp_proxy_tensors = PPProxyTensors(in_proxy)
+        result, self.launch_event = self._pp_launch_batch(
+            mb_id,
+            pp_proxy_tensors,
+            self.mb_metadata,
+            self.last_rank_comm_queue,
+        )
+        if not self.pp_group.is_last_rank:
+            if not is_prebuilt:
+                self.device_module.current_stream().wait_event(self.launch_event)
+                to_send_proxy = result.pp_hidden_states_proxy_tensors.tensors
+        elif self.last_rank_comm_queue:
+            # _pp_launch_batch enqueues one entry per launch on the last rank;
+            # drain it to keep the queue in lockstep, and inject the freshly
+            # computed output into the ring (unless prebuilt / skip-comm).
+            q_event, fresh_outputs = self.last_rank_comm_queue.popleft()
+            if not is_prebuilt and not _pp_can_skip_output_comm(self.cur_batch):
+                self.device_module.current_stream().wait_event(q_event)
+                to_send_output = fresh_outputs.tensors
+        return to_send_proxy, to_send_output
+
+    def _tc_pp_step(self: Scheduler, mb_id: int, mode: str) -> bool:
+        """One consolidated TorchComms PP step for slot ``mb_id``.
+
+        Shared by all three PP event loops (``mode`` in {"default", "prefill",
+        "decode"}). Every rank issues exactly ONE aligned ring exchange
+        (``_tc_ring_exchange``) carrying the PREVIOUS step's already-computed
+        bundle, because TorchComms P2P only progresses when send+recv are issued
+        together; the default loops' deferred async sends deadlock. The proxy /
+        ring output for a batch return to the SAME slot pp_loop_size steps later,
+        so this slot's prior batch is the one whose output arrives now. For the
+        disagg modes the PD consensus channels ride the same bundle (pre-consensus
+        chains via ``_pp_pd_get_*`` fed the bundle value instead of a blocking
+        recv; consensus rings via ``_pp_pd_send_consensus_*(tc_mode=True)``).
+        Returns True if a batch ran this step.
+
+        NOTE: the disagg modes are untested on hosts without PD infra; this path
+        is strictly gated, and the NCCL/Gloo bodies in the callers are unchanged.
+        """
+        next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+        self.running_batch = self.running_mbs[mb_id]
+
+        # ---- ONE aligned ring exchange (ships previous step's results) ----
+        incoming = self._tc_ring_exchange(self._tc_buffered_out)
+        in_pyobjs, in_proxy, in_output = self._tc_unpack_bundle(incoming)
+        out_pyobjs: Dict[str, Any] = {}
+
+        # ---- prior batch result + ring-output relay (same slot, mb_id) ----
+        to_send_output = self._tc_pp_consume_output(mb_id, in_output)
+
+        # ---- apply consensus that arrived this step (disagg; eventual) ----
+        consensus_a = consensus_b = release_rids = None
+        if mode == "prefill":
+            if "consensus_bootstrapped" in in_pyobjs:
+                consensus_a = self.process_bootstrapped_queue(
+                    in_pyobjs["consensus_bootstrapped"]
+                )
+            if "release" in in_pyobjs:
+                release_rids = in_pyobjs["release"]
+                self.process_disagg_prefill_inflight_queue(release_rids)
+        elif mode == "decode":
+            if "consensus_retract" in in_pyobjs:
+                consensus_a = self.process_retract_queue(in_pyobjs["consensus_retract"])
+            if "consensus_prealloc" in in_pyobjs:
+                consensus_b = self.process_prealloc_queue(
+                    in_pyobjs["consensus_prealloc"]
+                )
+            if "release" in in_pyobjs:
+                release_rids = self.process_decode_transfer_queue(in_pyobjs["release"])
+
+        # ---- requests (chain): rank 0 pulls zmq; others read the bundle ----
+        if not self.pp_group.is_first_rank:
+            self._tc_pp_incoming_reqs = in_pyobjs.get("reqs") or []
+        with torch.profiler.record_function("recv_requests"):
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+        if not self.pp_group.is_last_rank:
+            out_pyobjs["reqs"] = recv_reqs
+
+        # ---- pre-consensus chains (disagg) ----
+        rids_a = rids_b = transferred_rids = None
+        if mode == "prefill":
+            rids_a = self._pp_pd_get_bootstrapped_ids(
+                prev_rids=in_pyobjs.get("bootstrapped")
+            )
+            self._tc_bmbs[mb_id] = rids_a
+            transferred_rids = self._pp_pd_get_prefill_transferred_ids(
+                prev_rids=in_pyobjs.get("transferred")
+            )
+            self._tc_tmbs[mb_id] = transferred_rids
+            if not self.pp_group.is_last_rank:
+                out_pyobjs["bootstrapped"] = rids_a
+                out_pyobjs["transferred"] = transferred_rids
+        elif mode == "decode":
+            rids_a = self._pp_pd_get_retract_ids(
+                mb_id, prev_rids=in_pyobjs.get("retract")
+            )
+            self._tc_rmbs[mb_id] = rids_a
+            rids_b = self._pp_pd_get_prealloc_ids(prev_rids=in_pyobjs.get("prealloc"))
+            self._tc_pmbs[mb_id] = rids_b
+            transferred_rids = self._pp_pd_get_decode_transferred_ids(
+                prev_rids=in_pyobjs.get("transferred")
+            )
+            self._tc_tmbs[mb_id] = transferred_rids
+            if not self.pp_group.is_last_rank:
+                out_pyobjs["retract"] = rids_a
+                out_pyobjs["prealloc"] = rids_b
+                out_pyobjs["transferred"] = transferred_rids
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                self.decode_offload_manager.check_offload_progress()
+
+        # ---- build this step's batch into this slot ----
+        if mode == "prefill":
+            self.process_prefill_chunk()
+            batch = self.get_new_batch_prefill()
+            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        elif mode == "decode":
+            batch = self.get_next_disagg_decode_batch_to_run()
+        else:
+            with torch.profiler.record_function("get_next_batch_to_run"):
+                batch = self.get_next_batch_to_run()
+        self.mbs[mb_id] = batch
+        self.running_mbs[mb_id] = self.running_batch
+        self.cur_batch = batch
+
+        # ---- compute + assemble proxy / fresh output to ship next step ----
+        to_send_proxy, fresh_output = self._tc_pp_compute(mb_id, in_proxy)
+        to_send_output = to_send_output or fresh_output
+
+        # ---- consensus rings: last rank originates, others relay (disagg) ----
+        if mode == "prefill":
+            ts, _ = self._pp_pd_send_consensus_bootstrapped_ids(
+                self._tc_bmbs, next_first_rank_mb_id, consensus_a, rids_a, tc_mode=True
+            )
+            if ts is not None:
+                out_pyobjs["consensus_bootstrapped"] = ts
+            ts, _ = self._pp_pd_send_consensus_release_ids(
+                self._tc_tmbs,
+                next_first_rank_mb_id,
+                release_rids,
+                transferred_rids,
+                tc_mode=True,
+            )
+            if ts is not None:
+                out_pyobjs["release"] = ts
+        elif mode == "decode":
+            ts, _ = self._pp_pd_send_consensus_bootstrapped_ids(
+                self._tc_rmbs, next_first_rank_mb_id, consensus_a, rids_a, tc_mode=True
+            )
+            if ts is not None:
+                out_pyobjs["consensus_retract"] = ts
+            ts, _ = self._pp_pd_send_consensus_bootstrapped_ids(
+                self._tc_pmbs, next_first_rank_mb_id, consensus_b, rids_b, tc_mode=True
+            )
+            if ts is not None:
+                out_pyobjs["consensus_prealloc"] = ts
+            ts, _ = self._pp_pd_send_consensus_release_ids(
+                self._tc_tmbs,
+                next_first_rank_mb_id,
+                release_rids,
+                transferred_rids,
+                tc_mode=True,
+            )
+            if ts is not None:
+                out_pyobjs["release"] = ts
+
+        self._tc_buffered_out = self._tc_pack_bundle(
+            out_pyobjs, to_send_proxy, to_send_output
+        )
+        if mode != "default":
+            self.running_batch.batch_is_full = False
+        return batch is not None
+
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
@@ -205,6 +532,14 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+        # Under TorchComms each step runs the shared consolidated body
+        # (_tc_pp_step, mode="prefill"); the default scattered-comm body below is
+        # unchanged. See _event_loop_pp / _tc_pp_step.
+        tc = _use_torchcomms_enabled()
+        if tc:
+            assert (
+                self.server_args.pp_async_batch_depth == 0
+            ), "pp_async_batch_depth must be 0 for TorchComms PP"
 
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
@@ -220,6 +555,10 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if tc:
+                    if self._tc_pp_step(mb_id, "prefill"):
+                        server_is_idle = False
+                    continue
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -347,6 +686,14 @@ class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
+        # Under TorchComms each step runs the shared consolidated body
+        # (_tc_pp_step, mode="decode"); the default scattered-comm body below is
+        # unchanged.
+        tc = _use_torchcomms_enabled()
+        if tc:
+            assert (
+                self.server_args.pp_async_batch_depth == 0
+            ), "pp_async_batch_depth must be 0 for TorchComms PP"
 
         # PD additional state initialization
         rmbs = [None] * self.pp_loop_size
@@ -365,6 +712,10 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if tc:
+                    if self._tc_pp_step(mb_id, "decode"):
+                        server_is_idle = False
+                    continue
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -559,6 +910,22 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # TorchComms PP: the dict to ship on the NEXT step's consolidated ring
+        # exchange (carries the previous step's pyobjs + proxy + ring output), and
+        # the raw requests delivered by that exchange for non-first ranks (read
+        # by SchedulerRequestReceiver in place of its point_to_point_pyobj recv).
+        self._tc_buffered_out: Optional[Dict[str, torch.Tensor]] = None
+        self._tc_pp_incoming_reqs: List = []
+        # pp-group-local next/prev ranks for the ring exchange (shared by all
+        # three TorchComms PP loops).
+        self._tc_pp_dst = (self.pp_group.rank_in_group + 1) % self.pp_group.world_size
+        self._tc_pp_src = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
+        # Per-slot PD consensus tracking for the TorchComms disagg steps
+        # (bootstrap/retract, prealloc, transfer). Unused by mode="default".
+        self._tc_bmbs: List = [None] * self.pp_loop_size
+        self._tc_rmbs: List = [None] * self.pp_loop_size
+        self._tc_pmbs: List = [None] * self.pp_loop_size
+        self._tc_tmbs: List = [None] * self.pp_loop_size
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -785,7 +1152,7 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
+    def _pp_pd_get_bootstrapped_ids(self: Scheduler, prev_rids=_PP_RECV_FROM_PREV):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
@@ -797,7 +1164,11 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_bootstrapped_rids = (
+                self._pp_recv_pyobj_from_prev_stage()
+                if prev_rids is _PP_RECV_FROM_PREV
+                else prev_rids
+            )
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -815,7 +1186,9 @@ class SchedulerPPMixin:
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+    def _pp_pd_get_prefill_transferred_ids(
+        self: Scheduler, prev_rids=_PP_RECV_FROM_PREV
+    ):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -827,7 +1200,11 @@ class SchedulerPPMixin:
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_transferred_rids = (
+                self._pp_recv_pyobj_from_prev_stage()
+                if prev_rids is _PP_RECV_FROM_PREV
+                else prev_rids
+            )
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
@@ -846,21 +1223,29 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
+        tc_mode: bool = False,
     ):
+        # Determine the consensus rids to forward to the next stage: the last
+        # rank originates them (it holds the full intersection) once the pipeline
+        # is primed; every other rank relays the consensus it received.
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
+        to_send = None
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
+                to_send = consensus_bootstrapped_rids
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if consensus_bootstrapped_rids is not None:
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
+                to_send = consensus_bootstrapped_rids
+        if tc_mode:
+            # TorchComms: caller packs `to_send` into the ring bundle instead.
+            return to_send, consensus_bootstrapped_rids
+        if to_send is not None:
+            send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                to_send, async_send=True
+            )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
 
     def _pp_pd_send_consensus_release_ids(
@@ -869,20 +1254,24 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         release_rids: List[str],
         transferred_rids: List[str],
+        tc_mode: bool = False,
     ):
         send_release_work = []
+        to_send = None
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
                 release_rids = transferred_rids
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
+                to_send = release_rids
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if release_rids is not None:
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
+                to_send = release_rids
+        if tc_mode:
+            return to_send, release_rids
+        if to_send is not None:
+            send_release_work = self._pp_send_pyobj_to_next_stage(
+                to_send, async_send=True
+            )
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
@@ -1283,7 +1672,9 @@ class SchedulerPPMixin:
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
 
-    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
+    def _pp_pd_get_retract_ids(
+        self: Scheduler, mb_id: int, prev_rids=_PP_RECV_FROM_PREV
+    ):
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
             # assign retracted reqs to the current microbatch
@@ -1299,10 +1690,14 @@ class SchedulerPPMixin:
             return curr_retract_rids
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
-            prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_retract_rids = (
+                self._pp_recv_pyobj_from_prev_stage()
+                if prev_rids is _PP_RECV_FROM_PREV
+                else prev_rids
+            )
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
-    def _pp_pd_get_prealloc_ids(self: Scheduler):
+    def _pp_pd_get_prealloc_ids(self: Scheduler, prev_rids=_PP_RECV_FROM_PREV):
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue
@@ -1314,7 +1709,11 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
-            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_prealloc_rids = (
+                self._pp_recv_pyobj_from_prev_stage()
+                if prev_rids is _PP_RECV_FROM_PREV
+                else prev_rids
+            )
             prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
@@ -1330,7 +1729,9 @@ class SchedulerPPMixin:
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
-    def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+    def _pp_pd_get_decode_transferred_ids(
+        self: Scheduler, prev_rids=_PP_RECV_FROM_PREV
+    ):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -1342,7 +1743,11 @@ class SchedulerPPMixin:
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_transferred_rids = (
+                self._pp_recv_pyobj_from_prev_stage()
+                if prev_rids is _PP_RECV_FROM_PREV
+                else prev_rids
+            )
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
