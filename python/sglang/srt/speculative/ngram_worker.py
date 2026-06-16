@@ -106,6 +106,15 @@ class NGRAMWorker(BaseSpecWorker):
                 loaded,
             )
 
+        # Precomputed draft cache: maps (req_idx, node_j) -> (drafts, mask)
+        # populated by precompute_draft_tokens, consumed by _prepare_for_speculative_decoding
+        self._precomputed_cache = None
+        self._precomputed_batch_reqs = None  # list of req objects for identity check
+        self._precomputed_draft_tokens_np = (
+            None  # the current batch's draft tokens (numpy)
+        )
+        self._precomputed_tree_mask_np = None  # the current batch's tree mask (numpy)
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -206,6 +215,175 @@ class NGRAMWorker(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    def _try_use_precomputed_drafts(
+        self, batch: ScheduleBatch
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Try to use precomputed draft tokens from the previous batch's
+        precompute_draft_tokens call. Returns (drafts, mask) if ALL requests
+        hit, or None if any miss (with partial-hit regeneration possible).
+
+        Match conditions for each request i:
+        1. predicted_bonus == bonus_token: the ngram-predicted bonus token
+           (from the first-phase batch_get in precompute) must match the
+           actual bonus token from verification.
+        2. The precomputed path (path_cols stored in cache) must match the
+           actual accepted path from verification (accept_index local nodes).
+        """
+        if self._precomputed_cache is None or batch.has_grammar:
+            return None
+
+        bs = len(batch.reqs)
+        d = self.draft_token_num
+
+        prev_token_ids, prev_accept_lens = (
+            batch.spec_info.verified_tokens,
+            batch.spec_info.accept_lens,
+        )
+        prev_accept_index = batch.spec_info.accept_index
+        if not prev_token_ids.is_cpu:
+            prev_token_ids = prev_token_ids.cpu()
+            prev_accept_lens = prev_accept_lens.cpu()
+        if prev_accept_index is not None and not prev_accept_index.is_cpu:
+            prev_accept_index = prev_accept_index.cpu()
+        prev_token_ids_list = prev_token_ids.tolist()
+        prev_accept_lens_list = prev_accept_lens.tolist()
+
+        # Check that batch composition matches (same requests in same order)
+        if (
+            self._precomputed_batch_reqs is None
+            or len(self._precomputed_batch_reqs) != bs
+        ):
+            self._precomputed_cache = None
+            return None
+
+        # Compute accepted local node indices per request from accept_index
+        accepted_path_per_req = []
+        if prev_accept_index is not None:
+            accept_index_2d = prev_accept_index.reshape(bs, d)
+            for i in range(bs):
+                accept_len = prev_accept_lens_list[i]  # includes bonus
+                # The first (accept_len - 1) non-(-1) entries are accepted draft nodes
+                local_nodes = []
+                for j in range(d):
+                    idx = accept_index_2d[i][j].item()
+                    if idx != -1:
+                        local_nodes.append(idx - i * d)
+                accepted_path_per_req.append(tuple(sorted(local_nodes)))
+        else:
+            accepted_path_per_req = [None] * bs
+
+        result_drafts = np.empty(bs * d, dtype=np.int64)
+        result_masks = np.empty(bs * d * d, dtype=np.int64)
+        hit_flags = [False] * bs
+        hit_count = 0
+
+        for i in range(bs):
+            if batch.reqs[i] is not self._precomputed_batch_reqs[i]:
+                self._precomputed_cache = None
+                return None
+            accept_len = prev_accept_lens_list[i]  # includes bonus token
+            bonus_token = prev_token_ids_list[i * d + accept_len - 1]
+
+            # Search for a precomputed entry whose predicted bonus matches
+            for node_j in range(d):
+                key = (i, node_j, bonus_token)
+                if key not in self._precomputed_cache:
+                    continue
+                drafts_for_path, mask_for_path, cached_path_cols = (
+                    self._precomputed_cache[key]
+                )
+                # Verify the precomputed path matches the
+                # actual accepted path from verification
+                if (
+                    accepted_path_per_req[i] is not None
+                    and cached_path_cols != accepted_path_per_req[i]
+                ):
+                    continue
+                result_drafts[i * d : (i + 1) * d] = drafts_for_path
+                result_masks[i * d * d : (i + 1) * d * d] = mask_for_path.flatten()
+                hit_flags[i] = True
+                hit_count += 1
+                break
+
+        # Store prev token info (needed by precompute_draft_tokens of next batch)
+        self.prev_token_ids = prev_token_ids_list
+        self.prev_accept_lens = prev_accept_lens_list
+
+        if hit_count == bs:
+            logger.debug(f"Precomputed draft cache HIT for all {bs} requests")
+            return result_drafts, result_masks
+        elif hit_count == 0:
+            logger.debug(
+                f"Precomputed draft cache MISS for all {bs} requests, "
+                "falling back to fresh generation"
+            )
+            return None
+        else:
+            # Partial hit: regenerate only the missed requests and merge
+            logger.debug(
+                f"Precomputed draft cache partial HIT: {hit_count}/{bs} requests"
+            )
+            return self._regenerate_missing_drafts(
+                batch,
+                result_drafts,
+                result_masks,
+                hit_flags,
+                prev_token_ids_list,
+                prev_accept_lens_list,
+            )
+
+    def _regenerate_missing_drafts(
+        self,
+        batch: ScheduleBatch,
+        result_drafts: np.ndarray,
+        result_masks: np.ndarray,
+        hit_flags: list,
+        prev_token_ids_list: list,
+        prev_accept_lens_list: list,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Regenerate drafts only for requests that missed the precomputed cache,
+        then merge with precomputed hits."""
+        bs = len(batch.reqs)
+        d = self.draft_token_num
+        stride = d
+
+        self.ngram_corpus.synchronize()
+
+        # Collect lookup tokens only for missed requests
+        miss_indices = []
+        miss_tokens = []
+        for i in range(bs):
+            if not hit_flags[i]:
+                # This request missed the precomputed cache
+                miss_indices.append(i)
+                if not batch.has_grammar:
+                    prev_tokens = prev_token_ids_list[
+                        i * stride : i * stride + prev_accept_lens_list[i]
+                    ]
+                else:
+                    prev_tokens = []
+                check_token = self._efficient_concat_last_n(
+                    batch.reqs[i].origin_input_ids,
+                    batch.reqs[i].output_ids + prev_tokens,
+                    self.max_trie_depth,
+                )
+                miss_tokens.append(check_token)
+
+        if not miss_tokens:
+            return result_drafts, result_masks
+
+        # Batch lookup only for missed requests
+        miss_drafts, miss_masks = self.ngram_corpus.batch_get(miss_tokens)
+        miss_drafts_2d = miss_drafts.reshape(len(miss_indices), d)
+        miss_masks_3d = miss_masks.reshape(len(miss_indices), d, d)
+
+        # Merge into results
+        for j, i in enumerate(miss_indices):
+            result_drafts[i * d : (i + 1) * d] = miss_drafts_2d[j]
+            result_masks[i * d * d : (i + 1) * d * d] = miss_masks_3d[j].flatten()
+
+        return result_drafts, result_masks
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -269,6 +447,7 @@ class NGRAMWorker(BaseSpecWorker):
         # IDLE batch must keep its forward_mode instead of being rewritten to
         # TARGET_VERIFY below (relevant once DP attention support lands).
         if not batch.forward_mode.is_decode():
+            self._precomputed_cache = None
             return
 
         bs = len(batch.reqs)
@@ -280,7 +459,23 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
 
-        req_drafts, mask = self._prepare_draft_tokens(batch)
+        """# Wait for the previous batch's verify to finish (we need verified_tokens)
+        if batch.spec_info.verify_done is not None:
+            batch.spec_info.verify_done.synchronize()
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()"""
+
+        # Try to use precomputed drafts from the previous precompute_draft_tokens call
+        precomputed_result = self._try_use_precomputed_drafts(batch)
+        if precomputed_result is not None:
+            req_drafts, mask = precomputed_result
+        else:
+            req_drafts, mask = self._prepare_draft_tokens(batch)
+
+        # Save for precompute_draft_tokens and _try_use_precomputed_drafts
+        self._precomputed_draft_tokens_np = req_drafts.copy()
+        self._precomputed_tree_mask_np = mask.copy()
+
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
@@ -368,6 +563,161 @@ class NGRAMWorker(BaseSpecWorker):
             batch_tokens.append(put_ids)
             i += 1
         self.ngram_corpus.batch_put(batch_tokens)
+
+    def precompute_draft_tokens(self, batch: ScheduleBatch):
+        """Precompute draft tokens for the next batch by enumerating all possible
+        verify outcomes of the current batch.
+
+        Timing context (overlap scheduling):
+        - At precompute time: req.output_ids includes up to batch_{K-2}'s tokens
+        - At next batch's _prepare_draft_tokens: req.output_ids includes batch_{K-1}'s
+        - So we include prev_tokens (batch_{K-1}'s verified tokens) in the context.
+
+        The approach (two-phase batch_get):
+        1. From the current batch's tree mask, extract all valid paths (root to each node)
+        2. For each (request, path), construct the ngram check context:
+           context = last_n(output_ids + prev_tokens_from_current_batch + path_draft_tokens)
+        3. Phase 1 batch_get: predict the bonus token for each path (draft[0] from results)
+           Since batch N's draft tokens are never equal to the actual bonus token (otherwise
+           they would have been accepted), we use the ngram trie to predict the bonus.
+        4. Phase 2 batch_get: append predicted bonus to each context and get actual draft
+           tokens for batch N+1.
+        5. Store results indexed by (req_idx, node_j), including the predicted bonus token.
+        6. At next _prepare_for_speculative_decoding, check if predicted_bonus matches
+           the actual bonus token from verification.
+        """
+        if batch.forward_mode.is_extend() or batch.has_grammar:
+            # spec v2 currently doesn't support grammar, so directly return.
+            self._precomputed_cache = None
+            return
+
+        bs = len(batch.reqs)
+        d = self.draft_token_num
+
+        cur_draft_tokens = self._precomputed_draft_tokens_np  # shape (bs * d,)
+        cur_tree_mask = self._precomputed_tree_mask_np  # shape (bs * d * d,)
+
+        if cur_draft_tokens is None or cur_tree_mask is None:
+            self._precomputed_cache = None
+            return
+
+        if not hasattr(self, "prev_token_ids") or self.prev_token_ids is None:
+            self._precomputed_cache = None
+            return
+
+        cur_draft_tokens_2d = cur_draft_tokens.reshape(bs, d)
+        cur_tree_mask_3d = cur_tree_mask.reshape(bs, d, d)
+
+        bonus_check_tokens = []
+        path_metadata = []  # [(req_idx, node_j, path_cols_tuple), ...]
+        stride = d
+        for req_idx in range(bs):
+            req = batch.reqs[req_idx]
+            req_draft = cur_draft_tokens_2d[req_idx]  # shape (d,)
+            req_mask = cur_tree_mask_3d[req_idx]  # shape (d, d)
+
+            # batch_{K-1}'s verified tokens (will be added to output_ids by scheduler)
+            if not batch.has_grammar:
+                prev_tokens = self.prev_token_ids[
+                    req_idx * stride : req_idx * stride + self.prev_accept_lens[req_idx]
+                ]
+            else:
+                prev_tokens = []
+
+            # Simulate what output_ids will look like at next batch's draft prep
+            base_output = req.output_ids + prev_tokens
+
+            for node_j in range(d):
+                # Skip invalid/padding nodes
+                if req_mask[node_j, node_j] == 0:
+                    continue
+
+                # Extract the path: columns where mask[node_j][c] == 1
+                path_cols = np.nonzero(req_mask[node_j])[0]
+                path_cols_tuple = tuple(sorted(path_cols.tolist()))
+                path_draft_tokens = req_draft[path_cols].tolist()
+
+                check_token = self._efficient_concat_last_n(
+                    req.origin_input_ids,
+                    base_output + path_draft_tokens,
+                    self.max_trie_depth,
+                )
+                bonus_check_tokens.append(check_token)
+                path_metadata.append((req_idx, node_j, path_cols_tuple))
+
+        if not bonus_check_tokens:
+            self._precomputed_cache = None
+            return
+
+        self.ngram_corpus.synchronize()
+        # Phase 1: predict bonus tokens via ngram lookup.
+        # draft[0] of the returned tree echoes the last token of check_token.
+        # The direct children of root (nodes with path length == 2) are the
+        # predicted bonus tokens.
+        bonus_drafts, bonus_masks = self.ngram_corpus.batch_get(bonus_check_tokens)
+        n_paths = len(bonus_check_tokens)
+        bonus_drafts_2d = bonus_drafts.reshape(n_paths, d)
+        bonus_masks_3d = bonus_masks.reshape(n_paths, d, d)
+
+        # Phase 2: for each path, find children of root as predicted bonuses,
+        # append each to context, and batch_get the actual draft tokens.
+        draft_check_tokens = []
+        # (path_idx, predicted_bonus) for each Phase 2 entry
+        phase2_metadata = []
+        for idx in range(n_paths):
+            bonus_mask = bonus_masks_3d[idx]  # (d, d)
+            bonus_draft = bonus_drafts_2d[idx]  # (d,)
+
+            # Root is node 0; skip if invalid
+            if bonus_mask[0, 0] == 0:
+                continue
+
+            # Direct children of root: nodes j where mask[j][0]==1 and
+            # path length (sum of mask row) == 2 (attend to self + root only)
+            for j in range(1, d):
+                if (
+                    bonus_mask[j, 0] == 1
+                    and bonus_mask[j, j] == 1
+                    and int(np.sum(bonus_mask[j])) == 2
+                ):
+                    predicted_bonus = int(bonus_draft[j])
+                    check_token_with_bonus = (
+                        bonus_check_tokens[idx] + [predicted_bonus]
+                    )[-self.max_trie_depth :]
+                    draft_check_tokens.append(check_token_with_bonus)
+                    phase2_metadata.append((idx, predicted_bonus))
+
+        if not draft_check_tokens:
+            self._precomputed_cache = None
+            return
+
+        all_drafts, all_masks = self.ngram_corpus.batch_get(draft_check_tokens)
+        n_phase2 = len(draft_check_tokens)
+        all_drafts_2d = all_drafts.reshape(n_phase2, d)
+        all_masks_3d = all_masks.reshape(n_phase2, d, d)
+
+        # Build the precomputed cache:
+        # (req_idx, node_j, predicted_bonus) -> (drafts, mask, path_cols)
+        precomputed = {}
+        for p2_idx in range(n_phase2):
+            path_idx, predicted_bonus = phase2_metadata[p2_idx]
+            req_idx, node_j, path_cols_tuple = path_metadata[path_idx]
+            key = (req_idx, node_j, predicted_bonus)
+            # If same (req, node, bonus) appears multiple times, keep the first
+            if key not in precomputed:
+                precomputed[key] = (
+                    all_drafts_2d[p2_idx],
+                    all_masks_3d[p2_idx],
+                    path_cols_tuple,
+                )
+
+        self._precomputed_cache = precomputed
+        self._precomputed_batch_reqs = list(batch.reqs)
+
+        logger.debug(
+            f"Precomputed {len(precomputed)} draft combos from "
+            f"{n_phase2} phase2 contexts (2-phase) for {bs} requests"
+        )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
@@ -470,6 +820,8 @@ class NGRAMWorker(BaseSpecWorker):
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
+            # Precompute draft tokens for the NEXT batch while GPU is running verify
+            self.precompute_draft_tokens(batch)
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
             # processing, one iteration after the request left the batch.
@@ -496,6 +848,16 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens[:, 0] = predict
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
+            accept_index = torch.full(
+                (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
+            )
+            accept_index[:, 0] = torch.arange(
+                0,
+                bs * self.draft_token_num,
+                self.draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
@@ -506,6 +868,7 @@ class NGRAMWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             accept_tokens=accept_tokens,
             accept_lens=accept_lens,
+            accept_index=accept_index,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
