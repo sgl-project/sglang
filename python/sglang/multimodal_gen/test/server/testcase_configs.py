@@ -26,7 +26,7 @@ import statistics
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.registry import (
@@ -246,6 +246,15 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
+    # Realtime video consistency harness. When set, server tests use
+    # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
+    realtime_num_chunks: int | None = None
+    realtime_events: list[dict[str, Any]] = field(default_factory=list)
+    realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    realtime_perf_ignore_initial_chunks: int = 0
+    # None keeps the lossless/raw transport used by GT-backed consistency checks.
+    realtime_output_format: str | None = None
+
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
@@ -299,6 +308,52 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A slow aerial orbit around a pastel floating island hotel in the open "
+        "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
+        "clean horizon, cinematic but playful."
+    ),
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/"
+        "b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg"
+    ),
+    output_size="832x480",
+    num_frames=9,
+    fps=16,
+    realtime_num_chunks=4,
+    realtime_perf_thresholds={
+        "p95_chunk_total_ms": 5000.0,
+        "p95_scheduler_forward_ms": 4500.0,
+        "p95_ws_payload_mb": 16.0,
+    },
+    realtime_perf_ignore_initial_chunks=2,
+    extras={
+        "seed": 42,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "realtime_causal_sink_size": 9,
+        "realtime_causal_kv_cache_num_frames": 18,
+        "condition_inputs": {
+            "camera_actions": [
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            ]
+        },
+    },
+)
 
 
 def sample_step_indices(
@@ -372,6 +427,61 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
@@ -433,6 +543,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
+)
+
+SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(

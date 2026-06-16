@@ -16,4 +16,5 @@ mod graceful_shutdown;
 mod header_forwarding;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
+mod sticky_routing;
 mod timeout;

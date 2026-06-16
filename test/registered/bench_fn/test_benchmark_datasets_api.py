@@ -19,7 +19,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
-from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
@@ -383,6 +383,38 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
+
+    def test_gen_mm_prompt_excludes_special_tokens(self):
+        tokenizer = create_lightweight_tokenizer()
+        multimodal_special_tokens = [
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|vision_pad|>",
+        ]
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": multimodal_special_tokens}
+        )
+        special_token_ids = set(
+            tokenizer.convert_tokens_to_ids(multimodal_special_tokens)
+        )
+        image_pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        captured_population = {}
+
+        def fake_choices(population, k):
+            captured_population["tokens"] = population
+            return population[:k]
+
+        with patch(
+            "sglang.benchmark.datasets.common.random.choices",
+            side_effect=fake_choices,
+        ):
+            gen_mm_prompt(tokenizer, image_pad_id, token_num=8)
+
+        sampled_pool = set(captured_population["tokens"])
+        self.assertFalse(special_token_ids & sampled_pool)
+        self.assertTrue(sampled_pool)
 
     def test_mmmu_sampler(self):
         fake_records = [

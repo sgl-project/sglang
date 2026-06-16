@@ -1,7 +1,7 @@
 ---
 title: "Reasoning Parser"
 metatags:
-    description: "SGLang reasoning parser: separate thinking content from output for DeepSeek R1, Qwen3, Kimi K2, GPT-OSS reasoning models."
+    description: "SGLang reasoning parser: separate thinking content from output for DeepSeek R1, Qwen3, Kimi K2, GPT-OSS, and Apertus reasoning models."
 ---
 SGLang supports parsing reasoning content out from "normal" content for reasoning models such as [DeepSeek R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
 
@@ -23,6 +23,12 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[Apertus 2509 models](https://huggingface.co/swiss-ai/Apertus-8B-Instruct-2509)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`<|inner_prefix|>` … `<|inner_suffix|>`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`apertus2509`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Supports `enable_thinking` parameter</td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[DeepSeek‑R1 series](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`<think>` … `</think>`</td>
@@ -62,6 +68,9 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
   </tbody>
 </table>
 ### Model-Specific Behaviors
+
+**Apertus 2509:**
+- Uses `<|inner_prefix|>` and `<|inner_suffix|>` to delimit reasoning content. For agentic tool use, also specify `--tool-call-parser apertus2509`.
 
 **DeepSeek-R1 Family:**
 - DeepSeek-R1: No `<think>` start tag, jumps directly to thinking content

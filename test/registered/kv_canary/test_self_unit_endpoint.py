@@ -21,11 +21,12 @@ from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.state import (
     ViolationLog,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, suite="extra-a-test-1-gpu-small-amd")
 
 
 def _make_endpoint(*, device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL, swa_lut=None):
