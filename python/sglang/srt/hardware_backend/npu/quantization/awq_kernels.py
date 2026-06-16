@@ -164,7 +164,7 @@ class AWQAscendMoEKernel:
             layer.w13_kernel = NPUUnquantMoEMethod()
             layer.w2_kernel = NPUUnquantMoEMethod()
             layer.w13_kernel.process_weights_after_loading(layer, weight_prefix="w13")
-            layer.w2_kernel.process_weights_after_loading(layer, weight_prefix="w13")
+            layer.w2_kernel.process_weights_after_loading(layer, weight_prefix="w2")
 
         else:
             # Quantized path: pack weights (original code, not shown for brevity)
