@@ -207,4 +207,4 @@ class AWQAscendMoEKernel:
             # Transpose to (N, K) and store
             fp_weight[e] = w_fp.t().contiguous()  # (N, K)
     
-        setattr(layer, f"{prefix}_weight_fp", torch.nn.Parameter(fp_weight, requires_grad=False))
+        setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
