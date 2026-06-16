@@ -626,14 +626,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 )
             )
 
-    def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
-    ):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
@@ -695,7 +693,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
-    def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
+    def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state.
 
         In lazy mode the valid state stays at next_track_idx (no eager swap).
@@ -705,7 +703,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return req.mamba_next_track_idx
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
-    def _alloc_ping_pong_buffer(self, req: "Req"):
+    def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
 
         Lazy mode allocates 1 slot with the second set to -1 (allocated
@@ -731,7 +729,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
 
-    def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
+    def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
 
         The req holds the authoritative buffer; this keeps the
@@ -744,7 +742,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
     def donate_mamba_ping_pong_slot(
-        self, req: "Req", new_slot: torch.Tensor
+        self, req: Req, new_slot: torch.Tensor
     ) -> torch.Tensor:
         """Donate the tracked-state ping-pong slot to the radix cache.
 
@@ -767,7 +765,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return mamba_value_donated
 
     def free_mamba_cache(
-        self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
+        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
@@ -865,7 +863,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1665,9 +1663,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -1681,9 +1681,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_v_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
@@ -1713,10 +1715,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
+            cache_v, cache_v_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -1860,9 +1864,7 @@ class HybridLinearKVPool(KVCache):
             )
         return self.full_attention_layer_id_mapping[layer_id]
 
-    def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
-    ):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
         # The layer-wise wait logic is executed at the Hybrid LinearPool level;
         # no additional wait is needed in the full_kv_pool
@@ -2272,9 +2274,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -2294,9 +2298,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            cache_k_fp4, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+                cache_k
+            )
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -2330,14 +2338,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
-                    KVFP4QuantizeUtil,
+                    BlockFP4KVQuantizeUtil,
                 )
 
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
                 )
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_rope)
                 )
 
             if self.store_dtype != self.dtype:

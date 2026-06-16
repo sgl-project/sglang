@@ -29,7 +29,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_cuda_version,
     is_blackwell,
+    is_flashinfer_available,
     is_hip,
     is_npu,
     load_json_config,
@@ -232,15 +234,30 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        cls._buffer = Buffer(
-            group,
-            num_nvl_bytes,
-            num_rdma_bytes,
+        buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
+        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
+        # support, so cross-pod GB200/GB300 EP groups use
+        # cuMemImportFromShareableHandle instead of the intra-node-only
+        # cudaIpcOpenMemHandle. The DeepEP build we ship is keyed on the CUDA major
+        # version:
+        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
+        #            pass it when the device advertises fabric support.
+        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
+        #            auto-enables fabric in C++ when supported, so we skip it:
+        #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
+        is_cu12 = get_cuda_version()[0] == 12
+        if not is_cu12 and is_flashinfer_available():
+            from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+            if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+                buffer_kwargs["use_fabric"] = True
+
+        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
 
     @classmethod

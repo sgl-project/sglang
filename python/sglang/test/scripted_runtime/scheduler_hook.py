@@ -119,8 +119,8 @@ class ScriptedSchedulerHook:
     def __init__(
         self,
         *,
-        scheduler: "Scheduler",
-        tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
+        scheduler: Scheduler,
+        tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
@@ -128,7 +128,7 @@ class ScriptedSchedulerHook:
             and scheduler.ps.tp_rank == 0
             and scheduler.ps.attn_cp_rank == 0
         )
-        self._batch_log: List["ScriptedBatchRecord"] = []
+        self._batch_log: List[ScriptedBatchRecord] = []
 
         if self._is_driver:
             ensure_script_importable(
