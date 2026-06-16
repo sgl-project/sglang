@@ -2440,21 +2440,8 @@ class ServerArgs:
                     )
 
                 # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Only the kernel/page_first transfer
-                # path has a safe split K/V implementation.
-                if self.hicache_io_backend != "kernel":
-                    logger.warning(
-                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r})."
-                    )
-                    self.hicache_io_backend = "kernel"
-                if self.hicache_mem_layout != "page_first":
-                    logger.warning(
-                        f"Force hicache_mem_layout to 'page_first' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"asymmetric K/V HiCache requires kernel/page_first."
-                    )
-                    self.hicache_mem_layout = "page_first"
+                # asymmetric K/V allocation. Both kernel/page_first and
+                # direct/page_first_direct have split K/V transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
