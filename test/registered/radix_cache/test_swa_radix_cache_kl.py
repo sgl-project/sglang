@@ -18,7 +18,7 @@ class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
         "1",
         "--mem-fraction-static",
         "0.70",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
     ]
 
 

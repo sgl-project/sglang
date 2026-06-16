@@ -29,7 +29,7 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu", "base-b-test-cpu-arm64"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -39,9 +39,18 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
+        # extra-a: label-gated PR opt-in suite in pr-test-amd-extra.yml
+        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
+        # dispatch when the PR carries the `run-ci-extra` label). Only the
+        # 1-gpu-small mock-model / kv_canary *unit* tests are onboarded so
+        # far; the canary *e2e* tests (1-/2-gpu-large) need the canary JIT
+        # kernel ported to ROCm first, so those suites are intentionally
+        # not yet registered for AMD.
+        "extra-a-test-1-gpu-small-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -110,6 +119,8 @@ NIGHTLY_SUITES = {
         "nightly-perf-vlm-2-gpu",
         # GB300 (4x B200 NVL4) nightly suite
         "nightly-4-gpu-gb300",
+        # Nightly precision regression (per-layer hidden state comparison)
+        "nightly-precision-8-gpu-h200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
