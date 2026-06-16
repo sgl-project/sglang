@@ -44,6 +44,9 @@ class _DummyReq:
     def fill_ids_upto(self, length):
         return (self.origin_input_ids + self.output_ids)[:length]
 
+    def get_fill_ids_sliced(self, length):
+        return (self.origin_input_ids + self.output_ids)[:length]
+
 
 def _build_swa_tree(
     is_eagle: bool,

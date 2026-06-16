@@ -378,7 +378,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
         )
-        req.fill_len = req.get_full_untruncated_fill_len()
+        req.fill_len = len(req.get_full_untruncated_fill_ids())
         req.logprob_start_len = -1
         req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
         reqs.append(req)
@@ -395,7 +395,7 @@ def prepare_extend_inputs_for_correctness_test(
             to_array(req.origin_input_ids)
             + array("q", input_ids[i][bench_args.cut_len :])
         )
-        req.fill_len = req.get_full_untruncated_fill_len()
+        req.fill_len = len(req.get_full_untruncated_fill_ids())
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
@@ -427,7 +427,7 @@ def prepare_synthetic_inputs_for_latency_test(
             origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
         )
-        req.fill_len = req.get_full_untruncated_fill_len()
+        req.fill_len = len(req.get_full_untruncated_fill_ids())
         req.logprob_start_len = -1
         req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
         reqs.append(req)

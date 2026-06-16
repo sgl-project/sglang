@@ -95,6 +95,9 @@ class MockReq:
     def fill_ids_upto(self, length):
         return (self.origin_input_ids + self.output_ids)[:length]
 
+    def get_fill_ids_sliced(self, length):
+        return (self.origin_input_ids + self.output_ids)[:length]
+
     def pop_committed_kv_cache(self):
         self.kv_committed_freed = True
         return self.kv_committed_len

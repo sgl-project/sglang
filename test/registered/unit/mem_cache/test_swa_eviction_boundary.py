@@ -117,6 +117,9 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
     )
     req.pop_committed_kv_cache = lambda: req._kv_committed_len
     req.fill_ids_upto = lambda length: (req.origin_input_ids + req.output_ids)[:length]
+    req.get_fill_ids_sliced = lambda length: (req.origin_input_ids + req.output_ids)[
+        :length
+    ]
     req.get_full_untruncated_fill_ids = lambda: req.origin_input_ids + req.output_ids
     req.get_full_untruncated_fill_len = lambda: len(req.origin_input_ids) + len(
         req.output_ids
