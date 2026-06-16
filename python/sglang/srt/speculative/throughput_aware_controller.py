@@ -389,22 +389,39 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         rows = score_candidates(self._tracker, self._cost_table, candidates, batch_size)
         best_steps = pick_best_step(rows, fallback=self._current_steps)
 
-        pos_rates_str = format_position_rates(self._tracker, max(candidates) if candidates else 0)
-        scores_str = format_score_rows(rows, best_steps)
         logger.debug(
-            f"[ThroughputAware] batch_count={self._batch_count}  "
-            f"bs={batch_size}  pos_rates={pos_rates_str}  scores={scores_str}"
+            "[ThroughputAware] batch_count=%d  bs=%d  pos_rates=%s  scores=%s",
+            self._batch_count,
+            batch_size,
+            format_position_rates(self._tracker, max(candidates) if candidates else 0),
+            format_score_rows(rows, best_steps),
         )
 
         if best_steps != self._current_steps:
             old_steps = self._current_steps
             direction = "expand" if best_steps > old_steps else "shrink"
+
+            # Extract throughput scores for old and new steps (for the INFO summary).
+            score_map = {r["steps"]: r["score"] for r in rows}
+            old_score = score_map.get(old_steps)
+            new_score = score_map.get(best_steps)
+            score_summary = (
+                f"{old_score:.4f} → {new_score:.4f} tok/ms"
+                if old_score is not None and new_score is not None
+                else "n/a"
+            )
+
             if best_steps < old_steps:
                 self._tracker.clear_positions_above(best_steps)
             self._current_steps = best_steps
             log_info_on_rank0(
                 logger,
                 f"[ThroughputAware] Step {direction}: {old_steps} → {best_steps}  "
-                f"(bs={batch_size}, batch_count={self._batch_count})  "
-                f"pos_rates={pos_rates_str}  scores={scores_str}",
+                f"(bs={batch_size}, batch_count={self._batch_count}, "
+                f"throughput={score_summary})",
+            )
+            logger.debug(
+                "[ThroughputAware] detail: pos_rates=%s  scores=%s",
+                format_position_rates(self._tracker, max(candidates) if candidates else 0),
+                format_score_rows(rows, best_steps),
             )
