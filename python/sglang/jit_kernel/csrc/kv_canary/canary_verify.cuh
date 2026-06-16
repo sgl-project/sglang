@@ -4,7 +4,9 @@
 #include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
-#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum (warp-size-agnostic)
+#ifdef USE_ROCM
+#include <sgl_kernel/warp.cuh>  // For device::warp::reduce_sum (ROCm wave64-safe reduction)
+#endif
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -125,12 +127,21 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     }
   }
 
-  // Warp-size-agnostic reduction: device::warp::reduce_sum performs a width-kWarpThreads (32) xor
-  // all-reduce, so each 32-lane sub-group gets its own total. This is correct on both CUDA (warp=32)
-  // and ROCm wave64 (two 32-lane sub-groups per wavefront, each with its own lane-0 leader below).
-  // A hand-rolled __shfl_down over the full wavefront would cross the 32-lane boundary on wave64.
+#ifndef USE_ROCM
+  // CUDA path: unchanged 32-lane warp down-reduction (preserves the original NV codegen exactly).
+  uint32_t warp_active_count = local_active_count;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    warp_active_count += __shfl_down_sync(0xFFFFFFFFu, warp_active_count, offset);
+  }
+  const bool is_subgroup_leader = (threadIdx.x & 31u) == 0u;
+#else
+  // ROCm wave64: a hand-rolled __shfl_down over the full 64-lane wavefront would cross the 32-lane
+  // boundary and miscount. device::warp::reduce_sum performs a width-kWarpThreads (32) xor all-reduce,
+  // so each 32-lane sub-group gets its own total with its own lane-0 leader.
   const uint32_t warp_active_count = device::warp::reduce_sum<device::kWarpThreads>(local_active_count);
-  if ((threadIdx.x % device::kWarpThreads) == 0u && warp_active_count != 0u) {
+  const bool is_subgroup_leader = (threadIdx.x % device::kWarpThreads) == 0u;
+#endif
+  if (is_subgroup_leader && warp_active_count != 0u) {
     atomicAdd(
         reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(warp_active_count));
   }
