@@ -45,6 +45,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -91,6 +92,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_hip,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
@@ -98,6 +100,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
@@ -125,6 +128,9 @@ if _is_hip:
         _has_rocm_qk_norm_rope = True
     except ImportError:
         _has_rocm_qk_norm_rope = False
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 logger = logging.getLogger(__name__)
 
@@ -1114,6 +1120,50 @@ class MiniMaxM3Attention(nn.Module):
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
+    def _can_use_npu_split_qkv_tp_rmsnorm_rope(self) -> bool:
+        return (
+            _is_npu
+            and not self.is_sparse_attention_layer
+            and self.use_qk_norm
+            and self.qk_norm_type == "per_layer"
+            and not self.attention_output_gate
+        )
+
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
+
+        if not self._can_use_npu_split_qkv_tp_rmsnorm_rope():
+            return self.forward_prepare(positions, hidden_states, forward_batch)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        q, k, v = split_qkv_tp_rmsnorm_rope(
+            input=qkv,
+            cos=cos,
+            sin=sin,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            q_hidden_size=self.q_size,
+            kv_hidden_size=self.kv_size,
+            head_dim=self.head_dim,
+            rotary_dim=self.rotary_dim,
+            eps=self.q_norm.variance_epsilon,
+            tp_world=getattr(self.q_norm, "attn_tp_size", self.attn_tp_size),
+            tp_group=get_attention_tp_group().device_group,
+        )
+        inner_state = (q, k, v, None, forward_batch)
+        return None, forward_batch, inner_state
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1272,11 +1322,18 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if _is_npu:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
 

@@ -1977,7 +1977,16 @@ class ServerArgs:
             ):
                 self.quantization = quant_method
 
-            if is_hip():
+            if is_npu():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "ascend"
+                if self.page_size is None:
+                    self.page_size = 128
+                logger.info(
+                    "MiniMax-M3 on NPU: attention_backend="
+                    f"{self.attention_backend}, page_size={self.page_size}."
+                )
+            elif is_hip():
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "triton"
                 if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":

@@ -5,6 +5,8 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    MHATokenToKOnlyPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
     unwrap_write_loc,
@@ -280,6 +282,134 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
                 v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
+    """NPU paged K-only cache used by MiniMax sparse index-only layers."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        super(MHATokenToKOnlyPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            if self.use_fia:
+                self.k_buffer = [
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
+                ]
+
+        self._finalize_allocation_log(size)
+
+    def _get_key_buffer(self, layer_id: int):
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        if self.store_dtype != self.dtype:
+            return k_buffer.view(self.dtype)
+        return k_buffer
+
+    def set_k_buffer(
+        self,
+        layer_id: int,
+        loc_info,
+        cache_k: torch.Tensor,
+    ) -> None:
+        loc, _ = unwrap_write_loc(loc_info)
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+
+        k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
+            -1, self.head_num, self.head_dim
+        )
+        torch_npu.npu_scatter_nd_update_(
+            k_buffer_layer,
+            loc.view(-1, 1),
+            cache_k.view(-1, self.head_num, self.head_dim),
+        )
+
+    def get_contiguous_buf_infos(self):
+        data_ptrs = [
+            self.get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        data_lens = [
+            self.get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        if self.use_fia:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_kv_size_bytes(self):
+        return get_tensor_size_bytes(self.k_buffer), 0
+
+
+class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
+    """MiniMax sparse wrapper backed by NPU paged MHA/index pools."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            main_pool_cls=NPUMHATokenToKVPool,
+            index_kv_pool_cls=NPUMHATokenToKVPool,
+            index_k_pool_cls=NPUMHATokenToKOnlyPool,
+            **kwargs,
+        )
+
+    def get_index_k_state_buf_infos(self):
+        pool = self.index_k_pool
+        n = pool.layer_num
+        data_ptrs = [pool.get_key_buffer(i).data_ptr() for i in range(n)]
+        data_lens = [pool.get_key_buffer(i).nbytes for i in range(n)]
+        if pool.use_fia:
+            item_lens = [
+                pool.get_key_buffer(i)[0].nbytes * pool.page_size for i in range(n)
+            ]
+        else:
+            item_lens = [pool.get_key_buffer(i)[0].nbytes for i in range(n)]
+        return data_ptrs, data_lens, item_lens
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
