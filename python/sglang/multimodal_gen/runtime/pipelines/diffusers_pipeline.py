@@ -20,7 +20,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
@@ -638,10 +638,18 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, comp):
                 try:
                     component = getattr(pipe, comp)
-                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
-                    # modules which can significantly reduce compilation time for large models
-                    # with repeated blocks.
-                    if isinstance(component, torch.nn.Module) and hasattr(
+                    repeated_blocks = getattr(component, "_repeated_blocks", None)
+                    if (
+                        isinstance(component, torch.nn.Module)
+                        and repeated_blocks
+                        and hasattr(component, "compile_repeated_blocks")
+                    ):
+                        # Regional compilation: compile a single instance of each
+                        # repeated transformer block and let inductor's cache reuse
+                        # it for all repeats, instead of compiling the whole DiT as
+                        # one graph
+                        component.compile_repeated_blocks()
+                    elif isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
                     ):
                         # Prefer in-place compilation if supported. According to PyTorch documentation:
@@ -718,6 +726,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        stage.set_registered_stage_name(stage_name)
+        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self

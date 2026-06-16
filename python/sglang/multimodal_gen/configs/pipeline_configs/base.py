@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
@@ -179,6 +182,9 @@ def shard_rotary_emb_for_sp(emb):
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
     raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 5 and latents.dim() == 5:
+        return latents[:, :, : raw_shape[2], :, :]
+
     if len(raw_shape) == 3:
         # Sequence format [B, S, D]: use seq_len directly
         target_tokens = raw_shape[1]
@@ -227,6 +233,7 @@ class PipelineConfig:
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
+    image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -237,8 +244,8 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    # image encoding
-    image_encoder_extra_args: dict = field(default_factory=lambda: {})
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -259,6 +266,10 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # return the model-specific config for optimal deployment setting
+        return ModelDeploymentConfig()
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -303,8 +314,17 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        return False
+
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        """Realtime hook: optionally preprocess the first-frame condition image
+        in-place. Return True if handled (skip the standard path), False to fall
+        back to the normal condition-image preprocessing. Default: not handled."""
+        return False
 
     def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
@@ -348,6 +368,13 @@ class PipelineConfig:
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
+
+    def is_flux_v1(self) -> bool:
+        """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
+
+        Used by text encoding (e.g. fixed CLIP context). Other pipelines return False.
+        """
+        return False
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
@@ -422,6 +449,10 @@ class PipelineConfig:
 
     def maybe_prepare_latent_ids(self, latents):
         return None
+
+    # called before vae encode
+    def preprocess_vae_encode(self, image, vae):
+        return image
 
     # called after vae encode
     def postprocess_vae_encode(self, image_latents, vae):
@@ -667,6 +698,9 @@ class PipelineConfig:
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
+    def prepare_world_condition(self, batch, device, dtype):
+        return None
+
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 
@@ -717,6 +751,31 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}resolution",
             default=None,
             help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
+
+        # SANA-WM streaming knobs. default=None so they only apply to pipeline
+        # configs that define these fields (e.g. SanaWMPipelineConfig); other
+        # configs are left untouched by update_config_from_args.
+        parser.add_argument(
+            f"--{prefix_with_dot}streaming",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}streaming",
+            default=None,
+            help="SANA-WM: enable chunk-causal streaming (forward_long) generation.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}refiner-chunked",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}refiner_chunked",
+            default=None,
+            help="SANA-WM: chunk-wise streaming refiner (vs whole-clip dense refiner).",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}num-frame-per-block",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}num_frame_per_block",
+            default=None,
+            help="SANA-WM: latent frames per streaming chunk (default 3).",
         )
 
         # DiT configuration
@@ -786,6 +845,18 @@ class PipelineConfig:
             type=parse_int_list,
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-sink-size",
+            type=int,
+            default=None,
+            help="Override the number of sink frames kept by realtime causal DiT pipelines that support it.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-num-frames",
+            type=int,
+            default=None,
+            help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
 
         # Add VAE configuration arguments
@@ -904,6 +975,30 @@ class PipelineConfig:
                 )
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
+            # If an explicit pipeline_class_name refines the model-default config
+            # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
+            # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
+            # config so realtime-only wiring (the /v1/realtime_video adapter) is
+            # selected. Only applies when the explicit config strictly subclasses
+            # the model default, so non-realtime pipelines are unaffected.
+            if pipeline_class_name:
+                explicit_config_classes = get_pipeline_config_classes(
+                    pipeline_class_name
+                )
+                if explicit_config_classes is not None:
+                    explicit_config_cls = explicit_config_classes[0]
+                    if (
+                        isinstance(explicit_config_cls, type)
+                        and isinstance(pipeline_config_cls, type)
+                        and explicit_config_cls is not pipeline_config_cls
+                        and issubclass(explicit_config_cls, pipeline_config_cls)
+                    ):
+                        logger.info(
+                            f"Refining pipeline config {pipeline_config_cls.__name__} "
+                            f"-> {explicit_config_cls.__name__} for explicit "
+                            f"pipeline_class_name={pipeline_class_name}"
+                        )
+                        pipeline_config_cls = explicit_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         if vae_path is None:
             component_paths = kwargs.get(

@@ -45,6 +45,7 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+_DP_MAX_LEN_WITH_IDLE = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -72,8 +73,12 @@ class DpPaddingMode(IntEnum):
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
-        # to enable symmetric memory optimization (needed for NSA CP, etc.).
+        # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+            # fabricated-row conversion; other models keep mainline SUM_LEN.
+            if _DP_MAX_LEN_WITH_IDLE and min(global_num_tokens) == 0:
+                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -126,8 +131,8 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -136,8 +141,8 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -193,12 +198,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -251,7 +256,7 @@ def compute_dp_attention_world_info(
         # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
 
-    return attn_tp_rank, attn_tp_size, attn_dp_rank
+    return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
 def compute_dp_attention_local_info(
@@ -277,6 +282,10 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    global _DP_MAX_LEN_WITH_IDLE
+    _DP_MAX_LEN_WITH_IDLE = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
@@ -287,7 +296,7 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(

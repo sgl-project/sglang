@@ -78,7 +78,7 @@ class BatchingRule:
     source: str = "user"
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, source: str) -> "BatchingRule":
+    def from_dict(cls, data: dict[str, Any], *, source: str) -> BatchingRule:
         if not isinstance(data, dict):
             raise ValueError(
                 f"batching config rule from {source} must be an object, "
@@ -156,11 +156,11 @@ class BatchingRule:
 class BatchAdmissionController:
     """Applies configured caps before adding requests to a batch."""
 
-    def __init__(self, server_args: "ServerArgs", gpu_id: int):
+    def __init__(self, server_args: ServerArgs, gpu_id: int):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
-        self._offload = bool(server_args.dit_layerwise_offload)
+        self._offload = bool(server_args.layerwise_offload_components)
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config
