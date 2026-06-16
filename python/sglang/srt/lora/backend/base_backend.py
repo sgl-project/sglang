@@ -266,16 +266,27 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled = None
             token_lora_mapping = None
 
-        num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else forward_batch.batch_size
-        )
-        max_len = (
-            max(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else 1
-        )
+        fb = forward_batch
+        if fb.forward_mode.is_target_verify():
+            # Target-verify reports is_extend() but leaves extend_seq_lens_cpu=None
+            # (including during CUDA-graph capture). Every request verifies a uniform
+            # spec_info.draft_token_num tokens -- the same source
+            # generate_sequence_lengths() uses -- so derive the scalar counts directly
+            # (no GPU sync, unlike materializing a seg_lens tensor).
+            num_tokens_per_bs = fb.spec_info.draft_token_num
+            num_tokens = fb.batch_size * num_tokens_per_bs
+            max_len = num_tokens_per_bs
+            assert num_tokens <= fb.input_ids.shape[0], (
+                f"target-verify token count {num_tokens} exceeds input buffer "
+                f"{fb.input_ids.shape[0]}"
+            )
+        elif fb.forward_mode.is_extend():
+            extend_lens = fb.extend_seq_lens_cpu
+            num_tokens = sum(extend_lens)
+            max_len = max(extend_lens)
+        else:
+            num_tokens = fb.batch_size
+            max_len = 1
 
         if (
             batch_info.req_seg_indptr is not None
