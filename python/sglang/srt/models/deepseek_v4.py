@@ -999,13 +999,8 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_quant = (
-                o.view(T * G, D)
-                if not _is_hip
-                else o.reshape(T * G, D).contiguous()
-            )
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o_quant,
+                o.reshape(T * G, D).contiguous(),
                 group_size=128,
             )
             o_s = deep_gemm.ceil_to_ue8m0(o_s)
