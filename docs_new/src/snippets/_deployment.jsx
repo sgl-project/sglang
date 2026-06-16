@@ -512,7 +512,9 @@ export const Deployment = ({ config, benchmarks }) => {
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
+        ...(config.placeholders && config.placeholders.HF_TOKEN
+          ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
