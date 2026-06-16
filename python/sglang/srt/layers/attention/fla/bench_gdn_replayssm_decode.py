@@ -119,9 +119,7 @@ def _bench_cfg(B, H, HV, K, V, Ls, dtype, device, num_slots=None, warmup=25, rep
 
         t_replay = triton.testing.do_bench(run_replay, warmup=warmup, rep=rep)
         packed_bytes, replay_bytes = _state_bytes_per_step(B, HV, K, V, L, dtype)
-        rows.append(
-            (L, t_replay, t_packed / t_replay, replay_bytes / packed_bytes)
-        )
+        rows.append((L, t_replay, t_packed / t_replay, replay_bytes / packed_bytes))
     return t_packed, rows
 
 
@@ -131,13 +129,9 @@ def main():
     parser.add_argument("--h", type=int, default=16, help="num key/query heads")
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--v", type=int, default=128)
-    parser.add_argument(
-        "--batch-sizes", type=int, nargs="+", default=[1, 16, 64, 256]
-    )
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 16, 64, 256])
     parser.add_argument("--ls", type=int, nargs="+", default=[1, 8, 16])
-    parser.add_argument(
-        "--dtype", choices=["bf16", "fp16", "fp32"], default="bf16"
-    )
+    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():

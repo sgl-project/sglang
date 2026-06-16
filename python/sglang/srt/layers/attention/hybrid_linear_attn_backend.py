@@ -172,9 +172,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     # Dedup valid slots; for duplicates a scatter picks one
                     # arbitrary row, but all rows of a given slot share the same
                     # write_pos/flush, so the value is identical regardless.
-                    uniq_slots, inv = torch.unique(
-                        valid_slots, return_inverse=True
-                    )
+                    uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
                     next_for_valid = next_pos[valid_mask]
                     new_vals = torch.empty(
                         uniq_slots.shape[0],
@@ -653,9 +651,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 force_flush_dev = None
                 if forward_mode.is_decode_or_idle() and seq_lens_cpu is not None:
                     ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
-                    force_flush_dev = ff_mask.to(
-                        device=self.device, dtype=torch.int32
-                    )
+                    force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
                     static_ff.copy_(force_flush_dev)
                 else:
                     static_ff.zero_()
@@ -679,9 +675,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         )
                         # Dedup; rows sharing a slot share write_pos+flush, so
                         # the scattered value is identical for either row.
-                        uniq_slots, inv = torch.unique(
-                            valid_slots, return_inverse=True
-                        )
+                        uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
                         next_for_valid = next_pos[valid_mask]
                         new_vals = torch.empty(
                             uniq_slots.shape[0],

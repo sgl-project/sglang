@@ -155,7 +155,9 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     # end-to-end (ReplaySSM bf16 GSM8K parity); the unit test uses
     # tensor-core-realistic tolerances. At L=1 the buffer is empty so this dot
     # is identically zero and the path stays bit-exact regardless of precision.
-    b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(p_o.dtype.element_ty)  # [BV, BC]
+    b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(
+        p_o.dtype.element_ty
+    )  # [BV, BC]
 
     # Current token value (for the delta-rule update).
     v_off = (2 * H * K) + i_hv * V + o_v
@@ -190,8 +192,16 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
         p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
-        q_c = tl.load(p_mix + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32) * q_rnorm
-        k_c = tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32) * k_rnorm
+        q_c = (
+            tl.load(p_mix + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32)
+            * q_rnorm
+        )
+        k_c = (
+            tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
+                tl.float32
+            )
+            * k_rnorm
+        )
         q_cs = q_c * scale
         cur_kq += tl.sum(k_c * q_cs)
 
@@ -203,9 +213,9 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
             + o_v[:, None] * K
             + o_kt[None, :]
         )
-        b_h0_c = tl.load(
-            p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0
-        ).to(tl.float32)
+        b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(
+            tl.float32
+        )
         p_k_c = (
             k_cache
             + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
@@ -251,9 +261,12 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
             o_kt = kk * BKT + tl.arange(0, BKT)
             mask_kt = o_kt < K
             p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
-            k_c = tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
-                tl.float32
-            ) * k_rnorm
+            k_c = (
+                tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
+                    tl.float32
+                )
+                * k_rnorm
+            )
             p_h0_c = (
                 h0
                 + state_idx * stride_init_state_token
@@ -292,9 +305,7 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
         # Non-flush: append the current token's corrected delta d and gate g to
         # the cache (the k chunks were already written inside the loop above).
         p_cur_d = (
-            d_cache
-            + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V
-            + o_v
+            d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
         )
         tl.store(
             p_cur_d,
@@ -349,15 +360,11 @@ def fused_recurrent_gdn_replayssm_decode(
     if mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(
-            f"`a`/`b` must be 2D (got a.ndim={a.ndim}, b.ndim={b.ndim})."
-        )
+        raise ValueError(f"`a`/`b` must be 2D (got a.ndim={a.ndim}, b.ndim={b.ndim}).")
     if A_log.ndim != 1 or dt_bias.ndim != 1:
         raise ValueError("`A_log`/`dt_bias` must be 1D tensors.")
     if initial_state.ndim != 4:
-        raise ValueError(
-            f"`initial_state` must be 4D (got ndim={initial_state.ndim})."
-        )
+        raise ValueError(f"`initial_state` must be 4D (got ndim={initial_state.ndim}).")
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
     if write_pos.ndim != 1 or write_pos.dtype != torch.int32:
@@ -377,7 +384,9 @@ def fused_recurrent_gdn_replayssm_decode(
         )
     H = q_dim // K
     if H <= 0 or HV % H != 0:
-        raise ValueError(f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}.")
+        raise ValueError(
+            f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
+        )
     max_cache_len = d_cache.shape[2]
 
     # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).

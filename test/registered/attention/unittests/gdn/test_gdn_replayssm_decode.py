@@ -44,15 +44,15 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 # Mirror sibling GDN unittests: register for CUDA/AMD CI. This is a kernel-math
-# unit test; it lives with the other GDN kernel correctness tests.
+# unit test; it lives with the other GDN kernel correctness tests. The registry
+# calls MUST be module-level (the CI collector / check-registered-tests hook
+# parses them statically via AST and only scans top-level statements -- a
+# try/except wrapper hides them and fails the hook).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-try:
-    from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-    register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-    register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-large-amd")
-except Exception:  # pragma: no cover - registration is optional for local runs
-    pass
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-large-amd")
 
 
 def _build_inputs(B, H, HV, K, V, dtype, device, seed=0):
@@ -108,7 +108,9 @@ class TestGDNReplaySSMDecode(CustomTestCase):
 
         # Shared static params across steps.
         A_log = (torch.randn(HV, device=device, dtype=torch.float32) * 0.3).contiguous()
-        dt_bias = (torch.randn(HV, device=device, dtype=torch.float32) * 0.1).contiguous()
+        dt_bias = (
+            torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+        ).contiguous()
 
         # Two independent state pools (same init), one per kernel. One slot/req.
         num_slots = B
