@@ -137,27 +137,25 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
+        # We still use the kernel for packing utilities and dispatcher dtype, but not for process_weights
         self.w13_kernel = NPUW4A16Int4MoEMethod()
         self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     @staticmethod
-    def _register_or_replace_parameter(
-        layer: torch.nn.Module, name: str, tensor: torch.Tensor
-    ) -> None:
-        """Safely register a parameter, replacing if already present."""
+    def _register_or_replace_parameter(layer, name, tensor):
         if hasattr(layer, name):
             replace_parameter(layer, name, tensor)
         else:
-            layer.register_parameter(
-                name, torch.nn.Parameter(tensor, requires_grad=False)
-            )
+            layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
 
+    # ------------------------------------------------------------------
+    #  AWQ interleaved unpacking (0,4,1,5,2,6,3,7) with sign-extension
+    # ------------------------------------------------------------------
     def _unpack_awq_int4(self, packed: torch.Tensor) -> torch.Tensor:
         """
-        Unpack AWQ int4 weight (nibble order 0,4,1,5,2,6,3,7)
-        to signed int8 tensor of shape (E*K, N).
+        Unpack AWQ int4 weight to signed int8 (E*K, N).
         packed: (E, K, N_packed) int32
-        returns: (E*K, N) int8 (signed)
+        returns: (E*K, N) int8 (signed two's complement)
         """
         E, K, N_packed = packed.shape
         pack_factor = 8
@@ -174,62 +172,70 @@ class AWQAscendMoEKernel:
             out[:, i::pack_factor] = signed
         return out
 
-    def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
-        """Convert AWQ weight to NPU W4A16 layout (plain int32, no NZ)."""
-        E, K, _ = qweight.shape
-        unpacked = self._unpack_awq_int4(qweight)   # (E*K, N) int8
-        N = unpacked.shape[1]
-        weight = unpacked.view(E, K, N).permute(0, 2, 1).contiguous()  # (E, N, K)
-        # Pack 4 int8 values into int32 (standard packing, no NZ)
-        return self.w13_kernel._pack_to_int32(weight)   # (E, N, K//4) int32
-
-    def _convert_awq_qzeros_to_npu_offset(
-        self, qzeros: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
-        """Convert AWQ zero points to NPU offsets (shape E, N, groups)."""
-        E, G, _ = qzeros.shape
-        unpacked = self._unpack_awq_int4(qzeros)       # (E*G, N) int8, value = zero_point - 8
-        N = unpacked.shape[1]
-        offset = unpacked.view(E, G, N).permute(0, 2, 1).contiguous()  # (E, N, G)
-        # NPU kernel expects 8 - zero_point = -(zero_point - 8)
-        offset = -offset
-        return offset.to(dtype)
+    # ------------------------------------------------------------------
+    #  Weight packing for W4A16 NPU kernel
+    # ------------------------------------------------------------------
+    def _pack_for_w4a16(self, weight_int8: torch.Tensor) -> torch.Tensor:
+        """
+        Convert signed int8 weight (shape E,N,K) into the packed int4 layout
+        required by torch.ops.npu.npu_grouped_matmul (W4A16).
+        Uses npu_convert_weight_to_int4pack which expects int32 input of shape (E*N, K).
+        """
+        E, N, K = weight_int8.shape
+        # The operator expects (M, K) int32 tensor where each int32 holds 8 int4 values.
+        # Reshape to (E*N, K) and cast to int32 (it will be reinterpreted as packed int4)
+        weight_int32 = weight_int8.reshape(E * N, K).to(torch.int32)
+        # Convert to int4pack format (shape becomes (E*N, K//8))
+        packed = torch.ops.npu.npu_convert_weight_to_int4pack(weight_int32)
+        # Reshape back to (E, N, K//8)
+        packed = packed.view(E, N, -1)
+        return packed.contiguous()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # 1. Convert and register weights (already packed correctly)
-        self._register_or_replace_parameter(
-            layer, "w13_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w13_qweight.data),
-        )
-        self._register_or_replace_parameter(
-            layer, "w2_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
-        )
-    
-        # 2. Register scales (keep as (E, N, groups))
+        # 1. Convert weights and register
+        # w13
+        w13_unpacked = self._unpack_awq_int4(layer.w13_qweight.data)  # (E*K, N13) int8
+        E, K13, N13_packed = layer.w13_qweight.shape
+        N13 = N13_packed * 8
+        w13_int8 = w13_unpacked.view(E, K13, N13).permute(0, 2, 1).contiguous()  # (E, N13, K13)
+        w13_packed = self._pack_for_w4a16(w13_int8)   # (E, N13, K13//8) int32
+        self._register_or_replace_parameter(layer, "w13_weight", w13_packed)
+
+        # w2
+        w2_unpacked = self._unpack_awq_int4(layer.w2_qweight.data)
+        E2, K2, N2_packed = layer.w2_qweight.shape
+        N2 = N2_packed * 8
+        w2_int8 = w2_unpacked.view(E2, K2, N2).permute(0, 2, 1).contiguous()
+        w2_packed = self._pack_for_w4a16(w2_int8)
+        self._register_or_replace_parameter(layer, "w2_weight", w2_packed)
+
+        # 2. Scales – transpose from (E, groups, N) to (E, N, groups) and keep as is
         self._register_or_replace_parameter(
             layer, "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous(),
+            layer.w13_scales.data.transpose(1, 2).contiguous()
         )
         self._register_or_replace_parameter(
             layer, "w2_weight_scale",
-            layer.w2_scales.data.transpose(1, 2).contiguous(),
+            layer.w2_scales.data.transpose(1, 2).contiguous()
         )
-    
-        # 3. Register offsets
-        for prefix in ("w13", "w2"):
-            qzeros = getattr(layer, f"{prefix}_qzeros").data
-            scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
+
+        # 3. Offsets – correctly computed from zeros
+        for w_prefix in ("w13", "w2"):
+            qzeros = getattr(layer, f"{w_prefix}_qzeros").data   # (E, groups, N//8)
+            unpacked_zeros = self._unpack_awq_int4(qzeros)       # (E*groups, N) int8, value = zero_point - 8
+            E_z, groups, _ = qzeros.shape
+            N_z = unpacked_zeros.shape[1]
+            offset = unpacked_zeros.view(E_z, groups, N_z).permute(0, 2, 1).contiguous()  # (E, N, groups)
+            offset = -offset  # kernel expects 8 - zero_point
+            dtype = getattr(layer, f"{w_prefix}_scales").data.dtype
             self._register_or_replace_parameter(
-                layer, f"{prefix}_weight_offset",
-                self._convert_awq_qzeros_to_npu_offset(qzeros, scales_dtype),
+                layer, f"{w_prefix}_weight_offset", offset.to(dtype)
             )
-    
-        # 4. Set dispatcher output dtype for w13 (no weight unpacking needed)
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-    
-        # 5. Free original AWQ tensors to reclaim memory immediately
+
+        # 4. Set dispatcher output dtype for w13
+        self.w13_kernel._set_dispatcher_output_dtype(layer, "bf16")  # this only sets a config, safe
+
+        # 5. Free original AWQ tensors
         for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
                      "w2_qweight", "w2_qzeros", "w2_scales"):
             if hasattr(layer, attr):
