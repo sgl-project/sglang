@@ -113,7 +113,7 @@ class EagleDraftWorkerBase(ABC):
         batch.spec_info = draft_extend_input
         # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
         # gather requires input_ids to have a consistent integer dtype across ranks.
-        batch.input_ids = predict.to(torch.int64)
+        batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,

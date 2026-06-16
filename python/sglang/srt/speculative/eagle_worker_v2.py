@@ -749,11 +749,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Prepare for draft extend in a separate stream
+        predicts = batch_result.next_token_ids.to(torch.int64)
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                batch_result.next_token_ids,
+                predicts,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
