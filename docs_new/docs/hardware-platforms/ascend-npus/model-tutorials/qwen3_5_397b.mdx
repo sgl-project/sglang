@@ -148,76 +148,9 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **W8A8** quantized model.
-
-```bash Launch server
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#============================================================
-
-# high performance cpu
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-# bind cpu
-export SGLANG_SET_CPU_AFFINITY=1
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-
-export ASCEND_USE_FIA=1
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-export HCCL_BUFFSIZE=3000
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
-export STREAMS_PER_DEVICE=32
-export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_NPU_USE_MULTI_STREAM=1
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
-export ZBAL_ENABLE_GRAPH=1
-
-MODEL_PATH=/path/to/model-weights
-
-python3 -m sglang.launch_server \
---model-path $MODEL_PATH \
---attention-backend ascend \
---device npu \
---tp-size 16 \
---chunked-prefill-size -1 --max-prefill-tokens 35000 \
---disable-radix-cache \
---trust-remote-code \
---host 127.0.0.1 --max-running-requests 160 \
---mem-fraction-static 0.8 \
---port 6699 \
---cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
---quantization modelslim \
---enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
---mm-attention-backend ascend_attn \
---dtype bfloat16 --mamba-ssm-dtype bfloat16 --max-total-tokens 128000 \
---speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
---speculative-draft-model-quantization unquant \
---dp-size 8 --enable-dp-attention --enable-dp-lm-head \
---enable-prefill-delayer --prefill-delayer-max-delay-passes 100
-```
-
-For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
+deployment commands and benchmark data, see
+[Qwen3.5-397B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b#single-node).
 
 ## Functional verification
 

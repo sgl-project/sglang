@@ -143,61 +143,9 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **W8A8** quantized model.
-
-```bash Launch server
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#============================================================
-
-# high performance cpu
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-# bind cpu
-export SGLANG_SET_CPU_AFFINITY=1
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-
-# cann
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export STREAMS_PER_DEVICE=32
-export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
-
-MODEL_PATH=/path/to/model-weights
-
-python -m sglang.launch_server --model-path ${MODEL_PATH} \
-    --attention-backend ascend \
-    --device npu \
-    --tp-size 2 --nnodes 1 --node-rank 0 \
-    --chunked-prefill-size -1 --max-prefill-tokens 60000 \
-    --disable-radix-cache \
-    --trust-remote-code \
-    --host 127.0.0.1 --max-running-requests 48 --max-mamba-cache-size 60 \
-    --mem-fraction-static 0.7 \
-    --port 6699 \
-    --cuda-graph-bs 2 8 16 32 48 \
-    --enable-multimodal \
-    --quantization modelslim \
-    --mm-attention-backend ascend_attn \
-    --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-```
-
-For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
+deployment commands and benchmark data, see
+[Qwen3.6-27B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_27b#single-node).
 
 ## Functional verification
 

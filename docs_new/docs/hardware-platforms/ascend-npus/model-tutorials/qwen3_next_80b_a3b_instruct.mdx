@@ -147,79 +147,9 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **W8A8** quantized model with 2 Atlas 800I A3 cards.
-
-```bash Launch server
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   SPECULATIVE_DRAFT_MODEL_PATH: path to the draft model weights (BF16)
-#============================================================
-
-export cann_path=/usr/local/Ascend/ascend-toolkit/latest
-source /usr/local/Ascend/driver/bin/setenv.bash
-source ${cann_path}/../set_env.sh
-source ${cann_path}/../../nnal/atb/set_env.sh
-source ${cann_path}/opp/vendors/customize/bin/set_env.bash
-export ASCEND_HOME_PATH=${cann_path}
-source /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh
-
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-export SGLANG_SET_CPU_AFFINITY=1
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
-
-export STREAMS_PER_DEVICE=32
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-
-export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_ALGO="level0:NA;level1:ring"
-
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
-export ASCEND_USE_FIA=1
-export SGLANG_NPU_USE_MULTI_STREAM=0
-export SGLANG_WARMUP_TIMEOUT=3600
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export FORCE_DRAFT_MODEL_NON_QUANT=1
-
-ZBAL_HCCL_OP="allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base"
-export HCCL_BUFFSIZE=64
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
-export ZBAL_ENABLE_GRAPH=1
-MODEL_PATH=/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8
-
-python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
-    --page-size 128 \
-    --tp-size 4 \
-    --trust-remote-code \
-    --attention-backend ascend \
-    --device npu \
-    --watchdog-timeout 9000 \
-    --host 127.0.0.1 --port 6699 \
-    --mem-fraction-static 0.75 \
-    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
-    --chunked-prefill-size -1 --max-running-requests 300 \
-    --mamba-ssm-dtype bfloat16 \
-    --quantization modelslim \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
-    --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct \
-    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
-```
-
-For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
+deployment commands and benchmark data, see
+[Qwen3-Next-80B-A3B-Instruct Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_next_80b_a3b_instruct#single-node).
 
 ## Functional verification
 
