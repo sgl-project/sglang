@@ -13,12 +13,10 @@
 # ==============================================================================
 """Common utilities."""
 
-import hashlib
-import sys
-from array import array
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cpp_hash.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
@@ -105,65 +103,13 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def _token_bytes_and_width(token_ids: List[int]) -> tuple[memoryview, int]:
-    logical_len = len(token_ids)
-    if logical_len == 0:
-        return memoryview(b""), 1
-
-    is_bigram = getattr(token_ids, "is_bigram", False)
-    raw_token_ids = getattr(token_ids, "raw_token_ids", None)
-    raw = (
-        raw_token_ids()
-        if raw_token_ids is not None
-        else getattr(token_ids, "token_ids", token_ids)
-    )
-
-    if is_bigram:
-        unit_width = 2
-        tokens = array("I", [0]) * (logical_len * unit_width)
-        tokens[0::2] = array("I", raw[:logical_len])
-        tokens[1::2] = array("I", raw[1 : logical_len + 1])
-    else:
-        first_token = raw[0]
-        if isinstance(first_token, tuple):
-            unit_width = len(first_token)
-            tokens = array("I", (elem for token in raw[:logical_len] for elem in token))
-        else:
-            unit_width = 1
-            tokens = array("I", raw[:logical_len])
-
-    assert tokens.itemsize == 4
-    if sys.byteorder != "little":
-        tokens.byteswap()
-
-    return memoryview(tokens).cast("B"), unit_width
-
-
 def get_hash_str(
     token_ids: List[int],
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str | List[str]:
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
-    token_bytes, unit_width = _token_bytes_and_width(token_ids)
-    if page_size is None:
-        hasher = hashlib.sha256()
-        if prior_digest is not None:
-            hasher.update(prior_digest)
-        hasher.update(token_bytes)
-        return hasher.hexdigest()
-
-    hashes = []
-    bytes_per_page = page_size * unit_width * 4
-    for byte_start in range(0, len(token_bytes), bytes_per_page):
-        hasher = hashlib.sha256()
-        if prior_digest is not None:
-            hasher.update(prior_digest)
-        hasher.update(token_bytes[byte_start : byte_start + bytes_per_page])
-        prior_digest = hasher.digest()
-        hashes.append(prior_digest.hex())
-
-    return hashes
+    return get_native_hash(token_ids, prior_digest, page_size)
 
 
 def hash_str_to_int64(hash_str: str) -> int:
@@ -179,21 +125,13 @@ def hash_str_to_int64(hash_str: str) -> int:
 
 def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     """Compute SHA256-based hash values for position-aware KV block IDs."""
-    hash_values = []
-
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    logical_len = len(node.key)
-    for start in range(0, logical_len, page_size):
-        end = min(start + page_size, logical_len)
-        if end <= start:
-            continue
-        hash_val = node.key.hash_page(start, end, parent_hash)
-        hash_values.append(hash_val)
-        parent_hash = hash_val
+    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    assert isinstance(hash_values, list)
     return hash_values
 
 
