@@ -21,10 +21,10 @@ This guide intentionally stops at:
 - hotspot ranking
 - mapping hotspots to known fast paths
 
-If the hotspot survives this checklist, hand the work to
-`sglang-diffusion-ako4all-kernel` or another specialized kernel-optimization
-skill. Do not grow this skill back into a general Nsight or kernel-authoring
-guide.
+If the hotspot survives this checklist, package the perf dump, profiler trace,
+exact command, and shape/topology notes for the appropriate kernel, Nsight, or
+framework-specific optimization workflow. Do not grow this skill back into a
+general Nsight or kernel-authoring guide.
 
 ## Prerequisites
 
@@ -163,7 +163,8 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
-Run the full preset sweep:
+Run the full preset sweep only when you have enough GPU time for both the
+nightly-aligned cases and the source-tracked extras:
 
 ```bash
 PYTHONPATH=python python3 "$BENCH_PY" \
@@ -172,7 +173,21 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
-Nightly-aligned presets come first; skill-only presets stay available after them.
+Nightly-aligned presets come first, followed by current-source extras from the
+registry / GPU test cases, then broader skill-only stress presets.
+
+Use the preset categories this way:
+- **Nightly-aligned**: exact mirrors of
+  `scripts/ci/utils/diffusion/comparison_configs.json`; use these when the goal
+  is apples-to-apples comparison with CI / nightly coverage.
+- **Current-source extras**: models or request shapes with explicit support
+  evidence in the current registry, GPU cases, compatibility matrix, pipeline
+  files, or unit tests, but without a nightly comparison case yet.
+- **Skill-only stress / coverage presets**: extra profiling scenarios kept by
+  this skill to stress a topology, high-resolution path, multi-GPU mode, or
+  model-specific stage. These may be older than the latest registry additions,
+  so re-check the active source tree before treating them as support-matrix
+  commitments.
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
@@ -186,6 +201,19 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | `LTX2TwoStagePipeline`, 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
 | `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, `--cfg-parallel-size 2`, 768x512, 121 frames, seed 42 |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
+| `qwen-image` | `Qwen/Qwen-Image` | No | Current-source extra covering the base Qwen-Image native path, separate from the nightly `Qwen-Image-2512` case |
+| `qwen-edit-2509` | `Qwen/Qwen-Image-Edit-2509` | No | Current-source extra for the pre-2511 edit-plus path; uses the cat image, 1024x1024 |
+| `zimage-base` | `Tongyi-MAI/Z-Image` | No | Current-source extra for non-turbo Z-Image; keep it separate from `zimage` / `Z-Image-Turbo` |
+| `flux2-klein` | `black-forest-labs/FLUX.2-klein-4B` | No | Current-source extra for the distilled FLUX.2 Klein path; gated repo, 1024x1024, DiT layerwise offload disabled |
+| `flux2-klein-base` | `black-forest-labs/FLUX.2-klein-base-4B` | No | Current-source extra for the undistilled FLUX.2 Klein Base path; gated repo, 1024x1024, DiT layerwise offload disabled |
+| `cosmos3-nano-t2i` | `nvidia/Cosmos3-Nano` | No | Current-source extra for the single-frame Cosmos3 image path; sets `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` in the helper environment |
+| `cosmos3-nano-t2v` | `nvidia/Cosmos3-Nano` | No | Current-source extra for a short Cosmos3 video path; sets `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` in the helper environment |
+| `ideogram4-fp8` | `ideogram-ai/ideogram-4-fp8` | No | Current-source extra matching the native Ideogram 4 FP8 pipeline; do not override steps/guidance directly because the sampling preset owns them |
+| `ernie-image-turbo` | `baidu/ERNIE-Image-Turbo` | No | Current-source extra for ERNIE-Image Turbo |
+| `glm-image` | `zai-org/GLM-Image` | No | Current-source extra for GLM-Image |
+| `sana-1.5-1.6b` | `Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers` | No | Current-source extra for a SANA native image path |
+| `fastwan22-ti2v-5b` | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | No | Current-source extra matching the FastWan2.2 TI2V registered path |
+| `ltx23-hq-two-stage` | `Lightricks/LTX-2.3` | No | Current-source extra for `LTX2TwoStageHQPipeline` with `snapshot` device mode; high-resolution and VRAM-heavy |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage-cfg-parallel` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution CFG-parallel stress preset matching `ltx23-two-stage` plus `--cfg-parallel-size 2` |
@@ -461,6 +489,8 @@ the known mainline families.
 | `fused_inplace_qknorm_rope` missing, but separate qk norm plus rope show up | Check whether the fused diffusion `QK norm + RoPE` path should have engaged |
 | `to_q -> to_k -> to_v` on NVFP4 or Nunchaku FLUX-family checkpoints | Treat as a packed-QKV fast-path miss or checkpoint-format mismatch |
 | `fused_norm_tanh_mul_add*` missing on Z-Image | Treat as a missing mainline modulation path, not a new fusion request |
+| LTX-2 split RoPE appears as a long PyTorch elementwise chain | Check the `apply_ltx2_split_rotary_emb` Triton path and its shape guards |
+| masked attention spends time packing/unpacking Q/K/V | Check whether fused varlen USP pack/scatter should have engaged |
 | `all_to_all`, ring attention, or async A2A dominate | Classify against Ulysses, USP, or turbo-layer overlap first |
 | split `fc1 -> gelu -> quant -> fc2.lora_down` on Nunchaku FLUX | Treat as a missing fused GELU MLP path |
 | attention kernels dominate | Confirm backend, topology, and shape guards before proposing a new kernel |
@@ -475,7 +505,7 @@ Only after the hotspot survives the fast-path checklist:
 1. save a baseline perf dump
 2. save a representative `torch.profiler` trace
 3. note the exact model, shape, dtype, and GPU topology
-4. hand the work to `sglang-diffusion-ako4all-kernel` or another future specialized optimization skill
+4. hand the work to the appropriate kernel, Nsight, or framework-specific optimization workflow
 
 This skill intentionally stops here. It tells you whether you are looking at:
 - a missing existing optimization
@@ -490,4 +520,4 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
 - [ ] reference image or video checked for correctness
-- [ ] any remaining kernel work handed to a specialized optimization skill
+- [ ] any remaining kernel work handed off with perf/profile evidence attached

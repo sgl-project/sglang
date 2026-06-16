@@ -467,7 +467,7 @@ class MOVADenoisingStage(PipelineStage):
         metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
-        with self.progress_bar(total=total_steps) as progress_bar:
+        with self.progress_bar(total=total_steps, batch=batch) as progress_bar:
             for idx_step in range(total_steps):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
