@@ -593,13 +593,15 @@ class Fp8LinearMethod(LinearMethodBase):
             scale_u8 = layer.weight_scale_inv.data
             n, k = weight.shape
             epilogue_tile_m = 128
+            sf_cols = k // 32
+
+            scale_u8 = scale_u8.contiguous().view(torch.uint8).reshape(n, sf_cols)
             padded_n = ((n + epilogue_tile_m - 1) // epilogue_tile_m) * (
                 epilogue_tile_m
             )
+            pad_rows = padded_n - n
 
-            scale_matrix = scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32)
-
-            if padded_n != n:
+            if pad_rows:
                 logger.debug(
                     "Padding dense MXFP8 FlashInfer TRTLLM scale rows from %d to %d "
                     "for weight shape (%d, %d).",
@@ -608,9 +610,12 @@ class Fp8LinearMethod(LinearMethodBase):
                     n,
                     k,
                 )
-                padded_scale_matrix = scale_matrix.new_zeros((padded_n, k // 32))
-                padded_scale_matrix[:n] = scale_matrix
-                scale_matrix = padded_scale_matrix
+                scale_u8 = F.pad(
+                    scale_u8,
+                    (0, 0, 0, pad_rows),
+                    mode="constant",
+                    value=0,
+                )
 
             copy_or_rebind_param(
                 layer,
@@ -623,11 +628,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer,
                 "weight_scale_inv_shuffled",
                 shuffle_matrix_sf_a(
-                    scale_matrix,
+                    scale_u8,
                     epilogue_tile_m,
                     num_elts_per_sf=32,
                 )
-                .reshape_as(scale_matrix)
+                .reshape_as(scale_u8)
                 .contiguous(),
             )
         elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
@@ -793,9 +798,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-                weight_scale = layer.weight_scale_inv_swizzled
-            elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            if (
+                get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
+                or get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
+            ):
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
