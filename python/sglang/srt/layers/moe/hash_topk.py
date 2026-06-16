@@ -192,7 +192,7 @@ class HashTopK(nn.Module):
 
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
-        
+
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 

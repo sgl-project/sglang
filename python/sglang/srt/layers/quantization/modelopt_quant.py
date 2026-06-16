@@ -1354,7 +1354,7 @@ class HybridFp8NvFp4Config(Fp8Config):
     delegate to the inherited Fp8Config dispatch.
     """
 
-    def __init__(self, fp8_config: Fp8Config, nvfp4_config: "ModelOptFp4Config"):
+    def __init__(self, fp8_config: Fp8Config, nvfp4_config: ModelOptFp4Config):
         # Inherit all of fp8_config's state without re-running its
         # validation / logging (already happened at fp8_config build time).
         self.__dict__.update(fp8_config.__dict__)
@@ -1378,7 +1378,7 @@ class HybridFp8NvFp4Config(Fp8Config):
                 return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
         return super().get_quant_method(layer, prefix)
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
         self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
