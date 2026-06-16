@@ -106,6 +106,12 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    assert_lplb_supported_model,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
@@ -690,6 +696,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+            self._init_lplb_solvers()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -1612,6 +1621,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
             )
 
+    def _init_lplb_solvers(self):
+        """Initialize per-layer LPLB solvers from current expert location metadata."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+        # don't participate in the EP all-reduce (would deadlock under DP-
+        # attention). Failure here happens before any forward pass.
+        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        if architectures:
+            assert_lplb_supported_model(architectures[0])
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        clear_global_lplb_solvers()
+        ep_group = get_moe_ep_group()
+        for lid in range(metadata.num_layers):
+            solver = LPLBSolver(
+                phy2log=metadata.physical_to_logical_map[lid],
+                log2phy=metadata.logical_to_all_physical_map[lid],
+                num_gpus=metadata.ep_size,
+                ep_group=ep_group,
+                logical_to_all_physical_map_num_valid=(
+                    metadata.logical_to_all_physical_map_num_valid[lid]
+                ),
+            )
+            set_global_lplb_solver(lid, solver)
+        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
@@ -1653,6 +1691,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+        # Re-init LPLB solvers after expert location update
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            self._init_lplb_solvers()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device

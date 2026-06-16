@@ -668,7 +668,7 @@ class ServerArgs:
         "auto"
     )
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -3534,6 +3534,10 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+        from sglang.srt.layers.cp.base import init_cp_strategy
+
+        init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

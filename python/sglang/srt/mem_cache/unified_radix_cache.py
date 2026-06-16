@@ -8,7 +8,7 @@ from array import array
 from collections import defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 
 import torch
 
@@ -275,6 +275,33 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+class _OngoingWriteThrough(NamedTuple):
+    """Tracks an in-flight D→H write-through operation."""
+
+    node: UnifiedTreeNode
+    lock_params: Optional[DecLockRefParams]
+    publish_nodes: list[UnifiedTreeNode]
+
+
+class _OngoingLoadBack(NamedTuple):
+    """Tracks an in-flight H→D load-back operation."""
+
+    node: UnifiedTreeNode
+    lock_params: DecLockRefParams
+    host_lock_params: DecLockRefParams
+
+
+class _OngoingPrefetch(NamedTuple):
+    """Tracks an in-flight storage→host prefetch operation."""
+
+    anchor_node: UnifiedTreeNode
+    prefetch_key: RadixKey
+    host_indices: torch.Tensor
+    operation: PrefetchOperation
+    anchor_lock_params: DecLockRefParams
+    comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -437,31 +464,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
-        self.ongoing_write_through: dict[
-            int,
-            tuple[
-                UnifiedTreeNode,
-                Optional[DecLockRefParams],
-                list[UnifiedTreeNode],
-            ],
-        ] = {}
-        self.ongoing_load_back: dict[
-            int,
-            tuple[UnifiedTreeNode, DecLockRefParams, DecLockRefParams],
-        ] = {}
+        self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        self.ongoing_prefetch: dict[
-            str,
-            tuple[
-                UnifiedTreeNode,
-                RadixKey,
-                torch.Tensor,
-                PrefetchOperation,
-                DecLockRefParams,
-                dict[ComponentType, list[PoolTransfer]],
-            ],
-        ] = {}
+        self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
         if self.cache_controller is not None:
@@ -1561,7 +1568,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params: Optional[DecLockRefParams],
     ) -> None:
         node.write_through_pending_id = node.id
-        self.ongoing_write_through[node.id] = (node, lock_params, [node])
+        self.ongoing_write_through[node.id] = _OngoingWriteThrough(
+            node, lock_params, [node]
+        )
 
     def _replace_pending_write_through_node(
         self, old_node: UnifiedTreeNode, new_nodes: list[UnifiedTreeNode]
@@ -1589,7 +1598,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for node in new_nodes:
             node.write_through_pending_id = ack_id
-        self.ongoing_write_through[ack_id] = (
+        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node,
             lock_params,
             updated_nodes,
@@ -1698,7 +1707,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
-        self.ongoing_load_back[best_match_node.id] = (
+        self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
             host_anchor_params,
@@ -1905,7 +1914,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_prefetch[req_id] = (
+        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
             host_indices,
@@ -2039,7 +2048,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:
             return
-        _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
+        operation = self.ongoing_prefetch[req_id].operation
         if operation.host_indices is None:
             return
         operation.mark_terminate()
@@ -2553,9 +2562,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._all_component_values_flatten(ComponentType.MAMBA)
 
-    def all_swa_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentType.SWA)
-
     def available_and_evictable_str(self) -> str:
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
@@ -2873,28 +2879,3 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
-
-    def _rebuild_host_leaf_sets(self) -> None:
-        """Rebuild evictable_host_leaves after L1-only reset."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                self._update_evictable_leaf_sets(node)
-            stack.extend(node.children.values())
-
-    def _rebuild_host_lru_lists(self) -> None:
-        """Rebuild host_lru_lists for extra components after L1-only reset.
-        Walks the tree and adds nodes with host component data to the
-        appropriate host LRU list."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                for ct in self.tree_components:
-                    if ct == BASE_COMPONENT_TYPE:
-                        continue  # Full uses evictable_host_leaves, not host LRU
-                    cd = node.component_data[ct]
-                    if cd.host_value is not None:
-                        self.host_lru_lists[ct].insert_mru(node)
-            stack.extend(node.children.values())

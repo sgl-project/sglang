@@ -16,6 +16,15 @@ namespace {
 
 constexpr int kThreadsPerGroup = 16;
 
+#ifdef USE_ROCM
+// AMD implementation: HIP warps are 64-wide and require an explicit sub-group
+// width, so the CUDA 32-bit-mask shuffle reduction below does not compile on
+// gfx942. Delegate to the portable warp-reduce primitive, which emits
+// __shfl_xor with an explicit kThreadsPerGroup sub-group width.
+__device__ __forceinline__ float GroupReduceMax(float val, const int /*tid*/) {
+  return device::warp::reduce_max<kThreadsPerGroup>(val);
+}
+#else
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
   val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
@@ -24,6 +33,7 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
   return val;
 }
+#endif
 
 template <bool kScaleUE8M0>
 using scale_packed_t_t = std::conditional_t<kScaleUE8M0, uint32_t, float>;
