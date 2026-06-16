@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
-from tvm_ffi.module import Module
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
