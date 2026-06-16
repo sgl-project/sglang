@@ -41,34 +41,28 @@ if TYPE_CHECKING:
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
-def _fused_uint8_foreach_copy_(
-    dsts: List[torch.Tensor], srcs: List[torch.Tensor]
-) -> None:
-    """View pairs as uint8 so one _foreach_copy_ fuses all dtypes into a single memcpy."""
-    if not _has_foreach_copy:
-        for dst, src in zip(dsts, srcs):
-            dst.copy_(src)
-        return
+def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs
+    (a single foreach call requires a uniform dtype pair)."""
 
-    u8_dsts: List[torch.Tensor] = []
-    u8_srcs: List[torch.Tensor] = []
-    for dst, src in zip(dsts, srcs):
-        # Fold only when the byte view is provably identical to copy_(): same
-        # dtype (no cast), shape (no broadcast / transpose), device (foreach is
-        # per-device), and contiguity (view requires it). Else defer to copy_().
-        if (
-            dst.dtype == src.dtype
-            and dst.shape == src.shape
-            and dst.device == src.device
-            and dst.is_contiguous()
-            and src.is_contiguous()
-        ):
-            u8_dsts.append(dst.view(-1).view(torch.uint8))
-            u8_srcs.append(src.view(-1).view(torch.uint8))
+    def _foreach_copy(
+        group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
+    ) -> None:
+        if _has_foreach_copy:
+            torch._foreach_copy_(group_dsts, group_srcs)
         else:
-            dst.copy_(src)
-    if u8_dsts:
-        torch._foreach_copy_(u8_dsts, u8_srcs)
+            for dst, src in zip(group_dsts, group_srcs):
+                dst.copy_(src)
+
+    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
+    for dst, src in zip(dsts, srcs):
+        key = (dst.dtype, src.dtype)
+        if key not in groups:
+            groups[key] = ([], [])
+        groups[key][0].append(dst)
+        groups[key][1].append(src)
+    for group_dsts, group_srcs in groups.values():
+        _foreach_copy(group_dsts, group_srcs)
 
 
 class PaddingPolicy(Enum):
@@ -464,7 +458,7 @@ class CudaGraphBufferRegistry:
                 gpu_dsts.append(dst)
                 gpu_srcs.append(src)
         if gpu_dsts:
-            _fused_uint8_foreach_copy_(gpu_dsts, gpu_srcs)
+            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
         for dst, src in zip(cpu_dsts, cpu_srcs):
             dst.copy_(src)
 

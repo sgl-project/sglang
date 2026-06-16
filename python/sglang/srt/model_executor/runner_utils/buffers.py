@@ -60,36 +60,6 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
-def _fused_uint8_foreach_copy_(
-    dsts: List[torch.Tensor], srcs: List[torch.Tensor]
-) -> None:
-    """View pairs as uint8 so one _foreach_copy_ fuses all dtypes into a single memcpy."""
-    if not _has_foreach_copy:
-        for dst, src in zip(dsts, srcs):
-            dst.copy_(src)
-        return
-
-    u8_dsts: List[torch.Tensor] = []
-    u8_srcs: List[torch.Tensor] = []
-    for dst, src in zip(dsts, srcs):
-        # Fold only when the byte view is provably identical to copy_(): same
-        # dtype (no cast), shape (no broadcast / transpose), device (foreach is
-        # per-device), and contiguity (view requires it). Else defer to copy_().
-        if (
-            dst.dtype == src.dtype
-            and dst.shape == src.shape
-            and dst.device == src.device
-            and dst.is_contiguous()
-            and src.is_contiguous()
-        ):
-            u8_dsts.append(dst.view(-1).view(torch.uint8))
-            u8_srcs.append(src.view(-1).view(torch.uint8))
-        else:
-            dst.copy_(src)
-    if u8_dsts:
-        torch._foreach_copy_(u8_dsts, u8_srcs)
-
-
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
 
@@ -359,8 +329,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.out_cache_loc_swa[:raw_num_token])
             srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
 
-        # Batch all GPU copies into one uint8-reinterpreted foreach memcpy.
-        _fused_uint8_foreach_copy_(dsts, srcs)
+        # Batch all GPU copies, grouped by dtype pair.
+        _grouped_foreach_copy_(dsts, srcs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:

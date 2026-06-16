@@ -10,7 +10,6 @@ back into cuda_graph_runner/.
 from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: F401
     DecodeInputBuffers,
     PrefillInputBuffers,
-    _fused_uint8_foreach_copy_,
     _grouped_foreach_copy_,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: F401

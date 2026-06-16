@@ -24,7 +24,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
-    _fused_uint8_foreach_copy_,
+    _grouped_foreach_copy_,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
@@ -472,10 +472,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             f"{self.model_runner.model_config.vocab_size}",
         )
 
-        # Common inputs — fuse the per-field device copies into a single
-        # uint8-reinterpreted foreach copy (one batched async memcpy across all
-        # dtypes) to cut launch overhead on the replay path. seq_lens_cpu is
-        # handled separately below since it lives on host.
+        # Common inputs — batch the per-field device copies into a single
+        # grouped foreach copy (one foreach call per dtype pair) to cut launch
+        # overhead on the replay path. seq_lens_cpu is handled separately below
+        # since it lives on host.
         copy_dsts = [
             buffers.seq_lens[:raw_bs],
             buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
@@ -507,7 +507,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.hidden_states[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.hidden_states)
-        _fused_uint8_foreach_copy_(copy_dsts, copy_srcs)
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
