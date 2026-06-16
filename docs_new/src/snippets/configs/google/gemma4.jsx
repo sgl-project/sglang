@@ -156,9 +156,13 @@ python3 -m sglang.test.run_eval \\
             disableReason: "MoE expert-parallel backends apply only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
         ],
       },
-      ep: { label: "EP", values: [null, 1, 2, 4, 8],
-        disable: { variant: ["e2b", "e4b", "12b", "31b"] },
-        disableReason: "Expert Parallelism applies only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
+      ep: { label: "EP", values: [
+        null,
+        { value: 1, disable: { variant: ["e2b", "e4b", "12b", "31b"] }, disableReason: "Expert Parallelism applies only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
+        { value: 2, disable: { variant: ["e2b", "e4b", "12b", "31b"] }, disableReason: "Expert Parallelism applies only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
+        { value: 4, disable: { variant: ["e2b", "e4b", "12b", "31b"] }, disableReason: "Expert Parallelism applies only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
+        { value: 8, disable: { variant: ["e2b", "e4b", "12b", "31b"] }, disableReason: "Expert Parallelism applies only to the 26B-A4B MoE variant. Switch the Deploy panel's Model Variant to 26B-A4B." },
+      ] },
     },
 
     // ----- Parsers ----- Gemma 4 ships both a reasoning and a tool-call parser
