@@ -190,9 +190,9 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         quant_info = TorchNpuQuantInfo(
             w13_weight=layer.w13_qweight,
             w2_weight=layer.w2_qweight,
-            w13_weight_scale=layer.w13_scales,
+            '''w13_weight_scale=layer.w13_scales,
             w2_weight_scale=layer.w2_scales,
             w13_weight_offset=layer.w13_qzeros,
-            w2_weight_offset=layer.w2_qzeros,
+            w2_weight_offset=layer.w2_qzeros,'''
         )
         return self.runner.run(dispatch_output, quant_info)
