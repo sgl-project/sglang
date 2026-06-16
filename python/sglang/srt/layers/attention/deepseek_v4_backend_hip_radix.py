@@ -320,7 +320,7 @@ class DSV4AttnMetadata:
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self):
+    def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -342,6 +342,8 @@ class DSV4AttnMetadata:
             device=self.c4_topk_lengths_clamp1.device,
         )
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
+        if is_prefill:
+            self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
@@ -1187,6 +1189,49 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified.pf_cu_q
         final_pos = core_attn_metadata.unified.pf_final_pos
 
+        # DSA CP (round-robin/interleave): unified_pf_* are built over the GLOBAL
+        # token layout, but under CP each rank owns only 1/cp_size of the queries
+        # (q/positions are local) while kv was all-gathered to the full sequence.
+        # Slice the per-query fields to this rank's tokens so their length matches
+        # the local query count T; values stay global so each local query still
+        # attends over the full all-gathered KV.
+        from sglang.srt.layers.attention.dsa.utils import (
+            is_dsa_prefill_cp_round_robin_split,
+        )
+
+        # NOTE (AMD/HIP only): this whole DSA-CP prefill handling lives in the
+        # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
+        # The NVIDIA path uses DeepseekV4AttnBackend and never reaches here, so
+        # these CP changes do not affect B200/H200 execution.
+        _cp_size = get_attention_cp_size()
+        _cp_active = (
+            _cp_size > 1
+            and is_dsa_prefill_cp_round_robin_split()
+            and kv.shape[0] == _cp_size * T
+            and state_slot.shape[0] != T
+        )
+        state_slot_full = state_slot
+        final_pos_full = final_pos
+        positions_full = positions
+        if _cp_active:
+            _sl = slice(get_attention_cp_rank(), None, _cp_size)
+            state_slot = state_slot[_sl].contiguous()
+            chunk_start = chunk_start[_sl].contiguous()
+            cu_q = cu_q[_sl].contiguous()
+            final_pos = final_pos[_sl].contiguous()
+            # positions for the local queries are this rank's round-robin global
+            # positions {r, r+cp, r+2cp, ...}; forward_batch.positions is the full
+            # (padded) global layout, so slice it the same way instead of taking
+            # the first T entries (which would be the wrong, sequential 0..T-1).
+            positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
+            # The SWA ring must hold the FULL window on EVERY rank (decode and
+            # later chunks read this rank's ring). kv was all-gathered to the full
+            # sequence, so write the full kv with full global positions/state_slot
+            # instead of only this rank's 1/cp_size tokens.
+            positions_full = forward_batch.positions.to(torch.int64)[
+                : state_slot_full.shape[0]
+            ].contiguous()
+
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
             state_slot=state_slot,
@@ -1219,15 +1264,21 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            n_real = state_slot.shape[0]
+            # Under CP, write the FULL all-gathered window so every rank's ring is
+            # complete (decode / later chunks read the local ring). Without CP this
+            # is just the local kv + local metadata as before.
+            _ring_state_slot = state_slot_full if _cp_active else state_slot
+            _ring_final_pos = final_pos_full if _cp_active else final_pos
+            _ring_positions = positions_full if _cp_active else positions
+            n_real = _ring_state_slot.shape[0]
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
-                state_slot=state_slot,
-                positions=positions[:n_real],
+                state_slot=_ring_state_slot,
+                positions=_ring_positions[:n_real],
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=final_pos,
+                final_pos=_ring_final_pos,
             )
         return o
 
