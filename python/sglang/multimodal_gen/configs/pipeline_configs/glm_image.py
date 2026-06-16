@@ -19,6 +19,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     """Configuration for the GlmImage pipeline."""
 
+    # BCG is disabled for GLM-Image: service profiling showed same-shape replay
+    # remained slower than eager (about 42.8s eager vs 48.3s BCG on B200) while
+    # memory only rose modestly, so the current BCG integration has no upside.
+    supports_breakable_cuda_graph: bool = False
+    breakable_cuda_graph_unsupported_reason: str | None = (
+        "GLM-Image BCG is slower on B200; graph overhead outweighs replay gains."
+    )
+
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False

@@ -65,6 +65,16 @@ class TransformersModelConfig(EncoderConfig):
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
+
+    # BCG is disabled for Z-Image: B200 profiling showed the model keeps its
+    # fast paths, but graph launch/static-copy/output-clone overhead dominates
+    # the short denoising loop (especially Turbo), so BCG regresses latency.
+    supports_breakable_cuda_graph: bool = False
+    breakable_cuda_graph_unsupported_reason: str | None = (
+        "Z-Image BCG is slower on B200 because fixed graph replay/copy overhead "
+        "dominates its short denoising loop."
+    )
+
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
     vae_precision: str = "bf16"
