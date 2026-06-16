@@ -205,6 +205,6 @@ class AWQAscendMoEKernel:
             w_fp = ((w_int8.float() - z_exp) * s_exp).to(torch.bfloat16)  # (K, N)
     
             # Transpose to (N, K) and store
-            fp_weight[e] = w_fp.t().contiguous()  # (N, K)
+            fp_weight[e] = w_fp.contiguous()  # (N, K)
     
         setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
