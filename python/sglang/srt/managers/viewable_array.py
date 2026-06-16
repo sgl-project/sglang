@@ -40,10 +40,10 @@ class ViewableArray:
 
     def extend(self, values: Iterable[int]) -> None:
         materialized: array = to_array(values)
-        added: int = len(materialized)
-        if added == 0:
+        added_size: int = len(materialized)
+        if added_size == 0:
             return
-        new_size: int = self._size + added
+        new_size: int = self._size + added_size
         if new_size > len(self._data):
             self._reallocate(new_size)
         self._data[self._size : new_size] = materialized
