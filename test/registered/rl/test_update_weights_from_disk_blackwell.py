@@ -157,7 +157,7 @@ class UpdateWeightsFromDiskBase:
 
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
-    model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
+    model = "zianglih/JoyAI-LLM-Flash-MXFP8-last-6-BF16"
     backend_test_suites = (
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
@@ -170,6 +170,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
                 "flashinfer_trtllm_routed",
+                "--trust-remote-code",
             ),
         },
     )
