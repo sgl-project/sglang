@@ -1118,7 +1118,13 @@ def _eplb_remap_enabled() -> bool:
     # both unnecessary and not well-defined over the padded region of topk_ids).
     from sglang.srt.server_args import get_global_server_args
 
-    server_args = get_global_server_args()
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        # Global server args are not initialized outside the server runtime
+        # (e.g. in unit tests that call select_experts directly). In that case
+        # there is no EPLB mapping, so the remap must be skipped.
+        return False
     return (
         server_args.enable_eplb
         or server_args.init_expert_location != "trivial"
