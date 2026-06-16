@@ -12,10 +12,6 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
-)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -27,6 +23,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -63,6 +60,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -70,6 +71,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     print_info_once,
     round_up,
 )
@@ -78,6 +80,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -218,6 +221,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -284,6 +288,17 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        self.supports_deferred_finalize = (
+            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+            and get_moe_runner_backend().is_flashinfer_trtllm()
+            and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+        )
+        print_info_once(
+            "FlashInfer TRTLLM MoE deferred finalize is "
+            f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+            f"(moe_runner_backend={server_args.moe_runner_backend}, "
+            f"quant_method={type(self.quant_method).__name__})."
+        )
 
         self.quant_method.create_weights(
             layer=self,
@@ -465,6 +480,8 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -534,6 +551,8 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -773,6 +792,13 @@ class FusedMoE(torch.nn.Module):
         # expert weights into block layout. During weight update, we must restore
         # canonical load-time shapes before copying checkpoint tensors.
         if isinstance(method, UnquantizedFusedMoEMethod):
+            if _is_npu:
+                if weight_name.endswith(".experts.w2_weight"):
+                    if param.data.shape[1] != loaded_weight.shape[0]:
+                        param.data = param.data.transpose(1, 2).contiguous()
+                if weight_name.endswith(".experts.w13_weight"):
+                    if param.data.shape[2] != loaded_weight.shape[1]:
+                        param.data = param.data.transpose(1, 2).contiguous()
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
                 layer=self,
                 param=param,
@@ -1057,7 +1083,7 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1109,6 +1135,23 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
+    def forward_deferred_finalize(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ):
+        assert self.quant_method is not None
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            flashinfer_trtllm_deferred_finalize_context,
+        )
+
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+
+        with flashinfer_trtllm_deferred_finalize_context():
+            combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+
+        return self.dispatcher.combine(combine_input=combine_input)
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
@@ -1294,7 +1337,7 @@ def moe_forward_piecewise_cuda_graph_impl(
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
     )
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)
 
@@ -1321,6 +1364,6 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             renormalize=renormalize,
         ),
     )
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)

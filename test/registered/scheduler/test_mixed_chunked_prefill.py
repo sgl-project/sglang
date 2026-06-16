@@ -29,7 +29,7 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
