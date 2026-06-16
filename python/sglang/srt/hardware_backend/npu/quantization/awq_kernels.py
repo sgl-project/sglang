@@ -140,9 +140,18 @@ class AWQAscendMoEKernel:
         self.w13_kernel = NPUW4A16Int4MoEMethod()
         self.w2_kernel = NPUW4A16Int4MoEMethod()
 
-    # ------------------------------------------------------------------
-    #  Correct AWQ nibble order (0,4,1,5,2,6,3,7) + sign extension
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _register_or_replace_parameter(
+        layer: torch.nn.Module, name: str, tensor: torch.Tensor
+    ) -> None:
+        """Safely register a parameter, replacing if already present."""
+        if hasattr(layer, name):
+            replace_parameter(layer, name, tensor)
+        else:
+            layer.register_parameter(
+                name, torch.nn.Parameter(tensor, requires_grad=False)
+            )
+
     def _unpack_awq_int4(self, packed: torch.Tensor) -> torch.Tensor:
         """
         Unpack AWQ int4 weight (nibble order 0,4,1,5,2,6,3,7)
@@ -165,31 +174,29 @@ class AWQAscendMoEKernel:
             out[:, i::pack_factor] = signed
         return out
 
-    # ------------------------------------------------------------------
-    #  Conversion to NPU layout (plain int32, no NZ)
-    # ------------------------------------------------------------------
     def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
+        """Convert AWQ weight to NPU W4A16 layout (plain int32, no NZ)."""
         E, K, _ = qweight.shape
         unpacked = self._unpack_awq_int4(qweight)   # (E*K, N) int8
         N = unpacked.shape[1]
         weight = unpacked.view(E, K, N).permute(0, 2, 1).contiguous()  # (E, N, K)
-        # Pack 4 int8 values into int32 (no NZ cast)
+        # Pack 4 int8 values into int32 (standard packing, no NZ)
         return self.w13_kernel._pack_to_int32(weight)   # (E, N, K//4) int32
 
     def _convert_awq_qzeros_to_npu_offset(
         self, qzeros: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
+        """Convert AWQ zero points to NPU offsets (shape E, N, groups)."""
         E, G, _ = qzeros.shape
-        unpacked = self._unpack_awq_int4(qzeros)       # (E*G, N) int8 (zero - 8)
+        unpacked = self._unpack_awq_int4(qzeros)       # (E*G, N) int8, value = zero_point - 8
         N = unpacked.shape[1]
         offset = unpacked.view(E, G, N).permute(0, 2, 1).contiguous()  # (E, N, G)
-        offset = -offset  # kernel expects 8 - zero = -(zero - 8)
+        # NPU kernel expects 8 - zero_point = -(zero_point - 8)
+        offset = -offset
         return offset.to(dtype)
 
-    # ------------------------------------------------------------------
-    #  Main entry point (unchanged except calls)
-    # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # 1. Convert and register new NPU-compatible parameters
         self._register_or_replace_parameter(
             layer,
             "w13_weight",
@@ -203,7 +210,7 @@ class AWQAscendMoEKernel:
         self._register_or_replace_parameter(
             layer,
             "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous(),
+            layer.w13_scales.data.transpose(1, 2).contiguous(),   # (E, N, groups)
         )
         self._register_or_replace_parameter(
             layer,
@@ -225,10 +232,11 @@ class AWQAscendMoEKernel:
             ),
         )
 
+        # 2. Post‑processing specific to W4A16 kernel (squeeze, etc.)
         self.w13_kernel.process_weights_after_loading(layer, "w13")
         self.w2_kernel.process_weights_after_loading(layer, "w2")
 
-        # Free original AWQ tensors
+        # 3. Remove original AWQ tensors to free memory
         for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
                      "w2_qweight", "w2_qzeros", "w2_scales"):
             if hasattr(layer, attr):
