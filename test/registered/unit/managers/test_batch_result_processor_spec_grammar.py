@@ -1,14 +1,4 @@
-"""Unit test for the Spec V2 + grammar trimming in process_batch_result_decode.
-
-Companion to the GPU regression in
-test/registered/disaggregation/test_disaggregation_basic.py::
-TestDisaggregationSpecV2Grammar (PR #24082).
-
-This drives the real decode result processor on CPU with plain-Python stubs for
-the GPU/IO-bound helpers. The core fix: when Spec V2 proposes several tokens but
-the grammar terminates partway through the list, only the accepted prefix is
-retained in output_ids, the grammar FSM, and logprob bookkeeping.
-"""
+"""Unit tests for Spec V2 grammar trimming in process_batch_result_decode."""
 
 import unittest
 from types import SimpleNamespace
@@ -18,10 +8,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeGrammar:
@@ -55,15 +45,7 @@ class _FakeBatch:
 
 
 class _TrimmingProcessor(SchedulerBatchResultProcessor):
-    """Overrides GPU/IO-bound helpers so the Spec V2 grammar trimming branch of
-    process_batch_result_decode can run on CPU.
-
-    _normalize_decode_outputs returns the test-provided token/logprob lists
-    directly (the real one round-trips CUDA tensors and feeds the spec worker).
-    The returned next_token_ids list is the same object the production code
-    mutates in place via ``next_token_ids[i] = accept_tokens``, so the trim is
-    observable on ``result.test_next_token_ids`` after the call.
-    """
+    """Runs the real result processor with GPU/IO-bound helpers stubbed."""
 
     def _normalize_decode_outputs(
         self, *, batch, result, logits_output, next_token_ids
@@ -143,8 +125,6 @@ class TestSpecV2GrammarTrimming(CustomTestCase):
         return req
 
     def test_trims_tokens_after_grammar_completion(self):
-        # Grammar terminates after the 2nd accepted token; the 3rd proposed token
-        # must be dropped everywhere.
         req = self._make_req(terminate_after=2)
         proc = _make_processor()
         result = _make_result([101, 102, 103], [-0.1, -0.2, -0.3])
@@ -156,21 +136,15 @@ class TestSpecV2GrammarTrimming(CustomTestCase):
         proc.process_batch_result_decode(batch, result)
 
         self.assertTrue(req.finished())
-        # output_ids may be a list or array('q', ...) depending on sglang version.
         self.assertEqual(list(req.output_ids), [101, 102])
-        # next_token_ids[i] was trimmed in place for downstream consumers.
         self.assertEqual(result.test_next_token_ids[0], [101, 102])
-        # Grammar advanced exactly over the retained prefix and is marked terminal.
         self.assertEqual(req.grammar.accepted, [101, 102])
         self.assertTrue(req.grammar.finished)
-        # Logprob bookkeeping sees only the retained tokens.
         self.assertEqual(req.logprob.output_token_logprobs_val, [-0.1, -0.2])
         self.assertEqual(req.logprob.output_token_logprobs_idx, [101, 102])
-        # _resolve_spec_v2_tokens committed the full list before grammar trimmed it.
         self.assertEqual(req.kv_committed_len, len(req.origin_input_ids) + 2)
 
     def test_keeps_all_tokens_when_grammar_not_terminated(self):
-        # Grammar never terminates within this list: all proposed tokens retained.
         req = self._make_req(terminate_after=99)
         proc = _make_processor()
         result = _make_result([201, 202, 203], [-0.5, -0.6, -0.7])
