@@ -523,6 +523,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
+        # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
+        # gather requires input_ids to have a consistent integer dtype across ranks.
         predicts = batch_result.next_token_ids.to(torch.int64)
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
