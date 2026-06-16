@@ -22,10 +22,10 @@ def fill_bonus_tokens(
 
 
 @triton.jit
-def fill_accepted_out_cache_loc(
+def fill_accept_out_cache_loc(
     accept_index,
     out_cache_loc,
-    accepted_out_cache_loc,
+    accept_out_cache_loc,
     size_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -36,4 +36,4 @@ def fill_accepted_out_cache_loc(
     src = tl.load(accept_index + pid)
     if src > -1:
         value = tl.load(out_cache_loc + src)
-        tl.store(accepted_out_cache_loc + dst, value)
+        tl.store(accept_out_cache_loc + dst, value)

@@ -30,6 +30,11 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -57,6 +62,7 @@ if _is_cuda:
     from sglang.jit_kernel.activation import (
         gelu_and_mul,
         gelu_tanh_and_mul,
+        relu2,
         silu_and_mul,
     )
 elif _is_xpu:
@@ -127,6 +133,9 @@ class SiluAndMul(MultiPlatformOp):
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            return self.forward_native(x)
+
         if not hasattr(self, "_musa_swish_glu"):
             # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.
             self._musa_swish_glu = nn.SwishGLU()
@@ -190,15 +199,18 @@ class NewGELU(MultiPlatformOp):
         return self.forward_native(x)
 
 
-class ReLU2(nn.Module):
+class ReLU2(MultiPlatformOp):
     """
     Applies the squared Rectified Linear Unit function.
     y = max(0, x)^2
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(x)
         return x * x
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return relu2(x)
 
 
 class QuickGELU(MultiPlatformOp):
