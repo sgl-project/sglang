@@ -1945,33 +1945,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     @staticmethod
     def _bcg_text_buckets() -> tuple[int, ...]:
-        buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKETS")
-        if buckets_env is None:
-            buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKET")
-        if buckets_env is None:
-            buckets_env = "256,512,1024,2048"
+        """Prompt sequence-length buckets, from --bcg-text-buckets."""
+        from sglang.multimodal_gen.runtime.server_args import (
+            DEFAULT_BCG_TEXT_BUCKETS,
+            get_global_server_args,
+        )
 
-        buckets = []
-        for raw_bucket in buckets_env.replace(";", ",").split(","):
-            raw_bucket = raw_bucket.strip()
-            if not raw_bucket:
-                continue
-            try:
-                bucket = int(raw_bucket)
-            except ValueError:
-                logger.warning(
-                    "[Diffusion BCG] ignoring invalid text bucket %r",
-                    raw_bucket,
-                )
-                continue
-            if bucket <= 0:
-                logger.warning(
-                    "[Diffusion BCG] ignoring non-positive text bucket %d",
-                    bucket,
-                )
-                continue
-            buckets.append(bucket)
-        return tuple(sorted(set(buckets))) or (512,)
+        try:
+            resolver = get_global_server_args().resolved_bcg_text_buckets
+            return resolver()
+        except Exception:
+            return DEFAULT_BCG_TEXT_BUCKETS
 
     @classmethod
     def _bcg_select_text_bucket(cls, seq: int) -> int | None:
@@ -1981,7 +1965,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return bucket
         logger.warning(
             "[Diffusion BCG] text length %d exceeds max bucket %d; not padding "
-            "(this length captures its own graph). Raise SGLANG_BCG_TEXT_BUCKETS.",
+            "(this length captures its own graph). Raise --bcg-text-buckets.",
             seq,
             buckets[-1],
         )

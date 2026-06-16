@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -58,6 +57,15 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.zimage_model = ZImageFakeTransformer2DModel()
         self.hunyuanvideo_model = HunyuanVideoTransformer3DModel()
 
+    def _patch_buckets(self, *buckets: int):
+        """Override the BCG text buckets (now sourced from --bcg-text-buckets)."""
+        resolved = tuple(sorted({b for b in buckets if b > 0}))
+        return patch.object(
+            DenoisingStage,
+            "_bcg_text_buckets",
+            staticmethod(lambda: resolved),
+        )
+
     def _qwen_kwargs(self, seq_len: int, *, fill: float = 1.0):
         return {
             "hidden_states": torch.zeros(1, 4096, 64),
@@ -75,7 +83,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         }
 
     def test_qwen_prompt_lengths_share_bucket_signature_with_dynamic_varlen_meta(self):
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+        with self._patch_buckets(256, 512, 2048):
             short = self.stage._bcg_pad_prompt_kwargs(
                 self._qwen_kwargs(19), current_model=self.qwen_model
             )
@@ -96,7 +104,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def test_qwen_prompt_content_changes_do_not_change_signature(self):
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+        with self._patch_buckets(256, 512, 2048):
             first = self.stage._bcg_pad_prompt_kwargs(
                 self._qwen_kwargs(47, fill=1.0), current_model=self.qwen_model
             )
@@ -113,7 +121,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
 
     def test_qwen_bucket_boundary_length_keeps_shared_signature(self):
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+        with self._patch_buckets(256, 512, 2048):
             almost_full = self.stage._bcg_pad_prompt_kwargs(
                 self._qwen_kwargs(255), current_model=self.qwen_model
             )
@@ -129,7 +137,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_signature_kwargs(almost_full), _signature_kwargs(full))
 
     def test_qwen_prompt_lengths_in_different_buckets_do_not_share_signature(self):
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+        with self._patch_buckets(256, 512, 2048):
             small = self.stage._bcg_pad_prompt_kwargs(
                 self._qwen_kwargs(47), current_model=self.qwen_model
             )
@@ -199,7 +207,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
     def test_non_qwen_txt_seq_lens_and_freqs_cis_do_not_take_qwen_path(self):
         kwargs = self._qwen_kwargs(47)
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+        with self._patch_buckets(256, 512, 2048):
             out = self.stage._bcg_pad_prompt_kwargs(
                 kwargs, current_model=self.flux_model
             )
@@ -250,7 +258,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
 
-    def test_generic_prompt_padding_keeps_single_bucket_env_compatibility(self):
+    def test_generic_prompt_padding_keeps_single_bucket(self):
         kwargs = {
             "hidden_states": torch.zeros(1, 16, 64),
             "timestep": torch.zeros(1),
@@ -258,7 +266,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "encoder_attention_mask": torch.ones(1, 17, dtype=torch.bool),
         }
 
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKET": "64"}, clear=False):
+        with self._patch_buckets(64):
             out = self.stage._bcg_pad_prompt_kwargs(kwargs)
 
         self.assertEqual(out["encoder_hidden_states"].shape, (1, 64, 128))
@@ -278,7 +286,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 "txt_seq_lens": [seq_len],
             }
 
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+        with self._patch_buckets(64, 128):
             first = self.stage._bcg_pad_prompt_kwargs(
                 kwargs(17), current_model=self.flux_model
             )
@@ -307,7 +315,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 ],
             }
 
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+        with self._patch_buckets(64, 128):
             first = self.stage._bcg_pad_prompt_kwargs(
                 kwargs(22), current_model=self.flux_model
             )
@@ -335,7 +343,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 "freqs_cis": (cap_freqs, image_freqs),
             }
 
-        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+        with self._patch_buckets(64, 128):
             first = self.stage._bcg_pad_prompt_kwargs(
                 kwargs(17), current_model=self.zimage_model
             )
