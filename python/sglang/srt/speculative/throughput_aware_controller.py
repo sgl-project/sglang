@@ -147,6 +147,11 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
     for key, entry in cfg.items():
         if not key.isdigit():
             continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"throughput-aware config key '{key}' must map to a JSON object, "
+                f"got {type(entry).__name__}"
+            )
         steps = entry.get("candidate_steps")
         if (
             not isinstance(steps, list)
