@@ -17,7 +17,6 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Dict, Optional
 
-from sglang.srt.managers.array_utils import to_array
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -25,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.array_utils import to_array
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
