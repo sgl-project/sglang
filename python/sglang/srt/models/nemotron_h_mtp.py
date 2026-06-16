@@ -19,6 +19,13 @@ from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -33,6 +40,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHForCausalLM,
     NemotronHMoEDecoderLayer,
 )
+from sglang.srt.models.nemotron_h_utils import is_attn_layer
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -60,12 +68,14 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-            # Fusion layer to combine embeddings with target hidden states
+            _dp_attn = is_dp_attention_enabled()
             self.eh_proj = ColumnParallelLinear(
                 input_size=config.hidden_size * 2,
                 output_size=config.hidden_size,
                 bias=False,
-                gather_output=True,
+                gather_output=not _dp_attn,
+                tp_rank=get_attention_tp_rank() if _dp_attn else None,
+                tp_size=get_attention_tp_size() if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -95,6 +105,10 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
             hidden_states, _ = self.eh_proj(fused)
+            if is_dp_attention_enabled():
+                hidden_states = get_attention_tp_group().all_gather(
+                    hidden_states, dim=-1
+                )
 
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
@@ -130,16 +144,23 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
+        _pat = config.mtp_hybrid_override_pattern
+        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
+            _pat[(layer_idx - 1) % len(_pat)]
+        )
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+            _dp_attn = is_dp_attention_enabled()
             self.eh_proj = ColumnParallelLinear(
                 input_size=config.hidden_size * 2,
                 output_size=config.hidden_size,
                 bias=False,
-                gather_output=True,
+                gather_output=not _dp_attn,
+                tp_rank=get_attention_tp_rank() if _dp_attn else None,
+                tp_size=get_attention_tp_size() if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -169,6 +190,17 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
             hidden_states, _ = self.eh_proj(fused)
+            if is_dp_attention_enabled():
+                hidden_states = get_attention_tp_group().all_gather(
+                    hidden_states, dim=-1
+                )
+
+        if (
+            is_dp_attention_enabled()
+            and self.prev_layer_is_attn
+            and residual is not None
+        ):
+            hidden_states = attn_tp_all_reduce(hidden_states)
 
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
@@ -212,6 +244,8 @@ class NemotronHMultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         # Build flat list of layers

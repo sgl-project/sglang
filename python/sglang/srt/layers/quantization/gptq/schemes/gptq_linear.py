@@ -23,12 +23,12 @@ __all__ = ["GPTQLinearScheme", "GPTQAscendLinearScheme"]
 
 
 class GPTQLinearScheme(GPTQLinearSchemeBase):
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
         self.kernel = self._init_kernel(quant_config)
 
-    def _init_kernel(self, quant_config: "GPTQConfig"):
+    def _init_kernel(self, quant_config: GPTQConfig):
         from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
             GPTQLinearKernel,
         )
@@ -152,7 +152,7 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
 
 
 class GPTQAscendLinearScheme(GPTQLinearScheme):
-    def _init_kernel(self, quant_config: "GPTQConfig"):
+    def _init_kernel(self, quant_config: GPTQConfig):
         from sglang.srt.hardware_backend.npu.quantization.gptq_kernels import (
             GPTQLinearAscendKernel,
         )

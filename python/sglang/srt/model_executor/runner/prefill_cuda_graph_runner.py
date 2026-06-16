@@ -58,6 +58,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -72,6 +73,8 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
     is_npu,
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -81,6 +84,9 @@ from sglang.srt.utils import (
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
@@ -246,6 +252,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"this model architecture."
                 )
 
+        # --- aiter chip info pre-warming (AMD) -------------------------
+        if _use_aiter:
+            self._pre_warm_aiter_chip_info()
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
@@ -253,9 +263,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
 
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
     def _is_mamba_track_enabled(self) -> bool:
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -265,6 +272,41 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
 
     @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
@@ -378,9 +420,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    # -----------------------------------------------------------------
-    # can_run
-    # -----------------------------------------------------------------
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
@@ -423,12 +462,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly on top with live multi-req metadata.
         return True
 
-    # -----------------------------------------------------------------
-    # capture_prepare
-    # -----------------------------------------------------------------
-    def capture_prepare(
-        self, num_tokens: int
-    ) -> tuple[ForwardBatch, "AttentionBackend"]:
+    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -552,9 +586,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
-    # -----------------------------------------------------------------
-    # capture
-    # -----------------------------------------------------------------
     def capture(self) -> None:
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
@@ -585,9 +616,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.capture_one_shape(num_tokens)
 
-    # -----------------------------------------------------------------
-    # capture_one_shape
-    # -----------------------------------------------------------------
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
@@ -614,15 +642,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
-            num_tokens,
+            ShapeKey(size=num_tokens),
             run_once,
             dummies=None,
             post_warmup_hook=post_warmup_hook,
         )
 
-    # -----------------------------------------------------------------
-    # replay_prepare
-    # -----------------------------------------------------------------
     def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
@@ -757,14 +782,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    # -----------------------------------------------------------------
-    # replay
-    # -----------------------------------------------------------------
     def replay(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
 
             if self.layer_model is not None:
                 # BCG path. The captured graph is a bs=1 replay of
@@ -774,7 +798,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # model.forward eagerly with the live multi-req
                 # static_forward_batch. The outer's logits_processor /
                 # pooler then runs on top with live multi-req metadata.
-                shape_key = self._static_num_tokens
+                shape_key = ShapeKey(size=self._static_num_tokens)
 
                 def replay_layer_forward(*args, **layer_kwargs):
                     return self.backend.replay(
@@ -793,6 +817,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         self.moe_layers,
                         self.moe_fusions,
                         dsa_indexers=self.dsa_indexers,
+                        num_tokens=static_num_tokens,
+                        raw_num_tokens=raw_num_tokens,
                     ):
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
@@ -815,6 +841,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.moe_layers,
                     self.moe_fusions,
                     dsa_indexers=self.dsa_indexers,
+                    num_tokens=static_num_tokens,
+                    raw_num_tokens=raw_num_tokens,
                 ):
                     output = self.backend.replay(
                         self._static_num_tokens, static_forward_batch, **kwargs

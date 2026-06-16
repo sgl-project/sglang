@@ -36,7 +36,7 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
-    def __init__(self, server_args: "ServerArgs"):
+    def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         self._explicit_memory_policy = self._has_explicit_memory_policy()
         self._explicit_layerwise_replacement_policy = (

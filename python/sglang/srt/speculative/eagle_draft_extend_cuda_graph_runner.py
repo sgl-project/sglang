@@ -23,10 +23,11 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -81,12 +82,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
-            self.model_runner = model_runner = eagle_worker.draft_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        else:
-            self.model_runner = model_runner = eagle_worker.model_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND
+        self.model_runner = model_runner = eagle_worker.draft_runner
+        self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
         self.device = model_runner.device
@@ -164,10 +161,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
             self.seq_len_fill_value = (
-                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+                self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
@@ -210,18 +207,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = torch.zeros(
                 (
-                    (
-                        self.max_bs * self.num_tokens_per_bs
-                        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-                        else self.max_bs
-                    ),
+                    self.max_bs * self.num_tokens_per_bs,
                     vocab_size,
                 ),
                 dtype=torch.float,
             )
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftExtendInputBuffers(
@@ -242,10 +235,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = resolve_decode_backend(self)
 
         try:
             with model_capture_mode():
@@ -255,11 +245,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     def _cache_loc_dtype(self):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return bs
+        return ShapeKey(size=bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -311,15 +304,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
-        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
-        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
-        num_tokens_for_logprob = (
-            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
-        )
+        # pruned_states = num_tokens (all tokens)
+        num_tokens_for_logprob = num_tokens
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -496,12 +484,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            if self.forward_mode.is_draft_extend_v2():
-                buffers.global_num_tokens_for_logprob_gpu.fill_(
-                    bs * self.num_tokens_per_bs
-                )
-            else:
-                buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -556,28 +539,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self.backend.replay(shape_key, forward_batch)
+            out = self._replay_graph(shape_key, forward_batch)
 
-        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-            unpadding_bs = num_tokens
-        elif bs != raw_bs:
-            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
-                :raw_bs
-            ]
-            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[
-                :raw_bs
-            ]
-            unpadding_bs = raw_bs
-        else:
-            unpadding_bs = None
-
-        if unpadding_bs is not None:
-            out_copy = out
-            out = LogitsProcessorOutput(
-                next_token_logits=out.next_token_logits[:unpadding_bs],
-                hidden_states=out.hidden_states[:unpadding_bs],
-            )
-            if self.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
-                out.topk_p = out_copy.topk_p[:raw_bs]
-                out.topk_index = out_copy.topk_index[:raw_bs]
+        out = LogitsProcessorOutput(
+            next_token_logits=out.next_token_logits[:num_tokens],
+            hidden_states=out.hidden_states[:num_tokens],
+        )
         return out
