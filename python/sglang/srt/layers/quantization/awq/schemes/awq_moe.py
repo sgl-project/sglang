@@ -188,8 +188,8 @@ class AWQAscendMoEScheme(AWQMoEScheme):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
-            w13_weight=layer.w13_qweight,
-            w2_weight=layer.w2_qweight,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
         )
         '''w13_weight_scale=layer.w13_scales,
         w2_weight_scale=layer.w2_scales,
