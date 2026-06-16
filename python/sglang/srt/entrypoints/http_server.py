@@ -69,7 +69,13 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
-from sglang.srt.entrypoints.api_specs import (
+from sglang.srt.entrypoints.engine import (
+    Engine,
+    init_tokenizer_manager,
+    run_detokenizer_process,
+    run_scheduler_process,
+)
+from sglang.srt.entrypoints.http_api_specs import (
     AbortReqSpec,
     AttachHiCacheStorageReqInputSpec,
     CheckWeightsReqInputSpec,
@@ -99,12 +105,6 @@ from sglang.srt.entrypoints.api_specs import (
     UpdateWeightsFromTensorReqInputSpec,
     UpdateWeightVersionReqInputSpec,
     VertexGenerateReqInputSpec,
-)
-from sglang.srt.entrypoints.engine import (
-    Engine,
-    init_tokenizer_manager,
-    run_detokenizer_process,
-    run_scheduler_process,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,

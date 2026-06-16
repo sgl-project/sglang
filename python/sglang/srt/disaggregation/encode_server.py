@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
+from python.sglang.srt.entrypoints.http_api_specs import ProfileReqInputSpec
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -42,7 +43,6 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.entrypoints.api_specs import ProfileReqInputSpec
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import (

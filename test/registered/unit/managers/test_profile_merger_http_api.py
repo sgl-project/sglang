@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from sglang.srt.entrypoints.api_specs import ProfileReqInputSpec
+from sglang.srt.entrypoints.http_api_specs import ProfileReqInputSpec
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,

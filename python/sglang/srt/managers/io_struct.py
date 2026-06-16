@@ -2186,11 +2186,9 @@ def enc_hook(obj: Any) -> Any:
         try:
             return pickle.dumps(obj)
         except Exception as e:
-            if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-                logger.info(
-                    f"Return None since failed to encode object of type {type(obj)} with pickle: {e}"
-                )
-            return None
+            raise ValueError(
+                f"Failed to encode object of type {type(obj)} with pickle: {e}."
+            )
 
 
 def dec_hook(tp: Type, obj: Any) -> Any:
@@ -2223,11 +2221,9 @@ def dec_hook(tp: Type, obj: Any) -> Any:
         try:
             return pickle.loads(obj)
         except Exception as e:
-            if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-                logger.info(
-                    f"Return None since failed to decode object of type {type(obj)} with pickle: {e}"
-                )
-            return None
+            raise ValueError(
+                f"Failed to decode object of type {type(obj)} with pickle: {e}."
+            )
 
 
 _struct_types = tuple(
