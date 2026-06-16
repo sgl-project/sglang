@@ -171,6 +171,34 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    """Dense MXFP8 GEMM using fp8_fp4_gemm_nt with recipe_a=(1,32), recipe_b=(1,32)."""
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    # If both scales are pre-packed int32, skip internal UE8M0 layout transform
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
+        )
+
+
 def gemm_nt_bf16bf16f32(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
