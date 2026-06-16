@@ -762,6 +762,8 @@ class TboForwardBatchPreparer:
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
+                _original_batch_size=None,
+                _original_forward_mode=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
