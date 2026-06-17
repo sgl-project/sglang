@@ -688,6 +688,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    model_name=server_args.model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -1785,7 +1786,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
-            load_inquirer_get_loads=lambda req: self.load_inquirer.get_loads(req),
         )
 
     def init_batch_result_processor(self) -> None:
