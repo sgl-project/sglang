@@ -528,6 +528,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         self.assertGreaterEqual(avg_spec_accept_length, 2.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEPLBMoriStat(CustomTestCase):
     """EPLB with mori backend, stat mode (on_select_experts path)."""
 
