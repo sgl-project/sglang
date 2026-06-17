@@ -460,19 +460,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32.copy_(
                     seq_lens + self.speculative_step_id + 1
                 )
+                metadata.max_seq_len_k = self.max_context_len
+
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
+                metadata.max_seq_len_k = self.max_context_len
+                max_seq_pages = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+
                 metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            # Compute max_seq_pages from actual seq_lens on GPU (no D2H sync)
-            max_seq_pages = int(
-                (metadata.cache_seqlens_int32.max() + self.page_size - 1)
-                // self.page_size
             )
             page_indices = self.req_to_token[
                 req_pool_indices[:, None],
@@ -486,14 +490,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
+
             metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            max_seq_pages = int(
-                (metadata.cache_seqlens_int32.max() + self.page_size - 1)
-                // self.page_size
-            )
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
             page_indices = self.req_to_token[
                 req_pool_indices[:, None],
                 self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
@@ -503,6 +507,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
+
             metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -510,6 +515,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if forward_mode.is_draft_extend_v2():
                 num_tokens_per_bs = spec_info.num_tokens_per_req
                 if num_tokens_per_bs <= 0:
+                    # Capture uses a synthetic EagleDraftExtendInput; infer the
+                    # fixed V2 stride from the capture buffer when it is unset.
                     num_tokens_per_bs = int(
                         spec_info.num_accept_tokens[:bs].max().item()
                     )
@@ -534,10 +541,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
                 )
 
-            max_seq_pages = int(
-                (metadata.cache_seqlens_int32.max() + self.page_size - 1)
-                // self.page_size
-            )
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
             page_indices = self.req_to_token[
                 req_pool_indices[:, None],
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
@@ -630,12 +636,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
-        def _seq_max() -> int:
-            """Prefer seq_lens_cpu if present, otherwise fall back to GPU max."""
-            if forward_batch.seq_lens_cpu is not None:
-                return int(forward_batch.seq_lens_cpu.max().item())
-            return int(forward_batch.seq_lens.max())
-
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
@@ -643,7 +643,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = _seq_max() + (self.speculative_step_id + 1)
+                metadata.max_seq_len_k = self.max_context_len
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -659,7 +659,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = _seq_max()
+                metadata.max_seq_len_k = self.max_context_len
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -676,7 +676,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = _seq_max() + tokens_per_req
+            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -694,7 +694,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = _seq_max()
+            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
