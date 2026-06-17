@@ -4026,18 +4026,17 @@ class ServerArgs:
             )
 
         # The page_first kernel write-back relies on the CUDA-only JIT staged
-        # kernel. On non-CUDA platforms (e.g. ROCm) it falls back to a kernel
-        # that requires CUDA index tensors and crashes on host write-back, so
-        # use layer_first there instead.
+        # kernel. On ROCm it falls back to a kernel that requires CUDA index
+        # tensors and crashes on host write-back, so use layer_first there.
         if (
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "kernel"
-            and not is_cuda()
+            and is_hip()
         ):
             self.hicache_mem_layout = "layer_first"
             logger.warning(
                 "page_first kernel write-back requires the CUDA JIT kernel; "
-                "falling back to layer_first layout on this platform."
+                "falling back to layer_first layout on ROCm."
             )
 
     def _resolve_storage_layout_compatibility(self):
