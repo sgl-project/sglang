@@ -44,7 +44,6 @@ class TestNvidiaNemotron3Nano30BBF16FlashInfer(LMEvalMixin, DefaultServerBase):
     ] + NEMOTRON_3_NANO_THINKING_ARGS
 
 
-@unittest.skip("Skip, test pass locally but compiling takes too long in CI")
 @unittest.skipIf(
     not (is_sm80_supported() or is_sm90_supported()),
     "NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",

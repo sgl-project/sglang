@@ -1,12 +1,29 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+logger = logging.getLogger(__name__)
+
+MXFP8_BLOCK_SIZE = 32
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
+)
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -109,6 +126,135 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
+
+
+class NPUMXFP8LinearMethod(_NPULinearMethodBase):
+    """Ascend NPU MXFP8 linear method for LLM (SRT) models.
+
+    Online mode: loads FP16/BF16 weights → quantises to MXFP8 at load time.
+    Inference: dynamic MXFP8 activation quant + MXFP8 matmul (block_size=32).
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.parameter import ModelWeightParameter
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Load weights in original dtype; quantise later in process_weights_after_loading
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight_fp = layer.weight.data
+        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "NPUMXFP8LinearMethod: weight dtype %s is not float16/bfloat16; "
+                "casting to bfloat16 before MXFP8 quantisation.",
+                weight_fp.dtype,
+            )
+            weight_fp = weight_fp.to(torch.bfloat16)
+
+        # Move weight to NPU if needed (cpu offload may have moved it back to CPU)
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
+
+        # Online MXFP8 quantisation of weights (block_size=32).
+        # qw: [out, in] float8_e4m3fn, w_scale: [out, in//64, 2] uint8.
+        qw, w_scale = torch_npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=torch_npu.float8_e4m3fn
+        )
+        # Transpose to [in, out] / [in//64, out, 2] as a strided view — DO NOT
+        # call .contiguous(). The matmul reduction loop scans the in-dim per
+        # output column; the [out, in] row-major layout gives stride-1 access
+        # for that scan via the transpose view (matches msmodelslim's offline
+        # layout and vllm-ascend's AscendW8A8MXFP8DynamicLinearMethod). Calling
+        # .contiguous() physically reorders to [in, out] row-major, which makes
+        # the inner-loop stride = out and tanks HBM bandwidth.
+        layer.weight = Parameter(qw.transpose(0, 1), requires_grad=False)
+        layer.weight_scale_inv = Parameter(w_scale.transpose(0, 1), requires_grad=False)
+        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        original_dtype = x.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
+
+        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+
+        # Dynamic MXFP8 activation quantisation
+        qx, input_scale = torch_npu.npu_dynamic_mx_quant(
+            x_2d, dst_type=torch_npu.float8_e4m3fn
+        )
+
+        # MXFP8 matmul (weight & scale already transposed at load time)
+        # Use the cached FP32 bias from process_weights_after_loading; fall back
+        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
+        output = torch_npu.npu_quant_matmul(
+            qx,
+            layer.weight,
+            layer.weight_scale_inv,
+            scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+            pertoken_scale=input_scale,
+            pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+            bias=quant_bias,
+            output_dtype=original_dtype,
+            group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+        )
+
+        # Restore original shape (replace last dim with output features)
+        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+        return output.reshape(output_shape)
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):

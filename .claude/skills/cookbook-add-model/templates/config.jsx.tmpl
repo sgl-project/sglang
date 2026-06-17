@@ -48,6 +48,12 @@ export const config = {
     { id: "fp8",  label: "FP8"  },
     { id: "fp4",  label: "FP4"  },
   ],
+  // 4th dim. The count follows the model's operating points: 1 recipe → a
+  // single "balanced"; 2 → low-latency + high-throughput; 3 → the full trio
+  // (the ideal). Per-combination: a single-recipe combination (e.g. a CPU
+  // platform) parks under its semantically honest tier — no slant → balanced;
+  // the page's list is the union and the engine greys unused chips. Never
+  // invent a recipe just to fill chips.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -158,7 +164,10 @@ sgl-eval run gsm8k \\
     cookbookModel: "__HF_ORG__/__MODEL_SLUG__",
   },
 
-  // Opt-in per axis. DELETE any axis your model doesn't expose (don't leave a stub).
+  // Opt-OUT per axis: general axes (attention / moe-for-MoE / parsers /
+  // speculative / pdDisagg / hicache) ship on every cookbook — DELETE only the
+  // axes this model genuinely cannot use (e.g. hisparse on non-DSA models, moe
+  // on pure-dense models); prefer disable+disableReason for variant/hw subsets.
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----  KEEP if the model exposes TP/CP/DP
@@ -312,6 +321,9 @@ sgl-eval run gsm8k \\
   // EXAMPLE cells — one per hardware family to show the shape. REPLACE each with
   // your model's verified recipe, or DELETE families you don't support. `match`
   // MUST have exactly the 5 keys; env/flags are flat literals.
+  // Accuracy-degrading flags (W4A4-style runtime quant, lossy --kv-cache-dtype)
+  // default to Playground/tips — putting one in a cell needs explicit user
+  // confirmation (authoring-reference §2.2).
   cells: [
     // ==== NVIDIA Blackwell + FP4 (single node) ====
     {
