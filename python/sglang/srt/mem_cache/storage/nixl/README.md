@@ -379,8 +379,8 @@ The following keys are placed at the **top level** of the config file (not insid
 | ---------------- | ------- | -------- | ----------- |
 | `use_direct_io`  | boolean | `true`   | Open cache files with `O_DIRECT` to bypass the OS page cache. Reduces memory pressure and improves NVMe throughput. Falls back to buffered I/O with a warning if `O_DIRECT` is unavailable on the current OS. Can also be overridden via the `SGLANG_HICACHE_NIXL_USE_DIRECT_IO` environment variable. |
 | `l3_cleaner_enabled` | boolean | `true` | Enable the built-in background cleaner for FILE-backed L3 storage. Set to `false` when using an external cleaner. |
-| `l3_cleaner_high_watermark` | float | `80.0` | Start cleanup when the built-in cleaner is enabled and a configured storage directory reaches this disk-usage percentage. |
-| `l3_cleaner_low_watermark` | float | `70.0` | Stop cleanup after hot storage directories drop below this disk-usage percentage. Must be lower than `l3_cleaner_high_watermark`. |
+| `l3_cleaner_high_watermark` | float | `80.0` | Start cleanup when the built-in cleaner is enabled and the filesystem containing a configured storage directory reaches this disk-usage percentage. |
+| `l3_cleaner_low_watermark` | float | `70.0` | Stop cleanup after hot filesystems drop below this disk-usage percentage. Must be lower than `l3_cleaner_high_watermark`. |
 
 **Page-alignment and `O_DIRECT`**
 

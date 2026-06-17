@@ -98,8 +98,21 @@ class TestHiCacheL3Cleaner(CustomTestCase):
     def test_safe_unlink_tolerates_missing_and_os_errors(self):
         """Cleanup races should not fail the cleaner tick."""
         missing = os.path.join(self.test_dir, "missing")
-        self.assertFalse(_safe_unlink(missing))
-        self.assertFalse(_safe_unlink(self.test_dir))
+        existing = os.path.join(self.test_dir, "existing")
+        with open(existing, "wb") as f:
+            f.write(b"abc")
+
+        self.assertEqual(_safe_unlink(missing), (False, 0))
+        self.assertEqual(_safe_unlink(self.test_dir), (False, 0))
+        self.assertEqual(_safe_unlink(existing), (True, 3))
+        self.assertFalse(os.path.exists(existing))
+
+    def test_watermarks_report_values_when_invalid(self):
+        """Invalid watermark errors include both effective values."""
+        with self.assertRaisesRegex(
+            ValueError, r"low_watermark=70.0, high_watermark=60.0"
+        ):
+            HiCacheL3Cleaner(self.base_dirs, tp_rank=0, high_watermark=60.0)
 
     def test_start_only_runs_on_tp_rank_zero(self):
         """Only TP rank 0 owns file cleanup for a shared storage directory."""

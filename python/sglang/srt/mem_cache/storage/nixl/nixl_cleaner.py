@@ -55,16 +55,18 @@ def _parse_group_key(name: str) -> str:
     return stem
 
 
-def _safe_unlink(path: str) -> bool:
-    """Best-effort unlink; returns True only when a file was removed."""
+def _safe_unlink(path: str) -> tuple[bool, int]:
+    """Best-effort unlink; returns whether a file was removed and its size."""
     try:
+        size = os.stat(path).st_size
         os.unlink(path)
-        return True
+        return True, size
     except FileNotFoundError:
-        return False
+        logger.debug("NIXL L3 file already removed before cleanup: %s", path)
+        return False, 0
     except OSError:
         logger.debug("Failed to unlink NIXL L3 file %s", path, exc_info=True)
-        return False
+        return False, 0
 
 
 class HiCacheL3Cleaner:
@@ -99,7 +101,9 @@ class HiCacheL3Cleaner:
 
         if self.low_watermark >= self.high_watermark:
             raise ValueError(
-                "L3 cleaner low_watermark must be lower than high_watermark"
+                "L3 cleaner low_watermark must be lower than high_watermark "
+                f"(low_watermark={self.low_watermark}, "
+                f"high_watermark={self.high_watermark})"
             )
 
         self._stop = threading.Event()
@@ -184,11 +188,11 @@ class HiCacheL3Cleaner:
             while idx < len(ordered) and not self._stop.is_set():
                 batch = ordered[idx : idx + self.recheck_groups]
                 paths = list(self._iter_group_paths(batch))
-                for ok in pool.map(_safe_unlink, paths):
-                    if ok:
+                for removed, removed_bytes in pool.map(_safe_unlink, paths):
+                    if removed:
                         deleted_files += 1
+                        bytes_deleted += removed_bytes
                 deleted_groups += len(batch)
-                bytes_deleted += sum(group.size for group in batch)
                 idx += len(batch)
 
                 if all(
