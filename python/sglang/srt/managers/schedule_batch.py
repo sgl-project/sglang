@@ -768,7 +768,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv_info: ReqKvInfo = ReqKvInfo()
+        self.kv: ReqKvInfo = ReqKvInfo()
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
@@ -811,7 +811,7 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
-        self.mamba_info: ReqMambaInfo = ReqMambaInfo()
+        self.mamba: ReqMambaInfo = ReqMambaInfo()
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -864,7 +864,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache_info: ReqCacheInfo = ReqCacheInfo()
+        self.cache: ReqCacheInfo = ReqCacheInfo()
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1060,91 +1060,91 @@ class Req(ReqDllmMixin):
 
     @property
     def cache_protected_len(self) -> int:
-        return self.cache_info.cache_protected_len
+        return self.cache.cache_protected_len
 
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
-        self.cache_info.cache_protected_len = value
+        self.cache.cache_protected_len = value
 
     @property
     def last_node(self) -> Any:
-        return self.cache_info.last_node
+        return self.cache.last_node
 
     @last_node.setter
     def last_node(self, value: Any) -> None:
-        self.cache_info.last_node = value
+        self.cache.last_node = value
 
     @property
     def swa_uuid_for_lock(self) -> Optional[int]:
-        return self.cache_info.swa_uuid_for_lock
+        return self.cache.swa_uuid_for_lock
 
     @swa_uuid_for_lock.setter
     def swa_uuid_for_lock(self, value: Optional[int]) -> None:
-        self.cache_info.swa_uuid_for_lock = value
+        self.cache.swa_uuid_for_lock = value
 
     @property
     def swa_prefix_lock_released(self) -> bool:
-        return self.cache_info.swa_prefix_lock_released
+        return self.cache.swa_prefix_lock_released
 
     @swa_prefix_lock_released.setter
     def swa_prefix_lock_released(self, value: bool) -> None:
-        self.cache_info.swa_prefix_lock_released = value
+        self.cache.swa_prefix_lock_released = value
 
     @property
     def kv_allocated_len(self) -> int:
-        return self.kv_info.kv_allocated_len
+        return self.kv.kv_allocated_len
 
     @kv_allocated_len.setter
     def kv_allocated_len(self, value: int) -> None:
-        self.kv_info.kv_allocated_len = value
+        self.kv.kv_allocated_len = value
 
     @property
     def swa_evicted_seqlen(self) -> int:
-        return self.kv_info.swa_evicted_seqlen
+        return self.kv.swa_evicted_seqlen
 
     @swa_evicted_seqlen.setter
     def swa_evicted_seqlen(self, value: int) -> None:
-        self.kv_info.swa_evicted_seqlen = value
+        self.kv.swa_evicted_seqlen = value
 
     @property
     def mamba_pool_idx(self) -> Optional[torch.Tensor]:
-        return self.mamba_info.mamba_pool_idx
+        return self.mamba.mamba_pool_idx
 
     @mamba_pool_idx.setter
     def mamba_pool_idx(self, value: Optional[torch.Tensor]) -> None:
-        self.mamba_info.mamba_pool_idx = value
+        self.mamba.mamba_pool_idx = value
 
     @property
     def mamba_ping_pong_track_buffer(self) -> Optional[torch.Tensor]:
-        return self.mamba_info.mamba_ping_pong_track_buffer
+        return self.mamba.mamba_ping_pong_track_buffer
 
     @mamba_ping_pong_track_buffer.setter
     def mamba_ping_pong_track_buffer(self, value: Optional[torch.Tensor]) -> None:
-        self.mamba_info.mamba_ping_pong_track_buffer = value
+        self.mamba.mamba_ping_pong_track_buffer = value
 
     @property
     def mamba_next_track_idx(self) -> Optional[int]:
-        return self.mamba_info.mamba_next_track_idx
+        return self.mamba.mamba_next_track_idx
 
     @mamba_next_track_idx.setter
     def mamba_next_track_idx(self, value: Optional[int]) -> None:
-        self.mamba_info.mamba_next_track_idx = value
+        self.mamba.mamba_next_track_idx = value
 
     @property
     def mamba_last_track_seqlen(self) -> Optional[int]:
-        return self.mamba_info.mamba_last_track_seqlen
+        return self.mamba.mamba_last_track_seqlen
 
     @mamba_last_track_seqlen.setter
     def mamba_last_track_seqlen(self, value: Optional[int]) -> None:
-        self.mamba_info.mamba_last_track_seqlen = value
+        self.mamba.mamba_last_track_seqlen = value
 
     @property
     def mamba_branching_seqlen(self) -> Optional[int]:
-        return self.mamba_info.mamba_branching_seqlen
+        return self.mamba.mamba_branching_seqlen
 
     @mamba_branching_seqlen.setter
     def mamba_branching_seqlen(self, value: Optional[int]) -> None:
-        self.mamba_info.mamba_branching_seqlen = value
+        self.mamba.mamba_branching_seqlen = value
 
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
