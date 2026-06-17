@@ -1798,6 +1798,82 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def test_streaming_reasoning_chunk_includes_logprobs(self):
+        """Reasoning deltas should carry token logprobs when requested."""
+
+        async def _mock_generate_reasoning_with_logprobs():
+            yield {
+                "text": "thinking",
+                "meta_info": {
+                    "id": "chatcmpl-reasoning-logprobs",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [(-0.25, 123, "thinking")],
+                    "output_token_logprobs_length": 1,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_reasoning_with_logprobs()
+        self.tm.server_args.reasoning_parser = "qwen3"
+        self.chat.reasoning_parser = "qwen3"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Think briefly."}],
+            max_tokens=100,
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(
+                self.chat,
+                "_process_reasoning_stream",
+                return_value=("thinking", ""),
+            ),
+        ):
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                async for chunk in self.chat._generate_chat_stream(
+                    adapted_request, req, self.fastapi_request
+                ):
+                    chunks.append(chunk)
+                return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        reasoning_chunks = []
+        for chunk in chunks:
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            data = json.loads(chunk[len("data: ") :])
+            if data["choices"] and data["choices"][0]["delta"].get("reasoning_content"):
+                reasoning_chunks.append(data)
+
+        self.assertEqual(len(reasoning_chunks), 1)
+        choice = reasoning_chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["reasoning_content"], "thinking")
+        self.assertIsNotNone(choice["logprobs"])
+        self.assertEqual(choice["logprobs"]["content"][0]["token"], "thinking")
+        self.assertEqual(choice["logprobs"]["content"][0]["logprob"], -0.25)
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.
