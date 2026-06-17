@@ -48,6 +48,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
+    ProgressiveDenoisingStage,
+    ProgressiveDenoisingStageRouter,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -650,14 +654,24 @@ class ComposedPipelineBase(ABC):
 
     def add_standard_text_encoding_stage(
         self,
-        text_encoder_key: str = "text_encoder",
-        tokenizer_key: str = "tokenizer",
+        text_encoder_key: str | list[str] = "text_encoder",
+        tokenizer_key: str | list[str] = "tokenizer",
+        stage_name: str | None = None,
     ) -> "ComposedPipelineBase":
+        text_encoder_keys = (
+            [text_encoder_key]
+            if isinstance(text_encoder_key, str)
+            else text_encoder_key
+        )
+        tokenizer_keys = (
+            [tokenizer_key] if isinstance(tokenizer_key, str) else tokenizer_key
+        )
         return self.add_stage(
             TextEncodingStage(
-                text_encoders=[self.get_module(text_encoder_key)],
-                tokenizers=[self.get_module(tokenizer_key)],
+                text_encoders=[self.get_module(key) for key in text_encoder_keys],
+                tokenizers=[self.get_module(key) for key in tokenizer_keys],
             ),
+            stage_name,
         )
 
     def add_standard_timestep_preparation_stage(
@@ -718,6 +732,42 @@ class ComposedPipelineBase(ABC):
             stage_name,
         )
 
+    def add_progressive_denoising_stage(
+        self,
+        progressive_stage_cls: type[ProgressiveDenoisingStage],
+        transformer_key: str = "transformer",
+        transformer_2_key: str | None = "transformer_2",
+        scheduler_key: str = "scheduler",
+        vae_key: str | None = "vae",
+        stage_name: str = "denoising_stage",
+    ) -> "ComposedPipelineBase":
+
+        def create_stage() -> PipelineStage:
+            kwargs = {
+                "transformer": self.get_module(transformer_key),
+                "scheduler": self.get_module(scheduler_key),
+                "pipeline": self,
+            }
+
+            if transformer_2_key:
+                transformer_2 = self.get_module(transformer_2_key, None)
+                if transformer_2 is not None:
+                    kwargs["transformer_2"] = transformer_2
+
+            if vae_key:
+                kwargs["vae"] = self.get_module(vae_key, None)
+
+            return ProgressiveDenoisingStageRouter(
+                standard_stage=DenoisingStage(**kwargs),
+                progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
+            )
+
+        return self.add_stage_factory(
+            RoleType.DENOISER,
+            create_stage,
+            stage_name,
+        )
+
     def add_standard_decoding_stage(
         self,
         vae_key: str = "vae",
@@ -740,19 +790,30 @@ class ComposedPipelineBase(ABC):
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
+        text_encoder_key: str | list[str] = "text_encoder",
+        tokenizer_key: str | list[str] = "tokenizer",
+        text_encoding_stage_name: str | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        progressive_denoising_stage_cls: type[ProgressiveDenoisingStage] | None = None,
     ) -> "ComposedPipelineBase":
 
         if include_input_validation:
             self.add_stage(InputValidationStage())
 
-        self.add_standard_text_encoding_stage()
+        self.add_standard_text_encoding_stage(
+            text_encoder_key=text_encoder_key,
+            tokenizer_key=tokenizer_key,
+            stage_name=text_encoding_stage_name,
+        )
 
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_denoising_stage()
+        if progressive_denoising_stage_cls is None:
+            self.add_standard_denoising_stage()
+        else:
+            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
         self.add_standard_decoding_stage()
 
         return self
@@ -770,6 +831,7 @@ class ComposedPipelineBase(ABC):
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        progressive_denoising_stage_cls: type[ProgressiveDenoisingStage] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -806,7 +868,10 @@ class ComposedPipelineBase(ABC):
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_denoising_stage()
+        if progressive_denoising_stage_cls is None:
+            self.add_standard_denoising_stage()
+        else:
+            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
         self.add_standard_decoding_stage()
         return self
 

@@ -126,13 +126,17 @@ class CanaryE2EBase(CapturedServerE2EBase):
         assert_all_success: bool = True,
         max_new_tokens: int = 2048,
         timeout: float = 240.0,
+        ignore_eos: Optional[bool] = None,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
+        if ignore_eos is None:
+            ignore_eos = self.model_mode == "swa"
         results = post_parallel_generate(
             url=self.base_url + "/generate",
             prompts=self.make_prompts(n),
             max_new_tokens=max_new_tokens,
             timeout=timeout,
+            ignore_eos=ignore_eos,
         )
         if assert_all_success:
             for result in results:
@@ -155,9 +159,9 @@ class CanaryE2EBase(CapturedServerE2EBase):
         """Assert that the SWA path was genuinely exercised.
 
         Three signals must all hold:
-          - ``swa_out_of_window_tokens >= 1``: at least one prefix token has been clipped
-            out of the sliding window (its SWA mapping is 0). Any prompt longer than the
-            SWA window produces this — proves the SWA window slide actually ran.
+          - ``swa_out_of_window_tokens >= 1``: at least one token has slid out of the
+            sliding window (its SWA mapping is 0). This only appears once a request decodes
+            past the window, so the window evicts — proves the SWA window slide actually ran.
           - ``swa_full_idx_divergence >= 1``: SWA pool has actually remapped at least one
             slot to a non-identity index (i.e. real slot reuse / eviction occurred). The
             workload must drive SWA pool pressure for this to fire — required because the
@@ -165,34 +169,44 @@ class CanaryE2EBase(CapturedServerE2EBase):
             traffic, and we must keep it covered.
           - ``verify_swa < verify_full``: SWA verify kernel processed fewer tokens than
             FULL — proves both kernel groups ran and the window short-circuited SWA.
+
+        The first two signals are checked as the *peak* across all sampled forwards, not
+        only the last sample. The divergence reporter snapshots one live forward batch per
+        interval; under PP it snapshots a single micro-batch, which may hold only in-window
+        requests even when another micro-batch diverged. "Was the SWA path ever exercised?"
+        is a max-over-samples question, so a trailing in-window sample must not mask an
+        earlier diverging one. ``verify_swa``/``verify_full`` are monotonic running totals,
+        so the lag check reads the last sample.
         """
-        last_parsed = None
-        last_line: str = ""
+        samples: list[tuple[SwaDivergenceLog, str]] = []
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
-            log_text = self._captured_log_text()
-            found = SwaDivergenceLog.find_last(log_text)
-            if found is not None:
-                last_parsed, last_line = found
+            samples = SwaDivergenceLog.find_all(self._captured_log_text())
+            if samples:
                 break
 
-        if last_parsed is None:
+        if not samples:
             raise AssertionError(
                 "No kv_canary swa_divergence line found in server log after "
                 f"{max_retries} retries (wait={flush_wait_seconds}s each). "
                 f"Log tail:\n{self._captured_log_text()[-2000:]}"
             )
 
-        if last_parsed.swa_out_of_window_tokens < min_swa_out_of_window_tokens:
+        peak_out_of_window = max(p.swa_out_of_window_tokens for p, _ in samples)
+        peak_full_idx_divergence = max(p.swa_full_idx_divergence for p, _ in samples)
+        last_parsed, last_line = samples[-1]
+
+        if peak_out_of_window < min_swa_out_of_window_tokens:
             raise AssertionError(
-                f"SWA path not exercised: swa_out_of_window_tokens={last_parsed.swa_out_of_window_tokens} "
-                f"< min={min_swa_out_of_window_tokens}. Line: {last_line}"
+                f"SWA path not exercised: peak swa_out_of_window_tokens={peak_out_of_window} "
+                f"< min={min_swa_out_of_window_tokens} across {len(samples)} samples. "
+                f"Last line: {last_line}"
             )
-        if last_parsed.swa_full_idx_divergence < min_swa_full_idx_divergence:
+        if peak_full_idx_divergence < min_swa_full_idx_divergence:
             raise AssertionError(
-                f"SWA pool reuse not exercised: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
-                f"< min={min_swa_full_idx_divergence}. The workload did not drive enough SWA pool pressure "
-                f"to force slot remap. Line: {last_line}"
+                f"SWA pool reuse not exercised: peak swa_full_idx_divergence={peak_full_idx_divergence} "
+                f"< min={min_swa_full_idx_divergence} across {len(samples)} samples. The workload "
+                f"did not drive enough SWA pool pressure to force slot remap. Last line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full

@@ -35,7 +35,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         T2I_sampling_params,
-        run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -47,7 +46,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
-        run_consistency_check=False,
     ),
 ]
 
@@ -62,7 +60,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         T2I_sampling_params,
-        run_consistency_check=False,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2npu",
@@ -75,7 +72,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         T2I_sampling_params,
-        run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -90,7 +86,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
-        run_consistency_check=False,
     ),
 ]
 

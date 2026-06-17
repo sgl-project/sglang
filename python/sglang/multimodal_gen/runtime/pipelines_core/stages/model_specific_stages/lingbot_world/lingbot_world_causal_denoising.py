@@ -303,6 +303,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             prepare_model_input=prepare_model_input,
             prepare_context_input=prepare_model_input,
         )
+        cache_ctx.cache_state.runtime_cache.pop("lingbot_cam_conditioner", None)
 
         # Advance cumulative frame position
         self._advance_realtime_causal_cache(cache_ctx, num_frames=ctx.num_frames)

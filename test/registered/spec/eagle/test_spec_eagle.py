@@ -31,7 +31,6 @@ _KITS = (
 
 
 class _Core(Eagle3Base):
-    # Busy-time pool accounting check (topk=1 only).
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

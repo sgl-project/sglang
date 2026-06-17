@@ -42,9 +42,9 @@ class TritonKernelsRunnerInput(RunnerInput):
     """Input bundle passed to the triton-kernels runner core."""
 
     hidden_states: torch.Tensor
-    routing_data: "RoutingData"
-    gather_indx: "GatherIndx"
-    scatter_indx: "ScatterIndx"
+    routing_data: RoutingData
+    gather_indx: GatherIndx
+    scatter_indx: ScatterIndx
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -158,7 +158,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
 @register_pre_permute("standard", "triton_kernel")
 def pre_permute_standard_to_triton_kernels(
-    dispatch_output: "StandardDispatchOutput",
+    dispatch_output: StandardDispatchOutput,
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,

@@ -22,6 +22,10 @@ def _jit_ngram_embedding_module() -> Module:
                 "&NgramEmbeddingKernel::compute_n_gram_ids_decode",
             ),
             ("update_token_table", "&NgramEmbeddingKernel::update_token_table"),
+            (
+                "update_token_table_decode",
+                "&NgramEmbeddingKernel::update_token_table_decode",
+            ),
         ],
     )
 
@@ -132,4 +136,25 @@ def update_token_table(
         column_starts,
         req_lens,
         ignore_tokens,
+    )
+
+
+@debug_kernel_api
+def update_token_table_decode(
+    tokens: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+) -> None:
+    """
+    Update one decoded token per request in the ngram embedding token table.
+
+    This is the decode-only fast path for req_lens == 1 and no ignored tokens.
+    """
+    module = _jit_ngram_embedding_module()
+    module.update_token_table_decode(
+        tokens,
+        ne_token_table,
+        row_indices,
+        column_starts,
     )
