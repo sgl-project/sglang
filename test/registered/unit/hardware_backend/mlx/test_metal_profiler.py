@@ -48,6 +48,7 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
 
     def test_patch_replaces_profile(self):
         import torch
+
         from sglang.srt.hardware_backend.mlx.profiler import (
             MetalTorchProfiler,
             apply_metal_profiler_patches,
@@ -60,6 +61,7 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
 
     def test_patch_is_idempotent(self):
         import torch
+
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
@@ -71,6 +73,7 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
 
     def test_no_cuda_activity_uses_original(self):
         import torch
+
         from sglang.srt.hardware_backend.mlx.profiler import (
             MetalTorchProfiler,
             apply_metal_profiler_patches,
@@ -87,6 +90,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
     def test_start_mlx_success(self):
         import mlx.core as mx
+
         from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +107,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
     def test_start_mlx_runtime_error_returns_failure(self):
         import mlx.core as mx
+
         from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +125,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
     def test_stop_calls_stop_capture(self):
         import mlx.core as mx
+
         from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,6 +144,7 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
     def test_start_mps_success(self):
         import torch
+
         from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         mock_ctx = MagicMock()
@@ -158,6 +165,7 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
     def test_start_mps_runtime_error_returns_failure(self):
         import torch
+
         from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,6 +204,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
     def test_start_profile_failure_does_not_crash(self):
         import mlx.core as mx
+
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
@@ -216,11 +225,13 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         self.assertIsNone(mgr.torch_profiler)
 
     def test_start_profile_success_with_mock_capture(self):
+        from unittest.mock import patch as mock_patch
+
         import mlx.core as mx
+
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
-        from unittest.mock import patch as mock_patch
 
         apply_metal_profiler_patches()
 
