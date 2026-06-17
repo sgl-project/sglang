@@ -69,12 +69,6 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
-def _aiter_ck_moe_supported(layer) -> bool:
-    # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
-    # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-    return layer.intermediate_size_per_partition % 128 == 0
-
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -250,7 +244,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
             )
-            and _aiter_ck_moe_supported(layer)
+            and self._aiter_ck_moe_supported(layer)
         )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
@@ -403,6 +397,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         param.data = param.data.reshape(expected_shape)
 
+    def _aiter_ck_moe_supported(self, layer) -> bool:
+        # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
+        # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
+        return layer.intermediate_size_per_partition % 128 == 0
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -431,7 +430,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             and get_moe_a2a_backend().supports_aiter()
         ):
-            if _aiter_ck_moe_supported(layer):
+            if self._aiter_ck_moe_supported(layer):
                 self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
