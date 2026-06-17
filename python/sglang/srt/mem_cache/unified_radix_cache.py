@@ -466,6 +466,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_loaded_nodes_by_reqid: dict[str, UnifiedTreeNode] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
@@ -2185,6 +2186,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if insert_result.inserted_host_node is not None:
+            self.prefetch_loaded_nodes_by_reqid[req_id] = insert_result.inserted_host_node
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2210,8 +2213,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_loaded_node(self, req_id: str) -> Optional[UnifiedTreeNode]:
+        return self.prefetch_loaded_nodes_by_reqid.pop(req_id, None)
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_loaded_nodes_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 

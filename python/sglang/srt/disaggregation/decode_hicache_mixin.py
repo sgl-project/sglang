@@ -197,10 +197,13 @@ class DecodeHiCacheTransferMixin:
         pm = dr.prefix_match
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
+        loaded_host_node = None
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.rid):
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            if hasattr(self.tree_cache, "pop_prefetch_loaded_node"):
+                loaded_host_node = self.tree_cache.pop_prefetch_loaded_node(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -212,8 +215,12 @@ class DecodeHiCacheTransferMixin:
         )
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
+                best_match_node=loaded_host_node or rematch.best_match_node,
+                host_hit_length=(
+                    pm.l3_storage_hit_length
+                    if loaded_host_node is not None
+                    else rematch.host_hit_length
+                ),
                 req=dr.req,
             )
         )

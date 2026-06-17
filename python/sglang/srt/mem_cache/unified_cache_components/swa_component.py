@@ -619,15 +619,19 @@ class SWAComponent(TreeComponent):
             cur = node
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)
-                else:
+                elif cd.host_value is not None:
                     # host only, collect it
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
                     n_swa += len(cd.host_value)
+                else:
+                    # FULL-only tombstone: decode SWA tail prealloc restores this
+                    # prefix only before the live SWA window, so there is no SWA
+                    # chunk to load for this range.
+                    n_swa += len(cur.key)
                 cur = cur.parent
 
             if not backed_up:
