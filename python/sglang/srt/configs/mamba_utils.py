@@ -124,6 +124,13 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    @property
+    def is_kda(self) -> bool:
+        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
+        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
+        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
+        return False
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateShape:
@@ -208,6 +215,10 @@ class KimiLinearStateShape:
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
+    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
+    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -224,6 +235,11 @@ class KimiLinearStateShape:
             num_k_heads = num_heads
         if head_k_dim is None:
             head_k_dim = head_dim
+        num_k_heads_per_tp = (
+            divide(num_k_heads, tp_world_size)
+            if num_k_heads % tp_world_size == 0
+            else -(-num_k_heads // tp_world_size)
+        )
 
         proj_size = num_heads * head_dim
         proj_k_size = num_k_heads * head_k_dim
@@ -246,9 +262,14 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
+
+    @property
+    def is_kda(self) -> bool:
+        return True

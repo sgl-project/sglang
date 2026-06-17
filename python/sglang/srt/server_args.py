@@ -1829,14 +1829,15 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
-    # GDN ReplaySSM buffered decode (slice 1a: decode-only, EAGER, radix off).
-    enable_gdn_replayssm: A[
+    # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
+    # ring + periodic flush to cut per-step HBM state traffic.
+    enable_linear_replayssm: A[
         bool,
-        "Enable the GDN ReplaySSM buffered decode kernel (slice 1a: decode-only). Requires --disable-radix-cache and --disable-cuda-graph and the Triton linear-attn decode backend.",
+        "Enable the ReplaySSM buffered output-only linear-attn decode kernel (GDN + KDA). Requires the Triton linear-attn decode backend and --mamba-scheduler-strategy no_buffer (the default).",
     ] = False
-    gdn_replayssm_cache_len: A[
+    linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for GDN ReplaySSM decode. The full recurrent state is flushed to HBM every L decode steps.",
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
 
     # -------------------------------------------------------------------------
@@ -5064,24 +5065,34 @@ class ServerArgs:
         # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
-        if self.enable_gdn_replayssm:
+        if self.enable_linear_replayssm:
             if decode != "triton":
                 raise ValueError(
-                    "--enable-gdn-replayssm requires the Triton "
+                    "--enable-linear-replayssm requires the Triton "
                     "linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             if self.enable_mamba_extra_buffer():
                 raise ValueError(
-                    "--enable-gdn-replayssm requires --mamba-scheduler-strategy "
+                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
                     "donation path is not yet supported (follow-up). Got "
                     f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
                 )
-            if self.gdn_replayssm_cache_len < 1:
+            if self.disaggregation_mode != "null":
+                # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
+                # is not wired for the ReplaySSM ring, so the flag would silently
+                # no-op there; disagg also runs a different cache/coordination
+                # flow that is not yet validated for ReplaySSM (follow-up).
                 raise ValueError(
-                    "--gdn-replayssm-cache-len must be >= 1, got "
-                    f"{self.gdn_replayssm_cache_len}."
+                    "--enable-linear-replayssm is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
                 )
 
     def _handle_legacy_cp_arguments(self):

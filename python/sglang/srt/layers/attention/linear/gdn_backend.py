@@ -315,11 +315,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
-        # per-row write cursor. All None unless --enable-gdn-replayssm, so the
+        # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
         replayssm_write_pos = self.forward_metadata.replayssm_write_pos
         # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
-        # boundaries (None unless --enable-gdn-replayssm). When present the
+        # boundaries (None unless --enable-linear-replayssm). When present the
         # kernel folds the ring into temporal[slot] on the snapshot steps.
         replayssm_force_flush = self.forward_metadata.replayssm_force_flush
         replayssm_d = layer_cache.replayssm_d

@@ -39,7 +39,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.state_indices_list = []
         # GDN ReplaySSM (slice 1b): per-bs STATIC per-row write-cursor buffers
         # for cuda-graph. Allocated lazily in init_cuda_graph_state only when
-        # --enable-gdn-replayssm is set; stays None otherwise.
+        # --enable-linear-replayssm is set; stays None otherwise.
         self.replayssm_write_pos_list = None
         # GDN ReplaySSM (slice 2b): per-bs STATIC per-row force-flush buffers
         # for cuda-graph, parallel to replayssm_write_pos_list. Same lifetime
@@ -134,7 +134,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 # in-bounds (the kernel zeroes padded rows via state_idx < 0).
                 safe_slots = slots.clamp(min=0)
                 replayssm_write_pos = write_pos_buf[safe_slots].clone()
-                L = mamba_pool.gdn_replayssm_cache_len
+                L = mamba_pool.linear_replayssm_cache_len
+                # KDA (per-K gate) ships without radix coordination for now: no
+                # track-boundary force-flush, so the ring flushes only at the
+                # natural write_pos == L-1 wrap. GDN keeps the radix-aligned
+                # force-flush (slice 2b). Gate on the pool's recorded gate type.
+                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
                 # GDN ReplaySSM (slice 2b): per-row force-flush at the radix
                 # track boundary. THE alignment: the radix mamba track snapshots
                 # temporal[slot] when seq_lens_cpu % mamba_track_interval == 0
@@ -146,12 +151,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 # snapshot reads it. seq_lens_cpu is the committed length AFTER
                 # this decode token (incremented in prepare_for_decode before the
                 # forward), matching the track. int32, one entry per batch row.
-                force_flush_bool = self._replayssm_track_flush_mask(
-                    forward_batch.seq_lens_cpu, bs
-                )
-                replayssm_force_flush = force_flush_bool.to(
-                    device=self.device, dtype=torch.int32
-                )
+                if not is_kda:
+                    force_flush_bool = self._replayssm_track_flush_mask(
+                        forward_batch.seq_lens_cpu, bs
+                    )
+                    replayssm_force_flush = force_flush_bool.to(
+                        device=self.device, dtype=torch.int32
+                    )
                 # Advance only the VALID (non-padded) slots. Scatter over the
                 # unique valid slots to avoid duplicate-index races (padded rows
                 # all clamp to slot 0, which a real row may also occupy). A
@@ -161,9 +167,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 valid_slots = slots[valid_mask]
                 if valid_slots.numel() > 0:
                     # Per-row "did this step flush?": natural wrap OR forced.
-                    flushed = (replayssm_write_pos == (L - 1)) | (
-                        replayssm_force_flush != 0
-                    )
+                    # (KDA has no forced flush -> force_flush is None -> pure wrap.)
+                    flushed = replayssm_write_pos == (L - 1)
+                    if replayssm_force_flush is not None:
+                        flushed = flushed | (replayssm_force_flush != 0)
                     next_pos = torch.where(
                         flushed,
                         torch.zeros_like(replayssm_write_pos),
@@ -420,7 +427,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def _replayssm_enabled(self) -> bool:
-        """True iff --enable-gdn-replayssm allocated the persistent ring cursor.
+        """True iff --enable-linear-replayssm allocated the persistent ring cursor.
 
         The per-slot ``replayssm_write_pos`` buffer on MambaPool is None unless
         the flag is set, so it doubles as the on/off gate (same signal that
@@ -649,14 +656,22 @@ class MambaAttnBackendBase(AttentionBackend):
                 # capture (seq_lens_cpu is None) leave it zeroed: capture content
                 # is irrelevant and decode replays overwrite it below.
                 force_flush_dev = None
-                if forward_mode.is_decode_or_idle() and seq_lens_cpu is not None:
+                # KDA: no radix coordination -> leave static_ff zeroed and
+                # force_flush_dev None so the advance below is a pure wrap,
+                # matching the kernel (a zeroed force_flush flushes nothing).
+                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
+                if (
+                    not is_kda
+                    and forward_mode.is_decode_or_idle()
+                    and seq_lens_cpu is not None
+                ):
                     ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
                     force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
                     static_ff.copy_(force_flush_dev)
                 else:
                     static_ff.zero_()
                 if not in_capture:
-                    L = mamba_pool.gdn_replayssm_cache_len
+                    L = mamba_pool.linear_replayssm_cache_len
                     # Advance only VALID (non-padded) slots. A forced flush
                     # empties the ring -> next write_pos is 0 (same as the
                     # natural wrap at write_pos == L-1). Use this step's snapshot

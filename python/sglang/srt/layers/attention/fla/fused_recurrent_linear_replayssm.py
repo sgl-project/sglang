@@ -1,10 +1,17 @@
-# Buffered output-only GDN decode (ReplaySSM Part A), ported to SGLang.
+# Buffered output-only linear-attention decode (ReplaySSM Part A), ported to
+# SGLang. Covers BOTH gate granularities with one kernel:
+#   * GDN  (``IS_KDA=False``): per-head SCALAR gate ``alpha = exp(g)``.
+#   * KDA  (``IS_KDA=True``):  per-K-channel gate ``alpha[k] = exp(g[k])`` —
+#     the state decays column-wise, ``S' = S . Diag(alpha) + d k^T``.
+# GDN is the special case of KDA with all per-K decays equal; a single
+# ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
+# the original (no regression to the validated GDN kernel).
 #
 # This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
 # into the memory pool / radix cache / scheduler / backend dispatch. The caller
 # (currently the correctness test and the microbenchmark) owns the ring tensors.
 #
-# Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode``):
+# Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
 #   The plain packed decode reads the full recurrent state S [HV, V, K] from
 #   HBM and writes it back *every* decode step (~8*d*n bytes/step of state
 #   traffic for an fp32 state, read+write).  ReplaySSM keeps a small per-slot
@@ -14,29 +21,35 @@
 #   the buffer.  S0 is still READ every step, so per-step state traffic drops
 #   from read+write (~8*d*n) to read-only (~4*d*n) -> roughly halved.
 #
-# Math (single head, single step; matches the packed decode kernel exactly):
-#   alpha = exp(g)                      # per-head scalar decay for this token
-#   d_cur = beta * (v - alpha*(S . k))  # GDN *corrected* delta-rule vector
-#   o     = alpha*(S . q) + d_cur*(k^T q)   # output-only, k^T q factored FIRST
-#   S_new = alpha*S + d_cur k^T         # state update (only persisted on flush)
-# where S [V, K], (S . k)[v] = sum_k S[v,k] k[k], (S . q)[v] = sum_k S[v,k] q[k],
-# and q is already L2-normed (optional) and multiplied by ``scale``.
+# Math (single head, single step; matches the packed decode kernels exactly).
+# Let ``a = exp(g)`` be the decay (scalar for GDN, per-K vector for KDA) and
+# ``S`` the state *before* this token:
+#   d_cur = beta * (v - (S . Diag(a)) . k) = beta * (v - S . (a (.) k))
+#   o     = (S . Diag(a)) . q + d_cur*(k^T q) = S . (a (.) q) + d_cur*(k^T q)
+#   S_new = S . Diag(a) + d_cur k^T          # only persisted on flush
+# where ``(.)`` is elementwise over K.  For GDN ``a`` is scalar so
+# ``S . (a (.) q) = a * (S . q)`` (the cheap scalar post-multiply); for KDA the
+# per-K ``a`` folds into q/k before the matvec.  k^T q uses the RAW current
+# k/q (the rank-1 term), so it is identical for both gate types.
 #
 # Buffered reconstruction: with buffered steps j=0..m-1 holding (d_j, k_j, g_j),
 # the state *before* the current token is
-#   S = total_decay * S0 + sum_j replay_decay_j * d_j k_j^T
-# with total_decay = exp(sum_j g_j) and replay_decay_j = exp(sum_j g_j -
-# cumsum_inclusive_j) = prod_{i>j} alpha_i.  S is reconstructed in K-tiles and
-# immediately read with q (and k) -> the [V,K] state tile is never fully
-# materialized to HBM on a non-flush step.
+#   S = Diag(A) . S0 + sum_j d_j (W_j (.) k_j)^T          (per-K form)
+# with A[c]   = exp(sum_j g_j[c])                  (total decay, per-K)
+#      W_j[c] = exp(sum_i g_i[c] - cumsum_inclusive_j[c]) = prod_{i>j} a_i[c].
+# For GDN A and W_j are scalars (g is K-independent) and W_j folds onto d_j
+# instead of k_j (either factor works for a scalar). S is reconstructed in
+# K-tiles and immediately read with q (and k) -> the [V,K] state tile is never
+# fully materialized to HBM on a non-flush step.
 #
 # At L=1 the ring is always empty and ``write_pos == L-1`` every step, so the
-# reconstruction term is zero, total_decay == 1, and this kernel reduces
-# *algebraically* to ``fused_recurrent_gated_delta_rule_packed_decode_kernel``.
+# reconstruction term is zero, the total decay is 1, and this kernel reduces
+# *algebraically* to the corresponding packed-decode kernel.
 #
 # SPDX-License-Identifier: Apache-2.0
 # Ported from vllm/model_executor/layers/fla/ops/fused_recurrent_replayssm.py
-# (ReplaySSM, commit 3c85112) and adapted to SGLang's packed GDN decode layout.
+# (ReplaySSM, commit 3c85112) and adapted to SGLang's packed GDN/KDA decode
+# layout.
 
 from __future__ import annotations
 
@@ -46,18 +59,18 @@ import triton.language as tl
 
 
 @triton.jit
-def fused_recurrent_gdn_replayssm_decode_kernel(
+def fused_recurrent_linear_replayssm_decode_kernel(
     mixed_qkv,  # [B, 2*H*K + HV*V] packed (q | k | v) after conv1d
-    a,  # [B, HV] gate input a
+    a,  # GDN: [B, HV] gate input ; KDA: [B, HV, K] per-K gate input
     b,  # [B, HV] beta input b
-    A_log,  # [HV] log-space decay parameter
-    dt_bias,  # [HV] time-step bias
+    A_log,  # [HV] log-space decay parameter (per-head scalar, both gate types)
+    dt_bias,  # GDN: [HV] ; KDA: [HV, K] time-step bias
     o,  # [B, HV, V] output (written every step)
     h0,  # [num_slots, HV, V, K] checkpoint state (read every step)
     ht,  # [num_slots, HV, V, K] checkpoint state (written only on flush; == h0)
     d_cache,  # [num_slots, HV, L, V] ring: corrected delta vectors
     k_cache,  # [num_slots, H,  L, K] ring: (normed/scaled) keys
-    g_cache,  # [num_slots, HV, L]    ring: per-step log-decay gates (fp32)
+    g_cache,  # GDN: [num_slots, HV, L] ; KDA: [num_slots, HV, L, K] log-decay gates (fp32)
     ssm_state_indices,  # [B] physical state slot per decode row
     write_pos,  # [B] int32 per-row ring cursor (0..L-1)
     force_flush,  # [B] int32: !=0 forces a flush this step (radix track boundary)
@@ -81,6 +94,7 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     HAS_FORCE_FLUSH: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -114,31 +128,33 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
         b_is_flush = b_is_flush | (tl.load(force_flush + i_n) != 0)
     cache_valid = o_c < b_write_pos
 
-    # Gate for the current token: decay g, its exp alpha, and the beta weight.
-    # Mirrors fused_recurrent_gated_delta_rule_packed_decode_kernel exactly:
-    #   g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g);
-    #   beta = sigmoid(b).
-    a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
-    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
+    # Gate for the current token.  beta is a per-head scalar for both gate
+    # types; A_log is a per-head scalar for both.  The decay g/alpha is a
+    # per-head scalar for GDN (computed here) and a per-K vector for KDA
+    # (computed per K-tile inside the loop, since it is K-indexed).
+    #   g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g);  beta = sigmoid(b)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
-    x = a_val + dt_bias_val
-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
-    g_val = -tl.exp(A_log_val) * softplus_x
-    alpha_val = tl.exp(g_val)
+    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
     beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    if not IS_KDA:
+        a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+        x = a_val + dt_bias_val
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        g_val = -tl.exp(A_log_val) * softplus_x
+        alpha_val = tl.exp(g_val)
 
-    # Replay decay over the committed cache, from the cached per-step gates g.
-    # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
-    p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
-    b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
-    b_g_prefix = tl.cumsum(b_g_all, axis=0)
-    b_g_total = tl.sum(b_g_all, axis=0)
-    b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
-    b_total_decay = tl.exp(b_g_total)
+        # Replay decay over the committed cache, from the cached per-step gates.
+        # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
+        p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
+        b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
+        b_g_prefix = tl.cumsum(b_g_all, axis=0)
+        b_g_total = tl.sum(b_g_all, axis=0)
+        b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
+        b_total_decay = tl.exp(b_g_total)
 
-    # Cached corrected-delta vectors d (K-independent), scaled by the replay
-    # decay.  Layout d_cache[slot, hv, L, V] -> index [V, BC] tile.
+    # Cached corrected-delta vectors d (K-independent).  Layout
+    # d_cache[slot, hv, L, V] -> index [V, BC] tile.
     p_d_main = d_cache + (
         ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
     )
@@ -155,9 +171,14 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     # end-to-end (ReplaySSM bf16 GSM8K parity); the unit test uses
     # tensor-core-realistic tolerances. At L=1 the buffer is empty so this dot
     # is identically zero and the path stays bit-exact regardless of precision.
-    b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(
-        p_o.dtype.element_ty
-    )  # [BV, BC]
+    # GDN folds the (scalar) replay decay onto d here; KDA folds the (per-K)
+    # replay decay onto the cached keys inside the K-tile loop instead.
+    if not IS_KDA:
+        b_d_tc = (b_d_all * b_replay_decay[None, :]).to(
+            p_o.dtype.element_ty
+        )  # [BV, BC]
+    else:
+        b_d_tc = b_d_all.to(p_o.dtype.element_ty)  # [BV, BC]
 
     # Current token value (for the delta-rule update).
     v_off = (2 * H * K) + i_hv * V + o_v
@@ -188,6 +209,7 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
     write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
+    write_g_kda = IS_KDA and (not b_is_flush) and (i_v == 0)
     for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
@@ -203,9 +225,10 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
             * k_rnorm
         )
         q_cs = q_c * scale
+        # Rank-1 output term uses the RAW current k/q (gate-independent).
         cur_kq += tl.sum(k_c * q_cs)
 
-        # This K-tile of the state: S_tile = total_decay*S0_tile + d_scaled . k_cache.
+        # This K-tile of the state: S_tile = Diag(A_tile) S0_tile + d (.) (W (.) k_cache).
         p_h0_c = (
             h0
             + state_idx * stride_init_state_token
@@ -221,16 +244,68 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
             + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
             + o_kt[None, :]
         )
-        b_k_all_c = tl.load(
-            p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
-        ).to(p_o.dtype.element_ty)
-        b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(
-            tl.float32
-        )  # [BV, BKT], fp32
 
-        # Read the state with q and k (accumulated across K tiles).
-        b_state_q += tl.sum(b_h_c * q_cs[None, :], axis=1)
-        b_state_k += tl.sum(b_h_c * k_c[None, :], axis=1)
+        if not IS_KDA:
+            b_k_all_c = tl.load(
+                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
+            ).to(p_o.dtype.element_ty)
+            b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_tc, b_k_all_c).to(tl.float32)
+            # GDN: scalar current-token decay applied after the loop.
+            q_eff = q_cs
+            k_eff = k_c
+        else:
+            # KDA per-K decay: load this tile's cached gates [BC, BKT], form the
+            # per-K total / replay decay, fold the replay decay onto the cached
+            # keys and the total decay onto S0.
+            p_g_c = (
+                g_cache
+                + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                + o_kt[None, :]
+            )
+            b_g_all_c = tl.load(
+                p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+            ).to(tl.float32)
+            b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)  # [BC, BKT]
+            b_g_total_c = tl.sum(b_g_all_c, axis=0)  # [BKT]
+            b_replay_decay_c = tl.where(
+                cache_valid[:, None],
+                tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
+                0.0,
+            )  # [BC, BKT]
+            b_total_decay_c = tl.exp(b_g_total_c)  # [BKT]
+            b_k_all_c = tl.load(
+                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+            ).to(tl.float32)
+            b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
+            b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(b_d_tc, b_k_scaled).to(
+                tl.float32
+            )
+            # KDA: current-token per-K decay folds into q/k for the readout.
+            p_a_c = a + i_n * stride_a_tok + i_hv * K + o_kt
+            p_dt_c = dt_bias + i_hv * K + o_kt
+            b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
+            b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
+            x_c = b_a_c + b_dt_c
+            softplus_c = tl.where(
+                x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
+            )
+            g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
+            alpha_cur_c = tl.exp(g_cur_c)
+            q_eff = q_cs * alpha_cur_c
+            k_eff = k_c * alpha_cur_c
+
+            # Append this tile of the current gate to the ring (non-flush only).
+            if write_g_kda:
+                p_cur_g = (
+                    g_cache
+                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * K
+                    + o_kt
+                )
+                tl.store(p_cur_g, g_cur_c, mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
+
+        # Read the state with the (gate-folded) q and k, accumulated across tiles.
+        b_state_q += tl.sum(b_h_c * q_eff[None, :], axis=1)
+        b_state_k += tl.sum(b_h_c * k_eff[None, :], axis=1)
 
         if write_k:
             p_cur_k = (
@@ -244,16 +319,19 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
                 mask=mask_kt & (b_write_pos < MAX_CACHE_LEN),
             )
 
-    # Current-token output: alpha*(S q) + d_cur*(k . q), with the new corrected
-    # delta-rule vector d_cur = beta * (v - alpha*(S k)).
-    b_state_q *= alpha_val
-    b_state_k *= alpha_val
+    # Current-token output: (S . Diag(a)) q + d_cur*(k . q), with the new
+    # corrected delta-rule vector d_cur = beta * (v - (S . Diag(a)) k).
+    # For GDN the per-head scalar decay is applied here; for KDA it was already
+    # folded into q/k above.
+    if not IS_KDA:
+        b_state_q *= alpha_val
+        b_state_k *= alpha_val
     b_d_cur = beta_val * (b_v - b_state_k)
     b_o = b_state_q + b_d_cur * tl.sum(cur_kq)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
     if b_is_flush:
-        # Flush: fold the current token into the checkpoint, S_new = alpha*S +
+        # Flush: fold the current token into the checkpoint, S_new = S.Diag(a) +
         # d_cur k^T, and persist it.  Re-walk K chunks to rebuild S, then apply
         # the update.  After this the ring is logically cleared (the caller
         # resets write_pos to 0 on the next step).
@@ -282,13 +360,50 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
                 + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
                 + o_kt[None, :]
             )
-            b_k_all_c = tl.load(
-                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
-            ).to(p_o.dtype.element_ty)
-            b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(
-                tl.float32
-            )
-            b_h_new_c = alpha_val * b_h_c + b_d_cur[:, None] * k_c[None, :]
+            if not IS_KDA:
+                b_k_all_c = tl.load(
+                    p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
+                ).to(p_o.dtype.element_ty)
+                b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_tc, b_k_all_c).to(
+                    tl.float32
+                )
+                b_h_new_c = alpha_val * b_h_c + b_d_cur[:, None] * k_c[None, :]
+            else:
+                p_g_c = (
+                    g_cache
+                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                    + o_kt[None, :]
+                )
+                b_g_all_c = tl.load(
+                    p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+                ).to(tl.float32)
+                b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)
+                b_g_total_c = tl.sum(b_g_all_c, axis=0)
+                b_replay_decay_c = tl.where(
+                    cache_valid[:, None],
+                    tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
+                    0.0,
+                )
+                b_total_decay_c = tl.exp(b_g_total_c)
+                b_k_all_c = tl.load(
+                    p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+                ).to(tl.float32)
+                b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
+                b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(
+                    b_d_tc, b_k_scaled
+                ).to(tl.float32)
+                p_a_c = a + i_n * stride_a_tok + i_hv * K + o_kt
+                p_dt_c = dt_bias + i_hv * K + o_kt
+                b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
+                b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
+                x_c = b_a_c + b_dt_c
+                softplus_c = tl.where(
+                    x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
+                )
+                alpha_cur_c = tl.exp(-tl.exp(A_log_val) * softplus_c)  # [BKT]
+                b_h_new_c = (
+                    b_h_c * alpha_cur_c[None, :] + b_d_cur[:, None] * k_c[None, :]
+                )
             p_ht_c = (
                 ht
                 + state_idx * stride_final_state_token
@@ -302,8 +417,9 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
                 mask=mask_v[:, None] & mask_kt[None, :],
             )
     else:
-        # Non-flush: append the current token's corrected delta d and gate g to
-        # the cache (the k chunks were already written inside the loop above).
+        # Non-flush: append the current token's corrected delta d to the cache
+        # (k chunks were written inside the loop; KDA's g chunks too).  GDN's
+        # scalar g is appended here.
         p_cur_d = (
             d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
         )
@@ -312,12 +428,12 @@ def fused_recurrent_gdn_replayssm_decode_kernel(
             b_d_cur.to(p_cur_d.dtype.element_ty),
             mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
         )
-        if i_v == 0:
+        if (not IS_KDA) and (i_v == 0):
             p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
-def fused_recurrent_gdn_replayssm_decode(
+def fused_recurrent_linear_replayssm_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -333,36 +449,39 @@ def fused_recurrent_gdn_replayssm_decode(
     write_pos: torch.Tensor,
     force_flush: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    is_kda: bool = False,
     block_v: int | None = None,
     num_warps: int = 1,
     num_stages: int = 3,
     nk: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Buffered output-only GDN autoregressive decode (one new token / seq).
+    """Buffered output-only linear-attention autoregressive decode (1 token/seq).
 
-    Same call surface as ``fused_recurrent_gated_delta_rule_packed_decode``
-    plus the three ring caches (``d_cache`` / ``k_cache`` / ``g_cache``) and the
-    per-decode-row ``write_pos`` cursor.  ``initial_state`` is both the
-    checkpoint read (h0) and the (flush-only) checkpoint write (ht), in place.
+    One kernel for both gate granularities, selected by ``is_kda``:
+      * ``is_kda=False`` (GDN): per-head SCALAR gate.  ``a``=[B, HV],
+        ``dt_bias``=[HV], ``g_cache``=[num_slots, HV, L].
+      * ``is_kda=True`` (KDA): per-K-channel gate.  ``a``=[B, HV, K],
+        ``dt_bias``=[HV, K], ``g_cache``=[num_slots, HV, L, K].
+    ``A_log`` is [HV] (per-head scalar) for both.
+
+    Same call surface as the packed decode plus the three ring caches
+    (``d_cache`` / ``k_cache`` / ``g_cache``) and the per-decode-row
+    ``write_pos`` cursor.  ``initial_state`` is both the checkpoint read (h0)
+    and the (flush-only) checkpoint write (ht), in place.
 
     Allocates nothing persistent: the caller owns the ring tensors and is
     responsible for advancing / resetting ``write_pos`` (e.g. ``(write_pos+1) %
     L`` after each step).  This is a STANDALONE kernel; the memory-pool / cache
     integration is a later phase.
-
-    Ring tensor shapes (per state slot):
-        d_cache: [num_slots, HV, L, V]   (corrected delta vectors)
-        k_cache: [num_slots, H,  L, K]   ((normed/scaled) keys; shared by HV//H)
-        g_cache: [num_slots, HV, L]      (per-step log-decay gates, fp32)
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(f"`mixed_qkv` must be 2D (got ndim={mixed_qkv.ndim}).")
     if mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(f"`a`/`b` must be 2D (got a.ndim={a.ndim}, b.ndim={b.ndim}).")
-    if A_log.ndim != 1 or dt_bias.ndim != 1:
-        raise ValueError("`A_log`/`dt_bias` must be 1D tensors.")
+    if b.ndim != 2:
+        raise ValueError(f"`b` must be 2D (got b.ndim={b.ndim}).")
+    if A_log.ndim != 1:
+        raise ValueError("`A_log` must be a 1D tensor.")
     if initial_state.ndim != 4:
         raise ValueError(f"`initial_state` must be 4D (got ndim={initial_state.ndim}).")
     if not out.is_contiguous():
@@ -389,7 +508,31 @@ def fused_recurrent_gdn_replayssm_decode(
         )
     max_cache_len = d_cache.shape[2]
 
-    # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).
+    # Gate-shape sanity: GDN scalar gate vs KDA per-K gate.
+    if is_kda:
+        if a.ndim != 3 or tuple(a.shape) != (B, HV, K):
+            raise ValueError(
+                f"KDA `a` must have shape {(B, HV, K)} (got {tuple(a.shape)})."
+            )
+        if dt_bias.ndim != 2 or tuple(dt_bias.shape) != (HV, K):
+            raise ValueError(
+                f"KDA `dt_bias` must have shape {(HV, K)} (got {tuple(dt_bias.shape)})."
+            )
+        if not a.is_contiguous() or not dt_bias.is_contiguous():
+            raise ValueError("KDA `a`/`dt_bias` must be contiguous.")
+        g_expect = (HV, max_cache_len, K)
+    else:
+        if a.ndim != 2 or tuple(a.shape) != (B, HV):
+            raise ValueError(
+                f"GDN `a` must have shape {(B, HV)} (got {tuple(a.shape)})."
+            )
+        if dt_bias.ndim != 1 or dt_bias.shape[0] != HV:
+            raise ValueError(
+                f"GDN `dt_bias` must have shape {(HV,)} (got {tuple(dt_bias.shape)})."
+            )
+        g_expect = (HV, max_cache_len)
+
+    # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K).
     if tuple(d_cache.shape[1:]) != (HV, max_cache_len, V):
         raise ValueError(
             f"`d_cache` per-slot shape must be {(HV, max_cache_len, V)} "
@@ -400,9 +543,9 @@ def fused_recurrent_gdn_replayssm_decode(
             f"`k_cache` per-slot shape must be {(H, max_cache_len, K)} "
             f"(got {tuple(k_cache.shape[1:])})."
         )
-    if tuple(g_cache.shape[1:]) != (HV, max_cache_len):
+    if tuple(g_cache.shape[1:]) != g_expect:
         raise ValueError(
-            f"`g_cache` per-slot shape must be {(HV, max_cache_len)} "
+            f"`g_cache` per-slot shape must be {g_expect} "
             f"(got {tuple(g_cache.shape[1:])})."
         )
     if g_cache.dtype != torch.float32:
@@ -434,7 +577,7 @@ def fused_recurrent_gdn_replayssm_decode(
     BC = max(16, triton.next_power_of_2(max_cache_len))
 
     grid = (triton.cdiv(V, BV), B, HV)
-    fused_recurrent_gdn_replayssm_decode_kernel[grid](
+    fused_recurrent_linear_replayssm_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
@@ -469,7 +612,17 @@ def fused_recurrent_gdn_replayssm_decode(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         HAS_FORCE_FLUSH=force_flush is not None,
+        IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     return out, initial_state
+
+
+# Backwards-compatible aliases: the original GDN-only names. Existing callers
+# (backend dispatch, tests, microbench) keep working; ``is_kda`` defaults to
+# False so these are the GDN path unchanged.
+fused_recurrent_gdn_replayssm_decode_kernel = (
+    fused_recurrent_linear_replayssm_decode_kernel
+)
+fused_recurrent_gdn_replayssm_decode = fused_recurrent_linear_replayssm_decode

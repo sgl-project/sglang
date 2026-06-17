@@ -10,7 +10,7 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
     )
-    from sglang.srt.layers.attention.fla.fused_recurrent_gdn_replayssm import (
+    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_gdn_replayssm_decode,
     )
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
