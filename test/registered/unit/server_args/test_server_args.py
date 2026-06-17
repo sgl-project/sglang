@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -231,6 +232,19 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertFalse(server_args.enable_prefill_context_parallel)
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
         self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+    def test_context_parallel_handler_initializes_cp_strategy(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+        )
+
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_interleave())
 
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [

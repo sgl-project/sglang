@@ -375,6 +375,7 @@ class DeepSeekV4LayerItem(NamedTuple):
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
+# The following kv pool follows ATOM's unified_kv kernel layout.
 class DeepSeekV4UnifiedKVPool:
     """
     Layout:
