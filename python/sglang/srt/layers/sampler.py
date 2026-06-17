@@ -12,7 +12,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import (
+    _is_per_position_token_ids,
+    get_token_ids_logprobs,
+    get_top_logprobs,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -340,12 +344,18 @@ class Sampler(nn.Module):
                 logits_output.next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
-        if any(x is not None for x in token_ids_logprobs):
+        # Per-position token_ids_logprob entries (List[List[int]]) are an input-position
+        # scoring feature with no next-token meaning; they are served by the
+        # logits_processor input-logprob path, so exclude them from the next-token gather.
+        flat_token_ids_logprobs = [
+            None if _is_per_position_token_ids(t) else t for t in token_ids_logprobs
+        ]
+        if any(x is not None for x in flat_token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+                logprobs, flat_token_ids_logprobs, no_copy_to_cpu=True
             )
 
         logits_output.next_token_logprobs = logprobs[
@@ -389,10 +399,17 @@ class Sampler(nn.Module):
             logger.warning("No logits available for logprob computation")
             return
 
+        # Per-position token_ids_logprob entries (List[List[int]]) are an input-position
+        # scoring feature with no next-token meaning; they are served by the
+        # logits_processor input-logprob path, so exclude them from the next-token gather.
+        flat_token_ids_logprobs = [
+            None if _is_per_position_token_ids(t) else t for t in token_ids_logprobs
+        ]
+
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0
-            for token_ids in token_ids_logprobs
+            for token_ids in flat_token_ids_logprobs
         )
         needs_top_logprobs = any(x > 0 for x in top_logprobs_nums)
 
@@ -417,7 +434,9 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+            ) = get_token_ids_logprobs_batch_optimized(
+                logprobs, flat_token_ids_logprobs
+            )
 
 
 def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
@@ -661,6 +680,14 @@ def get_token_ids_logprobs_batch_optimized(
     """
     batch_size = len(token_ids_logprobs)
     device = logprobs.device
+
+    # This next-token path only handles flat per-request id-lists. Per-position
+    # (List[List[int]]) entries must be filtered out by callers (they are an
+    # input-position scoring feature served by the logits_processor path); guard so a
+    # future caller fails loudly instead of silently mis-shaping via torch's (N, 0) quirk.
+    assert not any(
+        _is_per_position_token_ids(t) for t in token_ids_logprobs
+    ), "per-position token_ids_logprob is not supported in the next-token sampler path"
 
     # Step 1: Calculate lengths for each request, treating None as empty list
     # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])

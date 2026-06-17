@@ -302,6 +302,36 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(len(req.input_ids), 4)  # 2 original * 2 parallel
 
+    def test_token_ids_logprob_positions_fold(self):
+        """Test token_ids_logprob_positions normalization and validation."""
+        per_pos = [[], [], [5, 6], [7, 8]]
+        req = GenerateReqInput(
+            input_ids=[10, 11, 12, 13],
+            return_logprob=True,
+            token_ids_logprob_positions=copy.deepcopy(per_pos),
+        )
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.token_ids_logprob, per_pos)
+        self.assertIsNone(req.token_ids_logprob_positions)
+
+        req = GenerateReqInput(
+            input_ids=[10, 11, 12, 13],
+            return_logprob=True,
+            token_ids_logprob=[5, 6],
+            token_ids_logprob_positions=[[], [], [5, 6], [7, 8]],
+        )
+        with self.assertRaises(ValueError):
+            req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(
+            input_ids=[[10, 11], [12, 13]],
+            return_logprob=True,
+            token_ids_logprob_positions=[[[1], [2]], [[3], [4]]],
+        )
+        with self.assertRaises(ValueError):
+            req.normalize_batch_and_arguments()
+
     def test_input_embeds_normalization(self):
         """Test normalization of input_embeds."""
         # Test single input_embeds
