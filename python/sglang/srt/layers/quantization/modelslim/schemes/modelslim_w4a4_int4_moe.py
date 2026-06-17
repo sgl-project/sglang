@@ -61,6 +61,8 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         Shape depends on the W4A4 packing environment flag and whether the weight
         prefix is "w13" or "w2".
         """
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         # --- compute shapes based on the packing path and prefix ---
         if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
             if self.weight_prefix == "w13":
