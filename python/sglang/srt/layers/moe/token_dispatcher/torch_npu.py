@@ -24,7 +24,9 @@ from sglang.srt.layers.moe.utils import (
     get_ascend_dispatcher_output_dtype,
     DispatcherOutputDtype,
 )
-
+from sglang.srt.distributed.communication_op import (
+            tensor_model_parallel_all_gather,
+)
 
 class TorchNpuDispatchOutput(NamedTuple):
     """Dispatch output specific to the TorchNpu dispatcher."""
