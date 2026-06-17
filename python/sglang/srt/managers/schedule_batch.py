@@ -674,7 +674,6 @@ class ReqCacheInfo:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    start_pos: int
     kv_allocated_len: int
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
@@ -767,9 +766,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv: ReqKvInfo = ReqKvInfo(
-            start_pos=0, kv_allocated_len=0, swa_evicted_seqlen=0
-        )
+        self.kv: ReqKvInfo = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1075,9 +1072,6 @@ class Req(ReqDllmMixin):
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
         self.cache.cache_protected_len = value
-        # Keep the owned-segment start in lockstep: owned KV is
-        # [start_pos, kv_allocated_len) and starts where the borrowed prefix ends.
-        self.kv.start_pos = value
 
     @property
     def last_node(self) -> Any:

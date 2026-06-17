@@ -56,7 +56,7 @@ def _new_cache() -> ReqCacheInfo:
 def _new_kv() -> ReqKvInfo:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-    return ReqKvInfo(start_pos=0, kv_allocated_len=0, swa_evicted_seqlen=0)
+    return ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
 
 def _new_mamba() -> ReqMambaInfo:
