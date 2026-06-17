@@ -47,7 +47,6 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
     def create_weights(
         self,
         layer: torch.nn.Module,
-        weight_prefix: str,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
