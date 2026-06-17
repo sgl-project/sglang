@@ -314,6 +314,7 @@ class MiniMaxM3MLP(nn.Module):
     def forward(
         self,
         x,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):

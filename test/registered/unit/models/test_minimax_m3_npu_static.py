@@ -85,6 +85,32 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "NPU must avoid the torch.compile/Triton swigluoai helper.",
         )
 
+    def test_dense_mlp_accepts_decoder_layer_call_signature(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        mlp_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3MLP"
+        )
+        forward = next(
+            node
+            for node in mlp_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        arg_names = [arg.arg for arg in forward.args.args]
+
+        self.assertEqual(
+            arg_names[:5],
+            [
+                "self",
+                "x",
+                "forward_batch",
+                "should_allreduce_fusion",
+                "use_reduce_scatter",
+            ],
+        )
+
     def test_large_gemma_rmsnorm_residual_avoids_npu_triton_kernel(self):
         source = _read("python/sglang/srt/layers/layernorm.py")
         tree = ast.parse(source)
