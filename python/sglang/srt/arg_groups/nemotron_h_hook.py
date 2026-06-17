@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -9,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> None:
+def apply_nemotron_h_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply NemotronH model-specific server arg defaults and constraints."""
     model_config = server_args.get_model_config()
     is_modelopt = model_config.quantization in [

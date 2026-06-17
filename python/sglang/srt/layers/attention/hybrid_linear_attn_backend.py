@@ -49,7 +49,7 @@ class MambaAttnBackendBase(AttentionBackend):
         if (
             not forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
             or self.is_draft_worker
         ):
             return

@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -379,9 +380,17 @@ async def lifespan(fast_api_app: FastAPI):
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
         )
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+    except Exception as e:
+        # Optional endpoint; a load failure (e.g. the gpt-oss harmony vocab
+        # download) must not look like a fatal error. One-line WARNING, full
+        # traceback at DEBUG.
+        logger.warning(
+            f"OpenAI Responses API (/v1/responses) disabled: "
+            f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
+        )
+        logger.debug(
+            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+        )
 
     # Execute custom warmups
     if server_args.warmups is not None:
@@ -607,7 +616,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+    # collide and crash the shared DetokenizerManager decode_status).
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(

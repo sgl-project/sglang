@@ -20,6 +20,10 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    run_dense_spec_verify_case,
+    run_dense_spec_verify_cuda_graph_case,
+)
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_dense_split_op_extend_case,
 )
@@ -87,6 +91,40 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             16,
+        ),
+    )
+    SPEC_VERIFY_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_swa_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
+    )
+    SPEC_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_dflash_verify_swa_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
         ),
     )
 
@@ -170,6 +208,40 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    def test_runner_mode_spec_verify_cases(self):
+        for case, topk, spec_kind in self.SPEC_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_dense_spec_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_spec_verify_cuda_graph_cases(self):
+        for case, topk, spec_kind in self.SPEC_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_dense_spec_verify_cuda_graph_case(
+                    self,
+                    case,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
 
 
 if __name__ == "__main__":
