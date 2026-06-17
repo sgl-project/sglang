@@ -464,6 +464,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.enable_hisparse_radix_cache = False
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -472,6 +473,18 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if hasattr(self.tree_cache, "init_hisparse_radix_cache"):
+                self.enable_hisparse_radix_cache = (
+                    self.tree_cache.init_hisparse_radix_cache(
+                        self.hisparse_coordinator.mem_pool_host,
+                        self.server_args,
+                    )
+                )
+                if self.enable_hisparse_radix_cache:
+                    self.hisparse_coordinator.set_radix_cache(self.tree_cache)
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -2439,8 +2452,11 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        batch.req_pool_indices_cpu = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
+        )
+        batch.req_pool_indices = batch.req_pool_indices_cpu.to(
+            device=device, non_blocking=True
         )
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
@@ -2639,7 +2655,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -2831,7 +2847,7 @@ class Scheduler(
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -2914,7 +2930,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
