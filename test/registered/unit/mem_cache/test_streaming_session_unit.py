@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    CacheLock,
+    ReqCacheInfo,
     ReqKvInfo,
     ReqMambaInfo,
 )
@@ -63,7 +63,7 @@ class _FakeReq:
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
         self.kv_info = ReqKvInfo(kv_allocated_len=allocated)
-        self.cache_lock = CacheLock()
+        self.cache_info = ReqCacheInfo()
         self.mamba_info = ReqMambaInfo()
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
@@ -113,7 +113,7 @@ def test_preabort_detaches_session_and_preserves_slot():
         req_pool_idx=0,
         kv_committed_len=48,
         kv_info=ReqKvInfo(kv_allocated_len=48),
-        cache_lock=CacheLock(protected_len=16),
+        cache_info=ReqCacheInfo(cache_protected_len=16),
     )
 
     req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
