@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.template_detection import (
+    REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
     detect_reasoning_parser,
@@ -137,6 +138,47 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "thinking",
         ),
         (
+            "deepseek_v4_dsml_tool_calls",
+            "{% if not thinking is defined %}{% set thinking = false %}{% endif %}\n"
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="tool"></｜DSML｜invoke>',
+            [],
+            "deepseek-v4",
+            "thinking",
+        ),
+        (
+            "hunyuan_interleaved_thinking",
+            "{% set reasoning_effort = reasoning_effort | default('no_think', true) %}\n"
+            "{% set interleaved_thinking = interleaved_thinking | default(false, true) %}\n"
+            "<think>reasoning</think><tool_calls><tool_call>name<tool_sep>",
+            ["<tool_calls>", "<tool_sep>", "<arg_key>", "<arg_value>"],
+            "hunyuan",
+            None,
+        ),
+        (
+            "poolside_v1_enable_thinking_false",
+            "{% if not enable_thinking is defined %}{% set enable_thinking = false %}{% endif %}\n"
+            "<tool_call>{{ name }}\n<arg_key>{{ key }}</arg_key><arg_value>{{ value }}</arg_value>",
+            ["<tool_call>", "<arg_key>", "<arg_value>"],
+            "poolside_v1",
+            "enable_thinking",
+        ),
+        (
+            "step3p5_think_tags",
+            "Step3.5-Flash\n<function=tool><parameter=arg>value</parameter></function>\n<think>",
+            [],
+            "step3p5",
+            None,
+        ),
+        (
+            "step3_steptml",
+            "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>"
+            '<steptml:invoke name="tool"><steptml:parameter name="arg">value</steptml:parameter>'
+            "</steptml:invoke><｜tool_call_end｜><think>",
+            [],
+            "step3",
+            None,
+        ),
+        (
             "qwen3_enable_thinking_true",
             "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n",
             [],
@@ -268,6 +310,27 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "deepseekv3",
             ),
             (
+                "deepseekv31",
+                (
+                    "{% if not thinking is defined %}{% set thinking = false %}{% endif %}\n"
+                    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool<｜tool▁sep｜>{}<｜tool▁call▁end｜>"
+                ),
+                [],
+                "deepseekv31",
+            ),
+            (
+                "deepseekv32",
+                '<｜DSML｜function_calls><｜DSML｜invoke name="tool"></｜DSML｜invoke></｜DSML｜function_calls>',
+                [],
+                "deepseekv32",
+            ),
+            (
+                "deepseekv4",
+                '<｜DSML｜tool_calls><｜DSML｜invoke name="tool"></｜DSML｜invoke></｜DSML｜tool_calls>',
+                [],
+                "deepseekv4",
+            ),
+            (
                 "kimi_k2",
                 "{% set thinking = thinking if thinking is defined else true %}\n<think>",
                 ["<|tool_calls_section_begin|>"],
@@ -283,6 +346,46 @@ class TestToolCallParserDetection(unittest.TestCase):
                 ),
                 ["<function", "<param"],
                 "minicpm5",
+            ),
+            (
+                "lfm2",
+                '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>',
+                ["<|tool_call_start|>", "<|tool_call_end|>"],
+                "lfm2",
+            ),
+            (
+                "hunyuan",
+                "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call></tool_calls>",
+                ["<tool_calls>", "<tool_sep>", "<arg_key>", "<arg_value>"],
+                "hunyuan",
+            ),
+            (
+                "poolside_v1",
+                "{% if not enable_thinking is defined %}{% set enable_thinking = false %}{% endif %}\n"
+                "<tool_call>get_weather\n<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+                ["<tool_call>", "<arg_key>", "<arg_value>"],
+                "poolside_v1",
+            ),
+            (
+                "qwen3_coder",
+                "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n"
+                "<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+                ["<tool_call>"],
+                "qwen3_coder",
+            ),
+            (
+                "step3p5",
+                "Step3.5-Flash\n<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+                ["<tool_call>"],
+                "step3p5",
+            ),
+            (
+                "step3",
+                "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>"
+                '<steptml:invoke name="get_weather"><steptml:parameter name="city">Paris</steptml:parameter>'
+                "</steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>",
+                [],
+                "step3",
             ),
             (
                 "glm47_compact_tool_call",
@@ -338,6 +441,30 @@ class TestToolCallParserDetection(unittest.TestCase):
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
         self.assertLess(rule_index["glm47"], rule_index["glm45"])
         self.assertLess(rule_index["glm45"], rule_index["xml_kv_tool_call"])
+
+    def test_specific_rules_precede_broad_fallbacks(self):
+        reasoning_index = {
+            rule.name: i for i, rule in enumerate(REASONING_PARSER_RULES)
+        }
+        self.assertLess(reasoning_index["deepseek_v4"], reasoning_index["deepseek_v3"])
+        self.assertLess(
+            reasoning_index["hunyuan"], reasoning_index["deepseek_r1_think_tags"]
+        )
+        self.assertLess(reasoning_index["poolside_v1"], reasoning_index["mimo"])
+        self.assertLess(
+            reasoning_index["step3p5"], reasoning_index["deepseek_r1_think_tags"]
+        )
+        self.assertLess(
+            reasoning_index["step3"], reasoning_index["deepseek_r1_think_tags"]
+        )
+
+        tool_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(tool_index["deepseek_v31"], tool_index["deepseek_v3"])
+        self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
+        self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
+        self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
+        self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
+        self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
     def test_xml_kv_requires_both_arg_tokens(self):
         template = "Hello {{ user }}"

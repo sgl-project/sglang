@@ -219,6 +219,35 @@ def _is_xml_kv_tool_call(ctx):
     return ctx.has_vocab("<arg_key>") and ctx.has_vocab("<arg_value>")
 
 
+def _is_deepseek_v31(ctx):
+    return ctx.has_text("<｜tool▁calls▁begin｜>") and ctx.has_text("<｜tool▁sep｜>")
+
+
+def _is_deepseek_v32(ctx):
+    return ctx.has_text("<｜DSML｜function_calls>")
+
+
+def _is_deepseek_v4(ctx):
+    return ctx.has_text("<｜DSML｜tool_calls>")
+
+
+def _is_hunyuan(ctx):
+    return (
+        (ctx.has_text("<tool_calls>") or ctx.has_vocab("<tool_calls>"))
+        and (ctx.has_text("<tool_sep>") or ctx.has_vocab("<tool_sep>"))
+    ) or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
+
+
+def _is_poolside_v1(ctx):
+    return (
+        ctx.reasoning_config
+        == ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=False)
+        and not _is_hunyuan(ctx)
+        and (ctx.has_text("<arg_key>") or ctx.has_vocab("<arg_key>"))
+        and (ctx.has_text("<arg_value>") or ctx.has_vocab("<arg_value>"))
+    )
+
+
 def _is_mimo(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="enable_thinking", default_enabled=False
@@ -233,6 +262,28 @@ def _is_minicpm5(ctx):
     if ctx.has_vocab("<function") and ctx.has_vocab("<param"):
         return True
     return ctx.has_pattern(r"<function\s+name=") and ctx.has_pattern(r"<param\s+name=")
+
+
+def _is_lfm2(ctx):
+    return (
+        ctx.has_text("<|tool_call_start|>") or ctx.has_vocab("<|tool_call_start|>")
+    ) and (ctx.has_text("<|tool_call_end|>") or ctx.has_vocab("<|tool_call_end|>"))
+
+
+def _is_step3p5(ctx):
+    return ctx.has_pattern(r"Step-?3(?:\.|p)?[57]", re.IGNORECASE) or ctx.has_pattern(
+        r"step3p[57]", re.IGNORECASE
+    )
+
+
+def _is_step3(ctx):
+    return ctx.has_text("<steptml:invoke") or (
+        ctx.has_text("<｜tool_calls_begin｜>") and ctx.has_text("<｜tool_sep｜>")
+    )
+
+
+def _is_qwen3_coder(ctx):
+    return ctx.has_text("<function=") and ctx.has_text("<parameter=")
 
 
 def _is_qwen3(ctx):
@@ -269,9 +320,14 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
+    DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
+    DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
+    DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
+    DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
@@ -295,13 +351,22 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax-m2", predicate=_is_minimax),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
+    DetectionRule(name="deepseek_v4", value="deepseekv4", predicate=_is_deepseek_v4),
+    DetectionRule(name="deepseek_v32", value="deepseekv32", predicate=_is_deepseek_v32),
+    DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
+    DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
+    DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
+    DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
+    DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
+    DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
     DetectionRule(name="deepseek_r1", value="deepseekv3", predicate=_is_deepseek_r1),
