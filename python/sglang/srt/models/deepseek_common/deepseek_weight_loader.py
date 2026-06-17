@@ -149,8 +149,12 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            name = name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+            #assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
