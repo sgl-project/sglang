@@ -668,9 +668,22 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                if batch.spec_algorithm.is_none():
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
+                    )
+                else:
+                    # Spec V2 hidden_states is strided [bs * speculative_num_draft_tokens, hidden_dim].
+                    # Req i's accepted-plus-bonus rows live at [i*stride : i*stride + accept_len].
+                    stride = result.speculative_num_draft_tokens
+                    accept_len = result.num_correct_drafts_per_req_cpu[i] + 1
+                    start = i * stride
+                    req.hidden_states.extend(
+                        logits_output.hidden_states[start : start + accept_len]
+                        .cpu()
+                        .clone()
+                        .tolist()
+                    )
 
             if req.grammar is not None:
                 self._apply_decode_grammar(
