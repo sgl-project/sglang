@@ -369,13 +369,6 @@ impl CacheAwarePolicy {
 
         Some(min_load_idx)
     }
-
-    fn tenant_tree_size(tree: &Tree, worker: &dyn Worker) -> usize {
-        tree.tenant_char_count
-            .get(worker.url())
-            .map(|count| *count)
-            .unwrap_or(0)
-    }
 }
 
 #[async_trait]
@@ -451,12 +444,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 healthy_indices
                     .iter()
                     .min_by_key(|&&idx| {
-                        (
-                            workers[idx].load(),
-                            Self::tenant_tree_size(&tree, workers[idx].as_ref()),
-                            workers[idx].processed_requests(),
-                            idx,
-                        )
+                        (workers[idx].load(), workers[idx].processed_requests(), idx)
                     })
                     .copied()
             };
