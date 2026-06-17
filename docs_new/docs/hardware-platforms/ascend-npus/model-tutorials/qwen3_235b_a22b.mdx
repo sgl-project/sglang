@@ -25,16 +25,16 @@ v0.5.13 or a later version.
 | Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
-| Data Parallelism              | `--dp-size 16 --enable-dp-attention`                                                          |
-| Expert Parallelism            | `--moe-a2a-backend ascend_fuseep`                                                             |
-| PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
+| Data Parallelism              | `--dp-size 16`                                                                                |
+| Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend ascend_fuseep`                                         |
+| PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size 94208 --max-prefill-tokens 458880`                                    |
-| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 16 20 24 26 27`                                                      |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                   |
+| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g. `--chunked-prefill-size 94208` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 1 2 4 8 16 20 24 26 27` |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| Context Parallelism           | `--enable-prefill-context-parallel --attn-cp-size 2 --moe-dp-size 2`                          |
+| Context Parallelism           | `--enable-prefill-context-parallel \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
