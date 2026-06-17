@@ -882,7 +882,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_ltx_snapshot_keeps_dit_offload_and_replaces_encoder_cpu_offload(
+    def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
     ):
         args = self._from_dict_with_pipeline_config(
@@ -891,13 +891,12 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
                 "pipeline_class_name": "LTX2TwoStageHQPipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
                 "performance_mode": "auto",
             },
         )
 
-        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)

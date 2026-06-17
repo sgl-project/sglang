@@ -66,7 +66,7 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -505,9 +505,9 @@ class ServerArgs(DisaggServerArgsMixin):
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
         if not current_platform.is_cuda():
             logger.info(
-                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+                "Automatically set ltx2_two_stage_device_mode=original on non-CUDA platform"
             )
-            return "snapshot"
+            return "original"
 
         device_name = str(current_platform.get_device_name(0)).upper()
         device_total_memory_gb = (
@@ -525,22 +525,16 @@ class ServerArgs(DisaggServerArgsMixin):
             return "resident"
 
         logger.info(
-            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            "Automatically set ltx2_two_stage_device_mode=original for CUDA GPU (%s, %.2f GiB total)",
             device_name,
             device_total_memory_gb,
         )
-        return "snapshot"
+        return "original"
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
             self._is_ltx23_model_path(self.model_path)
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
-        )
-
-    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
-        return (
-            self.ltx2_two_stage_device_mode == "snapshot"
-            and self._is_ltx23_two_stage_pipeline()
         )
 
     def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
@@ -1415,9 +1409,8 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
         parser.add_argument(
