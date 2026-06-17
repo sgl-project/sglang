@@ -71,6 +71,20 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_raise_npu_sparse_not_ready", source)
         self.assertRegex(source, r"self\.is_npu\s*=\s*is_npu\(\)")
 
+    def test_swigluoai_has_npu_eager_path(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        function_names = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn("_swigluoai_torch", function_names)
+        self.assertRegex(
+            source,
+            r"(?s)elif hidden_act == \"swigluoai\".*?if _is_npu:",
+            "NPU must avoid the torch.compile/Triton swigluoai helper.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

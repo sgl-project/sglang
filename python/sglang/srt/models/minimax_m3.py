@@ -249,6 +249,15 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
 
 
 class MiniMaxM3MLP(nn.Module):
+    @staticmethod
+    def _swigluoai_torch(
+        x: torch.Tensor, gemm1_alpha: float, gemm1_limit: float
+    ) -> torch.Tensor:
+        gate, up = x.chunk(2, dim=-1)
+        gate = gate.clamp(min=None, max=gemm1_limit)
+        up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+        return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -285,13 +294,18 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
+            if _is_npu:
+                self.act_fn = lambda x: self._swigluoai_torch(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
+            else:
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    swiglu_no_interleaved_with_alpha_and_limit,
+                )
 
-            self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                x, config.swiglu_alpha, config.swiglu_limit
-            )
+                self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
