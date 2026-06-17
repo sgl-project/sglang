@@ -177,6 +177,10 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False
             )
+            # weight_scale is now folded into weight_scale_inv (which keeps the
+            # underlying storage alive via its view); drop the stale parameter so
+            # it doesn't linger in named_parameters() / state_dict().
+            del layer.weight_scale
         else:
             # Online path: quantise FP16/BF16 weights to MXFP8 at load time.
             if weight.dtype not in (torch.float16, torch.bfloat16):
