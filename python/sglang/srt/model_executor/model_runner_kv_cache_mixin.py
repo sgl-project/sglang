@@ -799,6 +799,12 @@ class ModelRunnerKVCacheMixin:
                         )
                     elif self.page_size == 1:
                         if dcp_enabled():
+                            # When dcp_enabled, kv cache is stored across dcp
+                            # ranks in round-robin mode. max_total_num_tokens
+                            # should be scaled up by dcp_world_size of current
+                            # dcp rank. This ensures the correctness of
+                            # computing the number of free KV cache tokens when
+                            # assembling forward_batch in schedule_policy.
                             self.max_total_num_tokens *= get_attention_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
