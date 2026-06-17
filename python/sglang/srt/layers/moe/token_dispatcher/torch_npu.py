@@ -24,9 +24,7 @@ from sglang.srt.layers.moe.utils import (
     get_ascend_dispatcher_output_dtype,
     DispatcherOutputDtype,
 )
-from sglang.srt.distributed.communication_op import (
-            tensor_model_parallel_all_gather,
-)
+
 
 class TorchNpuDispatchOutput(NamedTuple):
     """Dispatch output specific to the TorchNpu dispatcher."""
@@ -140,9 +138,6 @@ class TorchNpuDispatcher(BaseDispatcher):
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_output.topk_ids,
         )
-        
-        # TP all-gather for intermediate dimension if needed
-        final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, dim=-1)
-            
+
         self._dispatch_output = None
         return final_hidden_states
