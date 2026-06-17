@@ -25,6 +25,8 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-2-gpu-large-amd")
 
+DP_GATHERV_MODEL = "Qwen/Qwen3-30B-A3B"
+
 
 class TestDPAttentionDP2TP2(
     CustomTestCase,
@@ -81,7 +83,7 @@ class TestDPAttentionGatherv(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DP_GATHERV_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
