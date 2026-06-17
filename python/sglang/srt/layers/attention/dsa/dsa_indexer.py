@@ -425,12 +425,6 @@ class Indexer(MultiPlatformOp):
             return max_kv_len <= self.index_topk
         return False
 
-    def _can_use_graph_dsa_dispatch(self, forward_batch: ForwardBatch) -> bool:
-        return (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        )
-
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -1406,7 +1400,10 @@ class Indexer(MultiPlatformOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile
         weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
 
-        if self._can_use_graph_dsa_dispatch(forward_batch):
+        if (
+            is_graph_dsa_split_op_surface(forward_batch)
+            and not self.dsa_enable_prefill_cp
+        ):
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph.
