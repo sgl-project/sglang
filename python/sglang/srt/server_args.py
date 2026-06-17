@@ -910,6 +910,18 @@ class ServerArgs:
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
 
+    # SLA Dynamic Batching Parameters
+    enable_sla_constraint: bool = False
+    sla_latency: float = 0.05
+    sla_epsilon: float = 0.01
+    sla_alpha: int = 20
+    sla_sigma: int = 5
+    sla_max_change_per_step: int = 10
+    batch_size_lower: int = 4
+    batch_size_upper: int = 256
+    sla_avg_tokens_per_req: int = 50
+    sla_max_growth_rate: float = 1.2
+
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
@@ -7569,6 +7581,68 @@ class ServerArgs:
             default=ServerArgs.limit_mm_data_per_request,
             help="Limit the number of multimodal inputs per request. "
             'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+        )
+
+        # SLA Dynamic Batching Parameters
+        parser.add_argument(
+            "--enable-sla-constraint",
+            action="store_true",
+            default=ServerArgs.enable_sla_constraint,
+            help="Enable SLA-constrained dynamic batching during decode phase.",
+        )
+        parser.add_argument(
+            "--sla-latency",
+            type=float,
+            default=ServerArgs.sla_latency,
+            help="Target SLA decode latency D_SLA in seconds (default: 0.05s = 50ms).",
+        )
+        parser.add_argument(
+            "--sla-epsilon",
+            type=float,
+            default=ServerArgs.sla_epsilon,
+            help="SLA tolerance epsilon_D in seconds, defines the acceptable latency range [D_SLA - epsilon_D, D_SLA + epsilon_D] (default: 0.01s = 10ms).",
+        )
+        parser.add_argument(
+            "--sla-alpha",
+            type=int,
+            default=ServerArgs.sla_alpha,
+            help="Minimum search-interval width alpha in the SLA algorithm (default: 20).",
+        )
+        parser.add_argument(
+            "--sla-sigma",
+            type=int,
+            default=ServerArgs.sla_sigma,
+            help="Conservative corrective step size delta in the SLA algorithm (default: 5).",
+        )
+        parser.add_argument(
+            "--sla-max-change-per-step",
+            type=int,
+            default=ServerArgs.sla_max_change_per_step,
+            help="Maximum batch size change per step to prevent oscillation (default: 10).",
+        )
+        parser.add_argument(
+            "--batch-size-lower",
+            type=int,
+            default=ServerArgs.batch_size_lower,
+            help="Hard lower bound B_min for the SLA search space (default: 4).",
+        )
+        parser.add_argument(
+            "--batch-size-upper",
+            type=int,
+            default=ServerArgs.batch_size_upper,
+            help="Hard upper bound B_max for the SLA search space (default: 256).",
+        )
+        parser.add_argument(
+            "--sla-avg-tokens-per-req",
+            type=int,
+            default=ServerArgs.sla_avg_tokens_per_req,
+            help="Average tokens per request for KV cache memory estimation (default: 50).",
+        )
+        parser.add_argument(
+            "--sla-max-growth-rate",
+            type=float,
+            default=ServerArgs.sla_max_growth_rate,
+            help="Maximum growth rate of upper bound to prevent overshoot (default: 1.2).",
         )
 
         # For checkpoint decryption
