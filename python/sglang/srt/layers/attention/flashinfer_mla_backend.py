@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils.dcp_utils import (
+    DecodeContextParallelMetadata,
     dcp_enabled,
     get_attention_dcp_world_size,
     plan_dcp_decode_metadata,
@@ -415,7 +416,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
-                forward_batch=forward_batch,
+                attn_dcp_metadata=forward_batch.attn_dcp_metadata,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -801,7 +802,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
-        forward_batch: Optional[ForwardBatch] = None,
+        attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -822,7 +823,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
-            forward_batch=forward_batch,
+            attn_dcp_metadata=attn_dcp_metadata,
         )
 
     def call_begin_forward(
@@ -838,7 +839,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
-        forward_batch: Optional[ForwardBatch] = None,
+        attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -890,12 +891,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            if forward_batch is not None:
-                if forward_batch.attn_dcp_metadata is not None:
-                    if forward_batch.attn_dcp_metadata.dcp_kv_indptr is not None:
-                        kv_indptr = forward_batch.attn_dcp_metadata.dcp_kv_indptr
-                    if forward_batch.attn_dcp_metadata.dcp_kv_indices is not None:
-                        kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
+            if attn_dcp_metadata is not None:
+                if attn_dcp_metadata.dcp_kv_indptr is not None:
+                    kv_indptr = attn_dcp_metadata.dcp_kv_indptr
+                if attn_dcp_metadata.dcp_kv_indices is not None:
+                    kv_indices = attn_dcp_metadata.dcp_kv_indices
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
                 qo_indptr,
