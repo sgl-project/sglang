@@ -65,7 +65,7 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 # ROCm SDK and PyTorch dependencies
 ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/"
 # Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
-ARG ROCM_SDK_VERSION="7.14.0a20260608"
+ARG ROCM_SDK_VERSION=""
 ARG TORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
 ARG TORCHAUDIO_VERSION="2.10.0"
@@ -86,6 +86,7 @@ ENV CPATH=$ROCM_HOME/include
 ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
 ENV ROCM_PATH=$ROCM_HOME
+RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
 
 # Install PyTorch ROCm wheels
 RUN python3 -m pip install --no-cache-dir numpy \
@@ -100,12 +101,9 @@ RUN python3 -m pip install --no-cache-dir numpy \
 # avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
 RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
 
-# Workaround: various tests crashes in late capture phase with error message:
-#   Assertion `detail::isPresent(Val) && "dyn_cast on a non-existent value"' failed.
-# This happens in MLIR Compilation pass TritonAMDGPUCanonicalizePointers in
-# triton-3.6.0+rocm7.14.0a20260612.  Disabling the use of buffer_ops can bypass
-# the compilation pass.
-ENV AMDGCN_USE_BUFFER_OPS=0
+# Workaround: At runtime, AITER determines `DEFAULT_GPU_ARCH` by calling
+# `/opt/rocm/llvm/bin/amdgpu-arch`.
+RUN ln -s ${ROCM_HOME} /opt/rocm
 
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
@@ -552,9 +550,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       jq \
       libopenmpi-dev \
       libpci-dev \
-      libibverbs-dev \
       libdrm-dev \
       initramfs-tools \
+      librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
+      libibverbs-dev rdma-core \
+      openssh-server openmpi-bin openmpi-common libopenmpi-dev \
   && rm -rf /var/lib/apt/lists/*; \
   \
   # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
