@@ -661,9 +661,9 @@ class ReqLogprob:
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
-class CacheLock:
+class ReqCacheInfo:
     # The prefix length that is inserted into the tree cache
-    protected_len: int = 0
+    cache_protected_len: int = 0
     # TODO(ispobock): rename to last_device_node
     last_node: Any = None
     # The node to lock until for swa radix tree lock ref
@@ -862,7 +862,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache_lock: Optional[CacheLock] = CacheLock()
+        self.cache_info: Optional[ReqCacheInfo] = ReqCacheInfo()
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1058,41 +1058,41 @@ class Req(ReqDllmMixin):
 
     @property
     def cache_protected_len(self) -> int:
-        return self.cache_lock.protected_len if self.cache_lock is not None else 0
+        return self.cache_info.cache_protected_len if self.cache_info is not None else 0
 
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
-        self.cache_lock.protected_len = value
+        self.cache_info.cache_protected_len = value
 
     @property
     def last_node(self) -> Any:
-        return self.cache_lock.last_node if self.cache_lock is not None else None
+        return self.cache_info.last_node if self.cache_info is not None else None
 
     @last_node.setter
     def last_node(self, value: Any) -> None:
-        self.cache_lock.last_node = value
+        self.cache_info.last_node = value
 
     @property
     def swa_uuid_for_lock(self) -> Optional[int]:
         return (
-            self.cache_lock.swa_uuid_for_lock if self.cache_lock is not None else None
+            self.cache_info.swa_uuid_for_lock if self.cache_info is not None else None
         )
 
     @swa_uuid_for_lock.setter
     def swa_uuid_for_lock(self, value: Optional[int]) -> None:
-        self.cache_lock.swa_uuid_for_lock = value
+        self.cache_info.swa_uuid_for_lock = value
 
     @property
     def swa_prefix_lock_released(self) -> bool:
         return (
-            self.cache_lock.swa_prefix_lock_released
-            if self.cache_lock is not None
+            self.cache_info.swa_prefix_lock_released
+            if self.cache_info is not None
             else False
         )
 
     @swa_prefix_lock_released.setter
     def swa_prefix_lock_released(self, value: bool) -> None:
-        self.cache_lock.swa_prefix_lock_released = value
+        self.cache_info.swa_prefix_lock_released = value
 
     @property
     def kv_allocated_len(self) -> int:

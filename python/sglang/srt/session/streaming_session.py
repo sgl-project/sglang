@@ -22,8 +22,8 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import (
-        CacheLock,
         Req,
+        ReqCacheInfo,
         ReqKvInfo,
         ReqMambaInfo,
     )
@@ -42,10 +42,10 @@ class _VirtualNode:
     pass
 
 
-def _new_cache_lock() -> CacheLock:
-    from sglang.srt.managers.schedule_batch import CacheLock
+def _new_cache_info() -> ReqCacheInfo:
+    from sglang.srt.managers.schedule_batch import ReqCacheInfo
 
-    return CacheLock()
+    return ReqCacheInfo()
 
 
 def _new_kv_info() -> ReqKvInfo:
@@ -70,7 +70,7 @@ class SessionSlot:
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
 
-    cache_lock: CacheLock = field(default_factory=_new_cache_lock)
+    cache_info: ReqCacheInfo = field(default_factory=_new_cache_info)
     kv_info: ReqKvInfo = field(default_factory=_new_kv_info)
     mamba_info: ReqMambaInfo = field(default_factory=_new_mamba_info)
 
@@ -88,7 +88,7 @@ class SessionSlot:
         self.kv_info = copy.copy(req.kv_info)
 
         if is_first:
-            self.cache_lock = copy.copy(req.cache_lock)
+            self.cache_info = copy.copy(req.cache_info)
 
         self.mamba_info = copy.copy(req.mamba_info)
 
@@ -102,7 +102,7 @@ class SessionSlot:
         # the slot is later freed.
         # TODO: to form real move semantics the slot should TAKE these objects
         # and the req side should be `req.kv_info = None` / `req.mamba_info =
-        # None` / (is_first) `req.cache_lock = None`, instead of the copy.copy
+        # None` / (is_first) `req.cache_info = None`, instead of the copy.copy
         # above and the field-level nulling below. Kept as-is to preserve the
         # original behavior; without the move it is not truly a move.
         req.req_pool_idx = None
@@ -117,7 +117,7 @@ class SessionSlot:
         req.req_pool_idx = self.req_pool_idx
         req.kv_committed_len = self.kv_committed_len
         req.kv_info = copy.copy(self.kv_info)
-        req.swa_uuid_for_lock = self.cache_lock.swa_uuid_for_lock
+        req.swa_uuid_for_lock = self.cache_info.swa_uuid_for_lock
         req.mamba_info = copy.copy(self.mamba_info)
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
@@ -257,9 +257,9 @@ class StreamingSession(BasePrefixCache):
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
-        assert prefix_len >= slot.cache_lock.protected_len, (
+        assert prefix_len >= slot.cache_info.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
-            f"{slot.cache_lock.protected_len=}"
+            f"{slot.cache_info.cache_protected_len=}"
         )
 
         # Free orphaned tail: alloc_for_extend will overwrite
@@ -278,7 +278,7 @@ class StreamingSession(BasePrefixCache):
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
-            cache_protected_len=slot.cache_lock.protected_len,
+            cache_protected_len=slot.cache_info.cache_protected_len,
         )
 
     def try_cache_finished_req(
@@ -304,7 +304,7 @@ class StreamingSession(BasePrefixCache):
             if slot is None:
                 # First-request mid-processing abort: create ephemeral
                 # slot from req state so release_session handles cleanup.
-                # cache_lock carries last_node/cache_protected_len from the
+                # cache_info carries last_node/cache_protected_len from the
                 # req so release_session calls dec_lock_ref on the tree lock.
                 # mamba_info carries the mamba refs over so _free_slot_mamba
                 # can return the (possibly extra_buffer ping-pong) slots to
@@ -312,7 +312,7 @@ class StreamingSession(BasePrefixCache):
                 slot = SessionSlot(
                     req_pool_idx=req.req_pool_idx,
                     kv_info=copy.copy(req.kv_info),
-                    cache_lock=copy.copy(req.cache_lock),
+                    cache_info=copy.copy(req.cache_info),
                     mamba_info=copy.copy(req.mamba_info),
                 )
                 self.slots[session_id] = slot
@@ -407,8 +407,8 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
-        protected_len = slot.cache_lock.protected_len
-        lock_node = slot.cache_lock.last_node
+        protected_len = slot.cache_info.cache_protected_len
+        lock_node = slot.cache_info.last_node
         tokens_freed = (
             max(0, slot.kv_info.kv_allocated_len - protected_len)
             if slot.is_holding_kv
@@ -419,11 +419,11 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.cache_lock.swa_uuid_for_lock is not None:
+            if slot.cache_info.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
                     lock_node,
                     DecLockRefParams(
-                        swa_uuid_for_lock=slot.cache_lock.swa_uuid_for_lock
+                        swa_uuid_for_lock=slot.cache_info.swa_uuid_for_lock
                     ),
                 )
             else:
@@ -455,7 +455,7 @@ class StreamingSession(BasePrefixCache):
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_info.kv_allocated_len, self.page_size)
-                total += allocated - slot.cache_lock.protected_len
+                total += allocated - slot.cache_info.cache_protected_len
         return total
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
@@ -472,7 +472,7 @@ class StreamingSession(BasePrefixCache):
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_info.kv_allocated_len, self.page_size)
                 total += allocated - max(
-                    slot.cache_lock.protected_len, slot.kv_info.swa_evicted_seqlen
+                    slot.cache_info.cache_protected_len, slot.kv_info.swa_evicted_seqlen
                 )
         return total
 
