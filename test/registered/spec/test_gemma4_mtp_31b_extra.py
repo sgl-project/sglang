@@ -5,7 +5,7 @@ from typing import Optional
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=280, suite="extra-a-test-2-gpu-large-amd")
 
 MODEL_NAME = "31B"
 TARGET_PATH = "google/gemma-4-31B-it"

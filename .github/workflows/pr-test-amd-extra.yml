@@ -14,7 +14,6 @@ name: PR Test Extra (AMD)
 # and dispatches `run_suite.py --hw amd --suite extra-a-test-{config}-amd`:
 #   - 1-gpu-small: mock-model / kv_canary *unit* tests
 #   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton)
-#   - 2-gpu-large: TP=2 model e2e tests (spec gemma4-mtp-31b)
 # The canary *e2e* tests still need the canary JIT kernel ported to ROCm
 # first, so they remain CUDA-only for now.
 
@@ -177,35 +176,6 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
-  # =============================================== extra-a (2-gpu-large) ===============================================
-  # Two-GPU (TP=2) lora / spec tests; dispatched to the 2-gpu AMD pool.
-  extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325') }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
-    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
-
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job
   # rather than every matrix leg. Fails if any dependent failed or was
@@ -216,7 +186,6 @@ jobs:
         call-gate,
         extra-a-test-1-gpu-small-amd,
         extra-a-test-1-gpu-large-amd,
-        extra-a-test-2-gpu-large-amd,
       ]
     if: always()
     runs-on: ubuntu-latest
