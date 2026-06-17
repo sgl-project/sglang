@@ -498,11 +498,13 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
@@ -511,11 +513,38 @@ class LayerCommunicator:
                 forward_batch=forward_batch,
                 context=self._context,
             )
-            if gathered_last_layer_output is residual:
-                # Clone to avoid modifying the original residual by Custom RMSNorm inplace operation
+            if (
+                gathered_last_layer_output is residual
+                and not self._post_attn_residual_is_read_only(residual)
+            ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
+
+    def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
+        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
+        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
+
+        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
+        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
+        every plain norm fold into ``residual`` in place. That path is reachable
+        only from the ``_gather_*`` communicate-fns, and only when they fall past
+        their input-scattered branch.
+        """
+        norm_fn = getattr(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            "func",
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+        )
+        uses_gather_norm = norm_fn in (
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual_moe,
+        )
+        return (
+            uses_gather_norm
+            and not get_attn_tp_context().input_scattered
+            and apply_flashinfer_allreduce_fusion(residual.shape[0])
+        )
 
     def prepare_attn(
         self,
