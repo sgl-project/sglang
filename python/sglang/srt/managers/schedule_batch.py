@@ -663,38 +663,36 @@ class ReqLogprob:
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqCacheInfo:
     # The prefix length that is inserted into the tree cache
-    cache_protected_len: int = 0
+    cache_protected_len: int
     # TODO(ispobock): rename to last_device_node
-    last_node: Any = None
+    last_node: Any
     # The node to lock until for swa radix tree lock ref
-    swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_lock: Optional[int]
     # Whether the prefill-time SWA tree lock has been released early
-    swa_prefix_lock_released: bool = False
+    swa_prefix_lock_released: bool
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    start_pos: int = 0
-    kv_allocated_len: int = 0
+    start_pos: int
+    kv_allocated_len: int
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
     # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
     #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
     # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-    swa_evicted_seqlen: int = 0
+    swa_evicted_seqlen: int
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqMambaInfo:
-    mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-    mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-    mamba_next_track_idx: Optional[int] = None  # 0 or 1
-    mamba_last_track_seqlen: Optional[int] = (
-        None  # seq len of the last cached mamba state
-    )
+    mamba_pool_idx: Optional[torch.Tensor]  # shape (1)
+    mamba_ping_pong_track_buffer: Optional[torch.Tensor]  # shape (2)
+    mamba_next_track_idx: Optional[int]  # 0 or 1
+    mamba_last_track_seqlen: Optional[int]  # seq len of the last cached mamba state
     # the branching point seqlen to track mamba state. If set, given by prefix match,
     # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
-    mamba_branching_seqlen: Optional[int] = None
+    mamba_branching_seqlen: Optional[int]
 
 
 class Req(ReqDllmMixin):
@@ -769,7 +767,9 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv: ReqKvInfo = ReqKvInfo()
+        self.kv: ReqKvInfo = ReqKvInfo(
+            start_pos=0, kv_allocated_len=0, swa_evicted_seqlen=0
+        )
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
@@ -812,7 +812,13 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
-        self.mamba: ReqMambaInfo = ReqMambaInfo()
+        self.mamba: ReqMambaInfo = ReqMambaInfo(
+            mamba_pool_idx=None,
+            mamba_ping_pong_track_buffer=None,
+            mamba_next_track_idx=None,
+            mamba_last_track_seqlen=None,
+            mamba_branching_seqlen=None,
+        )
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -865,7 +871,12 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache: ReqCacheInfo = ReqCacheInfo()
+        self.cache: ReqCacheInfo = ReqCacheInfo(
+            cache_protected_len=0,
+            last_node=None,
+            swa_uuid_for_lock=None,
+            swa_prefix_lock_released=False,
+        )
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1066,6 +1077,9 @@ class Req(ReqDllmMixin):
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
         self.cache.cache_protected_len = value
+        # Keep the owned-segment start in lockstep: owned KV is
+        # [start_pos, kv_allocated_len) and starts where the borrowed prefix ends.
+        self.kv.start_pos = value
 
     @property
     def last_node(self) -> Any:
