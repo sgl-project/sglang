@@ -151,13 +151,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
         return alloc_full_indices
+
+    def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
+        return (
+            num_full_pages
+            <= self.full_attn_allocator.available_size() // self.page_size
+            and num_swa_pages
+            <= self.swa_attn_allocator.available_size() // self.page_size
+        )
 
     def alloc_extend(
         self,
@@ -173,9 +176,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
-        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
-            return None
-        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
+        if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
@@ -201,12 +202,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
 
         return alloc_full_indices
 
@@ -235,9 +231,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
         num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
-        if num_full_pages > self.full_attn_allocator.available_size() // self.page_size:
-            return None
-        if num_swa_pages > self.swa_attn_allocator.available_size() // self.page_size:
+        if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
@@ -247,6 +241,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            num_new_pages=num_full_pages,
         )
         assert alloc_full_indices is not None
 
@@ -267,12 +262,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_seq_lens_cpu,
             swa_last_loc,
             swa_tail_len,
+            num_new_pages=num_swa_pages,
         )
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[
-            alloc_full_indices[-swa_tail_len:].to(torch.int64)
-        ] = alloc_swa_indices.to(torch.int64)
+        self.set_full_to_swa_mapping(
+            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
+        )
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[
                 alloc_full_indices[:-swa_tail_len].to(torch.int64)
