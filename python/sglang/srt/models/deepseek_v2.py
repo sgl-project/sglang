@@ -2474,7 +2474,12 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        topk_indices = None
+        topk_indices = (
+            pp_proxy_tensors["topk_indices"]
+            if pp_proxy_tensors is not None
+            and "topk_indices" in pp_proxy_tensors.tensors
+            else None
+        )
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2518,12 +2523,13 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if topk_indices is not None:
+                proxy["topk_indices"] = topk_indices
+            return PPProxyTensors(proxy)
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
