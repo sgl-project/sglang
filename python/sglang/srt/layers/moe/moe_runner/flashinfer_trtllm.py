@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, cast
+from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -55,6 +55,23 @@ class FlashInferTrtllmDeferredFinalizeOutput:
     gemm2_out: torch.Tensor
     expert_weights: torch.Tensor
     expanded_idx_to_permuted_idx: torch.Tensor
+    top_k: int
+
+
+@dataclass
+class FlashInferTrtllmMoeFinalizeFusionBundle:
+    """Carries a deferred MoE finalize across the layer boundary so the next
+    layer's input-RMSNorm can fuse finalize + all-reduce + residual + RMSNorm
+    (flashinfer ``kMoEFinalizeARResidualRMSNorm``).
+
+    The associated ``gemm2_out`` (the kernel's ``allreduce_in``) is carried as the
+    layer's ``hidden_states`` tensor; this bundle is attached to it via the
+    ``_sglang_moe_finalize_bundle`` attribute.
+    """
+
+    expanded_idx_to_permuted_idx: torch.Tensor
+    expert_scale_factor: torch.Tensor
+    shared_output: Optional[torch.Tensor]
     top_k: int
 
 

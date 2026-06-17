@@ -817,6 +817,148 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def fake_flashinfer_moe_finalize_allreduce_residual_rmsnorm(
+    gemm2_out: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(residual)
+    return norm_out, residual_out
+
+
+@register_custom_op(
+    mutates_args=["gemm2_out", "residual", "weight"],
+    fake_impl=fake_flashinfer_moe_finalize_allreduce_residual_rmsnorm,
+)
+def flashinfer_moe_finalize_allreduce_residual_rmsnorm(
+    gemm2_out: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused MoE finalize + all-reduce + residual add + RMSNorm.
+
+    Uses FlashInfer's ``kMoEFinalizeARResidualRMSNorm`` pattern, which combines
+    the per-rank expert outputs (weighted by ``expert_scale_factor`` and scattered
+    via ``expanded_idx_to_permuted_idx``), adds the shared-expert output, runs the
+    all-reduce across the MoE TP group, adds the residual and applies RMSNorm --
+    all in a single kernel. This lets the deferred MoE finalize be folded into the
+    next layer's input-RMSNorm AR fusion, while the post-all-reduce ``residual_out``
+    stays available for Eagle3 aux capture.
+
+    Args:
+        gemm2_out: Un-finalized expert outputs (the kernel's ``allreduce_in``),
+            shape [num_permuted_tokens, hidden_dim].
+        residual: Residual stream, shape [num_tokens, hidden_dim].
+        weight: RMSNorm weight (rms_gamma).
+        expanded_idx_to_permuted_idx: Map from (token, top_k slot) to the row in
+            ``gemm2_out`` (int32).
+        expert_scale_factor: Per-(token, expert) combine weights.
+        shared_expert_output: Optional shared-expert output [num_tokens, hidden_dim].
+        eps: RMSNorm epsilon.
+        max_token_num: Maximum token number for the workspace.
+        use_oneshot: Whether to use oneshot mode.
+        use_attn_tp_group: If True, use the attention TP group; otherwise the MoE
+            TP group (the all-reduce group the MoE output lives on).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output), or
+        (None, None) if the fused kernel is unavailable and the caller should fall
+        back to a separate finalize + AR + RMSNorm.
+    """
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        return None, None
+
+    moe_finalize_pattern = getattr(
+        _flashinfer_comm.AllReduceFusionPattern,
+        "kMoEFinalizeARResidualRMSNorm",
+        None,
+    )
+    if moe_finalize_pattern is None:
+        logger.debug(
+            "FlashInfer build lacks kMoEFinalizeARResidualRMSNorm, "
+            "falling back to separate finalize + allreduce fusion"
+        )
+        return None, None
+
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+    else:
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+
+    if world_size <= 1:
+        return None, None
+
+    assert residual.shape[0] <= max_token_num
+    if (
+        not gemm2_out.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+        or not expanded_idx_to_permuted_idx.is_contiguous()
+        or not expert_scale_factor.is_contiguous()
+        or (
+            shared_expert_output is not None
+            and not shared_expert_output.is_contiguous()
+        )
+    ):
+        logger.debug("Non-contiguous tensors, skipping FlashInfer MoE finalize fusion")
+        return None, None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=residual.shape[-1],
+        use_fp32_lamport=(residual.dtype == torch.float32),
+        dtype=residual.dtype,
+        token_num=residual.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        logger.debug("FlashInfer workspace not available")
+        return None, None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        return None, None
+
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(residual)
+
+    _flashinfer_comm.allreduce_fusion(
+        input=gemm2_out,
+        workspace=workspace_manager.workspace,
+        pattern=moe_finalize_pattern,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=use_oneshot,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_scale_factor=expert_scale_factor,
+        shared_expert_output=shared_expert_output,
+    )
+
+    return norm_out, residual_out
+
+
 def pre_initialize_workspaces(
     max_token_num: int,
     hidden_dim: int,

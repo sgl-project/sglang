@@ -567,7 +567,28 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if (
+                moe_finalize_bundle = getattr(
+                    hidden_states, "_sglang_moe_finalize_bundle", None
+                )
+                if moe_finalize_bundle is not None and hasattr(
+                    self.input_layernorm, "forward_with_moe_finalize_allreduce_fusion"
+                ):
+                    # Fuse the deferred MoE finalize into the AR + residual +
+                    # RMSNorm. residual_out (kept for Eagle3 capture) is the
+                    # post-all-reduce, pre-norm residual. ``hidden_states`` here
+                    # is the un-finalized gemm2_out carried from the prev layer.
+                    hidden_states, residual = (
+                        self.input_layernorm.forward_with_moe_finalize_allreduce_fusion(
+                            gemm2_out=hidden_states,
+                            residual=residual,
+                            expanded_idx_to_permuted_idx=moe_finalize_bundle.expanded_idx_to_permuted_idx,
+                            expert_scale_factor=moe_finalize_bundle.expert_scale_factor,
+                            shared_expert_output=moe_finalize_bundle.shared_output,
+                            top_k=moe_finalize_bundle.top_k,
+                            use_attn_tp_group=False,
+                        )
+                    )
+                elif (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
