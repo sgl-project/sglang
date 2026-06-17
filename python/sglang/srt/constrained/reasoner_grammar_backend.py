@@ -78,6 +78,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def maybe_init_reasoning(self, reasoning: bool):
         if reasoning:
             self.tokens_in_think = 0
+            self.tokens_after_end = -1
         else:
             self.tokens_in_think = -1
             self.tokens_after_end = 0

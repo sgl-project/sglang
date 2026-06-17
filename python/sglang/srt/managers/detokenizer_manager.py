@@ -169,7 +169,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
-        if no_stop_trim or not finished_reason:
+        if not finished_reason:
             return output
 
         matched = finished_reason.get("matched", None)
@@ -181,10 +181,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Trim stop str.
         if isinstance(matched, str) and isinstance(output, str):
             pos = output.find(matched)
-            return output[:pos] if pos != -1 else output
+            if pos == -1:
+                return output
+            end = pos + len(matched)
+            return output[:end] if no_stop_trim else output[:pos]
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
+            if no_stop_trim:
+                return output
             # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
@@ -416,6 +421,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
+            image_tokens=recv_obj.image_tokens,
+            audio_tokens=recv_obj.audio_tokens,
+            video_tokens=recv_obj.video_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,

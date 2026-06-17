@@ -15,14 +15,17 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
@@ -333,7 +336,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # fast_mla_decode_plan needs _cached_module from the initial
                 # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            elif forward_mode.is_target_verify():
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -378,17 +381,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -407,7 +399,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
-                and not is_in_piecewise_cuda_graph()
+                and not is_in_tc_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
@@ -469,7 +461,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -490,7 +482,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -946,17 +938,15 @@ class FlashInferMLAMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        # Fail fast on an undersized kv_indices row: the kernel would otherwise
-        # write OOB and silently corrupt memory.
         required_kv_indices_len = draft_kv_indices_used_len(
             seq_lens_sum, self.topk, bs, self.speculative_num_steps
         )
-        assert required_kv_indices_len <= kv_indices_buffer.shape[1], (
-            f"EAGLE draft kv_indices row too small: need {required_kv_indices_len} "
-            f"but row width is {kv_indices_buffer.shape[1]} (topk={self.topk}, "
-            f"num_seqs={num_seqs}, seq_lens_sum={seq_lens_sum}, "
-            f"num_steps={self.speculative_num_steps}); the buffer must be sized "
-            f"max_bs * topk * max_context_len."
+        assert_buffer_fits(
+            required_kv_indices_len,
+            kv_indices_buffer.shape[1],
+            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            bs=bs,
+            seq_lens_sum=seq_lens_sum,
         )
 
         self.generate_draft_decode_kv_indices[

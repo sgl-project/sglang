@@ -70,7 +70,7 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq`.
+/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -88,6 +88,13 @@ pub enum PolicyKind {
     /// lives on `ModelConfig::cache_aware`.
     #[value(name = "cache_aware_zmq")]
     CacheAwareZmq,
+    /// Sticky-session routing: pins a routing key (read from a
+    /// configurable request header) to a worker via an in-memory map, so
+    /// stateful sessions land on the same backend. Tuning — header name,
+    /// keyless-fallback policy, and TTL eviction — lives on
+    /// `ModelConfig::sticky`.
+    #[value(name = "sticky")]
+    Sticky,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +150,11 @@ pub struct ModelConfig {
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Tuning for the sticky-session policy. `Some` exactly when
+    /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
+    /// The chat handler reads `sticky.header_name` to populate
+    /// [`crate::policies::SelectionContext::routing_key`].
+    pub sticky: Option<StickyConfig>,
 }
 
 /// Per-model cache-aware-ZMQ tuning.
@@ -182,6 +194,52 @@ fn default_balance_abs() -> usize {
 }
 fn default_balance_rel() -> f32 {
     1.1
+}
+
+/// Default routing-key header for the sticky policy. The `x-sgl-` prefix
+/// matches the router's other emitted/consumed metadata headers
+/// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
+pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+
+/// Per-model sticky-session tuning. Built from the `--routing-key-header`
+/// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
+/// also validates that `header_name` parses as an HTTP header name and
+/// that `fallback_policy` is one of the dependency-free policies.
+#[derive(Debug, Clone)]
+pub struct StickyConfig {
+    /// Request header carrying the routing key. Validated to parse as a
+    /// `http::HeaderName` at config-build time.
+    pub header_name: String,
+    /// Policy used to pick a worker when a request has no routing key, and
+    /// to pick the initial worker when a new key is first seen. One of
+    /// `round_robin` / `random` / `power_of_two` / `load_based` — the
+    /// dependency-free policies the factory can build standalone (no
+    /// `HashTree` / tokenizer / ZMQ feed). `cache_aware_zmq` and `sticky`
+    /// are rejected at config-build time.
+    pub fallback_policy: PolicyKind,
+    /// Evict an assignment after it has been idle (unreferenced) this many
+    /// seconds. Bounds the map against unbounded routing-key cardinality.
+    pub idle_secs: u64,
+    /// Wall-clock cadence of the background eviction sweep.
+    pub eviction_interval_secs: u64,
+}
+
+pub fn default_sticky_idle_secs() -> u64 {
+    600
+}
+pub fn default_sticky_eviction_interval_secs() -> u64 {
+    60
+}
+
+impl Default for StickyConfig {
+    fn default() -> Self {
+        Self {
+            header_name: DEFAULT_STICKY_HEADER.to_string(),
+            fallback_policy: PolicyKind::RoundRobin,
+            idle_secs: default_sticky_idle_secs(),
+            eviction_interval_secs: default_sticky_eviction_interval_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
