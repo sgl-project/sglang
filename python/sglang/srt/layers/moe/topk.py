@@ -170,7 +170,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -189,7 +189,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
@@ -314,7 +314,7 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
-    def to_standard(self, layer_id: Optional[int] = None) -> "StandardTopKOutput":
+    def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
         return select_experts(
@@ -552,7 +552,30 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
         )
 
-    def empty_topk_output(self, device: torch.device) -> TopKOutput:
+    def empty_topk_output(
+        self, device: torch.device, *, layer_id: Optional[int] = None
+    ) -> TopKOutput:
+        """Return an empty topk output for a rank with zero tokens this forward.
+
+        When ``layer_id`` is provided and the active dispatch algorithm is LP,
+        also calls ``LPLBSolver.solve(empty)`` so that this rank participates
+        in the EP all-reduce. Without this, an empty rank would skip the
+        collective and deadlock under DP-attention.
+        """
+        if layer_id is not None:
+            # Skip the full ExpertLocationDispatchInfo allocation — we only
+            # need the per-layer solver to participate in the EP all-reduce.
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver.solve(
+                    torch.empty(
+                        (0, self.topk_config.top_k),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                )
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1114,18 +1137,40 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+def _eplb_remap_enabled() -> bool:
+    # A real logical->physical mapping only exists when EPLB is enabled, the
+    # initial expert placement is non-trivial, or there are redundant physical
+    # experts. Otherwise the map is identity and the remap must be skipped (it is
+    # both unnecessary and not well-defined over the padded region of topk_ids).
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        # Global server args are not initialized outside the server runtime
+        # (e.g. in unit tests that call select_experts directly). In that case
+        # there is no EPLB mapping, so the remap must be skipped.
+        return False
+    return (
+        server_args.enable_eplb
+        or server_args.init_expert_location != "trivial"
+        or server_args.ep_num_redundant_experts > 0
+    )
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
         return
     # TODO: let the kernel support other dtypes
-    if _is_cuda and topk_ids.dtype == torch.int32:
+    if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        topk_ids[indices >= num_token_non_padded, :] = fill_value
 
 
 def _zero_topk_weights_padded_region(
@@ -1490,16 +1535,48 @@ def _post_process_topk_ids(
         )
     recorder_topk_ids = None
     if _is_cuda:
-        # When shared experts are fused (appended as extra columns in topk_ids),
-        # EPLB dispatch must only remap the routed expert columns.
-        # The shared expert column (value = n_routed_experts) would be out-of-bounds
-        # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        # LP path: solve LP outside torch.compile (the solver contains an
+        # EP all-reduce that can't run inside compiled regions).
+        log2phy_prob = None
+        use_per_rank_shared_slots = (
+            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+        )
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver_input = (
+                    topk_ids[:, :-num_fused_shared_experts]
+                    if use_per_rank_shared_slots
+                    else topk_ids
+                )
+                log2phy_prob = lplb_solver.solve(lplb_solver_input)
+
+        if log2phy_prob is not None and not use_per_rank_shared_slots:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info, log2phy_prob
+            )
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        elif use_per_rank_shared_slots:
+            # Shared experts appended as extra columns in topk_ids: their value
+            # would be out-of-bounds for the logical-to-physical dispatch table,
+            # so split, dispatch the routed cols, recombine.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            routed_cols = _biased_grouped_topk_postprocess(
-                routed_cols, expert_location_dispatch_info, num_token_non_padded
-            )
+            if log2phy_prob is not None:
+                routed_cols = topk_ids_logical_to_physical(
+                    routed_cols, expert_location_dispatch_info, log2phy_prob
+                )
+                _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
+            else:
+                routed_cols = _biased_grouped_topk_postprocess(
+                    routed_cols, expert_location_dispatch_info, num_token_non_padded
+                )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             # ExpertDistributionRecorder tracks EPLB physical routed experts.
             # Per-rank shared-slot dispatch later inserts local shared slots into
@@ -1510,10 +1587,22 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
-        # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Instead, zero the
-        # routing weights for padded tokens so their MoE output contributes
-        # nothing to the hidden state after the weighted sum.
+        # The logical->physical remap is only meaningful when a real
+        # expert-location mapping exists. With a trivial placement and EPLB off
+        # the map is identity, and indexing it here is both unnecessary and not
+        # well-defined for the dp-attention padded region of topk_ids; skip it.
+        # ``--ep-dispatch-algorithm fake`` is a routing benchmark artifact and
+        # does not by itself require remapping.
+        if _eplb_remap_enabled():
+            # Mask the padded region to a valid in-range id (0) before the
+            # gather so it never indexes the dispatch map out of bounds. -1 is
+            # not used here: the aiter MoE kernels do not handle topk_ids=-1.
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+        # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely, so
+        # padded tokens are neutralized by zeroing their routing weights.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     if recorder_topk_ids is None:

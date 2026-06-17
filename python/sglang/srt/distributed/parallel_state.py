@@ -42,12 +42,14 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -61,6 +63,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -763,8 +766,12 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
-        elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
-            torch_symm_mem_comm.all_reduce(input_)
+        elif (
+            torch_symm_mem_comm is not None
+            and not torch_symm_mem_comm.disabled
+            and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -1690,17 +1697,14 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-_DEVICE_TO_DISTRIBUTED_BACKEND = {
-    "cuda": "nccl",
-    "xpu": "xccl",
-    "hpu": "hccl",
-    "cpu": "gloo",
-    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
-    "musa": "mccl",
-}
-
-
+# TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
+    # We deliberately go through ``platforms.current_platform`` (rather than
+    # ``from ... import current_platform``) so each call resolves through the
+    # platforms package's lazy ``__getattr__`` and picks up runtime overrides
+    # of ``_current_platform`` (e.g. in tests).
+    if device == platforms.current_platform.device_type:
+        return platforms.current_platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
@@ -1812,9 +1816,7 @@ def init_distributed_environment(
 
         init_process_group_kwargs = {}
         if backend == "nccl" and local_rank >= 0:
-            init_process_group_kwargs["device_id"] = torch.device(
-                "cuda", local_rank
-            )
+            init_process_group_kwargs["device_id"] = torch.device("cuda", local_rank)
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(
@@ -2448,7 +2450,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
         with contextlib.suppress(OSError):
             if rank == source_rank:
                 # create a shared memory segment
-                shm = shared_memory.SharedMemory(create=True, size=128)
+                shm = shared_memory.SharedMemory(
+                    create=True, size=128, name=make_shm_name("nodecheck")
+                )
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
                     [shm.name], src=ranks[source_rank], group=pg

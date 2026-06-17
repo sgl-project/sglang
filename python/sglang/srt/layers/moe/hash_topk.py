@@ -35,9 +35,10 @@ class HashTopK(nn.Module):
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
-        self.layer_id = None
+        self.layer_id = layer_id
         from sglang.srt.server_args import get_global_server_args
 
         self.enable_deepep_waterfill = (
@@ -81,8 +82,18 @@ class HashTopK(nn.Module):
         with torch.no_grad():
             self.tid2eid.copy_(tid2eid.to(self.tid2eid.dtype))
 
-    def empty_topk_output(self, device: torch.device):
+    def empty_topk_output(
+        self, device: torch.device, *, layer_id: Optional[int] = None
+    ):
         topk = self.topk - self.num_fused_shared_experts
+        if layer_id is not None:
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver.solve(
+                    torch.empty((0, topk), dtype=torch.int32, device=device)
+                )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
@@ -185,11 +196,34 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights.to(torch.float32)
 
         num_fused_shared_experts = self.num_fused_shared_experts
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        use_per_rank_shared_slots = (
+            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+        )
+
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            if self.layer_id is None:
+                raise RuntimeError("HashTopK LP dispatch requires layer_id.")
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(self.layer_id)
+            if lplb_solver is not None:
+                lplb_solver_input = (
+                    topk_ids[:, :-num_fused_shared_experts]
+                    if use_per_rank_shared_slots
+                    else topk_ids
+                )
+                log2phy_prob = lplb_solver.solve(lplb_solver_input)
+
+        if use_per_rank_shared_slots:
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
-                routed_cols, expert_location_dispatch_info
+                routed_cols, expert_location_dispatch_info, log2phy_prob
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
 
@@ -211,7 +245,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
+                topk_ids, expert_location_dispatch_info, log2phy_prob
             )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)

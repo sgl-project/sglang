@@ -145,13 +145,9 @@ def _waterfill_expand_kernel(
             new_id = tl.where(valid_id, old_id + old_rank, old_id)
             tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
 
-            val = tl.load(
-                topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0
-            )
+            val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
             val = tl.where(valid_id, val, 0.0)
-            tl.store(
-                expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask
-            )
+            tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
         total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
         for r in range(world_size):
@@ -278,16 +274,14 @@ def _waterfill_expand_kernel(
                 topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
             ).to(tl.int64)
             valid_id = old_id >= 0
-            new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
+            new_id = tl.where(
+                valid_id, old_id + (old_id // old_experts_per_rank), old_id
+            )
             tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
 
-            val = tl.load(
-                topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0
-            )
+            val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
             val = tl.where(valid_id, val, 0.0)
-            tl.store(
-                expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask
-            )
+            tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
     # Step 2: Compute shared expert ID and local mask.
     is_local = best_rank == source_rank

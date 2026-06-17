@@ -23,10 +23,12 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
+    _grouped_foreach_copy_,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -170,7 +172,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -204,7 +206,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftInputBuffers(
@@ -226,11 +228,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        # Backend (Full CUDA graph capture)
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = resolve_decode_backend(self)
 
         # Capture
         try:
@@ -241,6 +239,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     # -----------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------
@@ -248,8 +249,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants; key is just bs.
-        return bs
+        # EAGLE doesn't use stream_idx / lora variants.
+        return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
     # can_run
@@ -459,21 +460,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Common inputs
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
-        )
-        buffers.positions[:raw_num_token].copy_(forward_batch.positions)
-        if buffers.rids_int is not None and forward_batch.rids_int is not None:
-            buffers.rids_int[:raw_bs].copy_(forward_batch.rids_int)
-        if (
-            buffers.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
-        ):
-            buffers.bootstrap_room_ids_int[:raw_bs].copy_(
-                forward_batch.bootstrap_room_ids_int
-            )
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
             "EagleDraftCudaGraphRunner.replay: topk_p",
@@ -485,14 +471,45 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             "EagleDraftCudaGraphRunner.replay: topk_index vs vocab_size="
             f"{self.model_runner.model_config.vocab_size}",
         )
-        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+
+        # Common inputs — batch the small per-field device copies into a grouped
+        # foreach copy (one foreach call per dtype pair) to cut launch overhead.
+        # hidden_states is handled separately below (see note), and seq_lens_cpu
+        # is handled further down since it lives on host.
+        copy_dsts = [
+            buffers.seq_lens[:raw_bs],
+            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+            buffers.positions[:raw_num_token],
+            buffers.topk_p[:raw_bs],
+            buffers.topk_index[:raw_bs],
+            buffers.req_pool_indices[:raw_bs],
+        ]
+        copy_srcs = [
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.spec_info.topk_p,
+            forward_batch.spec_info.topk_index,
+            forward_batch.req_pool_indices,
+        ]
+        if buffers.rids_int is not None and forward_batch.rids_int is not None:
+            copy_dsts.append(buffers.rids_int[:raw_bs])
+            copy_srcs.append(forward_batch.rids_int)
+        if (
+            buffers.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
+            copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -533,7 +550,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self.backend.replay(shape_key, forward_batch)
+            out = self._replay_graph(shape_key, forward_batch)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

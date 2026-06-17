@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 __all__ = ["GPTQIntelAMXLinearScheme", "GPTQIntelAMXMoEScheme"]
 
 
-def _check_cpu_amx_support(quant_config: "GPTQConfig") -> None:
+def _check_cpu_amx_support(quant_config: GPTQConfig) -> None:
     if quant_config.desc_act and not (
         quant_config.true_sequential and quant_config.static_groups
     ):
@@ -46,7 +46,7 @@ def _check_cpu_amx_support(quant_config: "GPTQConfig") -> None:
 class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
     """Linear scheme for GPTQ on Intel CPU with AMX."""
 
-    def _init_kernel(self, quant_config: "GPTQConfig"):
+    def _init_kernel(self, quant_config: GPTQConfig):
         return GPTQIntelAMXLinearKernel(quant_config)
 
     def create_weights(
@@ -152,7 +152,7 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
 class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     """MoE scheme for GPTQ on Intel CPU with AMX."""
 
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
         self.kernel = GPTQIntelAMXMoEKernel(quant_config)
 
@@ -280,6 +280,6 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ):
         return self.kernel.apply(layer, dispatch_output)

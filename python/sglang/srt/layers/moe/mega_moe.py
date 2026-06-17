@@ -15,8 +15,8 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -239,7 +239,7 @@ def pre_initialize_mega_moe_symm_buffers_from_config(model_config) -> None:
         )
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -257,7 +257,7 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch] = None,
     should_allreduce_fusion: bool = False,
@@ -307,7 +307,7 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
@@ -478,7 +478,7 @@ def _rank_count_summary(
 
 
 def _log_mega_moe_timing(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     topk_ids: torch.Tensor,
     num_experts: int,
     num_tokens: int,
@@ -488,9 +488,9 @@ def _log_mega_moe_timing(
         return
     timing_events[-1][1].synchronize()
     elapsed = {
-        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[
-            i - 1
-        ][1].elapsed_time(timing_events[i][1])
+        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[i - 1][
+            1
+        ].elapsed_time(timing_events[i][1])
         for i in range(1, len(timing_events))
     }
     counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, moe.moe_ep_size)
@@ -511,7 +511,7 @@ def _log_mega_moe_timing(
 
 
 def _maybe_log_mega_moe_topk_stats(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     topk_ids: torch.Tensor,
     num_experts: int,
     num_tokens: int,

@@ -127,7 +127,7 @@ class DisaggCluster:
 
     # -- context manager -----------------------------------------------------
 
-    def __enter__(self) -> "DisaggCluster":
+    def __enter__(self) -> DisaggCluster:
         for attempt in range(3):
             try:
                 self._launch_roles()
