@@ -47,6 +47,9 @@ register_cuda_ci(
 )
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=110, stage="nightly", runner_config="8-gpu-h200")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 # ---------------------------------------------------------------------------
 # Test parameters
