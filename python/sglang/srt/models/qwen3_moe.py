@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     moe_expert_parallel_all_reduce,
+    moe_expert_parallel_tree_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -62,7 +63,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
@@ -83,7 +84,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     is_true_on_policy_enabled,
-    should_disable_fused_qk_norm_mrope,
+    should_force_bfloat16_dense_tensor_math,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -99,7 +100,6 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sglang.jit_kernel.fused_qknorm_rope import (
-        can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
 
@@ -115,6 +115,12 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+from sglang.srt.tp_invariant_ops import (
+    stable_topk as _stable_topk,
+    stable_topk_softmax as _stable_topk_softmax,
+)
 
 
 def compute_yarn_parameters(
@@ -266,6 +272,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             layer_id=layer_id,
         )
+        self.top_k = config.num_experts_per_tok
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
@@ -293,7 +300,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.num_experts = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
-            self.top_k = config.num_experts_per_tok
 
     def forward(
         self,
@@ -333,14 +339,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_hidden_states = hidden_states
+        gate_weight = getattr(self.gate, "weight", None)
+        if gate_weight is not None and router_hidden_states.dtype != gate_weight.dtype:
+            router_hidden_states = router_hidden_states.to(gate_weight.dtype)
+        router_logits, _ = self.gate(router_hidden_states)
         if is_true_on_policy_enabled():
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
+            routing_weights, selected_experts = _stable_topk_softmax(
+                router_logits, self.top_k, ids_dtype=torch.int32
             )
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+            routing_weights = routing_weights.to(router_hidden_states.dtype)
             topk_output = StandardTopKOutput(
                 topk_weights=routing_weights,
                 topk_ids=selected_experts,
@@ -348,14 +356,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        expert_hidden_states = router_hidden_states
+        expert_weight = getattr(self.experts, "w13_weight", None)
+        if expert_weight is not None and expert_hidden_states.dtype != expert_weight.dtype:
+            expert_hidden_states = expert_hidden_states.to(expert_weight.dtype)
+        final_hidden_states = self.experts(expert_hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+            if is_true_on_policy_enabled():
+                final_hidden_states = moe_expert_parallel_tree_all_reduce(
+                    final_hidden_states
+                )
+            else:
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -535,24 +555,11 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        ) and not is_true_on_policy_enabled()
-        self.compatible_with_fused_qk_norm_rope = not isinstance(
-            self.rotary_emb, MRotaryEmbedding
-        ) and self.head_dim in (64, 128, 256)
-        _yarn_factor, _, _, _ = compute_yarn_parameters(config)
+        self.compatible_with_fused_kv_buffer = False
+        self.compatible_with_fused_qk_norm_rope = False
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
-            and _is_cuda
-            and can_use_fused_qk_norm_rope(
-                self.head_dim,
-                self.rotary_emb.is_neox_style,
-                torch.bfloat16,
-                _yarn_factor != 1.0,
-            )
-            and not should_disable_fused_qk_norm_mrope()
         )
         self._used_fused_qk_norm_rope_last_call = False
 
@@ -565,7 +572,10 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            fp32_residual=False,
+            weight_dtype=torch.float32,
+        )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.alt_stream = alt_stream
@@ -689,6 +699,11 @@ class Qwen3MoeAttention(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
+            if (
+                should_force_bfloat16_dense_tensor_math()
+                and hidden_states.dtype != self.qkv_proj.weight.dtype
+            ):
+                hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -707,6 +722,9 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
+        if should_force_bfloat16_dense_tensor_math() and q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
@@ -811,7 +829,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            fp32_residual=True,
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+        )
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )

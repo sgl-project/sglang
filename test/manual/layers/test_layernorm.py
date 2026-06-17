@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
 from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
 from sglang.test.test_utils import CustomTestCase
 
@@ -75,6 +76,83 @@ class TestRMSNorm(CustomTestCase):
 
         self.assertEqual(out.dtype, torch.float32)
         self.assertTrue(torch.equal(out, ref_out))
+
+    def test_true_on_policy_fused_rms_norm_qk_dtype_boundary(self):
+        torch.manual_seed(0)
+
+        hidden_size = 128
+        x = torch.randn(13, hidden_size, dtype=torch.bfloat16)
+        weight = torch.randn(hidden_size, dtype=torch.float32)
+
+        actual = true_on_policy_rms_norm(
+            x,
+            weight,
+            eps=1e-6,
+            cast_x_before_out_mul=True,
+            norm_cast_dtype=torch.bfloat16,
+            weight_cast_dtype=torch.float32,
+        )
+
+        x_float = x.float()
+        expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + 1e-6)
+        expected = weight * expected.to(torch.bfloat16)
+
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_true_on_policy_fused_rms_norm_residual_pair_dtype_boundary(self):
+        torch.manual_seed(0)
+
+        hidden_size = 128
+        x = torch.randn(13, hidden_size, dtype=torch.bfloat16)
+        residual = torch.randn_like(x)
+        post_residual = torch.randn_like(x)
+        weight = torch.randn(hidden_size, dtype=torch.float32)
+
+        actual, actual_residual = true_on_policy_rms_norm(
+            x,
+            weight,
+            eps=1e-6,
+            residual=residual,
+            post_residual_addition=post_residual,
+            cast_x_before_out_mul=True,
+            norm_cast_dtype=torch.float32,
+            weight_cast_dtype=torch.float32,
+            residual_dtype=torch.float32,
+        )
+
+        x_float = x.float() + residual.float() + post_residual.float()
+        expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + 1e-6)
+        expected = weight * expected
+
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertEqual(actual_residual.dtype, torch.float32)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(actual_residual, x_float)
+
+    def test_true_on_policy_fused_rms_norm_final_norm_dtype_boundary(self):
+        torch.manual_seed(0)
+
+        hidden_size = 128
+        x = torch.randn(13, hidden_size, dtype=torch.float32)
+        weight = torch.randn(hidden_size, dtype=torch.float32)
+
+        actual = true_on_policy_rms_norm(
+            x,
+            weight,
+            eps=1e-6,
+            cast_x_before_out_mul=True,
+            norm_cast_dtype=torch.bfloat16,
+            weight_cast_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+
+        x_float = x.float()
+        expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + 1e-6)
+        expected = weight.to(torch.bfloat16) * expected.to(torch.bfloat16)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 class TestGemmaRMSNorm(CustomTestCase):
