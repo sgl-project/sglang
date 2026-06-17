@@ -23,7 +23,6 @@ dependencies = [
   "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
   "IPython",
   "aiohttp",
-  "apache-tvm-ffi==0.1.9",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "build",
