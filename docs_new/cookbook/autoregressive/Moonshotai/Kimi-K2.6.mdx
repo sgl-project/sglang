@@ -1,12 +1,71 @@
 ---
 title: Kimi-K2.6
-metatags:
-    description: "Deploy Kimi-K2.6 native multimodal agentic model with SGLang - reasoning, tool calling, and multimodal capabilities."
+description: "Deploy Kimi-K2.6 with SGLang — Moonshot AI's native-multimodal agentic Mixture-of-Experts model with reasoning, tool calling, and vision. INT4 base checkpoint + NVFP4 on NVIDIA Blackwell, on H200 / B300 / GB300 and AMD Instinct."
 ---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install "sglang>=0.5.9"
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+# NVIDIA (H200 / B300 / GB300):
+docker pull lmsysorg/sglang:latest
+
+# AMD Instinct — the command panel selects the matching ROCm image:
+#   MI300X / MI325X -> lmsysorg/sglang:v0.5.9-rocm700-mi30x
+#   MI350X / MI355X -> lmsysorg/sglang:v0.5.9-rocm700-mi35x
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. The two serving strategies follow the legacy generator's **DP Attention** toggle:
+
+- **Low-Latency** — DP Attention off. Fastest reply for a single user; pick for chat.
+- **High-Throughput** — DP Attention on (`--dp N --enable-dp-attention`, N = `--tp`). Most tokens per second across many concurrent users; best for production batch serving.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/moonshotai/kimi-k2.6.jsx";
+import { benchmarks } from "/src/snippets/configs/moonshotai/kimi-k2.6-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing — including the **Reasoning** / **Tool Call** parsers and **Speculative Decoding** (NVIDIA-only) for Kimi-K2.6.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
 
 ## 1. Model Introduction
 
-[Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6) is an open-source, native multimodal agentic model by Moonshot AI, delivering industry-leading coding, long-horizon execution, and agent swarm capabilities. It matches or surpasses GPT-5.4, Claude Opus 4.6, and Gemini 3.1 Pro across key benchmarks.
+[Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6) is an open-source, native-multimodal agentic model by Moonshot AI, delivering industry-leading coding, long-horizon execution, and agent-swarm capabilities. It matches or surpasses GPT-5.4, Claude Opus 4.6, and Gemini 3.1 Pro across key benchmarks.
 
 **Key Features:**
 
@@ -18,98 +77,80 @@ metatags:
 
 **Benchmarks (Open-Source SOTA):**
 
-<table>
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
-    <tr>
-      <th>Benchmark</th>
-      <th>Score</th>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Benchmark</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Score</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px"}}>HLE w/ tools</td><td style={{padding: "9px 12px", textAlign: "right"}}>54.0</td></tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}><td style={{padding: "9px 12px"}}>SWE-Bench Pro</td><td style={{padding: "9px 12px", textAlign: "right"}}>58.6</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>SWE-bench Multilingual</td><td style={{padding: "9px 12px", textAlign: "right"}}>76.7</td></tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}><td style={{padding: "9px 12px"}}>BrowseComp</td><td style={{padding: "9px 12px", textAlign: "right"}}>83.2</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>Toolathlon</td><td style={{padding: "9px 12px", textAlign: "right"}}>50.0</td></tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}><td style={{padding: "9px 12px"}}>AIME 2026</td><td style={{padding: "9px 12px", textAlign: "right"}}>96.4</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>GPQA-Diamond</td><td style={{padding: "9px 12px", textAlign: "right"}}>90.5</td></tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}><td style={{padding: "9px 12px"}}>LiveCodeBench</td><td style={{padding: "9px 12px", textAlign: "right"}}>89.6</td></tr>
+  </tbody>
+</table>
+
+**Available Models:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Use</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>HLE w/ tools</td>
-      <td>54.0</td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/moonshotai/Kimi-K2.6">moonshotai/Kimi-K2.6</a></strong></td>
+      <td style={{padding: "9px 12px"}}>INT4</td>
+      <td style={{padding: "9px 12px"}}>Native base checkpoint — all platforms</td>
     </tr>
-    <tr>
-      <td>SWE-Bench Pro</td>
-      <td>58.6</td>
-    </tr>
-    <tr>
-      <td>SWE-bench Multilingual</td>
-      <td>76.7</td>
-    </tr>
-    <tr>
-      <td>BrowseComp</td>
-      <td>83.2</td>
-    </tr>
-    <tr>
-      <td>Toolathlon</td>
-      <td>50.0</td>
-    </tr>
-    <tr>
-      <td>AIME 2026</td>
-      <td>96.4</td>
-    </tr>
-    <tr>
-      <td>GPQA-Diamond</td>
-      <td>90.5</td>
-    </tr>
-    <tr>
-      <td>LiveCodeBench</td>
-      <td>89.6</td>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/Kimi-K2.6-NVFP4">nvidia/Kimi-K2.6-NVFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>NVFP4</td>
+      <td style={{padding: "9px 12px"}}>4-bit quantized, NVIDIA Blackwell (B300 / GB300)</td>
     </tr>
   </tbody>
 </table>
 
-**Recommended Generation Parameters:**
-- Thinking Mode: `temperature=1.0`, `top_p=0.95`
-- Instant Mode: `temperature=0.6`, `top_p=0.95`
+**Recommended generation** (informational; SGLang applies the model's `generation_config.json` defaults automatically):
 
-**Available Models:**
-
-- **INT4 (native checkpoint)**: [moonshotai/Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6)
-- **NVFP4 (4-bit quantized, NVIDIA Blackwell)**: [nvidia/Kimi-K2.6-NVFP4](https://huggingface.co/nvidia/Kimi-K2.6-NVFP4)
+- Thinking mode: `temperature=1.0`, `top_p=0.95`
+- Instant mode: `temperature=0.6`, `top_p=0.95`
 
 **License:** Modified MIT for the native checkpoint. The NVIDIA NVFP4 checkpoint is governed by the [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).
 
-For details, see [official documentation](https://huggingface.co/moonshotai/Kimi-K2.6) and [tech blog](https://kimi.com/blog/kimi-k2-6).
+**Resources:** [HuggingFace](https://huggingface.co/moonshotai/Kimi-K2.6) · [Tech blog](https://kimi.com/blog/kimi-k2-6)
 
-## 2. SGLang Installation
+## 2. Configuration Tips
 
-Refer to the [official SGLang installation guide](../../../docs/get-started/install).
+- **Memory**: Requires GPUs with ≥140 GB each. The native INT4 checkpoint serves on H200 (8×, TP=8), B300 (8×, TP=8), GB300 (4×, TP=4), MI300X/MI325X (4×, TP=4), and MI350X/MI355X (4×, TP=4). Add `--context-length 128000` to conserve memory.
+- **NVFP4**: Use `nvidia/Kimi-K2.6-NVFP4` with `--quantization modelopt_fp4` on NVIDIA Blackwell — `--tp 8` on B300, `--tp 4` on GB300. Select **NVFP4** in the Deploy panel for the exact command.
+- **Blackwell attention backend**: On B300 / GB300 the recipe adds `--attention-backend tokenspeed_mla` (auto-included by the command panel for those tiles).
+- **AMD GPU TP constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.6 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0` — TP=4 gives 16 heads per GPU (valid), TP=8 gives 8 (invalid). The AMD recipe also sets `SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0` and `--mem-fraction-static 0.8`.
+- **AMD Docker image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
+- **AMD FP8 KV cache**: On AMD platforms the recipe adds `--kv-cache-dtype fp8_e4m3` by default (paired with `--mem-fraction-static 0.8`) to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
+- **DP Attention** (the Deploy panel's **High-Throughput** strategy): adds `--dp <N> --enable-dp-attention` for production throughput. A common choice is `--dp` equal to `--tp`, but this is not required — tune it in the **Attention Parallelism** card of the [Playground](#playground).
+- **Reasoning / Tool Call parsers**: add `--reasoning-parser kimi_k2` and `--tool-call-parser kimi_k2` to separate thinking from content and surface structured tool calls. Toggle them in the **Parsers** card of the [Playground](#playground) — they are not part of the base Deploy command.
+- **Speculative decoding (NVIDIA only)**: Kimi-K2.6 supports an EAGLE3 MLA draft (`lightseekorg/kimi-k2.6-eagle3.1-mla`) on H200 / B300 / GB300. Enable it from the **Speculative Decoding** card of the [Playground](#playground); it is not part of the base Deploy command and is unsupported on AMD GPUs.
 
-## 3. Model Deployment
+## 3. Advanced Usage
 
-### 3.1 Basic Configuration
+{/* Invocation examples carried over verbatim from the legacy page. Commands and
+    their real server outputs are collapsible (DeepSeek-V4 §3 pattern). */}
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and capabilities.
-
-import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deployment.jsx'
-
-<KimiK26Deployment />
-
-### 3.2 Configuration Tips
-
-- **Memory**: Requires GPUs with ≥140GB each. The native INT4 checkpoint supports H200 (8×, TP=8), B300 (8×, TP=8), GB300 (4×, TP=4), MI300X/MI325X (4×, TP=4), and MI350X/MI355X (4×, TP=4). Use `--context-length 128000` to conserve memory.
-- **NVFP4**: Use `nvidia/Kimi-K2.6-NVFP4` with `--quantization modelopt_fp4` on NVIDIA Blackwell. Use `tp=8` on B300 and `tp=4` on GB300.
-- **AMD GPU TP Constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.6 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
-- **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
-- **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
-- **Reasoning Parser**: Add `--reasoning-parser kimi_k2` to separate thinking and content in model outputs.
-- **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
-- **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
-
-## 4. Model Invocation
-
-### 4.1 Basic Usage
-
-See [Basic API Usage](../../../docs/basic_usage/send_request).
-
-### 4.2 Advanced Usage
-
-#### 4.2.1 Multimodal (Vision + Text) Input
+### 3.1 Multimodal (Vision + Text) Input
 
 Kimi-K2.6 supports native multimodal input with images:
+
+<Accordion title="Multimodal Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -143,7 +184,9 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 This image shows a **paper receipt from Auntie Anne's**, the pretzel chain restaurant. Here's a detailed breakdown:
@@ -172,11 +215,13 @@ This image shows a **paper receipt from Auntie Anne's**, the pretzel chain resta
 The transaction is in **Indonesian Rupiah (IDR)**, indicating this purchase was made at an Auntie Anne's location in Indonesia. The customer bought one Cinnamon Sugar pretzel for 17,000 IDR and received 3,000 IDR in change after paying with 20,000 IDR cash.
 ```
 
-#### 4.2.2 Reasoning Output
+</Accordion>
 
-Kimi-K2.6 supports both thinking mode (default) and instant mode.
+### 3.2 Reasoning
 
-**Thinking Mode (default)** — reasoning content is automatically separated:
+Kimi-K2.6 supports both thinking mode (default) and instant mode. Launch with `--reasoning-parser kimi_k2` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground](#playground)) — the thinking trace lands in `message.reasoning_content`, separate from the final answer in `message.content`.
+
+<Accordion title="Reasoning Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -186,6 +231,7 @@ client = OpenAI(
     api_key="EMPTY"
 )
 
+# Thinking Mode (default) — reasoning content is automatically separated
 response = client.chat.completions.create(
     model="moonshotai/Kimi-K2.6",
     messages=[
@@ -197,11 +243,8 @@ print("====== Reasoning Content (Thinking Mode) ======")
 print(response.choices[0].message.reasoning_content)
 print("====== Response (Thinking Mode) ======")
 print(response.choices[0].message.content)
-```
 
-**Instant Mode (thinking off)** — disable thinking for faster responses:
-
-```python Example
+# Instant Mode (thinking off) — disable thinking for faster responses
 response = client.chat.completions.create(
     model="moonshotai/Kimi-K2.6",
     messages=[
@@ -214,7 +257,9 @@ print("====== Response (Instant Mode) ======")
 print(response.choices[0].message.content)
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 ====== Reasoning Content (Thinking Mode) ======
@@ -263,9 +308,13 @@ Since 0.90 > 0.11
 This is a common trick question because people sometimes mistakenly compare 11 and 9 as whole numbers after the decimal point, forgetting that 9.9 = 9.90, which is greater than 9.11.
 ```
 
-#### 4.2.3 Tool Calling
+</Accordion>
 
-Kimi-K2.6 supports tool calling capabilities for agentic tasks:
+### 3.3 Tool Calling
+
+Kimi-K2.6 supports tool calling for agentic tasks. Launch with `--tool-call-parser kimi_k2` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground](#playground)) to surface structured tool calls via `message.tool_calls`.
+
+<Accordion title="Tool Calling Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -336,14 +385,20 @@ for index, tool_call in sorted(tool_calls_accumulator.items()):
     print(f"  Arguments: {tool_call['arguments']}")
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 Tool Call: get_weather
   Arguments: {"location": "Beijing"}
 ```
 
-**Handling Tool Call Results:**
+</Accordion>
+
+Send a tool result back to the model to get the final answer:
+
+<Accordion title="Handling Tool Call Results (Python)">
 
 ```python Example
 # Send tool result back to the model
@@ -376,7 +431,9 @@ final_response = client.chat.completions.create(
 print(final_response.choices[0].message.content)
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 The weather in Beijing is currently **22°C and sunny**. ☀️
@@ -384,9 +441,13 @@ The weather in Beijing is currently **22°C and sunny**. ☀️
 It's a nice, warm day there—great for being outdoors!
 ```
 
-#### 4.2.4 Multimodal + Tool Calling (Agentic Vision)
+</Accordion>
 
-Combine vision understanding with tool calling for advanced agentic tasks:
+### 3.4 Multimodal + Tool Calling (Agentic Vision)
+
+Combine vision understanding with tool calling for advanced agentic tasks. The follow-up turn on a thinking model may place text in `reasoning_content` as well as `content`, so print both:
+
+<Accordion title="Agentic Vision Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -458,7 +519,9 @@ if msg.tool_calls:
         print(f"  Arguments: {tc.function.arguments}")
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 === Reasoning ===
@@ -474,953 +537,16 @@ Let me search for this product and similar items for you.
   Arguments: {"query":"Auntie Anne's Cinnamon Sugar Pretzel"}
 ```
 
-#### 4.2.5 Speculative Decoding
+</Accordion>
 
-**NVIDIA**
+### 3.5 Speculative Decoding (NVIDIA)
 
-Deploy Kimi-K2.6 with the following command (H200/B300, all features enabled):
+On NVIDIA GPUs (H200 / B300 / GB300), Kimi-K2.6 supports EAGLE3 speculative decoding with the `lightseekorg/kimi-k2.6-eagle3.1-mla` MLA draft model for higher decode throughput. Enable it from the **Speculative Decoding** card of the [Playground](#playground) — it adds the following flags on top of the base command (it is unsupported on AMD GPUs):
 
-```shell Command
-sglang serve \
-  --model-path moonshotai/Kimi-K2.6 \
-  --tp 8 \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2 \
-  --speculative-algorithm EAGLE3 \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-Deploy Kimi-K2.6-NVFP4 with the following command (B300, all features enabled):
-
-```shell Command
-sglang serve \
-  --model-path nvidia/Kimi-K2.6-NVFP4 \
-  --tp 8 \
-  --quantization modelopt_fp4 \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2 \
-  --speculative-algorithm EAGLE3 \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-For GB300, use `--tp 4`.
-
-## 5. Benchmark
-
-### 5.1 Accuracy Benchmark
-
-**Test Environment:**
-
-- Hardware: 8× NVIDIA H200
-- Model: moonshotai/Kimi-K2.6 (INT4)
-- Tensor Parallelism: 8
-- SGLang version: 0.5.9
-- Reasoning Parser: `kimi_k2`
-- Tool Call Parser: `kimi_k2`
-
-#### NVIDIA NVFP4 Accuracy Reference
-
-NVIDIA reports the following accuracy results for `nvidia/Kimi-K2.6-NVFP4` compared with the native INT4 baseline, using `temperature=1.0`, `top_p=0.95`, and max tokens 128,000:
-
-<table>
-  <thead>
-    <tr>
-      <th>Precision</th>
-      <th>GPQA Diamond</th>
-      <th>SciCode</th>
-      <th>τ²-Bench Telecom</th>
-      <th>MMMU Pro</th>
-      <th>AA-LCR</th>
-      <th>IFBench</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Baseline (INT4)</td>
-      <td>90.9</td>
-      <td>52.6</td>
-      <td>98.2</td>
-      <td>75.6</td>
-      <td>71.0</td>
-      <td>73.9</td>
-    </tr>
-    <tr>
-      <td>NVFP4</td>
-      <td>90.4</td>
-      <td>54.4</td>
-      <td>98.0</td>
-      <td>76.5</td>
-      <td>71.8</td>
-      <td>73.9</td>
-    </tr>
-  </tbody>
-</table>
-
-#### 5.1.1 K2-Vendor-Verifier (Tool Calling)
-
-- Dataset: [K2-Vendor-Verifier](https://github.com/MoonshotAI/K2-Vendor-Verifier) tool-calls dataset (2,000 requests)
-- Evaluation Tool: K2-Vendor-Verifier `tool_calls_eval.py`
-- Settings: temperature=1.0, max_tokens=64,000, concurrency=256
-
-**Evaluation Command:**
-
-```shell Command
-cd K2-Vendor-Verifier
-
-python tool_calls_eval.py tool-calls/samples.jsonl \
-  --model "moonshotai/Kimi-K2.6" \
-  --base-url "http://localhost:30000/v1" \
-  --api-key "placeholder" \
-  --concurrency 256 \
-  --temperature 1.0 \
-  --max-tokens 64000 \
-  --output kimi-k26-results.jsonl
-```
-
-**Results:**
-
-<table>
-  <thead>
-    <tr>
-      <th>Metric</th>
-      <th>Value</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Success Rate</td>
-      <td>99.95% (1999/2000)</td>
-    </tr>
-    <tr>
-      <td>Tool Call Triggered</td>
-      <td>970</td>
-    </tr>
-    <tr>
-      <td>Tool Call Valid</td>
-      <td>89.6% (869/970)</td>
-    </tr>
-    <tr>
-      <td>Tool Call Invalid (schema error)</td>
-      <td>10.4% (101/970)</td>
-    </tr>
-  </tbody>
-</table>
-
-#### 5.1.2 AIME 2025
-
-- Dataset: [AIME 2025](https://huggingface.co/datasets/nvidia/aime25) (30 problems)
-- Evaluation Tool: [NVIDIA NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills)
-- Prompt: `eval/matharena/aime` (MathArena format with `\boxed{}` answers)
-- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 32 seeds
-
-**Evaluation Command:**
-
-```shell Command
-# Prepare dataset
-python3 nemo_skills/dataset/aime25/prepare.py
-
-# Run 32 seeds in parallel
-for RS in $(seq 0 31); do
-  python3 nemo_skills/inference/generate.py \
-    input_file=nemo_skills/dataset/aime25/test.jsonl \
-    output_file=results/kimi-k26/aime25/output-rs${RS}.jsonl \
-    prompt_config=eval/matharena/aime \
-    prompt_format=openai \
-    +server.server_type=openai \
-    +server.model=moonshotai/Kimi-K2.6 \
-    +server.base_url=http://localhost:30000/v1 \
-    ++inference.temperature=1.0 \
-    ++inference.top_p=0.95 \
-    ++inference.tokens_to_generate=131072 \
-    ++inference.random_seed=${RS} \
-    max_concurrent_requests=512 &
-done
-```
-
-**Results:**
-
-<table>
-  <thead>
-    <tr>
-      <th>Evaluation Mode</th>
-      <th>Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>pass@1 (avg-of-32)</td>
-      <td>98.9% (29.7/30)</td>
-    </tr>
-    <tr>
-      <td><strong>majority@32</strong></td>
-      <td><strong>100.0% (30/30)</strong></td>
-    </tr>
-    <tr>
-      <td>pass@32</td>
-      <td>100.0%</td>
-    </tr>
-  </tbody>
-</table>
-
-> 22 out of 32 seeds achieved a perfect score of 30/30. The remaining 10 seeds each missed exactly 1 problem (29/30).
-
-#### 5.1.3 GPQA Diamond
-
-- Dataset: [GPQA Diamond](https://huggingface.co/datasets/Idavidrein/gpqa) (198 questions, 4-choice multiple choice)
-- Evaluation Tool: [Inspect AI](https://github.com/UKGovernmentBEIS/inspect_ai) with `inspect_evals/gpqa_diamond`
-- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 4 epochs, cot=True
-
-**Evaluation Command:**
-
-```shell Command
-OPENAI_BASE_URL=http://localhost:30000/v1 OPENAI_API_KEY=placeholder \
-inspect eval inspect_evals/gpqa_diamond \
-  --model openai/moonshotai/Kimi-K2.6 \
-  --max-tokens 131072 \
-  --temperature 1.0 \
-  --top-p 0.95 \
-  --max-connections 128 \
-  -T cot=True
-```
-
-**Results (partial — 553/792 samples across 4 epochs):**
-
-<table>
-  <thead>
-    <tr>
-      <th>Evaluation Mode</th>
-      <th>Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>pass@1 (avg across epochs)</td>
-      <td><strong>96.9%</strong></td>
-    </tr>
-  </tbody>
-</table>
-
-<table>
-  <thead>
-    <tr>
-      <th>Epoch</th>
-      <th>Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>1</td>
-      <td>96.4% (160/166)</td>
-    </tr>
-    <tr>
-      <td>2</td>
-      <td>96.9% (156/161)</td>
-    </tr>
-    <tr>
-      <td>3</td>
-      <td>96.9% (155/160)</td>
-    </tr>
-    <tr>
-      <td>4</td>
-      <td>98.5% (65/66)</td>
-    </tr>
-  </tbody>
-</table>
-
-#### 5.1.4 OCRBench
-
-- Dataset: [OCRBench](https://huggingface.co/datasets/echo840/OCRBench) (1,000 questions with images)
-- Evaluation Tool: [Kimi-Vendor-Verifier](https://github.com/MoonshotAI/Kimi-Vendor-Verifier) (inspect-ai based)
-- Settings: max_tokens=4,096, thinking mode enabled (opensource)
-
-**Evaluation Command:**
-
-```shell Command
-cd Kimi-Vendor-Verifier
-
-OPENAI_BASE_URL=http://localhost:30000/v1 OPENAI_API_KEY=placeholder \
-python3 eval.py ocrbench \
-  --model openai/moonshotai/Kimi-K2.6 \
-  --max-tokens 4096 \
-  --think-mode opensource \
-  --thinking \
-  --max-connections 256
-```
-
-**Results:**
-
-<table>
-  <thead>
-    <tr>
-      <th>Evaluation Mode</th>
-      <th>Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>pass@1</td>
-      <td><strong>90.8%</strong></td>
-    </tr>
-  </tbody>
-</table>
-
-#### 5.1.5 MMMU Pro Vision
-
-- Dataset: [MMMU Pro](https://huggingface.co/datasets/MMMU/MMMU_Pro) standard 10-option subset (1,730 questions with images)
-- Evaluation Tool: [Kimi-Vendor-Verifier](https://github.com/MoonshotAI/Kimi-Vendor-Verifier) (inspect-ai based)
-- Settings: max_tokens=32,768, thinking mode (default), max_connections=256
-
-> **Important**: Kimi-K2.6 is a reasoning model. Setting `max_tokens` too low (e.g., 4096) causes the thinking process to consume the entire token budget, leaving no tokens for the final answer. Use `max_tokens=32768` or higher.
-
-**Evaluation Command:**
-
-```shell Command
-cd Kimi-Vendor-Verifier
-
-OPENAI_BASE_URL=http://localhost:30000/v1 OPENAI_API_KEY=placeholder \
-python3 eval.py mmmu \
-  --model openai/moonshotai/Kimi-K2.6 \
-  --max-tokens 32768 \
-  --think-mode none \
-  --max-connections 256
-```
-
-**Results (1,481/1,730 samples completed):**
-
-<table>
-  <thead>
-    <tr>
-      <th>Evaluation Mode</th>
-      <th>Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>pass@1</td>
-      <td><strong>82.2%</strong></td>
-    </tr>
-  </tbody>
-</table>
-
-### 5.2 Speed Benchmark
-
-**Test Environment:**
-
-- Hardware: NVIDIA H200 GPU (8x)
-- Model: Kimi-K2.6
-- Tensor Parallelism: 8
-- SGLang Version: 0.5.9
-
-<Info>
-Kimi-K2.6 shares the same architecture as K2.5. Speed benchmarks are expected to be equivalent. The results below are measured with K2.5 and serve as a reference.
-</Info>
-
-We use SGLang's built-in benchmarking tool with the `random` dataset for standardized performance evaluation.
-
-#### 5.2.1 Latency Benchmark
-
-- **Model Deployment:**
-
-```shell Command
-sglang serve \
-  --model-path moonshotai/Kimi-K2.6 \
-  --tp 8 \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-**Scenario 1: Chat (1K/1K)**
-
-- Low Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 10 \
-  --max-concurrency 1 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  39.77
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4221
-Request throughput (req/s):              0.25
-Input token throughput (tok/s):          153.40
-Output token throughput (tok/s):         106.10
-Peak output token throughput (tok/s):    156.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          259.50
-Concurrency:                             1.00
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   3972.87
-Median E2E Latency (ms):                 4044.55
-P90 E2E Latency (ms):                    7046.30
-P99 E2E Latency (ms):                    7441.13
----------------Time to First Token----------------
-Mean TTFT (ms):                          176.89
-Median TTFT (ms):                        154.24
-P99 TTFT (ms):                           285.75
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          9.22
-Median TPOT (ms):                        9.32
-P99 TPOT (ms):                           12.72
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           9.02
-Median ITL (ms):                         8.80
-P95 ITL (ms):                            13.23
-P99 ITL (ms):                            14.17
-Max ITL (ms):                            29.38
-==================================================
-```
-
-- Medium Concurrency (Balanced)
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 80 \
-  --max-concurrency 16 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  158.05
-Total input tokens:                      39668
-Total input text tokens:                 39668
-Total generated tokens:                  40805
-Total generated tokens (retokenized):    40775
-Request throughput (req/s):              0.51
-Input token throughput (tok/s):          250.99
-Output token throughput (tok/s):         258.18
-Peak output token throughput (tok/s):    1103.00
-Peak concurrent requests:                19
-Total token throughput (tok/s):          509.17
-Concurrency:                             14.09
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   27837.05
-Median E2E Latency (ms):                 23508.00
-P90 E2E Latency (ms):                    57126.31
-P99 E2E Latency (ms):                    66044.35
----------------Time to First Token----------------
-Mean TTFT (ms):                          374.30
-Median TTFT (ms):                        375.51
-P99 TTFT (ms):                           695.58
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          53.25
-Median TPOT (ms):                        57.93
-P99 TPOT (ms):                           85.45
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           53.95
-Median ITL (ms):                         53.97
-P95 ITL (ms):                            84.74
-P99 ITL (ms):                            244.84
-Max ITL (ms):                            655.61
-==================================================
-```
-
-- High Concurrency (Throughput-Optimized)
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 500 \
-  --max-concurrency 100 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 100
-Successful requests:                     500
-Benchmark duration (s):                  996.64
-Total input tokens:                      249831
-Total input text tokens:                 249831
-Total generated tokens:                  252662
-Total generated tokens (retokenized):    252588
-Request throughput (req/s):              0.50
-Input token throughput (tok/s):          250.67
-Output token throughput (tok/s):         253.51
-Peak output token throughput (tok/s):    1199.00
-Peak concurrent requests:                104
-Total token throughput (tok/s):          504.18
-Concurrency:                             92.70
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   184773.75
-Median E2E Latency (ms):                 174183.65
-P90 E2E Latency (ms):                    343625.28
-P99 E2E Latency (ms):                    404284.53
----------------Time to First Token----------------
-Mean TTFT (ms):                          1289.59
-Median TTFT (ms):                        1313.35
-P99 TTFT (ms):                           2346.78
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          364.70
-Median TPOT (ms):                        403.32
-P99 TPOT (ms):                           452.34
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           363.82
-Median ITL (ms):                         316.21
-P95 ITL (ms):                            745.91
-P99 ITL (ms):                            1345.88
-Max ITL (ms):                            3118.59
-==================================================
-```
-
-**Scenario 2: Reasoning (1K/8K)**
-
-- Low Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 8000 \
-  --num-prompts 10 \
-  --max-concurrency 1 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  680.26
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  44462
-Total generated tokens (retokenized):    44455
-Request throughput (req/s):              0.01
-Input token throughput (tok/s):          8.97
-Output token throughput (tok/s):         65.36
-Peak output token throughput (tok/s):    151.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          74.33
-Concurrency:                             1.00
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   68019.29
-Median E2E Latency (ms):                 70568.85
-P90 E2E Latency (ms):                    113237.40
-P99 E2E Latency (ms):                    121682.34
----------------Time to First Token----------------
-Mean TTFT (ms):                          206.17
-Median TTFT (ms):                        177.28
-P99 TTFT (ms):                           445.37
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          14.36
-Median TPOT (ms):                        15.89
-P99 TPOT (ms):                           16.43
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           15.26
-Median ITL (ms):                         15.85
-P95 ITL (ms):                            17.50
-P99 ITL (ms):                            23.21
-Max ITL (ms):                            45.22
-==================================================
-```
-
-- Medium Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 8000 \
-  --num-prompts 80 \
-  --max-concurrency 16 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  2475.98
-Total input tokens:                      39668
-Total input text tokens:                 39668
-Total generated tokens:                  318306
-Total generated tokens (retokenized):    318166
-Request throughput (req/s):              0.03
-Input token throughput (tok/s):          16.02
-Output token throughput (tok/s):         128.56
-Peak output token throughput (tok/s):    847.00
-Peak concurrent requests:                18
-Total token throughput (tok/s):          144.58
-Concurrency:                             14.62
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   452592.46
-Median E2E Latency (ms):                 486002.05
-P90 E2E Latency (ms):                    833197.57
-P99 E2E Latency (ms):                    957399.48
----------------Time to First Token----------------
-Mean TTFT (ms):                          359.38
-Median TTFT (ms):                        350.78
-P99 TTFT (ms):                           500.36
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          111.18
-Median TPOT (ms):                        122.76
-P99 TPOT (ms):                           145.90
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           113.69
-Median ITL (ms):                         122.81
-P95 ITL (ms):                            147.87
-P99 ITL (ms):                            151.03
-Max ITL (ms):                            272.05
-==================================================
-```
-
-**Scenario 3: Summarization (8K/1K)**
-
-- Low Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 8000 \
-  --random-output-len 1000 \
-  --num-prompts 10 \
-  --max-concurrency 1 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  120.73
-Total input tokens:                      41941
-Total input text tokens:                 41941
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4220
-Request throughput (req/s):              0.08
-Input token throughput (tok/s):          347.41
-Output token throughput (tok/s):         34.96
-Peak output token throughput (tok/s):    73.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          382.36
-Concurrency:                             1.00
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   12068.56
-Median E2E Latency (ms):                 10211.36
-P90 E2E Latency (ms):                    23203.32
-P99 E2E Latency (ms):                    30677.66
----------------Time to First Token----------------
-Mean TTFT (ms):                          1625.64
-Median TTFT (ms):                        1526.63
-P99 TTFT (ms):                           3743.51
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          24.95
-Median TPOT (ms):                        23.95
-P99 TPOT (ms):                           35.40
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           24.80
-Median ITL (ms):                         21.73
-P95 ITL (ms):                            59.56
-P99 ITL (ms):                            61.10
-Max ITL (ms):                            62.70
-==================================================
-```
-
-- Medium Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 8000 \
-  --random-output-len 1000 \
-  --num-prompts 80 \
-  --max-concurrency 16 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  389.96
-Total input tokens:                      300020
-Total input text tokens:                 300020
-Total generated tokens:                  41669
-Total generated tokens (retokenized):    41670
-Request throughput (req/s):              0.21
-Input token throughput (tok/s):          769.36
-Output token throughput (tok/s):         106.86
-Peak output token throughput (tok/s):    304.00
-Peak concurrent requests:                19
-Total token throughput (tok/s):          876.22
-Concurrency:                             14.95
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   72870.97
-Median E2E Latency (ms):                 70495.88
-P90 E2E Latency (ms):                    121820.46
-P99 E2E Latency (ms):                    148933.09
----------------Time to First Token----------------
-Mean TTFT (ms):                          2460.45
-Median TTFT (ms):                        1976.29
-P99 TTFT (ms):                           7305.53
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          140.57
-Median TPOT (ms):                        142.31
-P99 TPOT (ms):                           273.40
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           135.44
-Median ITL (ms):                         95.96
-P95 ITL (ms):                            152.93
-P99 ITL (ms):                            1488.37
-Max ITL (ms):                            6540.24
-==================================================
-```
-
-- High Concurrency
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 8000 \
-  --random-output-len 1000 \
-  --num-prompts 320 \
-  --max-concurrency 64 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 64
-Successful requests:                     320
-Benchmark duration (s):                  1279.50
-Total input tokens:                      1273893
-Total input text tokens:                 1273893
-Total generated tokens:                  170000
-Total generated tokens (retokenized):    169981
-Request throughput (req/s):              0.25
-Input token throughput (tok/s):          995.62
-Output token throughput (tok/s):         132.86
-Peak output token throughput (tok/s):    703.00
-Peak concurrent requests:                67
-Total token throughput (tok/s):          1128.49
-Concurrency:                             60.12
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   240385.63
-Median E2E Latency (ms):                 236266.30
-P90 E2E Latency (ms):                    429882.12
-P99 E2E Latency (ms):                    515158.36
----------------Time to First Token----------------
-Mean TTFT (ms):                          2710.44
-Median TTFT (ms):                        2345.63
-P99 TTFT (ms):                           7144.20
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          443.84
-Median TPOT (ms):                        493.29
-P99 TPOT (ms):                           606.19
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           448.23
-Median ITL (ms):                         296.17
-P95 ITL (ms):                            1869.15
-P99 ITL (ms):                            2708.95
-Max ITL (ms):                            7778.47
-==================================================
-```
-
-### 5.3 Speed Benchmark (AMD MI350X)
-
-**Test Environment:**
-
-- Hardware: AMD Instinct MI350X GPU (4x)
-- Model: Kimi-K2.6 (INT4)
-- Tensor Parallelism: 4
-- SGLang Version: 0.5.9
-- Docker Image: `lmsysorg/sglang:v0.5.9-rocm700-mi35x`
-- ROCm: 7.0
-
-We use SGLang's built-in benchmarking tool with the `random` dataset for standardized performance evaluation.
-
-<Info>
-**AMD GPU TP Constraint**: Kimi-K2.6 requires TP ≤ 4 on AMD GPUs. The model has 64 attention heads, and the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
-</Info>
-
-#### 5.3.1 Latency Benchmark
-
-- **Model Deployment:**
-
-```shell Command
-SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0 \
-sglang serve \
-  --model-path moonshotai/Kimi-K2.6 \
-  --tp 4 \
-  --mem-fraction-static 0.8 \
-  --trust-remote-code \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2 \
-  --kv-cache-dtype fp8_e4m3 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-- **Benchmark Command:**
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 10 \
-  --max-concurrency 1 \
-  --request-rate inf
-```
-
-- **Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  155.81
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4222
-Request throughput (req/s):              0.06
-Input token throughput (tok/s):          39.16
-Output token throughput (tok/s):         27.09
-Peak output token throughput (tok/s):    29.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          66.24
-Concurrency:                             1.00
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   15576.22
-Median E2E Latency (ms):                 12539.80
-P90 E2E Latency (ms):                    28150.56
-P99 E2E Latency (ms):                    34873.51
----------------Time to First Token----------------
-Mean TTFT (ms):                          563.50
-Median TTFT (ms):                        594.92
-P99 TTFT (ms):                           830.31
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          35.61
-Median TPOT (ms):                        35.66
-P99 TPOT (ms):                           35.77
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           35.66
-Median ITL (ms):                         35.69
-P95 ITL (ms):                            35.96
-P99 ITL (ms):                            36.13
-Max ITL (ms):                            36.92
-==================================================
-```
-
-- Medium Concurrency (Balanced)
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model moonshotai/Kimi-K2.6 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 80 \
-  --max-concurrency 16 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  526.66
-Total input tokens:                      39668
-Total input text tokens:                 39668
-Total generated tokens:                  40805
-Total generated tokens (retokenized):    40798
-Request throughput (req/s):              0.15
-Input token throughput (tok/s):          75.32
-Output token throughput (tok/s):         77.48
-Peak output token throughput (tok/s):    96.00
-Peak concurrent requests:                18
-Total token throughput (tok/s):          152.80
-Concurrency:                             14.59
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   96023.27
-Median E2E Latency (ms):                 93940.20
-P90 E2E Latency (ms):                    159449.54
-P99 E2E Latency (ms):                    194706.61
----------------Time to First Token----------------
-Mean TTFT (ms):                          989.08
-Median TTFT (ms):                        886.42
-P99 TTFT (ms):                           1543.60
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          191.04
-Median TPOT (ms):                        195.20
-P99 TPOT (ms):                           238.84
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           186.68
-Median ITL (ms):                         183.82
-P95 ITL (ms):                            189.90
-P99 ITL (ms):                            673.64
-Max ITL (ms):                            1633.20
-==================================================
+```text Speculative flags (added by the Playground)
+--speculative-algorithm EAGLE3
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla
 ```
