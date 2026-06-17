@@ -18,9 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Tokens covered per CTA along the page-block (grid axis-1) dimension. Must be a
-# multiple of every supported page_size so a page-block spans an exact token span
-# (see build_trtllm_mha_page_table's assert); true for all power-of-two page sizes.
+# Tokens covered per CTA along the page-block (grid axis-1) dimension.
+# Must be a multiple of page_size (asserted in build_trtllm_mha_page_table).
 _MHA_KV_INDEX_BLOCK_TOKENS = 4096
 # Triton kernels can only read module globals that are tl.constexpr instances.
 _MHA_KV_INDEX_BLOCK_TOKENS_TL = tl.constexpr(_MHA_KV_INDEX_BLOCK_TOKENS)
@@ -58,10 +57,9 @@ def create_trtllm_mha_kv_indices_triton(
     Programs past the request's page count are guarded out, so the work (and the
     DRAM traffic) is bounded by the device-side ``seq_lens`` — no host max needed.
 
-    The SWA lookup assumes every read slot is a valid (``>= 0``) full-pool index;
-    it does not handle the ``-1`` sentinel that ``translate_loc_from_full_to_swa``
-    maps via negative indexing (raw pointer arithmetic would read out of bounds).
-    Page-boundary reads stay within ``seq_len``, so slots are always valid here.
+    The SWA lookup assumes valid (``>= 0``) slots, unlike
+    ``translate_loc_from_full_to_swa``'s ``-1`` sentinel handling; page-boundary
+    reads stay within ``seq_len``, so slots are always valid here.
     """
     PAGES_PER_BLOCK: tl.constexpr = _MHA_KV_INDEX_BLOCK_TOKENS_TL // PAGE_SIZE
     pid_req = tl.program_id(0)

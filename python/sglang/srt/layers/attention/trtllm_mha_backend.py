@@ -147,8 +147,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
-        # Reusable eager-path page-table buffers, grown on demand (the cuda-graph
-        # path uses its own pre-allocated buffers). Avoids a per-forward alloc.
+        # Reusable eager-path page-table buffers, grown on demand.
         self._eager_page_table: Optional[torch.Tensor] = None
         self._eager_swa_page_table: Optional[torch.Tensor] = None
 
@@ -225,10 +224,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Reusable [bs, max_num_pages] eager page-table buffer(s), grown on demand.
 
-        The device-side build overwrites every used column per request, so the
-        buffer is safe to reuse across eager forwards without clearing. Sized to
-        the static ``max_num_pages`` upper bound (sync-free), like the cuda-graph
-        buffers, and returned as a ``[:batch_size]`` view.
+        Safe to reuse without clearing: the device build overwrites every used
+        column per request.
         """
         has_swa = self._swa_kv_pool is not None
         if (
@@ -486,9 +483,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        # The device-side build (_fill_page_table_device) sizes the page table to
-        # the static max_num_pages and bounds the actual writes by cache_seqlens,
-        # so no runtime host max is needed.
+        # Page table is built on-device (_fill_page_table_device), no host max.
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
