@@ -157,14 +157,9 @@ deployment commands and benchmark data, see
 
 ### Multi-node PD disaggregation deployment
 
-PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
-throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
-deployment commands and benchmark data, see
-[Qwen3-235B-A22B Best Practice — PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b).
-
 #### 256K long-sequence PD disaggregation on 2 x Atlas 800I A3 (without CP)
 
-This configuration uses PD disaggregation for **256K long-sequence inference** with context parallel disabled.
+This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x Atlas 800I A3 with context parallel disabled.
 The following command is based on the **W8A8** quantized model.
 
 1. Set the shared environment variables on both prefill and decode nodes:
