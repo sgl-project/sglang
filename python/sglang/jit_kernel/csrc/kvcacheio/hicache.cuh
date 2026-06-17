@@ -293,18 +293,18 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(k_cache_src)
         .verify(v_cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(k_cache_dst)
         .verify(v_cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -360,14 +360,14 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(k_ptr_src)
         .verify(v_ptr_src)
         .verify(k_ptr_dst)
         .verify(v_ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -418,16 +418,16 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -478,12 +478,12 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(ptr_src)
         .verify(ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 
