@@ -238,11 +238,6 @@ class BaseBreakableCudaGraphRunner:
         self._disabled_reason: str | None = None
         self.max_entries = max(0, _env_int("SGLANG_DIFFUSION_BCG_MAX_ENTRIES", 32))
         self.max_segments = max(0, _env_int("SGLANG_DIFFUSION_BCG_MAX_SEGMENTS", 128))
-        max_reserved_gb = max(
-            0.0, _env_float("SGLANG_DIFFUSION_BCG_MAX_RESERVED_GB", 12.0)
-        )
-        self.max_reserved_bytes = int(max_reserved_gb * (1024**3))
-        self._reserved_baseline_bytes = self._memory_reserved()
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for attributes the runner itself does not define; proxy
@@ -346,15 +341,6 @@ class BaseBreakableCudaGraphRunner:
         """
         return _signature_kwargs(kwargs)
 
-    def _memory_reserved(self) -> int:
-        memory_reserved = getattr(self.device_module, "memory_reserved", None)
-        if not callable(memory_reserved):
-            return 0
-        try:
-            return int(memory_reserved(self.device))
-        except TypeError:
-            return int(memory_reserved())
-
     def _empty_cache(self) -> None:
         empty_cache = getattr(self.device_module, "empty_cache", None)
         if callable(empty_cache):
@@ -384,14 +370,6 @@ class BaseBreakableCudaGraphRunner:
                 f"captured {entry.num_segments} segments, above "
                 f"SGLANG_DIFFUSION_BCG_MAX_SEGMENTS={self.max_segments}"
             )
-        if self.max_reserved_bytes:
-            reserved_delta = self._memory_reserved() - self._reserved_baseline_bytes
-            if reserved_delta > self.max_reserved_bytes:
-                return (
-                    f"reserved graph memory grew by {reserved_delta / (1024**3):.2f}GiB, "
-                    "above SGLANG_DIFFUSION_BCG_MAX_RESERVED_GB="
-                    f"{self.max_reserved_bytes / (1024**3):.2f}"
-                )
         return None
 
     def _evict_entries_if_needed(self) -> None:
