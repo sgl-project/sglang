@@ -257,7 +257,10 @@ def init_mori_op(
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
 
-    if dispatch_dtype == DispatchDtype.fp8:
+    if dispatch_dtype == DispatchDtype.bf16:
+        data_type = params_dtype
+        scale_dim = 0
+    elif dispatch_dtype == DispatchDtype.fp8:
         scale_dim = hidden_size // FP8_BLOCK_SIZE
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization

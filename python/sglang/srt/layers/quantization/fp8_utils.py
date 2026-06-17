@@ -227,11 +227,36 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
+    from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
     from sglang.srt.utils.custom_op import register_custom_op
+
+    @register_custom_op(
+        op_name="flashinfer_bmm_fp8",
+        mutates_args=[],
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+            q_input.new_empty((q_input.shape[0], weight.shape[1]), dtype=out_dtype)
+        ),
+    )
+    def flashinfer_bmm_fp8(
+        q_input: torch.Tensor,  # [M, K] fp8 e4m3
+        weight: torch.Tensor,  # [K, N] fp8 e4m3, column-major
+        x_scale: torch.Tensor,  # per-tensor scalar
+        weight_scale: torch.Tensor,  # per-tensor scalar
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        m, n = q_input.shape[0], weight.shape[1]
+        return _raw_flashinfer_bmm_fp8(
+            q_input.unsqueeze(0),
+            weight.unsqueeze(0),
+            x_scale.reshape(1),
+            weight_scale.reshape(1),
+            out_dtype,
+            backend="auto",
+        ).view(m, n)
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
@@ -1472,6 +1497,23 @@ def _apply_fallback_scaled_mm(
     if bias is not None:
         output = output + bias
     return output.to(dtype=input_dtype)
+
+
+def apply_fp8_linear_bmm_flashinfer(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+    input_2d = input.view(-1, input.shape[-1])
+    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
 
 
 def apply_fp8_linear(

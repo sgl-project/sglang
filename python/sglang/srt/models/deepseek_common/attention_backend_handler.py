@@ -45,12 +45,12 @@ def handle_attention_ascend(attn, forward_batch):
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MLA_NPU
