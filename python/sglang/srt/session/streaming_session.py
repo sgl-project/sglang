@@ -331,7 +331,9 @@ class StreamingSession(BasePrefixCache):
                 # TODO: with real move semantics this would be `req.mamba = None`.
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
-            slot.kv.kv_allocated_len = max(slot.kv.kv_allocated_len, req.kv_allocated_len)
+            slot.kv.kv_allocated_len = max(
+                slot.kv.kv_allocated_len, req.kv_allocated_len
+            )
             self.release_session(session_id)
             req.req_pool_idx = None
             req.session.abort_req()
@@ -419,7 +421,9 @@ class StreamingSession(BasePrefixCache):
         protected_len = slot.cache.cache_protected_len
         lock_node = slot.cache.last_node
         tokens_freed = (
-            max(0, slot.kv.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
+            max(0, slot.kv.kv_allocated_len - protected_len)
+            if slot.is_holding_kv
+            else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
