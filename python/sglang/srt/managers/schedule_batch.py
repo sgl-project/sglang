@@ -660,6 +660,18 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class CacheLock:
+    # The prefix length that is inserted into the tree cache
+    protected_len: int = 0
+    # TODO(ispobock): rename to last_device_node
+    last_node: Any = None
+    # The node to lock until for swa radix tree lock ref
+    swa_uuid_for_lock: Optional[int] = None
+    # Whether the prefill-time SWA tree lock has been released early
+    swa_prefix_lock_released: bool = False
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -843,8 +855,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        # TODO(ispobock): rename to last_device_node
-        self.last_node: Any = None
+        self.cache_lock: Optional[CacheLock] = CacheLock()
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -858,12 +869,6 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
-        # The node to lock until for swa radix tree lock ref
-        self.swa_uuid_for_lock: Optional[int] = None
-        # Whether the prefill-time SWA tree lock has been released early
-        self.swa_prefix_lock_released: bool = False
-        # The prefix length that is inserted into the tree cache
-        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1043,6 +1048,44 @@ class Req(ReqDllmMixin):
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
         )
+
+    @property
+    def cache_protected_len(self) -> int:
+        return self.cache_lock.protected_len if self.cache_lock is not None else 0
+
+    @cache_protected_len.setter
+    def cache_protected_len(self, value: int) -> None:
+        self.cache_lock.protected_len = value
+
+    @property
+    def last_node(self) -> Any:
+        return self.cache_lock.last_node if self.cache_lock is not None else None
+
+    @last_node.setter
+    def last_node(self, value: Any) -> None:
+        self.cache_lock.last_node = value
+
+    @property
+    def swa_uuid_for_lock(self) -> Optional[int]:
+        return (
+            self.cache_lock.swa_uuid_for_lock if self.cache_lock is not None else None
+        )
+
+    @swa_uuid_for_lock.setter
+    def swa_uuid_for_lock(self, value: Optional[int]) -> None:
+        self.cache_lock.swa_uuid_for_lock = value
+
+    @property
+    def swa_prefix_lock_released(self) -> bool:
+        return (
+            self.cache_lock.swa_prefix_lock_released
+            if self.cache_lock is not None
+            else False
+        )
+
+    @swa_prefix_lock_released.setter
+    def swa_prefix_lock_released(self, value: bool) -> None:
+        self.cache_lock.swa_prefix_lock_released = value
 
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
