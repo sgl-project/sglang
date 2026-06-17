@@ -1225,8 +1225,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
-    # Load for DP balance
-    load: Optional[GetLoadsReqOutput] = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1343,9 +1341,6 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
-
-    # Load for DP balance
-    load: Optional[GetLoadsReqOutput] = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -2106,10 +2101,6 @@ class GetLoadsReqOutput(BaseReq, kw_only=True):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
-
-
-class WatchLoadUpdateReq(BaseReq, kw_only=True):
-    loads: List[GetLoadsReqOutput]
 
 
 class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):
