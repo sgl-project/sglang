@@ -109,7 +109,7 @@ if _is_cuda:
     # submodule, paying per-submodule host overhead with no fusion benefit.
     #
     # The further "module fusion" — coalescing this op with the strictly adjacent
-    # `pcg_dsa_indexer_graph_dispatch` into a single eager region (no captured segment
+    # `pcg_dsa_indexer_graph_split` into a single eager region (no captured segment
     # between the two adjacent eager breaks) — is currently BCG-only: breakable
     # CUDA graph drops the empty segment and chains the adjacent replay fns (see
     # `breakable_cuda_graph.eager_on_graph`). Under PCG, `split_graph` leaves each
