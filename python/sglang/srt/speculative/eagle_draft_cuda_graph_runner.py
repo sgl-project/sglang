@@ -472,10 +472,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             f"{self.model_runner.model_config.vocab_size}",
         )
 
-        # Common inputs — batch the per-field device copies into a single
-        # grouped foreach copy (one foreach call per dtype pair) to cut launch
-        # overhead on the replay path. seq_lens_cpu is handled separately below
-        # since it lives on host.
+        # Common inputs — batch the small per-field device copies into a grouped
+        # foreach copy (one foreach call per dtype pair) to cut launch overhead.
+        # hidden_states is handled separately below (see note), and seq_lens_cpu
+        # is handled further down since it lives on host.
         copy_dsts = [
             buffers.seq_lens[:raw_bs],
             buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
@@ -501,13 +501,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+        # hidden_states is large + contiguous, so keep it on a plain copy_(): that
+        # lowers to a cudaMemcpyAsync DMA (copy engine), whereas folding it into
+        # _foreach_copy_ forces it through the multi_tensor_apply compute kernel
+        # (~3x slower, no copy-engine offload).
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
         ):
-            copy_dsts.append(buffers.hidden_states[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.hidden_states)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

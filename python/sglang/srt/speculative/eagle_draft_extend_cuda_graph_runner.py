@@ -456,9 +456,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
-        # Batch the per-field device copies into a single grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead on the replay
-        # path. seq_lens_cpu is handled separately below since it lives on host.
+        # Batch the small per-field device copies into a grouped foreach copy
+        # (one foreach call per dtype pair) to cut launch overhead. hidden_states
+        # is handled separately below (see note), and seq_lens_cpu is handled
+        # further down since it lives on host.
         copy_dsts = [
             buffers.input_ids[:num_tokens],
             buffers.seq_lens[:raw_bs],
@@ -478,20 +479,26 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.extend_seq_lens)
         else:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
-        if (
-            buffers.hidden_states is not None
-            and forward_batch.spec_info.hidden_states is not None
-            and forward_batch.spec_info.hidden_states.shape[1]
-            == buffers.hidden_states.shape[1]
-        ):
-            copy_dsts.append(buffers.hidden_states[:num_tokens])
-            copy_srcs.append(forward_batch.spec_info.hidden_states)
         if forward_batch.spec_info.num_correct_drafts is not None:
             copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
             copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+        # hidden_states is large + contiguous, so keep it on a plain copy_(): that
+        # lowers to a cudaMemcpyAsync DMA (copy engine), whereas folding it into
+        # _foreach_copy_ forces it through the multi_tensor_apply compute kernel
+        # (~3x slower, no copy-engine offload).
+        if (
+            buffers.hidden_states is not None
+            and forward_batch.spec_info.hidden_states is not None
+            and forward_batch.spec_info.hidden_states.shape[1]
+            == buffers.hidden_states.shape[1]
+        ):
+            buffers.hidden_states[:num_tokens].copy_(
+                forward_batch.spec_info.hidden_states
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
