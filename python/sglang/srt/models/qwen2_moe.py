@@ -31,9 +31,12 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_pp_indices,
     get_tensor_model_parallel_world_size,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -936,6 +939,16 @@ class Qwen2MoeModel(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
+            if (
+                hidden_states is not None
+                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                and hidden_states._sglang_needs_allreduce_fusion
+            ):
+                if get_moe_expert_parallel_world_size() > 1:
+                    hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+                elif get_moe_tensor_parallel_world_size() > 1:
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
