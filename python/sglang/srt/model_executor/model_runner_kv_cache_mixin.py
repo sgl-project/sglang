@@ -17,11 +17,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils.dcp_utils import (
     dcp_enabled,
-    get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
 from sglang.srt.mem_cache.allocator import (
-    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -305,16 +303,24 @@ class ModelRunnerKVCacheMixin:
     def _init_dcp_kv_pool_allocator(self: ModelRunner, need_sort) -> None:
         # When dcp_enabled, kv cache is stored across dcp ranks in round-robin mode. max_total_num_tokens should be scaled up by dcp_world_size of current dcp rank. This ensures the correctness of computing the number of free KV cache tokens when assembling forward_batch in schedule_policy.
         self.max_total_num_tokens *= get_attention_dcp_world_size()
-        self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
+        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
             self.max_total_num_tokens,
-            self.page_size,
+            self.page_size * get_attention_dcp_world_size(),
             dtype=self.kv_cache_dtype,
             device=self.device,
             kvcache=self.token_to_kv_pool,
             need_sort=need_sort,
-            dcp_rank=get_attention_dcp_rank(),
-            dcp_world_size=get_attention_dcp_world_size(),
         )
+        # self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
+        #     self.max_total_num_tokens,
+        #     self.page_size,
+        #     dtype=self.kv_cache_dtype,
+        #     device=self.device,
+        #     kvcache=self.token_to_kv_pool,
+        #     need_sort=need_sort,
+        #     dcp_rank=get_attention_dcp_rank(),
+        #     dcp_world_size=get_attention_dcp_world_size(),
+        # )
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
