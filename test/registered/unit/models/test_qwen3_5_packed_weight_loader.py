@@ -25,7 +25,6 @@ import torch
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
-from sglang.test.test_utils import CustomTestCase
 
 
 class MockQuantConfig:
@@ -58,7 +57,7 @@ def _make_per_tensor_scale_param(num_shards):
     )
 
 
-class TestMakePackedWeightLoader(CustomTestCase):
+class TestMakePackedWeightLoader(unittest.TestCase):
     """Tests for _make_packed_weight_loader broadcast / split logic."""
 
     # ------------------------------------------------------------------ #
@@ -231,9 +230,10 @@ class TestMakePackedWeightLoader(CustomTestCase):
             self.assertAlmostEqual(chunk.item(), 0.75, places=5)
 
 
-class TestQwen35ModelOptFp4Loading(CustomTestCase):
+class TestQwen35ModelOptFp4Loading(unittest.TestCase):
     def setUp(self):
         qwen3_5._get_modelopt_fp4_submodule_policy.cache_clear()
+        qwen3_5._get_modelopt_fp4_checkpoint_weight_dtypes.cache_clear()
 
     def test_modelopt_fp4_policy_uses_layer_scope(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,6 +274,35 @@ class TestQwen35ModelOptFp4Loading(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_safetensors_header(
                 Path(tmpdir) / "part-00001.safetensors",
+                {
+                    "model.layers.0.linear_attn.in_proj_b.weight": {"dtype": "U8"},
+                    "model.layers.0.linear_attn.in_proj_a.weight": {"dtype": "U8"},
+                },
+            )
+            config = SimpleNamespace(_name_or_path=tmpdir)
+            modelopt = MockQuantConfig("modelopt_fp4")
+
+            self.assertIs(
+                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
+                    config, modelopt, "linear_attn", 0
+                ),
+                modelopt,
+            )
+
+    def test_modelopt_fp4_policy_scans_safetensors_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = {
+                "weight_map": {
+                    "model.layers.0.linear_attn.in_proj_b.weight": "shard-a.safetensors",
+                    "model.layers.0.linear_attn.in_proj_a.weight": "shard-a.safetensors",
+                    "model.layers.0.mlp.up_proj.weight": "missing.safetensors",
+                }
+            }
+            (Path(tmpdir) / "model.safetensors.index.json").write_text(
+                json.dumps(index)
+            )
+            _write_safetensors_header(
+                Path(tmpdir) / "shard-a.safetensors",
                 {
                     "model.layers.0.linear_attn.in_proj_b.weight": {"dtype": "U8"},
                     "model.layers.0.linear_attn.in_proj_a.weight": {"dtype": "U8"},

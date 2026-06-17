@@ -67,7 +67,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
-    _maybe_squeeze_modelopt_fp4_weight,
+    maybe_squeeze_modelopt_fp4_weight,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -254,43 +254,45 @@ def _read_modelopt_fp4_submodule_dtypes(
     module_kind: str,
     layer_id: Optional[int],
 ) -> Set[str]:
-    dtypes: Set[str] = set()
-    for shard_file in _iter_relevant_safetensors_files(
-        model_path, module_kind, layer_id
-    ):
+    return {
+        dtype
+        for key, dtype in _get_modelopt_fp4_checkpoint_weight_dtypes(model_path)
+        if _is_modelopt_fp4_relevant_weight_key(key, module_kind, layer_id)
+    }
+
+
+@lru_cache(maxsize=None)
+def _get_modelopt_fp4_checkpoint_weight_dtypes(
+    model_path: str,
+) -> Tuple[Tuple[str, str], ...]:
+    dtypes = []
+    for shard_file in _iter_safetensors_files(model_path):
         with _open_checkpoint_file(model_path, shard_file) as file_obj:
             header_len = struct.unpack("<Q", file_obj.read(8))[0]
             header = json.loads(file_obj.read(header_len))
         for key, meta in header.items():
-            if (
-                key != "__metadata__"
-                and isinstance(meta, dict)
-                and _is_modelopt_fp4_relevant_weight_key(key, module_kind, layer_id)
-            ):
-                dtype = meta.get("dtype")
-                if dtype:
-                    dtypes.add(str(dtype))
-    return dtypes
+            if key == "__metadata__" or not isinstance(meta, dict):
+                continue
+            dtype = meta.get("dtype")
+            if dtype and key.endswith(".weight"):
+                dtypes.append((key, str(dtype)))
+    return tuple(dtypes)
 
 
-def _iter_relevant_safetensors_files(
-    model_path: str,
-    module_kind: str,
-    layer_id: Optional[int],
-) -> Tuple[str, ...]:
+def _iter_safetensors_files(model_path: str) -> Tuple[str, ...]:
     if _checkpoint_file_exists(model_path, "model.safetensors.index.json"):
         with _open_checkpoint_file(model_path, "model.safetensors.index.json") as f:
             weight_map = json.loads(f.read()).get("weight_map", {})
         if isinstance(weight_map, dict):
-            files = sorted(
-                {
-                    shard
-                    for key, shard in weight_map.items()
-                    if _is_modelopt_fp4_relevant_weight_key(key, module_kind, layer_id)
-                }
+            return tuple(
+                sorted(
+                    {
+                        shard
+                        for key, shard in weight_map.items()
+                        if _is_modelopt_fp4_candidate_weight_key(key)
+                    }
+                )
             )
-            if files:
-                return tuple(files)
 
     if _checkpoint_file_exists(model_path, "model.safetensors"):
         return ("model.safetensors",)
@@ -370,6 +372,14 @@ def _is_modelopt_fp4_relevant_weight_key(
         return ".mtp." in f".{key}" and key.endswith(".weight")
 
     return False
+
+
+def _is_modelopt_fp4_candidate_weight_key(key: str) -> bool:
+    return (
+        _is_modelopt_fp4_relevant_weight_key(key, "linear_attn", None)
+        or _is_modelopt_fp4_relevant_weight_key(key, "attention", None)
+        or _is_modelopt_fp4_relevant_weight_key(key, "mtp", None)
+    )
 
 
 def _format_modelopt_fp4_module_kind(module_kind: str, layer_id: Optional[int]) -> str:
@@ -600,7 +610,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
-            loaded_weight = _maybe_squeeze_modelopt_fp4_weight(param, loaded_weight)
+            loaded_weight = maybe_squeeze_modelopt_fp4_weight(param, loaded_weight)
             # Only intercept split-checkpoint tuple shards.
             # int shard_id and None should preserve original behavior.
             if isinstance(loaded_shard_id, tuple):
