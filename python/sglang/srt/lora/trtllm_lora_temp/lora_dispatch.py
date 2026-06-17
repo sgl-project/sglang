@@ -303,11 +303,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmBf16MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmBf16MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     """BF16 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
     Decomposed (unfused-activation) MoE-LoRA, bf16 end-to-end (no quantization):
