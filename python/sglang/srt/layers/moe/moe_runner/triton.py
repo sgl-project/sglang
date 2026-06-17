@@ -83,7 +83,7 @@ class TritonRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
         if quant_info.use_mxfp8:
-            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
             )
 
@@ -174,7 +174,7 @@ def fused_experts_none_to_triton(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     if quant_info.use_mxfp8:
-        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
             fused_experts_mxfp8,
         )
 

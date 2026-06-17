@@ -137,11 +137,13 @@ def _swiglu_oai_mxfp8_quant_kernel(
     valid_groups = pid_i * groups + tl.arange(0, groups) < (n_inter // 32)
 
     amax = tl.maximum(tl.max(tl.abs(activated_2d), axis=1), 1e-30)
-    scale_biased = tl.floor(tl.log2(amax)) + 127.0
+    # Round the E8M0 exponent up (ceil(log2(amax / e4m3_max))) so the block amax
+    # stays inside the e4m3 range and the full dynamic range is used.
+    scale_biased = tl.ceil(tl.log2(amax / 448.0)) + 127.0
     scale_biased = tl.minimum(tl.maximum(scale_biased, 0.0), 254.0)
     descale = tl.reshape(tl.exp2(scale_biased - 127.0), (groups, 1))
 
-    q_2d = activated_2d / descale
+    q_2d = tl.clamp(activated_2d / descale, -448.0, 448.0)
     q = tl.reshape(q_2d, (BLOCK_I,)).to(q_ptr.dtype.element_ty)
 
     tl.store(q_ptr + row * stride_qm + cols * stride_qn, q, mask=mask)

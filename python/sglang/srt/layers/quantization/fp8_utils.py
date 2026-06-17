@@ -391,7 +391,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif _is_hip and _is_gfx95_supported:
         # ROCm gfx95: native MXFP8 dense GEMM via Triton tl.dot_scaled
         # (replaces the FlyDSL v_mfma_scale_f32_32x32x64 dense path).
-        from sglang.srt.layers.quantization.mxfp8_native import (
+        from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
