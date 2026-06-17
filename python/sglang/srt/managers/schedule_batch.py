@@ -768,7 +768,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv_info: Optional[ReqKvInfo] = ReqKvInfo()
+        self.kv_info: ReqKvInfo = ReqKvInfo()
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
@@ -811,7 +811,7 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
-        self.mamba_info: Optional[ReqMambaInfo] = ReqMambaInfo()
+        self.mamba_info: ReqMambaInfo = ReqMambaInfo()
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -864,7 +864,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache_info: Optional[ReqCacheInfo] = ReqCacheInfo()
+        self.cache_info: ReqCacheInfo = ReqCacheInfo()
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1060,7 +1060,7 @@ class Req(ReqDllmMixin):
 
     @property
     def cache_protected_len(self) -> int:
-        return self.cache_info.cache_protected_len if self.cache_info is not None else 0
+        return self.cache_info.cache_protected_len
 
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
@@ -1068,7 +1068,7 @@ class Req(ReqDllmMixin):
 
     @property
     def last_node(self) -> Any:
-        return self.cache_info.last_node if self.cache_info is not None else None
+        return self.cache_info.last_node
 
     @last_node.setter
     def last_node(self, value: Any) -> None:
@@ -1076,9 +1076,7 @@ class Req(ReqDllmMixin):
 
     @property
     def swa_uuid_for_lock(self) -> Optional[int]:
-        return (
-            self.cache_info.swa_uuid_for_lock if self.cache_info is not None else None
-        )
+        return self.cache_info.swa_uuid_for_lock
 
     @swa_uuid_for_lock.setter
     def swa_uuid_for_lock(self, value: Optional[int]) -> None:
@@ -1086,11 +1084,7 @@ class Req(ReqDllmMixin):
 
     @property
     def swa_prefix_lock_released(self) -> bool:
-        return (
-            self.cache_info.swa_prefix_lock_released
-            if self.cache_info is not None
-            else False
-        )
+        return self.cache_info.swa_prefix_lock_released
 
     @swa_prefix_lock_released.setter
     def swa_prefix_lock_released(self, value: bool) -> None:
@@ -1098,7 +1092,7 @@ class Req(ReqDllmMixin):
 
     @property
     def kv_allocated_len(self) -> int:
-        return self.kv_info.kv_allocated_len if self.kv_info is not None else 0
+        return self.kv_info.kv_allocated_len
 
     @kv_allocated_len.setter
     def kv_allocated_len(self, value: int) -> None:
@@ -1106,7 +1100,7 @@ class Req(ReqDllmMixin):
 
     @property
     def swa_evicted_seqlen(self) -> int:
-        return self.kv_info.swa_evicted_seqlen if self.kv_info is not None else 0
+        return self.kv_info.swa_evicted_seqlen
 
     @swa_evicted_seqlen.setter
     def swa_evicted_seqlen(self, value: int) -> None:
@@ -1114,7 +1108,7 @@ class Req(ReqDllmMixin):
 
     @property
     def mamba_pool_idx(self) -> Optional[torch.Tensor]:
-        return self.mamba_info.mamba_pool_idx if self.mamba_info is not None else None
+        return self.mamba_info.mamba_pool_idx
 
     @mamba_pool_idx.setter
     def mamba_pool_idx(self, value: Optional[torch.Tensor]) -> None:
@@ -1122,11 +1116,7 @@ class Req(ReqDllmMixin):
 
     @property
     def mamba_ping_pong_track_buffer(self) -> Optional[torch.Tensor]:
-        return (
-            self.mamba_info.mamba_ping_pong_track_buffer
-            if self.mamba_info is not None
-            else None
-        )
+        return self.mamba_info.mamba_ping_pong_track_buffer
 
     @mamba_ping_pong_track_buffer.setter
     def mamba_ping_pong_track_buffer(self, value: Optional[torch.Tensor]) -> None:
@@ -1134,11 +1124,7 @@ class Req(ReqDllmMixin):
 
     @property
     def mamba_next_track_idx(self) -> Optional[int]:
-        return (
-            self.mamba_info.mamba_next_track_idx
-            if self.mamba_info is not None
-            else None
-        )
+        return self.mamba_info.mamba_next_track_idx
 
     @mamba_next_track_idx.setter
     def mamba_next_track_idx(self, value: Optional[int]) -> None:
@@ -1146,11 +1132,7 @@ class Req(ReqDllmMixin):
 
     @property
     def mamba_last_track_seqlen(self) -> Optional[int]:
-        return (
-            self.mamba_info.mamba_last_track_seqlen
-            if self.mamba_info is not None
-            else None
-        )
+        return self.mamba_info.mamba_last_track_seqlen
 
     @mamba_last_track_seqlen.setter
     def mamba_last_track_seqlen(self, value: Optional[int]) -> None:
@@ -1158,11 +1140,7 @@ class Req(ReqDllmMixin):
 
     @property
     def mamba_branching_seqlen(self) -> Optional[int]:
-        return (
-            self.mamba_info.mamba_branching_seqlen
-            if self.mamba_info is not None
-            else None
-        )
+        return self.mamba_info.mamba_branching_seqlen
 
     @mamba_branching_seqlen.setter
     def mamba_branching_seqlen(self, value: Optional[int]) -> None:
