@@ -1854,19 +1854,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            # Surface scheduler load info on each response so clients can do
-            # response-based flow control without polling /v1/loads. The
-            # scheduler already piggy-backs the per-DP-rank load on
-            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
-            load = getattr(recv_obj, "load", None)
-            if load is not None:
-                num_running_reqs = getattr(load, "num_running_reqs", None)
-                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
-                if num_running_reqs is not None:
-                    meta_info["num_running_reqs"] = num_running_reqs
-                if num_waiting_reqs is not None:
-                    meta_info["num_waiting_reqs"] = num_waiting_reqs
-
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
