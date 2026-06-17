@@ -82,7 +82,7 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
         logger.warning(
             "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
             "as original. Please use ltx2_two_stage_device_mode=original or "
-            "resident instead."
+            "resident instead. This alias may be removed after two release cycles."
         )
         return "original"
     return mode
@@ -1418,7 +1418,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
-                "'snapshot' is deprecated and treated as 'original'. "
+                "'snapshot' is deprecated, treated as 'original', and may be "
+                "removed after two release cycles. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
