@@ -55,7 +55,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
-        extra_weight_attrs: dict,
+        **extra_weight_attrs,
     ) -> None:
         """
         Create and register weight, scale, and offset parameters for the layer.
