@@ -10,6 +10,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinBasePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPipelineConfig,
+    QwenImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
     ZImagePipelineConfig,
@@ -229,14 +238,22 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
     def test_pipeline_configs_can_mark_bcg_unsupported(self):
         for cfg in (
+            PipelineConfig(),
             SanaPipelineConfig(),
             ZImagePipelineConfig(),
             GlmImagePipelineConfig(),
             Flux2KleinBasePipelineConfig(),
+            LTX2PipelineConfig(),
+            QwenImageEditPipelineConfig(),
         ):
             self.assertFalse(cfg.supports_breakable_cuda_graph, type(cfg).__name__)
             self.assertIsInstance(cfg.breakable_cuda_graph_unsupported_reason, str)
             self.assertGreater(len(cfg.breakable_cuda_graph_unsupported_reason), 16)
+
+    def test_only_benchmarked_pipeline_configs_opt_into_bcg(self):
+        for cfg in (QwenImagePipelineConfig(), Hunyuan3D2PipelineConfig()):
+            self.assertTrue(cfg.supports_breakable_cuda_graph, type(cfg).__name__)
+            self.assertIsNone(cfg.breakable_cuda_graph_unsupported_reason)
 
     def test_unsupported_pipeline_config_does_not_create_bcg_runner(self):
         self.stage.server_args = SimpleNamespace(
@@ -445,6 +462,34 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
 
         self.assertIn("captured 3 segments", runner._capture_limit_reason(entry))
+
+    def test_bcg_runner_lazy_capture_only_during_warmup(self):
+        runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
+            return_value=SimpleNamespace(
+                forward_batch=SimpleNamespace(is_warmup=True)
+            ),
+        ):
+            self.assertTrue(runner._should_capture_on_call(("sig",)))
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
+            return_value=SimpleNamespace(
+                forward_batch=SimpleNamespace(is_warmup=False)
+            ),
+        ):
+            self.assertFalse(runner._should_capture_on_call(("sig",)))
+
+    def test_bcg_runner_lazy_capture_disabled_without_forward_context(self):
+        runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
+            side_effect=RuntimeError("no context"),
+        ):
+            self.assertFalse(runner._should_capture_on_call(("sig",)))
 
     def test_bcg_runner_reset_drops_entries_and_marks_disabled(self):
         runner = object.__new__(DiffusionBreakableCudaGraphRunner)

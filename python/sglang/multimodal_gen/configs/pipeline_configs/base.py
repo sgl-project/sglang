@@ -264,11 +264,13 @@ class PipelineConfig:
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
 
-    # Breakable CUDA graph support. Model-specific pipeline configs may opt out
-    # when profiling shows graph replay/copy overhead dominates or graph pools
-    # reserve too much memory for the model's shape/segment pattern.
-    supports_breakable_cuda_graph: bool = True
-    breakable_cuda_graph_unsupported_reason: str | None = None
+    # Breakable CUDA graph support is opt-in per pipeline after model-specific
+    # benchmarking shows a clear serving benefit.
+    supports_breakable_cuda_graph: bool = False
+    breakable_cuda_graph_unsupported_reason: str | None = (
+        "Breakable CUDA graph is disabled by default until the pipeline has "
+        "model-specific benchmark coverage showing a serving benefit."
+    )
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
