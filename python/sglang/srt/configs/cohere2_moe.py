@@ -4,15 +4,7 @@
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-try:
-    from huggingface_hub.dataclasses import strict
-except ImportError:  # older huggingface_hub
 
-    def strict(cls):  # type: ignore[misc]
-        return cls
-
-
-@strict
 class Cohere2MoeConfig(PretrainedConfig):
     model_type = "cohere2_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
