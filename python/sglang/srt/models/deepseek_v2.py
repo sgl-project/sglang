@@ -1602,28 +1602,8 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = True
                 self.next_skip_topk = True
             else:
-                self.index_topk_freq = getattr(config, "index_topk_freq", 1) or 1
-                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                self.index_skip_topk_offset = getattr(
-                    config, "index_skip_topk_offset", None
-                )
-                if (
-                    self.index_topk_pattern is None
-                    and self.index_skip_topk_offset is not None
-                ):
-                    self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                    self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
-                elif self.index_topk_pattern is None:
-                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
-                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
-                else:
-                    self.skip_topk = self.index_topk_pattern[layer_id] == "S"
-                    if layer_id < len(self.index_topk_pattern) - 1:
-                        self.next_skip_topk = (
-                            self.index_topk_pattern[layer_id + 1] == "S"
-                        )
-                    else:
-                        self.next_skip_topk = False
+                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
