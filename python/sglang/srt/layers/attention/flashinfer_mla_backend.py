@@ -646,6 +646,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
+            # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
             return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
         )
         return out
