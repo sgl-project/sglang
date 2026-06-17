@@ -3399,7 +3399,7 @@ class ServerArgs:
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
@@ -3415,7 +3415,7 @@ class ServerArgs:
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
             prefill == "flashinfer"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
             and cuda_major < 13
         ):

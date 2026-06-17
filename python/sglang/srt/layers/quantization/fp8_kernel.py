@@ -28,6 +28,7 @@ try:
 except:
     pass
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -767,6 +768,7 @@ def _static_quant_fp8(
     # Meta-parameters
     BLOCK: tl.constexpr,
     REPEAT_SCALE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform quantization using the given scale on a
     tensor
@@ -783,8 +785,15 @@ def _static_quant_fp8(
     cols = tl.arange(0, BLOCK)  # N <= BLOCK
     mask = cols < N
 
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y_s = tl.load(y_s_ptr).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     y_s_inv = 1.0 / y_s
     y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -831,6 +840,7 @@ def static_quant_fp8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _static_quant_fp8[(M,)](
         x,
         x_q,
@@ -844,6 +854,7 @@ def static_quant_fp8(
         REPEAT_SCALE=repeat_scale,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s
