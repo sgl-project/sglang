@@ -19,7 +19,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(
+    est_time=600,
+    stage="extra-b",
+    runner_config="4-gpu-b200",
+    disabled="Waived until sgl-kernel fix is released",
+)
 
 MODEL = os.environ.get("QWEN3_30B_A3B_MODEL_PATH", "Qwen/Qwen3-30B-A3B")
 
