@@ -53,6 +53,10 @@ If you need to download model weights, check the model size before downloading t
 - [Qwen3-Next-80B-A3B-Instruct](https://www.modelscope.cn/models/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16)
 - [Qwen3-Next-80B-A3B-Instruct-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-Next-80B-A3B-Instruct-W8A8) (W8A8 quantized version)
 
+<Note>
+For EAGLE3 speculative decoding, use the BF16 weights as the draft model (set `--speculative-draft-model-path` to the BF16 weight path).
+</Note>
+
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
 refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
 
