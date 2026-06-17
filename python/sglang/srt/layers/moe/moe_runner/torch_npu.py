@@ -45,6 +45,10 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
 )
 
+from sglang.srt.distributed.communication_op import (
+            tensor_model_parallel_all_gather,
+)
+
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
