@@ -480,6 +480,9 @@ class MoonViT3dEncoder(nn.Module):
 
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         for block in self.blocks:
             hidden_states = block(
