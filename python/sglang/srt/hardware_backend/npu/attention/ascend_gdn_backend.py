@@ -191,14 +191,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
-            if (
-                not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
-            ):
-                mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
-                a = a[: forward_batch.num_token_non_padded_cpu]
-                b = b[: forward_batch.num_token_non_padded_cpu]
-                seq_len = forward_batch.num_token_non_padded_cpu
+            # if (
+            #     not self.graph_mode
+            #     and forward_batch.num_token_non_padded_cpu != num_token_padding
+            # ):
+            #     mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
+            #     a = a[: forward_batch.num_token_non_padded_cpu]
+            #     b = b[: forward_batch.num_token_non_padded_cpu]
+            #     seq_len = forward_batch.num_token_non_padded_cpu
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -358,7 +358,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
             num_accept_tokens = self.num_accept_tokens
-            actual_seq_lengths = self.actual_seq_lengths
+            # actual_seq_lengths = self.actual_seq_lengths
+            actual_seq_lengths = torch.full(
+                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+            )
             ssm_state_indices = self.ssm_state_indices
 
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
