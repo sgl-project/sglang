@@ -1434,9 +1434,10 @@ class Indexer(MultiPlatformOp):
                 positions=positions,
                 topk_result=topk_result,
             )
-            return maybe_capture_indexer_topk(
-                layer_id, topk_result if return_indices else None
+            result = _broadcast_indexer_topk_from_rank0(
+                topk_result if return_indices else None
             )
+            return maybe_capture_indexer_topk(layer_id, result)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
