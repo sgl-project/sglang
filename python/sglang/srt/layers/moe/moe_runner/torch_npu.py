@@ -138,10 +138,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             weight_prefix="w13",
             group_list_type=group_list_type,
         )
-        # TP all-gather for intermediate dimension if needed
-        if tp_size > 1:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
-
 
         # --- Activation ---
         # The DeepEP kernel expects extra dispatch metadata
@@ -156,6 +152,10 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                 hidden_states
             )
 
+        # TP all-gather for intermediate dimension if needed
+        if tp_size > 1:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
+        
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -166,10 +166,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-
-        # TP all-gather for intermediate dimension if needed
-        if tp_size > 1:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         return TorchNpuRunnerOutput(hidden_states=hidden_states)
 
