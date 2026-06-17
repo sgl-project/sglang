@@ -7,6 +7,8 @@ SGLang exports request trace data based on the OpenTelemetry Collector. You can 
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
 
+Scheduler traces include `prefill_queue_idle` and `prefill_budget_wait` slices for prefill requests. The first slice shows time spent waiting before the scheduler first tries to admit the request. The second slice shows time spent after that first attempt before forward starts, which usually points to token budget, chunking, or retry pressure.
+
 ## Setup Guide
 This section explains how to configure the request tracing and export the trace data.
 1. Install the required packages and tools

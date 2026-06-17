@@ -126,6 +126,16 @@ class RequestStage:
         # equal to "observe_queue_time"
         metrics_is_observed=False,
     )
+    PREFILL_QUEUE_IDLE = RequestStageConfig(
+        "prefill_queue_idle",
+        level=1,
+        metrics_is_observed=True,
+    )
+    PREFILL_BUDGET_WAIT = RequestStageConfig(
+        "prefill_budget_wait",
+        level=1,
+        metrics_is_observed=True,
+    )
     DECODE_FORWARD = RequestStageConfig(
         "decode_forward",
         level=1,
@@ -578,6 +588,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
+    first_prefill_attempt_time: float = 0.0
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
@@ -623,6 +634,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
+            "first_prefill_attempt_time": self.first_prefill_attempt_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
@@ -693,12 +705,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_chunked_prefill_finish_time = 0.0
         self.last_decode_finish_time = 0.0
         self.last_decode_scheduled_time = 0.0
+        self.first_prefill_attempt_time = 0.0
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_event("retract", 1, convert_time_to_realtime_ns(ts))
 
     def reset_prefill_retry_time(self):
         self.wait_queue_entry_time = 0.0
+        self.first_prefill_attempt_time = 0.0
         self.forward_entry_time = 0.0
         self.prefill_finished_time = 0.0
         self.completion_time = 0.0
@@ -729,6 +743,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         self.wait_queue_entry_time = ts
 
+    def set_first_prefill_attempt_time(self, ts=None):
+        if self.first_prefill_attempt_time == 0.0:
+            self.first_prefill_attempt_time = ts or time.perf_counter()
+
     def set_forward_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.forward_entry_time == 0.0:
@@ -747,6 +765,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
                 self.observe_per_stage_req_latency(stage, ts - slice_start_time)
                 self.trace_slice(stage, slice_start_time, ts)
+                if self.disagg_mode != DisaggregationMode.DECODE:
+                    self.observe_prefill_queue_breakdown(ts)
 
                 if self.disagg_mode == DisaggregationMode.DECODE:
                     self.trace_ctx.trace_slice_start(
@@ -1020,6 +1040,43 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
+    def get_idle_in_queue_time(self) -> float:
+        return self.duration_between(
+            self.wait_queue_entry_time, self.first_prefill_attempt_time
+        )
+
+    def get_prefill_budget_wait_time(self) -> float:
+        return self.duration_between(
+            self.first_prefill_attempt_time, self.forward_entry_time
+        )
+
+    def observe_prefill_queue_breakdown(self, forward_entry_time: float):
+        if self.first_prefill_attempt_time <= 0.0:
+            return
+
+        idle_in_queue_time = self.get_idle_in_queue_time()
+        prefill_budget_wait_time = self.duration_between(
+            self.first_prefill_attempt_time, forward_entry_time
+        )
+
+        self.observe_per_stage_req_latency(
+            RequestStage.PREFILL_QUEUE_IDLE, idle_in_queue_time
+        )
+        self.trace_slice(
+            RequestStage.PREFILL_QUEUE_IDLE,
+            self.wait_queue_entry_time,
+            self.first_prefill_attempt_time,
+        )
+
+        self.observe_per_stage_req_latency(
+            RequestStage.PREFILL_BUDGET_WAIT, prefill_budget_wait_time
+        )
+        self.trace_slice(
+            RequestStage.PREFILL_BUDGET_WAIT,
+            self.first_prefill_attempt_time,
+            forward_entry_time,
+        )
+
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.duration_between(
@@ -1034,7 +1091,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            return (
+                f"{self.format_prefill_queue_breakdown()}"
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            )
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
@@ -1075,6 +1137,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return (
                 f"{bootstrap_fields}"
+                f"{self.format_prefill_queue_breakdown()}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
@@ -1153,7 +1216,24 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "queue_time": self.get_queueing_time(),
             }
         )
+        if self.first_prefill_attempt_time > 0.0:
+            meta_data.update(
+                {
+                    "idle_in_queue_time": self.get_idle_in_queue_time(),
+                    "prefill_budget_wait_time": self.get_prefill_budget_wait_time(),
+                }
+            )
         return meta_data
+
+    def format_prefill_queue_breakdown(self) -> str:
+        if self.first_prefill_attempt_time <= 0.0:
+            return ""
+        return (
+            f"idle_in_queue_duration="
+            f"{self.format_duration(self.get_idle_in_queue_time())}, "
+            f"prefill_budget_wait_duration="
+            f"{self.format_duration(self.get_prefill_budget_wait_time())}, "
+        )
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
