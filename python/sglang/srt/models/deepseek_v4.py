@@ -2158,7 +2158,13 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        *,
+        is_full_load: bool = True,
+    ):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2462,34 +2468,38 @@ class DeepseekV4ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        assert len(cache_compressor_weight) == 0
-        assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
-        unloaded_params = params_dict.keys() - loaded_params
+        # Full-checkpoint coverage checks. Online weight updates pass a slice of
+        # tensors (is_full_load=False), so a fused pair may legitimately be only
+        # half-delivered and some params left untouched; skip the asserts/warning.
+        if is_full_load:
+            assert len(cache_compressor_weight) == 0
+            assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+            unloaded_params = params_dict.keys() - loaded_params
 
-        skipped_checking_patterns = [
-            "attn_mqa.k_scale",
-            "attn_mqa.v_scale",
-            "blockscale_swizzled",
-        ]
-        if not self.pp_group.is_first_rank:
-            skipped_checking_patterns.append("embed_tokens")
-        if not self.pp_group.is_last_rank:
-            skipped_checking_patterns.append("model.norm.")
-            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
-        if is_nextn:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
-        unloaded_params = {
-            p
-            for p in unloaded_params
-            if all(
-                skipped_checking_pattern not in p
-                for skipped_checking_pattern in skipped_checking_patterns
-            )
-        }
-        if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
+            skipped_checking_patterns = [
+                "attn_mqa.k_scale",
+                "attn_mqa.v_scale",
+                "blockscale_swizzled",
+            ]
+            if not self.pp_group.is_first_rank:
+                skipped_checking_patterns.append("embed_tokens")
+            if not self.pp_group.is_last_rank:
+                skipped_checking_patterns.append("model.norm.")
+                skipped_checking_patterns.extend(["lm_head", "hc_head_"])
+            if is_nextn:
+                skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+            unloaded_params = {
+                p
+                for p in unloaded_params
+                if all(
+                    skipped_checking_pattern not in p
+                    for skipped_checking_pattern in skipped_checking_patterns
+                )
+            }
+            if unloaded_params:
+                logger.warning(
+                    f"Some weights are not initialized from checkpoints: {unloaded_params}"
+                )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

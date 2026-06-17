@@ -274,8 +274,10 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             hidden_states_before_norm=pre_hc_head,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ):
+        super().load_weights(weights, is_nextn=True, is_full_load=is_full_load)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)
