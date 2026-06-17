@@ -311,16 +311,6 @@ class ModelRunnerKVCacheMixin:
             kvcache=self.token_to_kv_pool,
             need_sort=need_sort,
         )
-        # self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
-        #     self.max_total_num_tokens,
-        #     self.page_size,
-        #     dtype=self.kv_cache_dtype,
-        #     device=self.device,
-        #     kvcache=self.token_to_kv_pool,
-        #     need_sort=need_sort,
-        #     dcp_rank=get_attention_dcp_rank(),
-        #     dcp_world_size=get_attention_dcp_world_size(),
-        # )
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
