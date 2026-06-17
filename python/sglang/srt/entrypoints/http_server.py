@@ -380,9 +380,17 @@ async def lifespan(fast_api_app: FastAPI):
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
         )
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+    except Exception as e:
+        # Optional endpoint; a load failure (e.g. the gpt-oss harmony vocab
+        # download) must not look like a fatal error. One-line WARNING, full
+        # traceback at DEBUG.
+        logger.warning(
+            f"OpenAI Responses API (/v1/responses) disabled: "
+            f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
+        )
+        logger.debug(
+            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+        )
 
     # Execute custom warmups
     if server_args.warmups is not None:

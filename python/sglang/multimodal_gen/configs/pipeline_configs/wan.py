@@ -222,6 +222,7 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.boundary_ratio = self.boundary_ratio
+        self.dit_config.torch_compile_mode = "default"
 
 
 @dataclass

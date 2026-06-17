@@ -710,7 +710,8 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params"
+              "docs/basic_usage/sampling_params",
+              "docs/basic_usage/aws_sagemaker"
             ]
           },
           {
@@ -981,6 +982,7 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
                       "cookbook/autoregressive/GLM/GLM-OCR",
