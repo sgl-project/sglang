@@ -1190,6 +1190,13 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        # DFlash spec_v1 non-overlap 路径不经过 _forward_isolation，
+        # 需显式调用 update_penalties() 填充 acc_scaling_penalties
+        if batch.sampling_info is not None:
+            _orch = getattr(batch.sampling_info, "penalizer_orchestrator", None)
+            if _orch is not None and _orch.is_required:
+                batch.sampling_info.update_penalties()
+
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
         )
@@ -1208,6 +1215,85 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+
+        # === DFlash Repetition Penalty Fix (V-Final) ===
+        bs = new_bonus_tokens.shape[0]
+        draft_tokens_raw = verify_input.draft_token
+        if draft_tokens_raw.dim() == 1:
+            draft_tokens = draft_tokens_raw.view(bs, self.block_size)
+        else:
+            draft_tokens = draft_tokens_raw
+
+        max_k = draft_tokens.shape[1] - 1
+        correct_len = commit_lens - 1
+        verified_id = draft_tokens[:, 0]
+
+        vocab_sz_src = getattr(batch.sampling_info, "acc_scaling_penalties", None)
+        if vocab_sz_src is not None:
+            vocab_size = vocab_sz_src.shape[1]
+        elif logits_output.next_token_logits is not None:
+            vocab_size = logits_output.next_token_logits.shape[1]
+        else:
+            vocab_size = 32000
+
+        device = draft_tokens.device
+
+        # --- L3: Hard Guard（无条件执行，防死循环）---
+        meltdown = torch.zeros(bs, dtype=torch.bool, device=device)
+        if max_k > 0:
+            # 🔑 .all(): 整个block全是同一个token才算meltdown，不误杀正常重复
+            is_repeating_draft = (draft_tokens[:, 1:] == verified_id.unsqueeze(1)).all(dim=1)
+            full_loop = (correct_len >= max_k) & is_repeating_draft
+            zero_loop = (correct_len <= 0) & (new_bonus_tokens == verified_id)
+            meltdown = full_loop | zero_loop
+
+        if meltdown.any():
+            logger.warning(f"[DFLASH_HARD_GUARD] Triggered for {int(meltdown.sum().item())}/{bs} seqs.")
+            vid_md = verified_id[meltdown]
+            alt = torch.where(vid_md + 1 < vocab_size, vid_md + 1, torch.clamp(vid_md - 1, min=0))
+            idx = meltdown.nonzero(as_tuple=True)[0].squeeze(-1)
+            new_bonus_tokens[idx] = alt
+
+        # --- L1/L2: Vectorized penalty accumulation（零Python循环）---
+        orch = getattr(batch.sampling_info, "penalizer_orchestrator", None)
+        if orch is not None and orch.is_required:
+            from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
+            rep_pen = orch.penalizers.get(BatchedRepetitionPenalizer)
+            # 安全守卫：确保 penalizer 已初始化且包含累积惩罚矩阵
+            if rep_pen is not None and hasattr(rep_pen, "cumulated_repetition_penalties"):
+                cumulated = rep_pen.cumulated_repetition_penalties       # [B,V]
+                pfac      = rep_pen.repetition_penalties                 # [B,1]
+
+                # -- Accepted draft tokens (Doubao fix: clamp safety + torch.where) --
+                if max_k > 0:
+                    # Safety: Clamp correct_len to avoid negative indexing issues
+                    safe_correct_len = torch.clamp(correct_len, min=0)
+                    pos_idx = torch.arange(max_k, device=draft_tokens.device)
+                    valid_mask = pos_idx.unsqueeze(0) < safe_correct_len.unsqueeze(1)
+                    
+                    # Extract row (batch) and column (pos) indices directly
+                    b_idx, p_idx = torch.where(valid_mask)
+                    
+                    if b_idx.numel() > 0:
+                        # p_idx is relative offset, +1 to map to actual column index
+                        toks = draft_tokens[b_idx, p_idx + 1]
+                        safe = (toks >= 0) & (toks < cumulated.shape[1])
+                        
+                        # Apply penalty factor (using assignment for existence coverage)
+                        cumulated[b_idx[safe], toks[safe]] = pfac[b_idx[safe]].flatten()
+                            
+                # -- Bonus token --
+                bon_safe = (new_bonus_tokens >= 0) & (new_bonus_tokens < cumulated.shape[1])
+                if bon_safe.any():
+                    bon_bids = torch.arange(bs, device=cumulated.device)[bon_safe]
+                    cumulated[bon_bids, new_bonus_tokens[bon_safe]] = pfac.squeeze(-1)[bon_safe]
+                    
+                # Sync snapshot back — next verify reads updated penalties
+                acc_sc = getattr(batch.sampling_info, "acc_scaling_penalties", None)
+                if acc_sc is not None and acc_sc.shape == cumulated.shape:
+                    acc_sc.copy_(cumulated)
+        # === End DFlash Repetition Penalty Fix (V-Final) ===
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
