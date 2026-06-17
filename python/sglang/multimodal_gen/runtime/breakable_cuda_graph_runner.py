@@ -77,16 +77,19 @@ class DiffusionBreakableCudaGraphRunner(BaseBreakableCudaGraphRunner):
     """
 
     def _should_capture_on_call(self, key) -> bool:
-        """Diffusion DiTs capture lazily on first use of each signature.
+        """Allow lazy capture only while the current request is warmup.
 
-        Across denoising stages the runner is reached through several call
-        paths (the base stage, and model-specific stages that enter
-        ``set_forward_context`` without a ``forward_batch``), so gating capture
-        on a per-call warmup signal is unreliable and would silently disable
-        BCG for those stages. Instead, capture-on-first-use is always allowed,
-        and the *no-recapture-while-serving* property is delivered by warmup:
-        warmup runs the model's full recommended steps and (for the base stage)
-        every ``--bcg-text-buckets`` bucket, so by the time real requests
-        arrive every signature is already captured and serving only replays.
+        The base runner never captures on a cache miss during serving. Diffusion
+        warmup may still drive the normal denoising path and lazily populate
+        signatures, including model-specific stages that do not call
+        ``runner.capture`` directly.
         """
-        return True
+        try:
+            from sglang.multimodal_gen.runtime.managers.forward_context import (
+                get_forward_context,
+            )
+
+            forward_batch = get_forward_context().forward_batch
+        except Exception:
+            return False
+        return bool(getattr(forward_batch, "is_warmup", False))

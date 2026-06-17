@@ -500,6 +500,35 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertFalse(server_args.server_warmup)
 
 
+class TestBreakableCudaGraphSupport(unittest.TestCase):
+    def test_unsupported_pipeline_disables_requested_bcg(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_breakable_cuda_graph": True,
+            },
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertFalse(args.enable_breakable_cuda_graph)
+        self.assertFalse(args.warmup)
+        self.assertFalse(args.server_warmup)
+
+    def test_supported_pipeline_keeps_requested_bcg(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_breakable_cuda_graph": True,
+                "warmup_resolutions": ["1024x1024"],
+            },
+            pipeline_config=QwenImagePipelineConfig(),
+        )
+
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        self.assertTrue(args.warmup)
+        self.assertTrue(args.server_warmup)
+
+
 class TestWarmupModeNormalization(unittest.TestCase):
     """`_adjust_warmup` resolves the canonical warmup_mode and its derived booleans."""
 

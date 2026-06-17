@@ -2017,7 +2017,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not isinstance(current_model, nn.Module):
             return None
         pipeline_config = getattr(self.server_args, "pipeline_config", None)
-        if not getattr(pipeline_config, "supports_breakable_cuda_graph", True):
+        if not getattr(pipeline_config, "supports_breakable_cuda_graph", False):
             reason = getattr(
                 pipeline_config,
                 "breakable_cuda_graph_unsupported_reason",

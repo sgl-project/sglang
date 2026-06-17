@@ -400,6 +400,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
+        self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
         # adjust parallelism before attention backend
@@ -468,6 +469,25 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "--bcg-text-buckets must contain at least one positive integer."
             )
+
+    def _adjust_breakable_cuda_graph_support(self):
+        if not self.enable_breakable_cuda_graph:
+            return
+
+        pipeline_config = getattr(self, "pipeline_config", None)
+        if getattr(pipeline_config, "supports_breakable_cuda_graph", False):
+            return
+
+        reason = getattr(
+            pipeline_config, "breakable_cuda_graph_unsupported_reason", None
+        )
+        logger.warning(
+            "[Diffusion BCG] disabled for %s: %s",
+            type(pipeline_config).__name__,
+            reason
+            or "pipeline config has not opted into Breakable CUDA graph support",
+        )
+        self.enable_breakable_cuda_graph = False
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
