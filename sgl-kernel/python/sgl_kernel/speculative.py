@@ -12,11 +12,11 @@ def tree_speculative_sampling_target_only(
     uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
+    draft_probs = torch.zeros_like(target_probs)
     torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
         predicts,
         accept_index,
