@@ -579,6 +579,25 @@ class MultimodalInputs:
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
 
+    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Count prompt tokens consumed by each modality (image, audio, video).
+
+        A modality's token count is the total span covered by its items'
+        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
+        """
+        image_tokens = audio_tokens = video_tokens = 0
+        for item in self.mm_items:
+            if not item.offsets:
+                continue
+            num_tokens = sum(end - start + 1 for start, end in item.offsets)
+            if item.is_image():
+                image_tokens += num_tokens
+            elif item.is_audio():
+                audio_tokens += num_tokens
+            elif item.is_video():
+                video_tokens += num_tokens
+        return image_tokens, audio_tokens, video_tokens
+
     def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
@@ -821,6 +840,11 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Pre-computed multimodal prompt token counts; populated on the prefill
+        # node and transferred to decode via the metadata buffer in disagg (PD) mode.
+        self.mm_image_tokens: int = 0
+        self.mm_audio_tokens: int = 0
+        self.mm_video_tokens: int = 0
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -1631,13 +1655,19 @@ def retract_all(
 
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
+    vocab_size: int,
 ) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    origin_ids = chunked_req.origin_input_ids
+    if fill_len >= len(origin_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
+    return None
 
 
 @dataclasses.dataclass
@@ -1839,7 +1869,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req
+                chunked_req,
+                model_config.vocab_size,
             ),
             dllm_config=dllm_config,
         )
@@ -2551,6 +2582,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
 
+    def cumulate_penalty_output_tokens(self):
+        # Under overlap batch.input_ids is just a placeholder here -- the
+        # real token is relayed via future_map and resolved at forward
+        # entry. So take the last output token from Req directly
+        # (origin_input_ids[-1] on the first decode, before any output).
+        last_tokens = [
+            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+            for req in self.reqs
+        ]
+        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
+        # pin_memory (matching the prefill-path tensors) keeps the copy async;
+        # is_pin_memory_available falls back to pageable on unsupported devices.
+        latest_output_ids = torch.tensor(
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            latest_output_ids
+        )
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2570,25 +2622,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            # Under overlap batch.input_ids is just a placeholder here -- the
-            # real token is relayed via future_map and resolved at forward
-            # entry. So take the last output token from Req directly
-            # (origin_input_ids[-1] on the first decode, before any output).
-            latest_output_ids = torch.tensor(
-                [
-                    (
-                        req.output_ids[-1]
-                        if len(req.output_ids)
-                        else req.origin_input_ids[-1]
-                    )
-                    for req in self.reqs
-                ],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                latest_output_ids
-            )
+            self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
