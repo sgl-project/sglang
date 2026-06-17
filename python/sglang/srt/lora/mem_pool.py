@@ -333,6 +333,55 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
+    def _row_parallel_shard_tp(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> int:
+        """Shard count for a non-MoE row-parallel module's activation axis.
+
+        Probes the base module's ``input_size // input_size_per_partition`` so
+        the LoRA buffer matches the actual shard regardless of which TP group
+        owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
+        shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
+        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+
+        MoE-internal names go through ``self.moe_tp_size`` upstream.
+        """
+        cache = getattr(self, "_row_parallel_tp_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_row_parallel_tp_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            in_size = getattr(m, "input_size", None)
+            per_part = getattr(m, "input_size_per_partition", None)
+            if in_size is not None and per_part is not None and per_part > 0:
+                return max(1, in_size // per_part)
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        out = found if found is not None else self.tp_size
+        cache[key] = out
+        return out
+
     def _get_standard_shape(
         self,
         module_name: str,
@@ -345,8 +394,12 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        # Non-MoE row-parallel modules: probe the actual shard size so o_proj /
+        # down_proj match attn_tp under DP-attention and the shared-experts
+        # dense-vs-MoE per-layer-TP differences.
+        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, row_tp)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
@@ -367,9 +420,12 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        # MoE modules shard along `moe_tp_size`; non-MoE row-parallel modules
+        # use a probed shard that may be attn_tp under DP-attention.
         effective_tp_size = (
-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+            self.moe_tp_size
+            if self.is_moe_module(module_name)
+            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
         )
         if (
             effective_tp_size > 1
@@ -461,9 +517,12 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        # MoE modules shard along `moe_tp_size`; non-MoE column-parallel modules
+        # use a probed shard that may be attn_tp under DP-attention.
         effective_tp_size = (
-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+            self.moe_tp_size
+            if self.is_moe_module(module_name)
+            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
         )
         if (
             effective_tp_size > 1
@@ -851,19 +910,25 @@ class LoRAMemoryPool:
                 expert_match = re.search(r"experts\.(\d+)\.", name)
 
                 if expert_match:
-                    # Per-expert MoE weight — 2D tensors, one per expert
+                    # Per-expert MoE weight — 2D tensors, one per expert.
+                    # Init A and B independently: under ``experts_shared_outer_loras``,
+                    # fc1 has shared A (Tensor in temp_A_buffer) + per-expert B
+                    # (dict in temp_B_buffer), and fc2 has the opposite. A shared
+                    # init on both would either clobber the shared Tensor or leave
+                    # the per-expert side as None.
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
 
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
+                        if temp_A_buffer[target_module] is None:
+                            temp_A_buffer[target_module] = {}
+                            temp_A_cache_keys[target_module] = {}
                         temp_A_buffer[target_module][expert_id] = weights
                         temp_A_cache_keys[target_module][expert_id] = name
                     else:
+                        if temp_B_buffer[target_module] is None:
+                            temp_B_buffer[target_module] = {}
+                            temp_B_cache_keys[target_module] = {}
                         temp_B_buffer[target_module][expert_id] = weights
                         temp_B_cache_keys[target_module][expert_id] = name
                 elif "experts" in name and weights.dim() == 3:
