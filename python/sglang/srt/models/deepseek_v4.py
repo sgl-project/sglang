@@ -18,8 +18,6 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
@@ -64,6 +62,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
+    is_dp_gatherv_active,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -114,6 +113,9 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.triton_ops.deepseek_v4 import (
+    rms_normalize_triton as rms_normalize_triton,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -258,57 +260,6 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
-@triton.jit
-def _rms_normalize_kernel(
-    x_ptr,
-    weight_ptr,
-    eps,
-    stride_row,
-    dim,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < dim
-
-    base = pid * stride_row
-    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-
-    mean_sq = tl.sum(x * x, axis=0) / dim
-    rms_inv = tl.rsqrt(mean_sq + eps)
-    out = x * rms_inv
-
-    if HAS_WEIGHT:
-        weight = tl.load(weight_ptr + offs, mask=mask, other=0.0)
-        out = out * weight
-
-    tl.store(x_ptr + base + offs, out, mask=mask)
-
-
-def rms_normalize_triton(
-    x: torch.Tensor, eps: float, weight: torch.Tensor = None
-) -> torch.Tensor:
-    dim = x.shape[-1]
-    x_flat = x.view(-1, dim)
-    num_rows = x_flat.shape[0]
-
-    BLOCK_SIZE = triton.next_power_of_2(dim)
-    grid = (num_rows,)
-
-    _rms_normalize_kernel[grid](
-        x_flat,
-        weight,
-        eps,
-        x_flat.stride(0),
-        dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HAS_WEIGHT=(weight is not None),
-    )
-    return x
-
-
 class MQALayer(nn.Module):
     def __init__(
         self,
@@ -432,6 +383,9 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        self._attn_sink_local: Optional[torch.Tensor] = (
+            self.attn_sink if attn_tp_size == 1 else None
+        )
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -815,18 +769,10 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             if unified:
-                swa_ring_size = token_to_kv_pool.unified_swa_ring_size
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
-                # ring slot = req_slot * ring + pos % ring, per token.
-                # positions is per-token; req_pool_indices is per-req.
-                req_slot = forward_batch.req_pool_indices.to(torch.int64)
-                if req_slot.shape[0] != positions.shape[0]:
-                    req_slot = req_slot.repeat_interleave(
-                        positions.shape[0] // req_slot.shape[0]
-                    )
-                swa_loc = (
-                    req_slot * swa_ring_size + positions.to(torch.int64) % swa_ring_size
-                ).to(torch.int32)
+                # swa_loc is layer-independent; computed once per forward by the
+                # backend and cached on the metadata (read here by every layer).
+                swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
                 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
@@ -877,6 +823,19 @@ class MQALayer(nn.Module):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
+                # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
+                # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
+                if use_cp and _is_hip:
+                    # unified_kv + DSA CP: the 2-source prefill path needs the
+                    # FULL current-chunk KV (extend source + ring write), so
+                    # all-gather the per-rank bf16 KV across the CP group.
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -948,10 +907,23 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
-            rank = self.tp_rank
-            tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
+            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+            # this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
+            if self._attn_sink_local is None:
+                # Build once on the first forward (post weight load); a per-call
+                # rebuild would replay a fill+copy per layer in the decode graph.
+                rank = self.tp_rank
+                sink = self.attn_sink.new_zeros(padded_num_heads)
+                sink[: self.n_local_heads] = self.attn_sink[
+                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                ]
+                self._attn_sink_local = sink
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -1018,7 +990,7 @@ class MQALayer(nn.Module):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    self.attn_sink,
+                    self._attn_sink_local,
                     save_kv_cache,
                 )
             else:
@@ -1029,7 +1001,7 @@ class MQALayer(nn.Module):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self.attn_sink,
+                    attn_sink=self._attn_sink_local,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
@@ -1531,6 +1503,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
+        # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
+        # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
+        # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
+        # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
+        # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
+        # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
+        # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+        _use_gatherv_pair = (
+            _use_tp_moe_gather
+            and is_dp_gatherv_active()
+            and forward_batch.dp_padding_mode is not None
+            and not forward_batch.dp_padding_mode.is_max_len()
+        )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -1557,7 +1542,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
-            use_reduce_scatter=_use_cp,
+            # Skip the MoE-internal post-experts all_reduce when we will do the
+            # reduce via reduce_scatterv at the combine below (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1566,7 +1553,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv():
+            if should_use_dp_reduce_scatterv() or _use_gatherv_pair:
+                # SUM the TP-sharded per-rank partial expert outputs AND scatter
+                # each rank its own token slice, in one op. Correct because the
+                # MoE-internal all_reduce was skipped (use_reduce_scatter above).
+                # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,

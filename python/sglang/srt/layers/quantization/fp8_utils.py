@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
+)
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.utils.common import torch_release
 
@@ -224,11 +227,36 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
+    from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
     from sglang.srt.utils.custom_op import register_custom_op
+
+    @register_custom_op(
+        op_name="flashinfer_bmm_fp8",
+        mutates_args=[],
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+            q_input.new_empty((q_input.shape[0], weight.shape[1]), dtype=out_dtype)
+        ),
+    )
+    def flashinfer_bmm_fp8(
+        q_input: torch.Tensor,  # [M, K] fp8 e4m3
+        weight: torch.Tensor,  # [K, N] fp8 e4m3, column-major
+        x_scale: torch.Tensor,  # per-tensor scalar
+        weight_scale: torch.Tensor,  # per-tensor scalar
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        m, n = q_input.shape[0], weight.shape[1]
+        return _raw_flashinfer_bmm_fp8(
+            q_input.unsqueeze(0),
+            weight.unsqueeze(0),
+            x_scale.reshape(1),
+            weight_scale.reshape(1),
+            out_dtype,
+            backend="auto",
+        ).view(m, n)
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
@@ -496,10 +524,10 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
-    # TRTLLM backend requires K >= 256 and weight scales in UE8M0/R128c4
-    # packed format. Fall back to triton when scales are plain float32.
+    # Fall back to triton for non-supported formats.
+    # TODO: Check if flashinfer supports other output dtypes besides bf16.
     if backend == "trtllm" and (
-        input_2d.shape[1] < 256 or not getattr(weight_scale, "format_ue8m0", False)
+        input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
     ):
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
@@ -635,12 +663,19 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=True
+    # Quantize into row-padded buffers so the sgl-kernel wrapper's per-call
+    # pad_tensor() on mat_a / scales_a short-circuits (saves 2x fill + 2x cat
+    # kernels per GEMM). weight_scale.T is left as a K-major view because the
+    # kernel requires scales_b.stride(0) == 1 and materializes it internally.
+    q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
+        input_2d, block_size[1]
     )
     output = fp8_blockwise_scaled_mm(
         q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
     )
+    if output.shape[0] != input_2d.shape[0]:
+        # GEMM ran on the row-padded buffer; drop the padding rows.
+        output = output[: input_2d.shape[0]]
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
@@ -1462,6 +1497,23 @@ def _apply_fallback_scaled_mm(
     if bias is not None:
         output = output + bias
     return output.to(dtype=input_dtype)
+
+
+def apply_fp8_linear_bmm_flashinfer(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+    input_2d = input.view(-1, input.shape[-1])
+    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
 
 
 def apply_fp8_linear(

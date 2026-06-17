@@ -74,7 +74,6 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
         *_EAGLE3_SPEC_ARGS,
     ]
     env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 

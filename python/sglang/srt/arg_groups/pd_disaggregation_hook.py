@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
+def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -31,12 +33,10 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
                 )
-            if server_args.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+            if server_args.disaggregation_transfer_backend == "fake":
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache currently "
-                    "requires --disaggregation-transfer-backend in "
-                    "('nixl', 'mooncake'), but got "
-                    f"{server_args.disaggregation_transfer_backend!r}"
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
                 raise ValueError(
