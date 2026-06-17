@@ -1152,6 +1152,24 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+        # D2P KV cache replication
+        self.d2p_replicator = None
+        self.d2p_receiver = None
+        if (
+            self.server_args.disaggregation_enable_d2p_kv_replication
+            and self.transfer_backend == TransferBackend.MOONCAKE
+        ):
+            from sglang.srt.disaggregation.d2p_replication import (
+                DecodeToPrefillKVReplicator,
+                PrefillD2PReceiver,
+            )
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.d2p_replicator = DecodeToPrefillKVReplicator(self)
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.d2p_receiver = PrefillD2PReceiver(self)
+                self._register_d2p_endpoint()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1167,6 +1185,28 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def _register_d2p_endpoint(self):
+        """Register the D2P receiver endpoint with the bootstrap server."""
+        import requests as _requests
+
+        bootstrap_host = self.server_args.host
+        bootstrap_port = self.server_args.disaggregation_bootstrap_port
+        url = f"http://{bootstrap_host}:{bootstrap_port}/d2p_endpoint"
+        try:
+            resp = _requests.put(
+                url,
+                json={"endpoint": self.d2p_receiver.endpoint},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"D2P endpoint registered: {self.d2p_receiver.host_port}"
+                )
+            else:
+                logger.warning(f"D2P endpoint registration failed: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"D2P endpoint registration failed: {e}")
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -1771,6 +1811,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            d2p_replicator=getattr(self, "d2p_replicator", None),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3377,6 +3418,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                if self.d2p_receiver is not None:
+                    idle &= len(self.d2p_receiver._allocated_rooms) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

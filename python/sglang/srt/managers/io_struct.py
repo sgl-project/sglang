@@ -1171,6 +1171,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+    # PD disaggregation: prefill-side radix cache prefix length
+    disagg_prefill_prefix_len: Optional[List[int]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1237,6 +1239,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+    # PD disaggregation: prefill-side radix cache prefix length
+    disagg_prefill_prefix_len: Optional[List[int]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None

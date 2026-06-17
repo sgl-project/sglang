@@ -1885,6 +1885,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             state.customized_info_accumulated[k] = []
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
+                if getattr(recv_obj, "disagg_prefill_prefix_len", None):
+                    meta_info["disagg_prefill_prefix_len"] = recv_obj.disagg_prefill_prefix_len[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]

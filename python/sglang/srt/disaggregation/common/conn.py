@@ -1248,9 +1248,26 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_put("/d2p_endpoint", self._handle_d2p_endpoint_put)
+        self.app.router.add_get("/d2p_endpoint", self._handle_d2p_endpoint_get)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
+
+    async def _handle_d2p_endpoint_put(self, request: web.Request):
+        data = await request.json()
+        async with self.lock:
+            if not hasattr(self, "_d2p_endpoint"):
+                self._d2p_endpoint = None
+            self._d2p_endpoint = data.get("endpoint")
+        return web.json_response({"status": "ok"})
+
+    async def _handle_d2p_endpoint_get(self, request: web.Request):
+        async with self.lock:
+            endpoint = getattr(self, "_d2p_endpoint", None)
+        if endpoint:
+            return web.json_response({"endpoint": endpoint})
+        return web.json_response({"error": "not registered"}, status=404)
 
     async def _handle_route(self, request: web.Request):
         method = request.method

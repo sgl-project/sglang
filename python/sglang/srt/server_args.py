@@ -866,6 +866,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
+    disaggregation_enable_d2p_kv_replication: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -7395,6 +7396,11 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-d2p-kv-replication",
+            action="store_true",
+            help="After decode finishes a request, fire-and-forget replicate its KV cache back to the prefill server's radix cache for higher multi-turn cache hit rates.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

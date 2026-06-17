@@ -451,6 +451,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.process_disagg_prefill_inflight_queue()
 
+            if self.d2p_receiver is not None:
+                self.d2p_receiver.process_d2p_incoming()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -495,6 +498,9 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+
+            if self.d2p_receiver is not None:
+                self.d2p_receiver.process_d2p_incoming()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
