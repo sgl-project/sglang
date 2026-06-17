@@ -20,6 +20,9 @@
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
 //                      per-eval accuracy templates)
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
+//   accuracyLabels     [key, label, unit][] — the eval set shown in the
+//                      benchmark card + "⚡ Reproduce". NO engine default:
+//                      required whenever benchmarks carry accuracy data
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — per-hw image for `docker run` mode
 //   github             optional — "Submit verified cell" issue-template overrides
@@ -124,6 +127,15 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the command when speculative decoding (MTP) is on
+    // but --max-running-requests isn't set (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     badge: (verified) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
@@ -500,7 +512,9 @@ export const Deployment = ({ config, benchmarks }) => {
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
+        ...(config.placeholders && config.placeholders.HF_TOKEN
+          ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
@@ -530,13 +544,12 @@ export const Deployment = ({ config, benchmarks }) => {
     return cmd;
   };
 
-  // Accuracy labels: [field-key, display-label, unit]. Keys must match the
-  // `accuracy` fields in the benchmarks file + `benchmarkCommands.accuracy`.
-  const ACCURACY_LABELS = [
-    ["gpqa_pct",   "GPQA Diamond", "%"],
-    ["aime25_pct", "AIME25",       "%"],
-    ["gsm8k_pct",  "GSM8K (1-shot)", "%"],
-  ];
+  // Accuracy labels: [field-key, display-label, unit]. Declared per model via
+  // `config.accuracyLabels` — the engine ships NO default eval set. A config
+  // without it renders no accuracy rows (and no Accuracy section in the
+  // "⚡ Reproduce" modal). Keys must match the `accuracy` fields in the
+  // benchmarks file + `benchmarkCommands.accuracy`.
+  const ACCURACY_LABELS = config.accuracyLabels || [];
 
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
@@ -902,6 +915,13 @@ export const Deployment = ({ config, benchmarks }) => {
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
   const command = renderCommand(cell, sel, env, runMode);
+  // MTP hint: fire on the actual command (speculative decoding ON) — NOT on
+  // strategy=low-latency, since a low-latency cell may not enable MTP. SGLang
+  // resets --max-running-requests to 48 when spec is on and it's unset.
+  const mtpHint =
+    !!cell &&
+    (cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !(cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
@@ -1040,6 +1060,11 @@ export const Deployment = ({ config, benchmarks }) => {
             </div>
           </div>
           <pre style={s.commandPre}>{command}</pre>
+          {mtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 
