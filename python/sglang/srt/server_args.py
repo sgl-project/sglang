@@ -668,7 +668,7 @@ class ServerArgs:
         "auto"
     )
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -2440,21 +2440,8 @@ class ServerArgs:
                     )
 
                 # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Only the kernel/page_first transfer
-                # path has a safe split K/V implementation.
-                if self.hicache_io_backend != "kernel":
-                    logger.warning(
-                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r})."
-                    )
-                    self.hicache_io_backend = "kernel"
-                if self.hicache_mem_layout != "page_first":
-                    logger.warning(
-                        f"Force hicache_mem_layout to 'page_first' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"asymmetric K/V HiCache requires kernel/page_first."
-                    )
-                    self.hicache_mem_layout = "page_first"
+                # asymmetric K/V allocation. Both kernel/page_first and
+                # direct/page_first_direct have split K/V transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -3412,7 +3399,7 @@ class ServerArgs:
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
@@ -3428,7 +3415,7 @@ class ServerArgs:
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
             prefill == "flashinfer"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
             and cuda_major < 13
         ):
