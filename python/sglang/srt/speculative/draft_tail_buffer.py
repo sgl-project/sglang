@@ -53,7 +53,7 @@ def _format_batch_outputs_diag(batch: DraftTailStreamOutputBatch) -> str:
         f"batch_request_ids={[item.request_id for item in batch.outputs]} "
         f"batch_base_committed_lens={[int(item.base_committed_len) for item in batch.outputs]} "
         f"batch_new_token_pos={[int(item.new_token_pos) for item in batch.outputs]} "
-        f"batch_new_token_id={[int(item.new_token_id) for item in batch.outputs]}"
+        f"batch_new_token={[int(item.new_token) for item in batch.outputs]}"
     )
 
 
@@ -156,7 +156,7 @@ class DraftTailBuffer:
             self._condition.notify_all()
 
     def _open_request_locked(self, message: DraftSync) -> None:
-        committed_len = len(message.committed_output_ids)
+        committed_len = len(message.committed_outputs)
         self._states[message.request_id] = RequestDraftTailState(
             drafter_rank=int(message.dst_drafter_rank),
             committed_len=committed_len,
@@ -172,24 +172,22 @@ class DraftTailBuffer:
             self._condition.notify_all()
 
     def _apply_commit_locked(self, message: VerifyCommit) -> dict | None:
-        message.validate_committed_token_ids()
+        message.validate_committed_tokens()
         state = self._states.get(message.request_id)
         old_committed_len = int(message.pre_verify_committed_len)
-        committed_token_ids = [
-            int(token_id) for token_id in message.committed_token_ids
-        ]
-        committed_segment_len = len(committed_token_ids)
-        last_committed_token_id = int(committed_token_ids[-1])
+        committed_tokens = [int(token_id) for token_id in message.committed_tokens]
+        committed_segment_len = len(committed_tokens)
+        last_committed_token = int(committed_tokens[-1])
         if state is None:
             return {
                 "request_id": message.request_id,
                 "pre_committed_len": old_committed_len,
                 "committed_segment_len": committed_segment_len,
-                "last_committed_token_id": last_committed_token_id,
+                "last_committed_token": last_committed_token,
                 "matched_tail_len": 0,
                 "raw_tail_len_before": 0,
-                "mismatch_tail_token_id": -1,
-                "mismatch_committed_token_id": committed_token_ids[0],
+                "mismatch_tail_token": -1,
+                "mismatch_committed_token": committed_tokens[0],
                 "preserved_suffix_len": 0,
                 "tail_len_after": 0,
                 "committed_len_after": 0,
@@ -223,23 +221,23 @@ class DraftTailBuffer:
                     f"tail_tokens={list(state.tail_tokens)}"
                 )
             state.pending_expected_tokens.extend(
-                token_id for token_id in committed_token_ids
+                token_id for token_id in committed_tokens
             )
             return {
                 "request_id": message.request_id,
                 "pre_committed_len": old_committed_len,
                 "committed_segment_len": committed_segment_len,
-                "last_committed_token_id": last_committed_token_id,
+                "last_committed_token": last_committed_token,
                 "matched_tail_len": 0,
                 "raw_tail_len_before": raw_tail_len_before,
-                "mismatch_tail_token_id": -1,
-                "mismatch_committed_token_id": committed_token_ids[0],
+                "mismatch_tail_token": -1,
+                "mismatch_committed_token": committed_tokens[0],
                 "preserved_suffix_len": 0,
                 "tail_len_after": 0,
                 "committed_len_after": int(state.committed_len),
                 "pending_expected_len_before": pending_expected_len_before,
                 "pending_expected_len_after": len(state.pending_expected_tokens),
-                "pending_expected_added": len(committed_token_ids),
+                "pending_expected_added": len(committed_tokens),
             }
 
         matched_tail_len = 0
@@ -247,7 +245,7 @@ class DraftTailBuffer:
         while (
             matched_tail_len < max_possible_match_len
             and int(state.tail_tokens[matched_tail_len])
-            == committed_token_ids[matched_tail_len]
+            == committed_tokens[matched_tail_len]
         ):
             matched_tail_len += 1
 
@@ -255,8 +253,8 @@ class DraftTailBuffer:
             del state.tail_tokens[:matched_tail_len]
             state.committed_len += matched_tail_len
 
-        mismatch_tail_token_id = -1
-        mismatch_committed_token_id = -1
+        mismatch_tail_token = -1
+        mismatch_committed_token = -1
         pending_expected_added = 0
         preserved_suffix_len = len(state.tail_tokens)
         if matched_tail_len < committed_segment_len:
@@ -277,11 +275,11 @@ class DraftTailBuffer:
             # output with stale base before the mismatch will be rejected, even
             # if it matches the preserved tail suffix.
             if matched_tail_len < raw_tail_len_before:
-                mismatch_tail_token_id = int(state.tail_tokens[0])
+                mismatch_tail_token = int(state.tail_tokens[0])
                 state.can_accept_prefix_len = int(state.committed_len)
-            mismatch_committed_token_id = committed_token_ids[matched_tail_len]
+            mismatch_committed_token = committed_tokens[matched_tail_len]
             state.tail_tokens = []
-            state.pending_expected_tokens.extend(committed_token_ids[matched_tail_len:])
+            state.pending_expected_tokens.extend(committed_tokens[matched_tail_len:])
             pending_expected_added = committed_segment_len - matched_tail_len
             preserved_suffix_len = 0
 
@@ -289,11 +287,11 @@ class DraftTailBuffer:
             "request_id": message.request_id,
             "pre_committed_len": old_committed_len,
             "committed_segment_len": committed_segment_len,
-            "last_committed_token_id": last_committed_token_id,
+            "last_committed_token": last_committed_token,
             "matched_tail_len": matched_tail_len,
             "raw_tail_len_before": raw_tail_len_before,
-            "mismatch_tail_token_id": mismatch_tail_token_id,
-            "mismatch_committed_token_id": mismatch_committed_token_id,
+            "mismatch_tail_token": mismatch_tail_token,
+            "mismatch_committed_token": mismatch_committed_token,
             "preserved_suffix_len": preserved_suffix_len,
             "tail_len_after": len(state.tail_tokens),
             "committed_len_after": int(state.committed_len),
@@ -340,8 +338,8 @@ class DraftTailBuffer:
             "committed_segment_lens_by_req": [
                 item["committed_segment_len"] for item in commit_stats
             ],
-            "last_committed_token_ids_by_req": [
-                item["last_committed_token_id"] for item in commit_stats
+            "last_committed_tokens_by_req": [
+                item["last_committed_token"] for item in commit_stats
             ],
             "matched_tail_lens_by_req": [
                 item["matched_tail_len"] for item in commit_stats
@@ -349,11 +347,11 @@ class DraftTailBuffer:
             "raw_tail_lens_before_by_req": [
                 item["raw_tail_len_before"] for item in commit_stats
             ],
-            "mismatch_tail_token_ids_by_req": [
-                item["mismatch_tail_token_id"] for item in commit_stats
+            "mismatch_tail_tokens_by_req": [
+                item["mismatch_tail_token"] for item in commit_stats
             ],
-            "mismatch_committed_token_ids_by_req": [
-                item["mismatch_committed_token_id"] for item in commit_stats
+            "mismatch_committed_tokens_by_req": [
+                item["mismatch_committed_token"] for item in commit_stats
             ],
             "preserved_suffix_lens_by_req": [
                 item["preserved_suffix_len"] for item in commit_stats
@@ -400,7 +398,7 @@ class DraftTailBuffer:
         request_id = output.request_id
         base_committed_len = int(output.base_committed_len)
         token_pos = int(output.new_token_pos)
-        token_id = int(output.new_token_id)
+        token_id = int(output.new_token)
         src_drafter_rank = int(output.src_drafter_rank)
         dst_verifier_rank = int(output.dst_verifier_rank)
 

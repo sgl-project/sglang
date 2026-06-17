@@ -41,7 +41,7 @@ def _sync(rid, *, committed_len=0, drafter_rank=0, src_verifier_rank=0) -> Draft
         src_verifier_rank=src_verifier_rank,
         dst_drafter_rank=drafter_rank,
         prompt_token_ids=[],
-        committed_output_ids=[0] * committed_len,
+        committed_outputs=[0] * committed_len,
     )
 
 
@@ -51,7 +51,7 @@ def _commit(rid, *, pre, tokens, drafter_rank=0, src_verifier_rank=0) -> VerifyC
         src_verifier_rank=src_verifier_rank,
         dst_drafter_rank=drafter_rank,
         pre_verify_committed_len=pre,
-        committed_token_ids=list(tokens),
+        committed_tokens=list(tokens),
     )
 
 
@@ -73,7 +73,7 @@ def _out(
         request_id=rid,
         base_committed_len=base,
         new_token_pos=pos,
-        new_token_id=tok,
+        new_token=tok,
     )
 
 
@@ -131,7 +131,7 @@ class TestDraftTailBufferBasics(CustomTestCase):
         self.assertIn("conflicts with buffered tail", msg)
         # The O(N^2) fix must still surface the whole-batch diagnostic on error.
         self.assertIn("batch_request_ids=", msg)
-        self.assertIn("batch_new_token_id=", msg)
+        self.assertIn("batch_new_token=", msg)
 
     def test_already_committed_output_ignored(self):
         buf = self._buf()
