@@ -30,6 +30,9 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
