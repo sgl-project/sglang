@@ -315,7 +315,7 @@ do
         --enable-dp-lm-head --moe-dense-tp 1 \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
-        
+
         # cp
         #--enable-nsa-prefill-context-parallel \
         #--nsa-prefill-cp-mode in-seq-split \
@@ -351,7 +351,7 @@ do
         --cuda-graph-max-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
