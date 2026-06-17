@@ -205,6 +205,8 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if is_npu():
+            return 0  # NPU bypasses CUDA capability checks
         if _is_musa:
             return 31
 
@@ -261,6 +263,12 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
+            if is_npu() and self.use_mxfp8:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUMXFP8LinearMethod,
+                )
+
+                return NPUMXFP8LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
@@ -302,7 +310,7 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         if self.ignored_layers:
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
@@ -2094,7 +2102,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         no_combine: bool = False,
-    ) -> Optional["AiterMoeQuantInfo"]:
+    ) -> Optional[AiterMoeQuantInfo]:
         if not (_use_aiter or _use_hip_int4):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
