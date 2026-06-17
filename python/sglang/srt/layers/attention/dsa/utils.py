@@ -22,12 +22,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
-# Cached once at import. Master switch for the graph DSA split-op fusions
-# (`is_cuda and SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION`), shared by the indexer
-# split-op dispatch and the MLA BMM-into-attention fusion.
-_enable_graph_dsa_split_op_fusion = (
-    is_cuda() and envs.SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION.get()
-)
+# Cached once at import. PCG/BCG only ever run on CUDA (piecewise is disabled on
+# non-CUDA hardware and breakable rejects HIP), so being in a graph already
+# implies CUDA; this is a cheap defensive guard.
+_is_cuda = is_cuda()
 
 
 @lru_cache(maxsize=1)
@@ -95,9 +93,14 @@ def is_dsa_prefill_cp_round_robin_split():
     )
 
 
-def is_graph_dsa_split_op_surface_active(forward_batch: "ForwardBatch") -> bool:
+# Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
+# MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
+# inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
+# this surface (no feature flag); each adds its own extra carve-outs at its call
+# site (e.g. the indexer also excludes DSA prefill context parallelism).
+def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        _enable_graph_dsa_split_op_fusion
+        _is_cuda
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
         and forward_batch.forward_mode.is_extend_without_speculative()
     )

@@ -9,7 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
-    is_graph_dsa_split_op_surface_active,
+    is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -109,7 +109,7 @@ if _is_cuda:
     # submodule, paying per-submodule host overhead with no fusion benefit.
     #
     # The further "module fusion" — coalescing this op with the strictly adjacent
-    # `dsa_indexer_graph_dispatch` into a single eager region (no captured segment
+    # `pcg_dsa_indexer_graph_dispatch` into a single eager region (no captured segment
     # between the two adjacent eager breaks) — is currently BCG-only: breakable
     # CUDA graph drops the empty segment and chains the adjacent replay fns (see
     # `breakable_cuda_graph.eager_on_graph`). Under PCG, `split_graph` leaves each
@@ -223,9 +223,10 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        # Shared activation surface with dsa_indexer_graph_dispatch (feature flag
-        # + in piecewise/breakable graph + non-speculative extend).
-        if not is_graph_dsa_split_op_surface_active(forward_batch):
+        # Shared activation surface with the DSA indexer graph dispatch
+        # (in piecewise/breakable graph + non-speculative extend). Like the indexer
+        # dispatch, this fusion is on by default on that surface.
+        if not is_graph_dsa_split_op_surface(forward_batch):
             return False
         if not self.use_dsa:
             return False

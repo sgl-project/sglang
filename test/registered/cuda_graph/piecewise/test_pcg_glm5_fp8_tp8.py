@@ -48,7 +48,6 @@ class TestBCGGlm5Fp8TP8(CustomTestCase):
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
             env={
-                "SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION": "1",
                 "SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM": "1",
             },
         )
