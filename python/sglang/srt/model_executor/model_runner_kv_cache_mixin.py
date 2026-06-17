@@ -318,6 +318,12 @@ class ModelRunnerKVCacheMixin:
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
 
                 pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+                # -1 shrinks the pool below max_num_reqs (alloc() fails at full
+                # load); keep MiniMax-M3's default, restore 0 for all others.
+                if pre_alloc_size < 0 and not is_minimax_sparse(
+                    self.model_config.hf_config
+                ):
+                    pre_alloc_size = 0
                 pre_alloc_size = (
                     max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
                 )

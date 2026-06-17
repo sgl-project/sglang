@@ -1212,11 +1212,12 @@ def build_minimax_sparse_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     """KV (main_pool) + INDEXER (index_k_pool) host stack for MiniMax M3 sparse."""
-    # full_layer_mapping is global-keyed but loads run by stage-local index, so PP silently mis-loads.
+    # Mappings are stage-local keyed (controller iterates 0..transfer_layer_num).
+    # PP>1 stays gated below pending end-to-end validation of the sparse host path.
     if pp_size > 1:
         raise NotImplementedError(
             "MiniMax-M3 sparse HiCache does not support pipeline parallelism "
-            "(pp_size>1) yet: layer-id mapping is global-keyed."
+            "(pp_size>1) yet."
         )
     # mirror HiRadix's guard, which the Unified-tree strategy path otherwise skips.
     if sparse_pool.index_kv_pool is not None:
@@ -1226,11 +1227,10 @@ def build_minimax_sparse_hicache_stack(
         )
     main_pool = sparse_pool.main_pool
     start_layer = main_pool.start_layer
-    end_layer = main_pool.end_layer
     transfer_layer_num = main_pool.layer_num
-    full_layer_mapping = {
-        layer_id: layer_id - start_layer for layer_id in range(start_layer, end_layer)
-    }
+    # Stage-local keys (0..transfer_layer_num) match the controller's per-layer
+    # load loop; values index the host pool's local layer buffer.
+    full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     kv_host_pool = build_kv_host_pool(
         kv_pool=main_pool,
@@ -1262,7 +1262,10 @@ def build_minimax_sparse_hicache_stack(
                 name=PoolName.INDEXER,
                 host_pool=index_host_pool,
                 device_pool=index_k_pool,
-                layer_mapping=dict(sparse_pool.index_k_layer_id_mapping),
+                layer_mapping={
+                    gid - start_layer: sub_id
+                    for gid, sub_id in sparse_pool.index_k_layer_id_mapping.items()
+                },
                 transfer_layer_num=transfer_layer_num,
             )
         )
@@ -1325,8 +1328,7 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 server_args=server_args,
                 kv_pool=main_pool,
                 full_layer_mapping={
-                    layer_id: layer_id - main_pool.start_layer
-                    for layer_id in range(main_pool.start_layer, main_pool.end_layer)
+                    layer_id: layer_id for layer_id in range(main_pool.layer_num)
                 },
                 page_size=radix_cache.page_size,
                 tp_group=radix_cache.tp_group,

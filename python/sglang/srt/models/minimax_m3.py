@@ -939,6 +939,11 @@ class MiniMaxM3Attention(nn.Module):
         if type(ip.quant_method) is not type(qm):
             return
 
+        # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
+        # fused module skips that pass, so keep two separate (converted) GEMMs.
+        if getattr(qm, "convert_mxfp8_to_block", False):
+            return
+
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
         if isinstance(qm, UnquantizedLinearMethod):
             scale = None
@@ -1433,15 +1438,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if (
-            _is_hip
-            and self.is_layer_sparse
-            and get_moe_a2a_backend().is_none()
-            and get_moe_expert_parallel_world_size() > 1
-        ):
-            # Standard EP computes partial expert outputs on each rank and
-            # needs the normal immediate all-reduce in MiniMaxM3MoE.forward_normal.
-            # The deferred AITER all-reduce fusion corrupts those sparse partials.
+        if self.is_layer_sparse and get_tensor_model_parallel_world_size() > 1:
+            # Sparse MoE produces partial expert outputs per rank; deferring the
+            # all-reduce into the next layer's fusion corrupts those partials and
+            # re-triggers the M3 no-EOS runaway. Force the immediate all-reduce in
+            # MiniMaxM3MoE.forward_normal (aligns with vLLM). Dense MLP keeps fusion.
             should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
