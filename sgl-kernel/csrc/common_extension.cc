@@ -38,15 +38,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
-  m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
-  m.def(
-      "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
-      "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
-  m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
-
-  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
-  m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
-
   /*
    * From csrc/attention
    */
@@ -213,6 +204,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
+
+  // DeepSeek-V4 fused norm + rope
+  m.def(
+      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
+  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
+
+  m.def(
+      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
+
+  m.def(
+      "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
+      "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
+  m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
 
   m.def(
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
