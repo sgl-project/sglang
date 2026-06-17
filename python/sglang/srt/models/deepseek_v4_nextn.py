@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
@@ -169,14 +170,20 @@ class DeepseekV4ModelNextN(nn.Module):
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
 
-        hidden_states = self.decoder(
+        hidden_states, residual, post, comb = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if residual is not None:
+            # NextN has a single decoder layer, so no later layer can consume a
+            # deferred fused hc_post state.
+            hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
@@ -251,7 +258,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)

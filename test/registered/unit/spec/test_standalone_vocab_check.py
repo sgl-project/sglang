@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for StandaloneWorker._validate_vocab_compatibility.
+"""Unit tests for StandaloneWorkerV2._validate_vocab_compatibility.
 
 All tests are CPU-only: no server, no GPU, no model loading needed.
 Tokenizers are replaced with lightweight MagicMock fakes.
@@ -8,7 +8,7 @@ Tokenizers are replaced with lightweight MagicMock fakes.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.speculative.standalone_worker import StandaloneWorker
+from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,9 +27,9 @@ def _tok(vocab: dict):
 
 def _validate(target_size, draft_size, target_tok, draft_tok):
     fake_self = MagicMock()
-    fake_self.draft_model_runner.model_config.vocab_size = draft_size
-    fake_self.tokenizer = draft_tok
-    StandaloneWorker._validate_vocab_compatibility(
+    fake_self._draft_worker.draft_runner.model_config.vocab_size = draft_size
+    fake_self._draft_worker.draft_worker.tokenizer = draft_tok
+    StandaloneWorkerV2._validate_vocab_compatibility(
         fake_self,
         target_vocab_size=target_size,
         target_tokenizer=target_tok,

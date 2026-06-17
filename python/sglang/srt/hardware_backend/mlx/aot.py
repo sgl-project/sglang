@@ -13,8 +13,8 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import (
-        ContiguousKVCache,
+    from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
+        ContiguousAttentionKVCache,
     )
 
 
@@ -123,6 +123,10 @@ class MlxAOTKernelRegistry:
 
 
 def _build_rope_kernel(inputs: MlxAOTKernelBuildInputs) -> MlxAOTRoPEKernel:
+    from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+        get_num_heads,
+    )
+
     sample_attn = getattr(inputs.sample_attn, "_inner", inputs.sample_attn)
     rope = getattr(sample_attn, "rope", None)
     if rope is None or getattr(rope, "traditional", False):
@@ -136,10 +140,13 @@ def _build_rope_kernel(inputs: MlxAOTKernelBuildInputs) -> MlxAOTRoPEKernel:
         return MlxAOTRoPEKernel()
 
     base = float(getattr(rope, "base", 10000.0))
+    num_qo_heads = get_num_heads(sample_attn)
+    if num_qo_heads is None:
+        return MlxAOTRoPEKernel()
     config = {
         "head_dim": int(inputs.head_dim),
         "rope_dim": rope_dim,
-        "num_qo_heads": int(sample_attn.n_heads),
+        "num_qo_heads": int(num_qo_heads),
         "num_kv_heads": int(inputs.n_kv_heads),
     }
     try:
@@ -196,8 +203,8 @@ class MlxAOTKernelContext:
         req_ids: list[str],
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
-        layer_caches: list[list[ContiguousKVCache]],
-    ) -> "MlxAOTKernelContext":
+        layer_caches: list[list[ContiguousAttentionKVCache]],
+    ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:
             return cls()
