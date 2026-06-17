@@ -50,7 +50,6 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
