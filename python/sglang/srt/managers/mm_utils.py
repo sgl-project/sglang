@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1570,7 +1571,9 @@ class ShmPointerMMData:
         self.dtype = tensor.dtype
         self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
-        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm = shared_memory.SharedMemory(
+            create=True, size=nbytes, name=make_shm_name("mm")
+        )
         try:
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
