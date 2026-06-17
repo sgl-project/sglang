@@ -912,12 +912,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
                 # Cap full-attention prefix reuse at the sliding-window start so
                 # the SWA window lands entirely in the fresh delta, keeping
-                # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
-                # of only the last ~window_size full-attention tokens.
-                if uses_swa_tail_prealloc and prefix_len > 0:
+                # alloc_extend_swa_tail's tail->full mapping in range. This must
+                # apply to the full prefix promised to prefill, including HiCache
+                # L2/L3 hits; otherwise the fresh delta can be shorter than the
+                # live SWA tail.
+                if uses_swa_tail_prealloc and total_prefix_len > 0:
                     swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
-                    if prefix_len > swa_prefix_cap:
-                        prefix_len = swa_prefix_cap
+                    if total_prefix_len > swa_prefix_cap:
+                        prefix_len = min(prefix_len, swa_prefix_cap)
                         prefix_indices = prefix_indices[:prefix_len]
                         prefix_match.prefix_indices = prefix_indices
                         prefix_match.l2_host_hit_length = 0
