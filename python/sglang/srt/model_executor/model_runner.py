@@ -665,9 +665,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Fail-closed runtime guard: when a draft worker is configured to
         # participate in routed-experts capture (R3), every MoE TopK on the
-        # draft model must already carry allow_routed_experts_capture=False (or
-        # the architecture must be on the dense allowlist). Unknown
-        # architectures or stale opt-outs raise here rather than silently
+        # draft model must carry allow_routed_experts_capture=False. An
+        # un-opted-out draft MoE layer raises here rather than silently
         # polluting the target's R3 buffer at runtime.
         if self.is_draft_worker:
             from sglang.srt.state_capturer.draft_guard import (
@@ -676,7 +675,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             check_draft_capture_optout(
                 self.model,
-                self.model_config.hf_config,
                 routed_experts_capture_enabled=bool(
                     getattr(self.server_args, "enable_return_routed_experts", False)
                 ),
