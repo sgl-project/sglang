@@ -1100,8 +1100,14 @@ class ServerArgs:
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject unverified non-HIP execution paths early
-        # instead of letting them fail deeper in attention or allocator code.
+        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+        # early instead of letting them fail deeper in model initialization.
+        if self.dcp_size < 1:
+            raise ValueError(
+                "Decode context parallel size (--dcp-size / "
+                "--decode-context-parallel-size) must be >= 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
         if self.dcp_size > 1 and not is_hip():
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
