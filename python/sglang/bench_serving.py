@@ -2374,7 +2374,7 @@ if __name__ == "__main__":
         help="Collect and display cache hit statistics after the benchmark. "
         "Supported with sglang backends (native, oai, oai-chat).",
     )
-    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+    parser.add_argument("--seed", type=int, default=42, help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
