@@ -251,6 +251,7 @@ class Envs:
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
