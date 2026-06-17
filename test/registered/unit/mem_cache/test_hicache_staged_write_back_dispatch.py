@@ -241,6 +241,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
                 return_value=True,
             ) as can_use_jit,
+            mock.patch(f"{MEMORY_POOL_HOST_MODULE}._is_cuda", True),
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -321,6 +322,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
                 return_value=True,
             ) as can_use_jit,
+            mock.patch(f"{MEMORY_POOL_HOST_MODULE}._is_cuda", True),
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
