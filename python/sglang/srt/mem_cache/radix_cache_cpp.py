@@ -169,10 +169,11 @@ class RadixCacheCpp(BasePrefixCache):
     def total_size(self):
         return self.tree.total_size()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
+    ):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        kv_committed_len = req.pop_committed_kv_cache()
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
