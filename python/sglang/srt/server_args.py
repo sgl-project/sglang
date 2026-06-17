@@ -2753,6 +2753,11 @@ class ServerArgs:
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
     ] = False
 
+    language_model_only: A[
+        bool,
+        "Enable strip multimodal vision/audio encoders and load only the language backbone..",
+    ] = False
+
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
     # -------------------------------------------------------------------------
@@ -3917,7 +3922,7 @@ class ServerArgs:
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only:
+            if model_config.is_multimodal and not self.language_only and not self.language_model_only:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -5936,6 +5941,44 @@ class ServerArgs:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
             )
+
+        # --language-model-only is a standalone mode that strips multimodal
+        # components without EPD disaggregation. It is incompatible with
+        # encoder-related flags.
+        if self.language_model_only:
+            if self.encoder_only:
+                raise ValueError(
+                    "--language-model-only cannot be combined with --encoder-only"
+                )
+            if self.language_only:
+                raise ValueError(
+                    "--language-model-only cannot be combined with --language-only"
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--language-model-only is incompatible with "
+                    "--disaggregation-mode prefill/decode"
+                )
+            if self.enable_prefix_mm_cache:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--enable-prefix-mm-cache"
+                )
+            if self.enable_broadcast_mm_inputs_process:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--enable-broadcast-mm-inputs-process"
+                )
+            if self.mm_enable_dp_encoder:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--mm-enable-dp-encoder"
+                )
+            # Skip the encoder disaggregation validation (architecture whitelist,
+            # IB device checks, etc.) -- language-model-only works with any
+            # multimodal model and does not need encoder infrastructure.
+            return
+
         if self.encoder_only and self.language_only:
             raise ValueError("Cannot set --encoder-only and --language-only together")
         if self.encoder_only and not self.disaggregation_mode == "null":
