@@ -1,25 +1,36 @@
 import sys
+import unittest
 
-import flashinfer
 import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion import (
-    fused_scale_residual_norm_scale_shift,
-    try_fused_scale_residual_norm_scale_shift_nvfp4,
-)
-from sglang.multimodal_gen.runtime.layers.quantization import (
-    modelopt_quant as diffusion_modelopt_quant,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp4LinearMethod,
-    apply_nvfp4_gemm_prequantized,
-    apply_nvfp4_gemm_swiglu_quant,
-)
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
+if torch.cuda.is_available():
+    from sglang.kernels.ops.diffusion import (
+        fused_scale_residual_norm_scale_shift,
+        try_fused_scale_residual_norm_scale_shift_nvfp4,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization import (
+        modelopt_quant as diffusion_modelopt_quant,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+        ModelOptFp4Config,
+        ModelOptFp4LinearMethod,
+        apply_nvfp4_gemm_prequantized,
+        apply_nvfp4_gemm_swiglu_quant,
+    )
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+    from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
+else:
+    fused_scale_residual_norm_scale_shift = None
+    try_fused_scale_residual_norm_scale_shift_nvfp4 = None
+    diffusion_modelopt_quant = None
+    ModelOptFp4Config = None
+    ModelOptFp4LinearMethod = None
+    apply_nvfp4_gemm_prequantized = None
+    apply_nvfp4_gemm_swiglu_quant = None
+    current_platform = None
+    pad_nvfp4_weight = None
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # B200-only correctness coverage for diffusion NVFP4 scaled mm.
@@ -407,6 +418,7 @@ def _resolve_mode(mode: str):
     raise ValueError(f"Unknown mode: {mode}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -434,6 +446,7 @@ def test_checkpoint_processing(
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -477,6 +490,7 @@ def test_flux2_shape_correctness(mode: str) -> None:
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{mode=}, {m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -523,6 +537,7 @@ def test_flux2_shape_correctness_flashinfer_trtllm(
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -608,6 +623,7 @@ def test_flux2_swizzled_scale_checkpoint_flashinfer_trtllm_matches_cudnn(
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
