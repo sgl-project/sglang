@@ -14,10 +14,7 @@ Skips on non-Apple-Silicon platforms and when ``mlx`` is missing.
 from __future__ import annotations
 
 import importlib.util
-import os
 import platform
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +42,6 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
 
     def tearDown(self):
         import torch
-        from sglang.srt.hardware_backend.mlx.profiler import MetalTorchProfiler
 
         if self._original_profile is not None:
             torch.profiler.profile = self._original_profile
@@ -58,17 +54,15 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
         )
 
         apply_metal_profiler_patches()
-        self.assertTrue(
-            getattr(torch.profiler.profile, "_sglang_metal_patched", False)
-        )
-        p = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        )
+        self.assertTrue(getattr(torch.profiler.profile, "_sglang_metal_patched", False))
+        p = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
         self.assertIsInstance(p, MetalTorchProfiler)
 
     def test_patch_is_idempotent(self):
         import torch
-        from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+        from sglang.srt.hardware_backend.mlx.profiler import (
+            apply_metal_profiler_patches,
+        )
 
         apply_metal_profiler_patches()
         first = torch.profiler.profile
@@ -99,7 +93,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
             trace_path = Path(tmp) / "test.gputrace"
             with patch.object(mx.metal, "start_capture"), patch.object(
                 mx.metal, "stop_capture"
-            ) as mock_stop:
+            ):
                 profiler, result = MetalCaptureProfiler.start_mlx(trace_path)
 
             self.assertTrue(result.success)
@@ -152,7 +146,9 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(torch.mps.profiler, "metal_capture", return_value=mock_ctx):
+            with patch.object(
+                torch.mps.profiler, "metal_capture", return_value=mock_ctx
+            ):
                 profiler, result = MetalCaptureProfiler.start_mps(trace_path)
 
         self.assertTrue(result.success)
@@ -200,7 +196,9 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
     def test_start_profile_failure_does_not_crash(self):
         import mlx.core as mx
-        from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+        from sglang.srt.hardware_backend.mlx.profiler import (
+            apply_metal_profiler_patches,
+        )
 
         apply_metal_profiler_patches()
 
@@ -219,20 +217,22 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
     def test_start_profile_success_with_mock_capture(self):
         import mlx.core as mx
-        from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+        from sglang.srt.hardware_backend.mlx.profiler import (
+            apply_metal_profiler_patches,
+        )
         from unittest.mock import patch as mock_patch
 
         apply_metal_profiler_patches()
 
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
-            with mock_patch.object(mx.metal, "start_capture"), \
-                 mock_patch.object(mx.metal, "stop_capture"), \
-                 mock_patch("torch.distributed.barrier"):
+            with mock_patch.object(mx.metal, "start_capture"), mock_patch.object(
+                mx.metal, "stop_capture"
+            ), mock_patch("torch.distributed.barrier"):
                 result = mgr._start_profile()
                 self.assertTrue(result.success)
                 self.assertTrue(mgr.profile_in_progress)
-                result2 = mgr._stop_profile()
+                mgr._stop_profile()
                 self.assertFalse(mgr.profile_in_progress)
 
 
