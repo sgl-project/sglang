@@ -683,6 +683,17 @@ class ReqKvInfo:
     swa_evicted_seqlen: int = 0
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqMambaInfo:
+    mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    mamba_next_track_idx: Optional[int] = None  # 0 or 1
+    mamba_last_track_seqlen: Optional[int] = None  # seq len of the last cached mamba state
+    # the branching point seqlen to track mamba state. If set, given by prefix match,
+    # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
+    mamba_branching_seqlen: Optional[int] = None
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -798,15 +809,7 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
-        self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
-        self.mamba_last_track_seqlen: Optional[int] = (
-            None  # seq len of the last cached mamba state
-        )
-        # the branching point seqlen to track mamba state. If set, given by prefix match,
-        # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
-        self.mamba_branching_seqlen: Optional[int] = None
+        self.mamba_info: Optional[ReqMambaInfo] = ReqMambaInfo()
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1106,6 +1109,60 @@ class Req(ReqDllmMixin):
     @swa_evicted_seqlen.setter
     def swa_evicted_seqlen(self, value: int) -> None:
         self.kv_info.swa_evicted_seqlen = value
+
+    @property
+    def mamba_pool_idx(self) -> Optional[torch.Tensor]:
+        return self.mamba_info.mamba_pool_idx if self.mamba_info is not None else None
+
+    @mamba_pool_idx.setter
+    def mamba_pool_idx(self, value: Optional[torch.Tensor]) -> None:
+        self.mamba_info.mamba_pool_idx = value
+
+    @property
+    def mamba_ping_pong_track_buffer(self) -> Optional[torch.Tensor]:
+        return (
+            self.mamba_info.mamba_ping_pong_track_buffer
+            if self.mamba_info is not None
+            else None
+        )
+
+    @mamba_ping_pong_track_buffer.setter
+    def mamba_ping_pong_track_buffer(self, value: Optional[torch.Tensor]) -> None:
+        self.mamba_info.mamba_ping_pong_track_buffer = value
+
+    @property
+    def mamba_next_track_idx(self) -> Optional[int]:
+        return (
+            self.mamba_info.mamba_next_track_idx if self.mamba_info is not None else None
+        )
+
+    @mamba_next_track_idx.setter
+    def mamba_next_track_idx(self, value: Optional[int]) -> None:
+        self.mamba_info.mamba_next_track_idx = value
+
+    @property
+    def mamba_last_track_seqlen(self) -> Optional[int]:
+        return (
+            self.mamba_info.mamba_last_track_seqlen
+            if self.mamba_info is not None
+            else None
+        )
+
+    @mamba_last_track_seqlen.setter
+    def mamba_last_track_seqlen(self, value: Optional[int]) -> None:
+        self.mamba_info.mamba_last_track_seqlen = value
+
+    @property
+    def mamba_branching_seqlen(self) -> Optional[int]:
+        return (
+            self.mamba_info.mamba_branching_seqlen
+            if self.mamba_info is not None
+            else None
+        )
+
+    @mamba_branching_seqlen.setter
+    def mamba_branching_seqlen(self, value: Optional[int]) -> None:
+        self.mamba_info.mamba_branching_seqlen = value
 
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
