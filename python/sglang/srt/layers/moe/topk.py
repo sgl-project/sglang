@@ -552,7 +552,30 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
         )
 
-    def empty_topk_output(self, device: torch.device) -> TopKOutput:
+    def empty_topk_output(
+        self, device: torch.device, *, layer_id: Optional[int] = None
+    ) -> TopKOutput:
+        """Return an empty topk output for a rank with zero tokens this forward.
+
+        When ``layer_id`` is provided and the active dispatch algorithm is LP,
+        also calls ``LPLBSolver.solve(empty)`` so that this rank participates
+        in the EP all-reduce. Without this, an empty rank would skip the
+        collective and deadlock under DP-attention.
+        """
+        if layer_id is not None:
+            # Skip the full ExpertLocationDispatchInfo allocation — we only
+            # need the per-layer solver to participate in the EP all-reduce.
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver.solve(
+                    torch.empty(
+                        (0, self.topk_config.top_k),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                )
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1508,11 +1531,29 @@ def _post_process_topk_ids(
         )
     recorder_topk_ids = None
     if _is_cuda:
-        # When shared experts are fused (appended as extra columns in topk_ids),
-        # EPLB dispatch must only remap the routed expert columns.
-        # The shared expert column (value = n_routed_experts) would be out-of-bounds
-        # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+        # LP path: solve LP outside torch.compile (the solver contains an
+        # EP all-reduce that can't run inside compiled regions).
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                log2phy_prob = lplb_solver.solve(topk_ids)
+
+        if log2phy_prob is not None:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info, log2phy_prob
+            )
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        elif num_fused_shared_experts > 0 and is_deepep_class_backend():
+            # Shared experts appended as extra columns in topk_ids: their value
+            # would be out-of-bounds for the logical-to-physical dispatch table,
+            # so split, dispatch the routed cols, recombine.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
