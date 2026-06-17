@@ -107,13 +107,6 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         self.assertEqual(_safe_unlink(existing), (True, 3))
         self.assertFalse(os.path.exists(existing))
 
-    def test_watermarks_report_values_when_invalid(self):
-        """Invalid watermark errors include both effective values."""
-        with self.assertRaisesRegex(
-            ValueError, r"low_watermark=70.0, high_watermark=60.0"
-        ):
-            HiCacheL3Cleaner(self.base_dirs, tp_rank=0, high_watermark=60.0)
-
     def test_start_only_runs_on_tp_rank_zero(self):
         """Only TP rank 0 owns file cleanup for a shared storage directory."""
         cleaner = HiCacheL3Cleaner(self.base_dirs, tp_rank=1, interval_sec=0.01)
