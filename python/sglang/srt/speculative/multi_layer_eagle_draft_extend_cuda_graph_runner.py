@@ -351,9 +351,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch,
             )
 
-            # Chain-style MTP: overwrite the shared hidden_states buffer with
-            # this step's output (hidden_states_before_norm) so the next step's
-            # graph reads the chained value without any inter-step Python copy.
             if (
                 self.eagle_worker.chain_mtp_hidden_states
                 and ret.hidden_states is not None
