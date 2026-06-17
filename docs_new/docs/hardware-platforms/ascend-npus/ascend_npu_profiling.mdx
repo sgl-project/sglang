@@ -16,7 +16,7 @@ and analysis to visualization — helping you get started with performance
 profiling quickly.
 
 For more profiling scenarios (e.g., Nsight Systems, PD disaggregation, etc.),
-see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
+see [SGLang Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx).
 
 ## Ascend PyTorch Profiler
 
@@ -259,6 +259,7 @@ python3 -m sglang.profiler \
   --num-steps 3 \
   --cpu --gpu &
 ```
+
 ```bash Command
 # Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests.
 # The profiler starts recording once /start_profile is received by the server.
@@ -407,15 +408,18 @@ them via:
 
 - **When profiling starts**: server log outputs
   `Profiling starts. Traces will be saved to: <path> (with profile id: <id>)`
-```
+
+```text
 [2026-05-19 13:23:15] Profiling starts. Traces will be saved to: /tmp/1779196995.6948605 (with profile id: 1779196995.6979997)
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] INFO:     127.0.0.1:40714 - "POST /start_profile HTTP/1.1" 200 OK
 ```
+
 - **When profiling stops**: server log outputs
   `Profiling done. Traces are saved to: <path>`
-```
+
+```text
 [2026-05-19 13:23:17] Stop profiling...
 [2026-05-19 13:23:17] [WARNING] [350443] profiler.py: Incorrect schedule: Stop profiler while current state is RECORD which may result in incomplete parsed data.
 [rank0]:[W519 13:23:17.084812760 compiler_depend.ts:3136] Warning: The indexFromRank 0is not equal indexFromCurDevice 4 , which might be normal if the number of devices on your collective communication server is inconsistent.Otherwise, you need to check if the current device is correct when calling the interface.If it's incorrect, it might have introduced an error. (function operator())
@@ -424,8 +428,10 @@ them via:
 [2026-05-19 13:23:32] [INFO] [352725] profiler.py: All profiling data parsed in a total time of 0:00:14.305669
 [2026-05-19 13:23:32] Profiling done. Traces are saved to: /tmp/1779196995.6948605
 ```
+
 - **CLI output**: `sglang.profiler` outputs `Dump profiling traces to <path>`
-```
+
+```text
 Dump profiling traces to /tmp/1779243331.3219
 Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 ```
@@ -476,7 +482,7 @@ In a multi-node deployment, each node generates its own trace files.
 To merge them into a single unified trace, set `"merge_profiles": true` in the `/start_profile` request.
 However, on Ascend NPU, the merge feature does **not** fully support the `*_ascend_pt` format — merged results may be incomplete or incorrect.
 It is recommended to view `trace_view.json` on each node individually instead.
-For more details, see [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces).
+For more details, see [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx#profiler-trace-merger-for-distributed-traces).
 </Note>
 
 ### 6. Re-parsing Raw Data (Optional)
@@ -523,17 +529,17 @@ If the original data is still needed, back it up before running `analyse()`.
   limited support — check `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json`
   on each node individually. In PD disaggregation mode, prefill and decode
   workers must be profiled separately — see
-  [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
+  [Profile In PD Disaggregation Mode](../../developer_guide/benchmark_and_profiling.mdx#profile-in-pd-disaggregation-mode).
 
 ## See Also
 
-- [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
+- [SGLang Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx)
   — General SGLang profiling guide
-- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
+- [Ascend NPU Quickstart](../../hardware-platforms/ascend-npus/ascend_npu_quick_start.mdx)
   — Ascend NPU environment setup
-- [Ascend NPU Optimization](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization)
+- [Ascend NPU Optimization](../../hardware-platforms/ascend-npus/ascend_npu_optimization.mdx)
   — Ascend NPU optimization parameters
-- [Ascend NPU Performance Testing](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing)
+- [Ascend NPU Performance Testing](../../hardware-platforms/ascend-npus/ascend_npu_performance_testing.mdx)
   — Ascend NPU performance benchmarking
-- [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables)
+- [Ascend NPU Environment Variables](../../hardware-platforms/ascend-npus/ascend_npu_environment_variables.mdx)
   — Environment variable reference

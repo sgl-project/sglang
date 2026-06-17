@@ -12,7 +12,7 @@ This page walks through performance testing your SGLang deployment on Ascend NPU
 
 ### 1.1 Start SGLang server
 
-Launch the server with the appropriate flags for each model type. Make sure SGLang is installed first — see [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) for environment setup.
+Launch the server with the appropriate flags for each model type. Make sure SGLang is installed first — see [Ascend NPU Quickstart](../../hardware-platforms/ascend-npus/ascend_npu_quick_start.mdx) for environment setup.
 
 <Tabs>
   <Tab title="Text Generation">
@@ -84,13 +84,13 @@ Run `ais_bench -h` to verify.
 
 Test `Qwen/Qwen2.5-7B-Instruct` via the online serving endpoint.
 
-<Note>Before running any benchmark in this section, make sure the SGLang text-generation server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) for the launch command.</Note>
+<Note>Before running any benchmark in this section, make sure the SGLang text-generation server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#11-start-sglang-server) for the launch command.</Note>
 
 <Tip>For performance testing, prefer random datasets (`--dataset random`, `--dataset-name random`) over real datasets. Random datasets let you pin `--min-prompt-length` / `--max-prompt-length` and `--min-tokens` / `--max-tokens` to fixed values, producing consistent, repeatable results. Real datasets (ShareGPT, openqa, etc.) have variable input lengths that add noise and make cross-run comparisons unreliable.</Tip>
 
 ### 2.1 Using Evalscope
 
-<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang server running at `http://127.0.0.1:30000`.</Note>
+<Note>Prerequisites: [Evalscope installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang server running at `http://127.0.0.1:30000`.</Note>
 
 Run the following command to run a performance test against the server:
 
@@ -162,7 +162,7 @@ Percentile results:
 
 ### 2.2 Using AISBench
 
-<Note>Prerequisites: [AISBench installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands must be run from the `benchmark/` directory. SGLang server running at `http://127.0.0.1:30000`. Set `stream=True` and `ignore_eos=True` in the model config for accurate results.</Note>
+<Note>Prerequisites: [AISBench installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands must be run from the `benchmark/` directory. SGLang server running at `http://127.0.0.1:30000`. Set `stream=True` and `ignore_eos=True` in the model config for accurate results.</Note>
 
 Two files need to be configured for performance testing.
 
@@ -290,7 +290,7 @@ Example output (for illustration only — actual results depend on your hardware
 
 SGLang's built-in `bench_serving` requires no extra installation. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
 
-<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for all backends, datasets, and advanced options.</Note>
+<Note>See the [Bench Serving Guide](../../developer_guide/bench_serving.mdx) for all backends, datasets, and advanced options.</Note>
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -312,7 +312,7 @@ python -m sglang.bench_serving \
 2. If downloading still fails, manually download the dataset file `ShareGPT_V3_unfiltered_cleaned_split.json` locally, upload it to your server, then specify the file directory via `--dataset-path` to run offline.
 </Note>
 
-<Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/docs/developer_guide/bench_serving).</Tip>
+<Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](../../developer_guide/bench_serving.mdx).</Tip>
 
 Example output (for illustration only — actual results depend on your hardware and configuration):
 
@@ -436,6 +436,7 @@ The output format is **hardcoded in `bench_serving.py`. All formatting decisions
 </table>
 
 ##### Time per Output Token (TPOT) – Excluding First Token
+
 Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
 
 <table>
@@ -460,18 +461,17 @@ Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
   </tbody>
 </table>
 
-
 ## 3. Online Service: Multimodal Model
 
 Test `Qwen/Qwen2.5-VL-7B-Instruct` for vision-language tasks.
 
-<Note>Before running any benchmark in this section, make sure the SGLang multimodal server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) and use the Multimodal tab for the launch command.</Note>
+<Note>Before running any benchmark in this section, make sure the SGLang multimodal server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#11-start-sglang-server) and use the Multimodal tab for the launch command.</Note>
 
 <Tip>For consistent, repeatable results, set `--random-range-ratio 1` to fix input/output lengths, or `0` (default) for uniform distribution.</Tip>
 
 ### 3.1 Using Evalscope
 
-<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang multimodal server running at `http://127.0.0.1:30000`.</Note>
+<Note>Prerequisites: [Evalscope installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang multimodal server running at `http://127.0.0.1:30000`.</Note>
 
 Evalscope's `perf` tool uses the OpenAI-compatible `/v1/chat/completions` endpoint. Use `--dataset random_vl` for randomized multimodal data with image generation:
 
@@ -500,7 +500,7 @@ evalscope perf \
 
 ### 3.2 Using AISBench
 
-<Note>Prerequisites: [AISBench installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands run from the `benchmark/` directory. SGLang multimodal server running at `http://127.0.0.1:30000`. AISBench does not include a built-in multimodal dataset — you must provide your own.</Note>
+<Note>Prerequisites: [AISBench installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands run from the `benchmark/` directory. SGLang multimodal server running at `http://127.0.0.1:30000`. AISBench does not include a built-in multimodal dataset — you must provide your own.</Note>
 
 First, edit `ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py` to configure the vision model:
 
@@ -608,7 +608,7 @@ Example output (for illustration only — actual results depend on your hardware
 
 Set `--dataset-name image` for image datasets. `bench_serving` will generate random prompts with image inputs. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
 
-<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for the full list of image-related flags.</Note>
+<Note>See the [Bench Serving Guide](../../developer_guide/bench_serving.mdx) for the full list of image-related flags.</Note>
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -672,11 +672,11 @@ Max ITL (ms):                            11309.91
 
 Test `Qwen/Qwen3-Embedding-8B` on the embedding API endpoint.
 
-<Note>Before running any benchmark in this section, make sure the SGLang embedding server is running with `--is-embedding` at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) and use the Embedding tab for the launch command. AISBench does not support embedding endpoints — use `bench_serving` or Evalscope instead.</Note>
+<Note>Before running any benchmark in this section, make sure the SGLang embedding server is running with `--is-embedding` at `http://127.0.0.1:30000`. See [Start SGLang server](#11-start-sglang-server) and use the Embedding tab for the launch command. AISBench does not support embedding endpoints — use `bench_serving` or Evalscope instead.</Note>
 
 ### 4.1 Using Evalscope
 
-<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang embedding server running with `--is-embedding` at `http://127.0.0.1:30000`.</Note>
+<Note>Prerequisites: [Evalscope installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang embedding server running with `--is-embedding` at `http://127.0.0.1:30000`.</Note>
 
 Evalscope supports embedding evaluation. For performance testing the embedding API directly:
 
@@ -695,7 +695,7 @@ evalscope perf \
 
 <Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
 
-<Note>Evalscope's embedding performance testing support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#4-2-using-bench_serving-embedding-backend) as the primary option.</Note>
+<Note>Evalscope's embedding performance testing support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#42-using-bench_serving-embedding-backend) as the primary option.</Note>
 
 ### 4.2 Using bench_serving (embedding backend)
 
@@ -764,7 +764,7 @@ python -m sglang.bench_offline_throughput \
 
 ## See also
 
-- [Bench Serving Guide](/docs/developer_guide/bench_serving) — all backends, datasets, and advanced options for `bench_serving`
-- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — environment setup for Ascend NPUs
+- [Bench Serving Guide](../../developer_guide/bench_serving.mdx) — all backends, datasets, and advanced options for `bench_serving`
+- [Ascend NPU Quickstart](../../hardware-platforms/ascend-npus/ascend_npu_quick_start.mdx) — environment setup for Ascend NPUs
 - [Evalscope Performance Testing Guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/quick_start.html) — full Evalscope documentation
 - [AISBench Documentation](https://ais-bench-benchmark.readthedocs.io/en/latest/) — full AISBench documentation

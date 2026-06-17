@@ -1957,7 +1957,7 @@ do
         --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		--load-balance-method round_robin
+    --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -2060,7 +2060,7 @@ do
         --nnodes 2 --node-rank $i \
         --disaggregation-bootstrap-port 8995 \
         --moe-dense-tp-size 1 \
-	    --enable-dsa-prefill-context-parallel \
+      --enable-dsa-prefill-context-parallel \
         --dsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
@@ -2117,7 +2117,6 @@ do
     fi
 done
 ```
-
 
 ```bash Command
 python -m sglang_router.launch_router \
@@ -3059,8 +3058,8 @@ do
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 2 --mem-fraction-static 0.7 \
         --disable-radix-cache \
-	    --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
-	    --max-running-requests 16 --chunked-prefill-size 20480 --max-prefill-tokens 20480 \
+      --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
+      --max-running-requests 16 --chunked-prefill-size 20480 --max-prefill-tokens 20480 \
         --enable-dp-attention  \
         --moe-a2a-backend ascend_fuseep --dtype bfloat16 \
         --disable-overlap-schedule
@@ -3088,7 +3087,7 @@ do
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend ascend_fuseep --cuda-graph-bs 16 32 56 72 80 88 96 104 112 120 128 136 \
         --dist-init-addr DIP1:5000 \
-	    --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+      --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 --load-balance-method round_robin
         NODE_RANK=$i
         break
@@ -5294,6 +5293,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 32001 --random-input-len 3500 --random-output-len 1500 --num-prompts 320 --random-range-ratio 1 --max-concurrency 80
 ```
+
 ### MiniMax-M2.5 128K-1K Low Latency on A3 8 Cards Mixed Mode
 
 Model: MiniMax-M2.5
@@ -5378,6 +5378,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 32000 --random-input-len 131072 --random-output-len 1024 --num-prompts 8 --random-range-ratio 1 --max-concurrency 2
 ```
+
 ### MiniMax-M2.5 3_5K-1_5K High Throughput on A3 8 Cards Mixed Mode
 
 Model: MiniMax-M2.5
@@ -5542,6 +5543,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 32000 --random-input-len 65536 --random-output-len 1024 --num-prompts 144 --random-range-ratio 1 --max-concurrency 36
 ```
+
 ### MiniMax-M2.5 128K-1K High Throughput on A3 8 Cards Mixed Mode
 
 Model: MiniMax-M2.5
@@ -5625,6 +5627,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 32000 --random-input-len 131072 --random-output-len 1024 --num-prompts 128 --random-range-ratio 1 --max-concurrency 32
 ```
+
 ### MiniMax-M2.5 64K-1K High Throughput on A3 4 Cards Mixed Mode
 
 Model: MiniMax-M2.5
@@ -5707,6 +5710,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 32000 --random-input-len 65536 --random-output-len 1024 --num-prompts 144 --random-range-ratio 1 --max-concurrency 36
 ```
+
 ### MiniMax-M2.5 64K-1K High Throughput on A3 16 Cards Disaggregation Mode
 
 Model: MiniMax-M2.5
@@ -5842,6 +5846,7 @@ We tested it based on the `RANDOM` dataset.
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --random-input-len 65536 --random-output-len 1024 --num-prompts 640 --random-range-ratio 1 --max-concurrency 160
 ```
+
 ### MiniMax-M2.5 128K-1K High Throughput on A3 16 Cards Disaggregation Mode
 
 Model: MiniMax-M2.5
@@ -5978,7 +5983,6 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --random-input-len 131072 --random-output-len 1024 --num-prompts 192 --random-range-ratio 1 --max-concurrency 48
 ```
 
-
 ### Kimi K2.5 w4a8 3_5K-1_5K 20ms on A3 8 Cards Mixed Mode
 
 Model: Kimi-K2.5-w4a8
@@ -6052,7 +6056,6 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 64 --random-output-len 1500 --random-input-len 3500 --num-prompts 64
 ```
-
 
 ### Kimi K2.5 w4a8 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
 
@@ -6874,7 +6877,7 @@ python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903 
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).
 
 ### MiMo-V2-Flash 16K+1K 16ms on A3 24 Cards Disaggregation Mode
 
@@ -6896,7 +6899,7 @@ Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).
 
 #### Benchmark
 
@@ -6926,4 +6929,4 @@ python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903 
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).

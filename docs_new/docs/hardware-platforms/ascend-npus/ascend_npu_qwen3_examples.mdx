@@ -11,9 +11,9 @@ If you need to download model weights, check the model size at [ModelScope](http
 
 ### Running Qwen3
 
-#### Running Qwen3-32B on 1 x Atlas 800I A3.
+#### Running Qwen3-32B on 1 x Atlas 800I A3
 
-Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-32B)
+Model weights could be found [Qwen3-32B on Hugging Face](https://huggingface.co/Qwen/Qwen3-32B)
 
 ```shell Launch Server
 export SGLANG_SET_CPU_AFFINITY=1
@@ -31,11 +31,11 @@ python -m sglang.launch_server \
    --mem-fraction-static 0.8
 ```
 
-#### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3.
+#### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3
 
-Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-32B)
+Model weights could be found [Qwen3-32B on Hugging Face](https://huggingface.co/Qwen/Qwen3-32B)
 
-Speculative model weights could be found [here](https://huggingface.co/Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3)
+Speculative model weights could be found [Zhi-Create-Qwen3-32B-Eagle3 on Hugging Face](https://huggingface.co/Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3)
 
 ```shell Launch Server with Eagle3
 export SGLANG_SET_CPU_AFFINITY=1
@@ -58,9 +58,9 @@ python -m sglang.launch_server \
    --speculative-num-draft-tokens 2
 ```
 
-#### Running Qwen3-30B-A3B MOE on 1 x Atlas 800I A3.
+#### Running Qwen3-30B-A3B MOE on 1 x Atlas 800I A3
 
-Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-30B-A3B)
+Model weights could be found [Qwen3-30B-A3B on Hugging Face](https://huggingface.co/Qwen/Qwen3-30B-A3B)
 
 ```shell Launch Server
 export SGLANG_SET_CPU_AFFINITY=1
@@ -79,9 +79,9 @@ python -m sglang.launch_server \
    --mem-fraction-static 0.8
 ```
 
-#### Running Qwen3-235B-A22B-Instruct-2507 MOE on 1 x Atlas 800I A3.
+#### Running Qwen3-235B-A22B-Instruct-2507 MOE on 1 x Atlas 800I A3
 
-Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507)
+Model weights could be found [Qwen3-235B-A22B-Instruct-2507 on Hugging Face](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507)
 
 ```shell Launch Server
 export SGLANG_SET_CPU_AFFINITY=1
@@ -192,6 +192,7 @@ python3 -m sglang_router.launch_router \
 This example enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences. PD disaggregation is required.
 
 > **Constraints**
+> 
 > - Prefill side must set `--max-running-requests 1` (PCP only supports batch_size=1)
 > - `--attn-cp-size` must evenly divide `--tp-size`; each CP rank occupies `tp_size / cp_size` NPUs
 
@@ -267,9 +268,9 @@ python3 -m sglang.launch_server \
 
 > **Note:** `ASCEND_MF_STORE_URL` on both nodes must point to the same KV store (typically the Prefill node IP). `ASCEND_USE_FIA=True` enables fast interconnect aggregation for KV transfer. PCP is a Prefill-only feature; the Decode side needs no CP-related flags.
 
-#### Running Qwen3-VL-8B-Instruct on 1 x Atlas 800I A3.
+#### Running Qwen3-VL-8B-Instruct on 1 x Atlas 800I A3
 
-Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
+Model weights could be found [Qwen3-VL-8B-Instruct on Hugging Face](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
 
 ```shell Launch Server
 export SGLANG_SET_CPU_AFFINITY=1
@@ -290,4 +291,4 @@ python -m sglang.launch_server \
 
 ## Testing the Service
 
-Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](../../hardware-platforms/ascend-npus/ascend_npu.mdx#testing-the-service).
