@@ -6,10 +6,13 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
 register_amd_ci(est_time=313, suite="stage-b-test-2-gpu-large-amd")
+
+SERVER_LAUNCH_TIMEOUT = 4500 if is_in_amd_ci() else 45 * 60
 
 
 class TestMixtralAccuracy(CustomTestCase):
@@ -34,7 +37,7 @@ class TestMixtralAccuracy(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=45 * 60,
+            timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
         )
 
