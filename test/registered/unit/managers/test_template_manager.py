@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.template_detection import (
     REASONING_PARSER_RULES,
@@ -16,8 +18,9 @@ register_cpu_ci(2.0, "base-a-test-cpu")
 
 
 class _DummyTokenizer:
-    def __init__(self, vocab):
+    def __init__(self, vocab, chat_template=None):
         self._vocab = vocab
+        self.chat_template = chat_template
 
     def get_vocab(self):
         return {token: i for i, token in enumerate(self._vocab)}
@@ -161,6 +164,49 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             ["<tool_call>", "<arg_key>", "<arg_value>"],
             "poolside_v1",
             "enable_thinking",
+        ),
+        (
+            "poolside_v1_actual_template_shape",
+            "{% set enable_thinking = enable_thinking | default(false) %}\n"
+            "Wrap your thinking in '<think>', '</think>' tags, followed by a function call.\n"
+            "For each function call, return an unescaped XML-like object with function name "
+            "and arguments within '<tool_call>' and '</tool_call>' tags, like here:\n"
+            "<tool_call>function-name\n"
+            "<arg_key>argument-key</arg_key>\n"
+            "<arg_value>value-of-argument-key</arg_value>\n"
+            "</tool_call>",
+            ["<tool_call>"],
+            "poolside_v1",
+            None,
+        ),
+        (
+            "lfm2_not_deepseek_r1_from_history_cleanup",
+            "{% set keep_past_thinking = keep_past_thinking | default(false) %}\n"
+            "{% if not keep_past_thinking and '</think>' in content %}"
+            "{{ content.split('</think>')[-1] }}{% endif %}\n"
+            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>",
+            ["<|tool_call_start|>", "<|tool_call_end|>"],
+            None,
+            None,
+        ),
+        (
+            "qwen3_coder_actual_template_shape_has_no_reasoning",
+            "<tools>\n"
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Paris</parameter></function></tool_call>",
+            ["<tool_call>"],
+            None,
+            None,
+        ),
+        (
+            "step3p5_actual_template_shape",
+            "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}\n"
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Paris</parameter></function></tool_call>\n"
+            "{% if '<think>' in content %}{{ content.split('</think>')[-1] }}{% endif %}",
+            ["<tool_call>", "<tool_calls>"],
+            "step3p5",
+            None,
         ),
         (
             "step3p5_think_tags",
@@ -367,6 +413,18 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "poolside_v1",
             ),
             (
+                "poolside_v1_actual_template_shape",
+                "{% set enable_thinking = enable_thinking | default(false) %}\n"
+                "return an unescaped XML-like object with function name and arguments "
+                "within '<tool_call>' and '</tool_call>' tags\n"
+                "<tool_call>function-name\n"
+                "<arg_key>argument-key</arg_key>\n"
+                "<arg_value>value-of-argument-key</arg_value>\n"
+                "</tool_call>",
+                ["<tool_call>"],
+                "poolside_v1",
+            ),
+            (
                 "qwen3_coder",
                 "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n"
                 "<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
@@ -377,6 +435,14 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "step3p5",
                 "Step3.5-Flash\n<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
                 ["<tool_call>"],
+                "step3p5",
+            ),
+            (
+                "step3p5_actual_template_shape",
+                "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}\n"
+                "<tool_call><function=get_weather>"
+                "<parameter=city>Paris</parameter></function></tool_call>",
+                ["<tool_call>", "<tool_calls>"],
                 "step3p5",
             ),
             (
@@ -507,12 +573,15 @@ class TestToolCallParserDetection(unittest.TestCase):
 class TestResolveAutoParsers(unittest.TestCase):
     """Tests for resolve_auto_parsers() using real model tokenizers."""
 
-    def _make_server_args(self, reasoning_parser=None, tool_call_parser=None):
+    def _make_server_args(
+        self, reasoning_parser=None, tool_call_parser=None, chat_template=None
+    ):
         return SimpleNamespace(
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
             model_path="Qwen/Qwen3-0.6B",
             trust_remote_code=False,
+            chat_template=chat_template,
         )
 
     def test_resolves_both_parsers_with_real_model(self):
@@ -549,6 +618,45 @@ class TestResolveAutoParsers(unittest.TestCase):
         resolve_auto_parsers(args)
         self.assertIsNone(args.reasoning_parser)
         self.assertIsNone(args.tool_call_parser)
+
+    def test_none_chat_template_disables_both_parsers(self):
+        args = self._make_server_args(
+            reasoning_parser="auto", tool_call_parser="auto"
+        )
+        tokenizer = _DummyTokenizer([])
+
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_tokenizer",
+            return_value=tokenizer,
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertIsNone(args.reasoning_parser)
+        self.assertIsNone(args.tool_call_parser)
+
+    def test_explicit_jinja_template_takes_precedence(self):
+        tokenizer = _DummyTokenizer([], chat_template=None)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".jinja") as f:
+            f.write(
+                "{% if not thinking is defined %}{% set thinking = false %}{% endif %}\n"
+                '<｜DSML｜function_calls><｜DSML｜invoke name="tool"></｜DSML｜invoke>'
+            )
+            f.flush()
+            args = self._make_server_args(
+                reasoning_parser="auto",
+                tool_call_parser="auto",
+                chat_template=f.name,
+            )
+
+            with patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer",
+                return_value=tokenizer,
+            ):
+                resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "deepseek-v3")
+        self.assertEqual(args.tool_call_parser, "deepseekv32")
 
 
 if __name__ == "__main__":

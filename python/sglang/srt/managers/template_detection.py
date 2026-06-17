@@ -19,6 +19,7 @@ parser from chat templates and tokenizer vocabularies.
 """
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
@@ -239,7 +240,13 @@ def _is_hunyuan(ctx):
 
 
 def _is_poolside_v1(ctx):
-    return (
+    has_poolside_tool_format = (
+        ctx.has_text("unescaped XML-like object")
+        and ctx.has_text("<tool_call>function-name")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+    return has_poolside_tool_format or (
         ctx.reasoning_config
         == ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=False)
         and not _is_hunyuan(ctx)
@@ -271,8 +278,14 @@ def _is_lfm2(ctx):
 
 
 def _is_step3p5(ctx):
-    return ctx.has_pattern(r"Step-?3(?:\.|p)?[57]", re.IGNORECASE) or ctx.has_pattern(
-        r"step3p[57]", re.IGNORECASE
+    return (
+        ctx.has_pattern(r"Step-?3(?:\.|p)?[57]", re.IGNORECASE)
+        or ctx.has_pattern(r"step3p[57]", re.IGNORECASE)
+        or (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("Reasoning: ")
+            and _is_qwen3_coder(ctx)
+        )
     )
 
 
@@ -303,7 +316,7 @@ def _is_deepseek_r1(ctx):
 
 
 def _is_deepseek_r1_think_tags(ctx):
-    return ctx.has_text("<think>") or ctx.has_text("</think>")
+    return not _is_lfm2(ctx) and (ctx.has_text("<think>") or ctx.has_text("</think>"))
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +509,25 @@ def _resolve_auto_parser(
         setattr(server_args, attr, None)
 
 
+def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
+    if not chat_template_arg or not isinstance(chat_template_arg, str):
+        return None
+    if not chat_template_arg.endswith(".jinja") or not os.path.exists(
+        chat_template_arg
+    ):
+        return None
+    with open(chat_template_arg, encoding="utf-8") as f:
+        return f.read().replace("\\n", "\n")
+
+
+def _disable_auto_parser(server_args, attr: str, label: str) -> None:
+    logger.warning(
+        f"--{attr.replace('_', '-')}=auto specified but could not detect "
+        f"{label} from chat template. Disabling {label}."
+    )
+    setattr(server_args, attr, None)
+
+
 def resolve_auto_parsers(server_args) -> None:
     """Resolve --reasoning-parser=auto and --tool-call-parser=auto before scheduler.
 
@@ -515,21 +547,17 @@ def resolve_auto_parsers(server_args) -> None:
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
         )
-        template = getattr(tokenizer, "chat_template", None)
+        template = _load_explicit_jinja_template(
+            getattr(server_args, "chat_template", None)
+        )
+        if template is None:
+            template = getattr(tokenizer, "chat_template", None)
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
         if needs_reasoning:
-            logger.warning(
-                "--reasoning-parser=auto specified but could not detect "
-                "reasoning parser from chat template. Disabling reasoning parser."
-            )
-            server_args.reasoning_parser = None
+            _disable_auto_parser(server_args, "reasoning_parser", "reasoning parser")
         if needs_tool_call:
-            logger.warning(
-                "--tool-call-parser=auto specified but could not detect "
-                "tool-call parser from chat template. Disabling tool-call parser."
-            )
-            server_args.tool_call_parser = None
+            _disable_auto_parser(server_args, "tool_call_parser", "tool-call parser")
         return
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
@@ -537,6 +565,10 @@ def resolve_auto_parsers(server_args) -> None:
         template, tokenizer, reasoning_config, force_reasoning
     )
     if ctx is None:
+        if needs_reasoning:
+            _disable_auto_parser(server_args, "reasoning_parser", "reasoning parser")
+        if needs_tool_call:
+            _disable_auto_parser(server_args, "tool_call_parser", "tool-call parser")
         return
 
     if needs_reasoning:
