@@ -38,7 +38,9 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_spec_by_arch,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -2618,7 +2620,9 @@ class ServerArgs:
                 support_mamba_cache_extra_buffer=True,
             )
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import apply_nemotron_h_defaults
+            from sglang.srt.arg_groups.nemotron_h_hook import (
+                apply_nemotron_h_defaults,
+            )
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
