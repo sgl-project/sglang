@@ -1907,6 +1907,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
 
+                # Add multimodal prompt token counts only for requests that
+                # actually consumed them, so plain-text meta_info stays unchanged.
+                image_tokens_list = getattr(recv_obj, "image_tokens", None)
+                audio_tokens_list = getattr(recv_obj, "audio_tokens", None)
+                video_tokens_list = getattr(recv_obj, "video_tokens", None)
+                if image_tokens_list and image_tokens_list[i]:
+                    meta_info["image_tokens"] = image_tokens_list[i]
+                if audio_tokens_list and audio_tokens_list[i]:
+                    meta_info["audio_tokens"] = audio_tokens_list[i]
+                if video_tokens_list and video_tokens_list[i]:
+                    meta_info["video_tokens"] = video_tokens_list[i]
+
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
@@ -2642,7 +2654,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Two scheduler messages can race in handle_loop for the same rid: a
+        # batch output that finishes it normally (deletes rid_to_state[rid])
+        # and this abort echo. If the finish wins, the rid is already gone and
+        # there is nothing left to abort. Common under mass client
+        # disconnects, amplified by prefix / abort_all fan-out.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.info(
+                "Abort request for rid=%s not found in rid_to_state; "
+                "likely already finished/removed.",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -3003,6 +3027,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
+            model_name=server_args.model_path,
         )
     except ValueError as e:
         error_message = str(e)
@@ -3017,6 +3042,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
+                model_name=server_args.model_path,
             )
         else:
             raise e

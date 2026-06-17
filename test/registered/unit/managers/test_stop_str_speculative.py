@@ -41,9 +41,16 @@ class _FakeTokenizer:
         return "".join(ID_TO_TEXT[int(i)] for i in ids)
 
 
+class _MockTokenizerForNormalize:
+    """Mock tokenizer for normalize() - returns char-count as token list."""
+
+    def encode(self, s, add_special_tokens=False):
+        return list(range(len(s)))  # One "token" per character
+
+
 def _make_req(output_ids, stop=None, stop_regex=None):
     sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
-    sp.normalize(tokenizer=None)  # char-based stop_str_max_len
+    sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
         rid="t",
         origin_input_text="",
