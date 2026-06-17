@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -1152,17 +1151,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        debug_t0 = time.perf_counter()
-        debug_layer_name = layer.__class__.__name__
-        logger.info(
-            "FP8_MOE_POST_LOAD_BEGIN layer=%s block_quant=%s is_fp4_expert=%s "
-            "w13_shape=%s w2_shape=%s",
-            debug_layer_name,
-            self.block_quant,
-            self.is_fp4_expert,
-            tuple(layer.w13_weight.shape) if hasattr(layer, "w13_weight") else None,
-            tuple(layer.w2_weight.shape) if hasattr(layer, "w2_weight") else None,
-        )
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1376,13 +1364,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 weight_block_size = self.quant_config.weight_block_size
-                logger.info(
-                    "FP8_MOE_POST_LOAD_MEGA_MOE_CONVERT_BEGIN layer=%s "
-                    "weight_block_size=%s elapsed=%.3fs",
-                    debug_layer_name,
-                    weight_block_size,
-                    time.perf_counter() - debug_t0,
-                )
                 convert_fp8_experts_to_fp4_for_mega_moe(layer, weight_block_size)
                 build_mega_moe_experts_weights(layer)
                 return
@@ -1401,38 +1382,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     isinstance(layer, DeepEPMoE) or get_moe_a2a_backend().is_megamoe()
                 ), "DeepGemm MoE is only supported with DeepEPMoE or MegaMOE"
                 weight_block_size = self.quant_config.weight_block_size
-                logger.info(
-                    "FP8_MOE_POST_LOAD_REQUANT_BEGIN layer=%s backend=%s "
-                    "runner=%s weight_block_size=%s elapsed=%.3fs",
-                    debug_layer_name,
-                    get_moe_a2a_backend(),
-                    get_moe_runner_backend(),
-                    weight_block_size,
-                    time.perf_counter() - debug_t0,
-                )
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
-                )
-                logger.info(
-                    "FP8_MOE_POST_LOAD_REQUANT_STEP w13 layer=%s elapsed=%.3fs",
-                    debug_layer_name,
-                    time.perf_counter() - debug_t0,
                 )
                 requant_weight_ue8m0_inplace(
                     layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
                 )
-                logger.info(
-                    "FP8_MOE_POST_LOAD_REQUANT_STEP w2 layer=%s elapsed=%.3fs",
-                    debug_layer_name,
-                    time.perf_counter() - debug_t0,
-                )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
-        logger.info(
-            "FP8_MOE_POST_LOAD_DONE layer=%s elapsed=%.3fs",
-            debug_layer_name,
-            time.perf_counter() - debug_t0,
-        )
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 

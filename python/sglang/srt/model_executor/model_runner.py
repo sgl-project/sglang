@@ -172,7 +172,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
+from sglang.srt.model_executor.runner import (
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
 )
@@ -565,12 +567,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
-        if self._should_pre_initialize_mega_moe_symm_buffers():
-            from sglang.srt.layers.moe.mega_moe import (
-                pre_initialize_mega_moe_symm_buffers_from_config,
-            )
-
-            pre_initialize_mega_moe_symm_buffers_from_config(self.model_config)
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -1037,7 +1033,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError:
+        except ImportError as e:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
             )
@@ -2070,7 +2066,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
-            return True, "Succeeded to update parameter online."
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -2386,10 +2382,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
                 logger.warning(
-                    "--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
         else:
@@ -2490,13 +2486,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        if self._should_pre_initialize_mega_moe_symm_buffers():
-            from sglang.srt.layers.moe.mega_moe import (
-                pre_initialize_mega_moe_symm_buffers,
-            )
-
-            pre_initialize_mega_moe_symm_buffers(self.model)
-
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2528,19 +2517,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.dtype,
         )
 
-    def _should_pre_initialize_mega_moe_symm_buffers(self) -> bool:
-        if self.server_args.moe_a2a_backend != "megamoe" or self.device != "cuda":
-            return False
-
-        override = os.getenv("SGLANG_MEGA_MOE_PREINIT_SYMM_BUFFERS")
-        if override:
-            return override == "1"
-
-        try:
-            return torch.cuda.get_device_capability()[0] >= 10
-        except RuntimeError:
-            return False
-
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         if self.server_args.disable_flashinfer_autotune:
@@ -2569,7 +2545,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "flashinfer_cutlass",
         ]
 
-        from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
 
         model_uses_fp4 = self.model_config.quantization in (
             "modelopt_fp4",
@@ -2580,7 +2558,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
         )
 
-        from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
         from sglang.srt.utils import is_sm100_supported
 
         model_uses_modelopt_fp8 = self.model_config.quantization in (

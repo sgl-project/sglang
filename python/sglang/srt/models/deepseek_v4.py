@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -2006,7 +2005,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        load_debug_t0 = time.perf_counter()
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2023,22 +2021,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            logger.debug("DSV4_LOAD_WEIGHTS_LIST_BEGIN is_nextn=%s", is_nextn)
             weights = list(weights)
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_LIST_DONE is_nextn=%s count=%s elapsed=%.3fs",
-                is_nextn,
-                len(weights),
-                time.perf_counter() - load_debug_t0,
-            )
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 logger.info("Skip dequant fp8 wo_a")
-        else:
-            logger.debug("DSV4_LOAD_WEIGHTS_LIST_SKIPPED is_nextn=%s", is_nextn)
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -2088,28 +2077,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
-            num_seen_weights = 0
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_APPLY_BEGIN is_nextn=%s elapsed=%.3fs",
-                is_nextn,
-                time.perf_counter() - load_debug_t0,
-            )
             for name, loaded_weight in weights:
-                num_seen_weights += 1
-                if num_seen_weights == 1 or num_seen_weights % 100 == 0:
-                    logger.debug(
-                        "DSV4_LOAD_WEIGHTS_APPLY_PROGRESS is_nextn=%s seen=%s "
-                        "name=%s shape=%s elapsed=%.3fs",
-                        is_nextn,
-                        num_seen_weights,
-                        name,
-                        tuple(loaded_weight.shape),
-                        time.perf_counter() - load_debug_t0,
-                    )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
-                    if os.environ.get("SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD") == "1":
-                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
@@ -2335,26 +2305,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_FUTURES_BEGIN is_nextn=%s seen=%s "
-                "loaded_params=%s futures=%s elapsed=%.3fs",
-                is_nextn,
-                num_seen_weights,
-                len(loaded_params),
-                len(futures),
-                time.perf_counter() - load_debug_t0,
-            )
             for future in concurrent.futures.as_completed(futures):
                 future.result()
-            logger.debug(
-                "DSV4_LOAD_WEIGHTS_APPLY_DONE is_nextn=%s loaded_params=%s "
-                "seen=%s futures=%s elapsed=%.3fs",
-                is_nextn,
-                len(loaded_params),
-                num_seen_weights,
-                len(futures),
-                time.perf_counter() - load_debug_t0,
-            )
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
@@ -2381,18 +2333,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
-        logger.debug(
-            "DSV4_LOAD_WEIGHTS_POST_BEGIN is_nextn=%s weight_names=%s elapsed=%.3fs",
-            is_nextn,
-            len(weight_names),
-            time.perf_counter() - load_debug_t0,
-        )
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
-        logger.debug(
-            "DSV4_LOAD_WEIGHTS_DONE is_nextn=%s elapsed=%.3fs",
-            is_nextn,
-            time.perf_counter() - load_debug_t0,
-        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
