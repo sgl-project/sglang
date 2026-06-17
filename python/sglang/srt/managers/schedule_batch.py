@@ -688,7 +688,9 @@ class ReqMambaInfo:
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
-    mamba_last_track_seqlen: Optional[int] = None  # seq len of the last cached mamba state
+    mamba_last_track_seqlen: Optional[int] = (
+        None  # seq len of the last cached mamba state
+    )
     # the branching point seqlen to track mamba state. If set, given by prefix match,
     # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
     mamba_branching_seqlen: Optional[int] = None
@@ -1133,7 +1135,9 @@ class Req(ReqDllmMixin):
     @property
     def mamba_next_track_idx(self) -> Optional[int]:
         return (
-            self.mamba_info.mamba_next_track_idx if self.mamba_info is not None else None
+            self.mamba_info.mamba_next_track_idx
+            if self.mamba_info is not None
+            else None
         )
 
     @mamba_next_track_idx.setter
