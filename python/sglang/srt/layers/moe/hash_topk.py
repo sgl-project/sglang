@@ -37,12 +37,16 @@ class HashTopK(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
+        # Fuse the routed scaling factor into the topk weights so MoE runners
+        # that do not scale their output (e.g. flashinfer trtllm-routed) still
+        # produce scaled results. Equivalent to the module-level
+        # `final_hidden_states *= routed_scaling_factor`: routed weights gain
+        # x rsf and the fused shared-expert slot (sum/rsf) becomes weight 1.
+        self.apply_routed_scaling_factor_on_output = apply_routed_scaling_factor_on_output
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
         )
-
-        assert not apply_routed_scaling_factor_on_output, "not implemented"
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
@@ -124,6 +128,9 @@ class HashTopK(nn.Module):
 
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
+
+        if self.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * self.routed_scaling_factor
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)

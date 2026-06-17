@@ -1411,7 +1411,9 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        # The sqrtsoftplus biased-topk branch implements
+        # apply_routed_scaling_factor_on_output (the flag is forwarded below);
+        # the remaining branches do not, so assert inside them instead.
         if scoring_func == "sqrtsoftplus":
             _biased_topk = (
                 biased_topk_jit_kernel_impl
@@ -1437,6 +1439,7 @@ def select_experts(
             and scoring_func == "softmax"
             and correction_bias is None
         ):
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
             # flashinfer_trtllm_routed uses raw-logits topk
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
@@ -1445,6 +1448,7 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
             # Qwen3MOE uses fused_topk
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
