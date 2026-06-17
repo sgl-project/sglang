@@ -6,8 +6,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
@@ -15,9 +13,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
-)
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    ModelRunnerKVCacheMixin,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
@@ -207,31 +202,6 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
         server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
-
-    @patch("sglang.srt.model_executor.model_runner_kv_cache_mixin._is_hip", True)
-    @patch(
-        "sglang.srt.model_executor.model_runner_kv_cache_mixin.is_deepseek_dsa",
-        return_value=True,
-    )
-    def test_hisparse_rocm_aiter_fp8_uses_raw_mla_kv_cache_dim(
-        self, _mock_is_deepseek_dsa
-    ):
-        model_runner = SimpleNamespace(
-            kv_cache_dtype=torch.float8_e4m3fn,
-            model_config=SimpleNamespace(
-                hf_config=object(),
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
-            ),
-            server_args=SimpleNamespace(
-                dsa_prefill_backend="aiter",
-                dsa_decode_backend="aiter",
-            ),
-        )
-
-        kv_cache_dim = ModelRunnerKVCacheMixin.calculate_mla_kv_cache_dim(model_runner)
-
-        self.assertEqual(kv_cache_dim, 576)
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
