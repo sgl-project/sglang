@@ -661,7 +661,10 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if self.can_use_jit:
+                if _is_cuda and can_use_hicache_jit_kernel(
+                    element_size=self.element_dim * self.dtype.itemsize,
+                    staged=True,
+                ):
                     jit_transfer_hicache_all_layer_staged_lf_pf(
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
@@ -1211,7 +1214,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first" and self.can_use_jit:
+        if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             transposed = self.kv_buffer.transpose(0, 1)
@@ -1447,7 +1450,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if self.can_use_jit:
+                if _is_cuda and can_use_hicache_jit_kernel(
+                    element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    staged=True,
+                ):
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
                         src_indices=device_indices,
@@ -1757,12 +1763,14 @@ class MambaPoolHost(HostKVCache):
             return
 
         self._temporal_can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self._item_size_per_index(self.temporal_buffer[0])
+            element_size=self._item_size_per_index(self.temporal_buffer[0]),
+            staged=True,
         )
         self._conv_can_use_jit = [
             _is_cuda
             and can_use_hicache_jit_kernel(
-                element_size=self._item_size_per_index(buf[0])
+                element_size=self._item_size_per_index(buf[0]),
+                staged=True,
             )
             for buf in self.conv_buffer
         ]
@@ -2355,7 +2363,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return
 
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.item_bytes * self.dtype.itemsize
+            element_size=self.item_bytes * self.dtype.itemsize,
+            staged=True,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
@@ -2763,7 +2772,8 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return
 
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.state_page_bytes * self.dtype.itemsize
+            element_size=self.state_page_bytes * self.dtype.itemsize,
+            staged=True,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
@@ -3258,7 +3268,8 @@ class DSAIndexerPoolHost(HostKVCache):
             return
 
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
+            staged=True,
         )
         staging_page_capacity = min(
             self.indexer_page_num, _WRITE_BACK_STAGING_PAGE_CHUNK

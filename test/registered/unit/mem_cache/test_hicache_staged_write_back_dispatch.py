@@ -14,14 +14,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    DSAIndexerPoolHost,
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
+    DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
+    MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    MambaPoolHost,
     PoolEntry,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -236,6 +236,10 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer",
                 side_effect=_cpu_jit_one_layer_mha_copy,
             ) as load,
+            mock.patch(
+                f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
+                return_value=True,
+            ) as can_use_jit,
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -254,6 +258,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(staged.call_count, 1)
         self.assertEqual(fallback.call_count, 0)
         self.assertEqual(load.call_count, layer_num)
+        can_use_jit.assert_called_once_with(element_size=4, staged=True)
         for layer_id in range(layer_num):
             self.assertTrue(
                 torch.equal(k_layers[layer_id][device_indices], expected_k[layer_id])
@@ -311,6 +316,10 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer_mla",
                 side_effect=_cpu_jit_one_layer_mla_copy,
             ) as load,
+            mock.patch(
+                f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
+                return_value=True,
+            ) as can_use_jit,
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -329,6 +338,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(staged.call_count, 1)
         self.assertEqual(fallback.call_count, 0)
         self.assertEqual(load.call_count, layer_num)
+        can_use_jit.assert_called_once_with(element_size=5, staged=True)
         for layer_id, layer in enumerate(device_layers):
             self.assertTrue(torch.equal(layer[device_indices], expected[layer_id]))
             self.assertTrue(
@@ -667,9 +677,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         controller.move_hybrid_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
-        self.assertEqual(
-            captured["pool_transfers"][0].host_indices.device.type, "cpu"
-        )
+        self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
 
 
 if __name__ == "__main__":
