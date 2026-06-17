@@ -269,9 +269,20 @@ def try_get_optimal_moe_config(
                     [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
                 )
     if return_down_config:
-        assert (
-            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
-        )
+        if (
+            down_config is not None
+            and config["BLOCK_SIZE_M"] != down_config["BLOCK_SIZE_M"]
+        ):
+            # Both kernels share one moe_align_block_size sort, so the down
+            # config must use the up config's BLOCK_SIZE_M.
+            logger.warning_once(
+                "down_moe config BLOCK_SIZE_M=%d does not match up config "
+                "BLOCK_SIZE_M=%d at M=%d; overriding down BLOCK_SIZE_M to match.",
+                down_config["BLOCK_SIZE_M"],
+                config["BLOCK_SIZE_M"],
+                M,
+            )
+            down_config["BLOCK_SIZE_M"] = config["BLOCK_SIZE_M"]
         return config, (down_config, max_block_m)
     return config
 
