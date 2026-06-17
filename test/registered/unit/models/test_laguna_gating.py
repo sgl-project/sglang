@@ -42,9 +42,7 @@ def _ensure_dist_initialized() -> None:
     )
 
     if not torch.distributed.is_initialized():
-        init_distributed_environment(
-            world_size=1, rank=0, local_rank=0, backend="gloo"
-        )
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
     if not model_parallel_is_initialized():
         initialize_model_parallel(
             tensor_model_parallel_size=1,
