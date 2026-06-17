@@ -790,10 +790,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if (
-                get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-                or get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
-            ):
+            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+                weight_scale = layer.weight_scale_inv_swizzled
+            elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
