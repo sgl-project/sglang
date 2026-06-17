@@ -234,7 +234,7 @@ class TestAnthropicServer(CustomTestCase):
         Uses the Anthropic SDK the way a real client would."""
         client = anthropic.Anthropic(
             base_url=self.base_url,
-            api_key=self.api_key,
+            auth_token=self.api_key,  # Bearer header — SGLang's --api-key checks Authorization
         )
         message = client.messages.create(
             model=self.model,

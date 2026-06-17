@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 from fastapi.responses import JSONResponse  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicMessage,
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
@@ -1334,6 +1335,22 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(
             chat_request.messages[0].content, "You are a helpful assistant."
         )
+
+    def test_validator_handles_constructed_message_objects(self):
+        """The ``mode="before"`` validator must also handle requests built
+        programmatically with ``AnthropicMessage`` objects (not just raw dicts),
+        e.g. ``handle_count_tokens`` constructs the request this way."""
+        request = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=8,
+            messages=[
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="system", content="be terse"),
+                AnthropicMessage(role="user", content="go"),
+            ],
+        )
+        self.assertEqual(request.system, "be terse")
+        self.assertEqual([m.role for m in request.messages], ["user", "user"])
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""

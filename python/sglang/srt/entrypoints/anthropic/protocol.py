@@ -392,6 +392,11 @@ class AnthropicMessagesRequest(BaseModel):
         extracted_system_texts = []
 
         for msg in messages:
+            # ``mode="before"`` sees raw dicts (HTTP path) but also already-
+            # constructed ``AnthropicMessage`` objects (programmatic path, e.g.
+            # ``handle_count_tokens``), so normalize to a dict first.
+            if isinstance(msg, BaseModel):
+                msg = msg.model_dump()
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
@@ -415,6 +420,8 @@ class AnthropicMessagesRequest(BaseModel):
                         combined_system.append(existing_system.strip())
                 elif isinstance(existing_system, list):
                     for block in existing_system:
+                        if isinstance(block, BaseModel):
+                            block = block.model_dump()
                         if isinstance(block, dict) and block.get("type") == "text":
                             text = block.get("text", "").strip()
                             if text:
