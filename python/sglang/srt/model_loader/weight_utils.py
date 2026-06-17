@@ -305,8 +305,9 @@ def get_quant_config(
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
-            # ModelOpt-style NVFP4 checkpoints keep their quant metadata in a
-            # separate hf_quant_config.json
+            # Some ModelOpt NVFP4 checkpoints store quant metadata only in
+            # hf_quant_config.json; others duplicate it in config.json. Read
+            # hf_quant_config.json first when present and FP4-typed.
             modelopt_quant_path = os.path.join(hf_folder, "hf_quant_config.json")
             if os.path.isfile(modelopt_quant_path):
                 with open(modelopt_quant_path) as f:

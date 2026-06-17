@@ -289,19 +289,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             pass
 
         with torch.device("meta"):
-            w13_in = torch.nn.Parameter(
+            w13_input_scale = torch.nn.Parameter(
                 torch.empty(num_experts, dtype=torch.float32), requires_grad=False
             )
-            w2_in = torch.nn.Parameter(
+            w2_input_scale = torch.nn.Parameter(
                 torch.empty(num_experts, dtype=torch.float32), requires_grad=False
             )
-        layer.register_parameter("w13_input_scale", w13_in)
-        layer.register_parameter("w2_input_scale", w2_in)
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(
-            w13_in, {**extra_weight_attrs, "weight_loader": _discard_loader}
+            w13_input_scale, {**extra_weight_attrs, "weight_loader": _discard_loader}
         )
         set_weight_attrs(
-            w2_in, {**extra_weight_attrs, "weight_loader": _discard_loader}
+            w2_input_scale, {**extra_weight_attrs, "weight_loader": _discard_loader}
         )
 
     def get_online_nvfp4_to_mxfp4_weight_loader(self, layer, original_weight_loader):
@@ -362,34 +362,41 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
     def _requantize_nvfp4_to_mxfp4(self, layer, prefix):
         # dynamic_mxfp4_quant is 2-D only; loop over experts.
-        w = getattr(layer, f"{prefix}_weight")
-        w_s = getattr(layer, f"{prefix}_weight_scale")
-        w_s2 = getattr(layer, f"{prefix}_weight_scale_2")
-        qws, qss = [], []
-        for e in range(w.shape[0]):
+        packed_weight = getattr(layer, f"{prefix}_weight")
+        weight_scale = getattr(layer, f"{prefix}_weight_scale")
+        weight_scale_2 = getattr(layer, f"{prefix}_weight_scale_2")
+        quantized_weights, quantized_scales = [], []
+        for expert_idx in range(packed_weight.shape[0]):
             if prefix == "w13":
-                # w_s2[e] = [gate_scale, up_scale]; the fused weight is
-                # [gate_rows; up_rows] so expand each scalar over its half as a
-                # per-row [2I, 1] multiplier.
-                half = w[e].shape[0] // 2
-                e_s2 = torch.cat(
-                    [w_s2[e, 0].repeat(half), w_s2[e, 1].repeat(half)]
+                # weight_scale_2[expert_idx] = [gate_scale, up_scale]; the fused
+                # weight is [gate_rows; up_rows] so expand each scalar over its
+                # half as a per-row [2I, 1] multiplier.
+                half = packed_weight[expert_idx].shape[0] // 2
+                expert_scale_2 = torch.cat(
+                    [
+                        weight_scale_2[expert_idx, 0].repeat(half),
+                        weight_scale_2[expert_idx, 1].repeat(half),
+                    ]
                 ).view(-1, 1)
             else:  # w2: single per-expert per-tensor scalar
-                e_s2 = w_s2[e]
-            bf16 = dequantize_nvfp4(w[e], w_s[e], e_s2)
-            qw, qs = dynamic_mxfp4_quant(bf16)
-            qws.append(qw)
-            qss.append(qs)
+                expert_scale_2 = weight_scale_2[expert_idx]
+            dequantized_weight = dequantize_nvfp4(
+                packed_weight[expert_idx], weight_scale[expert_idx], expert_scale_2
+            )
+            requantized_weight, requantized_scale = dynamic_mxfp4_quant(
+                dequantized_weight
+            )
+            quantized_weights.append(requantized_weight)
+            quantized_scales.append(requantized_scale)
         setattr(
             layer,
             f"{prefix}_weight",
-            torch.nn.Parameter(torch.stack(qws), requires_grad=False),
+            torch.nn.Parameter(torch.stack(quantized_weights), requires_grad=False),
         )
         setattr(
             layer,
             f"{prefix}_weight_scale",
-            torch.nn.Parameter(torch.stack(qss), requires_grad=False),
+            torch.nn.Parameter(torch.stack(quantized_scales), requires_grad=False),
         )
 
     def get_online_weight_loader(self, layer, original_weight_loader):

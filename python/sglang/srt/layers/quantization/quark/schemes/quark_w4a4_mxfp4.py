@@ -443,39 +443,6 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         return online_mxfp4_weight_loader
 
-    def get_online_mxfp4_weight_loader(
-        self,
-        layer,
-        original_weight_loader: Callable,
-    ) -> Callable:
-        """
-        Wrap the original weight loader to perform online MXFP4 quantization.
-        """
-
-        def online_mxfp4_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            shard_id: int | str | None = None,
-        ):
-            # Materialize on device the loaded weight.
-            loaded_weight = loaded_weight.to(param.device)
-
-            # Quantize the loaded weight shard immediately. Since MXFP4 uses per-group quantization, there is no need to load all shards (e.g. q_proj, k_proj, v_proj) before doing online quantization.
-            qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
-
-            # Required e.g. for q_proj, k_proj, v_proj.
-            kwargs = {}
-            if shard_id is not None:
-                kwargs["loaded_shard_id"] = shard_id
-
-            # Use the original weight loader to handle the loading logic
-            # (e.g. qkv sharding, etc.)
-            original_weight_loader(param, qweight, **kwargs)
-
-            layer.weight_scale.weight_loader(layer.weight_scale, weight_scale, **kwargs)
-
-        return online_mxfp4_weight_loader
-
     def apply_weights(
         self,
         layer: torch.nn.Module,

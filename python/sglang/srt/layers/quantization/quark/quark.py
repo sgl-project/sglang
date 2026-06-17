@@ -64,27 +64,44 @@ def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"
     """Return an Nvfp4SourceConfig if `config` (the checkpoint's
     quantization_config dict) describes a supported NVFP4 source, else None.
 
-    Handles two producers, both carrying a per-tensor `weight_scale_2`:
+    Handles two producers:
       - ModelOpt:  quant_method in {modelopt, modelopt_fp4, nvfp4}
-                   with quant_algo NVFP4/FP4 (or unspecified)
-      - AMD Quark: quant_method == "quark" and
-                   global_quant_config.weight.dtype == "fp4"
+                   with quant_algo NVFP4/FP4 (or unspecified).
+      - AMD Quark: quant_method == "quark". global_quant_config.weight is a
+                   2-element list [fp4_per_group_gs16, fp8_e4m3_per_tensor].
 
     compressed-tensors NVFP4 is not supported at this time.
     """
     from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 
-    qm = config.get("quant_method", "")
-    qa = (config.get("quant_algo") or "").upper()
+    quant_method = config.get("quant_method", "")
+    quant_algo = (config.get("quant_algo") or "").upper()
 
-    if qm in ("modelopt", "modelopt_fp4", "nvfp4") and qa in ("", "NVFP4", "FP4"):
+    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in ("", "NVFP4", "FP4"):
         return Nvfp4SourceConfig()
-    if qm == "quark":
-        gw = config.get("global_quant_config", {}).get("weight")
-        if isinstance(gw, dict) and gw.get("dtype") == "fp4":
+    if quant_method == "quark":
+        gqc = config.get("global_quant_config", {})
+        weight = gqc.get("weight")
+        if not (isinstance(weight, list) and len(weight) == 2):
+            return None
+        w0, w1 = weight
+        is_nvfp4_weight = (
+            isinstance(w0, dict)
+            and w0.get("dtype") == "fp4"
+            and w0.get("qscheme") == "per_group"
+            and w0.get("group_size") == 16
+            and not w0.get("is_dynamic")
+        )
+        is_nvfp4_scale_2 = (
+            isinstance(w1, dict)
+            and w1.get("dtype") == "fp8_e4m3"
+            and w1.get("qscheme") == "per_tensor"
+            and not w1.get("is_dynamic")
+        )
+        if is_nvfp4_weight and is_nvfp4_scale_2:
             return Nvfp4SourceConfig()
         return None
-    if qm in ("compressed-tensors", "compressed_tensors"):
+    if quant_method in ("compressed-tensors", "compressed_tensors"):
         raise NotImplementedError(
             "Online MXFP4 requantization from compressed-tensors NVFP4 "
             "checkpoints is not supported at this time."
