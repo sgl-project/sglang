@@ -45,11 +45,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
 )
 
-from sglang.srt.distributed.communication_op import (
-            tensor_model_parallel_all_gather,
-)
-
-
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
 # ---------------------------------------------------------------------------
@@ -151,10 +146,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states, pertoken_scale = self.activation._apply_activation(
                 hidden_states
             )
-
-        # TP all-gather for intermediate dimension if needed
-        if tp_size > 1:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
         
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
