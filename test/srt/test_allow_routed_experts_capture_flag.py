@@ -243,5 +243,27 @@ class BypassPathStructuralTest(unittest.TestCase):
         )
 
 
+class Qwen3MoeMTPOptOutStructuralTest(unittest.TestCase):
+    """Regression tripwire for the Qwen3-MoE MTP draft construction chain."""
+
+    def test_qwen3_moe_mtp_path_forwards_is_nextn_to_topk(self):
+        from sglang.srt.models.qwen3_moe import (
+            Qwen3MoeDecoderLayer,
+            Qwen3MoeModel,
+            Qwen3MoeSparseMoeBlock,
+        )
+        from sglang.srt.models.qwen3_moe_mtp import Qwen3MoeForCausalLMMTP
+
+        mtp_source = inspect.getsource(Qwen3MoeForCausalLMMTP.__init__)
+        model_source = inspect.getsource(Qwen3MoeModel.__init__)
+        decoder_source = inspect.getsource(Qwen3MoeDecoderLayer.__init__)
+        moe_source = inspect.getsource(Qwen3MoeSparseMoeBlock.__init__)
+
+        self.assertIn("is_nextn=True", mtp_source)
+        self.assertIn("is_nextn=True", model_source)
+        self.assertIn("is_nextn=is_nextn", decoder_source)
+        self.assertIn("allow_routed_experts_capture=not is_nextn", moe_source)
+
+
 if __name__ == "__main__":
     unittest.main()

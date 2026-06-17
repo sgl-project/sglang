@@ -57,7 +57,10 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
         )
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = Qwen3MoeModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
