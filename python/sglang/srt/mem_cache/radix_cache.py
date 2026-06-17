@@ -567,6 +567,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # Capture lifetime stats per evicted entry so operators can answer
+        # "how long does a cache entry actually live / can it survive 1h".
+        # TreeNode.creation_time/last_access_time are time.monotonic() based.
+        collect_lifetime = self.metrics_collector is not None
+        now = time.monotonic() if collect_lifetime else 0.0
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -575,6 +581,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
+            # Record lifetime only after the entry has actually left L1.
+            if collect_lifetime:
+                self.metrics_collector.observe_eviction_age(
+                    age_seconds=now - x.creation_time,
+                    idle_seconds=now - x.last_access_time,
+                    hit_count=x.hit_count,
+                )
+
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
@@ -582,6 +596,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        if collect_lifetime and num_evicted > 0:
+            self.metrics_collector.increment_eviction_events()
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:

@@ -1039,6 +1039,12 @@ class HiRadixCache(RadixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # L1 (GPU) residency lifetime: record how long each entry stayed in GPU
+        # before leaving L1 (freed outright, or demoted to host on write_back).
+        # The true L2 end-of-life age is recorded separately in evict_host().
+        collect_lifetime = self.metrics_collector is not None
+        now = time.monotonic() if collect_lifetime else 0.0
+
         num_evicted = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
@@ -1047,6 +1053,7 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
+            before = num_evicted
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
@@ -1058,6 +1065,15 @@ class HiRadixCache(RadixCache):
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
+
+            # Only record lifetime if this node actually left L1 this iteration
+            # (write_backup may return 0 when the host pool is full, leaving x in place).
+            if collect_lifetime and num_evicted > before:
+                self.metrics_collector.observe_eviction_age(
+                    age_seconds=now - x.creation_time,
+                    idle_seconds=now - x.last_access_time,
+                    hit_count=x.hit_count,
+                )
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -1076,6 +1092,8 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        if collect_lifetime and num_evicted > 0:
+            self.metrics_collector.increment_eviction_events()
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
@@ -1110,6 +1128,12 @@ class HiRadixCache(RadixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        # L2 (host/CPU DRAM) eviction observability: previously this tier had no
+        # metrics at all. Record host-tier evicted tokens and entry age so "how
+        # long does L2 survive" is answerable alongside the L1 lifetime histograms.
+        collect_lifetime = self.metrics_collector is not None
+        now = time.monotonic() if collect_lifetime else 0.0
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -1125,7 +1149,12 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            host_evicted = self.cache_controller.evict_host(x.host_value)
+            num_evicted += host_evicted
+            # Only record lifetime once the host entry actually left L2.
+            if collect_lifetime and host_evicted > 0:
+                self.metrics_collector.observe_host_eviction_age(now - x.creation_time)
+                self.metrics_collector.increment_host_eviction_num_tokens(host_evicted)
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
