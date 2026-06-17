@@ -710,7 +710,8 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params"
+              "docs/basic_usage/sampling_params",
+              "docs/basic_usage/aws_sagemaker"
             ]
           },
           {
@@ -752,6 +753,7 @@
               "docs/advanced_features/breakable_cuda_graph",
               "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
+              "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
               "docs/advanced_features/checkpoint_engine",
@@ -854,7 +856,8 @@
                   "cookbook/base/reference/server_arguments"
                 ]
               },
-              "docs/references/post_training_integration"
+              "docs/references/post_training_integration",
+              "docs/references/nightly_precision_regression"
             ]
           }
         ]
@@ -884,6 +887,24 @@
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  {
+                    "group": "Best Practice",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/best_practice/deepseek_r1",
+                      "docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
+                      "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
+                      "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_32b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_27b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_35b_a3b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_next_80b_a3b_instruct"
+                    ]
+                  },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
@@ -961,6 +982,7 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
                       "cookbook/autoregressive/GLM/GLM-OCR",
@@ -995,6 +1017,7 @@
                   {
                     "group": "Moonshotai",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2",
@@ -1004,6 +1027,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.5"
