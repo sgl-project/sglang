@@ -594,8 +594,6 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
     from flashinfer import block_scale_interleave
 
-    # restore_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
-
     is_gated = _is_gated(layer)
 
     w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
