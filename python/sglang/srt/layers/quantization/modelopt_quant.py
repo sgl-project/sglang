@@ -1420,6 +1420,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight.is_modelopt_fp4_weight = True
         layer.register_parameter("weight", weight)
 
         input_scale = PerTensorScaleParameter(
