@@ -50,7 +50,7 @@ class PoolsideV1Detector(BaseFormatDetector):
     String values are emitted as raw text; non-strings are JSON-encoded by
     the chat template. The parser does schema-based type coercion to round-trip
     them: schema type `string` keeps the raw value; other types attempt
-    `json.loads` and fall back to `ast.literal_eval`, then to the raw string.
+    `json.loads` and fall back to `safe_literal_eval`, then to the raw string.
     """
 
     # Wire-format tag tokens — constants, not per-instance.
@@ -166,7 +166,7 @@ class PoolsideV1Detector(BaseFormatDetector):
           - no schema entry           → json.loads only (conservative; don't
                                         ast-eval untyped values)
           - everything else (int,
-            number, bool, object, …)  → json.loads, then ast.literal_eval
+            number, bool, object, …)  → json.loads, then safe_literal_eval
 
         Each decoder result is round-tripped through `json.dumps` before being
         returned; non-JSON-serializable values (sets / complex / bytes from
