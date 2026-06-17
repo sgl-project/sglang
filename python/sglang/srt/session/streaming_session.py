@@ -534,7 +534,9 @@ class StreamingSession(BasePrefixCache):
         )
         slot.kv_info.kv_allocated_len = prefix_len
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
-        slot.kv_info.swa_evicted_seqlen = min(slot.kv_info.swa_evicted_seqlen, prefix_len)
+        slot.kv_info.swa_evicted_seqlen = min(
+            slot.kv_info.swa_evicted_seqlen, prefix_len
+        )
         req.kv_allocated_len = prefix_len
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
         req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
