@@ -93,7 +93,7 @@ repos:
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-registered-tests
-        name: check registered tests have CI registry
+        name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py
         language: system
         files: ^test/registered/.*\.py$

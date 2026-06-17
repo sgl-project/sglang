@@ -394,9 +394,17 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
+        # For now, kernel write-back keeps host indices on CPU only for page_first.
+        # More layouts can use this path once their write-back kernels accept CPU
+        # destination indices.
+        if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
+            host_indices = op.host_indices
+            device_indices = op.device_indices
+            resolved_pool_transfers = op.pool_transfers
+        else:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
+            )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -410,6 +418,13 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
+            if self.has_draft and host_indices.numel() > 0:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -484,6 +499,18 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                if (
+                    self.has_draft
+                    and host_indices.numel() > 0
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,

@@ -962,7 +962,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             assert transformer is not None
             self.transformer = transformer
 
-            for step_idx, t in enumerate(self.progress_bar(timesteps)):
+            for step_idx, t in enumerate(self.progress_bar(timesteps, batch=batch)):
                 if cfg_parallel:
                     latent_model_input = latents
                 else:

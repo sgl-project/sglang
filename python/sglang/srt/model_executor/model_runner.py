@@ -106,6 +106,12 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    assert_lplb_supported_model,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
@@ -191,7 +197,10 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    create_dummy_verify_input,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -229,6 +238,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, next_power_of_2, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -686,6 +696,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+            self._init_lplb_solvers()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -1608,6 +1621,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
             )
 
+    def _init_lplb_solvers(self):
+        """Initialize per-layer LPLB solvers from current expert location metadata."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+        # don't participate in the EP all-reduce (would deadlock under DP-
+        # attention). Failure here happens before any forward pass.
+        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        if architectures:
+            assert_lplb_supported_model(architectures[0])
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        clear_global_lplb_solvers()
+        ep_group = get_moe_ep_group()
+        for lid in range(metadata.num_layers):
+            solver = LPLBSolver(
+                phy2log=metadata.physical_to_logical_map[lid],
+                log2phy=metadata.logical_to_all_physical_map[lid],
+                num_gpus=metadata.ep_size,
+                ep_group=ep_group,
+                logical_to_all_physical_map_num_valid=(
+                    metadata.logical_to_all_physical_map_num_valid[lid]
+                ),
+            )
+            set_global_lplb_solver(lid, solver)
+        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
@@ -1649,6 +1691,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+        # Re-init LPLB solvers after expert location update
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            self._init_lplb_solvers()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
@@ -2459,7 +2505,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if self.server_args.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -2737,69 +2783,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
-        def get_spec_info():
-            spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-                from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-                if self.is_draft_worker:
-                    raise RuntimeError("This should not happen.")
-                else:
-                    spec_info = EagleVerifyInput(
-                        draft_token=None,
-                        custom_mask=buffers.custom_mask,
-                        positions=None,
-                        retrieve_index=None,
-                        retrieve_next_token=None,
-                        retrieve_next_sibling=None,
-                        retrieve_cum_len=None,
-                        spec_steps=self.server_args.speculative_num_steps,
-                        topk=self.server_args.speculative_eagle_topk,
-                        draft_token_num=self.server_args.speculative_num_draft_tokens,
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        seq_lens_sum=None,
-                        seq_lens_cpu=None,
-                    )
-                    # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
-                    # during forward; provide a dummy so warmup doesn't crash.
-                    spec_info.hidden_states = torch.zeros(
-                        (num_tokens, self.model_config.hidden_size),
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-            elif self.spec_algorithm.is_dflash():
-                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-
-                # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
-                spec_info = DFlashVerifyInput(
-                    draft_token=None,
-                    positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
-                    custom_mask=None,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.NULL
-                        if self.is_draft_worker
-                        else CaptureHiddenMode.FULL
-                    ),
-                )
-
-            elif self.spec_algorithm.is_ngram():
-                from sglang.srt.speculative.ngram_info import NgramVerifyInput
-
-                spec_info = NgramVerifyInput(
-                    draft_token=None,
-                    custom_mask=buffers.custom_mask,
-                    positions=None,
-                    retrieve_index=None,
-                    retrieve_next_token=None,
-                    retrieve_next_sibling=None,
-                    draft_token_num=num_tokens_per_bs,
-                )
-                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
-            return spec_info
-
-        spec_info = get_spec_info()
+        spec_info = create_dummy_verify_input(
+            self.spec_algorithm,
+            self.server_args,
+            buffers.custom_mask,
+            num_tokens_per_bs,
+            self.is_draft_worker,
+        )
+        if spec_info is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+        ):
+            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+            # during forward; provide a dummy so warmup doesn't crash.
+            spec_info.hidden_states = torch.zeros(
+                (num_tokens, self.model_config.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
         if capture_hidden_mode != CaptureHiddenMode.FULL:
             capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -3494,11 +3494,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = (
-            torch.profiler.record_function(_build_step_span_name(forward_batch))
-            if torch.autograd._profiler_enabled()
-            else contextlib.nullcontext()
-        )
+        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(
