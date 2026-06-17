@@ -6,11 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
-
-from ..common.utils import get_cu_seqblocks, robust_allocator
-
-_is_hip = is_hip()
+from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocator
 
 
 @triton.heuristics(
@@ -279,18 +275,7 @@ def flash_prefill_with_gqa_share_sparse(
     max_seqblock_q: Optional[int] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
-    # dtype check. On HIP, the paged main K/V cache may be fp8 (unit-scaled)
-    # under --kv-cache-dtype fp8_*; the kernel widens it to the Q dtype on load.
-    # Keep CUDA's pre-existing sparse prefill dtype contract unchanged by
-    # accepting fp8 only on HIP.
-    assert q.dtype in (torch.bfloat16, torch.float16)
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
-    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
-    assert k_cache.dtype == q.dtype or is_fp8, (
-        f"sparse prefill expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8 on HIP, got {k_cache.dtype}"
-    )
-    assert v_cache.dtype == k_cache.dtype
+    is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape

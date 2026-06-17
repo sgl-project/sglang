@@ -1658,9 +1658,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        def _ue8m0_to_float32(scale_u8: torch.Tensor) -> torch.Tensor:
-            """Convert UE8M0 uint8 scale to float32: each uint8 is an exponent, float = 2^(val-127)."""
-            return (scale_u8.to(torch.int32) << 23).view(torch.float32)
+        from sglang.srt.layers.quantization.mxfp8_block_convert import (
+            _ue8m0_to_fp32,
+        )
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             """Quantize weights to MXFP8 with int32 packed UE8M0 scales for DeepGemm."""
@@ -1672,7 +1672,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             qweight, scale_u8 = mxfp8_group_quantize(weight_flat)
             qweight = qweight.view_as(weight)
             # Convert uint8 UE8M0 → float32, then pack to int32 MN-major
-            scale_fp32 = _ue8m0_to_float32(scale_u8).view(num_experts, m, k // 32)
+            scale_fp32 = _ue8m0_to_fp32(scale_u8).view(num_experts, m, k // 32)
             scale_packed = _pack_moe_scale_for_deepgemm(scale_fp32)
             return qweight, scale_packed
 
@@ -1702,7 +1702,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ) -> torch.Tensor:
             """Convert pre-quantized UE8M0 uint8 scales to int32 packed format for DeepGemm."""
             num_experts, m, k_groups = shape[0], shape[1], scale_u8.shape[-1]
-            scale_fp32 = _ue8m0_to_float32(scale_u8.contiguous().view(-1)).view(
+            scale_fp32 = _ue8m0_to_fp32(scale_u8.contiguous().view(-1)).view(
                 num_experts, m, k_groups
             )
             return _pack_moe_scale_for_deepgemm(scale_fp32)

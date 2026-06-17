@@ -8,7 +8,44 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 _tma_keep_alive_buf = deque(maxlen=200)
+
+# Q is always bf16/fp16. On HIP the paged main K/V cache may be fp8 (unit-scaled)
+# under --kv-cache-dtype fp8_*; the kernel widens it to the Q dtype on load
+# (IS_FP8 branch). CUDA keeps its pre-existing sparse dtype contract by accepting
+# fp8 only on HIP.
+_IS_HIP = is_hip()
+SPARSE_KV_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+)
+
+
+def check_sparse_kv_fp8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    label: str,
+) -> bool:
+    """Validate the sparse-attention KV cache dtype contract.
+
+    Returns True iff the K cache is fp8 on HIP (then widened to Q dtype in the
+    kernel). Raises AssertionError otherwise, mirroring the contract the decode
+    and prefill topk kernels both enforce.
+    """
+    assert q.dtype in (torch.bfloat16, torch.float16)
+    is_fp8 = _IS_HIP and k_cache.dtype in SPARSE_KV_FP8_DTYPES
+    assert k_cache.dtype == q.dtype or is_fp8, (
+        f"sparse {label} expects K cache dtype == Q dtype ({q.dtype}) "
+        f"or fp8 on HIP, got {k_cache.dtype}"
+    )
+    assert v_cache.dtype == k_cache.dtype
+    return is_fp8
+
 
 try:
     make_tensor_descriptor = tl.make_tensor_descriptor
