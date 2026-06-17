@@ -418,9 +418,9 @@ class MetadataBuffers:
                             f"metadata capacity {max_mask_len}. Increase "
                             "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
                         )
-                    self.output_token_sampling_mask_len[
-                        req.metadata_buffer_index
-                    ][0] = mask_len
+                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
+                        0
+                    ] = mask_len
                     if mask_len:
                         self.output_token_sampling_mask_idx[
                             req.metadata_buffer_index, :mask_len
@@ -431,9 +431,9 @@ class MetadataBuffers:
                                 device=self.output_token_sampling_mask_idx.device,
                             )
                         )
-                    self.output_token_sampling_logprobs[
-                        req.metadata_buffer_index
-                    ][0] = float(sampling_logprob)
+                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
+                        0
+                    ] = float(sampling_logprob)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
