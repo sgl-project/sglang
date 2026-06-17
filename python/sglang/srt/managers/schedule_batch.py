@@ -242,6 +242,8 @@ class MultimodalInputFormat(Enum):
 class DataType(Enum):
     TENSOR = auto()
     NDARRAY = auto()
+    SHM_DATA = auto()
+    CUDA_IPC_PROXY = auto()
 
 
 class TensorOrNdarray(msgspec.Struct):
@@ -253,10 +255,23 @@ class TensorOrNdarray(msgspec.Struct):
     data_type: DataType
     tensor: Optional[torch.Tensor] = None
     ndarray: Optional[np.ndarray] = None
+    shm_data: Optional[object] = (
+        None  # use object instead of ShmPointerMMData to avoid circular import
+    )
+    cuda_ipc_proxy: Optional[CudaIpcTensorTransportProxy] = None
 
     @property
     def value(self):
-        return self.tensor if self.data_type == DataType.TENSOR else self.ndarray
+        if self.data_type == DataType.TENSOR:
+            return self.tensor
+        elif self.data_type == DataType.NDARRAY:
+            return self.ndarray
+        elif self.data_type == DataType.SHM_DATA:
+            return self.shm_data
+        elif self.data_type == DataType.CUDA_IPC_PROXY:
+            return self.cuda_ipc_proxy
+        else:
+            raise ValueError(f"Invalid data_type: {self.data_type}")
 
 
 class ModelSpecificData(MutableMapping):
@@ -342,13 +357,32 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True):
         return self._feature.value if self._feature else None
 
     @feature.setter
-    def feature(self, value: Optional[Union[torch.Tensor, np.ndarray]]):
+    def feature(self, value: Optional[Union[TensorOrNdarray, List[TensorOrNdarray]]]):
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
+
         if value is None:
             self._feature = None
+        elif isinstance(value, list):
+            if len(value) > 0 and isinstance(value[0], ShmPointerMMData):
+                self._feature = [
+                    TensorOrNdarray(data_type=DataType.SHM_DATA, shm_data=item)
+                    for item in value
+                ]
+            elif len(value) > 0 and isinstance(value[0], torch.Tensor):
+                self._feature = [
+                    TensorOrNdarray(data_type=DataType.TENSOR, tensor=item)
+                    for item in value
+                ]
         elif isinstance(value, torch.Tensor):
             self._feature = TensorOrNdarray(data_type=DataType.TENSOR, tensor=value)
         elif isinstance(value, np.ndarray):
             self._feature = TensorOrNdarray(data_type=DataType.NDARRAY, ndarray=value)
+        elif isinstance(value, ShmPointerMMData):
+            self._feature = TensorOrNdarray(data_type=DataType.SHM_DATA, shm_data=value)
+        elif isinstance(value, CudaIpcTensorTransportProxy):
+            self._feature = TensorOrNdarray(
+                data_type=DataType.CUDA_IPC_PROXY, cuda_ipc_proxy=value
+            )
         else:
             raise ValueError(
                 f"feature must be a torch.Tensor, np.ndarray, or None, got {type(value)}"
