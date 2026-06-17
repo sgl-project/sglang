@@ -2558,7 +2558,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
         )
 
-        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
+        from sglang.srt.utils import is_sm100_supported
+
+        model_uses_modelopt_fp8 = self.model_config.quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_mixed",
+        )
+        fp8_gemm_needs_autotune = (
+            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
+            or (model_uses_modelopt_fp8 and is_sm100_supported())
+        )
+
+        if not (
+            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
+        ):
             return False
 
         major, _ = torch.cuda.get_device_capability()
