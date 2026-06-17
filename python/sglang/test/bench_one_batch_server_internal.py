@@ -399,10 +399,7 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
     base_url = f"http://{server_args.host}:{server_args.port}"
 
     # Reuse an already-running server instead of forking a second one onto the
-    # same host:port. Forking onto an occupied port spawns an orphan server that
-    # competes for the GPU, OOMs, and (via SIGQUIT) can take down the whole
-    # benchmark -- a race whose outcome depends on how long the run lasts. Probe
-    # first with a short timeout so the common "no server yet" case stays fast.
+    # occupied port, where it would orphan, compete for the GPU, and OOM.
     if server_is_up(base_url, timeout=5):
         print(
             f"WARNING: a server is already running at {base_url}; reusing it "
@@ -422,8 +419,7 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
 
     start_time = time.time()
     while time.time() - start_time < DEFAULT_TIMEOUT:
-        # Fail fast if the server died during startup (e.g. OOM) instead of
-        # polling a port nobody will ever bind until the full timeout elapses.
+        # Fail fast if the server died during startup (e.g. OOM).
         if not proc.is_alive():
             raise RuntimeError(
                 f"Server process exited during startup (exit code "
@@ -433,8 +429,7 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
             return proc, base_url
         time.sleep(10)
 
-    # Timed out: kill the half-started server so it does not linger as an orphan
-    # competing for the GPU after we give up on it.
+    # Timed out: kill the half-started server so it does not linger as an orphan.
     kill_process_tree(proc.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
 
