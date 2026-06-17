@@ -672,6 +672,17 @@ class CacheLock:
     swa_prefix_lock_released: bool = False
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqKvInfo:
+    kv_allocated_len: int = 0
+    # The length of KV that have been removed in swa cache.
+    # SWA KV cache eviction behavior differs by cache type:
+    # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
+    #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
+    # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
+    swa_evicted_seqlen: int = 0
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -744,19 +755,12 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv_allocated_len = 0
+        self.kv_info: Optional[ReqKvInfo] = ReqKvInfo()
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
-
-        # The length of KV that have been removed in swa cache.
-        # SWA KV cache eviction behavior differs by cache type:
-        # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
-        #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
-        # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-        self.swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -1086,6 +1090,22 @@ class Req(ReqDllmMixin):
     @swa_prefix_lock_released.setter
     def swa_prefix_lock_released(self, value: bool) -> None:
         self.cache_lock.swa_prefix_lock_released = value
+
+    @property
+    def kv_allocated_len(self) -> int:
+        return self.kv_info.kv_allocated_len if self.kv_info is not None else 0
+
+    @kv_allocated_len.setter
+    def kv_allocated_len(self, value: int) -> None:
+        self.kv_info.kv_allocated_len = value
+
+    @property
+    def swa_evicted_seqlen(self) -> int:
+        return self.kv_info.swa_evicted_seqlen if self.kv_info is not None else 0
+
+    @swa_evicted_seqlen.setter
+    def swa_evicted_seqlen(self, value: int) -> None:
+        self.kv_info.swa_evicted_seqlen = value
 
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
