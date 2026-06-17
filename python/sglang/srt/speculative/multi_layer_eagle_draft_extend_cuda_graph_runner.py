@@ -603,9 +603,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         # Bucketize to a captured batch size (padding the tail).
         if self.require_mlp_tp_gather:
             max_batch_size = max(forward_batch.original_global_num_tokens_cpu)
-            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+            bs = self.get_runner(0)._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
-            bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
 
         # Reset padded slots, then copy the real values in.
         buffers.input_ids.zero_()
