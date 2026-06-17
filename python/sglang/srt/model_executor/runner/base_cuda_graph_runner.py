@@ -25,11 +25,7 @@ from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
@@ -81,10 +77,10 @@ def get_batch_sizes_to_capture(
         num_tokens_per_bs = 1
 
     if require_gathered_buffer(server_args):
-        mul_base *= get_attention_tp_size()
+        mul_base *= get_parallel().attn_tp_size
 
-    if mul_base % get_attention_cp_size() != 0:
-        mul_base *= get_attention_cp_size()
+    if mul_base % get_parallel().attn_cp_size != 0:
+        mul_base *= get_parallel().attn_cp_size
 
     # pad `num_max_requests` to avoid being filtered out
     num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
@@ -146,8 +142,8 @@ class BaseCudaGraphRunner(ABC):
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
     @staticmethod
