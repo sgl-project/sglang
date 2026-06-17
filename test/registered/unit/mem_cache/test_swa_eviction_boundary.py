@@ -190,7 +190,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             insert_len = seq_len // page_size * page_size
             self.assertLess(req.swa_evicted_seqlen, insert_len)
 
-            tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+            tree.cache_finished_req(
+                req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+            )
             tree.sanity_check()
 
     # -- Eviction formula: page_size == 1 --
@@ -213,7 +215,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             self.assertLess(req.swa_evicted_seqlen, seq_len)
             self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
 
-            tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+            tree.cache_finished_req(
+                req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+            )
             tree.sanity_check()
 
     # -- Eviction formula: no-op when seq too short --
@@ -301,7 +305,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         self.assertGreater(req.swa_evicted_seqlen, 0, "Should have some eviction")
         self.assertLess(req.swa_evicted_seqlen, insert_len, "Should be partial")
 
-        tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+        tree.cache_finished_req(
+            req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+        )
 
         non_tombstone = insert_len - req.swa_evicted_seqlen
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + non_tombstone)
@@ -339,7 +345,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         req.swa_evicted_seqlen = old_evicted
         swa_evictable_before = tree.swa_evictable_size_
 
-        tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+        tree.cache_finished_req(
+            req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+        )
 
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
 
@@ -368,7 +376,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             insert_len = seq_len // page_size * page_size
             self.assertLess(req.swa_evicted_seqlen, insert_len, f"turn {turn}")
 
-            tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+            tree.cache_finished_req(
+                req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+            )
             tree.sanity_check()
 
     # -- Integration: page_size=1 full flow --
@@ -390,7 +400,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
 
             self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
 
-            tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+            tree.cache_finished_req(
+                req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+            )
             tree.sanity_check()
 
 

@@ -393,7 +393,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, kv_committed_len=req.effective_kv_committed_len())
+            cache.cache_finished_req(
+                req, kv_committed_len=req.effective_kv_committed_len()
+            )
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

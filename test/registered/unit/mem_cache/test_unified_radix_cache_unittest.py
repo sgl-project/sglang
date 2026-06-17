@@ -901,7 +901,9 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
-        tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+        tree.cache_finished_req(
+            req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+        )
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -938,7 +940,9 @@ class UnifiedRadixCacheSuite:
         get_global_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
-            tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+            tree.cache_finished_req(
+                req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+            )
             start_p, end_p = req.effective_kv_committed_len(), req.kv_allocated_len
         finally:
             get_global_server_args().strip_thinking_cache = False
@@ -1136,7 +1140,9 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=True, kv_committed_len=req.effective_kv_committed_len())
+        tree.cache_finished_req(
+            req, is_insert=True, kv_committed_len=req.effective_kv_committed_len()
+        )
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
