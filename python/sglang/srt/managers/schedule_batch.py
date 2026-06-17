@@ -2582,9 +2582,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for req in self.reqs
         ]
         # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
-        latest_output_ids = torch.tensor(last_tokens, dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
+        # pin_memory (matching the prefill-path tensors) keeps the copy async;
+        # is_pin_memory_available falls back to pageable on unsupported devices.
+        latest_output_ids = torch.tensor(
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             latest_output_ids
         )
