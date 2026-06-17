@@ -19,6 +19,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
+from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
+    create_trtllm_mha_kv_indices_triton,
+    get_num_mha_kv_index_blocks,
+)
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -133,6 +137,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
+        self.max_num_pages = (
+            self.max_context_len + self.page_size - 1
+        ) // self.page_size
+
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
@@ -190,17 +198,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return None
         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
-    def _copy_swa_page_table(
+    def _fill_page_table_device(
         self,
         metadata: TRTLLMMHAMetadata,
-        page_indices: torch.Tensor,
-        num_pages: int,
+        req_pool_indices: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ):
-        """Translate and copy SWA page indices into metadata. No-op for non-SWA."""
-        if metadata.swa_page_table is None:
-            return
-        swa_indices = self._maybe_translate_swa(page_indices)
-        metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
+        """Build the page table on-device from per-request KV lengths (no sync)."""
+        page_table = metadata.page_table
+        bs = page_table.shape[0]
+        has_swa = self._swa_kv_pool is not None
+        create_trtllm_mha_kv_indices_triton[
+            (bs, get_num_mha_kv_index_blocks(page_table.shape[1], self.page_size))
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            cache_seqlens,
+            self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None,
+            page_table,
+            metadata.swa_page_table if has_swa else None,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            PAGE_SIZE=self.page_size,
+            HAS_SWA=has_swa,
+        )
 
     def _get_layer_cache_loc(
         self,
@@ -252,9 +273,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=self.device,
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-            "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
-            ),
         }
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
@@ -307,9 +325,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
             }
 
             self.draft_extend_metadata = {
@@ -331,9 +346,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
             }
 
     def _build_cuda_graph_metadata(
@@ -460,54 +472,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32.copy_(
                     seq_lens + self.speculative_step_id + 1
                 )
-                metadata.max_seq_len_k = self.max_context_len
-
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                metadata.max_seq_len_k = self.max_context_len
-                max_seq_pages = (
-                    self.max_context_len + self.page_size - 1
-                ) // self.page_size
-
                 metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                    None, :
-                ],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_target_verify():
-            # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
 
             metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            self._fill_page_table_device(
+                metadata, req_pool_indices, metadata.cache_seqlens_int32
+            )
+        elif forward_mode.is_target_verify():
+            # Here we only support topk = 1 for now.
+            metadata = self.target_verify_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
+            metadata.max_seq_len_k = self.max_context_len
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+            self._fill_page_table_device(
+                metadata, req_pool_indices, metadata.cache_seqlens_int32
+            )
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
-
             metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -541,15 +531,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
                 )
 
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            self._fill_page_table_device(
+                metadata, req_pool_indices, metadata.cache_seqlens_int32
+            )
         self.forward_metadata = metadata
 
     def update_verify_buffers_to_fill_after_draft(
@@ -636,6 +620,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
+        def _seq_max() -> int:
+            if forward_batch.seq_lens_cpu is not None:
+                return int(forward_batch.seq_lens_cpu.max().item())
+            return int(forward_batch.seq_lens.max())
+
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
@@ -643,7 +632,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = self.max_context_len
+                metadata.max_seq_len_k = _seq_max() + (self.speculative_step_id + 1)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -659,7 +648,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = self.max_context_len
+                metadata.max_seq_len_k = _seq_max()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -676,7 +665,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = self.max_context_len
+            metadata.max_seq_len_k = _seq_max() + tokens_per_req
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -694,7 +683,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = self.max_context_len
+            metadata.max_seq_len_k = _seq_max()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
