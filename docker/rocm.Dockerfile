@@ -353,7 +353,8 @@ RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
-         PATH=$PATH:$ROCM_HOME/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
+         PATH=$PATH:$ROCM_HOME/llvm/bin PREBUILD_KERNELS=1 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
+          && PATH=$PATH:$ROCM_HOME/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
