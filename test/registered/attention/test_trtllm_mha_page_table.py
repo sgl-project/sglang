@@ -14,8 +14,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
-    create_trtllm_mha_kv_indices_triton,
-    get_num_mha_kv_index_blocks,
+    build_trtllm_mha_page_table,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -63,25 +62,19 @@ def _build_page_table_kernel(
     dev = req_to_token.device
     bs = req_pool_indices.shape[0]
     page_table = torch.zeros((bs, max_num_pages), dtype=torch.int32, device=dev)
-    has_swa = full_to_swa is not None
     swa_page_table = (
         torch.zeros((bs, max_num_pages), dtype=torch.int32, device=dev)
-        if has_swa
+        if full_to_swa is not None
         else None
     )
-    create_trtllm_mha_kv_indices_triton[
-        (bs, get_num_mha_kv_index_blocks(max_num_pages, page_size))
-    ](
-        req_to_token,
-        req_pool_indices,
-        cache_seqlens,
-        full_to_swa,
-        page_table,
-        swa_page_table,
-        req_to_token.stride(0),
-        page_table.stride(0),
-        PAGE_SIZE=page_size,
-        HAS_SWA=has_swa,
+    build_trtllm_mha_page_table(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        page_size=page_size,
+        swa_page_table=swa_page_table,
+        full_to_swa=full_to_swa,
     )
     return page_table, swa_page_table
 

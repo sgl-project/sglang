@@ -12,6 +12,9 @@ emits the SWA-translated block table in the same pass via the full->SWA lookup
 table, so SWA hybrid models stay sync-free too.
 """
 
+from typing import Optional
+
+import torch
 import triton
 import triton.language as tl
 
@@ -83,3 +86,41 @@ def create_trtllm_mha_kv_indices_triton(
             (swa_slot // PAGE_SIZE).to(tl.int32),
             mask=mask,
         )
+
+
+def build_trtllm_mha_page_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    swa_page_table: Optional[torch.Tensor] = None,
+    full_to_swa: Optional[torch.Tensor] = None,
+) -> None:
+    """Fill ``page_table`` (and ``swa_page_table`` when SWA) on-device, no D2H sync.
+
+    Computes the launch grid from the static page-table width and dispatches
+    ``create_trtllm_mha_kv_indices_triton``. ``page_table`` (and, for SWA models,
+    ``swa_page_table``) are written in place; the caller owns the buffers so the
+    cuda-graph path can reuse its pre-allocated tensors. SWA is enabled iff
+    ``full_to_swa`` is provided, which then also requires ``swa_page_table``.
+    """
+    has_swa = full_to_swa is not None
+    assert has_swa == (
+        swa_page_table is not None
+    ), "full_to_swa and swa_page_table must be provided together"
+    bs, num_pages = page_table.shape
+    create_trtllm_mha_kv_indices_triton[
+        (bs, get_num_mha_kv_index_blocks(num_pages, page_size))
+    ](
+        req_to_token,
+        req_pool_indices,
+        cache_seqlens,
+        full_to_swa,
+        page_table,
+        swa_page_table,
+        req_to_token.stride(0),
+        page_table.stride(0),
+        PAGE_SIZE=page_size,
+        HAS_SWA=has_swa,
+    )

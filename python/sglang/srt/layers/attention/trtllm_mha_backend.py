@@ -20,8 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
-    create_trtllm_mha_kv_indices_triton,
-    get_num_mha_kv_index_blocks,
+    build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -182,20 +181,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
-    def _maybe_translate_swa(
-        self, token_indices: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Translate full-pool token indices to SWA-pool indices, or return None."""
-        if self._swa_kv_pool is None:
-            return None
-        shape = token_indices.shape
-        # trtllm-gen SWA attention kernels require int32 page indices.
-        return (
-            self._swa_kv_pool.translate_loc_from_full_to_swa(token_indices.reshape(-1))
-            .reshape(shape)
-            .to(torch.int32)
-        )
-
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
@@ -219,22 +204,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         buffer width use the static ``max_num_pages`` upper bound while the actual
         writes stay bounded by ``cache_seqlens`` — no host-side max / D2H sync.
         """
-        page_table = metadata.page_table
-        bs = page_table.shape[0]
         has_swa = self._swa_kv_pool is not None
-        create_trtllm_mha_kv_indices_triton[
-            (bs, get_num_mha_kv_index_blocks(page_table.shape[1], self.page_size))
-        ](
-            self.req_to_token,
-            req_pool_indices,
-            cache_seqlens,
-            self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None,
-            page_table,
-            metadata.swa_page_table if has_swa else None,
-            self.req_to_token.stride(0),
-            page_table.stride(0),
-            PAGE_SIZE=self.page_size,
-            HAS_SWA=has_swa,
+        build_trtllm_mha_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            cache_seqlens=cache_seqlens,
+            page_table=metadata.page_table,
+            page_size=self.page_size,
+            swa_page_table=metadata.swa_page_table if has_swa else None,
+            full_to_swa=(
+                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
+            ),
         )
 
     def _get_layer_cache_loc(
@@ -644,14 +624,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
-        def _seq_max() -> int:
-            """
-            Prefer seq_lens_cpu if present, otherwise fall back to a GPU max (triggers D2H).
-            """
-            if forward_batch.seq_lens_cpu is not None:
-                return int(forward_batch.seq_lens_cpu.max().item())
-            return int(forward_batch.seq_lens.max())
-
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
@@ -659,7 +631,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = _seq_max() + (self.speculative_step_id + 1)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -669,22 +640,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = _seq_max()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
         elif forward_batch.forward_mode.is_target_verify():
             # Only support topk = 1 for now.
             tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
@@ -692,7 +656,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = _seq_max() + tokens_per_req
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -704,40 +667,46 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = _seq_max()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-
+            # Query-side max length, sourced from the host-resident extend lengths
+            # (sync-free); for plain prefill these equal the full seq lens.
+            # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+            # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+            max_q = max(forward_batch.extend_seq_lens_cpu)
+            metadata.max_seq_len_q = (
+                int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+            )
             if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens = forward_batch.extend_seq_lens
-                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-                max_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.max_seq_len_q = (
-                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
-                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        # Compute SWA page table (None for non-SWA models)
-        metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+        metadata.max_seq_len_k = self.max_context_len
+        has_swa = self._swa_kv_pool is not None
+        metadata.page_table = torch.empty(
+            (batch_size, self.max_num_pages), dtype=torch.int32, device=device
+        )
+        metadata.swa_page_table = (
+            torch.empty(
+                (batch_size, self.max_num_pages), dtype=torch.int32, device=device
+            )
+            if has_swa
+            else None
+        )
+        self._fill_page_table_device(
+            metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
+        )
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -746,19 +715,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     forward_batch.out_cache_loc
                 )
             )
-
-        # Convert the page tables to a strided format
-        if self.page_size > 1:
-            self.strided_indices = torch.arange(
-                0, metadata.page_table.shape[1], self.page_size, device=self.device
-            )
-            metadata.page_table = (
-                metadata.page_table[:, self.strided_indices] // self.page_size
-            )
-            if metadata.swa_page_table is not None:
-                metadata.swa_page_table = (
-                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
-                )
 
         self.forward_metadata = metadata
 
