@@ -474,9 +474,14 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_idx.append([])
 
         if self.return_hidden_states:
-            self.output_hidden_states.append(
-                req.hidden_states if req.return_hidden_states else None
-            )
+            if req.return_hidden_states:
+                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
+                hs = req.hidden_states
+                if req.finished_len is not None:
+                    hs = hs[: req.finished_len]
+                self.output_hidden_states.append(hs)
+            else:
+                self.output_hidden_states.append(None)
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
