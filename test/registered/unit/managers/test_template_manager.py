@@ -193,7 +193,7 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "{% set keep_past_thinking = keep_past_thinking | default(false) %}\n"
             "{% if not keep_past_thinking and '</think>' in content %}"
             "{{ content.split('</think>')[-1] }}{% endif %}\n"
-            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>",
+            '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>',
             ["<|tool_call_start|>", "<|tool_call_end|>"],
             None,
             None,
@@ -582,9 +582,7 @@ class TestToolCallParserDetection(unittest.TestCase):
 class TestResolveAutoParsers(unittest.TestCase):
     """Tests for resolve_auto_parsers()."""
 
-    qwen3_template = (
-        "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
-    )
+    qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
 
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
@@ -650,9 +648,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertIsNone(args.tool_call_parser)
 
     def test_none_chat_template_disables_both_parsers(self):
-        args = self._make_server_args(
-            reasoning_parser="auto", tool_call_parser="auto"
-        )
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([])
 
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
@@ -662,9 +658,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertIsNone(args.tool_call_parser)
 
     def test_deepseek_v32_arch_without_chat_template_uses_custom_encoder(self):
-        args = self._make_server_args(
-            reasoning_parser="auto", tool_call_parser="auto"
-        )
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([])
         config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
 
@@ -677,9 +671,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertEqual(args.tool_call_parser, "deepseekv32")
 
     def test_deepseek_v4_arch_without_chat_template_uses_custom_encoder(self):
-        args = self._make_server_args(
-            reasoning_parser="auto", tool_call_parser="auto"
-        )
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         tokenizer = _DummyTokenizer([])
         config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
@@ -692,9 +684,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertEqual(args.tool_call_parser, "deepseekv4")
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
-        args = self._make_server_args(
-            reasoning_parser="auto", tool_call_parser="auto"
-        )
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
 
         with _patch_hf_transformers_utils(
@@ -716,9 +706,7 @@ class TestResolveAutoParsers(unittest.TestCase):
         tokenizer = _DummyTokenizer([])
         get_config = Mock()
 
-        with _patch_hf_transformers_utils(
-            Mock(return_value=tokenizer), get_config
-        ):
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer), get_config):
             resolve_auto_parsers(args)
 
         get_config.assert_not_called()
