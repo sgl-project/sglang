@@ -861,81 +861,83 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Pre-dequantize MoE weights and orient as (E, K, N) for NPU grouped matmul."""
+        """Pre-dequantize MoE weights to FP16 for faster inference."""
+
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
-    
-        # ----- w13: transpose to (hidden, 2*intermediate) -----
+
+        # Check if weights are actually loaded (not still UninitializedParameter/empty)
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
-    
+
+        # Pre-dequantize w13 weights (gate+up projections)
         if w13_qtype not in UNQUANTIZED_TYPES:
             num_experts = w13_qweight.shape[0]
             w13_dequant_list = []
+
             block_size, type_size = gguf.GGML_QUANT_SIZES[w13_qtype]
-    
+
             for e in range(num_experts):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
-                rows = w13_qweight[e].shape[0]          # 2*intermediate
-                cols = w13_qweight[e].shape[1] // type_size * block_size  # hidden
-    
+                rows = w13_qweight[e].shape[0]
+                cols = w13_qweight[e].shape[1] // type_size * block_size
+
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)                # (2*intermediate, hidden)
-                    .transpose(-1, -2)                  # -> (hidden, 2*intermediate)
+                    .reshape(rows, cols)
+                    .transpose(-1, -2)
                     .contiguous()
                 )
                 w13_dequant_list.append(dequant)
-    
-            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, hidden, 2*intermediate)
+
+            w13_full = torch.stack(w13_dequant_list, dim=0)
+
             w13_full = npu_format_cast(w13_full)
             layer.register_buffer("w13_dequant", w13_full, persistent=False)
         else:
-            w13_data = w13_qweight.data
-            if w13_data.dim() == 3:
-                w13_data = w13_data.transpose(-1, -2).contiguous()  # ensure (E, hidden, 2*intermediate)
-            w13_data = npu_format_cast(w13_data)
-            layer.register_buffer("w13_dequant", w13_data, persistent=False)
-    
-        # ----- w2: keep as (intermediate, hidden) – no transpose -----
+            w13_qweight.data = npu_format_cast(w13_qweight.data)
+            layer.register_buffer("w13_dequant", w13_qweight.data, persistent=False)
+
+        # Pre-dequantize w2 weights (down projection)
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
-    
+
         if w2_qtype not in UNQUANTIZED_TYPES:
             num_experts = w2_qweight.shape[0]
             w2_dequant_list = []
+
             block_size, type_size = gguf.GGML_QUANT_SIZES[w2_qtype]
-    
+
             for e in range(num_experts):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
-                rows = w2_qweight[e].shape[0]          # intermediate
-                cols = w2_qweight[e].shape[1] // type_size * block_size  # hidden
-    
+                rows = w2_qweight[e].shape[0]
+                cols = w2_qweight[e].shape[1] // type_size * block_size
+
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)                # (intermediate, hidden) – already (K, N)
+                    .reshape(rows, cols)
+                    .transpose(-1, -2)
                     .contiguous()
                 )
                 w2_dequant_list.append(dequant)
-    
-            w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, intermediate, hidden)
+
+            w2_full = torch.stack(w2_dequant_list, dim=0)
+
             w2_full = npu_format_cast(w2_full)
             layer.register_buffer("w2_dequant", w2_full, persistent=False)
         else:
-            w2_data = w2_qweight.data
-            # Ensure shape is (E, intermediate, hidden) – no transpose needed
-            w2_data = npu_format_cast(w2_data)
-            layer.register_buffer("w2_dequant", w2_data, persistent=False)
-    
-        # Cleanup
-        for attr in ("w13_qweight", "w2_qweight", "w13_qweight_type", "w2_qweight_type"):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
-                
+            w2_qweight.data = npu_format_cast(w2_qweight.data)
+            layer.register_buffer("w2_dequant", w2_qweight.data, persistent=False)
+
+        if hasattr(layer, "w2_qweight"):
+            del layer.w2_qweight
+        if hasattr(layer, "w13_qweight"):
+            del layer.w13_qweight
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
