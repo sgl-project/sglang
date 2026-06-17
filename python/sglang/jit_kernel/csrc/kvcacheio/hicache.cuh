@@ -37,44 +37,81 @@ inline constexpr auto get_mem_package() {
 template <int kUnit>
 using PackageType = decltype(get_mem_package<kUnit>());
 
+// NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
+// has no equivalent PTX, but non-temporal (streaming) loads/stores express the
+// same intent for one-shot HiCache write-back traffic that should not pollute
+// the cache. Guard the PTX behind USE_ROCM so the JIT module also compiles with
+// hipcc; see python/sglang/jit_kernel/utils.py for the ROCm build flags.
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
   return uint1{tmp};
+#else
+  return uint1{__builtin_nontemporal_load(&src->x)};
+#endif
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1;
   asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
   return uint2{tmp0, tmp1};
+#else
+  return uint2{__builtin_nontemporal_load(&src->x), __builtin_nontemporal_load(&src->y)};
+#endif
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1, tmp2, tmp3;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
                : "l"(src));
   return uint4{tmp0, tmp1, tmp2, tmp3};
+#else
+  return uint4{
+      __builtin_nontemporal_load(&src->x),
+      __builtin_nontemporal_load(&src->y),
+      __builtin_nontemporal_load(&src->z),
+      __builtin_nontemporal_load(&src->w)};
+#endif
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#ifndef USE_ROCM
   uint32_t tmp = value.x;
   asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#else
+  __builtin_nontemporal_store(value.x, &dst->x);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#else
+  __builtin_nontemporal_store(value.x, &dst->x);
+  __builtin_nontemporal_store(value.y, &dst->y);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   uint32_t tmp2 = value.z;
   uint32_t tmp3 = value.w;
   asm volatile(
       "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#else
+  __builtin_nontemporal_store(value.x, &dst->x);
+  __builtin_nontemporal_store(value.y, &dst->y);
+  __builtin_nontemporal_store(value.z, &dst->z);
+  __builtin_nontemporal_store(value.w, &dst->w);
+#endif
 }
 
 }  // namespace details
