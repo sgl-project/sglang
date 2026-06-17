@@ -36,9 +36,7 @@ def _reference_append_remap(
     Shared wgt:   scale_factor
     """
     m, k = topk_ids.shape
-    out_ids = torch.empty(
-        (m, k + s), dtype=topk_ids.dtype, device=topk_ids.device
-    )
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
     out_w = torch.empty(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -80,7 +78,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
 
     def test_matches_golden_reference(self):
         """Kernel output equals the documented routed-remap + shared-append math."""
-        for (m, k, npr, ep_size, ep_rank, s) in self.CASES:
+        for m, k, npr, ep_size, ep_rank, s in self.CASES:
             with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
                 shared_id_base, num_local_routed = self._shared_id_base(
                     npr, ep_size, ep_rank, s
@@ -118,7 +116,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
         """
         rsf = 2.5
         scale_factor = 1.0 / rsf
-        for (m, k, npr, ep_size, ep_rank, s) in self.CASES:
+        for m, k, npr, ep_size, ep_rank, s in self.CASES:
             with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
                 shared_id_base, num_local_routed = self._shared_id_base(
                     npr, ep_size, ep_rank, s
@@ -171,7 +169,9 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
     def test_shared_weight_is_one_on_aiter_path(self):
         """On the aiter path the always-on shared expert must contribute 1.0x."""
         m, k, npr, ep_size, ep_rank, s = 8, 8, 256, 8, 1, 1
-        shared_id_base, num_local_routed = self._shared_id_base(npr, ep_size, ep_rank, s)
+        shared_id_base, num_local_routed = self._shared_id_base(
+            npr, ep_size, ep_rank, s
+        )
         topk_ids, topk_weights = self._make_inputs(m, k, npr)
 
         _, got_w = fused_append_remap_shared_experts_deepep(
