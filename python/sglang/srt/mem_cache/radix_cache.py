@@ -627,6 +627,26 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def get_cache_stats(self) -> Tuple[int, int]:
+        """Return (entry_count, total_tokens) currently held in the radix tree.
+
+        Capacity/footprint observability (PR #15699 style). ``total_tokens`` is the
+        exact device-resident token count via the incrementally-maintained
+        evictable/protected sizes (O(1)); ``entry_count`` is the number of
+        non-evicted nodes (O(n) traversal), so this should be called at a throttled
+        cadence (e.g. the periodic metrics push), not on the request hot path.
+        """
+        total_tokens = self.evictable_size_ + self.protected_size_
+        entry_count = 0
+        stack = list(self.root_node.children.values())
+        while stack:
+            current_node = stack.pop()
+            if current_node.evicted:
+                continue
+            entry_count += 1
+            stack.extend(current_node.children.values())
+        return entry_count, total_tokens
+
     def all_values_flatten(self):
         values = []
 

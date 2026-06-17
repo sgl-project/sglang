@@ -1847,9 +1847,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1928,6 +1930,22 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # --- Capacity / footprint gauges (align with PR #15699) -------------
+        # Together with the eviction-token rate these let operators estimate the
+        # effective cache horizon (capacity / churn) and "how many requests fit".
+        self.cache_entry_count = Gauge(
+            name="sglang:cache_entry_count",
+            documentation="Number of entries (nodes) currently in the radix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_total_tokens = Gauge(
+            name="sglang:cache_total_tokens",
+            documentation="Total tokens currently stored in the radix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1939,6 +1957,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def set_cache_size(self, entry_count: int, total_tokens: int) -> None:
+        self.cache_entry_count.labels(**self.labels).set(entry_count)
+        self.cache_total_tokens.labels(**self.labels).set(total_tokens)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
