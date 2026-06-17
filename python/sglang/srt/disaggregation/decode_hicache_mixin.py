@@ -79,18 +79,37 @@ class DecodeHiCachePreallocMixin:
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
+                query_kwargs = {}
+                if (
+                    self.tree_cache.supports_swa()
+                    and hasattr(self, "_uses_swa_tail_prealloc")
+                    and self._uses_swa_tail_prealloc()
+                ):
+                    fill_len = len(req.origin_input_ids) + max(
+                        len(req.output_ids) - 1, 0
+                    )
+                    req.swa_evicted_seqlen = max(
+                        req.swa_evicted_seqlen,
+                        fill_len - self._swa_tail_len(fill_len),
+                    )
+                    max_storage_len = max(0, req.swa_evicted_seqlen - matched_len)
+                    suffix_tokens = suffix_tokens[:max_storage_len]
+                    if hasattr(self.tree_cache, "_build_storage_hit_query_transfers"):
+                        query_kwargs["full_only"] = True
                 last_hash = last_host_node.get_last_hash_value()
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+                if suffix_tokens:
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                        **query_kwargs,
+                    )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -125,12 +144,24 @@ class DecodeHiCachePreallocMixin:
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
+            full_only = (
+                self.tree_cache.supports_swa()
+                and prefix_match.decode_prefix_len <= req.swa_evicted_seqlen
+            )
+            prefetch_kwargs = {"full_only": True} if full_only else {}
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid,
+                node,
+                suffix,
+                last_hash,
+                prefix_keys,
+                **prefetch_kwargs,
             )
-            prefix_match.prefetch_registered = (
-                req.rid in self.tree_cache.ongoing_prefetch
-            )
+            prefetch_info = self.tree_cache.ongoing_prefetch.get(req.rid)
+            prefix_match.prefetch_registered = prefetch_info is not None
+            if not prefix_match.prefetch_registered:
+                prefix_match.l3_storage_hit_length = 0
+                prefix_match.last_host_node = None
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",

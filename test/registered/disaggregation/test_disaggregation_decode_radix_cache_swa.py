@@ -147,42 +147,37 @@ class TestDisaggregationDecodeRadixCacheSWAHiCacheFileBackend(
         self._post_ok(f"{self.decode_url}/hicache/storage-backend/clear")
         self._flush_memory_cache()
 
-        num_rounds = 4
         output_len = 32
         history = self._sample_token_ids(
             input_len=192, output_len=output_len, num_prompts=1
         )[0]
         suffixes = self._sample_token_ids(
-            input_len=32, output_len=output_len, num_prompts=num_rounds - 1
+            input_len=32, output_len=output_len, num_prompts=3
         )
 
-        saw_cache_hit_after_flush = False
-        prev_prompt_len = 0
-        prev_output_len = 0
-        for round_idx in range(num_rounds):
-            output = self._generate(history, output_len)
-            if round_idx == 0:
-                self.assertEqual(output.cached_tokens, 0)
-            else:
-                self.assertGreater(output.cached_tokens, 0)
-                if round_idx % 2 == 1:
-                    saw_cache_hit_after_flush = True
-                self.assertGreaterEqual(
-                    output.cached_tokens,
-                    min(prev_prompt_len + prev_output_len, len(history) - 128),
-                )
+        cold = self._generate(history, output_len)
+        self.assertEqual(cold.cached_tokens, 0)
 
-            history.extend(output.output_ids)
-            prev_prompt_len = output.prompt_len
-            prev_output_len = len(output.output_ids)
+        history.extend(cold.output_ids)
+        history.extend(suffixes[0])
+        primed = self._generate(history, output_len)
+        self.assertGreaterEqual(primed.cached_tokens, 64)
 
-            if round_idx < num_rounds - 1:
-                history.extend(suffixes[round_idx])
-                time.sleep(1)
-                if round_idx % 2 == 0:
-                    self._flush_memory_cache()
+        history.extend(primed.output_ids)
+        history.extend(suffixes[1])
+        time.sleep(1)
+        self._flush_memory_cache()
 
-        self.assertTrue(saw_cache_hit_after_flush)
+        restored = self._generate(history, output_len)
+        self.assertGreaterEqual(restored.cached_tokens, 64)
+
+        history.extend(restored.output_ids)
+        history.extend(suffixes[2])
+        time.sleep(1)
+        self._flush_memory_cache()
+
+        restored_again = self._generate(history, output_len)
+        self.assertGreaterEqual(restored_again.cached_tokens, 64)
 
 
 if __name__ == "__main__":

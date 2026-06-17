@@ -1890,6 +1890,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        full_only: bool = False,
     ) -> int:
         if (
             not self.enable_storage
@@ -1913,7 +1914,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys=prefix_keys,
-            pool_transfers=self._build_storage_hit_query_transfers(len(prefetch_key)),
+            pool_transfers=(
+                None
+                if full_only
+                else self._build_storage_hit_query_transfers(len(prefetch_key))
+            ),
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
@@ -1993,6 +1998,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        full_only: bool = False,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2032,21 +2038,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         alloc_failed = False
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            transfers = comp.build_hicache_transfers(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                last_hash=last_hash,
-            )
-            if transfers == []:
-                alloc_failed = True
-                break
-            if transfers:
-                comp_xfers[comp.component_type] = transfers
+        if not full_only:
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                transfers = comp.build_hicache_transfers(
+                    last_host_node,
+                    CacheTransferPhase.PREFETCH,
+                    token_ids=prefetch_key.token_ids,
+                    prefetch_tokens=len(prefetch_key),
+                    last_hash=last_hash,
+                )
+                if transfers == []:
+                    alloc_failed = True
+                    break
+                if transfers:
+                    comp_xfers[comp.component_type] = transfers
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
