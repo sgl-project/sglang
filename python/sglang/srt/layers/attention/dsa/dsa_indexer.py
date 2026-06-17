@@ -12,6 +12,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
@@ -45,6 +46,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
@@ -118,118 +120,6 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 
 
 if _is_cuda:
-    from sglang.srt.compilation.compilation_config import register_split_op
-    from sglang.srt.utils.custom_op import register_custom_op
-
-    def _resolve_indexer_split_op_context(layer_id: int):
-        # Shared preamble for the indexer split ops: resolve the forward batch,
-        # this layer's indexer, and its metadata from the captured forward context.
-        forward_context = get_tc_piecewise_forward_context()
-        forward_batch = forward_context.forward_batch
-        indexer = forward_context.dsa_indexers[layer_id]
-        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
-        return forward_batch, indexer, metadata
-
-    @register_custom_op(mutates_args=["topk_result"])
-    @register_split_op()
-    def k_cache_and_topk_result(
-        layer_id: int,
-        key: torch.Tensor,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        topk_result: torch.Tensor,
-    ) -> None:
-        assert (
-            _is_cuda
-        ), "Internal error: piecewise CUDA graph is only supported on CUDA"
-        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-
-        forward_batch, indexer, metadata = _resolve_indexer_split_op_context(layer_id)
-
-        indexer._store_k_cache_and_get_topk_ragged_graph(
-            forward_batch,
-            layer_id,
-            key,
-            q_fp8,
-            weights,
-            metadata,
-            topk_result,
-            act_quant,
-        )
-
-    bcg_k_cache_and_topk_result = eager_on_graph(True)(k_cache_and_topk_result)
-
-    @register_custom_op(mutates_args=["topk_result"])
-    @register_split_op()
-    def dsa_indexer_graph_dispatch(
-        layer_id: int,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        topk_result: torch.Tensor,
-    ) -> None:
-        # Shared by piecewise (PCG) and breakable (BCG) CUDA graph capture: both
-        # route the indexer through this eager split op.
-        #
-        # Output contract (differs from the eager `forward` path): a split op
-        # returns None, so results are delivered only by mutating `topk_result`
-        # in place. The call site pre-allocates it at a static, padded shape and a
-        # downstream captured graph reads it at a fixed address; eager code instead
-        # allocates and returns a fresh, naturally-sized tensor each call.
-        assert (
-            _is_cuda
-        ), "Internal error: indexer graph dispatch is only supported on CUDA"
-        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-
-        forward_batch, indexer, metadata = _resolve_indexer_split_op_context(layer_id)
-
-        extend_num_tokens = forward_batch.extend_num_tokens
-        # Empty buffer encodes return_indices=False for graph dispatch.
-        return_indices = topk_result.numel() != 0
-        k_only = not return_indices or (
-            indexer._should_skip_logits_computation(forward_batch)
-            and not indexer.dsa_enable_prefill_cp
-        )
-        if k_only:
-            indexer._compute_and_store_k_only(
-                x,
-                positions,
-                forward_batch,
-                layer_id,
-                act_quant,
-                enable_dual_stream=False,
-                num_tokens=extend_num_tokens,
-            )
-            if not return_indices:
-                return
-            raw_topk_result = indexer._get_k_only_topk_result(metadata, x.device)
-            # Buffer is padded to the capture shape: fill the valid prefix and
-            # leave padded rows at the -1 sentinel.
-            topk_result[: raw_topk_result.shape[0]] = raw_topk_result
-            return
-
-        query, key = indexer._get_q_k_bf16(
-            q_lora,
-            x,
-            positions,
-            enable_dual_stream=False,
-            forward_batch=forward_batch,
-        )
-        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-        # Reuse the compiled head-gate util shared with the eager path.
-        weights = indexer._get_logits_head_gate(x, q_scale)
-        indexer._store_k_cache_and_get_topk_ragged_graph(
-            forward_batch,
-            layer_id,
-            key,
-            q_fp8,
-            weights,
-            metadata,
-            topk_result,
-            act_quant,
-        )
-
-    bcg_dsa_indexer_graph_dispatch = eager_on_graph(True)(dsa_indexer_graph_dispatch)
 
     def _logits_head_gate_graph_fake_impl(
         x: torch.Tensor,
@@ -1582,7 +1472,7 @@ class Indexer(MultiPlatformOp):
             graph_dispatch_fn = (
                 bcg_dsa_indexer_graph_dispatch
                 if is_in_breakable_cuda_graph()
-                else dsa_indexer_graph_dispatch
+                else pcg_dsa_indexer_graph_dispatch
             )
             graph_dispatch_fn(
                 layer_id=layer_id,
@@ -1791,7 +1681,7 @@ class Indexer(MultiPlatformOp):
                         dtype=torch.int32,
                     )
                     k_cache_topk_fn = (
-                        bcg_k_cache_and_topk_result
+                        bcg_dsa_k_cache_and_topk_result
                         if is_in_breakable_cuda_graph()
                         else k_cache_and_topk_result
                     )
@@ -2151,6 +2041,112 @@ class Indexer(MultiPlatformOp):
             sparse_mode=3,
         )
         return topk_indices_prev[0], topk_indices_next[0]
+
+
+@register_custom_op(mutates_args=["topk_result"])
+@register_split_op()
+def k_cache_and_topk_result(
+    layer_id: int,
+    key: torch.Tensor,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    topk_result: torch.Tensor,
+) -> None:
+    assert _is_cuda, "Internal error: DSA PCG split op is only supported on CUDA"
+    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+
+    forward_context = get_tc_piecewise_forward_context()
+    forward_batch = forward_context.forward_batch
+    indexer = forward_context.dsa_indexers[layer_id]
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
+    indexer._store_k_cache_and_get_topk_ragged_graph(
+        forward_batch,
+        layer_id,
+        key,
+        q_fp8,
+        weights,
+        metadata,
+        topk_result,
+        act_quant,
+    )
+
+
+bcg_dsa_k_cache_and_topk_result = eager_on_graph(True)(k_cache_and_topk_result)
+
+
+@register_custom_op(mutates_args=["topk_result"])
+@register_split_op()
+def pcg_dsa_indexer_graph_dispatch(
+    layer_id: int,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    topk_result: torch.Tensor,
+) -> None:
+    # PCG calls this as a split op; BCG uses the explicit eager wrapper below.
+    #
+    # Output contract (differs from the eager `forward` path): a split op returns
+    # None, so results are delivered only by mutating `topk_result` in place. The
+    # call site pre-allocates it at a static, padded shape and a downstream
+    # captured graph reads it at a fixed address; eager code instead allocates
+    # and returns a fresh, naturally-sized tensor each call.
+    assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
+    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+
+    forward_context = get_tc_piecewise_forward_context()
+    forward_batch = forward_context.forward_batch
+    indexer = forward_context.dsa_indexers[layer_id]
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
+    extend_num_tokens = forward_batch.extend_num_tokens
+    # Empty buffer encodes return_indices=False for graph dispatch.
+    return_indices = topk_result.numel() != 0
+    k_only = not return_indices or (
+        indexer._should_skip_logits_computation(forward_batch)
+        and not indexer.dsa_enable_prefill_cp
+    )
+    if k_only:
+        indexer._compute_and_store_k_only(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            act_quant,
+            enable_dual_stream=False,
+            num_tokens=extend_num_tokens,
+        )
+        if not return_indices:
+            return
+        raw_topk_result = indexer._get_k_only_topk_result(metadata, x.device)
+        # Buffer is padded to the capture shape: fill the valid prefix and leave
+        # padded rows at the -1 sentinel.
+        topk_result[: raw_topk_result.shape[0]] = raw_topk_result
+        return
+
+    query, key = indexer._get_q_k_bf16(
+        q_lora,
+        x,
+        positions,
+        enable_dual_stream=False,
+        forward_batch=forward_batch,
+    )
+    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+    # Reuse the compiled head-gate util shared with the eager path.
+    weights = indexer._get_logits_head_gate(x, q_scale)
+    indexer._store_k_cache_and_get_topk_ragged_graph(
+        forward_batch,
+        layer_id,
+        key,
+        q_fp8,
+        weights,
+        metadata,
+        topk_result,
+        act_quant,
+    )
+
+
+bcg_dsa_indexer_graph_dispatch = eager_on_graph(True)(pcg_dsa_indexer_graph_dispatch)
 
 
 def scattered_to_tp_attn_full(
