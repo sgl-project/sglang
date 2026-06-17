@@ -28,7 +28,6 @@ from sglang.srt.layers.moe.moe_runner.torch_npu import (
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4MoEMethod,
-    NPUUnquantMoEMethod,
 )
 
 from sglang.srt.layers.moe import (
@@ -173,8 +172,8 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
-        layer.w13_kernel = NPUUnquantMoEMethod()
-        layer.w2_kernel = NPUUnquantMoEMethod()
+        layer.w13_kernel = NPUW4A16Int4MoEMethod()
+        layer.w2_kernel = NPUW4A16Int4MoEMethod()
         moe_runner_config.layer = layer
         backend = get_moe_runner_backend()
         if backend.is_auto():
@@ -190,9 +189,9 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         quant_info = TorchNpuQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            w13_weight_offset=layer.w13_weight_offset,
+            w2_weight_offset=layer.w2_weight_offset,
         )
-        '''w13_weight_scale=layer.w13_scales,
-        w2_weight_scale=layer.w2_scales,
-        w13_weight_offset=layer.w13_qzeros,
-        w2_weight_offset=layer.w2_qzeros,'''
         return self.runner.run(dispatch_output, quant_info)
