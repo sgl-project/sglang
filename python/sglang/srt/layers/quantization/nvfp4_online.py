@@ -164,17 +164,22 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if layer_match is not None
             else layer_prefix
         )
-        if not self.enable_flashinfer_trtllm_moe:
+        if not (
+            self.enable_flashinfer_trtllm_moe
+            or (self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep)
+        ):
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl "
+                "with moe_a2a_backend='none'/'flashinfer'."
             )
 
     @staticmethod
     def _quantize_weight_nvfp4(
         weight: torch.Tensor,
         weight_scale_2: Optional[torch.Tensor] = None,
+        backend: str = "cuda",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return packed NVFP4 weight, block scales, and per-tensor decode scale.
 
@@ -224,7 +229,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight.contiguous(),
             1.0 / weight_scale_2,
             sfLayout=SfLayout.layout_linear,
-            backend="cuda",
+            backend=backend,
         )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
@@ -332,6 +337,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         pending_fp8_lock = threading.Lock()
         quantization_log_lock = threading.Lock()
         did_log_quantization = False
+        quantize_backend = "cute-dsl" if self.enable_flashinfer_cutedsl_moe else "cuda"
 
         def log_quantization_start() -> None:
             nonlocal did_log_quantization
@@ -399,7 +405,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if shard_id == "w2":
                 loaded_weight = loaded_weight.to(param.device)
                 fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
-                    loaded_weight
+                    loaded_weight,
+                    backend=quantize_backend,
                 )
                 store_quantized_weight(
                     param,
@@ -445,7 +452,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             # Quantize the gated pair together so w1/w3 share one amax-derived
             # per-tensor FP32 scale, matching the serialized NVFP4 convention.
             fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
-                torch.cat([pending_weight, loaded_weight], dim=0)
+                torch.cat([pending_weight, loaded_weight], dim=0),
+                backend=quantize_backend,
             )
             pending_fp4_weight, loaded_fp4_weight = fp4_weight.split(
                 [pending_rows, loaded_rows], dim=0
