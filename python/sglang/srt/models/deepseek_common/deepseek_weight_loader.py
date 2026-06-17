@@ -142,8 +142,10 @@ class DeepseekV2WeightLoaderMixin:
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
+        fuse_qkv_a_proj = (
+            hasattr(self.config, "q_lora_rank")
+            and (self.config.q_lora_rank is not None)
+            and (self.quant_config is None or self.quant_config.get_name() not in ("awq", "awq_marlin", "moe_wna16"))
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
