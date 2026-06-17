@@ -930,25 +930,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             param.format_ue8m0 = True
 
-    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
-        """Restore MXFP8 FlashInfer TRT-LLM MoE tensors before hot update.
-
-        Miles sends canonical HF-layout MXFP8 tensors during weight update.
-        FlashInfer TRT-LLM MoE keeps the same parameters in a runtime shuffled
-        layout, so the single-buffer path must undo that layout before loading.
-        """
-        if not self.use_mxfp8 or not (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
-            return
-
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            restore_mxfp8_moe_weights_for_flashinfer_trtllm,
-        )
-
-        restore_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
-
     def create_weights(
         self,
         layer: Module,
