@@ -328,16 +328,18 @@ pub async fn spawn(
     cfg: K8sDiscoveryConfig,
     tx: mpsc::Sender<DiscoveryEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mode = cfg.mode().context("validate k8s discovery selectors")?;
+    // The mode was resolved + validated at construction (`resolve_mode` in
+    // `Cli::build_discovery`); just destructure it here.
+    let K8sDiscoveryConfig { namespace, mode } = cfg;
 
     let client = Client::try_default()
         .await
         .context("kube client default config")?;
 
-    let api: Api<EndpointSlice> = if cfg.namespace.is_empty() {
+    let api: Api<EndpointSlice> = if namespace.is_empty() {
         Api::all(client)
     } else {
-        Api::namespaced(client, &cfg.namespace)
+        Api::namespaced(client, &namespace)
     };
 
     // Plain mode pushes the single selector to the server side so the LIST
@@ -350,6 +352,36 @@ pub async fn spawn(
         K8sDiscoveryMode::PdDisaggregation { .. } => String::new(),
     };
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
+
+    // Log the resolved namespace + selector(s) at startup. We can't
+    // verify the namespace exists (the router's RBAC covers
+    // endpointslices/services/pods, not namespaces, and a correct
+    // namespace legitimately has zero matching workers until they come
+    // up), so a typo'd `--service-discovery-namespace` silently watches
+    // an empty namespace. Surfacing the watch target here lets an
+    // operator spot the typo in the first log lines instead of only
+    // discovering it via later `no workers available` request failures.
+    let namespace_display: &str = if namespace.is_empty() {
+        "<all namespaces>"
+    } else {
+        &namespace
+    };
+    match &mode {
+        K8sDiscoveryMode::Plain { label_selector } => tracing::info!(
+            namespace = %namespace_display,
+            label_selector = %label_selector,
+            "k8s discovery starting (plain mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+        K8sDiscoveryMode::PdDisaggregation {
+            prefill_selector,
+            decode_selector,
+        } => tracing::info!(
+            namespace = %namespace_display,
+            prefill_selector = %prefill_selector,
+            decode_selector = %decode_selector,
+            "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+    }
 
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
@@ -1052,5 +1084,135 @@ mod tests {
         );
         // Same URL across both, confirming the IP didn't change.
         assert_eq!(added[0].url, added[1].url);
+    }
+
+    /// End-to-end reconcile: an EndpointSlice flips `ready=true` while the
+    /// engine's `/server_info` is still failing (503) — the production
+    /// race where K8s readiness (cheap `/health`) leads the
+    /// scheduler-backed `/server_info`. The worker registers with empty
+    /// `model_ids` (invisible to routing), and discovery emits no further
+    /// event. The manager's reconcile loop must re-introspect it and move
+    /// it into the model pool once `/server_info` recovers — driven
+    /// through the real `process_events` → manager path.
+    #[tokio::test]
+    async fn k8s_reconcile_recovers_worker_whose_server_info_was_initially_failing() {
+        use crate::discovery::ModelId;
+        use crate::workers::introspect::WorkerIntrospector;
+        use crate::workers::manager::run_with_introspector_and_reconcile;
+        use crate::workers::WorkerRegistry;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+
+        // Fake engine: 503 on /server_info until `ready` flips true, then
+        // serves a valid body advertising model "m".
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_handler = ready.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move || {
+                let ready = ready_handler.clone();
+                async move {
+                    if ready.load(Ordering::SeqCst) {
+                        Json(json!({"served_model_name": "m"})).into_response()
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        // EndpointSlice already marked ready=true (kubelet's /health probe
+        // passed) pointing at the engine whose /server_info is still 503.
+        let slice = with_uid(
+            make_slice_full(&["127.0.0.1"], port as i32, true, "ns", "engine-1", &[]),
+            "u-e1",
+        );
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (dtx, drx) = mpsc::channel::<DiscoveryEvent>(16);
+        // Hold a second sender so the channel stays open after the
+        // producer's single-event stream ends — otherwise the manager
+        // loop would exit before any reconcile tick fires.
+        let dtx_keepalive = dtx.clone();
+        let introspector = Arc::new(WorkerIntrospector::new(Duration::from_millis(300)));
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            drx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            introspector,
+            Duration::from_millis(150),
+        ));
+
+        // Drive the ready=true slice through the real discovery processor.
+        let producer = tokio::spawn(async move {
+            let stream = futures::stream::iter(vec![Ok(watcher::Event::Apply(slice))]);
+            process_events(stream, dtx, plain_mode()).await;
+        });
+
+        // No target_ref on the endpoint => id falls back to ns/slice/addr:port.
+        let id = WorkerId(format!("ns/engine-1/127.0.0.1:{port}"));
+        let model = ModelId("m".into());
+
+        // Phase 1: worker is registered but absent from the model pool
+        // while /server_info keeps failing.
+        let stuck = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && registry.workers_for(&model).is_empty() {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "worker should register with empty model_ids while /server_info is failing",
+        );
+
+        // Engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and the worker joins the pool,
+        // with no further discovery event.
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "reconcile must re-introspect the worker and add it to the model pool once \
+             /server_info recovers; registry state: {:?}",
+            registry.get(&id).map(|w| w.model_ids.clone()),
+        );
+
+        drop(dtx_keepalive);
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(1), producer).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle).await;
     }
 }
