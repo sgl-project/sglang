@@ -490,18 +490,6 @@ class LayerCommunicator:
                 context=self._context,
             )
         )
-        # prepare_mlp's post-attention RMSNorm only reads the residual read-only
-        # (writing a freshly allocated residual_out) when it routes through the
-        # all-reduce-fused gather path; every other path mutates the residual in
-        # place. Eagle3 aux capture uses this to decide whether it can keep the
-        # captured residual by reference instead of cloning it. See
-        # _post_attn_residual_is_read_only.
-        self._post_attn_norm_fused_capable = (
-            self.layer_scatter_modes.mlp_mode
-            in (ScatterMode.FULL, ScatterMode.MOE_FULL)
-            and self.layer_scatter_modes.middle_residual_mode
-            == ScatterMode.TP_ATTN_FULL
-        )
 
     def prepare_attn_and_capture_last_layer_outputs(
         self,
@@ -529,33 +517,32 @@ class LayerCommunicator:
                 gathered_last_layer_output is residual
                 and not self._post_attn_residual_is_read_only(residual)
             ):
-                # The post-attention RMSNorm (prepare_mlp) consumes this buffer in
-                # place on the non-fused path and would corrupt the captured value,
-                # so take a private copy. On the all-reduce-fusion path it reads the
-                # residual read-only and emits a fresh residual_out, so we capture by
-                # reference and avoid inserting a device-to-device copy between the
-                # all-reduce and the attention fused_a_gemm (preserving PDL overlap).
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
     def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
-        """Whether the upcoming post-attention RMSNorm leaves ``residual`` intact.
+        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
+        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
 
-        Eagle3 aux capture keeps a reference to the post-attention residual, which
-        is normally consumed in place by ``prepare_mlp``'s fused add+RMSNorm. On the
-        flashinfer all-reduce-fusion path the norm instead reads the residual
-        read-only and writes a freshly allocated ``residual_out`` (see
-        ``flashinfer_allreduce_residual_rmsnorm``), so the captured reference stays
-        valid and the clone can be skipped.
-
-        Returns ``True`` only when that fused, out-of-place path is guaranteed.
+        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
+        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
+        every plain norm fold into ``residual`` in place. That path is reachable
+        only from the ``_gather_*`` communicate-fns, and only when they fall past
+        their input-scattered branch.
         """
+        norm_fn = getattr(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            "func",
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+        )
+        uses_gather_norm = norm_fn in (
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual_moe,
+        )
         return (
-            self._post_attn_norm_fused_capable
-            and self._context.attn_tp_size > 1
+            uses_gather_norm
             and not get_attn_tp_context().input_scattered
-            and residual.is_contiguous()
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
 
