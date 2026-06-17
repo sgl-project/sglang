@@ -83,4 +83,5 @@ __all__ = [
     "TorchNpuDispatcher",
     "TorchNpuDispatchOutput",
     "TorchNpuCombineInput",
+    "NpuFuseEPDispatcher",
 ]
