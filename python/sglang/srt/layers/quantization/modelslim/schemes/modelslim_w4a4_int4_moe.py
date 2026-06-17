@@ -61,6 +61,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         Shape depends on the W4A4 packing environment flag and whether the weight
         prefix is "w13" or "w2".
         """
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
