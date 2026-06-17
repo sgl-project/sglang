@@ -2118,6 +2118,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_storage = storage_portion
                     req._cache_breakdown_computed = True
 
+                    # Decision-snapshot: record the per-tier prefix hit breakdown
+                    # and matched radix node so "why did this request (not) hit
+                    # cache" is answerable per request. Emits a DEBUG log line
+                    # and/or a trace event (each independently gated, both no-ops
+                    # by default); the trace event is correlatable with the gateway
+                    # routing span via the shared rid.
+                    time_stats = getattr(req, "time_stats", None)
+                    if time_stats is not None and hasattr(
+                        time_stats, "record_cache_match"
+                    ):
+                        last_node = getattr(req, "last_node", None)
+                        time_stats.record_cache_match(
+                            rid=req.rid,
+                            device_tokens=device_portion,
+                            host_tokens=host_portion,
+                            storage_tokens=storage_portion,
+                            prefix_tokens=len(req.prefix_indices),
+                            input_tokens=len(req.origin_input_ids),
+                            last_node_id=getattr(last_node, "id", None),
+                        )
+
                 req.already_computed = seq_len
             req.is_retracted = False
 
