@@ -13,10 +13,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.quantization.dequantization import (
-    copy_missing_attrs,
-    dequantize_nvfp4,
-)
+from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
@@ -285,62 +282,70 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         # the `current_device() == idx` assert in the loader
         layer._load_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         layer._nvfp4_loading_lock = threading.Lock()
-        layer._nvfp4_materialized = False
 
         nvfp4_loader = self.get_online_nvfp4_to_mxfp4_weight_loader(
             layer, weight_loader
         )
 
-        with torch.device("meta"):
-            layer.register_parameter(
-                "weight",
-                ModelWeightParameter(
-                    data=torch.empty(
-                        output_size_per_partition,
-                        input_size_per_partition // 2,
-                        dtype=torch.uint8,
-                    ),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=nvfp4_loader,
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                    device=layer._load_device,
                 ),
-            )
-            layer.register_parameter(
-                "weight_scale",
-                ModelWeightParameter(
-                    data=torch.empty(
-                        output_size_per_partition,
-                        input_size_per_partition // NVFP4_BLOCK_SIZE,
-                        dtype=torch.float8_e4m3fn,
-                    ),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=nvfp4_loader,
+                input_dim=1,
+                output_dim=0,
+                weight_loader=nvfp4_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // NVFP4_BLOCK_SIZE,
+                    dtype=torch.float8_e4m3fn,
+                    device=layer._load_device,
                 ),
-            )
-            layer.register_parameter(
-                "weight_scale_2",
-                PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=nvfp4_loader,
+                input_dim=1,
+                output_dim=0,
+                weight_loader=nvfp4_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale_2",
+            PerTensorScaleParameter(
+                data=torch.empty(
+                    len(output_partition_sizes),
+                    dtype=torch.float32,
+                    device=layer._load_device,
                 ),
-            )
+                weight_loader=nvfp4_loader,
+            ),
+        )
 
-            # NVFP4 checkpoints carry per-tensor `input_scale` (activation scale).
-            # MXFP4 uses dynamic activation quantization, so we discard it, but
-            # we still register the param so upstream model loaders that rename
-            # `gate_proj.input_scale` -> `gate_up_proj.input_scale` find a slot
-            # to write into
-            def _discard_loader(param, loaded_weight, shard_id=None):
-                pass
+        # NVFP4 checkpoints carry per-tensor `input_scale` (activation scale).
+        # MXFP4 uses dynamic activation quantization, so we discard it, but
+        # we still register the param so upstream model loaders that rename
+        # `gate_proj.input_scale` -> `gate_up_proj.input_scale` find a slot
+        # to write into
+        def _discard_loader(param, loaded_weight, shard_id=None):
+            pass
 
-            layer.register_parameter(
-                "input_scale",
-                PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=_discard_loader,
+        layer.register_parameter(
+            "input_scale",
+            PerTensorScaleParameter(
+                data=torch.empty(
+                    len(output_partition_sizes),
+                    dtype=torch.float32,
+                    device=layer._load_device,
                 ),
-            )
+                weight_loader=_discard_loader,
+            ),
+        )
 
         layer.weight._param_name = "weight"
         layer.weight_scale._param_name = "weight_scale"
@@ -351,32 +356,14 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         layer,
         original_weight_loader: Callable,
     ) -> Callable:
-        """NVFP4 -> MXFP4 loader: materialize on first touch, then
-        dequantize+requantize once all source bytes are in place."""
-
-        def _materialize(name):
-            src = getattr(layer, name)
-            assert src.device.type == "meta"
-            kwargs = dict(
-                data=torch.empty_like(src.data, device=layer._load_device),
-                weight_loader=src._weight_loader,
-            )
-            if isinstance(src, ModelWeightParameter):
-                kwargs.update(input_dim=src.input_dim, output_dim=src.output_dim)
-            materialized = src.__class__(**kwargs)
-            copy_missing_attrs(src, materialized)
-            setattr(layer, name, materialized)
+        """NVFP4 -> MXFP4 loader: dequantize+requantize once all source bytes
+        are in place."""
 
         def loader(param, loaded_weight, shard_id=None):
             param_name = getattr(param, "_param_name", None)
             assert torch.cuda.current_device() == layer._load_device.index
 
             with layer._nvfp4_loading_lock:
-                if not layer._nvfp4_materialized:
-                    _materialize("weight")
-                    _materialize("weight_scale")
-                    _materialize("weight_scale_2")
-                    layer._nvfp4_materialized = True
                 param = getattr(layer, param_name)
 
             kwargs = {"loaded_shard_id": shard_id} if shard_id is not None else {}

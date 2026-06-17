@@ -11,10 +11,7 @@ import torch
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.dequantization import (
-    copy_missing_attrs,
-    dequantize_nvfp4,
-)
+from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
@@ -221,7 +218,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         extra_weight_attrs,
     ):
         layer._nvfp4_loaded_numel = 0
-        layer._nvfp4_materialized = False
         layer._load_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         layer._nvfp4_loading_lock = threading.Lock()
 
@@ -230,22 +226,22 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
         extra_weight_attrs["weight_loader"] = nvfp4_loader
 
-        def _meta_param(shape, dtype):
-            with torch.device("meta"):
-                return torch.nn.Parameter(
-                    torch.empty(*shape, dtype=dtype), requires_grad=False
-                )
+        def _param(shape, dtype):
+            return torch.nn.Parameter(
+                torch.empty(*shape, dtype=dtype, device=layer._load_device),
+                requires_grad=False,
+            )
 
         params = {
-            "w13_weight": _meta_param(
+            "w13_weight": _param(
                 (num_experts, 2 * intermediate_size_per_partition, hidden_size // 2),
                 torch.uint8,
             ),
-            "w2_weight": _meta_param(
+            "w2_weight": _param(
                 (num_experts, hidden_size, intermediate_size_per_partition // 2),
                 torch.uint8,
             ),
-            "w13_weight_scale": _meta_param(
+            "w13_weight_scale": _param(
                 (
                     num_experts,
                     2 * intermediate_size_per_partition,
@@ -253,7 +249,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 ),
                 torch.float8_e4m3fn,
             ),
-            "w2_weight_scale": _meta_param(
+            "w2_weight_scale": _param(
                 (
                     num_experts,
                     hidden_size,
@@ -264,8 +260,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         }
         # w13 fuses gate(w1)+up(w3): FusedMoE stores a per-tensor scale for
         # each at param[expert][0|1], so shape is [E, 2]. w2 (down) is single.
-        params["w13_weight_scale_2"] = _meta_param((num_experts, 2), torch.float32)
-        params["w2_weight_scale_2"] = _meta_param((num_experts,), torch.float32)
+        params["w13_weight_scale_2"] = _param((num_experts, 2), torch.float32)
+        params["w2_weight_scale_2"] = _param((num_experts,), torch.float32)
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -288,13 +284,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         def _discard_loader(param, loaded_weight, weight_name, shard_id, expert_id):
             pass
 
-        with torch.device("meta"):
-            w13_input_scale = torch.nn.Parameter(
-                torch.empty(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            w2_input_scale = torch.nn.Parameter(
-                torch.empty(num_experts, dtype=torch.float32), requires_grad=False
-            )
+        w13_input_scale = torch.nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32, device=layer._load_device),
+            requires_grad=False,
+        )
+        w2_input_scale = torch.nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32, device=layer._load_device),
+            requires_grad=False,
+        )
         layer.register_parameter("w13_input_scale", w13_input_scale)
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(
@@ -305,20 +302,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
     def get_online_nvfp4_to_mxfp4_weight_loader(self, layer, original_weight_loader):
-        """NVFP4 MoE loader: materialize on first touch, then expert-wise
-        dequant+requant once all source bytes are in place."""
+        """NVFP4 MoE loader: expert-wise dequant+requant once all source bytes
+        are in place."""
         bulk_names = ["w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"]
         scale2_names = ["w13_weight_scale_2", "w2_weight_scale_2"]
-
-        def _materialize(name):
-            src = getattr(layer, name)
-            assert src.device.type == "meta"
-            new = torch.nn.Parameter(
-                torch.empty_like(src.data, device=layer._load_device),
-                requires_grad=False,
-            )
-            copy_missing_attrs(src, new)
-            setattr(layer, name, new)
 
         def loader(param, loaded_weight, weight_name, shard_id, expert_id):
             is_scale_2 = "weight_scale_2" in weight_name
@@ -327,11 +314,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert torch.cuda.current_device() == layer._load_device.index
 
             with layer._nvfp4_loading_lock:
-                if not layer._nvfp4_materialized:
-                    for n in bulk_names + scale2_names:
-                        _materialize(n)
-                    layer._nvfp4_materialized = True
-
                 if is_scale_2:
                     name = "w13_weight_scale_2" if is_w13 else "w2_weight_scale_2"
                 elif is_scale:

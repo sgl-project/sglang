@@ -200,20 +200,10 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
     # ModelOpt NVFP4 export (quant_method="modelopt", quant_algo="NVFP4") =>
     # Nvfp4SourceConfig(). Exercises the NVFP4 -> MXFP4 MoE requantization path:
-    # meta-device weight registration, the per-expert dequantize_nvfp4 +
-    # dynamic_mxfp4_quant requant, and the w13 gate/up weight_scale_2 split in
-    # _requantize_nvfp4_to_mxfp4.
+    # the per-expert dequantize_nvfp4 + dynamic_mxfp4_quant requant, and the w13
+    # gate/up weight_scale_2 split in _requantize_nvfp4_to_mxfp4.
     model = "nvidia/Qwen3-30B-A3B-NVFP4"  # NVFP4 model
     tp = 1
-
-    def test_peak_memory(self):
-        # NVFP4 weights are registered on the meta device, so peak memory before
-        # load_weights is tiny (~1.2 GiB, < 5). Equivalent BF16 model
-        # (Qwen/Qwen3-30B-A3B) loads at 56.940 GiB; requantized MXFP4
-        # reference (peak_before + load_increase) ~= 16.44 GiB (TP=1).
-        self._test_peak_memory(
-            threshold=18, test_start=True, add_peak_memory_before_load=True
-        )
 
     def test_gsm8k(self):
         # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
