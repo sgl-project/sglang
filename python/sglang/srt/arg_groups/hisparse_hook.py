@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -35,7 +37,7 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
 
 
 def apply_hisparse_dsa_backend_defaults(
-    server_args: "ServerArgs",
+    server_args: ServerArgs,
     user_set_prefill: bool,
     user_set_decode: bool,
     kv_cache_dtype: str,
@@ -61,7 +63,7 @@ def apply_hisparse_dsa_backend_defaults(
 
 
 def validate_hisparse_dsa_backend(
-    server_args: "ServerArgs", attr: str, label: str
+    server_args: ServerArgs, attr: str, label: str
 ) -> None:
     backend = getattr(server_args, attr)
     allowed_backends = _hisparse_allowed_backends(server_args.kv_cache_dtype)
@@ -76,7 +78,7 @@ def validate_hisparse_dsa_backend(
         )
 
 
-def validate_hisparse_kv_cache_dtype(server_args: "ServerArgs") -> None:
+def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     if server_args.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
         return
 
@@ -89,7 +91,7 @@ def validate_hisparse_kv_cache_dtype(server_args: "ServerArgs") -> None:
     )
 
 
-def validate_hisparse(server_args: "ServerArgs") -> None:
+def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
     if not server_args.enable_hisparse:
         return
