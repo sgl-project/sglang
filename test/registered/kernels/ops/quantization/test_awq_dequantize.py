@@ -10,6 +10,10 @@ from sglang.kernels.ops.quantization.awq_dequantize import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 try:
     from sgl_kernel import awq_dequantize as aot_awq_dequantize
