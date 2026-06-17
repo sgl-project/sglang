@@ -46,8 +46,8 @@ class NixlBackendConfig:
         """Return typed NIXL FILE L3 cleaner options from top-level config."""
         config = {
             "enabled": True,
-            "high_pct": 80.0,
-            "low_pct": 70.0,
+            "high_watermark": 80.0,
+            "low_watermark": 70.0,
         }
         if "l3_cleaner_enabled" in self.config:
             enabled = self.config["l3_cleaner_enabled"]
@@ -55,8 +55,8 @@ class NixlBackendConfig:
                 raise ValueError("l3_cleaner_enabled must be a boolean")
             config["enabled"] = enabled
         key_map = {
-            "l3_cleaner_high_watermark": ("high_pct", float),
-            "l3_cleaner_low_watermark": ("low_pct", float),
+            "l3_cleaner_high_watermark": ("high_watermark", float),
+            "l3_cleaner_low_watermark": ("low_watermark", float),
         }
         for raw_key, (cleaner_key, parser) in key_map.items():
             if raw_key in self.config:

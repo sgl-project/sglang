@@ -152,8 +152,8 @@ class HiCacheNixl(HiCacheStorage):
             HiCacheL3Cleaner(
                 cleanup_dirs,
                 tp_rank,
-                high_pct=cleaner_config["high_pct"],
-                low_pct=cleaner_config["low_pct"],
+                high_watermark=cleaner_config["high_watermark"],
+                low_watermark=cleaner_config["low_watermark"],
             )
             if (
                 cleanup_dirs

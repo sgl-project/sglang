@@ -57,8 +57,8 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         cleaner = HiCacheL3Cleaner(
             self.base_dirs,
             tp_rank=0,
-            high_pct=80.0,
-            low_pct=70.0,
+            high_watermark=80.0,
+            low_watermark=70.0,
             recheck_groups=1,
             unlink_workers=1,
         )
@@ -86,8 +86,8 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         cleaner = HiCacheL3Cleaner(
             self.base_dirs,
             tp_rank=0,
-            high_pct=80.0,
-            low_pct=70.0,
+            high_watermark=80.0,
+            low_watermark=70.0,
             unlink_workers=1,
         )
         cleaner._disk_usage_pct = lambda _path: 90.0
@@ -120,8 +120,8 @@ class TestHiCacheL3Cleaner(CustomTestCase):
 
         cleaner_config = cfg.get_l3_cleaner_config()
         self.assertFalse(cleaner_config["enabled"])
-        self.assertEqual(cleaner_config["high_pct"], 85.0)
-        self.assertEqual(cleaner_config["low_pct"], 75.0)
+        self.assertEqual(cleaner_config["high_watermark"], 85.0)
+        self.assertEqual(cleaner_config["low_watermark"], 75.0)
         self.assertEqual(cfg.get_backend_initparams("POSIX"), {"use_uring": "true"})
 
         default_config = NixlBackendConfig().get_l3_cleaner_config()

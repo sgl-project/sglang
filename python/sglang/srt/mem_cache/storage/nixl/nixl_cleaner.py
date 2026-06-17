@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_SEC = 30.0
 _DEFAULT_RECHECK_GROUPS = 50
-_DEFAULT_HIGH_PCT = 80.0
-_DEFAULT_LOW_PCT = 70.0
+_DEFAULT_HIGH_WATERMARK = 80.0
+_DEFAULT_LOW_WATERMARK = 70.0
 _RANK_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
 _KV_SUFFIXES = ("_k", "_v")
 _BUCKET_NAME_RE = re.compile(rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
@@ -79,8 +79,8 @@ class HiCacheL3Cleaner:
         storage_dirs: list[str] | str,
         tp_rank: int,
         *,
-        high_pct: float = _DEFAULT_HIGH_PCT,
-        low_pct: float = _DEFAULT_LOW_PCT,
+        high_watermark: float = _DEFAULT_HIGH_WATERMARK,
+        low_watermark: float = _DEFAULT_LOW_WATERMARK,
         interval_sec: float = _DEFAULT_INTERVAL_SEC,
         recheck_groups: int = _DEFAULT_RECHECK_GROUPS,
         unlink_workers: Optional[int] = None,
@@ -89,16 +89,18 @@ class HiCacheL3Cleaner:
             storage_dirs = [storage_dirs] if storage_dirs else []
         self.storage_dirs = [path for path in storage_dirs if path]
         self.tp_rank = tp_rank
-        self.high_pct = high_pct
-        self.low_pct = low_pct
+        self.high_watermark = high_watermark
+        self.low_watermark = low_watermark
         self.interval_sec = interval_sec
         self.recheck_groups = max(1, recheck_groups)
         self.unlink_workers = unlink_workers or max(
             8, 8 * max(len(self.storage_dirs), 1)
         )
 
-        if self.low_pct >= self.high_pct:
-            raise ValueError("L3 cleaner low_pct must be lower than high_pct")
+        if self.low_watermark >= self.high_watermark:
+            raise ValueError(
+                "L3 cleaner low_watermark must be lower than high_watermark"
+            )
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -117,8 +119,8 @@ class HiCacheL3Cleaner:
             "HiCacheL3Cleaner started: dirs=%s high=%.1f%% low=%.1f%% "
             "interval=%.1fs unlink_workers=%d",
             self.storage_dirs,
-            self.high_pct,
-            self.low_pct,
+            self.high_watermark,
+            self.low_watermark,
             self.interval_sec,
             self.unlink_workers,
         )
@@ -152,7 +154,9 @@ class HiCacheL3Cleaner:
 
     def _tick(self) -> bool:
         initial_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
-        hot_dirs = {path for path, pct in initial_pcts.items() if pct >= self.high_pct}
+        hot_dirs = {
+            path for path, pct in initial_pcts.items() if pct >= self.high_watermark
+        }
         if not hot_dirs:
             return False
 
@@ -187,7 +191,10 @@ class HiCacheL3Cleaner:
                 bytes_deleted += sum(group.size for group in batch)
                 idx += len(batch)
 
-                if all(self._disk_usage_pct(path) < self.low_pct for path in hot_dirs):
+                if all(
+                    self._disk_usage_pct(path) < self.low_watermark
+                    for path in hot_dirs
+                ):
                     break
 
         final_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
