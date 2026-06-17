@@ -13,7 +13,8 @@ name: PR Test Extra (AMD)
 # Stage: extra-a. Each job mirrors the container bring-up of pr-test-amd.yml
 # and dispatches `run_suite.py --hw amd --suite extra-a-test-{config}-amd`:
 #   - 1-gpu-small: mock-model / kv_canary *unit* tests
-#   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton)
+#   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
+#                  sessions streaming-session)
 # The canary *e2e* tests still need the canary JIT kernel ported to ROCm
 # first, so they remain CUDA-only for now.
 
