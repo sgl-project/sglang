@@ -400,7 +400,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
             host_indices = op.host_indices
             device_indices = op.device_indices
-            resolved_pool_transfers = op.pool_transfers
+            # Sidecar pools (e.g. DSA indexer) still use kernels that require
+            # CUDA indices, so we must move pool_transfers indices to device.
+            resolved_pool_transfers = self._move_pool_transfers(op.pool_transfers)
         else:
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
@@ -612,16 +614,19 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
-    def move_hybrid_indices(
-        self, operation: CacheOperation
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        host_indices, device_indices = self.move_indices(
-            operation.host_indices, operation.device_indices
-        )
+    def _move_pool_transfers(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> Optional[list[PoolTransfer]]:
+        """Move pool_transfers indices to the appropriate device.
+
+        This is factored out of ``move_hybrid_indices`` so that
+        ``start_writing`` can move sidecar indices independently when the
+        anchor KV pool keeps its indices on CPU (e.g. page_first JIT path).
+        """
         resolved_pool_transfers = None
-        if operation.pool_transfers:
+        if pool_transfers:
             resolved_pool_transfers = []
-            for transfer in operation.pool_transfers:
+            for transfer in pool_transfers:
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer.host_indices, transfer.device_indices
                 )
@@ -638,6 +643,15 @@ class HybridCacheController(BaseHiCacheController):
                         indices_from_pool=transfer.indices_from_pool,
                     )
                 )
+        return resolved_pool_transfers
+
+    def move_hybrid_indices(
+        self, operation: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        host_indices, device_indices = self.move_indices(
+            operation.host_indices, operation.device_indices
+        )
+        resolved_pool_transfers = self._move_pool_transfers(operation.pool_transfers)
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
