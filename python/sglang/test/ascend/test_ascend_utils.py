@@ -175,6 +175,10 @@ XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-Mo
 TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
 MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
 
+KIMI_LINEAR_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "moonshotai/Kimi-Linear-48B-A3B-Instruct"
+)
+
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
 GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")

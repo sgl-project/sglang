@@ -223,7 +223,8 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
