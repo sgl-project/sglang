@@ -17,7 +17,13 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+)
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 logger = init_logger(__name__)
 
 
@@ -102,12 +108,18 @@ class CpuPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        if selected_backend not in (None, AttentionBackendEnum.TORCH_SDPA):
+        if selected_backend not in (
+            None,
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.AMX_ATTN,
+        ):
             logger.warning(
-                "%s is not supported on CPU; falling back to Torch SDPA.",
+                "%s is not supported on CPU; falling back to auto selection SDPA or AMX_ATTN",
                 selected_backend,
             )
-
+        if _is_cpu and _is_cpu_amx_available:
+            logger.info("Using AMX Attention backend for CPU.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.amx_attn.AMXAttentionBackend"
         logger.info("Using Torch SDPA backend for CPU.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
