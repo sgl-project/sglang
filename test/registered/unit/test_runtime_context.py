@@ -135,6 +135,11 @@ class TestBuildParallelContext(unittest.TestCase):
         self.assertEqual(p.local_attn_dp_rank, 0)
         self.assertEqual(p.dp_size, 3)  # folded value off the runner
         self.assertEqual(p.dp_rank, 1)
+        # the 7 static group handles are captured (tp_group excluded — PDMUX-dynamic)
+        self.assertEqual(p.world_group.world_size, 8)
+        self.assertEqual(p.moe_ep_group.world_size, 4)
+        self.assertIsNotNone(p.attn_tp_group)
+        self.assertIsNotNone(p.pp_group)
 
 
 class TestDpAttentionGettersReadContext(unittest.TestCase):
@@ -169,6 +174,57 @@ class TestDpAttentionGettersReadContext(unittest.TestCase):
         self.assertEqual(get_attention_dp_rank(), 3)
         self.assertEqual(get_local_attention_dp_size(), 2)
         self.assertEqual(get_local_attention_dp_rank(), 1)
+
+
+class TestStaticGroupGettersReadContext(unittest.TestCase):
+    """The 7 static group getters return the context-held handle when present
+    (with global-assert fallback). get_tp_group is NOT flipped (PDMUX-dynamic)."""
+
+    def setUp(self):
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_static_group_getters_read_context(self):
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_cp_group,
+            get_attn_tp_group,
+            get_moe_dp_group,
+            get_moe_ep_group,
+            get_moe_tp_group,
+            get_pp_group,
+            get_world_group,
+        )
+
+        groups = {name: object() for name in (
+            "world_group", "pp_group", "moe_ep_group", "moe_dp_group",
+            "moe_tp_group", "attn_tp_group", "attn_cp_group",
+        )}
+        set_context(RuntimeContext(parallel=ParallelContext(**groups)))
+        self.assertIs(get_world_group(), groups["world_group"])
+        self.assertIs(get_pp_group(), groups["pp_group"])
+        self.assertIs(get_moe_ep_group(), groups["moe_ep_group"])
+        self.assertIs(get_moe_dp_group(), groups["moe_dp_group"])
+        self.assertIs(get_moe_tp_group(), groups["moe_tp_group"])
+        self.assertIs(get_attn_tp_group(), groups["attn_tp_group"])
+        self.assertIs(get_attn_cp_group(), groups["attn_cp_group"])
+
+    def test_alias_identity_preserved(self):
+        # if a group aliases another (e.g. _MOE_DP is _TP), holding the SAME object
+        # in two fields preserves identity through the getters
+        shared = object()
+        set_context(
+            RuntimeContext(
+                parallel=ParallelContext(moe_dp_group=shared, attn_cp_group=shared)
+            )
+        )
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_cp_group,
+            get_moe_dp_group,
+        )
+
+        self.assertIs(get_moe_dp_group(), get_attn_cp_group())
 
 
 if __name__ == "__main__":

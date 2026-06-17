@@ -191,6 +191,13 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import (
+    RuntimeContext,
+    build_parallel_context,
+    get_parallel,
+    has_context,
+    set_context,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -371,6 +378,58 @@ class _EagerBufferRegistry:
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
+    # Parallel topology (Global Context): these read the published
+    # RuntimeContext.parallel snapshot, falling back to the value resolved at
+    # __init__ (stored as `_<name>`) for the pre-publish window. The runner no
+    # longer carries its own authoritative copy — the context is the single source.
+    @property
+    def tp_rank(self) -> int:
+        return get_parallel().tp_rank if has_context() else self._tp_rank
+
+    @property
+    def tp_size(self) -> int:
+        return get_parallel().tp_size if has_context() else self._tp_size
+
+    @property
+    def pp_rank(self) -> int:
+        return get_parallel().pp_rank if has_context() else self._pp_rank
+
+    @property
+    def pp_size(self) -> int:
+        return get_parallel().pp_size if has_context() else self._pp_size
+
+    @property
+    def dp_rank(self) -> Optional[int]:
+        return get_parallel().dp_rank if has_context() else self._dp_rank
+
+    @property
+    def dp_size(self) -> int:
+        return get_parallel().dp_size if has_context() else self._dp_size
+
+    @property
+    def moe_ep_rank(self) -> int:
+        return get_parallel().moe_ep_rank if has_context() else self._moe_ep_rank
+
+    @property
+    def moe_ep_size(self) -> int:
+        return get_parallel().moe_ep_size if has_context() else self._moe_ep_size
+
+    @property
+    def moe_dp_rank(self) -> Optional[int]:
+        return get_parallel().moe_dp_rank if has_context() else self._moe_dp_rank
+
+    @property
+    def moe_dp_size(self) -> int:
+        return get_parallel().moe_dp_size if has_context() else self._moe_dp_size
+
+    @property
+    def attn_cp_rank(self) -> Optional[int]:
+        return get_parallel().attn_cp_rank if has_context() else self._attn_cp_rank
+
+    @property
+    def attn_cp_size(self) -> int:
+        return get_parallel().attn_cp_size if has_context() else self._attn_cp_size
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -401,18 +460,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.moe_ep_rank = moe_ep_rank
-        self.moe_ep_size = moe_ep_size
-        self.dp_rank = dp_rank
-        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dp_rank = moe_dp_rank
-        self.moe_dp_size = server_args.moe_dp_size
+        # Backing for the parallel-topology properties (see the @property block
+        # above): the value resolved here at __init__, used until the context is
+        # published a few lines below, after which the properties read the context.
+        self._tp_rank = tp_rank
+        self._tp_size = tp_size
+        self._moe_ep_rank = moe_ep_rank
+        self._moe_ep_size = moe_ep_size
+        self._dp_rank = dp_rank
+        self._dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self._pp_rank = pp_rank
+        self._pp_size = pp_size
+        self._attn_cp_rank = attn_cp_rank
+        self._attn_cp_size = server_args.attn_cp_size
+        self._moe_dp_rank = moe_dp_rank
+        self._moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -570,13 +632,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Snapshot + publish the parallel topology now that distributed init has
         # resolved every group + the dp-attention dims (Global Context). The
-        # parallel_state size/rank getters read this snapshot from here on.
-        from sglang.srt.runtime_context import (
-            RuntimeContext,
-            build_parallel_context,
-            set_context,
-        )
-
+        # parallel_state size/rank getters AND this runner's tp_size/etc. properties
+        # read this snapshot from here on (before this, they used the _<name> backing).
         set_context(RuntimeContext(parallel=build_parallel_context(self)))
 
         # Initialize MooncakeTransferEngine

@@ -1499,6 +1499,8 @@ _WORLD: Optional[GroupCoordinator] = None
 
 
 def get_world_group() -> GroupCoordinator:
+    if has_context() and get_parallel().world_group is not None:
+        return get_parallel().world_group
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
 
@@ -1587,6 +1589,8 @@ def get_tp_group() -> GroupCoordinator:
 
 
 def get_attn_tp_group() -> GroupCoordinator:
+    if has_context() and get_parallel().attn_tp_group is not None:
+        return get_parallel().attn_tp_group
     assert (
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
@@ -1594,6 +1598,8 @@ def get_attn_tp_group() -> GroupCoordinator:
 
 
 def get_attn_cp_group() -> GroupCoordinator:
+    if has_context() and get_parallel().attn_cp_group is not None:
+        return get_parallel().attn_cp_group
     assert (
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
@@ -1606,16 +1612,22 @@ _MOE_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
+    if has_context() and get_parallel().moe_dp_group is not None:
+        return get_parallel().moe_dp_group
     assert _MOE_DP is not None, "moe data parallel group is not initialized"
     return _MOE_DP
 
 
 def get_moe_ep_group() -> GroupCoordinator:
+    if has_context() and get_parallel().moe_ep_group is not None:
+        return get_parallel().moe_ep_group
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
 
 
 def get_moe_tp_group() -> GroupCoordinator:
+    if has_context() and get_parallel().moe_tp_group is not None:
+        return get_parallel().moe_tp_group
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
 
@@ -1627,6 +1639,8 @@ _PP: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
+    if has_context() and get_parallel().pp_group is not None:
+        return get_parallel().pp_group
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
@@ -2258,7 +2272,7 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 # group otherwise (pre-context calls during distributed init, or non-runner
 # processes). Names/signatures are unchanged, so the ~hundreds of call-sites do not
 # change. runtime_context imports only stdlib at load, so this import is cycle-safe.
-from sglang.srt.runtime_context import get_parallel, has_context
+from sglang.srt.runtime_context import get_parallel, has_context, reset_context
 
 
 def get_world_size():
@@ -2380,6 +2394,12 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    # Global Context: drop the published RuntimeContext first, so the parallel
+    # getters fall back to the live globals (being torn down here) rather than
+    # holding stale references to about-to-be-destroyed groups. This is the single
+    # teardown point the legacy globals never had.
+    reset_context()
+
     global _TP
     if _TP:
         _TP.destroy()

@@ -18,7 +18,7 @@ process resolves and runs synchronously on one thread.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Parallel topology: every dimension's resolved size + rank, in one object.
@@ -66,6 +66,19 @@ class ParallelContext:
     attn_dp_rank: int = 0
     local_attn_dp_size: int = 1
     local_attn_dp_rank: int = 0
+    # --- process-group handles (the SAME GroupCoordinator objects the legacy
+    # globals reference, so identity — incl. _MOE_DP/_ATTN_CP aliasing _TP — is
+    # preserved). tp_group is intentionally NOT held: get_tp_group() is runtime-
+    # dynamic under PD-multiplexing (returns _PDMUX_PREFILL_TP_GROUP), so it can't be
+    # a static snapshot. Group `destroy` stays in parallel_state; reset_context drops
+    # these references. ---
+    world_group: Optional[Any] = None
+    pp_group: Optional[Any] = None
+    moe_ep_group: Optional[Any] = None
+    moe_dp_group: Optional[Any] = None
+    moe_tp_group: Optional[Any] = None
+    attn_tp_group: Optional[Any] = None
+    attn_cp_group: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +147,14 @@ def build_parallel_context(model_runner) -> ParallelContext:
         attn_dp_rank=get_attention_dp_rank(),
         local_attn_dp_size=get_local_attention_dp_size(),
         local_attn_dp_rank=get_local_attention_dp_rank(),
+        # group handles (same objects as the locals above; tp_group excluded — PDMUX)
+        world_group=world,
+        pp_group=pp,
+        moe_ep_group=moe_ep,
+        moe_dp_group=moe_dp,
+        moe_tp_group=moe_tp,
+        attn_tp_group=attn_tp,
+        attn_cp_group=attn_cp,
     )
 
 
