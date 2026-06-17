@@ -1460,6 +1460,7 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
 ):
