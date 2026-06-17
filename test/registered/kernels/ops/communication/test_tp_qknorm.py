@@ -33,6 +33,9 @@ register_cuda_ci(
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 # ---------------------------------------------------------------------------
