@@ -250,6 +250,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         self.assertGreater(metrics["score"], 0.89)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendNvFp4OnlineBase:
     backend = None
     extra_env = {}

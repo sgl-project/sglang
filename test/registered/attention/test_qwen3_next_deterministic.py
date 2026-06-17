@@ -6,6 +6,8 @@ python3 -m unittest test_qwen3_next_deterministic.TestFlashInferDeterministic
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
@@ -17,6 +19,7 @@ register_cuda_ci(est_time=200, suite="nightly-4-gpu", nightly=True)
 QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFlashInferDeterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
@@ -30,6 +33,7 @@ class TestFlashInferDeterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonDeterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
