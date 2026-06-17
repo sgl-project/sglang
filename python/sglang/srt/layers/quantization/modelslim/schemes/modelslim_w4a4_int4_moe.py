@@ -51,7 +51,6 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
     def create_weights(
         self,
         layer: torch.nn.Module,
-        weight_prefix: str,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
@@ -64,7 +63,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         """
         # --- compute shapes based on the packing path and prefix ---
         if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
-            if weight_prefix == "w13":
+            if self.weight_prefix == "w13":
                 out_features = intermediate_size_per_partition
                 in_features = hidden_size
             else:  # w2
@@ -74,7 +73,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
             weight_shape = (num_experts, out_features, in_features)
             scale_shape = (num_experts, 2 * out_features, 1)
         else:
-            if weight_prefix == "w13":
+            if self.weight_prefix == "w13":
                 a_dim = 2 * intermediate_size_per_partition
                 b_dim = hidden_size
             else:  # w2
@@ -87,7 +86,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         offset_shape = scale_shape  # offset always matches scale
 
         self._create_weight_params(
-            layer, weight_prefix, weight_shape, scale_shape, offset_shape, extra_weight_attrs
+            layer, self.weight_prefix, weight_shape, scale_shape, offset_shape, extra_weight_attrs
         )
 
     @staticmethod
