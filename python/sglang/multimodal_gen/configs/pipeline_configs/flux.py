@@ -497,6 +497,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         """
         return True
 
+    def supports_continuous_batching(self):
+        """Allow continuous batching for Flux2 text-only requests."""
+        return True
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)
         effective_max_length = tok_kwargs.pop("max_length", 512)
