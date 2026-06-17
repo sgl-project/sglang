@@ -259,6 +259,7 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    hicache_restored_lock_params: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -533,7 +534,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # boundary needed for the matching dec_lock_ref.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        prefix_match.lock_params = lock_result.to_dec_params()
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -916,6 +919,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefix_len > swa_prefix_cap:
                         prefix_len = swa_prefix_cap
                         prefix_indices = prefix_indices[:prefix_len]
+                        prefix_match.prefix_indices = prefix_indices
+                        prefix_match.l2_host_hit_length = 0
+                        prefix_match.l3_storage_hit_length = 0
+                        prefix_match.last_host_node = None
+                        prefix_match.prefetch_registered = False
                         # Cap the prefill-committed prefix too: tokens past the
                         # cap are neither device-resident nor HiCache-restored,
                         # so prefill must transfer them.
@@ -959,18 +967,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(
                         decode_req.req.last_node,
-                        DecLockRefParams(
-                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                        ),
+                        prefix_match.lock_params,
                     )
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(
                         decode_req.req.last_node,
-                        DecLockRefParams(
-                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                        ),
+                        prefix_match.lock_params,
                     )
                 break
 
@@ -991,9 +995,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(
                             decode_req.req.last_node,
-                            DecLockRefParams(
-                                swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                            ),
+                            prefix_match.lock_params,
                         )
                     break
 
