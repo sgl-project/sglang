@@ -2598,6 +2598,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return self.cache_controller.start_loading()
         return 0
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete."""
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
     # TODO: simplify and consolidate in a future refactor.
