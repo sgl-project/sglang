@@ -2253,88 +2253,128 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP = old_tp_group
 
 
+# Global Context (parallel refactor): the size/rank getters below read the published
+# RuntimeContext.parallel snapshot when present, and fall back to the live process
+# group otherwise (pre-context calls during distributed init, or non-runner
+# processes). Names/signatures are unchanged, so the ~hundreds of call-sites do not
+# change. runtime_context imports only stdlib at load, so this import is cycle-safe.
+from sglang.srt.runtime_context import get_parallel, has_context
+
+
 def get_world_size():
     """Return world size for the world group."""
+    if has_context():
+        return get_parallel().world_size
     return get_world_group().world_size
 
 
 def get_world_rank():
     """Return my rank for the world group."""
+    if has_context():
+        return get_parallel().world_rank
     return get_world_group().rank_in_group
 
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
+    if has_context():
+        return get_parallel().tp_size
     return get_tp_group().world_size
 
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
+    if has_context():
+        return get_parallel().tp_rank
     return get_tp_group().rank_in_group
 
 
 # ATTN_TP
 def get_attn_tensor_model_parallel_world_size():
     """Return world size for the attention tensor model parallel group."""
+    if has_context():
+        return get_parallel().attn_tp_size
     return get_attn_tp_group().world_size
 
 
 def get_attn_tensor_model_parallel_rank():
     """Return my rank for the attention tensor model parallel group."""
+    if has_context():
+        return get_parallel().attn_tp_rank
     return get_attn_tp_group().rank_in_group
 
 
 # ATTN_CP
 def get_attn_context_model_parallel_world_size():
     """Return world size for the attention context model parallel group."""
+    if has_context():
+        return get_parallel().attn_cp_size
     return get_attn_cp_group().world_size
 
 
 def get_attn_context_model_parallel_rank():
     """Return my rank for the attention context model parallel group."""
+    if has_context():
+        return get_parallel().attn_cp_rank
     return get_attn_cp_group().rank_in_group
 
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
+    if has_context():
+        return get_parallel().pp_size
     return get_pp_group().world_size
 
 
 def get_pipeline_model_parallel_rank():
     """Return my rank for the pipeline model parallel group."""
+    if has_context():
+        return get_parallel().pp_rank
     return get_pp_group().rank_in_group
 
 
 # MOE_DP
 def get_moe_data_parallel_world_size():
     """Return world size for the moe data parallel group."""
+    if has_context():
+        return get_parallel().moe_dp_size
     return get_moe_dp_group().world_size
 
 
 def get_moe_data_parallel_rank():
     """Return my rank for the moe data parallel group."""
+    if has_context():
+        return get_parallel().moe_dp_rank
     return get_moe_dp_group().rank_in_group
 
 
 # MOE_EP
 def get_moe_expert_parallel_world_size():
     """Return world size for the moe expert parallel group."""
+    if has_context():
+        return get_parallel().moe_ep_size
     return get_moe_ep_group().world_size
 
 
 def get_moe_expert_parallel_rank():
     """Return my rank for the moe expert parallel group."""
+    if has_context():
+        return get_parallel().moe_ep_rank
     return get_moe_ep_group().rank_in_group
 
 
 # MOE_TP
 def get_moe_tensor_parallel_world_size():
     """Return world size for the moe tensor parallel group."""
+    if has_context():
+        return get_parallel().moe_tp_size
     return get_moe_tp_group().world_size
 
 
 def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
+    if has_context():
+        return get_parallel().moe_tp_rank
     return get_moe_tp_group().rank_in_group
 
 

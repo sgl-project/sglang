@@ -80,8 +80,8 @@ class TestParallelDefaults(unittest.TestCase):
 
 
 class TestBuildParallelContext(unittest.TestCase):
-    """The factory: grouped dims read off the parallel_state getters, attn_dp off the
-    dp_attention getters, dp_size off the runner. All stubbed."""
+    """The factory: grouped dims read off the process groups directly, attn_dp off the
+    dp_attention getters, the folded dp_size off the runner. All stubbed."""
 
     def setUp(self):
         reset_context()
@@ -89,31 +89,26 @@ class TestBuildParallelContext(unittest.TestCase):
     def tearDown(self):
         reset_context()
 
-    def test_snapshots_from_getters_and_runner(self):
+    def test_snapshots_from_groups_and_runner(self):
         class FakeMR:
             dp_size = 3
             dp_rank = 1
+
+        def grp(world_size, rank):
+            return mock.Mock(world_size=world_size, rank_in_group=rank)
 
         ps = "sglang.srt.distributed.parallel_state"
         dpa = "sglang.srt.layers.dp_attention"
         with mock.patch.multiple(
             ps,
-            get_world_size=lambda: 8,
-            get_world_rank=lambda: 5,
-            get_tensor_model_parallel_world_size=lambda: 2,
-            get_tensor_model_parallel_rank=lambda: 1,
-            get_pipeline_model_parallel_world_size=lambda: 2,
-            get_pipeline_model_parallel_rank=lambda: 0,
-            get_moe_expert_parallel_world_size=lambda: 4,
-            get_moe_expert_parallel_rank=lambda: 3,
-            get_moe_data_parallel_world_size=lambda: 1,
-            get_moe_data_parallel_rank=lambda: 0,
-            get_moe_tensor_parallel_world_size=lambda: 2,
-            get_moe_tensor_parallel_rank=lambda: 1,
-            get_attn_tensor_model_parallel_world_size=lambda: 2,
-            get_attn_tensor_model_parallel_rank=lambda: 1,
-            get_attn_context_model_parallel_world_size=lambda: 1,
-            get_attn_context_model_parallel_rank=lambda: 0,
+            get_world_group=lambda: grp(8, 5),
+            get_tp_group=lambda: grp(2, 1),
+            get_pp_group=lambda: grp(2, 0),
+            get_moe_ep_group=lambda: grp(4, 3),
+            get_moe_dp_group=lambda: grp(1, 0),
+            get_moe_tp_group=lambda: grp(2, 1),
+            get_attn_tp_group=lambda: grp(2, 1),
+            get_attn_cp_group=lambda: grp(1, 0),
         ):
             with mock.patch.multiple(
                 dpa,

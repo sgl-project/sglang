@@ -80,29 +80,23 @@ def build_parallel_context(model_runner) -> ParallelContext:
     """Snapshot the resolved parallel topology — call ONCE, AFTER
     ``init_torch_distributed`` (groups + dp-attention all resolved by then).
 
-    Sizes/ranks for grouped dimensions are read from the process GROUPS (the same
-    source the legacy getters use, so the values are byte-equivalent); the attention
-    dims come from the ``dp_attention`` getters; the engine ``dp_size`` (folded, no
-    process group of its own) is read off the resolved ``model_runner``. Deferred
-    imports avoid an import cycle (``parallel_state`` / ``dp_attention`` import early).
-    """
+    Sizes/ranks for grouped dimensions are read from the process GROUPS directly
+    (``get_X_group().world_size`` / ``.rank_in_group`` — exactly what the legacy
+    getters returned, so the values are byte-equivalent); reading the groups rather
+    than the (now context-backed) size getters keeps the snapshot robust under
+    multi-runner re-publish. The attention ``dp`` dim comes from the ``dp_attention``
+    getters; the engine ``dp_size`` (folded, no process group of its own) is read off
+    the resolved ``model_runner``. Deferred imports avoid an import cycle
+    (``parallel_state`` / ``dp_attention`` import early)."""
     from sglang.srt.distributed.parallel_state import (
-        get_attn_context_model_parallel_rank,
-        get_attn_context_model_parallel_world_size,
-        get_attn_tensor_model_parallel_rank,
-        get_attn_tensor_model_parallel_world_size,
-        get_moe_data_parallel_rank,
-        get_moe_data_parallel_world_size,
-        get_moe_expert_parallel_rank,
-        get_moe_expert_parallel_world_size,
-        get_moe_tensor_parallel_rank,
-        get_moe_tensor_parallel_world_size,
-        get_pipeline_model_parallel_rank,
-        get_pipeline_model_parallel_world_size,
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-        get_world_rank,
-        get_world_size,
+        get_attn_cp_group,
+        get_attn_tp_group,
+        get_moe_dp_group,
+        get_moe_ep_group,
+        get_moe_tp_group,
+        get_pp_group,
+        get_tp_group,
+        get_world_group,
     )
     from sglang.srt.layers.dp_attention import (
         get_attention_dp_rank,
@@ -110,25 +104,28 @@ def build_parallel_context(model_runner) -> ParallelContext:
     )
 
     mr = model_runner
+    world, tp, pp = get_world_group(), get_tp_group(), get_pp_group()
+    moe_ep, moe_dp, moe_tp = get_moe_ep_group(), get_moe_dp_group(), get_moe_tp_group()
+    attn_tp, attn_cp = get_attn_tp_group(), get_attn_cp_group()
     return ParallelContext(
-        world_size=get_world_size(),
-        world_rank=get_world_rank(),
-        tp_size=get_tensor_model_parallel_world_size(),
-        tp_rank=get_tensor_model_parallel_rank(),
-        pp_size=get_pipeline_model_parallel_world_size(),
-        pp_rank=get_pipeline_model_parallel_rank(),
+        world_size=world.world_size,
+        world_rank=world.rank_in_group,
+        tp_size=tp.world_size,
+        tp_rank=tp.rank_in_group,
+        pp_size=pp.world_size,
+        pp_rank=pp.rank_in_group,
         dp_size=mr.dp_size,
         dp_rank=mr.dp_rank,
-        moe_ep_size=get_moe_expert_parallel_world_size(),
-        moe_ep_rank=get_moe_expert_parallel_rank(),
-        moe_dp_size=get_moe_data_parallel_world_size(),
-        moe_dp_rank=get_moe_data_parallel_rank(),
-        moe_tp_size=get_moe_tensor_parallel_world_size(),
-        moe_tp_rank=get_moe_tensor_parallel_rank(),
-        attn_tp_size=get_attn_tensor_model_parallel_world_size(),
-        attn_tp_rank=get_attn_tensor_model_parallel_rank(),
-        attn_cp_size=get_attn_context_model_parallel_world_size(),
-        attn_cp_rank=get_attn_context_model_parallel_rank(),
+        moe_ep_size=moe_ep.world_size,
+        moe_ep_rank=moe_ep.rank_in_group,
+        moe_dp_size=moe_dp.world_size,
+        moe_dp_rank=moe_dp.rank_in_group,
+        moe_tp_size=moe_tp.world_size,
+        moe_tp_rank=moe_tp.rank_in_group,
+        attn_tp_size=attn_tp.world_size,
+        attn_tp_rank=attn_tp.rank_in_group,
+        attn_cp_size=attn_cp.world_size,
+        attn_cp_rank=attn_cp.rank_in_group,
         attn_dp_size=get_attention_dp_size(),
         attn_dp_rank=get_attention_dp_rank(),
     )

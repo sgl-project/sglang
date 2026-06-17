@@ -568,6 +568,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
 
+        # Snapshot + publish the parallel topology now that distributed init has
+        # resolved every group + the dp-attention dims (Global Context). The
+        # parallel_state size/rank getters read this snapshot from here on.
+        from sglang.srt.runtime_context import (
+            RuntimeContext,
+            build_parallel_context,
+            set_context,
+        )
+
+        set_context(RuntimeContext(parallel=build_parallel_context(self)))
+
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
