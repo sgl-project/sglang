@@ -98,7 +98,11 @@ __global__ void plan_entries_persistent_kernel(
           static_cast<long long>(total_verify),
           static_cast<long long>(params.verify_capacity));
     }
+#ifndef USE_ROCM
     __trap();
+#else
+    __builtin_trap();  // HIP/clang device-side trap; __trap() is CUDA-only.
+#endif
   }
 
   const int64_t tid_start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
