@@ -590,6 +590,7 @@ Optimization columns are abbreviated to keep the matrix readable:
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
+   - Deprecated compatibility: `snapshot` is accepted as an alias for `original`.
 5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
    `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from

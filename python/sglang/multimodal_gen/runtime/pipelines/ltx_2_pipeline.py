@@ -46,7 +46,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LTX2TextConnectorStage,
     LTX2UpsampleStage,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
+    ServerArgs,
+    _normalize_ltx2_two_stage_device_mode,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -453,11 +457,17 @@ class LTX2TwoStageResidencyController:
         mode = server_args.ltx2_two_stage_device_mode
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
-            mode = env_mode.lower() if env_mode else "original"
+            mode = (
+                _normalize_ltx2_two_stage_device_mode(env_mode)
+                if env_mode
+                else "original"
+            )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
         if mode not in cls.VALID_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
-                f"Expected one of {cls.VALID_MODES}."
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
         return mode
 

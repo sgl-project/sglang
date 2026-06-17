@@ -67,6 +67,7 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -77,6 +78,13 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     mode = mode.lower()
+    if mode == "snapshot":
+        logger.warning(
+            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
+            "as original. Please use ltx2_two_stage_device_mode=original or "
+            "resident instead."
+        )
+        return "original"
     return mode
 
 
@@ -497,7 +505,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
-                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
 
         self.ltx2_two_stage_device_mode = mode
@@ -1404,12 +1412,13 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
             type=str,
-            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
+                "'snapshot' is deprecated and treated as 'original'. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )

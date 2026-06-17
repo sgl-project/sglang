@@ -64,6 +64,8 @@ For two-stage pipelines, `--ltx2-two-stage-device-mode` controls transformer res
 | `resident` | Best latency on high-VRAM GPUs because both DiTs can stay resident. |
 | `original` | Closest to the original two-stage switching semantics. |
 
+`snapshot` is kept only as a deprecated compatibility alias for `original`; use `original` or `resident` in new configs.
+
 Other deployment flags:
 
 - `--lora-path`: Preload a community LoRA adapter.
