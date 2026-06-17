@@ -106,6 +106,12 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    assert_lplb_supported_model,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
@@ -191,7 +197,10 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    create_dummy_verify_input,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -229,6 +238,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, next_power_of_2, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -449,41 +459,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
+        self.eagle_draft_num_layers = None
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            # load draft config
-            draft_model_config = ModelConfig.from_server_args(
+        if (
+            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
+            and not self.is_draft_worker
+            and server_args.speculative_draft_model_path
+        ):
+            # Load draft config to get layer count for KV cache sizing
+            draft_model_config = self._build_model_config(
                 server_args,
-                model_path=(server_args.speculative_draft_model_path),
+                model_path=server_args.speculative_draft_model_path,
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
-            self.eagle_use_aux_hidden_state = True
+            num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+            if num_nextn_predict_layers is not None:
+                self.eagle_draft_num_layers = int(num_nextn_predict_layers)
+            else:
+                self.eagle_draft_num_layers = int(
+                    max(
+                        draft_model_config.num_hidden_layers,
+                        draft_model_config.num_attention_layers,
+                    )
+                )
 
-            try:
-                # get the aux layer from draft model config
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                self.eagle_use_aux_hidden_state = eagle_config.get(
-                    "use_aux_hidden_state", True
-                )
-                self.eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                self.eagle_aux_hidden_state_layer_ids = None
+            if self.spec_algorithm.is_eagle3():
+                self.eagle_use_aux_hidden_state = True
+                try:
+                    eagle_config = getattr(
+                        draft_model_config.hf_config, "eagle_config", None
+                    )
+                    self.eagle_use_aux_hidden_state = eagle_config.get(
+                        "use_aux_hidden_state", True
+                    )
+                    self.eagle_aux_hidden_state_layer_ids = eagle_config[
+                        "eagle_aux_hidden_state_layer_ids"
+                    ]
+                except:
+                    # if there is no aux layer, set to None
+                    self.eagle_aux_hidden_state_layer_ids = None
 
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                parse_dflash_draft_config,
-            )
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building DFlash context features.
-            draft_model_config = ModelConfig.from_server_args(
+            draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -541,8 +564,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
-        # Get available memory before model loading
-        pre_model_load_memory = self.init_torch_distributed()
+        # Get available memory before model loading.
+        # Stored for later use by alloc_memory_pool().
+        self.pre_model_load_memory = self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -570,8 +594,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self._linear_attn_registry_cache: Any = _UNSET
 
-        # Initialize the model runner
-        self.initialize(pre_model_load_memory)
+        # Load model weights and configure
+        self.initialize()
         self.check_quantized_moe_compatibility()
 
         if (
@@ -603,6 +627,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
+    def _build_model_config(
+        self, server_args, model_path=None, model_revision=None, is_draft_model=False
+    ):
+        return ModelConfig.from_server_args(
+            server_args,
+            model_path=model_path,
+            model_revision=model_revision,
+            is_draft_model=is_draft_model,
+        )
+
     def init_msprobe(self):
         # Init the msprobe
         try:
@@ -632,7 +666,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def initialize(self, pre_model_load_memory: float):
+    def initialize(self):
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -662,6 +696,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+            self._init_lplb_solvers()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -783,14 +820,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+        # Snapshot free memory at the end of the weight-load phase. KV-pool
+        # profiling uses this instead of measuring at alloc_memory_pool()
+        # time: draft-model weights load between the two phases and must stay
+        # outside the --mem-fraction-static budget (deployments tune the
+        # fraction assuming draft weights live in the non-static slack).
+        self.post_model_load_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+    def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
+        """Allocate KV cache memory pools only (no backends or cuda graphs)."""
+        if memory_pool_config is not None:
+            self.memory_pool_config = memory_pool_config
+
+        self.init_memory_pool(self.pre_model_load_memory)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
-        # canary to monkey-patch, and BEFORE init_device_graphs so warmup
+        # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
         self.canary_manager = install_canary(
-            server_args=server_args,
+            server_args=self.server_args,
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
@@ -798,10 +851,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
-        # Init routed experts capturer
-        self.init_routed_experts_capturer()
+        if self.enable_hisparse:
+            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            hisparse_top_k = getattr(
+                self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+            )
+            self.hisparse_coordinator = HiSparseCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                top_k=hisparse_top_k,
+                device_buffer_size=hisparse_cfg.device_buffer_size,
+                device=self.device,
+                tp_group=(
+                    self.attention_tp_group.cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_group.cpu_group
+                ),
+                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            )
+
+        self.init_routed_experts_capturer()
         self.init_indexer_capturer()
+
+        self.attn_backend = None
+        self.decode_attn_backend = None
+        self.decode_attn_backend_group = []
+        self.decode_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+        self.prefill_cuda_graph_runner = None
+
+    def init_backends(self, disable_cuda_graph: bool = False):
+        """Initialize attention backends and capture cuda graphs."""
+        server_args = self.server_args
 
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
@@ -810,34 +894,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
-            if self.enable_hisparse:
-                from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                hisparse_cfg = parse_hisparse_config(self.server_args)
-                hisparse_top_k = getattr(
-                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-                )
-                self.hisparse_coordinator = HiSparseCoordinator(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    top_k=hisparse_top_k,
-                    device_buffer_size=hisparse_cfg.device_buffer_size,
-                    device=self.device,
-                    tp_group=(
-                        self.attention_tp_group.cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_group.cpu_group
-                    ),
-                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-                )
             self.init_attention_backend()
             self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_decode_cuda_graph()
+            if not disable_cuda_graph:
+                self.init_decode_cuda_graph()
         elif self.device == "cpu":
             self.init_attention_backend()
-            self.init_decode_cuda_graph()
+            if not disable_cuda_graph:
+                self.init_decode_cuda_graph()
         elif self.device == "npu":
             self.init_attention_backend()
             # lazy init for zbal with mix mode (before graph capture when enable_cuda_graph)
@@ -851,10 +916,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-            self.init_decode_cuda_graph()
+            if not disable_cuda_graph:
+                self.init_decode_cuda_graph()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
-            if current_platform.support_cuda_graph():
+            if current_platform.support_cuda_graph() and not disable_cuda_graph:
                 self.init_decode_cuda_graph()
             else:
                 self.decode_cuda_graph_runner = None
@@ -864,10 +930,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
+        if disable_cuda_graph:
+            self.decode_cuda_graph_runner = None
+            self.graph_mem_usage = 0
+
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # Initialize piecewise CUDA graph
         self.init_prefill_cuda_graph()
 
         self.prealloc_symmetric_memory_pool()
@@ -1552,6 +1621,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
             )
 
+    def _init_lplb_solvers(self):
+        """Initialize per-layer LPLB solvers from current expert location metadata."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+        # don't participate in the EP all-reduce (would deadlock under DP-
+        # attention). Failure here happens before any forward pass.
+        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        if architectures:
+            assert_lplb_supported_model(architectures[0])
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        clear_global_lplb_solvers()
+        ep_group = get_moe_ep_group()
+        for lid in range(metadata.num_layers):
+            solver = LPLBSolver(
+                phy2log=metadata.physical_to_logical_map[lid],
+                log2phy=metadata.logical_to_all_physical_map[lid],
+                num_gpus=metadata.ep_size,
+                ep_group=ep_group,
+                logical_to_all_physical_map_num_valid=(
+                    metadata.logical_to_all_physical_map_num_valid[lid]
+                ),
+            )
+            set_global_lplb_solver(lid, solver)
+        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
@@ -1593,6 +1691,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+        # Re-init LPLB solvers after expert location update
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            self._init_lplb_solvers()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
@@ -2403,13 +2505,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if self.server_args.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            pre_initialize_workspaces,
-        )
+        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
@@ -2458,7 +2558,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
         )
 
-        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
+        from sglang.srt.utils import is_sm100_supported
+
+        model_uses_modelopt_fp8 = self.model_config.quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_mixed",
+        )
+        fp8_gemm_needs_autotune = (
+            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
+            or (model_uses_modelopt_fp8 and is_sm100_supported())
+        )
+
+        if not (
+            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
+        ):
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2683,62 +2800,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
-        def get_spec_info():
-            spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-                from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-                if self.is_draft_worker:
-                    raise RuntimeError("This should not happen.")
-                else:
-                    spec_info = EagleVerifyInput(
-                        draft_token=None,
-                        custom_mask=buffers.custom_mask,
-                        positions=None,
-                        retrieve_index=None,
-                        retrieve_next_token=None,
-                        retrieve_next_sibling=None,
-                        retrieve_cum_len=None,
-                        spec_steps=self.server_args.speculative_num_steps,
-                        topk=self.server_args.speculative_eagle_topk,
-                        draft_token_num=self.server_args.speculative_num_draft_tokens,
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        seq_lens_sum=None,
-                        seq_lens_cpu=None,
-                    )
-            elif self.spec_algorithm.is_dflash():
-                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-
-                # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
-                spec_info = DFlashVerifyInput(
-                    draft_token=None,
-                    positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
-                    custom_mask=None,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.NULL
-                        if self.is_draft_worker
-                        else CaptureHiddenMode.FULL
-                    ),
-                )
-
-            elif self.spec_algorithm.is_ngram():
-                from sglang.srt.speculative.ngram_info import NgramVerifyInput
-
-                spec_info = NgramVerifyInput(
-                    draft_token=None,
-                    custom_mask=buffers.custom_mask,
-                    positions=None,
-                    retrieve_index=None,
-                    retrieve_next_token=None,
-                    retrieve_next_sibling=None,
-                    draft_token_num=num_tokens_per_bs,
-                )
-                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
-            return spec_info
-
-        spec_info = get_spec_info()
+        spec_info = create_dummy_verify_input(
+            self.spec_algorithm,
+            self.server_args,
+            buffers.custom_mask,
+            num_tokens_per_bs,
+            self.is_draft_worker,
+        )
+        if spec_info is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+        ):
+            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+            # during forward; provide a dummy so warmup doesn't crash.
+            spec_info.hidden_states = torch.zeros(
+                (num_tokens, self.model_config.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
         if capture_hidden_mode != CaptureHiddenMode.FULL:
             capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -3433,11 +3511,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = (
-            torch.profiler.record_function(_build_step_span_name(forward_batch))
-            if torch.autograd._profiler_enabled()
-            else contextlib.nullcontext()
-        )
+        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(

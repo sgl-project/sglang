@@ -329,8 +329,9 @@ class MockMamba2ModelRunner(ModelRunner):
         # `intermediate_ssm` / `intermediate_conv_window` buffers when
         # `speculative_num_draft_tokens is not None`, so auto-derive the
         # count from `case.extend_lens` for the speculative modes.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = (
                 max(case.extend_lens) if case.extend_lens else 1
@@ -566,7 +567,7 @@ class ProjectedMamba2Attention(nn.Module):
         # state support. The dense-extend path leaves it False.
         use_triton_causal_conv = (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
         self.backend.forward(
             self.mixer,
