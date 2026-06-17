@@ -861,11 +861,11 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Pre-dequantize MoE weights and orient for NPU grouped matmul (E, N, K)."""
+        """Pre-dequantize MoE weights and orient as (E, K, N) for NPU grouped matmul."""
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
     
-        # ----- w13: keep as (E, 2*intermediate, hidden) – already (E, N, K) -----
+        # ----- w13: transpose to (hidden, 2*intermediate) -----
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
     
@@ -883,24 +883,23 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)                # (2*intermediate, hidden) – (N, K)
+                    .reshape(rows, cols)                # (2*intermediate, hidden)
+                    .transpose(-1, -2)                  # -> (hidden, 2*intermediate)
                     .contiguous()
                 )
                 w13_dequant_list.append(dequant)
     
-            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, N, K) – correct
+            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, hidden, 2*intermediate)
             w13_full = npu_format_cast(w13_full)
             layer.register_buffer("w13_dequant", w13_full, persistent=False)
         else:
-            # Already FP, keep shape (E, N, K)
             w13_data = w13_qweight.data
-            if w13_data.dim() == 3 and w13_data.shape[-1] != w13_data.shape[-2]:
-                # Ensure it's (E, N, K) – no transpose
-                pass
+            if w13_data.dim() == 3:
+                w13_data = w13_data.transpose(-1, -2).contiguous()  # ensure (E, hidden, 2*intermediate)
             w13_data = npu_format_cast(w13_data)
             layer.register_buffer("w13_dequant", w13_data, persistent=False)
     
-        # ----- w2: transpose to (E, hidden, intermediate) – (E, N, K) -----
+        # ----- w2: keep as (intermediate, hidden) – no transpose -----
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
     
@@ -918,28 +917,25 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)                # (intermediate, hidden) – (K, N)
-                    .transpose(-1, -2)                  # -> (hidden, intermediate) – (N, K)
+                    .reshape(rows, cols)                # (intermediate, hidden) – already (K, N)
                     .contiguous()
                 )
                 w2_dequant_list.append(dequant)
     
-            w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, N, K) – correct
+            w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, intermediate, hidden)
             w2_full = npu_format_cast(w2_full)
             layer.register_buffer("w2_dequant", w2_full, persistent=False)
         else:
-            # Already FP, need to transpose to (E, hidden, intermediate)
             w2_data = w2_qweight.data
-            if w2_data.dim() == 3:
-                w2_data = w2_data.transpose(-1, -2).contiguous()  # (E, N, K)
+            # Ensure shape is (E, intermediate, hidden) – no transpose needed
             w2_data = npu_format_cast(w2_data)
             layer.register_buffer("w2_dequant", w2_data, persistent=False)
     
-        # Clean up original quantized parameters
+        # Cleanup
         for attr in ("w13_qweight", "w2_qweight", "w13_qweight_type", "w2_qweight_type"):
             if hasattr(layer, attr):
                 delattr(layer, attr)
-
+                
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
