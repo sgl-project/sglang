@@ -238,14 +238,17 @@ uninstall_stale_flashinfer() {
 }
 
 install_pytorch_stack() {
-    # TEMP: use the PyTorch test index for PR CI until torch 2.12.1 CUDA
-    # wheels are available on the normal PyTorch index.
+    PYTORCH_SPECS=()
+    for package in torch torchaudio torchvision torchao torchcodec; do
+        spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
+        if [ -n "$spec" ]; then
+            PYTORCH_SPECS+=("$spec")
+        fi
+    done
+
     $PIP_CMD install \
-        "torch==2.12.1" \
-        "torchaudio==2.11.0" \
-        "torchvision==0.27.1" \
-        --extra-index-url "https://download.pytorch.org/whl/test/${CU_VERSION}" \
-        $PIP_INSTALL_SUFFIX
+        "${PYTORCH_SPECS[@]}" \
+        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
 
     mark_step_done "${FUNCNAME[0]}"
 }

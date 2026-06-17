@@ -16,9 +16,7 @@ ARG CMAKE_VERSION_MINOR=1
 ARG USE_CCACHE=1
 ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
-# TEMP: use the PyTorch test index for PR CI until torch 2.12.1 CUDA
-# wheels are available on the normal PyTorch index.
-ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl/test
+ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 # Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
 # Pass scheme + host (and optional path prefix), e.g.
