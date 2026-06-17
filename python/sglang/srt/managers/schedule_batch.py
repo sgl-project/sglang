@@ -2595,17 +2595,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # real token is relayed via future_map and resolved at forward
             # entry. So take the last output token from Req directly
             # (origin_input_ids[-1] on the first decode, before any output).
-            latest_output_ids = torch.tensor(
-                [
-                    (
-                        req.output_ids[-1]
-                        if len(req.output_ids)
-                        else req.origin_input_ids[-1]
-                    )
-                    for req in self.reqs
-                ],
-                dtype=torch.int64,
-                device=self.device,
+            last_tokens = [
+                req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+                for req in self.reqs
+            ]
+            # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
+            latest_output_ids = torch.tensor(last_tokens, dtype=torch.int64).to(
+                self.device, non_blocking=True
             )
             self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 latest_output_ids

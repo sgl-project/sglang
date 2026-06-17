@@ -62,6 +62,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return 4, 4
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return 2, 2
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -419,16 +436,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        state_dtype_size = 4
-        c4_state_bytes = 2 * 2 * attn_head_dim * state_dtype_size
+        c4_state_dtype_size, c128_state_dtype_size = (
+            _get_dsv4_compress_state_dtype_sizes()
+        )
+        c4_state_bytes = 2 * 2 * attn_head_dim * c4_state_dtype_size
         # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
         # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
         # nets a large reduction (~3/256x) but the per-slot bytes go up.
         c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
         c128_state_bytes = (
-            (3 if c128_online else 2 * 1) * attn_head_dim * state_dtype_size
+            (3 if c128_online else 2 * 1) * attn_head_dim * c128_state_dtype_size
         )
-        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * state_dtype_size
+        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         c128_state_ratio = self.c128_ring_size / self.swa_page_size
