@@ -436,7 +436,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def test_bcg_runner_rejects_too_many_segments(self):
         runner = object.__new__(DiffusionBreakableCudaGraphRunner)
         runner.max_segments = 2
-        runner.max_reserved_bytes = 0
         entry = _CaptureEntry(
             graph=SimpleNamespace(_break_fns=[], _segments=[object()] * 3),
             static_kwargs={},
@@ -469,12 +468,9 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(entry.output)
         self.assertEqual(runner._disabled_reason, "too much memory")
 
-    def test_bcg_runner_rejects_reserved_memory_growth(self):
+    def test_bcg_runner_allows_reserved_memory_growth(self):
         runner = object.__new__(DiffusionBreakableCudaGraphRunner)
         runner.max_segments = 0
-        runner.max_reserved_bytes = 1024
-        runner._reserved_baseline_bytes = 0
-        runner._memory_reserved = lambda: 2048
         entry = _CaptureEntry(
             graph=SimpleNamespace(_break_fns=[], _segments=[object()]),
             static_kwargs={},
@@ -483,7 +479,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             num_segments=1,
         )
 
-        self.assertIn("reserved graph memory grew", runner._capture_limit_reason(entry))
+        self.assertIsNone(runner._capture_limit_reason(entry))
 
 
 if __name__ == "__main__":
