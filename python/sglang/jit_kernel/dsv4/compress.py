@@ -156,6 +156,7 @@ class CompressorDecodePlan(NamedTuple):
         req_to_token: torch.Tensor,
         full_to_swa: torch.Tensor,
         swa_page_size: int,
+        state_slot_offset: int = 0,
     ) -> CompressorDecodePlan:
         batch_size = int(seq_lens.shape[0])
         module = _jit_compress_128_online_module(512)
@@ -165,7 +166,13 @@ class CompressorDecodePlan(NamedTuple):
             device=req_pool_indices.device,
         )
         module.plan_decode(
-            seq_lens, req_pool_indices, req_to_token, full_to_swa, plan_d, swa_page_size
+            seq_lens,
+            req_pool_indices,
+            req_to_token,
+            full_to_swa,
+            plan_d,
+            swa_page_size,
+            int(state_slot_offset),
         )
         return CompressorDecodePlan(128, plan_d)
 
@@ -267,9 +274,11 @@ class CompressorPrefillPlan(NamedTuple):
         full_to_swa: torch.Tensor,
         num_q_tokens: int,
         swa_page_size: int,
+        use_cuda_graph: bool = False,
+        state_slot_offset: int = 0,
     ) -> CompressorPrefillPlan:
-        seq_lens_cpu = seq_lens.to(torch.int64)
-        extend_lens_cpu = extend_lens.to(torch.int64)
+        seq_lens_cpu = seq_lens.detach().to(torch.int64).cpu()
+        extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
         r2t_i32 = req_to_token.to(torch.int32)
         f2s_i64 = full_to_swa.to(torch.int64)
@@ -292,6 +301,8 @@ class CompressorPrefillPlan(NamedTuple):
             plan_c_dev,
             plan_w_dev,
             int(swa_page_size),
+            int(state_slot_offset),
+            bool(use_cuda_graph),
         )
         return CompressorPrefillPlan(
             128,
