@@ -123,23 +123,29 @@ class SchedulerUpdateWeightsMixin:
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
         self._quiesce_for_weight_update()
-        runners = [runner for _, runner in self.get_model_runners(recv_req.selector)]
-        # The target runner owns the distributed update group: it receives the
-        # broadcast once and loads the weights into every selected runner.
-        success, message = (
-            self.tp_worker.model_runner.update_weights_from_distributed_to_model_runners(
-                runners,
+        # The target (main) model owns this process's connection to the training
+        # engine, so it receives the broadcast once; the received weights are then
+        # loaded into each selected runner locally.
+        try:
+            weights = self.tp_worker.model_runner.receive_weights_from_distributed(
                 recv_req.names,
                 recv_req.dtypes,
                 recv_req.shapes,
                 recv_req.group_name,
                 recv_req.load_format,
             )
-        )
+            for _, runner in self.get_model_runners(recv_req.selector):
+                runner.load_weights(weights)
+            success, message = True, "Succeeded to update parameter online."
+        except Exception as e:
+            success = False
+            message = (
+                f"Failed to update parameter online: {e}. The full weights of the "
+                "ModelRunner are partially updated. Please discard the whole weights."
+            )
+            logger.error(message)
         if success:
             self.flush_cache_after_weight_update(recv_req)
-        else:
-            logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 

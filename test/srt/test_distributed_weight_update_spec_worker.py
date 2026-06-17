@@ -5,7 +5,6 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class _TestScheduler(SchedulerUpdateWeightsMixin):
@@ -33,16 +32,14 @@ def _scheduler(tp_worker, draft_worker):
     return scheduler
 
 
-def test_scheduler_distributed_update_fans_out_to_target_and_draft():
-    # Default selector ("both"): the scheduler resolves the runner list via
-    # get_model_runners; the target runner owns the update group, receives the
-    # broadcast once, and loads it into both the target and the draft runner.
+def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
+    # Default selector ("both"): only the target (main model) owns the update group,
+    # so it receives the broadcast once; that single weights object is then loaded
+    # into every selected runner — receive once on the target, load into each.
+    weights = object()
     target_runner = Mock()
-    target_runner.update_weights_from_distributed_to_model_runners.return_value = (
-        True,
-        "updated",
-    )
-    draft_runner = object()
+    target_runner.receive_weights_from_distributed.return_value = weights
+    draft_runner = Mock()
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
         draft_worker=SimpleNamespace(
@@ -58,25 +55,25 @@ def test_scheduler_distributed_update_fans_out_to_target_and_draft():
         )
 
     assert output.success is True
-    target_runner.update_weights_from_distributed_to_model_runners.assert_called_once_with(
-        [target_runner, draft_runner],
+    target_runner.receive_weights_from_distributed.assert_called_once_with(
         ["model.layers.0.weight"],
         ["float32"],
         [[1]],
         "weight_update_group",
         None,
     )
+    # The single received weights object is loaded into every selected runner.
+    target_runner.load_weights.assert_called_once_with(weights)
+    draft_runner.load_weights.assert_called_once_with(weights)
     assert barrier.call_count == 2
 
 
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
-    # selector="target" resolves to the target runner alone; the draft worker is
-    # never enumerated.
+    # selector="target": the target still receives once, but the draft worker is
+    # never enumerated and no draft runner is loaded.
+    weights = object()
     target_runner = Mock()
-    target_runner.update_weights_from_distributed_to_model_runners.return_value = (
-        True,
-        "updated",
-    )
+    target_runner.receive_weights_from_distributed.return_value = weights
     draft_worker = Mock()
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
@@ -91,37 +88,6 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
         )
 
     assert output.success is True
-    target_runner.update_weights_from_distributed_to_model_runners.assert_called_once_with(
-        [target_runner],
-        ["model.layers.0.weight"],
-        ["float32"],
-        [[1]],
-        "weight_update_group",
-        None,
-    )
+    target_runner.receive_weights_from_distributed.assert_called_once()
+    target_runner.load_weights.assert_called_once_with(weights)
     draft_worker.iter_draft_runners.assert_not_called()
-
-
-def test_model_runner_loads_one_distributed_receive_into_multiple_runners():
-    weights = [("model.layers.0.weight", object())]
-    source_runner = SimpleNamespace(
-        _model_update_group={"weight_update_group": object()},
-        _receive_weights_from_distributed=Mock(return_value=weights),
-    )
-    draft_runner = SimpleNamespace(model=Mock())
-    target_runner = SimpleNamespace(model=Mock())
-
-    success, message = ModelRunner.update_weights_from_distributed_to_model_runners(
-        source_runner,
-        [draft_runner, target_runner],
-        ["model.layers.0.weight"],
-        ["float32"],
-        [[1]],
-        "weight_update_group",
-    )
-
-    assert success is True
-    assert message == "Succeeded to update parameter online."
-    source_runner._receive_weights_from_distributed.assert_called_once()
-    draft_runner.model.load_weights.assert_called_once_with(weights)
-    target_runner.model.load_weights.assert_called_once_with(weights)
