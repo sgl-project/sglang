@@ -22,11 +22,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
-# Cached once at import. PCG/BCG only ever run on CUDA (piecewise is disabled on
-# non-CUDA hardware and breakable rejects HIP), so being in a graph already
-# implies CUDA; this is a cheap defensive guard.
-_is_cuda = is_cuda()
-
 
 @lru_cache(maxsize=1)
 def aiter_can_use_preshuffle_paged_mqa() -> bool:
@@ -100,7 +95,7 @@ def is_dsa_prefill_cp_round_robin_split():
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        _is_cuda
+        is_cuda()
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
