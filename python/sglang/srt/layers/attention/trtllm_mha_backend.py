@@ -483,7 +483,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        # Page table is built on-device (_fill_page_table_device), no host max.
+        # The device-side build (_fill_page_table_device) sizes to the static
+        # max_num_pages and bounds the actual writes by cache_seqlens, so no
+        # runtime host max is needed.
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
