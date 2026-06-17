@@ -816,6 +816,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+        self.assertEqual(ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1),))
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
@@ -1194,6 +1195,54 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
+
+    def test_ltx23_auto_four_gpu_uses_full_sequence_parallel(self):
+        with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True):
+            args = self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                kwargs={
+                    "model_path": "Lightricks/LTX-2.3",
+                    "num_gpus": 4,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertEqual(args.cfg_parallel_degree, 1)
+        self.assertEqual(args.sp_degree, 4)
+        self.assertEqual(args.ulysses_degree, 4)
+
+    def test_ltx23_auto_eight_gpu_keeps_cfg_plus_sequence_parallel(self):
+        with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True):
+            args = self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                kwargs={
+                    "model_path": "Lightricks/LTX-2.3",
+                    "num_gpus": 8,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertEqual(args.cfg_parallel_degree, 2)
+        self.assertEqual(args.sp_degree, 4)
+        self.assertEqual(args.ulysses_degree, 4)
+
+    def test_ltx23_auto_four_gpu_preserves_explicit_cfg_parallel_degree(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 4,
+                "performance_mode": "auto",
+                "cfg_parallel_degree": 2,
+            },
+        )
+
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertEqual(args.cfg_parallel_degree, 2)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
 
     def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
