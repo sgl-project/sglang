@@ -1182,7 +1182,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             self.embeddings_buffer = None
             self._buffer_from_pool = False
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self._cleanup_gpu_buffer()
         self.recv_socket.close()

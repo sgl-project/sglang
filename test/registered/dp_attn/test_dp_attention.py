@@ -64,6 +64,45 @@ class TestDPAttentionDP2TP2(
         cls._env_override.__exit__(None, None, None)
 
 
+class TestDPAttentionGatherv(
+    CustomTestCase,
+    GSM8KMixin,
+):
+    """Exercise the variable-length all_gatherv + reduce_scatterv DP-MoE path
+    (SGLANG_DP_USE_GATHERV=1). The path only activates for the
+    attn_tp_size == 1, tp_size == dp_size layout, which tp2 + dp2 satisfies.
+    Without this test the gatherv/reduce_scatterv code is never exercised by CI
+    (it is gated behind the env var, default off). gsm8k must stay correct since
+    the change is a pure communication reorg, not a numerics change."""
+
+    gsm8k_accuracy_thres = 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={"SGLANG_DP_USE_GATHERV": "1"},
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--chunked-prefill-size",
+                "256",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
