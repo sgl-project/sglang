@@ -110,7 +110,10 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
-from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.models.deepseek_common.utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    compute_dsv4_index_topk_flags,
+)
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.models.triton_ops.deepseek_v4 import (
     rms_normalize_triton as rms_normalize_triton,
@@ -382,53 +385,14 @@ class MQALayer(nn.Module):
                     alt_streams=self.alt_streams_indexer,
                     rotary_emb=getattr(self, "rotary_emb", None),
                 )
-                c4_layer_ids = [
-                    idx
-                    for idx, ratio in enumerate(config.compress_ratios)
-                    if ratio == 4
-                ]
-                c4_layer_rank = c4_layer_ids.index(layer_id)
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                if self.index_topk_pattern is None:
-                    assert self.index_topk_freq > 0
-                    self.skip_topk = c4_layer_rank % self.index_topk_freq != 0
-                    self.next_skip_topk = (
-                        c4_layer_rank + 1 < len(c4_layer_ids)
-                        and (c4_layer_rank + 1) % self.index_topk_freq != 0
-                    )
-                else:
-                    if isinstance(self.index_topk_pattern, str):
-                        self.index_topk_pattern = list(self.index_topk_pattern)
-                    invalid_pattern_values = set(self.index_topk_pattern) - {"F", "S"}
-                    if invalid_pattern_values:
-                        raise ValueError(
-                            "index_topk_pattern only supports 'F' for full indexer "
-                            f"layers and 'S' for shared layers, got "
-                            f"{sorted(invalid_pattern_values)}"
-                        )
-                    if len(self.index_topk_pattern) == len(config.compress_ratios):
-                        pattern_idx = layer_id
-                        has_next_pattern = layer_id < len(self.index_topk_pattern) - 1
-                        next_pattern_idx = layer_id + 1
-                    elif len(self.index_topk_pattern) == len(c4_layer_ids):
-                        pattern_idx = c4_layer_rank
-                        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
-                        next_pattern_idx = c4_layer_rank + 1
-                    else:
-                        raise ValueError(
-                            "index_topk_pattern length must either match "
-                            f"num_hidden_layers ({len(config.compress_ratios)}) or "
-                            f"the number of C4 layers ({len(c4_layer_ids)}), got "
-                            f"{len(self.index_topk_pattern)}"
-                        )
-                    self.skip_topk = self.index_topk_pattern[pattern_idx] == "S"
-                    if has_next_pattern:
-                        self.next_skip_topk = (
-                            self.index_topk_pattern[next_pattern_idx] == "S"
-                        )
-                    else:
-                        self.next_skip_topk = False
+                self.skip_topk, self.next_skip_topk = compute_dsv4_index_topk_flags(
+                    config.compress_ratios,
+                    layer_id,
+                    self.index_topk_freq,
+                    self.index_topk_pattern,
+                )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
