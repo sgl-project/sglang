@@ -465,7 +465,10 @@ class Phi3SmallForCausalLM(nn.Module):
                 continue
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            if getattr(self.config, "tie_word_embeddings", True) and "lm_head.weight" in name:
+            if (
+                getattr(self.config, "tie_word_embeddings", True)
+                and "lm_head.weight" in name
+            ):
                 continue
 
             param = params_dict[name]

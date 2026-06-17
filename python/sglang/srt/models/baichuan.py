@@ -194,7 +194,9 @@ class BaiChuanAttention(nn.Module):
             alibi_slopes = _get_alibi_slopes(self.total_num_heads)
             alibi_slopes = alibi_slopes[head_start:head_end]
             self.alibi_slopes = torch.tensor(
-                alibi_slopes, dtype=dtype, device="npu" if _is_npu else "xpu" if _is_xpu else "cuda"
+                alibi_slopes,
+                dtype=dtype,
+                device="npu" if _is_npu else "xpu" if _is_xpu else "cuda",
             )
         else:
             self.rotary_emb = get_rope(

@@ -87,9 +87,7 @@ class LightOnOCRForConditionalGeneration(nn.Module):
             config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
         dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
         vision_args = {
-            key: value
-            for key, value in config_dict.items()
-            if key in dataclass_fields
+            key: value for key, value in config_dict.items() if key in dataclass_fields
         }
         # LightOnOCR stores these at the top-level config
         if "image_token_id" not in vision_args:
