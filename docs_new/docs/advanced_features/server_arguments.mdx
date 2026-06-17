@@ -1509,6 +1509,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code>, <code>auto</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-fused-grouped-gemm-combine</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer CuteDSL down-GEMM plus DeepEP low-latency combine fusion for modelopt FP4 MoE on CUDA GPUs. Requires <code>--moe-a2a-backend deepep</code>, <code>--moe-runner-backend flashinfer_cutedsl</code>, <code>--deepep-mode low_latency</code>, <code>--quantization modelopt_fp4</code>, and <code>--deepep-dispatcher-output-dtype auto</code> or <code>nvfp4</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--ep-num-redundant-experts</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocate this number of redundant experts in expert parallel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
