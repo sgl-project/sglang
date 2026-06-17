@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -13,9 +13,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -24,9 +22,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -63,7 +59,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
-    MultiprocessingSerializer,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
@@ -74,12 +69,15 @@ from sglang.srt.utils.common import (
     log_info_on_rank0,
     next_power_of_2,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 logger = logging.getLogger(__name__)
 
@@ -742,6 +740,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_worker.draft_runner)]
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -1246,36 +1247,3 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not success:
             return success, message
         return True, "Succeeded to update model weights."
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        monkey_patch_torch_reductions()
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.tp_rank]
-        )
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
-        )
-        if not success:
-            return success, message
-
-        success, message = self.target_worker.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
-            [
-                self.draft_worker.draft_runner,
-                self.target_worker.model_runner,
-            ],
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )

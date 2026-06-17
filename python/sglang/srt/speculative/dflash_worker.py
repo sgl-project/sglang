@@ -1,12 +1,11 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -31,6 +30,10 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 logger = logging.getLogger(__name__)
 
@@ -344,22 +347,17 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        # Spelled out instead of falling through `__getattr__` so the gap is
-        # visible: this only updates the target. The DFlash draft model
-        # (`self.draft_model_runner`) is NOT refreshed and goes stale after a
-        # distributed weight update.
-        # TODO(dflash): fan out to the draft runner like EAGLEWorker does.
-        return self.target_worker.update_weights_from_distributed(recv_req)
-
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
         pass
+
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # Explicit so DFlash's __getattr__ doesn't delegate this to the target
+        # (whose model_runner is aliased here) and miss the real draft.
+        return [("draft", self.draft_model_runner)]
 
     def _gather_req_to_token_masked(
         self,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import traceback
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, List, Set, Tuple
 
 import torch
 
@@ -37,14 +37,41 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
 
+def _parse_runner_selector(selector: str) -> Set[str]:
+    """Map a {target, draft, both} weight-op selector to the set of roles it covers."""
+    if selector == "both":
+        return {"target", "draft"}
+    if selector in ("target", "draft"):
+        return {selector}
+    raise ValueError(
+        f"invalid selector {selector!r}; expected 'target', 'draft', or 'both'"
+    )
+
+
 class SchedulerUpdateWeightsMixin:
+    def get_model_runners(
+        self: Scheduler, selector: str = "both"
+    ) -> List[Tuple[str, "ModelRunner"]]:
+        """Resolve a {target, draft} selector to (role, ModelRunner) pairs, target first.
+        role is "" for the target runner; draft roles come from iter_draft_runners()."""
+        parsed = _parse_runner_selector(selector)
+        runners: List[Tuple[str, "ModelRunner"]] = []
+        if "target" in parsed:
+            runners.append(("", self.tp_worker.model_runner))
+        if "draft" in parsed and self.draft_worker is not None:
+            runners += self.draft_worker.iter_draft_runners()
+        return runners
+
     def flush_cache_after_weight_update(self: Scheduler, recv_req) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
@@ -91,33 +118,55 @@ class SchedulerUpdateWeightsMixin:
         return DestroyWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
-        self,
+        self: Scheduler,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
-        """Update the online model parameter."""
+        """Update the online model parameter, fanning out to the selected runners."""
         self._quiesce_for_weight_update()
-        if recv_req.disable_draft_model:
-            worker = self.tp_worker
-        else:
-            worker = self.draft_worker or self.tp_worker
-        success, message = worker.update_weights_from_distributed(recv_req)
+        # The target (main) model owns this process's connection to the training
+        # engine, so it receives the broadcast once; the received weights are then
+        # loaded into each selected runner locally.
+        try:
+            weights = self.tp_worker.model_runner.receive_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+                recv_req.load_format,
+            )
+            for _, runner in self.get_model_runners(recv_req.selector):
+                runner.load_weights(weights)
+            success, message = True, "Succeeded to update parameter online."
+        except Exception as e:
+            success = False
+            message = (
+                f"Failed to update parameter online: {e}. The full weights of the "
+                "ModelRunner are partially updated. Please discard the whole weights."
+            )
+            logger.error(message)
         if success:
             self.flush_cache_after_weight_update(recv_req)
-        else:
-            logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
-        """Update the online model parameter from tensors."""
+        """Update the online model parameter from tensors, fanning out to the
+        selected runners."""
         self._quiesce_for_weight_update()
-        if recv_req.disable_draft_model:
-            worker = self.tp_worker
-        else:
-            worker = self.draft_worker or self.tp_worker
-        success, message = worker.update_weights_from_tensor(recv_req)
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        success, message = True, "Success"
+        for _, runner in self.get_model_runners(recv_req.selector):
+            success, message = runner.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
+            if not success:
+                break
         if success:
             self.flush_cache_after_weight_update(recv_req)
         else:
