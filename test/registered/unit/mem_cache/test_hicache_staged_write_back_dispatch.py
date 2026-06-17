@@ -158,6 +158,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             mock.patch(
                 f"{MEMORY_POOL_HOST_MODULE}.transfer_kv_per_layer_mla_pf_lf",
                 side_effect=_cpu_per_layer_pf_lf_copy,
+                create=True,
             ),
         )
 
