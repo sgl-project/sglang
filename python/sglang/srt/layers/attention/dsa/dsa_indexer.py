@@ -1484,9 +1484,10 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             else:
-                # piecewise/breakable CUDA graph need to split graph on
-                # store_k_cache and mqa_logits, so delay store_k_cache after
-                # weights proj.
+                # Graph paths not handled by the full DSA indexer split op
+                # still need q_fp8 for paged topk and q_scale for
+                # logits_head_gate_graph. K-cache storage is handled by the
+                # full graph split path when prefill requires it.
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
