@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
@@ -627,16 +628,6 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     activation_type: int | None = None
 
 
-def _pack_topk_for_flashinfer_routed(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor
-) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
-
-
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
@@ -717,9 +708,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
             assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
+            packed_topk_ids = PackTopkIds.execute(
+                topk_output.topk_ids, topk_output.topk_weights
             )
 
             output = trtllm_fp8_block_scale_routed_moe_wrapper(
@@ -1021,7 +1011,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = PackTopkIds.execute(
             topk_output.topk_ids, topk_output.topk_weights
         )
         result = trtllm_fp4_block_scale_routed_moe(
@@ -1201,9 +1191,8 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
+            packed_topk_ids = PackTopkIds.execute(
+                topk_output.topk_ids, topk_output.topk_weights
             )
             final_hidden_states = trtllm_bf16_routed_moe(
                 topk_ids=packed_topk_ids,

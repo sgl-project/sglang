@@ -631,6 +631,7 @@ class DeepseekV2MoE(nn.Module):
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                layer_id=self.layer_id,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -996,7 +997,9 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             shared_output = None
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -1168,7 +1171,19 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
+            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+                n = self.num_fused_shared_experts
+                topk_output = topk_output._replace(
+                    topk_ids=topk_output.topk_ids.new_empty(
+                        (0, topk_output.topk_ids.shape[-1] + n)
+                    ),
+                    topk_weights=topk_output.topk_weights.new_empty(
+                        (0, topk_output.topk_weights.shape[-1] + n)
+                    ),
+                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1391,7 +1406,9 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+            state.topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
