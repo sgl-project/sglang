@@ -486,10 +486,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
-        # hidden_states is large + contiguous, so keep it on a plain copy_(): that
-        # lowers to a cudaMemcpyAsync DMA (copy engine), whereas folding it into
-        # _foreach_copy_ forces it through the multi_tensor_apply compute kernel
-        # (~3x slower, no copy-engine offload).
+        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
