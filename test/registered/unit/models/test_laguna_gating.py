@@ -110,6 +110,19 @@ class TestLagunaGating(CustomTestCase):
         self.assertFalse(attn.gate_per_head)
         self.assertEqual(attn.g_proj.weight.shape[0], NUM_HEADS * HEAD_DIM)
 
+    def test_disabled_gating(self):
+        """Falsy ``gating`` builds no g_proj (ungated attention)."""
+        for value in (False, None):
+            attn = _make_attention(value)
+            self.assertFalse(attn.gating)
+            self.assertFalse(attn.gate_per_head)
+            self.assertIsNone(attn.g_proj)
+
+    def test_invalid_gating_raises(self):
+        """An unsupported gating value raises ValueError."""
+        with self.assertRaises(ValueError):
+            _make_attention("bogus")
+
 
 if __name__ == "__main__":
     unittest.main()
