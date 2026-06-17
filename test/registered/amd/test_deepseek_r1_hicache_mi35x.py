@@ -21,6 +21,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -50,6 +52,7 @@ GSM8K_NUM_EXAMPLES = None
 GSM8K_NUM_THREADS = 64
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
     """DSR1-0528 FP8 + HiCache (L1+L2+L3) GSM8K regression test for MI35x."""
 

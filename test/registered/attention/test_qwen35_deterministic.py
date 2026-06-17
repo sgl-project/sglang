@@ -6,6 +6,8 @@ python3 -m unittest test_qwen35_deterministic.TestQwen35Fa3Deterministic
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
@@ -17,6 +19,7 @@ register_cuda_ci(est_time=360, stage="extra-b", runner_config="4-gpu-h100")
 QWEN35 = "Qwen/Qwen3.5-35B-A3B"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35Fa3Deterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
