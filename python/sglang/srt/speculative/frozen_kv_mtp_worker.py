@@ -21,7 +21,7 @@ assistant-side KV extension.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +78,9 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +202,9 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def clear_cache_pool(self):
         pass
+
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)]
 
     def _resolve_draft_backend_type(self) -> str:
         return (

@@ -1,7 +1,7 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -32,6 +32,10 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
+
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 logger = logging.getLogger(__name__)
@@ -351,6 +355,11 @@ class DFlashWorker:
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
         pass
+
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # Explicit so DFlash's __getattr__ doesn't delegate this to the target
+        # (whose model_runner is aliased here) and miss the real draft.
+        return [("draft", self.draft_model_runner)]
 
     def _gather_req_to_token_masked(
         self,
