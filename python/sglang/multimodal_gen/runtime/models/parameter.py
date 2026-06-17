@@ -279,9 +279,6 @@ class PerTensorScaleParameter(BasevLLMParameter):
         # AutoFP8 scales do not have a shape
         # compressed-tensors scales do have a shape
         if len(loaded_weight.shape) != 0:
-            if loaded_weight.shape == param_data.shape:
-                param_data.copy_(loaded_weight)
-                return
             assert loaded_weight.shape[0] == 1
             loaded_weight = loaded_weight[0]
 

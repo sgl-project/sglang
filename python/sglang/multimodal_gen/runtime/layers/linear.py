@@ -479,7 +479,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         tp_group: dist.ProcessGroup = None,
     ):
-        self.output_sizes = output_sizes
+        tp_group = tp_group or get_tp_group()
+        if get_group_size(tp_group) > 1:
+            self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -491,6 +493,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             tp_group=tp_group,
         )
+        self.output_sizes = output_sizes
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(
@@ -621,6 +624,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
+                if self.tp_size > 1 and loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
