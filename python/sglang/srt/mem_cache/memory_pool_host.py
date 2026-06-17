@@ -490,7 +490,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
+        self.can_use_write_back_jit = False
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+            return
+
+        self.can_use_write_back_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.element_dim * self.dtype.itemsize,
+            staged=True,
+        )
+        if not self.can_use_write_back_jit:
             return
 
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -661,10 +669,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if _is_cuda and can_use_hicache_jit_kernel(
-                    element_size=self.element_dim * self.dtype.itemsize,
-                    staged=True,
-                ):
+                if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_staged_lf_pf(
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
@@ -1326,7 +1331,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_buffer = None
+        self.can_use_write_back_jit = False
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+            return
+
+        self.can_use_write_back_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.kv_cache_dim * self.dtype.itemsize,
+            staged=True,
+        )
+        if not self.can_use_write_back_jit:
             return
 
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -1450,10 +1463,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if _is_cuda and can_use_hicache_jit_kernel(
-                    element_size=self.kv_cache_dim * self.dtype.itemsize,
-                    staged=True,
-                ):
+                if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
                         src_indices=device_indices,

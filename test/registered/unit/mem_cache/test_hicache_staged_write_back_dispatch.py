@@ -208,6 +208,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.layout_dim = host.token_stride_size * layer_num
         host.dtype = torch.uint8
         host.can_use_jit = True
+        host.can_use_write_back_jit = True
         host.kv_buffer = torch.zeros(
             2, 8, layer_num, head_num, head_dim, dtype=torch.uint8
         )
@@ -241,7 +242,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
                 return_value=True,
             ) as can_use_jit,
-            mock.patch(f"{MEMORY_POOL_HOST_MODULE}._is_cuda", True),
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -260,7 +260,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(staged.call_count, 1)
         self.assertEqual(fallback.call_count, 0)
         self.assertEqual(load.call_count, layer_num)
-        can_use_jit.assert_called_once_with(element_size=4, staged=True)
+        can_use_jit.assert_not_called()
         for layer_id in range(layer_num):
             self.assertTrue(
                 torch.equal(k_layers[layer_id][device_indices], expected_k[layer_id])
@@ -303,6 +303,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.layout_dim = host.token_stride_size * layer_num
         host.dtype = torch.uint8
         host.can_use_jit = True
+        host.can_use_write_back_jit = True
         host.kv_buffer = torch.zeros(8, layer_num, 1, kv_cache_dim, dtype=torch.uint8)
         host.data_refs = [host.kv_buffer.transpose(0, 1)[i] for i in range(layer_num)]
         host.staging_buffer = torch.empty(
@@ -322,7 +323,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 f"{MEMORY_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
                 return_value=True,
             ) as can_use_jit,
-            mock.patch(f"{MEMORY_POOL_HOST_MODULE}._is_cuda", True),
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -341,7 +341,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(staged.call_count, 1)
         self.assertEqual(fallback.call_count, 0)
         self.assertEqual(load.call_count, layer_num)
-        can_use_jit.assert_called_once_with(element_size=5, staged=True)
+        can_use_jit.assert_not_called()
         for layer_id, layer in enumerate(device_layers):
             self.assertTrue(torch.equal(layer[device_indices], expected[layer_id]))
             self.assertTrue(
