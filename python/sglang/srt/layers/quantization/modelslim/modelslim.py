@@ -381,7 +381,6 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
             weight_type="w13",
             **extra_weight_attrs,
         )
@@ -390,7 +389,6 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
             weight_type="w2",
             **extra_weight_attrs,
         )
