@@ -122,6 +122,9 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+import triton
+import triton.language as tl
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -1423,6 +1426,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             from sglang.srt.layers.mhc import npu_hc_pre
+
             return npu_hc_pre(
                 x,
                 hc_fn,
