@@ -1590,7 +1590,6 @@ class DeepseekV2AttentionMLA(
                         % self.index_topk_freq
                         != 0
                     )
-                    is_neox_style = getattr(config, "indexer_rope_interleave", False)
                 elif self.index_topk_pattern is None:
                     self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
                     self.next_skip_topk = layer_id % self.index_topk_freq != 0
