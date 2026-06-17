@@ -402,10 +402,8 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
     # occupied port, where it would orphan, compete for the GPU, and OOM.
     if server_is_up(base_url, timeout=5):
         print(
-            f"WARNING: a server is already running at {base_url}; reusing it. "
-            f"--model and all server-launch args are ignored; the benchmark "
-            f"runs against the config that server was started with. "
-            f"Pass --base-url {base_url} to silence this warning."
+            f"WARNING: reusing the server already running at {base_url} "
+            f"(--model and server-launch args ignored). Pass --base-url to silence."
         )
         return None, base_url
 
