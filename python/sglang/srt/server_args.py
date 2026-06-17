@@ -4025,6 +4025,21 @@ class ServerArgs:
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
             )
 
+        # The page_first kernel write-back relies on the CUDA-only JIT staged
+        # kernel. On non-CUDA platforms (e.g. ROCm) it falls back to a kernel
+        # that requires CUDA index tensors and crashes on host write-back, so
+        # use layer_first there instead.
+        if (
+            self.hicache_mem_layout == "page_first"
+            and self.hicache_io_backend == "kernel"
+            and not is_cuda()
+        ):
+            self.hicache_mem_layout = "layer_first"
+            logger.warning(
+                "page_first kernel write-back requires the CUDA JIT kernel; "
+                "falling back to layer_first layout on this platform."
+            )
+
     def _resolve_storage_layout_compatibility(self):
         if (
             self.hicache_storage_backend != "mooncake"
