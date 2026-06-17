@@ -18,7 +18,10 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # Skip this test on Hopper machine
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+skip_condition = not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 
 def apply_rotary_emb(
