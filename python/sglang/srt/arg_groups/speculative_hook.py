@@ -103,7 +103,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             )
 
     if (
-        server_args.speculative_dflash_mamba_cache_steps is not None
+        getattr(server_args, "speculative_dflash_mamba_cache_steps", None) is not None
         and server_args.speculative_algorithm != "DFLASH"
     ):
         raise ValueError(
