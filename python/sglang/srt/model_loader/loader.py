@@ -326,6 +326,91 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    # Strip multimodal components after weight loading for loaders that bypass
+    # the DefaultModelLoader path (dummy, sharded state, remote, etc.).
+    if hasattr(model, "config") and getattr(
+        model.config, "language_model_only", False
+    ):
+        _strip_multimodal_components(model)
+
+
+# Known multimodal component attribute names across all model architectures.
+# When language_model_only=True, these are set to None after model construction
+# to free GPU memory consumed by vision/audio encoders and their projectors.
+_MM_COMPONENT_NAMES: set[str] = {
+    # Vision encoders
+    "vision_tower",
+    "vision_model",
+    "vision_encoder",
+    "visual",
+    # Vision projectors / adapters
+    "multi_modal_projector",
+    "mm_projector",
+    "vision_language_adapter",
+    "pre_mm_projector_norm",
+    "patch_merger",
+    # MiniCPM-V
+    "vpm",
+    # Audio encoders
+    "audio_tower",
+    "audio_encoder",
+    "audio_model",
+}
+
+
+def _strip_multimodal_components(model: nn.Module) -> None:
+    """Set known multimodal encoder/projector attributes to None.
+
+    After this call, PyTorch will no longer track their parameters as part of
+    the model, GPU memory is freed, and the language model forward path
+    proceeds unimpeded as long as no multimodal inputs are received (which are
+    rejected at the server level).
+    """
+    for attr_name in sorted(_MM_COMPONENT_NAMES):
+        if hasattr(model, attr_name):
+            component = getattr(model, attr_name)
+            if not isinstance(component, nn.Module):
+                continue
+            try:
+                component.cpu()
+            except Exception:
+                pass  # some modules may not support .cpu()
+            setattr(model, attr_name, None)
+            logger.info(
+                "Stripped multimodal component %r from model (language-model-only mode).",
+                attr_name,
+            )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+# Weight name prefixes that identify multimodal encoder/projector parameters.
+# When language_model_only=True, weights matching any of these are skipped
+# during loading to save GPU memory and bandwidth.
+_MM_WEIGHT_PREFIXES: tuple[str, ...] = (
+    "vision_tower.",
+    "vision_model.",
+    "vision_encoder.",
+    "visual.",
+    "multi_modal_projector.",
+    "mm_projector.",
+    "vision_language_adapter.",
+    "pre_mm_projector_norm.",
+    "patch_merger.",
+    "vpm.",
+    "audio_tower.",
+    "audio_encoder.",
+    "audio_model.",
+    # Some models (InternVL, Llava, Qwen) prefix with "model."
+    "model.vision_tower.",
+    "model.vision_model.",
+    "model.vision_encoder.",
+    "model.visual.",
+    "model.mm_projector.",
+    "model.multi_modal_projector.",
+)
 
 
 class BaseModelLoader(ABC):
@@ -668,6 +753,21 @@ class DefaultModelLoader(BaseModelLoader):
                 new_name = name
             yield (prefix + new_name, tensor)
 
+    @staticmethod
+    def _filter_mm_weights(
+        weights_iter: Generator[Tuple[str, torch.Tensor], None, None],
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Filter out multimodal encoder/projector weights from the iterator.
+
+        When language_model_only is set, weights belonging to vision/audio
+        encoders or their projectors are skipped, saving GPU memory and
+        avoiding unused parameter loading.
+        """
+        for name, tensor in weights_iter:
+            if name.startswith(_MM_WEIGHT_PREFIXES):
+                continue
+            yield name, tensor
+
     def _get_all_weights(
         self,
         model_config: ModelConfig,
@@ -675,13 +775,20 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        weights_iter = self._get_weights_iterator(primary_weights)
+
+        if getattr(model_config.hf_config, "language_model_only", False):
+            weights_iter = self._filter_mm_weights(weights_iter)
+        yield from weights_iter
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            s_iter = self._get_weights_iterator(source)
+            if getattr(model_config.hf_config, "language_model_only", False):
+                s_iter = self._filter_mm_weights(s_iter)
+            yield from s_iter
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -790,6 +897,12 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                     quant_config,
                 )
+
+            # Strip multimodal components (vision/audio encoders, projectors)
+            # before loading weights, so their GPU memory is freed early and
+            # their weights are never loaded.
+            if getattr(model_config.hf_config, "language_model_only", False):
+                _strip_multimodal_components(model)
 
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device

@@ -5974,9 +5974,24 @@ class ServerArgs:
                     "--language-model-only cannot be combined with "
                     "--mm-enable-dp-encoder"
                 )
-            # Skip the encoder disaggregation validation (architecture whitelist,
-            # IB device checks, etc.) -- language-model-only works with any
-            # multimodal model and does not need encoder infrastructure.
+            # Validate model architecture. Currently only Qwen2-VL and Qwen3-VL
+            # family models are supported for --language-model-only.
+            hf_config = self.get_model_config().hf_config
+            model_arch = hf_config.architectures[0]
+            if model_arch not in [
+                "Qwen2VLForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            ]:
+                raise ValueError(
+                    f"Model architecture {model_arch} is not currently supported "
+                    f"for --language-model-only. Supported architectures: "
+                    f"Qwen2VL, Qwen2_5_VL, Qwen3VL, Qwen3VLMoe, Qwen3_5, "
+                    f"Qwen3_5Moe."
+                )
             return
 
         if self.encoder_only and self.language_only:

@@ -1250,6 +1250,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config = config.text_config  # for qwen3-omni / qwen3-vl-moe
             self.config.encoder_only = getattr(config, "encoder_only", False)
             self.config.language_only = getattr(config, "language_only", False)
+            self.config.language_model_only = getattr(
+                config, "language_model_only", False
+            )
             # Propagate tie_word_embeddings from parent config. In transformers
             # v5.5.3+, Qwen3VLMoeTextConfig sets tie_word_embeddings=True by
             # default but the actual model checkpoint has a separate lm_head.
@@ -1500,7 +1503,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     continue
                 # Skip loading visual/language model weights
                 if (
-                    self.config.encoder_only or self.config.language_only
+                    self.config.encoder_only
+                    or self.config.language_only
+                    or getattr(self.config, "language_model_only", False)
                 ) and name not in params_dict:
                     continue
                 param = params_dict[name]

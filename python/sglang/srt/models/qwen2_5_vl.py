@@ -847,7 +847,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     continue
                 # Skip loading visual/language model weights
                 if (
-                    self.config.encoder_only or self.config.language_only
+                    self.config.encoder_only
+                    or self.config.language_only
+                    or getattr(self.config, "language_model_only", False)
                 ) and name not in params_dict:
                     continue
                 param = params_dict[name]

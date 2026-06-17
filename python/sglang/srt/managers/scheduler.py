@@ -689,7 +689,11 @@ class Scheduler(
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
-        if self.model_config.is_multimodal and self.processor is not None:
+        if (
+            self.model_config.is_multimodal
+            and self.processor is not None
+            and not server_args.language_model_only
+        ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
@@ -2195,6 +2199,17 @@ class Scheduler(
                 return
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
+            if self.server_args.language_model_only:
+                logger.error(
+                    "Unexpected multimodal inputs received in language_model_only "
+                    "mode. This should have been rejected upstream by the tokenizer "
+                    "manager."
+                )
+                req.set_finish_with_abort("Multimodal inputs not supported")
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
