@@ -245,6 +245,18 @@ pub(crate) fn init_metrics() {
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
     );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "Cache-aware routing decisions by branch (cache_hit, cache_miss_min_load, load_balance, stale_tenant_fallback, no_tree_random, no_healthy_workers)"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_rate",
+        "Best-prefix match rate (0..1) observed at cache-aware routing decisions"
+    );
+    describe_gauge!(
+        "smg_cache_aware_tree_chars",
+        "Approximate per-worker cache footprint in characters by model and worker"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -917,6 +929,43 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(count as f64);
+    }
+
+    /// Record cache-aware policy execution branch for routing decisions.
+    ///
+    /// This answers "why did cache-aware route this request the way it did" at the
+    /// decision level. Branches: cache_hit / cache_miss_min_load / load_balance /
+    /// stale_tenant_fallback / no_tree_random / no_healthy_workers. A high share of
+    /// `load_balance` or `cache_miss_min_load` while match rates are high indicates
+    /// the affinity-vs-load-balance tension is actively hurting cache hit rate.
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the global best-prefix match rate observed at a cache-aware decision.
+    ///
+    /// The distribution (p50/p90) distinguishes "traffic genuinely has little shared
+    /// prefix" (low match rate) from "routing is breaking affinity" (high match rate
+    /// but low realized cache hit rate downstream).
+    pub fn record_cache_aware_match_rate(rate: f64) {
+        histogram!("smg_cache_aware_match_rate").record(rate);
+    }
+
+    /// Set the approximate cache footprint (in characters) a model's tree attributes
+    /// to a specific worker (tenant). Exposes per-worker cache skew across the pool.
+    pub fn set_cache_aware_tree_chars(model_id: &str, worker: &str, chars: usize) {
+        let model = intern_string(model_id);
+        let worker_interned = intern_string(worker);
+        gauge!(
+            "smg_cache_aware_tree_chars",
+            "model" => model,
+            "worker" => worker_interned
+        )
+        .set(chars as f64);
     }
 
     /// Set active routing keys per worker
