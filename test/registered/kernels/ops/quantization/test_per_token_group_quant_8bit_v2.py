@@ -27,6 +27,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     fp8_max,
     fp8_min,
 )
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 G = 128
 
