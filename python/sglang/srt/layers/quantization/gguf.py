@@ -865,7 +865,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
     
-        # ----- w13 (gate + up) : transpose to (hidden, 2*intermediate) -----
+        # ----- w13 (gate + up) : keep as (2*intermediate, hidden) -----
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
     
@@ -878,23 +878,24 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
                 rows = w13_qweight[e].shape[0]          # 2*intermediate
                 cols = w13_qweight[e].shape[1] // type_size * block_size  # hidden
+    
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)
-                    .transpose(-1, -2)                  # (hidden, 2*intermediate)
+                    .reshape(rows, cols)                # (2*intermediate, hidden) – no transpose
                     .contiguous()
                 )
                 w13_dequant_list.append(dequant)
-            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, hidden, 2*intermediate)
+    
+            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, 2*intermediate, hidden)
             w13_full = npu_format_cast(w13_full)
             layer.register_buffer("w13_dequant", w13_full, persistent=False)
         else:
             w13_qweight.data = npu_format_cast(w13_qweight.data)
             layer.register_buffer("w13_dequant", w13_qweight.data, persistent=False)
     
-        # ----- w2 (down) : keep as (intermediate, hidden) – no transpose -----
+        # ----- w2 (down) : transpose to (hidden, intermediate) -----
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
     
@@ -907,15 +908,18 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
                 rows = w2_qweight[e].shape[0]          # intermediate
                 cols = w2_qweight[e].shape[1] // type_size * block_size  # hidden
+    
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)                # (intermediate, hidden) – NO transpose
+                    .reshape(rows, cols)                # (intermediate, hidden)
+                    .transpose(-1, -2)                  # (hidden, intermediate) – now input dim is intermediate
                     .contiguous()
                 )
                 w2_dequant_list.append(dequant)
-            w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, intermediate, hidden)
+    
+            w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, hidden, intermediate)
             w2_full = npu_format_cast(w2_full)
             layer.register_buffer("w2_dequant", w2_full, persistent=False)
         else:
