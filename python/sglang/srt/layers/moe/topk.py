@@ -1539,10 +1539,11 @@ def capture_routed_experts_if_allowed(
     """
     if not topk_config.allow_routed_experts_capture:
         return
-    cap = get_global_experts_capturer()
-    if cap is None:
-        return
-    cap.capture(layer_id=layer_id, topk_indices=topk_ids)
+    if (cap := get_global_experts_capturer()) is not None:
+        cap.capture(
+            layer_id=layer_id,
+            topk_indices=topk_ids,
+        )
 
 
 def _post_process_topk_ids(
