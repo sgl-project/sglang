@@ -64,31 +64,54 @@ libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 default_target = "gfx942"
-amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+# An explicit AMDGPU_TARGET always wins over auto-detection. This is the
+# documented escape hatch for cross-compilation and for building on
+# experimental/unsupported architectures; previously it was read here but then
+# silently overwritten by the torch.cuda detection below whenever a GPU was
+# visible, so the override never took effect on a build host with a GPU.
+explicit_target = os.environ.get("AMDGPU_TARGET")
+amdgpu_target = explicit_target or default_target
 
-if torch.cuda.is_available():
-    try:
-        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception as e:
-        print(f"Warning: Failed to detect GPU properties: {e}")
-else:
-    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+if explicit_target is None:
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            amdgpu_target = props.gcnArchName.split(":")[0]
+        except Exception as e:
+            print(f"Warning: Failed to detect GPU properties: {e}")
+    else:
+        print(
+            f"Warning: torch.cuda not available. Using default target: {amdgpu_target}"
+        )
 
 if amdgpu_target not in ["gfx942", "gfx950"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
     )
-    sys.exit(1)
+    # Only abort for an auto-detected architecture. If the user explicitly set
+    # AMDGPU_TARGET they have opted in to building for an unsupported arch
+    # (e.g. RDNA3 gfx1101), so honor it with a warning instead of aborting.
+    if explicit_target is None:
+        sys.exit(1)
+    print(
+        f"Warning: AMDGPU_TARGET='{explicit_target}' was set explicitly; "
+        "continuing with an unsupported architecture. This configuration is "
+        "untested upstream — use at your own risk."
+    )
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
 )
 
 # Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# Only archs with a large LDS budget can take the 128KB path:
+# - gfx95x (MI350): LDS is large (e.g. 160KB per CU) -> allow 128KB dynamic smem.
+# Everything else (gfx942/MI300 at 64KB, and all RDNA2/RDNA3/3.5 gfx10xx/gfx11xx
+# at 64KB, plus any unknown/future arch) caps at 48KB to stay within LDS limits.
+_large_lds_targets = ["gfx950"]
+topk_dynamic_smem_bytes = (
+    32 * 1024 * 4 if amdgpu_target in _large_lds_targets else 48 * 1024
+)
 
 hipcc_flags = [
     "-DNDEBUG",
