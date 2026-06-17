@@ -964,7 +964,7 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # Fast path: only compute and store k cache, skip all q and weights ops.
+        # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         out_cache_loc = None
         if num_tokens is not None:
@@ -997,7 +997,7 @@ class Indexer(MultiPlatformOp):
         )
         raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
-            # Graph dispatch: fill the valid prefix of the padded static buffer and
+            # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
             topk_result[: raw_topk_result.shape[0]] = raw_topk_result
             return None
