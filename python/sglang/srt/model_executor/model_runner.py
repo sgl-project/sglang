@@ -1238,6 +1238,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
+                decode_context_model_parallel_size=self.server_args.dcp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,

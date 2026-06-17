@@ -1603,16 +1603,6 @@ _ATTN_CP: Optional[GroupCoordinator] = None
 
 _DCP: Optional[GroupCoordinator] = None
 
-decode_context_parallel_size: Optional[int] = None
-
-
-def get_dcp_size_from_env():
-    global decode_context_parallel_size
-    if decode_context_parallel_size is None:
-        decode_context_parallel_size = envs.SGLANG_DCP_WORLD_SIZE.get()
-    return decode_context_parallel_size
-
-
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
@@ -1914,6 +1904,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    decode_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -2089,7 +2080,6 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
     # build decode context parallel groups
-    decode_context_model_parallel_size = get_dcp_size_from_env()
     if decode_context_model_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2285,6 +2275,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_model_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -2315,8 +2306,8 @@ def ensure_model_parallel_initialized(
 
     dcp_world_size = get_dcp_group().world_size
     assert (
-        dcp_world_size == get_dcp_size_from_env()
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+        dcp_world_size == decode_context_model_parallel_size
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_model_parallel_size=}"
 
 
 def model_parallel_is_initialized():

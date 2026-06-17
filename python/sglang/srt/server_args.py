@@ -558,6 +558,9 @@ class ServerArgs:
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
+    # decode context parallel
+    dcp_size: int = 1
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -5269,6 +5272,13 @@ class ServerArgs:
             help="The moe data parallelism size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="The decode context parallelism size.",
+        )
+        parser.add_argument(
             "--pipeline-parallel-size",
             "--pp-size",
             type=int,
@@ -7649,6 +7659,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.attn_cp_size = args.attention_context_parallel_size
         args.moe_dp_size = args.moe_data_parallel_size
+        args.dcp_size = args.decode_context_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
