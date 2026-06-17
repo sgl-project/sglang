@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
@@ -17,6 +18,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -58,6 +60,7 @@ from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils.custom_op import register_custom_op
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -75,10 +78,6 @@ class MlaBmmFusionPlan:
 
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
-    from sglang.srt.compilation.compilation_config import register_split_op
-    from sglang.srt.layers.radix_attention import unified_attention_with_output
-    from sglang.srt.utils.custom_op import register_custom_op
 
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
     # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
@@ -102,65 +101,6 @@ if _is_cuda:
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
-
-    # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
-    # into one eager split op (under both PCG and BCG). Without this, the bf16
-    # fallback BMM was captured alone in its own single-kernel CUDA graph
-    # submodule, paying per-submodule host overhead with no fusion benefit.
-    #
-    # The further "module fusion" — coalescing this op with the strictly adjacent
-    # `pcg_dsa_indexer_graph_split` into a single eager region (no captured segment
-    # between the two adjacent eager breaks) — is currently BCG-only: breakable
-    # CUDA graph drops the empty segment and chains the adjacent replay fns (see
-    # `breakable_cuda_graph.eager_on_graph`). Under PCG, `split_graph` leaves each
-    # split op in its own eager submodule for now (no merge), so the surrounding
-    # capture stays split into separate CUDA graph islands. The adjacency this
-    # relies on currently holds on the trtllm-FP8 DSA path where
-    # `_fuse_rope_for_trtllm_mla` skips the Python `rotary_emb` call.
-    # Gated by `_can_fuse_bmm_into_attention`.
-    # `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
-    # `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
-    # `q_nope_out_view`, so the alias's storage is mutated too — declare it
-    # in `mutates_args` to keep the schema honest.
-    @register_custom_op(
-        mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
-    )
-    @register_split_op()
-    def mla_bmm_then_unified_attention(
-        q_nope_t: torch.Tensor,
-        w_kc: torch.Tensor,
-        q_nope_out_buf: torch.Tensor,
-        q_nope_out_view: torch.Tensor,
-        k_nope: torch.Tensor,
-        attn_output_buf: torch.Tensor,
-        save_kv_cache: bool,
-        layer_id: int,
-        q_pe: torch.Tensor,
-        k_pe: torch.Tensor,
-        cos_sin_cache: Optional[torch.Tensor] = None,
-        is_neox: Optional[bool] = None,
-        llama_4_scaling: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-    ) -> None:
-        torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
-        unified_attention_with_output(
-            q_nope_out_view,
-            k_nope,
-            k_nope,
-            attn_output_buf,
-            save_kv_cache,
-            layer_id,
-            q_rope=q_pe,
-            k_rope=k_pe,
-            cos_sin_cache=cos_sin_cache,
-            is_neox=is_neox,
-            llama_4_scaling=llama_4_scaling,
-            topk_indices=topk_indices,
-        )
-
-    bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
-        mla_bmm_then_unified_attention
-    )
 
 
 if _use_aiter:
@@ -993,3 +933,62 @@ class DeepseekMLAForwardMixin:
             and self.current_attention_backend
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
+
+
+# Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
+# into one eager split op under both PCG and BCG. Without this, the bf16
+# fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
+# paying per-submodule host overhead with no fusion benefit.
+#
+# The further module fusion, coalescing this op with the strictly adjacent
+# `pcg_dsa_indexer_graph_split` into a single eager region, is currently
+# BCG-only: breakable CUDA graph drops the empty segment and chains adjacent
+# replay fns. Under PCG, `split_graph` leaves each split op in its own eager
+# submodule for now. The adjacency this relies on currently holds on the
+# trtllm-FP8 DSA path where `_fuse_rope_for_trtllm_mla` skips the Python
+# `rotary_emb` call. The call site gates this by `_can_fuse_bmm_into_attention`.
+#
+# `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
+# `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
+# `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
+# `mutates_args` to keep the schema honest.
+@register_custom_op(
+    mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
+)
+@register_split_op()
+def mla_bmm_then_unified_attention(
+    q_nope_t: torch.Tensor,
+    w_kc: torch.Tensor,
+    q_nope_out_buf: torch.Tensor,
+    q_nope_out_view: torch.Tensor,
+    k_nope: torch.Tensor,
+    attn_output_buf: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+    unified_attention_with_output(
+        q_nope_out_view,
+        k_nope,
+        k_nope,
+        attn_output_buf,
+        save_kv_cache,
+        layer_id,
+        q_rope=q_pe,
+        k_rope=k_pe,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+
+
+bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
+    mla_bmm_then_unified_attention
+)
