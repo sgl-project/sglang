@@ -64,6 +64,8 @@ class ParallelContext:
     attn_cp_rank: int = 0
     attn_dp_size: int = 1
     attn_dp_rank: int = 0
+    local_attn_dp_size: int = 1
+    local_attn_dp_rank: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +103,8 @@ def build_parallel_context(model_runner) -> ParallelContext:
     from sglang.srt.layers.dp_attention import (
         get_attention_dp_rank,
         get_attention_dp_size,
+        get_local_attention_dp_rank,
+        get_local_attention_dp_size,
     )
 
     mr = model_runner
@@ -128,6 +132,8 @@ def build_parallel_context(model_runner) -> ParallelContext:
         attn_cp_rank=attn_cp.rank_in_group,
         attn_dp_size=get_attention_dp_size(),
         attn_dp_rank=get_attention_dp_rank(),
+        local_attn_dp_size=get_local_attention_dp_size(),
+        local_attn_dp_rank=get_local_attention_dp_rank(),
     )
 
 

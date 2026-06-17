@@ -353,21 +353,39 @@ def get_attention_cp_size() -> int:
 
 
 def get_attention_dp_rank() -> int:
+    # Global Context (parallel): read the published snapshot when present, falling
+    # back to the module global for pre-context calls (during distributed init).
+    from sglang.srt.runtime_context import get_parallel, has_context
+
+    if has_context():
+        return get_parallel().attn_dp_rank
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
 
 
 def get_attention_dp_size() -> int:
+    from sglang.srt.runtime_context import get_parallel, has_context
+
+    if has_context():
+        return get_parallel().attn_dp_size
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
 
 
 def get_local_attention_dp_rank() -> int:
+    from sglang.srt.runtime_context import get_parallel, has_context
+
+    if has_context():
+        return get_parallel().local_attn_dp_rank
     assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_RANK
 
 
 def get_local_attention_dp_size() -> int:
+    from sglang.srt.runtime_context import get_parallel, has_context
+
+    if has_context():
+        return get_parallel().local_attn_dp_size
     assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_SIZE
 

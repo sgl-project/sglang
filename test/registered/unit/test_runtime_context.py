@@ -114,6 +114,8 @@ class TestBuildParallelContext(unittest.TestCase):
                 dpa,
                 get_attention_dp_size=lambda: 2,
                 get_attention_dp_rank=lambda: 1,
+                get_local_attention_dp_size=lambda: 2,
+                get_local_attention_dp_rank=lambda: 0,
             ):
                 p = build_parallel_context(FakeMR())
 
@@ -129,8 +131,44 @@ class TestBuildParallelContext(unittest.TestCase):
         self.assertEqual(p.attn_cp_size, 1)
         self.assertEqual(p.attn_dp_size, 2)
         self.assertEqual(p.attn_dp_rank, 1)
+        self.assertEqual(p.local_attn_dp_size, 2)
+        self.assertEqual(p.local_attn_dp_rank, 0)
         self.assertEqual(p.dp_size, 3)  # folded value off the runner
         self.assertEqual(p.dp_rank, 1)
+
+
+class TestDpAttentionGettersReadContext(unittest.TestCase):
+    """The dp_attention attn_dp / local_attn_dp getters read the published
+    context snapshot (with module-global fallback when no context)."""
+
+    def setUp(self):
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_attn_dp_getters_read_context(self):
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_local_attention_dp_rank,
+            get_local_attention_dp_size,
+        )
+
+        set_context(
+            RuntimeContext(
+                parallel=ParallelContext(
+                    attn_dp_size=4,
+                    attn_dp_rank=3,
+                    local_attn_dp_size=2,
+                    local_attn_dp_rank=1,
+                )
+            )
+        )
+        self.assertEqual(get_attention_dp_size(), 4)
+        self.assertEqual(get_attention_dp_rank(), 3)
+        self.assertEqual(get_local_attention_dp_size(), 2)
+        self.assertEqual(get_local_attention_dp_rank(), 1)
 
 
 if __name__ == "__main__":
