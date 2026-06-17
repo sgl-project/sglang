@@ -2,6 +2,8 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import asyncio
+import base64
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -12,6 +14,7 @@ import uuid
 from unittest.mock import MagicMock, Mock
 
 import jinja2
+import numpy as np
 
 
 # Stub out sgl_kernel (and all submodules) before any sglang import so
@@ -183,6 +186,94 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertEqual(adapted_request.input_ids, [1, 2, 3, 4, 5])
         # self.assertEqual(adapted_request.rid, "test-id")
         self.assertEqual(processed_request, self.token_ids_req)
+
+    def test_base64_encoding_format_returns_base64_embedding(self):
+        """encoding_format=base64 should encode dense embeddings as float32 bytes."""
+        request = EmbeddingRequest(
+            model="test-model",
+            input="Hello, how are you?",
+            encoding_format="base64",
+        )
+        adapted_request, processed_request = (
+            self.serving_embedding._convert_to_internal_request(request)
+        )
+
+        response = asyncio.run(
+            self.serving_embedding._handle_non_streaming_request(
+                adapted_request,
+                processed_request,
+                self.request,
+            )
+        )
+
+        embedding = response.data[0].embedding
+        self.assertIsInstance(embedding, str)
+        values = np.frombuffer(base64.b64decode(embedding), dtype="<f4")
+        self.assertEqual(values.shape, (100,))
+        np.testing.assert_allclose(values[:2], [0.1, 0.2], rtol=1e-6)
+
+    def test_rejects_unsupported_encoding_format(self):
+        """Unsupported embedding formats should not silently return float lists."""
+        request = EmbeddingRequest(
+            model="test-model",
+            input="Hello, how are you?",
+            encoding_format="bytes",
+        )
+
+        error = self.serving_embedding._validate_request(request)
+
+        self.assertIn("Unsupported encoding_format", error)
+        self.assertIn("float", error)
+        self.assertIn("base64", error)
+
+    def test_base64_rejects_sparse_embedding_outputs(self):
+        """base64 currently only supports dense embedding lists."""
+
+        async def mock_generate_sparse_embedding():
+            yield {
+                "embedding": {"indices": [1], "values": [0.1]},
+                "meta_info": {
+                    "id": f"embd-{uuid.uuid4()}",
+                    "prompt_tokens": 5,
+                },
+            }
+
+        self.tokenizer_manager.generate_request = Mock(
+            return_value=mock_generate_sparse_embedding()
+        )
+        request = EmbeddingRequest(
+            model="test-model",
+            input="Hello, how are you?",
+            encoding_format="base64",
+        )
+        adapted_request, processed_request = (
+            self.serving_embedding._convert_to_internal_request(request)
+        )
+
+        try:
+            response = asyncio.run(
+                self.serving_embedding._handle_non_streaming_request(
+                    adapted_request,
+                    processed_request,
+                    self.request,
+                )
+            )
+        except Exception as exc:
+            self.fail(
+                "sparse embedding base64 requests should return an error response, "
+                f"not raise {type(exc).__name__}: {exc}"
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"base64", response.body)
+        self.assertIn(b"dense", response.body)
+
+    def test_base64_rejects_nested_embedding_lists(self):
+        """Nested lists must error rather than be silently flattened."""
+        with self.assertRaises(ValueError) as ctx:
+            self.serving_embedding._encode_embedding_base64([[0.1, 0.2], [0.3, 0.4]])
+
+        self.assertIn("dense", str(ctx.exception))
 
     def test_convert_multimodal_request(self):
         """Test converting multimodal request to internal format."""
