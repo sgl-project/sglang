@@ -358,9 +358,51 @@ class DFlashVerifyInput(SpecInput):
                     device=device,
                 )
                 sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
+                # 🎯 Industry Optimal Strategy: Verify屏蔽 / Bonus惩罚
+                # Reshape to [bs, num_drafts, vocab] — only touch LAST slot (bonus candidate)
+                try:
+                    logits_view = logits_output.next_token_logits.view(bs, self.draft_token_num, -1)
+                    logits_view[:, -1, :].add_(linear_penalty)
+                except RuntimeError:
+                    logging.warning("DFLASH reshape failed; falling back to full broadcast.")
+                    logits_output.next_token_logits.add_(
+                        torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                    )
+
+            # Multiplicative Scaling: also ONLY on Bonus position
+            if sampling_info is not None:
+                acc_scaling = getattr(sampling_info, "acc_scaling_penalties", None)
+                if acc_scaling is not None:
+                    try:
+                        safe_scaling = acc_scaling.to(device).unsqueeze(1).clamp(min=1.0, max=2.5)
+                        raw_logits = logits_output.next_token_logits
+                        
+                        logits_3d = raw_logits.view(bs, self.draft_token_num, -1)
+                        
+                        # Safety NaN handling
+                        logits_3d[:] = torch.nan_to_num(logits_3d, nan=0.0, posinf=50.0, neginf=-50.0, out=logits_3d)
+                        
+                        # 🎯 ONLY target the last step (bonus token), skip first K-1 (verify drafts)
+                        bonus_slice = logits_3d[:, -1:, :]  # [bs, 1, vocab]
+                        torch.where(
+                            bonus_slice < 0,
+                            bonus_slice * safe_scaling,
+                            bonus_slice / safe_scaling,
+                            out=bonus_slice,
+                        )
+                        # View is inplace-modified, no copy needed
+                    except Exception as e:
+                        logging.error(f"[DFlash] Scaling fallback due to: {e}")
+                        # Fallback: apply to all positions (old behavior)
+                        logits_3d_fall = raw_logits.clone().view(bs, self.draft_token_num, -1)
+                        ts = acc_scaling.to(device).unsqueeze(1).clamp(min=1.0, max=2.5)
+                        logits_3d_fall[:] = torch.where(
+                            logits_3d_fall < 0,
+                            logits_3d_fall * ts,
+                            logits_3d_fall / ts,
+                        )
+                        raw_logits.copy_(logits_3d_fall.view_as(raw_logits))
+            # === End Fix ===
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
         if (
