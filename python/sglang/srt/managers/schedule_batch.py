@@ -674,6 +674,7 @@ class ReqCacheInfo:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
+    start_pos: int = 0
     kv_allocated_len: int = 0
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
