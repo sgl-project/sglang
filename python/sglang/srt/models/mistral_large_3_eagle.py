@@ -12,6 +12,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -61,6 +62,12 @@ class MistralLarge3EagleModel(DeepseekV2Model):
                 for i in range(self.config.num_hidden_layers)
             ]
         )
+        # This EAGLE draft reuses DeepseekV2DecoderLayer with is_nextn=False;
+        # opt out at the wrapper boundary without changing Deepseek NextN semantics.
+        for layer in self.layers:
+            for module in layer.modules():
+                if isinstance(module, TopK):
+                    module.topk_config.allow_routed_experts_capture = False
         self.start_layer = 0
         self.end_layer = self.config.num_hidden_layers
 
