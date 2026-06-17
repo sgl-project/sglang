@@ -95,6 +95,7 @@ class BenchArgs:
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
     base_url: str = ""
+    local_tokenizer_path: str = ""
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
@@ -149,6 +150,16 @@ class BenchArgs:
             default=BenchArgs.input_len_step_percentage,
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
+        parser.add_argument(
+            "--local-tokenizer-path",
+            type=str,
+            default=BenchArgs.local_tokenizer_path,
+            help=(
+                "Local tokenizer path to use when benchmarking an external "
+                "SGLang server via --base-url. Defaults to the tokenizer path "
+                "reported by /server_info."
+            ),
+        )
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
@@ -190,7 +201,7 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random", "generated-shared-prefix"],
+            choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
         parser.add_argument(
@@ -517,7 +528,7 @@ def run_one_case(
         _flush_cache_with_retry(url, "/flush_cache")
 
     # Load input token ids via bench_serving.get_dataset
-    supported_datasets = ("random", "mmmu", "generated-shared-prefix")
+    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
     if dataset_name not in supported_datasets:
         raise ValueError(
             f"Unsupported dataset for batch benchmark: {dataset_name}. "
@@ -905,7 +916,9 @@ def run_benchmark_internal(
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
-        if "tokenizer_path" in server_info:
+        if bench_args.local_tokenizer_path:
+            tokenizer_path = bench_args.local_tokenizer_path
+        elif "tokenizer_path" in server_info:
             tokenizer_path = server_info["tokenizer_path"]
         elif "prefill" in server_info:
             tokenizer_path = server_info["prefill"][0]["tokenizer_path"]

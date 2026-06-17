@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -7,9 +9,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> None:
+def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
-    from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
     server_args.attention_backend = "dsv4"
@@ -41,35 +42,26 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             server_args.speculative_eagle_topk == 1
         ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
-        if not envs.SGLANG_ENABLE_SPEC_V2.get():
-            envs.SGLANG_ENABLE_SPEC_V2.set(True)
-            logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
-
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1
         logger.info(
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
-        # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
-        # flat KV ptrs by PP layer range.
-        raise ValueError(
-            f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
-        )
 
-
-def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
+def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
-    if not server_args.enable_nsa_prefill_context_parallel:
+    if not server_args.enable_prefill_cp:
         return
 
-    if server_args.nsa_prefill_cp_mode != "round-robin-split":
+    if server_args.cp_strategy != "interleave":
         raise ValueError(
-            f"DeepSeekV4 only supports round-robin-split CP mode, "
-            f"got {server_args.nsa_prefill_cp_mode}"
+            "DeepSeekV4 only supports interleave CP strategy, "
+            f"got {server_args.cp_strategy}"
         )
 
+    server_args.enable_dsa_prefill_context_parallel = True
+    server_args.dsa_prefill_cp_mode = "round-robin-split"
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
     server_args.attn_cp_size = server_args.tp_size // server_args.dp_size

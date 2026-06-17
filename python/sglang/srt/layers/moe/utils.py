@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
@@ -91,6 +91,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -112,7 +113,15 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
-        return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
 
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -279,6 +288,11 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
+    if IS_SBO_ENABLED and is_cuda():
+        if torch.cuda.get_device_capability()[0] == 9:
+            raise ValueError(
+                "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
+            )
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -501,8 +515,14 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = (6,)
+    # MiniMax2
+    MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalize)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = 9
 
 
 AITER_PADDING_SIZE = 128

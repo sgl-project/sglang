@@ -21,12 +21,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
+from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -94,7 +94,7 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -112,9 +112,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -149,9 +149,9 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:

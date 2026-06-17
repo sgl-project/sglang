@@ -36,7 +36,7 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
-    def __init__(self, server_args: "ServerArgs"):
+    def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         self._explicit_memory_policy = self._has_explicit_memory_policy()
         self._explicit_layerwise_replacement_policy = (
@@ -148,6 +148,38 @@ class ServerArgsAutoTuner:
                     ", ".join(changed),
                 )
 
+        self._maybe_keep_ltx23_resident_aux_components_resident()
+
+    def _maybe_keep_ltx23_resident_aux_components_resident(self) -> None:
+        args = self.server_args
+        if not args._uses_ltx23_high_memory_resident_two_stage_mode():
+            return
+
+        changed: list[str] = []
+        if (
+            args.layerwise_offload_components is not None
+            and not args.is_arg_explicitly_set("layerwise_offload_components")
+        ):
+            args.layerwise_offload_components = None
+            changed.append("layerwise_offload_components=None")
+
+        # high-memory resident mode keeps both DiTs on GPU; unset auxiliary
+        # placement should stay resident instead of using default layerwise
+        for arg_name in (
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+        ):
+            if getattr(args, arg_name) and not args.is_arg_explicitly_set(arg_name):
+                setattr(args, arg_name, False)
+                changed.append(f"{arg_name}=False")
+
+        if changed:
+            logger.info(
+                "Keeping LTX2 high-memory two-stage auxiliary components resident: %s",
+                ", ".join(changed),
+            )
+
     def maybe_adjust_auto_fsdp_with_offload_enabled(self) -> None:
         args = self.server_args
         if (
@@ -169,7 +201,7 @@ class ServerArgsAutoTuner:
             self._enable_cfg_parallel_if_supported()
 
     def maybe_adjust_auto_default_layerwise_offload(self) -> None:
-        """Enable verified non-DiT layerwise defaults for unset component placement."""
+        """Enable verified layerwise defaults for unset component placement."""
         args = self.server_args
         if args.performance_mode != "auto":
             return
@@ -188,9 +220,9 @@ class ServerArgsAutoTuner:
             return
 
         logger.info(
-            "Automatically enable default non-DiT layerwise offload for %s: %s",
+            "Auto memory policy for %s selected layerwise offload components: %s",
             args.pipeline_config.__class__.__name__,
-            layerwise_components,
+            ", ".join(layerwise_components),
         )
         args.layerwise_offload_components = layerwise_components
 
@@ -335,17 +367,70 @@ class ServerArgsAutoTuner:
             or args.dit_layerwise_offload is True
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
-            # Do not merge implicit non-DiT defaults into that explicit mode.
+            # Do not merge implicit defaults into that explicit mode.
             return []
 
         # `*_cpu_offload` is the component placement knob. If a user explicitly
         # set it to either true or false, keep that component out of default
         # layerwise selection.
-        return [
+        components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
             if not args.is_arg_explicitly_set(arg_name)
         ]
+        if self._should_auto_enable_dit_layerwise_offload():
+            components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
+            self._set_default_wan_dit_offload_prefetch_size()
+        return components
+
+    def _should_auto_enable_dit_layerwise_offload(self) -> bool:
+        args = self.server_args
+
+        # only for wan for now
+        if not self._is_wan_pipeline_config():
+            return False
+        if not self._deployment_config().auto_dit_layerwise_offload:
+            return False
+
+        if (
+            args.pipeline_config.dmd_denoising_steps is not None
+            or not current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or args.use_fsdp_inference
+            or args.is_arg_explicitly_set("dit_cpu_offload")
+        ):
+            return False
+
+        # memory mode is memory-first: keep the broad Wan DiT layerwise policy
+        # unless a guard above says it conflicts with another placement path
+        if args.performance_mode == "memory":
+            return True
+
+        # auto mode is performance-first: profiling only showed clear wins for
+        # Wan2.2 A14B, where coarse DiT CPU offload creates large step spikes
+        return (
+            args.performance_mode == "auto" and self._is_wan2_2_a14b_pipeline_config()
+        )
+
+    def _is_wan2_2_a14b_pipeline_config(self) -> bool:
+        config_name = self.server_args.pipeline_config.__class__.__name__
+        return config_name.startswith("Wan2_2_") and "A14B" in config_name
+
+    def _set_default_wan_dit_offload_prefetch_size(self) -> None:
+        args = self.server_args
+        if (
+            args.performance_mode == "auto"
+            and self._is_wan2_2_a14b_pipeline_config()
+            and not args.is_arg_explicitly_set("dit_offload_prefetch_size")
+        ):
+            # p2 was the fastest stable default in the Wan2.2 A14B sweep
+            args.dit_offload_prefetch_size = 2
+
+    def _is_wan_pipeline_config(self) -> bool:
+        return any(
+            cls.__module__.endswith(".wan")
+            for cls in self.server_args.pipeline_config.__class__.mro()
+        )
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
@@ -405,8 +490,10 @@ class ServerArgsAutoTuner:
 
     def _enable_cfg_parallel_if_supported(self) -> None:
         args = self.server_args
+        deployment_config = self._deployment_config()
         if (
-            args.enable_cfg_parallel is None
+            deployment_config.auto_enable_cfg_parallel
+            and args.enable_cfg_parallel is None
             and not self._has_explicit_parallel_policy()
             and args._model_default_uses_cfg()
         ):

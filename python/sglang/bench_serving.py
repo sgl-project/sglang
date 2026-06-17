@@ -17,6 +17,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import math
 import os
 import random
 import shutil
@@ -129,6 +130,10 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+    return (message.get("reasoning_content") or "") + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -440,9 +445,8 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                        message = response_json["choices"][0]["message"]
+                        output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -477,9 +481,7 @@ async def async_request_openai_chat_completions(
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
                                 delta = choices[0].get("delta") or {}
-                                content = (delta.get("reasoning_content") or "") + (
-                                    delta.get("content") or ""
-                                )
+                                content = _combine_openai_chat_content(delta)
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -614,13 +616,16 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        sampling_params = {
+            "temperature": args.temperature,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+        if args.top_p < 1.0:
+            sampling_params["top_p"] = args.top_p
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -884,37 +889,56 @@ ASYNC_REQUEST_FUNCS = {
 
 @dataclass
 class BenchmarkMetrics:
+    # Request counts and token totals
     completed: int
     total_input: int
     total_input_text: int
     total_input_vision: int
     total_output: int
     total_output_retokenized: int
+
+    # Throughput (req/s and tok/s)
     request_throughput: float
     input_throughput: float
     output_throughput: float
     output_throughput_retokenized: float
     total_throughput: float
     total_throughput_retokenized: float
+
+    # TTFT - Time to First Token (ms)
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
+    p90_ttft_ms: float
+    p95_ttft_ms: float
     p99_ttft_ms: float
+
+    # TPOT - Time per Output Token, excluding the first token (ms)
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
+    p90_tpot_ms: float
+    p95_tpot_ms: float
     p99_tpot_ms: float
+
+    # ITL - Inter-Token Latency (ms)
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
+    p90_itl_ms: float
     p95_itl_ms: float
     p99_itl_ms: float
     max_itl_ms: float
+
+    # E2E - End-to-End request latency (ms)
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
     p90_e2e_latency_ms: float
+    p95_e2e_latency_ms: float
     p99_e2e_latency_ms: float
+
+    # Concurrency and peak metrics
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
@@ -1111,14 +1135,19 @@ def calculate_metrics(
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
+        p90_ttft_ms=np.percentile(ttfts or 0, 90) * 1000,
+        p95_ttft_ms=np.percentile(ttfts or 0, 95) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
+        p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
+        p95_tpot_ms=np.percentile(tpots or 0, 95) * 1000,
         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
         mean_itl_ms=np.mean(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
+        p90_itl_ms=np.percentile(itls or 0, 90) * 1000,
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
@@ -1126,6 +1155,7 @@ def calculate_metrics(
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
+        p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
@@ -1549,12 +1579,17 @@ async def benchmark(
         "{:<40} {:<10.2f}".format("P90 E2E Latency (ms):", metrics.p90_e2e_latency_ms)
     )
     print(
+        "{:<40} {:<10.2f}".format("P95 E2E Latency (ms):", metrics.p95_e2e_latency_ms)
+    )
+    print(
         "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
     )
     if not is_embedding:
         print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
         print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P90 TTFT (ms):", metrics.p90_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P95 TTFT (ms):", metrics.p95_ttft_ms))
         print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
         print(
             "{s:{c}^{n}}".format(
@@ -1563,10 +1598,13 @@ async def benchmark(
         )
         print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
         print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P90 TPOT (ms):", metrics.p90_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P95 TPOT (ms):", metrics.p95_tpot_ms))
         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
         print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
@@ -1609,18 +1647,24 @@ async def benchmark(
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
             "p90_e2e_latency_ms": metrics.p90_e2e_latency_ms,
+            "p95_e2e_latency_ms": metrics.p95_e2e_latency_ms,
             "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
             "std_ttft_ms": metrics.std_ttft_ms,
+            "p90_ttft_ms": metrics.p90_ttft_ms,
+            "p95_ttft_ms": metrics.p95_ttft_ms,
             "p99_ttft_ms": metrics.p99_ttft_ms,
             "mean_tpot_ms": metrics.mean_tpot_ms,
             "median_tpot_ms": metrics.median_tpot_ms,
             "std_tpot_ms": metrics.std_tpot_ms,
+            "p90_tpot_ms": metrics.p90_tpot_ms,
+            "p95_tpot_ms": metrics.p95_tpot_ms,
             "p99_tpot_ms": metrics.p99_tpot_ms,
             "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
             "std_itl_ms": metrics.std_itl_ms,
+            "p90_itl_ms": metrics.p90_itl_ms,
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
@@ -1714,6 +1758,11 @@ def run_benchmark(args_: argparse.Namespace):
         args.logprob_start_len = -1
     if not hasattr(args, "return_logprob"):
         args.return_logprob = False
+
+    if not hasattr(args, "temperature"):
+        args.temperature = 0.0
+    if not hasattr(args, "top_p"):
+        args.top_p = 1.0
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
@@ -1882,7 +1931,20 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.served_model_name or args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer_id = args.tokenizer
+    if tokenizer_id is None:
+        try:
+            resp = requests.get(
+                base_url + "/model_info", headers=get_auth_headers(), timeout=5
+            )
+            if resp.status_code == 200:
+                info = resp.json()
+                tokenizer_id = info.get("tokenizer_path") or info.get("model_path")
+        except Exception:
+            pass
+    if tokenizer_id is None:
+        tokenizer_id = args.model
+
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
@@ -1927,6 +1989,44 @@ def run_benchmark(args_: argparse.Namespace):
             profile_decode_url=getattr(args, "profile_decode_url", None),
         )
     )
+
+
+def _finite_positive_float(value) -> float:
+    """argparse type for a finite, strictly positive float."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite float > 0, got {value!r}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
+    return parsed
+
+
+def _validate_parsed_gsp_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject malformed GSP distribution/alpha combinations at parse time.
+
+    Invoked from the CLI entry point right after ``parser.parse_args()`` so
+    users see a clear argparse-style error before any server, model, or
+    tokenizer setup runs and masks the real cause with an unrelated network
+    failure.
+    """
+    distribution = getattr(args, "gsp_group_distribution", None)
+    alpha = getattr(args, "gsp_zipf_alpha", None)
+    if distribution == "zipf" and alpha is None:
+        parser.error(
+            "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
+            "(a finite float > 0)"
+        )
+    if distribution == "uniform" and alpha is not None:
+        parser.error(
+            "--gsp-zipf-alpha is only meaningful with "
+            "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
+            "or set --gsp-group-distribution=zipf"
+        )
 
 
 class LoRAPathAction(argparse.Action):
@@ -1981,11 +2081,25 @@ if __name__ == "__main__":
             "image",
             "mooncake",
             "longbench_v2",
+            "speed-bench",
         ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--speed-bench-category",
+        type=str,
+        default=None,
+        choices=["low_entropy", "mixed", "high_entropy"],
+        help="Category filter for the speed-bench dataset.",
+    )
+    parser.add_argument(
+        "--speed-bench-output-len",
+        type=int,
+        default=512,
+        help="Fixed output length for speed-bench requests (default: 512).",
     )
     parser.add_argument(
         "--model",
@@ -2150,6 +2264,18 @@ if __name__ == "__main__":
         "--disable-ignore-eos",
         action="store_true",
         help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling parameter.",
     )
     parser.add_argument(
         "--extra-request-body",
@@ -2351,6 +2477,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
     )
+    group.add_argument(
+        "--gsp-group-distribution",
+        type=str,
+        choices=["uniform", "zipf"],
+        default="uniform",
+        help=(
+            "Prefix-group sampling distribution for generated-shared-prefix. "
+            "'uniform' (default) assigns each group an equal number of requests. "
+            "'zipf' samples each request's group by rank with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha); rank starts at 1 "
+            "and group index 0 is the hottest. Requires --gsp-zipf-alpha "
+            "(a finite float > 0) when set to 'zipf'. Total request count is "
+            "still num_groups * prompts_per_group, identical to uniform mode; "
+            "only the per-request group assignment changes. The on-disk "
+            "dataset cache uses a distinct key per (group_distribution, "
+            "zipf_alpha), so uniform-mode caches are never mixed with "
+            "zipf-mode caches and zipf runs with different alpha use "
+            "separate files."
+        ),
+    )
+    group.add_argument(
+        "--gsp-zipf-alpha",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Zipf exponent alpha for --gsp-group-distribution=zipf, with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha) and rank starting "
+            "at 1. Must be a finite float strictly greater than 0; larger "
+            "values concentrate requests on lower-ranked (hotter) groups."
+        ),
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -2398,4 +2555,5 @@ if __name__ == "__main__":
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
+    _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)

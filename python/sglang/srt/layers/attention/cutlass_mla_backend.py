@@ -12,15 +12,17 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -79,6 +81,44 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if forward_mode.is_decode_or_idle() and spec_info is None:
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                    ),
+                )
+            ](
+                self.req_to_token,
+                forward_batch.req_pool_indices[:bs],
+                forward_batch.seq_lens[:bs],
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+                PAGED_SIZE=PAGE_SIZE,
+            )
+            if in_capture:
+                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+                self.forward_metadata = CutlassMLADecodeMetadata(
+                    self.cuda_graph_mla_workspace,
+                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                )
+        else:
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         bs = forward_batch.batch_size
@@ -94,7 +134,9 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     dtype=torch.int32,
                     device=forward_batch.seq_lens.device,
                 )
-                create_flashmla_kv_indices_triton[(bs,)](
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+                ](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -143,83 +185,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    self.cuda_graph_mla_workspace,
-                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                )
-        else:
-            super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-
-        if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            seq_lens = seq_lens[:bs]
-
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-                PAGED_SIZE=PAGE_SIZE,
-            )
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
-
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
@@ -241,14 +206,14 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -269,7 +234,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         q_nope = q_nope.to(self.q_data_type)
         q_rope = q_rope.to(self.q_data_type)
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         o = cutlass_mla_decode(
             q_nope=q_nope,

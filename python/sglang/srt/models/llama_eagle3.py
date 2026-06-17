@@ -49,7 +49,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config, prefix)
+        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
 
         # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0
@@ -195,12 +195,13 @@ class LlamaModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:

@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -54,6 +55,7 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -92,7 +94,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -164,6 +165,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
+    is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -305,7 +307,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -316,8 +322,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
-    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
+    fast_api_app.state.openai_serving_chat = (
+        _global_state.tokenizer_manager.serving_chat_class(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -372,9 +380,17 @@ async def lifespan(fast_api_app: FastAPI):
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
         )
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+    except Exception as e:
+        # Optional endpoint; a load failure (e.g. the gpt-oss harmony vocab
+        # download) must not look like a fatal error. One-line WARNING, full
+        # traceback at DEBUG.
+        logger.warning(
+            f"OpenAI Responses API (/v1/responses) disabled: "
+            f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
+        )
+        logger.debug(
+            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+        )
 
     # Execute custom warmups
     if server_args.warmups is not None:
@@ -418,13 +434,77 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 app.include_router(v1_loads_router)
 
 
+def _anthropic_validation_message(raw_errors) -> str:
+    """Render Pydantic-style errors for an Anthropic /v1/messages route.
+
+    Builds a short ``loc: msg`` digest that names the offending fields without
+    leaking file paths or Python internals (the default ``str(exc)`` includes
+    the dispatcher's ``File "/.../http_server.py"`` line).
+    """
+    parts: list[str] = []
+    for err in raw_errors or []:
+        loc = err.get("loc") or ()
+        if loc:
+            loc_str = ".".join(str(p) for p in loc if p not in ("body",))
+        else:
+            loc_str = ""
+        msg = (err.get("msg") or "").strip()
+        if loc_str and msg:
+            parts.append(f"{loc_str}: {msg}")
+        elif msg:
+            parts.append(msg)
+    text = "; ".join(parts) or "Invalid request"
+    if len(text) > 500:
+        text = text[:500] + "…"
+    return text
+
+
+def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+    """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
+    return ORJSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
+    if request.url.path.startswith("/v1/messages"):
+        # Map HTTP status to Anthropic error.type; fall back to api_error.
+        anthropic_type = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            413: "request_too_large",
+            422: "invalid_request_error",
+            429: "rate_limit_error",
+            500: "api_error",
+            502: "api_error",
+            503: "overloaded_error",
+            504: "api_error",
+        }.get(exc.status_code, "api_error")
+        # 5xx must never echo upstream detail (may contain stack/PII).
+        message = (
+            "Internal server error"
+            if exc.status_code >= 500
+            else (str(exc.detail) if exc.detail else "Request failed")
+        )
+        return _anthropic_error_response(
+            status_code=exc.status_code,
+            error_type=anthropic_type,
+            message=message,
+        )
+
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -451,8 +531,18 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Override FastAPI's default 422 validation error with 400.
 
-    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    For /v1/messages, emit Anthropic-style envelope and scrub the message so
+    file paths or Python internals from the default ``str(exc)`` representation
+    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
+    use the legacy ErrorResponse shape.
     """
+    if request.url.path.startswith("/v1/messages"):
+        return _anthropic_error_response(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            error_type="invalid_request_error",
+            message=_anthropic_validation_message(exc.errors()),
+        )
+
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -526,7 +616,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+    # collide and crash the shared DetokenizerManager decode_status).
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
@@ -635,12 +727,18 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
+    server_args = _global_state.tokenizer_manager.server_args
+
     # server_args.model_config is not serializable but should be excluded by asdict.
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+        **dataclasses.asdict(server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
+        # Structured KV-event publisher descriptor for KV-aware routers.
+        # `None` when publishing is disabled or misconfigured; see
+        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+        "kv_events": server_args.describe_kv_events_publisher(),
     }
 
 
@@ -713,7 +811,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
-                out = {"error": {"message": str(e)}}
+                # A client disconnect also surfaces here. It's a client-side
+                # cancellation, not a server error or bad input -- log it and
+                # stop (the request was already aborted upstream) instead of
+                # emitting a 400.
+                if request is not None and await request.is_disconnected():
+                    logger.info(f"[http_server] Client disconnected: {e}")
+                    return
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": 400,
+                        "retryable": False,
+                    }
+                }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
@@ -1040,9 +1152,11 @@ async def dump_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
 
     content = {
         "success": success,
@@ -1066,10 +1180,11 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1083,10 +1198,11 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1155,9 +1271,10 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
-    )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -1192,10 +1309,11 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1291,15 +1409,21 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
+@app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
-        obj, request
+async def check_weights(
+    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+):
+    if obj is None:
+        obj = CheckWeightsReqInput()
+    success, message, ranks, per_engine_checksum = (
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
+    if per_engine_checksum is not None:
+        body["per_engine_checksum"] = per_engine_checksum
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
@@ -1444,13 +1568,24 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    if getattr(obj, "return_blocks", False):
+        blocks = parser.parse_non_stream_blocks(obj.text)
+        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        reasoning_text = "".join(reasoning_blocks)
+        normal_text = "".join(text_blocks)
+    else:
+        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
+    if getattr(obj, "return_blocks", False):
+        response_data["reasoning_blocks"] = reasoning_blocks
+        response_data["text_blocks"] = text_blocks
+        response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
 
@@ -1598,6 +1733,17 @@ async def openai_v1_audio_transcriptions(
     )
 
 
+@app.websocket("/v1/realtime")
+async def openai_v1_realtime_transcription(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint."""
+    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+    # chat modes. This handler implements the transcription subset only;
+    # chat-mode session.update payloads are rejected by the
+    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+    # (see realtime/protocol.py).
+    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
+
+
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
@@ -1664,12 +1810,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
-async def v1_responses_request(request: dict, raw_request: Request):
+async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+        request, raw_request
     )
 
     # Handle streaming responses
@@ -1884,8 +2029,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     model_info = res.json()
 
-    # Construct a warmup request
-    is_vlm = bool(model_info.get("has_image_understanding", False))
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -1965,6 +2110,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1997,9 +2143,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    server_args.disaggregation_mode,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
