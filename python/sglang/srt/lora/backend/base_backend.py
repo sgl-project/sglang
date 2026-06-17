@@ -384,6 +384,13 @@ def _compute_moe_lora_info(
             (num_tokens,), dtype=torch.int32, device=seg_indptr.device
         )
 
+    # Sentinel-fill so any positions not covered by a segment (foreign tokens
+    # gathered under DP-attention live past ``seg_indptr[-1]``) read as -1
+    # rather than as garbage from the prior batch's mapping. The CUDA-kernel
+    # path overwrites only the in-segment slots; the Python fallback below
+    # uses a padded ``weight_indices`` lookup so the same -1 lands there.
+    token_lora_mapping.fill_(-1)
+
     if adapter_enabled is not None:
         assert (
             len(lora_ranks) <= adapter_enabled.shape[0]
@@ -424,10 +431,7 @@ def _compute_moe_lora_info(
         adapter_enabled.scatter_(
             0, weight_indices.long(), (active_ranks > 0).to(torch.int32)
         )
-    if num_tokens == 0:
-        return adapter_enabled, token_lora_mapping
-    if not has_segments:
-        token_lora_mapping.fill_(-1)
+    if num_tokens == 0 or not has_segments:
         return adapter_enabled, token_lora_mapping
 
     token_positions = torch.arange(
@@ -440,8 +444,15 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
+    # Pad weight_indices with a -1 sentinel so foreign tokens (whose
+    # req_indices land at len(weight_indices)) read -1 instead of going
+    # out of bounds. Matches the kernel-path semantics established above.
+    weight_indices_int32 = weight_indices.to(torch.int32)
+    weight_indices_padded = torch.cat(
+        [weight_indices_int32, weight_indices_int32.new_full((1,), -1)]
+    )
     token_lora_mapping = torch.index_select(
-        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
+        weight_indices_padded, 0, req_indices, out=token_lora_mapping
     )
 
     return adapter_enabled, token_lora_mapping
