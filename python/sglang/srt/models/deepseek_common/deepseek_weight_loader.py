@@ -142,19 +142,13 @@ class DeepseekV2WeightLoaderMixin:
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = (
-            hasattr(self.config, "q_lora_rank")
-            and (self.config.q_lora_rank is not None)
-            and (self.quant_config is None or self.quant_config.get_name() not in ("awq", "awq_marlin", "moe_wna16"))
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
-        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-            name = name.replace(
-                "mlp.shared_experts",
-                f"mlp.experts.{self.config.n_routed_experts}",
-            )
-            #assert self.num_fused_shared_experts == 1
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
