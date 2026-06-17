@@ -573,36 +573,48 @@ def resolve_auto_parsers(server_args) -> None:
 
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
+    chat_template_arg = getattr(server_args, "chat_template", None)
+    try:
+        explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
+    except Exception as e:
+        logger.warning("Failed to load explicit Jinja chat template: %s", e)
+        explicit_jinja_template = None
+    has_explicit_template_without_detection = (
+        chat_template_arg is not None and explicit_jinja_template is None
+    )
+
+    tokenizer = None
     try:
         tokenizer = get_tokenizer(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
         )
-        template = _load_explicit_jinja_template(
-            getattr(server_args, "chat_template", None)
-        )
-        if template is None:
-            template = getattr(tokenizer, "chat_template", None)
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
-        if needs_reasoning:
-            _disable_auto_parser(server_args, "reasoning_parser", "reasoning parser")
-        if needs_tool_call:
-            _disable_auto_parser(server_args, "tool_call_parser", "tool-call parser")
-        return
+
+    template = explicit_jinja_template
+    if template is None and tokenizer is not None:
+        template = getattr(tokenizer, "chat_template", None)
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
     if ctx is None:
-        try:
-            _resolve_architecture_auto_parsers(server_args)
-        except Exception as e:
+        if has_explicit_template_without_detection:
             logger.warning(
-                "Failed to load model config for architecture-based auto-detection: %s",
-                e,
+                "--chat-template=%s is explicit but is not a readable Jinja template, so "
+                "parser auto-detection from chat template is not available.",
+                chat_template_arg,
             )
+        else:
+            try:
+                _resolve_architecture_auto_parsers(server_args)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load model config for architecture-based auto-detection: %s",
+                    e,
+                )
         if needs_reasoning:
             if server_args.reasoning_parser == "auto":
                 _disable_auto_parser(
