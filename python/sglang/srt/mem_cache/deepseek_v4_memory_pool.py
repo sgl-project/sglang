@@ -35,7 +35,8 @@ def get_compress_state_ring_size(
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
     # is incompatible with speculative decode for now.
     if compress_ratio == 128 and ONLINE_C128:
-        assert not is_speculative, "online c128 does not support MTP"
+        if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -374,6 +375,7 @@ class DeepSeekV4LayerItem(NamedTuple):
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
+# The following kv pool follows ATOM's unified_kv kernel layout.
 class DeepSeekV4UnifiedKVPool:
     """
     Layout:
@@ -458,6 +460,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
+        online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
     ):
         super().__init__(
@@ -493,6 +496,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c128_state_pool_size = c128_state_pool_size
         self.state_dtype = state_dtype
         self.compression_ratios = compression_ratios
+        self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+        self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
+        if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            self.online_c128_mtp_pending_seq_lens = torch.empty(
+                max_num_reqs, dtype=torch.int64, device=device
+            )
 
         # Determine this PP stage's absolute layer range
         if (
@@ -758,6 +767,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
                 swa_page_size=self.swa_page_size,
+                online_mtp_max_draft_tokens=(
+                    self.online_mtp_max_draft_tokens if ratio == 128 else 0
+                ),
             )
 
             if ratio == 4:
@@ -814,6 +826,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_state_pool is not None
         ), "Only c4/c128 layers have attention states."
         return compress_state_pool
+
+    def get_online_c128_mtp_state_slot_offset(self) -> int:
+        for pool in self.compress_state_pools:
+            if pool is not None and pool.ratio == 128:
+                return int(pool.online_mtp_state_slot_offset)
+        return 0
+
+    def get_online_c128_mtp_max_draft_tokens(self) -> int:
+        for pool in self.compress_state_pools:
+            if pool is not None and pool.ratio == 128:
+                return int(pool.online_mtp_max_draft_tokens)
+        return 0
+
+    def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:
+        assert self.online_c128_mtp_pending_seq_lens is not None
+        return self.online_c128_mtp_pending_seq_lens
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
