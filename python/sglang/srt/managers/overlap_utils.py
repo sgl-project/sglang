@@ -368,5 +368,3 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
             self.draft_probs_buf[indices] = draft_input.draft_probs
-        if draft_input.draft_probs is not None and self.draft_probs_buf is not None:
-            self.draft_probs_buf[indices] = draft_input.draft_probs

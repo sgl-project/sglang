@@ -360,6 +360,12 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
                 "--speculative-accept-threshold-acc; rejection sampling ignores "
                 "the accept thresholds."
             )
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--enable-deterministic-inference; the sampling kernel draws "
+                "coins from the global RNG and is not batch-invariant."
+            )
         logger.info(
             "Rejection sampling is enabled for speculative decoding "
             "(speculative_use_rejection_sampling=True)."

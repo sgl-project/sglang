@@ -532,7 +532,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        if forward_batch.sampling_info is not None:
+        # Only rejection sampling reads temperatures (renorm_draft_probs); skip
+        # the copy otherwise to keep the non-RS path free of extra work.
+        if (
+            self.model_runner.server_args.speculative_use_rejection_sampling
+            and forward_batch.sampling_info is not None
+        ):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )

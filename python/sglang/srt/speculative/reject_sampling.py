@@ -43,7 +43,7 @@ def speculative_sampling_classic_kernel(
     tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
     last_accepted_global_idx = root_global_idx
 
-    num_accepted = 0
+    num_accept = 0
 
     # Verification Loop
     step = 1
@@ -69,13 +69,13 @@ def speculative_sampling_classic_kernel(
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
 
         if coin * q < p:
-            num_accepted += 1
+            num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
 
             curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
             tl.store(
-                AcceptIndex + pid * stride_idx_b + num_accepted * stride_idx_s,
+                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
                 curr_global_idx,
             )
             last_accepted_global_idx = curr_global_idx
@@ -84,7 +84,7 @@ def speculative_sampling_classic_kernel(
         else:
             continue_verifying = 0
 
-    tl.store(AcceptTokenNum + pid, num_accepted)
+    tl.store(AcceptTokenNum + pid, num_accept)
 
     # Final Sampling
     all_drafts_accepted = continue_verifying
@@ -92,6 +92,10 @@ def speculative_sampling_classic_kernel(
     norm_sum = 0.0
 
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
+    # DraftProbs has only num_steps rows (TargetProbs has num_steps + 1). When
+    # all drafts are accepted cur_prob_row == num_steps is out of bounds for
+    # DraftProbs, but the all-accepted branch samples pure target p and never
+    # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
     # Pass 1: Sum
@@ -112,7 +116,9 @@ def speculative_sampling_classic_kernel(
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF
+    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
+    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
+    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1

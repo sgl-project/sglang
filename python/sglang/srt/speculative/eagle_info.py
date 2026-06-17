@@ -43,7 +43,8 @@ class EagleVerifyInput(SpecInput):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
-    # Per-step draft proposal distribution q; only set under rejection sampling.
+    # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
+    # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
 
     # Shape info for padding
@@ -162,7 +163,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, num_steps + 1, vocab); only set under rejection sampling.
+    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
+    # only set under rejection sampling.
     draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
