@@ -338,9 +338,7 @@ class UMBPStore(HiCacheStorage):
                 )
             if UMBPIoBackend is not None:
                 cfg.ssd.io.backend = (
-                    UMBPIoBackend.Posix
-                    if backend == "posix"
-                    else UMBPIoBackend.IoUring
+                    UMBPIoBackend.Posix if backend == "posix" else UMBPIoBackend.IoUring
                 )
         if "ssd_durability_mode" in extra:
             # Validate even when the enum is unavailable (older mori / mocks).

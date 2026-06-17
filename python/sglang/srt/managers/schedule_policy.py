@@ -642,9 +642,7 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
-    def _accumulate_per_tier_hits(
-        self, l1: int, l2: int, l3: int, miss: int
-    ) -> None:
+    def _accumulate_per_tier_hits(self, l1: int, l2: int, l3: int, miss: int) -> None:
         self.log_l1_hit_tokens += l1
         self.log_l2_hit_tokens += l2
         self.log_l3_hit_tokens += l3
@@ -983,7 +981,9 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, req.extend_input_len)
+                self._accumulate_per_tier_hits(
+                    l1_hit, l2_hit, l3_hit, req.extend_input_len
+                )
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.fill_len = len(req.full_untruncated_fill_ids)
@@ -1002,7 +1002,9 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                 )
-                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, req.extend_input_len)
+                self._accumulate_per_tier_hits(
+                    l1_hit, l2_hit, l3_hit, req.extend_input_len
+                )
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
