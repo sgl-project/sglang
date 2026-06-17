@@ -153,21 +153,21 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-235B-A22B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b#single-node).
+[Qwen3-235B-A22B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b#single-node).
 
 ### Multi-node online deployment
 
 Multi-node deployment distributes tensor parallelism across multiple nodes for models that require more compute resources.
 This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-235B-A22B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b#multi-node).
+[Qwen3-235B-A22B Best Practice — Multi-node On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b#multi-node).
 
 ### Multi-node PD disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
 throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-235B-A22B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b).
+[Qwen3-235B-A22B Best Practice — PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b).
 
 #### 256K long-sequence PD disaggregation on 2 x Atlas 800I A3 (without CP)
 
