@@ -922,14 +922,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len = min(prefix_len, swa_prefix_cap)
                         prefix_indices = prefix_indices[:prefix_len]
                         prefix_match.prefix_indices = prefix_indices
-                        prefix_match.l2_host_hit_length = 0
-                        prefix_match.l3_storage_hit_length = 0
-                        prefix_match.last_host_node = None
-                        prefix_match.prefetch_registered = False
+                        remaining_prefix_len = swa_prefix_cap - prefix_len
+                        prefix_match.l2_host_hit_length = min(
+                            prefix_match.l2_host_hit_length, remaining_prefix_len
+                        )
+                        remaining_prefix_len -= prefix_match.l2_host_hit_length
+                        prefix_match.l3_storage_hit_length = min(
+                            prefix_match.l3_storage_hit_length, remaining_prefix_len
+                        )
+                        if prefix_match.l3_storage_hit_length == 0:
+                            prefix_match.last_host_node = None
+                            prefix_match.prefetch_registered = False
                         # Cap the prefill-committed prefix too: tokens past the
                         # cap are neither device-resident nor HiCache-restored,
                         # so prefill must transfer them.
-                        total_prefix_len = prefix_len
+                        total_prefix_len = prefix_match.decode_prefix_len
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
