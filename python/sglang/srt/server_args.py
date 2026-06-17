@@ -668,7 +668,7 @@ class ServerArgs:
         "auto"
     )
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -2440,21 +2440,8 @@ class ServerArgs:
                     )
 
                 # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Only the kernel/page_first transfer
-                # path has a safe split K/V implementation.
-                if self.hicache_io_backend != "kernel":
-                    logger.warning(
-                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r})."
-                    )
-                    self.hicache_io_backend = "kernel"
-                if self.hicache_mem_layout != "page_first":
-                    logger.warning(
-                        f"Force hicache_mem_layout to 'page_first' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"asymmetric K/V HiCache requires kernel/page_first."
-                    )
-                    self.hicache_mem_layout = "page_first"
+                # asymmetric K/V allocation. Both kernel/page_first and
+                # direct/page_first_direct have split K/V transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -3534,6 +3521,10 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+        from sglang.srt.layers.cp.base import init_cp_strategy
+
+        init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
