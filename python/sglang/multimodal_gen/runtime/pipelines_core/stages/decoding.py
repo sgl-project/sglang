@@ -9,7 +9,11 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_world_size,
+    get_local_torch_device,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -26,7 +30,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled,
+    resolve_precision,
+    temporary_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -101,7 +109,9 @@ class DecodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -114,9 +124,19 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if get_global_server_args().enable_cfg_parallel:
+        server_args = get_global_server_args()
+        if server_args.enable_cfg_parallel:
+            if self._can_use_parallel_decode():
+                return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def _can_use_parallel_decode(self) -> bool:
+        return (
+            model_parallel_is_initialized()
+            and get_decode_parallel_world_size() > 1
+            and self.vae.use_parallel_decode
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
@@ -158,9 +178,11 @@ class DecodingStage(PipelineStage):
             normalized to [0, 1] range and moved to CPU as float32
         """
         latents = latents.to(get_local_torch_device())
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        # Setup VAE precision from user policy.
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
@@ -181,10 +203,14 @@ class DecodingStage(PipelineStage):
                     self.vae.enable_tiling()
             except Exception:
                 pass
+            should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            decode_output = self.vae.decode(latents)
-            image = _ensure_tensor_decode_output(decode_output)
+            with temporary_module_dtype(
+                self.vae, vae_dtype, enabled=should_cast_vae
+            ) as vae:
+                decode_output = vae.decode(latents)
+                image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -222,7 +248,9 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,

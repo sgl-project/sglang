@@ -83,6 +83,8 @@ def _make_model_runner(
     mr.server_args = sa
 
     spec = MagicMock()
+    spec.is_eagle.return_value = False
+    spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
@@ -301,6 +303,35 @@ class TestAllSWAConfigurator(unittest.TestCase):
             config = cfg.calculate_pool_sizes_from_max_tokens(500, page_size=1)
         self.assertEqual(config.max_total_num_tokens, 500)
         self.assertEqual(config.swa_max_total_num_tokens, 500)
+
+
+class TestEagleConfigurator(unittest.TestCase):
+    """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
+
+    def test_eagle_does_not_exceed_budget(self):
+        """Total memory (target + draft KV cache) must not exceed available."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 4
+
+        mr = _make_model_runner(num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = eagle_draft_num_layers
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        full_pt = _full_per_token(mr)
+        total_layers = num_layers + eagle_draft_num_layers
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
 
 
 class TestFactory(unittest.TestCase):
