@@ -872,6 +872,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             )
+            self.hisparse_coordinator.configure_indexcache_prefetch(
+                self.model_config.hf_text_config
+            )
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()

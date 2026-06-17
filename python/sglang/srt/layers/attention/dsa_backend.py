@@ -1644,6 +1644,12 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
+            self.hisparse_coordinator.prefetch_indexcache_shared_layers(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                topk_indices,
+                layer.layer_id,
+            )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:

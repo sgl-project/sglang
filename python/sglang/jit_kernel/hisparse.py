@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -55,6 +56,17 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+@functools.cache
+def _get_tvm_ffi_use_torch_stream():
+    """Make TVM-FFI launches follow torch current stream/cuda graph capture."""
+    try:
+        import tvm_ffi
+
+        return tvm_ffi.use_torch_stream
+    except (ImportError, AttributeError):
+        return nullcontext
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
@@ -64,12 +76,13 @@ def transfer_cache_dsv4_mla(
 ) -> None:
     """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
     module = _jit_dsv4_transfer_module(block_size)
-    module.transfer_cache_dsv4_mla(
-        src_ptrs,
-        dst_ptrs,
-        src_indices,
-        dst_indices,
-    )
+    with _get_tvm_ffi_use_torch_stream()():
+        module.transfer_cache_dsv4_mla(
+            src_ptrs,
+            dst_ptrs,
+            src_indices,
+            dst_indices,
+        )
 
 
 def _load_cache_to_device_buffer_mla(
@@ -112,23 +125,24 @@ def _load_cache_to_device_buffer_mla(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
 
-    module.load_cache_to_device_buffer(
-        top_k_tokens,
-        device_buffer_tokens,
-        host_cache_locs,
-        device_buffer_locs,
-        host_cache,
-        empty,
-        device_buffer,
-        empty,
-        top_k_device_locs,
-        req_pool_indices,
-        seq_lens,
-        lru_slots,
-        num_real_reqs,
-        page_size,
-        item_size_bytes,
-    )
+    with _get_tvm_ffi_use_torch_stream()():
+        module.load_cache_to_device_buffer(
+            top_k_tokens,
+            device_buffer_tokens,
+            host_cache_locs,
+            device_buffer_locs,
+            host_cache,
+            empty,
+            device_buffer,
+            empty,
+            top_k_device_locs,
+            req_pool_indices,
+            seq_lens,
+            lru_slots,
+            num_real_reqs,
+            page_size,
+            item_size_bytes,
+        )
 
 
 def load_cache_to_device_buffer_mla(

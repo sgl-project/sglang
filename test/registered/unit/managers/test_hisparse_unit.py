@@ -158,6 +158,7 @@ class TestHiSparseUnit(unittest.TestCase):
         Without this, a mid-test assertion failure skips cleanup and leaks
         resources, causing unrelated failures in later tests.
         """
+        self.coordinator.wait_for_pending_indexcache_prefetch()
         self.allocator.clear()
         self.req_to_token_pool.clear()
         self.coordinator.mem_pool_host.clear()
@@ -171,6 +172,10 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
         self.coordinator._has_pending_backup = False
+        self.coordinator._indexcache_prefetch_layers_after.clear()
+        self.coordinator._indexcache_prefetch_enabled = False
+        for i in range(len(self.coordinator._indexcache_prefetch_pending)):
+            self.coordinator._indexcache_prefetch_pending[i] = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -338,6 +343,54 @@ class TestHiSparseUnit(unittest.TestCase):
         """
         self.coordinator.num_real_reqs[0] = rpi.shape[0]
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
+
+    def _reset_layer_hot_cache_tags(self, req, layer_id: int):
+        """Restore a cold logical cache state while keeping allocated slot locs.
+
+        The physical device-buffer slot table is created by admit_request_direct
+        and must remain valid; only token tags and LRU order model cache hits.
+        """
+        layer_idx = self.coordinator._local_layer_index(layer_id)
+        self.assertIsNotNone(layer_idx)
+        self.coordinator.req_device_buffer_tokens[layer_idx, req.req_pool_idx, :].fill_(
+            -1
+        )
+        self.coordinator.lru_slots[layer_idx, req.req_pool_idx, :].copy_(
+            self.coordinator._lru_init
+        )
+        self.coordinator.top_k_device_locs_buffer.fill_(-1)
+        self.coordinator.raw_indices_buffer.fill_(-1)
+        for i in range(len(self.coordinator._indexcache_prefetch_pending)):
+            self.coordinator._indexcache_prefetch_pending[i] = False
+
+    def _reset_layer_hot_cache_tags_for_reqs(self, reqs, layer_id: int):
+        """Graph-capturable reset for multiple request hot-cache tag rows."""
+        layer_idx = self.coordinator._local_layer_index(layer_id)
+        self.assertIsNotNone(layer_idx)
+        for req in reqs:
+            self.coordinator.req_device_buffer_tokens[
+                layer_idx, req.req_pool_idx, :
+            ].fill_(-1)
+            self.coordinator.lru_slots[layer_idx, req.req_pool_idx, :].copy_(
+                self.coordinator._lru_init
+            )
+        self.coordinator.top_k_device_locs_buffer[: len(reqs)].fill_(-1)
+        self.coordinator.raw_indices_buffer[: len(reqs)].fill_(-1)
+
+    @staticmethod
+    def _measure_cuda_graph_ms(graph: torch.cuda.CUDAGraph, *, iters: int) -> float:
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / iters
 
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
         """request_finished -> free KV -> free req slot."""
