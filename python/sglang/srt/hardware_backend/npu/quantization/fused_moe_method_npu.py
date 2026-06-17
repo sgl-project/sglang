@@ -975,6 +975,11 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     ):
         from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
+        if hidden_states.dtype == torch.bfloat16:
+            hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states
+            )
+
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
