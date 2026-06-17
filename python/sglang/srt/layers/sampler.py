@@ -330,7 +330,9 @@ class Sampler(nn.Module):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
-        sampling_mask_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        sampling_mask_data: Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ],
     ) -> None:
         probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
         return_sampling_masks = sampling_info.return_sampling_masks or []
