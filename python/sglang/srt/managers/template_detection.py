@@ -528,6 +528,37 @@ def _disable_auto_parser(server_args, attr: str, label: str) -> None:
     setattr(server_args, attr, None)
 
 
+def _resolve_architecture_auto_parsers(server_args) -> None:
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    config = get_config(
+        server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=getattr(server_args, "revision", None),
+        model_config_parser=getattr(server_args, "model_config_parser", "auto"),
+    )
+    architectures = getattr(config, "architectures", None) or []
+    arch = architectures[0] if architectures else ""
+
+    if "DeepseekV4" in arch:
+        reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
+    elif "DeepseekV3" in arch:
+        reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
+    else:
+        return
+
+    for attr, detected in (
+        ("reasoning_parser", reasoning_parser),
+        ("tool_call_parser", tool_call_parser),
+    ):
+        if getattr(server_args, attr) == "auto":
+            setattr(server_args, attr, detected)
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
+                f"from model architecture '{arch}'"
+            )
+
+
 def resolve_auto_parsers(server_args) -> None:
     """Resolve --reasoning-parser=auto and --tool-call-parser=auto before scheduler.
 
@@ -565,10 +596,23 @@ def resolve_auto_parsers(server_args) -> None:
         template, tokenizer, reasoning_config, force_reasoning
     )
     if ctx is None:
+        try:
+            _resolve_architecture_auto_parsers(server_args)
+        except Exception as e:
+            logger.warning(
+                "Failed to load model config for architecture-based auto-detection: %s",
+                e,
+            )
         if needs_reasoning:
-            _disable_auto_parser(server_args, "reasoning_parser", "reasoning parser")
+            if server_args.reasoning_parser == "auto":
+                _disable_auto_parser(
+                    server_args, "reasoning_parser", "reasoning parser"
+                )
         if needs_tool_call:
-            _disable_auto_parser(server_args, "tool_call_parser", "tool-call parser")
+            if server_args.tool_call_parser == "auto":
+                _disable_auto_parser(
+                    server_args, "tool_call_parser", "tool-call parser"
+                )
         return
 
     if needs_reasoning:

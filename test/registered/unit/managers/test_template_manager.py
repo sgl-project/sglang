@@ -634,6 +634,50 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertIsNone(args.reasoning_parser)
         self.assertIsNone(args.tool_call_parser)
 
+    def test_deepseek_v32_arch_without_chat_template_uses_custom_encoder(self):
+        args = self._make_server_args(
+            reasoning_parser="auto", tool_call_parser="auto"
+        )
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+
+        with (
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer",
+                return_value=tokenizer,
+            ),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=config,
+            ),
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "deepseek-v3")
+        self.assertEqual(args.tool_call_parser, "deepseekv32")
+
+    def test_deepseek_v4_arch_without_chat_template_uses_custom_encoder(self):
+        args = self._make_server_args(
+            reasoning_parser="auto", tool_call_parser="auto"
+        )
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+        with (
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer",
+                return_value=tokenizer,
+            ),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=config,
+            ),
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "deepseek-v4")
+        self.assertEqual(args.tool_call_parser, "deepseekv4")
+
     def test_explicit_jinja_template_takes_precedence(self):
         tokenizer = _DummyTokenizer([], chat_template=None)
 
