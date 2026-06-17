@@ -112,11 +112,8 @@ jobs:
 
       - name: Run stage-a tests (card-sharded)
         timeout-minutes: 60
-        env:
-          # Start serial; ramp up to N (= card count) once measured.
-          SGLANG_XPU_MAX_CONCURRENCY: "1"
         run: |
-          docker exec -e SGLANG_XPU_MAX_CONCURRENCY ci_sglang_xpu bash -c \
+          docker exec ci_sglang_xpu bash -c \
             "source /opt/venv/bin/activate && cd /sglang-checkout && bash scripts/ci/xpu/run_card_sharded.sh stage-a-test-1-gpu-xpu"
 
       - name: Cleanup container

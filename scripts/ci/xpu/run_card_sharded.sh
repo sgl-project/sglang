@@ -20,18 +20,31 @@ set -uo pipefail
 SUITE="${1:?suite name required as first arg}"
 TIMEOUT_PER_FILE="${2:-1800}"
 
-N=$(python3 -c "import torch
-ok = hasattr(torch, 'xpu') and torch.xpu.is_available()
-print(torch.xpu.device_count() if ok else 0)")
+N=$(python3 -c "
+import torch
+if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+    print(0)
+else:
+    live = 0
+    for i in range(torch.xpu.device_count()):
+        try:
+            torch.zeros(1, device=f'xpu:{i}')
+            live += 1
+        except Exception:
+            pass
+    print(live)
+")
 
 if [ "$N" -eq 0 ]; then
-  echo "::error::No XPU devices available on $(hostname)"
+  echo "::error::No live XPU devices available on $(hostname)"
   exit 1
 fi
 
+echo "Detected $N live XPU card(s) on $(hostname)"
+
 MAX="${SGLANG_XPU_MAX_CONCURRENCY:-$N}"
 if [ "$MAX" -lt "$N" ]; then
-  echo "::warning::Capping shard count at $MAX (box has $N cards)"
+  echo "::warning::Capping shard count at $MAX (live cards: $N)"
   N="$MAX"
 fi
 
