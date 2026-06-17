@@ -2,14 +2,13 @@
 
 The decode worker reuses full-attention prefix KV while transferring the SWA
 window fresh per request. This path requires the unified radix tree and validates
-both multi-turn cache hits and two-pass GSM8K accuracy.
+multi-turn cache hits, two-pass GSM8K accuracy, and HiCache file-backend restore.
 """
 
 import asyncio
 import os
 import shutil
 import tempfile
-import time
 import unittest
 
 import requests
@@ -165,7 +164,6 @@ class TestDisaggregationDecodeRadixCacheSWAHiCacheFileBackend(
 
         history.extend(primed.output_ids)
         history.extend(suffixes[1])
-        time.sleep(1)
         self._flush_memory_cache()
 
         restored = self._generate(history, output_len)
@@ -173,7 +171,6 @@ class TestDisaggregationDecodeRadixCacheSWAHiCacheFileBackend(
 
         history.extend(restored.output_ids)
         history.extend(suffixes[2])
-        time.sleep(1)
         self._flush_memory_cache()
 
         restored_again = self._generate(history, output_len)
