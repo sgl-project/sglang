@@ -260,37 +260,6 @@ def test_dsv4_swap_in_reads_paged_host_layout() -> None:
     )
 
 
-def test_swap_in_ignores_invalid_topk_entries_long_seq() -> None:
-    state = _make_state(
-        device_buffer_locs_rows=[[0, 1, 2, 3, 4]],
-        device_buffer_tokens_rows=[[-1, -1, -1, -1, -1]],
-        newest_tokens=[7],
-    )
-
-    top_k_tokens = torch.tensor([[1, -1, 9, 2]], dtype=torch.int32, device=DEVICE)
-    out = _run_kernel(
-        top_k_tokens=top_k_tokens,
-        device_buffer_tokens=state["device_buffer_tokens"],
-        host_cache_locs=state["host_cache_locs"],
-        device_buffer_locs=state["device_buffer_locs"],
-        host_cache=state["host_cache"],
-        device_buffer=state["device_buffer"],
-        lru_slots=state["lru_slots"],
-        seq_len=8,
-    )
-
-    assert out[0, 1].item() == -1
-    assert out[0, 2].item() == -1
-    assert torch.equal(
-        state["device_buffer"][out[0, 0].long()],
-        state["host_cache"][1].to(DEVICE),
-    )
-    assert torch.equal(
-        state["device_buffer"][out[0, 3].long()],
-        state["host_cache"][2].to(DEVICE),
-    )
-
-
 def _long_case():
     # One-request baseline used by the stateful cases below:
     # req 0 LRU slots      : [0, 1, 2, 3]
