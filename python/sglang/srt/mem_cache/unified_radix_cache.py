@@ -29,12 +29,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -66,9 +68,6 @@ from sglang.srt.session.streaming_session import StreamingSession
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        PrefetchOperation,
-    )
     from sglang.srt.server_args import ServerArgs
 
 
@@ -1831,6 +1830,97 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         return transfers
+
+    def _build_storage_hit_query_transfers(
+        self, prefetch_tokens: int
+    ) -> list[PoolTransfer]:
+        transfers: list[PoolTransfer] = []
+        source_transfers: dict[PoolName, PoolTransfer] = {}
+        prefetch_pages = prefetch_tokens // self.page_size
+
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+
+            if comp.component_type == ComponentType.SWA:
+                window_pages = (
+                    getattr(comp, "sliding_window_size") + self.page_size - 1
+                ) // self.page_size
+                if window_pages == 0 or prefetch_pages < window_pages:
+                    continue
+                transfer = PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["__placeholder__"] * window_pages,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            elif comp.component_type == ComponentType.MAMBA:
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__placeholder__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            else:
+                continue
+
+            transfers.append(transfer)
+            source_transfers[transfer.name] = transfer
+
+        for spec in self.sidecar_pool_specs:
+            keys = None
+            if spec.indices_from_pool != PoolName.KV:
+                source_transfer = source_transfers.get(spec.indices_from_pool)
+                if source_transfer is None:
+                    continue
+                keys = source_transfer.keys
+            transfers.append(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    keys=keys,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+            )
+
+        return transfers
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=self._build_storage_hit_query_transfers(len(prefetch_key)),
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
