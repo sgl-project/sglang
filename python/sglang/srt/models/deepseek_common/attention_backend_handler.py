@@ -1,7 +1,9 @@
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -41,15 +43,14 @@ def handle_attention_ascend(attn, forward_batch):
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MLA_NPU
@@ -72,7 +73,7 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 
 
 def _handle_attention_backend(attn, forward_batch, backend_name):
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the
@@ -130,7 +131,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -170,7 +171,7 @@ def handle_attention_dsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
