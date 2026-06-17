@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -27,6 +28,7 @@ register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
     GSM8KMixin,
@@ -106,6 +108,7 @@ class TestDPAttentionGatherv(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
@@ -138,6 +141,7 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,
@@ -178,6 +182,7 @@ class TestDPRetract(
             self.assertIsNone(self.process.poll())
 
 
+@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
