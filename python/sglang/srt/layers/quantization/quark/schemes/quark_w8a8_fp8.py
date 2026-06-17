@@ -12,6 +12,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -174,6 +175,27 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # fused_rms_fp8_group_quant (aiter gfx95) passes activations as a tuple.
+        # 3-tuple (fp8, scale, bf16): use the bf16 copy produced by output_unquantized_inp1=True.
+        # 2-tuple (fp8, group_scale): dequantize to bf16; scale layout mirrors
+        #   transpose_scale=_use_aiter_bpreshuffle_gfx95 used at quantization time.
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                fp8_q, gs = x[0], x[1]
+                m, k = fp8_q.shape
+                if _use_aiter_bpreshuffle_gfx95:
+                    gs = gs.t().contiguous()
+                k_groups = gs.shape[1]
+                group_size = k // k_groups
+                x = (
+                    fp8_q.to(torch.float32)
+                    .view(m, k_groups, group_size)
+                    .mul_(gs.to(torch.float32).unsqueeze(-1))
+                    .view(m, k)
+                    .to(torch.bfloat16)
+                )
 
         return apply_fp8_linear(
             x,
