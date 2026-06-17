@@ -85,6 +85,32 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "NPU must avoid the torch.compile/Triton swigluoai helper.",
         )
 
+    def test_large_gemma_rmsnorm_residual_avoids_npu_triton_kernel(self):
+        source = _read("python/sglang/srt/layers/layernorm.py")
+        tree = ast.parse(source)
+        class_node = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "GemmaRMSNorm"
+        )
+        function_names = {
+            node.name for node in class_node.body if isinstance(node, ast.FunctionDef)
+        }
+        forward_npu = next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_npu"
+        )
+        forward_source = ast.get_source_segment(source, forward_npu)
+
+        self.assertIn("_forward_npu_unfused_residual", function_names)
+        self.assertIn("_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE", source)
+        self.assertRegex(
+            forward_source,
+            r"x\.shape\[-1\]\s*>\s*_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE",
+            "MiniMax-M3 hidden_size=6144 must avoid the fused Triton residual kernel.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
