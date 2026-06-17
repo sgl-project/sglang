@@ -15,6 +15,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, suite="base-b-kernel-unit-1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 G = 128
 

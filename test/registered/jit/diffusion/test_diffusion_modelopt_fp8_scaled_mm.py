@@ -1,17 +1,25 @@
 import sys
+import unittest
 
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp8Config,
-    ModelOptFp8LinearMethod,
-)
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
-from sglang.srt.layers.quantization.fp8_utils import (
-    cutlass_fp8_supported,
-    input_to_float8,
-)
+if torch.cuda.is_available():
+    from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+        ModelOptFp8Config,
+        ModelOptFp8LinearMethod,
+    )
+    from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.layers.quantization.fp8_utils import (
+        cutlass_fp8_supported,
+        input_to_float8,
+    )
+else:
+    ModelOptFp8Config = None
+    ModelOptFp8LinearMethod = None
+    static_quant_fp8 = None
+    cutlass_fp8_supported = lambda: False
+    input_to_float8 = None
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="base-b-kernel-unit-1-gpu-large")
@@ -81,6 +89,7 @@ def _build_layer(
     return layer, method
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _modelopt_fp8_supported(),
     reason="Diffusion ModelOpt FP8 scaled mm correctness requires CUDA FP8 support",
@@ -107,6 +116,7 @@ def test_checkpoint_processing(m: int, n: int, k: int) -> None:
     torch.testing.assert_close(actual_weight, expected_weight, atol=0.0, rtol=0.0)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.skipif(
     not _modelopt_fp8_supported(),
     reason="Diffusion ModelOpt FP8 scaled mm correctness requires CUDA FP8 support",

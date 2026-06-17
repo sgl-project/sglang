@@ -19,7 +19,10 @@ register_cuda_ci(est_time=120, suite="base-b-kernel-unit-1-gpu-b200")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 # Skip this test on Hopper machine
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+skip_condition = not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 
 def apply_rotary_emb(
