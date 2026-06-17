@@ -62,6 +62,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
+    is_dp_gatherv_active,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -1502,6 +1503,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
+        # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
+        # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
+        # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
+        # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
+        # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
+        # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
+        # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+        _use_gatherv_pair = (
+            _use_tp_moe_gather
+            and is_dp_gatherv_active()
+            and forward_batch.dp_padding_mode is not None
+            and not forward_batch.dp_padding_mode.is_max_len()
+        )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -1528,7 +1542,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
-            use_reduce_scatter=_use_cp,
+            # Skip the MoE-internal post-experts all_reduce when we will do the
+            # reduce via reduce_scatterv at the combine below (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1537,7 +1553,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv():
+            if should_use_dp_reduce_scatterv() or _use_gatherv_pair:
+                # SUM the TP-sharded per-rank partial expert outputs AND scatter
+                # each rank its own token slice, in one op. Correct because the
+                # MoE-internal all_reduce was skipped (use_reduce_scatter above).
+                # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
