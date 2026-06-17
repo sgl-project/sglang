@@ -1826,6 +1826,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                if getattr(recv_obj, "disagg_prefill_prefix_len", None):
+                    meta_info["disagg_prefill_prefix_len"] = recv_obj.disagg_prefill_prefix_len[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]

@@ -268,6 +268,7 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    disagg_prefill_prefix_len: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
@@ -374,6 +375,8 @@ class _GenerationStreamAccumulator:
 
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+
+        self.disagg_prefill_prefix_len.append(req.disagg_prefill_prefix_len)
 
         self.retraction_counts.append(req.retraction_count)
 
@@ -502,6 +505,7 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            disagg_prefill_prefix_len=self.disagg_prefill_prefix_len or None,
             input_token_logprobs_val=self.input_token_logprobs_val,
             input_token_logprobs_idx=self.input_token_logprobs_idx,
             output_token_logprobs_val=self.output_token_logprobs_val,
