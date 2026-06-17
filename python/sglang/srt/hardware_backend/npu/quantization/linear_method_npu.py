@@ -13,10 +13,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
+
+
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
 # by the runtime), so this module needs no top-level `import torch_npu` and stays
 # importable on CUDA/CPU/AMD/XPU CI.
-_FLOAT8_E8M0FNU_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+def _get_float8_e8m0fnu_dtype():
+    # Resolve lazily rather than as a module-level constant: this module is
+    # imported early (during quant-scheme registration), so reading the dtype at
+    # call time keeps it correct regardless of import order / platform.
+    return getattr(torch, "float8_e8m0fnu", None)
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -256,13 +262,14 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         else:
             quant_bias = bias.to(torch.float32)
 
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
         output = torch.ops.npu.npu_quant_matmul(
             qx,
             layer.weight,
             layer.weight_scale_inv,
-            scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+            scale_dtype=e8m0_dtype,
             pertoken_scale=input_scale,
-            pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+            pertoken_scale_dtype=e8m0_dtype,
             bias=quant_bias,
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
