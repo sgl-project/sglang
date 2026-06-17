@@ -381,7 +381,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            weight_type="w13",
+            weight_prefix="w13",
             **extra_weight_attrs,
         )
         layer.w2_scheme.create_weights(
@@ -389,7 +389,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            weight_type="w2",
+            weight_prefix="w2",
             **extra_weight_attrs,
         )
 
