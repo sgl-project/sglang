@@ -1,9 +1,4 @@
-"""Regression test for issue #26163: return_hidden_states under EAGLE spec V2
-must yield len(hidden_states) == completion_tokens. The spec-V2 path used to
-.append a single row per verify step from a strided
-[bs * speculative_num_draft_tokens, hidden_dim] tensor, silently truncating
-output and potentially aliasing onto a neighbor request's rows.
-"""
+"""Regression test for issue #26163: return_hidden_states under EAGLE spec V2."""
 
 import unittest
 
@@ -39,9 +34,7 @@ class TestEagleReturnHiddenStates(CustomTestCase):
             cls.engine.shutdown()
 
     def test_hidden_states_length_matches_completion(self):
-        # Two prompts of different lengths catch the i*stride+accept_lens[i]
-        # slicing: with the old code, req 1's accepted-rows are partly stolen
-        # from req 0's window and vice versa.
+        # Two prompts to exercise cross-request stride aliasing.
         prompts = [
             "Repeat: the quick brown fox the quick brown fox the quick brown fox",
             "Count down from ten: ten nine eight",
@@ -62,10 +55,7 @@ class TestEagleReturnHiddenStates(CustomTestCase):
                 ct,
                 f"len(hidden_states)={len(hs)} but completion_tokens={ct}",
             )
-            # hs[0] is the prefill block (List[List[float]]); hs[1:] are
-            # per-decode-token rows (List[float]). All decode rows must share
-            # the same hidden_dim — a collapsed/promoted shape would indicate
-            # strided-tensor misindexing in the spec-V2 path.
+            # hs[0] is the prefill block (List[List[float]]); hs[1:] are decode rows.
             decode_rows = hs[1:]
             self.assertGreater(len(decode_rows), 0)
             hidden_dim = len(decode_rows[0])

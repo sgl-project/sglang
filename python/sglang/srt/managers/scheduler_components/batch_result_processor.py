@@ -673,8 +673,7 @@ class SchedulerBatchResultProcessor:
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
                 else:
-                    # Spec V2 hidden_states is strided [bs * speculative_num_draft_tokens, hidden_dim].
-                    # Req i's accepted-plus-bonus rows live at [i*stride : i*stride + accept_len].
+                    # Spec V2: hidden_states is [bs * speculative_num_draft_tokens, hidden_dim].
                     stride = result.speculative_num_draft_tokens
                     accept_len = result.num_correct_drafts_per_req_cpu[i] + 1
                     start = i * stride

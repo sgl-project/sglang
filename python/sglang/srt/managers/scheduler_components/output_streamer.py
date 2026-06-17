@@ -480,10 +480,7 @@ class _GenerationStreamAccumulator:
 
         if self.return_hidden_states:
             if req.return_hidden_states:
-                # Mirror output_ids_through_stop: drop rows past finished_len
-                # so len(hidden_states) tracks completion_tokens. Spec V2 verify
-                # steps can overshoot when the final accepted run crosses
-                # max_new_tokens; this trims that tail.
+                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
                 hs = req.hidden_states
                 if req.finished_len is not None:
                     hs = hs[: req.finished_len]
