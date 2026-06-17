@@ -122,6 +122,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
+        tp_size = 4
 
         # --- w13 (gate & up) projection ---
         hidden_states = self.config.layer.w13_kernel.apply(
@@ -147,6 +148,10 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                 hidden_states
             )
 
+        # TP all-gather for intermediate dimension if needed
+        if tp_size > 1:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
+
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -158,7 +163,9 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             group_list_type=group_list_type,
         )
 
-        #print(hidden_states)
+        # TP all-gather for intermediate dimension if needed
+        if tp_size > 1:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         return TorchNpuRunnerOutput(hidden_states=hidden_states)
 
