@@ -3684,10 +3684,14 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    if not torch.version.hip:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
         return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
+    except Exception as e:
+        logger.warning("Failed to determine gfx942 support: %s", e)
         return False
 
 
