@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -41,6 +42,9 @@ _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
 _mnnvl_non_blackwell_fallback_logged = False
+# Mirrors flashinfer.comm.trtllm_ar.MAX_COMM_SIZE (MAX_INT32 rounded down to 2MB):
+# the largest one-shot lamport comm the MoE-finalize fusion kernel accepts.
+_FLASHINFER_MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -62,17 +66,28 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     if backend == "auto":
         # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
         # single-node); fall back to trtllm otherwise.
-        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
-
-    if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
+        resolved = "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
+    elif backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
         if not _mnnvl_non_blackwell_fallback_logged:
             logger.info(
                 "FlashInfer allreduce fusion: forcing trtllm backend "
                 "(mnnvl requires a Blackwell system, or SM90 single-node)."
             )
             _mnnvl_non_blackwell_fallback_logged = True
-        return "trtllm"
-    return backend
+        resolved = "trtllm"
+    else:
+        resolved = backend
+
+    # The deferred MoE finalize fusion (kMoEFinalizeARResidualRMSNorm, pattern 7)
+    # is only implemented by the trtllm backend; mnnvl rejects it. When deferred
+    # finalize is enabled the finalize is folded into the AR + residual + RMSNorm
+    # fusion, so the shared workspace must be trtllm (which also serves the plain
+    # kARResidualRMSNorm pattern used by the non-finalize fusion path). Note this
+    # ties the whole fusion to trtllm's intra-node lamport all-reduce, so deferred
+    # finalize fusion is single-(NVLink-)node only -- see _mnnvl_supported.
+    if resolved == "mnnvl" and envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get():
+        resolved = "trtllm"
+    return resolved
 
 
 def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
@@ -906,7 +921,25 @@ def flashinfer_moe_finalize_allreduce_residual_rmsnorm(
     if world_size <= 1:
         return None, None
 
-    assert residual.shape[0] <= max_token_num
+    # The MoE-finalize pattern all-reduces the *permuted* expert output
+    # (``gemm2_out``), whose row count is dominated by per-expert tile padding and
+    # is many times larger than the token count. FlashInfer sizes the lamport comm
+    # buffer from ``allreduce_in.numel()``, so the workspace must cover
+    # ``gemm2_out.shape[0]`` rows, not ``residual.shape[0]``.
+    comm_token_num = gemm2_out.shape[0]
+    # FlashInfer's MoE-finalize kernel derives ``top_k`` from
+    # ``expanded_idx_to_permuted_idx.size(-1)`` and indexes both the index map and
+    # ``expert_scale_factor`` as ``[token, slot]``. The deferred-finalize path hands
+    # us a *flat* ``[token_num * top_k]`` index tensor, which would make the kernel
+    # treat ``top_k == token_num * top_k`` and read far past the end of every per-
+    # token row (illegal access). Restore the ``[token_num, top_k]`` shape the kernel
+    # expects (``expert_scale_factor`` is already 2D, but normalize defensively).
+    num_token = residual.shape[0]
+    top_k = expanded_idx_to_permuted_idx.numel() // max(num_token, 1)
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(
+        num_token, top_k
+    )
+    expert_scale_factor = expert_scale_factor.reshape(num_token, top_k)
     if (
         not gemm2_out.is_contiguous()
         or not residual.is_contiguous()
@@ -921,20 +954,38 @@ def flashinfer_moe_finalize_allreduce_residual_rmsnorm(
         logger.debug("Non-contiguous tensors, skipping FlashInfer MoE finalize fusion")
         return None, None
 
-    if not ensure_workspace_initialized(
-        max_token_num=max_token_num,
-        hidden_dim=residual.shape[-1],
-        use_fp32_lamport=(residual.dtype == torch.float32),
-        dtype=residual.dtype,
-        token_num=residual.shape[0],
-        use_oneshot=use_oneshot,
-        use_attn_tp_group=use_attn_tp_group,
-    ):
-        logger.debug("FlashInfer workspace not available")
+    # FlashInfer's MoE-finalize fusion is one-shot only and rejects comms whose
+    # lamport size exceeds MAX_COMM_SIZE. Mirror that bound here and fall back for
+    # large (e.g. prefill) shapes instead of letting the kernel raise.
+    required_comm_size = comm_token_num * residual.shape[-1] * 2 * world_size
+    if required_comm_size > _FLASHINFER_MAX_COMM_SIZE:
+        logger.debug(
+            "MoE finalize fusion comm size %d exceeds MAX_COMM_SIZE; falling back",
+            required_comm_size,
+        )
         return None, None
 
+    # Never grow the workspace here: this op runs inside captured CUDA graphs, and
+    # reallocating the symmetric workspace would invalidate graph-captured pointers.
+    # The workspace is pre-sized for the deferred-finalize comm in
+    # pre_initialize_workspaces(); if it is too small for this shape (e.g. an
+    # un-captured large prefill), fall back to the separate finalize + AR fusion.
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    if workspace_manager.workspace is None:
+    if (
+        not workspace_manager.initialized
+        or workspace_manager.workspace is None
+        or not workspace_manager.is_buffer_size_sufficient(
+            token_num=comm_token_num,
+            hidden_dim=residual.shape[-1],
+            dtype=residual.dtype,
+            use_oneshot=use_oneshot,
+        )
+    ):
+        logger.debug(
+            "FlashInfer workspace insufficient for MoE finalize fusion "
+            "(need %d permuted rows); falling back",
+            comm_token_num,
+        )
         return None, None
 
     residual_out = torch.empty_like(residual)
@@ -964,21 +1015,31 @@ def pre_initialize_workspaces(
     hidden_dim: int,
     dtype: torch.dtype,
     use_oneshot: Optional[bool] = None,
+    moe_finalize_max_token_num: Optional[int] = None,
 ):
     """Pre-initialize flashinfer workspaces before CUDA graph capture.
 
     This must be called before graph capture to avoid collective operations
     (broadcasts, barriers) inside the graph capture context, which can
     deadlock with custom_all_reduce.register_graph_buffers.
+
+    ``moe_finalize_max_token_num`` sizes the MoE-TP workspace for the deferred
+    MoE-finalize AR fusion, whose ``allreduce_in`` is the *permuted* expert
+    output (``num_local_experts`` tile padding + ``num_tokens * top_k`` rows) and
+    is far larger than the token count. It must be sized up front because the
+    fused op runs inside captured CUDA graphs and must never grow the workspace.
     """
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return
 
-    # Initialize MoE workspace
+    # Initialize MoE workspace (sized for the permuted MoE-finalize comm when the
+    # deferred-finalize fusion is enabled).
+    moe_max_token_num = max(max_token_num, moe_finalize_max_token_num or 0)
     ensure_workspace_initialized(
-        max_token_num=max_token_num,
+        max_token_num=moe_max_token_num,
         hidden_dim=hidden_dim,
         dtype=dtype,
+        token_num=moe_max_token_num,
         use_oneshot=use_oneshot,
         use_attn_tp_group=False,
     )
