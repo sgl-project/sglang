@@ -1,4 +1,3 @@
-import sys
 import unittest
 
 import requests
@@ -28,7 +27,7 @@ register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-2-gpu-large-amd")
 
 
-@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
     GSM8KMixin,
@@ -108,7 +107,7 @@ class TestDPAttentionGatherv(
         kill_process_tree(cls.process.pid)
 
 
-@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
@@ -141,7 +140,7 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
-@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,
@@ -182,7 +181,7 @@ class TestDPRetract(
             self.assertIsNone(self.process.poll())
 
 
-@unittest.skipIf(is_in_amd_ci(), "Only run TestDPAttentionGatherv on AMD CI")
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -229,7 +228,4 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
 
 
 if __name__ == "__main__":
-    # run_suite.py invokes files with `python3 <file> -f`. Strip unittest
-    # fail-fast here so all DP Attention cases run and report their results.
-    sys.argv = [a for a in sys.argv if a not in ("-f", "--failfast")]
     unittest.main()
