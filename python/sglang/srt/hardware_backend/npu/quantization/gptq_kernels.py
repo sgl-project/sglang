@@ -188,7 +188,7 @@ class GPTQMoEAscendKernel:
                 layer.w13_scales.data.abs_()
 
             layer.w13_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
+                torch.ops.npu.npu_convert_weight_to_int4pack(
                     w13_qweight_tmp.reshape(
                         layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
                     )
@@ -238,7 +238,7 @@ class GPTQMoEAscendKernel:
                 layer.w2_scales.data.abs_()
 
             layer.w2_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
+                torch.ops.npu.npu_convert_weight_to_int4pack(
                     w2_qweight_tmp.reshape(
                         layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
                     )
