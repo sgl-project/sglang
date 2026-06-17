@@ -640,7 +640,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
-        out = decode_wrapper.run(
+        o = decode_wrapper.run(
             q_nope,
             q_rope,
             k_buffer[:, :, : layer.v_head_dim],
@@ -649,7 +649,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
             return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
         )
-        return out
+        if isinstance(o, tuple):
+            out, lse = o
+            out = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return (out, lse)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 class FlashInferMLAIndicesUpdaterDecode:
