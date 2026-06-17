@@ -23,16 +23,12 @@ from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -657,6 +653,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [
+            (f"draft_step_{i}", r)
+            for i, r in enumerate(self.draft_worker.draft_runner_list)
+        ]
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -834,15 +836,3 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
-
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
-            self.draft_worker.draft_runner_list + [self.target_worker.model_runner],
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
