@@ -369,14 +369,21 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        is_full_load: bool = True,
+    ):
         def remap_assistant_weights():
             for name, weight in weights:
                 if name.startswith("masked_embedding."):
                     name = name.removeprefix("masked_embedding.")
                 yield name, weight
 
-        result = super().load_weights(remap_assistant_weights())
+        result = super().load_weights(
+            remap_assistant_weights(), is_full_load=is_full_load
+        )
         if self.use_ordered_embeddings:
             self._reorder_embedding_to_centroid_order()
         return result
