@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -149,11 +148,6 @@ def validate_continuous_batching_config(server_args: Any) -> None:
             "use --backend sglang"
         )
 
-    if pipeline_config.task_type != ModelTaskType.T2I:
-        raise ContinuousBatchingError(
-            "continuous batching currently only supports text-to-image pipelines"
-        )
-
     disagg_role = getattr(server_args, "disagg_role", RoleType.MONOLITHIC)
     disagg_role_value = getattr(disagg_role, "value", disagg_role)
     if disagg_role_value != RoleType.MONOLITHIC.value:
@@ -196,12 +190,6 @@ def validate_continuous_batching_request(req: Req, server_args: Any) -> None:
     if not isinstance(req, Req):
         raise ContinuousBatchingError(
             f"continuous batching only handles generation Req objects, got {type(req)}"
-        )
-
-    pipeline_config = server_args.pipeline_config
-    if pipeline_config.task_type != ModelTaskType.T2I:
-        raise ContinuousBatchingError(
-            "continuous batching currently only supports text-to-image pipelines"
         )
 
     if not isinstance(getattr(req, "prompt", None), str):
