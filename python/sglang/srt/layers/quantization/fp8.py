@@ -56,7 +56,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
-    cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
@@ -64,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    use_flashinfer_fp8,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -82,6 +82,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -339,7 +340,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -669,7 +669,10 @@ class Fp8LinearMethod(LinearMethodBase):
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
                 if (
-                    self.cutlass_fp8_supported
+                    (
+                        (is_sm90_supported() or is_blackwell_supported())
+                        and not use_flashinfer_fp8()
+                    )
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -710,7 +713,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    self.cutlass_fp8_supported
+                    (
+                        (is_sm90_supported() or is_blackwell_supported())
+                        and not use_flashinfer_fp8()
+                    )
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -850,7 +856,6 @@ class Fp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
 
@@ -878,8 +883,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
-                cutlass_fp8_supported()
-            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+                is_sm90_supported() or is_blackwell_supported()
+            ), "cutlass_fp8 MoE requires SM90 or newer"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
@@ -1771,7 +1776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif envs.SGLANG_MOE_PADDING.get():
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),

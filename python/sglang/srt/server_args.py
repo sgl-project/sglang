@@ -258,6 +258,7 @@ MOE_A2A_BACKEND_CHOICES = [
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
+    "flashinfer",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_deepgemm",
@@ -3650,15 +3651,6 @@ class ServerArgs:
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if envs.SGLANG_CUTLASS_MOE.get():
-            logger.warning(
-                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-            )
-            assert self.quantization in [
-                "fp8",
-                "mxfp8",
-            ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-            self.moe_runner_backend = "cutlass"
         if self.moe_runner_backend == "cutlass" and self.quantization in [
             "fp8",
             "mxfp8",
@@ -6004,14 +5996,15 @@ class ServerArgs:
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.fp8_gemm_runner_backend,
             dest="fp8_gemm_runner_backend",
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. "
+            help="Choose the runner backend for blockwise and per-tensor FP8 GEMM operations. "
             "Options: 'auto' (default, auto-selects based on hardware), "
             "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
-            "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'flashinfer' (SM100 only, autotunes over all Flashinfer backends), "
+            "'flashinfer_trtllm' (SM100 only, low-latency decoding), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), "
-            "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
-            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
-            "'triton' (fallback, widely compatible), "
+            "'flashinfer_deepgemm' (SM90 only; uses swapAB optimization for small M dimensions in decoding), "
+            "'cutlass' (SM90, SM100, SM120, widely compatible), "
+            "'triton' (fallback, not recommended for performance), "
             "'aiter' (ROCm only). ",
         )
         parser.add_argument(

@@ -44,8 +44,8 @@ from sglang.srt.layers.quantization.fp4_utils import (
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    apply_fp8_linear_bmm_flashinfer,
-    cutlass_fp8_supported,
+    apply_fp8_linear_flashinfer,
+    get_fp8_gemm_runner_backend,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -68,6 +68,7 @@ from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
     is_flashinfer_available,
+    is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
     next_power_of_2,
@@ -512,8 +513,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__()
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        gemm_backend = get_fp8_gemm_runner_backend()
+        self.enable_flashinfer_bmm = (
+            is_sm100_supported()
+            and is_flashinfer_available()
+            and (gemm_backend.is_auto() or gemm_backend.is_flashinfer())
+        )
 
     def create_weights(
         self,
@@ -575,7 +580,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
-        if self.cutlass_fp8_supported and not self.enable_flashinfer_bmm:
+        if (
+            is_sm90_supported() or is_blackwell_supported()
+        ) and not self.enable_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -588,7 +595,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
-            return apply_fp8_linear_bmm_flashinfer(
+            return apply_fp8_linear_flashinfer(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -601,7 +608,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 
@@ -801,7 +807,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
 
     def create_weights(
         self,

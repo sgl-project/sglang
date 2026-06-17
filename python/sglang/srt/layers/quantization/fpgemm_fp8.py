@@ -19,7 +19,6 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
-    cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -99,7 +98,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         # self.fp8_linear = Fp8LinearOp(
         #     act_quant_static=False, act_quant_group_shape=GroupShape.PER_TOKEN)
         self.out_dtype = torch.get_default_dtype()
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
 
     def create_weights(
         self,
@@ -197,6 +195,5 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             input_scale=None,
             input_scale_ub=layer.input_scale_ub,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )

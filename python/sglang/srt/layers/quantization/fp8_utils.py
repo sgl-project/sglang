@@ -18,6 +18,7 @@ from sglang.srt.utils.common import torch_release
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -37,7 +38,6 @@ from sglang.srt.utils import (
     ceil_align,
     ceil_div,
     get_bool_env_var,
-    get_cuda_version,
     get_device_capability,
     get_hip_version,
     is_blackwell_supported,
@@ -123,8 +123,6 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
-
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
@@ -141,19 +139,6 @@ def use_rowwise_torch_scaled_mm():
 
 
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
-
-
-@lru_cache(maxsize=1)
-def cutlass_fp8_supported():
-    if not _is_cuda:
-        return False
-    major, minor = get_device_capability()
-    cuda_version = get_cuda_version()
-    if major >= 9:
-        return cuda_version >= (12, 0)
-    elif major == 8 and minor == 9:
-        return cuda_version >= (12, 4)
-    return False
 
 
 def normalize_e4m3fn_to_e4m3fnuz(
@@ -184,6 +169,7 @@ class Fp8GemmRunnerBackend(Enum):
     """Enum for FP8 GEMM runner backend selection."""
 
     AUTO = "auto"
+    FLASHINFER = "flashinfer"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
@@ -194,6 +180,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
+
+    def is_flashinfer(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_TRTLLM
@@ -386,12 +375,10 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
 
-    # Handle explicit backend selection via --fp8-gemm-backend
-    if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
+    if backend.is_auto() or backend.is_flashinfer():
+        return _dispatch_auto_backend()
 
-    # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+    return _dispatch_explicit_backend(backend)
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
@@ -1499,7 +1486,15 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
-def apply_fp8_linear_bmm_flashinfer(
+def use_flashinfer_fp8() -> bool:
+    return (
+        is_blackwell_supported()
+        and is_flashinfer_available()
+        and get_fp8_gemm_runner_backend().is_flashinfer()
+    )
+
+
+def apply_fp8_linear_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -1523,19 +1518,36 @@ def apply_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     input_scale_ub: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
+    gemm_backend = get_fp8_gemm_runner_backend()
+    cutlass_fp8_supported = is_sm90_supported() or is_blackwell_supported()
+
+    if (
+        use_flashinfer_fp8()
+        and not compressed_tensor_quant
+        and input_scale is not None
+        and input_scale.numel() == 1
+        and weight_scale.numel() == 1
+    ):
+        return apply_fp8_linear_flashinfer(
+            input=input,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+        )
+
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
     # This could change in the future.
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
-            "SGLANG_ENABLE_TORCH_COMPILE"
+        pad_output = (
+            not cutlass_fp8_supported and not envs.SGLANG_ENABLE_TORCH_COMPILE.get()
         )
     output_padding = 17 if pad_output else None
 
@@ -1605,7 +1617,7 @@ def apply_fp8_linear(
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+        if not cutlass_compatible_b or gemm_backend.is_triton():
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
@@ -1729,7 +1741,6 @@ def apply_fp8_ptpc_linear(
     input_scale: Optional[torch.Tensor] = None,
     input_scale_ub: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,

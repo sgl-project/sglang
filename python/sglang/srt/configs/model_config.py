@@ -27,7 +27,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_sm100_supported, retry
+from sglang.srt.utils import is_hip, is_sm100_supported, print_warning_once, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -1272,8 +1272,12 @@ class ModelConfig:
             self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
             from sglang.srt.layers import deep_gemm_wrapper
 
-            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                logger.warning(
+            if (
+                quant_cfg.get("weight_block_size") is not None
+                and not self.use_scale_ue8m0
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            ):
+                print_warning_once(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
 

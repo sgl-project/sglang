@@ -603,11 +603,10 @@ class Envs:
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
 
     # Kernels
-    USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
-    SGLANG_CUTLASS_MOE = EnvBool(False)
+    SGLANG_MOE_CONFIG_DIR = EnvStr(None)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)

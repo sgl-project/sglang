@@ -36,7 +36,8 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    cutlass_fp8_supported,
+    is_blackwell_supported,
+    is_sm90_supported,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
 
@@ -127,7 +128,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.cutlass_fp8_supported = is_sm90_supported() or is_blackwell_supported()
 
     def create_weights(
         self,
@@ -200,5 +201,4 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
