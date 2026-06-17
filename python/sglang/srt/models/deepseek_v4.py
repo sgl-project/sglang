@@ -62,6 +62,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
+    is_dp_gatherv_active,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -382,6 +383,9 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        self._attn_sink_local: Optional[torch.Tensor] = (
+            self.attn_sink if attn_tp_size == 1 else None
+        )
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -819,6 +823,19 @@ class MQALayer(nn.Module):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
+                # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
+                # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
+                if use_cp and _is_hip:
+                    # unified_kv + DSA CP: the 2-source prefill path needs the
+                    # FULL current-chunk KV (extend source + ring write), so
+                    # all-gather the per-rank bf16 KV across the CP group.
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -890,10 +907,23 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
-            rank = self.tp_rank
-            tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
+            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+            # this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
+            if self._attn_sink_local is None:
+                # Build once on the first forward (post weight load); a per-call
+                # rebuild would replay a fill+copy per layer in the decode graph.
+                rank = self.tp_rank
+                sink = self.attn_sink.new_zeros(padded_num_heads)
+                sink[: self.n_local_heads] = self.attn_sink[
+                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                ]
+                self._attn_sink_local = sink
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -960,7 +990,7 @@ class MQALayer(nn.Module):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    self.attn_sink,
+                    self._attn_sink_local,
                     save_kv_cache,
                 )
             else:
@@ -971,7 +1001,7 @@ class MQALayer(nn.Module):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self.attn_sink,
+                    attn_sink=self._attn_sink_local,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
@@ -1473,6 +1503,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
+        # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
+        # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
+        # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
+        # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
+        # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
+        # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
+        # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+        _use_gatherv_pair = (
+            _use_tp_moe_gather
+            and is_dp_gatherv_active()
+            and forward_batch.dp_padding_mode is not None
+            and not forward_batch.dp_padding_mode.is_max_len()
+        )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -1499,7 +1542,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
-            use_reduce_scatter=_use_cp,
+            # Skip the MoE-internal post-experts all_reduce when we will do the
+            # reduce via reduce_scatterv at the combine below (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1508,7 +1553,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv():
+            if should_use_dp_reduce_scatterv() or _use_gatherv_pair:
+                # SUM the TP-sharded per-rank partial expert outputs AND scatter
+                # each rank its own token slice, in one op. Correct because the
+                # MoE-internal all_reduce was skipped (use_reduce_scatter above).
+                # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
