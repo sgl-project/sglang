@@ -19,11 +19,15 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-register_cuda_ci(est_time=957, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+
+
+class TestLfm2VlServer(ImageOpenAITestMixin):
+    model = "LiquidAI/LFM2.5-VL-1.6B"
 
 
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
@@ -142,6 +146,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
+        "--mem-fraction-static=0.40",
     ]
 
     def test_video_images_chat_completion(self):

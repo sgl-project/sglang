@@ -143,5 +143,25 @@ This section lists the oncalls for each hardware platform. The format is @github
 
 This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping [Lianmin Zheng](https://github.com/merrymercy) and [Ying Sheng](https://github.com/Ying1123) in the Slack channel. They will start a nomination and internal review process.
 
+## CI Maintenance Mode
+When the CI is unhealthy (e.g., the scheduled pr-test on `main` is broken for consecutive runs), the project enters **CI Maintenance Mode** by opening [issue #21065](https://github.com/sgl-project/sglang/issues/21065). While active:
+- All PR CI runs are paused. Resources are allocated to PRs that fix the CI.
+- **Merging non-CI-fix PRs is prohibited.** Only PRs that fix the CI may be merged. In severe cases, merge permissions may be revoked.
+
+Maintenance mode ends when `pr-test.yml` is all green on `main` and the issue is closed.
+
+### Rebase-Required Mode
+When a major update lands on `main` and all open PRs must rebase before CI can run (without fully pausing CI), add a line of the form `MIN_BASE_SHA: <sha>` to the body of issue #21065. **The rebase check is enforced regardless of whether the issue is open or closed** — you do not need to enter full maintenance mode (open the issue) to use this gate; just editing the body to include the directive is enough. While the directive is present:
+- CI is allowed to run only for PRs whose branch already contains `<sha>` (GitHub compare API status `ahead` or `identical` — i.e., the PR has `<sha>` in its history).
+- PRs that are `behind` or `diverged` from `<sha>` are blocked with a "rebase required" error until they rebase onto the latest `main`.
+- The `bypass-maintenance` label still bypasses this check for CI-fix PRs.
+
+Notes:
+- Only the **first** `MIN_BASE_SHA:` line in the issue body is read.
+- The SHA must be 7-40 hex characters; malformed values are ignored (with a warning in the job summary).
+- Avoid pasting the directive inside a fenced code block in the issue body — the parser does not skip code fences and may match example snippets.
+
+Remove the directive from the issue body to lift the rebase requirement (closing the issue does NOT lift it on its own).
+
 ## Suspending Permissions
-If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, or if they repeatedly break the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.
+If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, merges a non-CI-fix PR during CI Maintenance Mode, or repeatedly breaks the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.

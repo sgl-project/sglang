@@ -38,15 +38,21 @@ def moe_lora_align_block_size(
     adapter_enabled: torch.Tensor,
     lora_ids: torch.Tensor,
     maybe_expert_map: Optional[torch.Tensor] = None,
+    cumsum_buffer: Optional[torch.Tensor] = None,
+    token_mask: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_moe_align_module(topk_ids.dtype)
 
-    cumsum_buffer = torch.zeros(
-        max_loras * (num_experts + 1), dtype=torch.int32, device=topk_ids.device
-    )
-    token_mask = torch.empty(
-        (max_loras * topk_ids.shape[0],), dtype=torch.int32, device=topk_ids.device
-    )
+    if cumsum_buffer is None:
+        cumsum_buffer = torch.zeros(
+            max_loras * (num_experts + 1), dtype=torch.int32, device=topk_ids.device
+        )
+    else:
+        cumsum_buffer.zero_()
+    if token_mask is None:
+        token_mask = torch.empty(
+            (max_loras * topk_ids.shape[0],), dtype=torch.int32, device=topk_ids.device
+        )
 
     module.moe_lora_align_block_size(
         topk_ids,

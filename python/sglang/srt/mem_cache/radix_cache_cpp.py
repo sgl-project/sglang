@@ -101,12 +101,13 @@ class RadixCacheCpp(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
-            self.tree.match_prefix(key.token_ids)
+            self.tree.match_prefix(key.raw_token_ids())
         )
         return MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
             last_device_node=node_gpu,
             last_host_node=node_cpu,
+            best_match_node=node_cpu,
             host_hit_length=host_indices_length,
         )
 
@@ -209,7 +210,7 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len

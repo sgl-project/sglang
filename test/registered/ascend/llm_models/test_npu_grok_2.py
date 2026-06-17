@@ -6,9 +6,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-16-npu-a3",
-    nightly=False,
-    disabled="https://github.com/Ascend/sglang/issues/25",
+    suite="full-16-npu-a3",
+    nightly=True,
 )
 
 

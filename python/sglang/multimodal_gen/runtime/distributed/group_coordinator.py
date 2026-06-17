@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # Copyright 2024 xDiT team.
@@ -27,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
+from sglang.srt.utils import is_shm_available
 
 try:
     import torch_musa  # noqa: F401
@@ -155,6 +158,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
+        use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -186,7 +190,6 @@ class GroupCoordinator:
         self.device = get_local_torch_device()
 
         self.use_device_communicator = use_device_communicator
-
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
@@ -211,10 +214,28 @@ class GroupCoordinator:
                 )
 
         self.mq_broadcaster = None
+        self.srt_custom_allreduce = None
+        if (
+            use_srt_custom_allreduce
+            and current_platform.is_cuda_alike()
+            and self.world_size > 1
+        ):
+            # srt owns topology, dtype, contiguity, and size dispatch for custom ar
+            self._init_srt_custom_allreduce()
 
         # TODO(will): check if this is needed
         # self.use_custom_op_call = current_platform.is_cuda_alike()
         self.use_custom_op_call = False
+
+    def _init_srt_custom_allreduce(self) -> None:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        self.srt_custom_allreduce = CustomAllreduce(
+            group=self.cpu_group,
+            device=self.device,
+        )
 
     @property
     def first_rank(self):
@@ -324,9 +345,31 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+            custom_ar = self.srt_custom_allreduce
+            if (
+                not async_op
+                and custom_ar is not None
+                and op == torch.distributed.ReduceOp.SUM
+                and not input_.is_cpu
+                and not custom_ar.disabled
+                and custom_ar.should_custom_ar(input_)
+            ):
+                if custom_ar._IS_CAPTURING:
+                    return custom_ar.custom_all_reduce(input_)
+                return custom_ar._all_reduce_impl(input_, registered=False)
+            if (
+                current_platform.is_cpu()
+                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+                and op is torch.distributed.ReduceOp.SUM
+            ):
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, int(torch.distributed.ReduceOp.SUM)
+                )
+            else:
+                torch.distributed.all_reduce(
+                    input_, op=op, group=self.device_group, async_op=async_op
+                )
         return input_
 
     def all_gather(
@@ -348,10 +391,17 @@ class GroupCoordinator:
         output_tensor = torch.empty(
             input_size, dtype=input_.dtype, device=input_.device
         )
+
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        if current_platform.is_cpu() and is_shm_available(
+            input_.dtype, self.world_size, len(self.ranks)
+        ):
+            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -418,6 +468,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
         torch.distributed.broadcast(
             input_,
             src=self.ranks[src],
@@ -435,9 +487,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
-        if self.shm_broadcaster is not None:
+        if self.mq_broadcaster is not None:
             assert src == 0, "Shared memory broadcaster only supports src=0"
-            return self.shm_broadcaster.broadcast_object(obj)
+            return self.mq_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
             torch.distributed.broadcast_object_list(
                 [obj], src=self.ranks[src], group=self.cpu_group
@@ -748,6 +800,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+        if self.srt_custom_allreduce is not None:
+            self.srt_custom_allreduce.close()
+            self.srt_custom_allreduce = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

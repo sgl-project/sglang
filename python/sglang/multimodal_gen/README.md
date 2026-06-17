@@ -9,7 +9,7 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
+  - Broad model support: Wan series, FastWan series, Hunyuan, LTX-2, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
   - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
   - Multi-platform support:
@@ -25,7 +25,7 @@ SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we u
 
 ### Moore Threads/MUSA Support
 
-SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use the Torch SDPA backend for attention. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
+SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use FlashAttention (FA3) when available; also supports Sage Attention when installed; otherwise falls back to the Torch SDPA backend. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
 
 ### Apple MPS Support
 

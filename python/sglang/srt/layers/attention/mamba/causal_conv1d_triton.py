@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
@@ -7,6 +9,8 @@ from typing import List, Optional, Union
 import torch
 import triton
 import triton.language as tl
+
+from sglang.jit_kernel.utils import is_arch_support_pdl
 
 PAD_SLOT_ID = -1
 
@@ -576,7 +580,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     cache_seqlens_ptr,  # circular buffer
     conv_state_indices_ptr,
-    num_accepted_tokens_ptr,
+    num_accept_tokens_ptr,
     intermediate_conv_window_ptr,
     intermediate_state_indices_ptr,
     retrieve_next_token_ptr,
@@ -627,8 +631,12 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -667,7 +675,7 @@ def _causal_conv1d_update_kernel(
         # - accept 1 tokens: [history2, ..., historyM, draft1]
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
-        conv_state_token_offset = tl.load(num_accepted_tokens_ptr + idx_seq) - 1
+        conv_state_token_offset = tl.load(num_accept_tokens_ptr + idx_seq) - 1
     else:
         conv_state_token_offset = 0
 
@@ -976,6 +984,9 @@ def _causal_conv1d_update_kernel(
                 mask=mask_retrieve,
             )
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def causal_conv1d_update(
     x: torch.Tensor,
@@ -985,7 +996,7 @@ def causal_conv1d_update(
     activation: Union[bool, str, None] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
-    num_accepted_tokens: Optional[torch.Tensor] = None,
+    num_accept_tokens: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     retrieve_next_token: Optional[torch.Tensor] = None,
@@ -1071,7 +1082,7 @@ def causal_conv1d_update(
         if intermediate_state_indices is not None
         else 0
     )
-    if num_accepted_tokens is not None:
+    if num_accept_tokens is not None:
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
     else:
         state_len = width - 1
@@ -1122,6 +1133,8 @@ def causal_conv1d_update(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1130,7 +1143,7 @@ def causal_conv1d_update(
         conv_state,
         cache_seqlens,
         conv_state_indices,
-        num_accepted_tokens,
+        num_accept_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
         intermediate_state_indices,
         retrieve_next_token,
@@ -1174,13 +1187,14 @@ def causal_conv1d_update(
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
-        IS_SPEC_DECODING=num_accepted_tokens is not None,
+        IS_SPEC_DECODING=num_accept_tokens is not None,
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        **pdl_kwargs,
     )
     if unsqueeze:
         out = out.squeeze(-1)

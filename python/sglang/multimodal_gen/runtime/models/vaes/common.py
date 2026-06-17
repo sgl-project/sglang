@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from math import prod
+from functools import lru_cache
+from math import isqrt, prod
 from typing import Optional, cast
 
 import numpy as np
@@ -15,13 +15,74 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    should_use_spatial_shard_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
 )
 
 
-class ParallelTiledVAE(ABC, nn.Module):
+@lru_cache(maxsize=1)
+def _cached_decode_parallel_world_size(
+    is_dist_initialized: bool, is_model_parallel_initialized: bool, group_id: int
+) -> int:
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return 1
+    return get_decode_parallel_world_size()
+
+
+def _decode_parallel_world_size() -> int:
+    is_dist_initialized = dist.is_initialized()
+    is_model_parallel_initialized = model_parallel_is_initialized()
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return _cached_decode_parallel_world_size(
+            is_dist_initialized, is_model_parallel_initialized, 0
+        )
+    return _cached_decode_parallel_world_size(
+        is_dist_initialized,
+        is_model_parallel_initialized,
+        id(get_decode_parallel_group_coordinator()),
+    )
+
+
+def has_decode_parallel_world() -> bool:
+    return _decode_parallel_world_size() > 1
+
+
+def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
+    world_size = _decode_parallel_world_size()
+    return (
+        config is not None
+        and world_size > 1
+        and should_use_spatial_shard_parallel_decode(config, world_size=world_size)
+    )
+
+
+def should_run_spatial_shard_parallel_decode(
+    config: VAEConfig, z: torch.Tensor
+) -> bool:
+    world_size = _decode_parallel_world_size()
+    return world_size > 1 and should_use_spatial_shard_parallel_decode(
+        config, z, world_size
+    )
+
+
+class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "encoder.down_blocks",
+        "decoder.up_blocks",
+        "encoder.down",
+        "decoder.up",
+    ]
     tile_sample_min_height: int
     tile_sample_min_width: int
     tile_sample_min_num_frames: int
@@ -32,6 +93,8 @@ class ParallelTiledVAE(ABC, nn.Module):
     use_tiling: bool
     use_temporal_tiling: bool
     use_parallel_tiling: bool
+    use_parallel_decode: bool
+    parallel_decode_mode: str
 
     def __init__(self, config: VAEConfig, **kwargs) -> None:
         super().__init__()
@@ -46,6 +109,8 @@ class ParallelTiledVAE(ABC, nn.Module):
         self.use_tiling = config.use_tiling
         self.use_temporal_tiling = config.use_temporal_tiling
         self.use_parallel_tiling = config.use_parallel_tiling
+        self.use_parallel_decode = config.use_parallel_decode
+        self.parallel_decode_mode = config.parallel_decode_mode
 
     @property
     def device(self):
@@ -102,7 +167,15 @@ class ParallelTiledVAE(ABC, nn.Module):
         )
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
 
-        if self.use_tiling and self.use_parallel_tiling and get_sp_world_size() > 1:
+        if should_run_spatial_shard_parallel_decode(self.config, z):
+            return self._decode(z)[:, :, :num_sample_frames]
+
+        if (
+            self.parallel_decode_mode == "tiled"
+            and self.use_tiling
+            and self.use_parallel_tiling
+            and get_sp_world_size() > 1
+        ):
             return self.parallel_tiled_decode(z)[:, :, :num_sample_frames]
         if (
             self.use_tiling
@@ -203,31 +276,13 @@ class ParallelTiledVAE(ABC, nn.Module):
             tile_latent_stride_width,
         )
 
-    def _parallel_data_generator(
-        self, gathered_results, gathered_dim_metadata
-    ) -> Iterator[tuple[torch.Tensor, int]]:
-        global_idx = 0
-        for i, per_rank_metadata in enumerate(gathered_dim_metadata):
-            _start_shape = 0
-            for shape in per_rank_metadata:
-                mul_shape = prod(shape)
-                yield (
-                    gathered_results[
-                        i, _start_shape : _start_shape + mul_shape
-                    ].reshape(shape),
-                    global_idx,
-                )
-                _start_shape += mul_shape
-                global_idx += 1
-
     def parallel_tiled_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
         """
         world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
-        B, C, T, H, W = z.shape
+        _, _, T, H, W = z.shape
 
-        # Calculate parameters
         tile_latent_min_height = (
             self.tile_sample_min_height // self.spatial_compression_ratio
         )
@@ -258,27 +313,22 @@ class ParallelTiledVAE(ABC, nn.Module):
         num_w_tiles = (W + tile_latent_stride_width - 1) // tile_latent_stride_width
         total_spatial_tiles = num_h_tiles * num_w_tiles
         total_tiles = num_t_tiles * total_spatial_tiles
-
-        # Calculate tiles per rank and padding
         tiles_per_rank = (total_tiles + world_size - 1) // world_size
         start_tile_idx = rank * tiles_per_rank
         end_tile_idx = min((rank + 1) * tiles_per_rank, total_tiles)
 
         local_results = []
         local_dim_metadata = []
-        # Process assigned tiles
-        for local_idx, global_idx in enumerate(range(start_tile_idx, end_tile_idx)):
+        for global_idx in range(start_tile_idx, end_tile_idx):
             t_idx = global_idx // total_spatial_tiles
             spatial_idx = global_idx % total_spatial_tiles
             h_idx = spatial_idx // num_w_tiles
             w_idx = spatial_idx % num_w_tiles
 
-            # Calculate positions
             t_start = t_idx * tile_latent_stride_num_frames
             h_start = h_idx * tile_latent_stride_height
             w_start = w_idx * tile_latent_stride_width
 
-            # Extract and process tile
             tile = z[
                 :,
                 :,
@@ -286,23 +336,18 @@ class ParallelTiledVAE(ABC, nn.Module):
                 h_start : h_start + tile_latent_min_height,
                 w_start : w_start + tile_latent_min_width,
             ]
-
-            # Process tile
-            tile = self._decode(tile)
-
+            decoded_tile = self._decode(tile)
             if t_start > 0:
-                tile = tile[:, :, 1:, :, :]
+                decoded_tile = decoded_tile[:, :, 1:, :, :]
+            local_results.append(decoded_tile.reshape(-1))
+            local_dim_metadata.append(decoded_tile.shape)
 
-            # Store metadata
-            shape = tile.shape
-            # Store decoded data (flattened)
-            decoded_flat = tile.reshape(-1)
-            local_results.append(decoded_flat)
-            local_dim_metadata.append(shape)
-
-        results = torch.cat(local_results, dim=0).contiguous()
+        if local_results:
+            results = torch.cat(local_results, dim=0).contiguous()
+        else:
+            results = z.new_empty((0,), dtype=z.dtype)
         del local_results
-        # first gather size to pad the results
+
         local_size = torch.tensor(
             [results.size(0)], device=results.device, dtype=torch.int64
         )
@@ -312,34 +357,42 @@ class ParallelTiledVAE(ABC, nn.Module):
         ]
         dist.all_gather(all_sizes, local_size)
         max_size = max(size.item() for size in all_sizes)
-        padded_results = torch.zeros(max_size, device=results.device)
-        padded_results[: results.size(0)] = results
-        del results
 
-        # Gather all results
+        padded_results = torch.zeros(
+            max_size, device=results.device, dtype=results.dtype
+        )
+        padded_results[: results.size(0)] = results
+
         gathered_dim_metadata = [None] * world_size
         gathered_results = (
             torch.zeros_like(padded_results)
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
-        )  # use contiguous to make sure it won't copy data in the following operations
-        # TODO (PY): use sgl_diffusion distributed methods
+        )
         dist.all_gather_into_tensor(gathered_results, padded_results)
         dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
-        # Process gathered results
+        gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
+
         data: list = [
             [[[] for _ in range(num_w_tiles)] for _ in range(num_h_tiles)]
             for _ in range(num_t_tiles)
         ]
-        for current_data, global_idx in self._parallel_data_generator(
-            gathered_results, gathered_dim_metadata
-        ):
-            t_idx = global_idx // total_spatial_tiles
-            spatial_idx = global_idx % total_spatial_tiles
-            h_idx = spatial_idx // num_w_tiles
-            w_idx = spatial_idx % num_w_tiles
-            data[t_idx][h_idx][w_idx] = current_data
-        # Merge results
+        global_idx = 0
+        for i, per_rank_metadata in enumerate(gathered_dim_metadata):
+            start_shape = 0
+            for shape in per_rank_metadata:
+                mul_shape = prod(shape)
+                current_data = gathered_results[
+                    i, start_shape : start_shape + mul_shape
+                ].reshape(shape)
+                t_idx = global_idx // total_spatial_tiles
+                spatial_idx = global_idx % total_spatial_tiles
+                h_idx = spatial_idx // num_w_tiles
+                w_idx = spatial_idx % num_w_tiles
+                data[t_idx][h_idx][w_idx] = current_data
+                start_shape += mul_shape
+                global_idx += 1
+
         result_slices = []
         last_slice_data = None
         for i, tem_data in enumerate(data):
@@ -362,8 +415,117 @@ class ParallelTiledVAE(ABC, nn.Module):
                     slice_data[:, :, : self.tile_sample_stride_num_frames + 1, :, :]
                 )
             last_slice_data = slice_data
-        dec = torch.cat(result_slices, dim=2)
+        return torch.cat(result_slices, dim=2)
 
+    def parallel_patch_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
+        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
+        if world_size <= 1:
+            return self._decode(z)
+
+        tile_latent_min_height = (
+            self.tile_sample_min_height // self.spatial_compression_ratio
+        )
+        tile_latent_min_width = (
+            self.tile_sample_min_width // self.spatial_compression_ratio
+        )
+        tile_latent_stride_height = (
+            self.tile_sample_stride_height // self.spatial_compression_ratio
+        )
+        tile_latent_stride_width = (
+            self.tile_sample_stride_width // self.spatial_compression_ratio
+        )
+        overlap_h = max(0, tile_latent_min_height - tile_latent_stride_height)
+        overlap_w = max(0, tile_latent_min_width - tile_latent_stride_width)
+        halo_h = overlap_h // 2
+        halo_w = overlap_w // 2
+
+        _, _, _, latent_h, latent_w = z.shape
+        scale = self.spatial_compression_ratio
+        out_h = latent_h * scale
+        out_w = latent_w * scale
+        root = isqrt(world_size)
+        grid_rows, grid_cols = 1, world_size
+        for rows in range(root, 0, -1):
+            if world_size % rows == 0:
+                grid_rows, grid_cols = rows, world_size // rows
+                break
+        patch_id = rank
+        patch_row = patch_id // grid_cols
+        patch_col = patch_id % grid_cols
+
+        h0 = (patch_row * latent_h) // grid_rows
+        h1 = ((patch_row + 1) * latent_h) // grid_rows
+        w0 = (patch_col * latent_w) // grid_cols
+        w1 = ((patch_col + 1) * latent_w) // grid_cols
+
+        ext_h0 = max(0, h0 - halo_h)
+        ext_h1 = min(latent_h, h1 + halo_h)
+        ext_w0 = max(0, w0 - halo_w)
+        ext_w1 = min(latent_w, w1 + halo_w)
+
+        local_patch = z[:, :, :, ext_h0:ext_h1, ext_w0:ext_w1]
+        decoded_patch = self._decode(local_patch)
+
+        crop_top = (h0 - ext_h0) * scale
+        crop_bottom = crop_top + (h1 - h0) * scale
+        crop_left = (w0 - ext_w0) * scale
+        crop_right = crop_left + (w1 - w0) * scale
+        decoded_core = decoded_patch[
+            :, :, :, crop_top:crop_bottom, crop_left:crop_right
+        ].contiguous()
+
+        local_result = decoded_core.reshape(-1)
+        local_dim_metadata = torch.tensor(
+            decoded_core.shape, device=z.device, dtype=torch.int64
+        )
+        local_position = torch.tensor(
+            [h0 * scale, h1 * scale, w0 * scale, w1 * scale],
+            device=z.device,
+            dtype=torch.int64,
+        )
+        gathered_positions = [
+            torch.empty_like(local_position) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_positions, local_position)
+
+        local_size = torch.tensor(
+            [local_result.size(0)], device=z.device, dtype=torch.int64
+        )
+        gathered_dim_metadata = [
+            torch.empty_like(local_dim_metadata) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_dim_metadata, local_dim_metadata)
+
+        all_sizes = [
+            torch.zeros(1, device=z.device, dtype=torch.int64)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(all_sizes, local_size)
+        max_size = max(size.item() for size in all_sizes)
+
+        padded_results = torch.zeros(max_size, device=z.device, dtype=z.dtype)
+        padded_results[: local_result.size(0)] = local_result
+        gathered_results = torch.empty(
+            (world_size, *padded_results.shape),
+            device=padded_results.device,
+            dtype=padded_results.dtype,
+        )
+        dist.all_gather_into_tensor(gathered_results, padded_results)
+
+        dec = z.new_empty(
+            (
+                decoded_core.shape[0],
+                decoded_core.shape[1],
+                decoded_core.shape[2],
+                out_h,
+                out_w,
+            )
+        )
+        for src_rank, positions in enumerate(gathered_positions):
+            h_start, h_end, w_start, w_end = [int(x.item()) for x in positions]
+            shape = tuple(int(x.item()) for x in gathered_dim_metadata[src_rank])
+            patch = gathered_results[src_rank][: prod(shape)].reshape(shape)
+            dec[:, :, :, h_start:h_end, w_start:w_end] = patch
         return dec
 
     def _merge_spatial_tiles(

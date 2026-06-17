@@ -1,12 +1,25 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/utils.py
 """Utils for model executor."""
 
 from typing import Any
 
 import torch
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+)
+
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 
 def set_weight_attrs(
@@ -131,7 +144,10 @@ def pred_noise_to_pred_video(
     pred_noise = pred_noise.double().to(device)
     noise_input_latent = noise_input_latent.double().to(device)
     sigmas = scheduler.sigmas.double().to(device)
-    timesteps = scheduler.timesteps.double().to(device)
+    high_dtype = (
+        torch.float64 if current_platform.is_float64_supported() else torch.float32
+    )
+    timesteps = scheduler.timesteps.to(high_dtype).to(device)
     timestep_id = torch.argmin(
         (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
     )

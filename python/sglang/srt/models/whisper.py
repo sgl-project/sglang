@@ -1,4 +1,7 @@
-from typing import Any, Iterable, List, Optional, Tuple
+from __future__ import annotations
+
+from array import array
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from transformers import WhisperConfig
@@ -292,6 +295,10 @@ class WhisperEncoder(torch.nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        device = self.conv1.weight.device
+        input_features = input_features.to(device=device)
+        position_ids = position_ids.to(device=device)
+
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
@@ -414,14 +421,15 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend
         # correctly allocates encoder KV cache locations in the KV pool.
         # These dummy tokens are stripped before the model forward receives input_ids.
         encoder_len = self.config.max_source_positions
         mm_inputs.num_image_tokens = encoder_len
-        pad_ids = [0] * encoder_len
-        return pad_ids + input_ids
+        return array("q", [0]) * encoder_len + input_ids
 
     def forward(
         self,
@@ -442,30 +450,31 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 forward_batch.encoder_cached if forward_batch.encoder_cached else []
             )
 
-            encoder_list = []
-            for i, (mm_input, cached) in enumerate(
-                zip(mm_inputs_list, encoder_cached_list)
-            ):
+            # Collect features from all uncached requests for batched encoding
+            features_to_encode = []
+            for mm_input, cached in zip(mm_inputs_list, encoder_cached_list):
                 if cached or mm_input is None or not mm_input.mm_items:
                     continue
-
                 features = mm_input.mm_items[0].feature
                 if features.ndim == 2:
                     features = features.unsqueeze(0)
+                features_to_encode.append(features.to(dtype))
 
-                encoder_len = features.shape[-1] // 2
-                encoder_position_ids = torch.arange(encoder_len).to(
-                    features.device, non_blocking=True
+            if features_to_encode:
+                # Batch all features and run encoder once instead of sequentially
+                features_batch = torch.cat(features_to_encode, dim=0)
+                encoder_len = features_batch.shape[-1] // 2
+                encoder_position_ids = torch.arange(
+                    encoder_len, device=features_batch.device
                 )
 
-                req_encoder_output = self.encoder(
-                    features.to(dtype), encoder_position_ids, forward_batch
+                batched_output = self.encoder(
+                    features_batch, encoder_position_ids, forward_batch
                 )
-                req_encoder_output = req_encoder_output.squeeze(0)
-                encoder_list.append(req_encoder_output)
-
-            if encoder_list:
-                encoder_hidden_states = torch.cat(encoder_list, dim=0)
+                # Flatten [N, seq_len, dim] → [N*seq_len, dim] for cross-attention
+                encoder_hidden_states = batched_output.reshape(
+                    -1, batched_output.shape[-1]
+                )
 
         decoder_outputs = self.decoder(
             input_ids, encoder_hidden_states, forward_batch, positions
