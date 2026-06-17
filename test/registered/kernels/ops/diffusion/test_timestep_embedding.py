@@ -19,6 +19,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 CORRECTNESS_BATCH_SIZES = get_ci_test_range(
     [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384],

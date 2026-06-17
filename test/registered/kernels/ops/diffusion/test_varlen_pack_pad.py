@@ -19,6 +19,10 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 DEVICE = "cuda"
 DTYPES = get_ci_test_range([torch.bfloat16, torch.float16], [torch.bfloat16])

@@ -17,6 +17,10 @@ from sglang.kernels.ops.quantization.hadamard import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=128, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py.
