@@ -818,7 +818,7 @@ class MultimodalInputs(msgspec.Struct):
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
 
-        for key, val in other.__dict__.items():
+        for key in other.__struct_fields__:
             if "_id" in key:
                 # set token_ids
                 if getattr(self, key, None) is None:
