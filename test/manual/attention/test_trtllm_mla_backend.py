@@ -5,11 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.srt.runtime_context import get_parallel
 
-# Patch DP-attention globals before importing backends
-# TODO: change the interface of both trtllm_mla and flashinfer backends to take tp_size as an argument instead of patching
-_dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+# Force attention TP size = 1 for this unit test through the global parallel
+# context (the backends read get_parallel().attn_tp_size). Module-level ref so GC
+# of the context manager doesn't undo the override.
+# TODO: have the trtllm_mla / flashinfer backends take tp_size as an argument.
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
