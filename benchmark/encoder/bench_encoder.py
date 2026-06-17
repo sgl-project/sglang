@@ -19,7 +19,7 @@ Usage:
 
     # ZMQ with mock receiver @ 10 QPS
     python bench_encoder.py --encoder-url http://localhost:30000 --backend zmq \
-        --receiver-port 12345 --qps 10 --duration 60
+        --receiver-url tcp://127.0.0.1:12345 --qps 10 --duration 60
 
     # Using image/audio/video URL instead of random generation
     python bench_encoder.py --encoder-url http://localhost:30000 --qps 20 \
@@ -75,6 +75,7 @@ class BenchmarkStats:
     results: List[RequestResult] = field(default_factory=list)
     start_time: float = 0.0
     end_time: float = 0.0
+    send_end_time: float = 0.0
 
     @property
     def total_requests(self) -> int:
@@ -96,7 +97,8 @@ class BenchmarkStats:
 
     @property
     def actual_qps(self) -> float:
-        duration = self.end_time - self.start_time
+        window_end = self.send_end_time if self.send_end_time > 0 else self.end_time
+        duration = window_end - self.start_time
         if duration <= 0:
             return 0.0
         return self.successful_requests / duration
@@ -106,6 +108,7 @@ class BenchmarkStats:
 class ImageConfig:
     size: int = 448
     num_per_request: int = 1
+    num_unique: int = 32
     urls: Optional[List[str]] = None
 
 
@@ -114,6 +117,7 @@ class AudioConfig:
     duration: float = 1.0
     sample_rate: int = 24000
     num_per_request: int = 1
+    num_unique: int = 32
     urls: Optional[List[str]] = None
 
 
@@ -142,7 +146,7 @@ class BenchmarkConfig:
 
 def generate_random_image(size: int) -> str:
     """Generate a random RGB image and return as base64 string."""
-    arr = (np.random.rand(size, size, 3) * 255).astype(np.uint8)
+    arr = np.random.randint(0, 256, size=(size, size, 3), dtype=np.uint8)
     img = Image.fromarray(arr)
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=85)
@@ -165,6 +169,33 @@ def generate_random_audio(duration: float = 1.0, sample_rate: int = 24000) -> st
     return (
         f"data:audio/wav;base64,{base64.b64encode(buffer.getvalue()).decode('utf-8')}"
     )
+
+
+class MMItemProvider:
+    """Supplies the ``mm_items`` list for each request.
+
+    URL inputs are reused verbatim every request (the URLs are explicit). For
+    random inputs a pool of unique items is pre-generated once and rotated
+    per request, so consecutive requests send different payloads instead of one
+    identical payload — which would be unrepresentative and would hit the
+    encoder's multimodal cache (``--enable-mm-global-cache``) after the first
+    request. Pre-generating the pool keeps the per-request hot path free of
+    CPU-heavy media generation.
+    """
+
+    def __init__(self, pool: List[str], num_per_request: int, rotate: bool):
+        self._pool = pool
+        self._num = max(1, num_per_request)
+        self._rotate = rotate and len(pool) > 0
+        self._cursor = 0
+
+    def next(self) -> List[str]:
+        if not self._rotate:
+            return self._pool
+        n = len(self._pool)
+        items = [self._pool[(self._cursor + i) % n] for i in range(self._num)]
+        self._cursor = (self._cursor + self._num) % n
+        return items
 
 
 def _parse_receiver_url(receiver_url: str) -> tuple[str, int]:
@@ -304,46 +335,57 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
                 )
             )
 
-    # Prepare mm_items based on modality
+    # Prepare the mm_items provider based on modality.
     if config.modality == "video":
         video = config.video
         if not video.urls:
             raise ValueError("--video-url is required for video modality")
         print(f"Using {len(video.urls)} video URL(s)...")
-        mm_items = video.urls
+        provider = MMItemProvider(video.urls, num_per_request=1, rotate=False)
         print("Video preparation complete.")
     elif config.modality == "audio":
         audio = config.audio
         if audio.urls:
             print(f"Using {len(audio.urls)} audio URL(s)...")
-            mm_items = audio.urls
+            provider = MMItemProvider(audio.urls, num_per_request=1, rotate=False)
         else:
+            pool_size = max(audio.num_unique, audio.num_per_request)
             print(
-                f"Generating {audio.num_per_request} random audio(s) "
-                f"({audio.duration}s @ {audio.sample_rate}Hz)..."
+                f"Generating {pool_size} unique random audio(s) "
+                f"({audio.duration}s @ {audio.sample_rate}Hz), "
+                f"{audio.num_per_request}/request..."
             )
-            mm_items = [
+            pool = [
                 generate_random_audio(audio.duration, audio.sample_rate)
-                for _ in range(audio.num_per_request)
+                for _ in range(pool_size)
             ]
+            provider = MMItemProvider(
+                pool, num_per_request=audio.num_per_request, rotate=True
+            )
         print("Audio preparation complete.")
     else:
         # image modality (default)
         image = config.image
         if image.urls:
             print(f"Using {len(image.urls)} image URL(s)...")
-            mm_items = image.urls
+            provider = MMItemProvider(image.urls, num_per_request=1, rotate=False)
         else:
+            pool_size = max(image.num_unique, image.num_per_request)
             print(
-                f"Generating {image.num_per_request} random image(s) of size {image.size}x{image.size}..."
+                f"Generating {pool_size} unique random image(s) of size "
+                f"{image.size}x{image.size}, {image.num_per_request}/request..."
             )
-            images_base64 = [
-                generate_random_image(image.size) for _ in range(image.num_per_request)
+            pool = [
+                f"data:image/jpeg;base64,{generate_random_image(image.size)}"
+                for _ in range(pool_size)
             ]
-            mm_items = [f"data:image/jpeg;base64,{img}" for img in images_base64]
+            provider = MMItemProvider(
+                pool, num_per_request=image.num_per_request, rotate=True
+            )
         print("Image preparation complete.")
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(limit=0)
+    async with aiohttp.ClientSession(connector=connector) as session:
         # Warmup phase
         if config.warmup > 0:
             print(f"\nWarmup phase ({config.warmup}s)...")
@@ -353,7 +395,7 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
                 req_id = f"warmup_{warmup_count}"
                 payload = build_request_payload(
                     req_id,
-                    mm_items,
+                    provider.next(),
                     config.backend,
                     config.modality,
                     prefill_host,
@@ -397,7 +439,7 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
                     req_id = f"bench_{request_count}_{uuid.uuid4().hex[:8]}"
                     payload = build_request_payload(
                         req_id,
-                        mm_items,
+                        provider.next(),
                         config.backend,
                         config.modality,
                         prefill_host,
@@ -414,6 +456,7 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
                 # Check if sending phase is complete
                 if time.perf_counter() - stats.start_time >= config.duration:
                     sending_complete = True
+                    stats.send_end_time = time.perf_counter()
 
             # Count completed requests
             completed = completed_count
@@ -439,8 +482,12 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
             if all_done:
                 break
 
-            # Brief sleep to avoid busy loop
-            await asyncio.sleep(0.01)
+            now = time.perf_counter()
+            next_wakeup = last_progress_time + progress_interval
+            if not sending_complete:
+                next_wakeup = min(next_wakeup, next_send_time)
+            sleep_for = min(max(next_wakeup - now, 0.0), progress_interval)
+            await asyncio.sleep(sleep_for)
 
         # Clear progress line
         print()
