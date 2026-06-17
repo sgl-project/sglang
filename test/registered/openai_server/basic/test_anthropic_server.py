@@ -227,6 +227,25 @@ class TestAnthropicServer(CustomTestCase):
         self.assertEqual(body["type"], "message")
         self.assertTrue(len(body["content"]) > 0)
 
+    def test_in_messages_system_role(self):
+        """A ``role: "system"`` turn inside ``messages`` (emitted by some
+        clients, e.g. Claude Code) must be accepted — not rejected with 400.
+        The official Anthropic API accepts it."""
+        payload = self._default_payload(
+            messages=[
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "system", "content": "Always respond in French."},
+                {"role": "user", "content": "Answer in a few words."},
+            ]
+        )
+        resp = self._make_request(payload)
+        self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
+
+        body = resp.json()
+        self.assertEqual(body["type"], "message")
+        self.assertTrue(len(body["content"]) > 0)
+        self.assertEqual(body["content"][0]["type"], "text")
+
     def test_max_tokens(self):
         """Test max_tokens limits output length."""
         payload = self._default_payload(
