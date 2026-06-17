@@ -1,4 +1,8 @@
-# Copyright 2023-2024 SGLang Team
+# Adapted from
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_image/modeling_glm_image.py
+# Copyright 2025 The ZhipuAI Team.
+# Copyright 2025 The HuggingFace Team.
+# Copyright 2026 SGLang Team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
