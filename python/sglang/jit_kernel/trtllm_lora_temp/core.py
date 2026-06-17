@@ -308,6 +308,77 @@ def trtllm_fp8_block_scale_moe_lora_finalize(
     return output
 
 
+def trtllm_bf16_routed_moe_lora(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gate_up_lora_delta: torch.Tensor,
+    activation_lora_input: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    output: Optional[torch.Tensor] = None,
+    activation_type: Optional[int] = None,
+    lora_ready_event: int = 0,
+    gemm2_done_event: int = 0,
+) -> Union[List[torch.Tensor], torch.Tensor]:
+    """BF16 MoE-LoRA: decomposed trtllm pipeline (permute -> raw gate_up GEMM ->
+    LoRA-aware activation -> down GEMM), bf16 end-to-end (no quantization).
+    Weights are the SAME prepared bf16 tensors the plain trtllm_bf16 path uses
+    (shuffled + BlockMajorK). With do_finalize=False returns
+    (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) for the
+    python-side down-LoRA delta + trtllm_fp8_block_scale_moe_lora_finalize
+    (which is pure bf16 and shared across fp8/fp4/bf16)."""
+    from flashinfer.fused_moe.core import ActivationType
+    from flashinfer.utils import device_support_pdl
+
+    if activation_type is None:
+        activation_type = ActivationType.Swiglu.value
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+    if output is None:
+        output = torch.empty(
+            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        )
+
+    assert gate_up_lora_delta.is_contiguous()
+    assert activation_lora_input.is_contiguous()
+
+    result = get_sgl_trtllm_moe_sm100_raw_module().sgl_trtllm_bf16_routed_moe_lora(
+        topk_ids,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        enable_pdl,
+        activation_type,
+        output,
+        True,
+        gate_up_lora_delta,
+        activation_lora_input,
+        lora_ready_event,
+        gemm2_done_event,
+    )
+
+    return output if do_finalize else result
+
+
 def trtllm_fp4_block_scale_routed_moe_lora(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
