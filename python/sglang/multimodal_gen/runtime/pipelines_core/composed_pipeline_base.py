@@ -1007,6 +1007,10 @@ class ComposedPipelineBase(ABC):
                 denoising_index = index
                 denoising_stage = stage
                 break
+            if isinstance(stage, ProgressiveDenoisingStageRouter):
+                denoising_index = index
+                denoising_stage = stage.standard_stage
+                break
 
         if denoising_index is None or denoising_stage is None:
             raise RuntimeError(
