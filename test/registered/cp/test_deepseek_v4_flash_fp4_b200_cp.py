@@ -16,8 +16,9 @@ from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectness
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
-    DEFAULT_URL_FOR_TEST,
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
     try_cached_model,
 )
@@ -27,6 +28,7 @@ register_cuda_ci(est_time=235, stage="extra-b", runner_config="deepep-4-gpu-b200
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
+DEFAULT_TEST_PORT = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000
 
 _DEEPEP_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
@@ -39,7 +41,7 @@ class TestDSV4FlashFP4B200Balanced_CP(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+    """Balanced recipe: TP=4, attn-CP=4, DeepEP, EAGLE (1-step spec)."""
 
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 1.8
@@ -48,7 +50,7 @@ class TestDSV4FlashFP4B200Balanced_CP(
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = f"http://127.0.0.1:{find_available_port(DEFAULT_TEST_PORT)}"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -91,7 +93,7 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """Balanced recipe: TP=4, DP=4, EAGLE (1-step spec)."""
+    """Balanced recipe: TP=4, attn-CP=4, EAGLE (1-step spec)."""
 
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 1.8
@@ -100,7 +102,7 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = f"http://127.0.0.1:{find_available_port(DEFAULT_TEST_PORT)}"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
