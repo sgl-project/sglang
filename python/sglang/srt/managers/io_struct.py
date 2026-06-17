@@ -38,7 +38,11 @@ from zmq.asyncio import Socket as AsyncSocket
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -48,6 +52,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.trace import (
     TraceContext,
+    TraceSpan,
     TraceSpanContext,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -743,7 +748,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]
     # The multimodal inputs
-    mm_inputs: Optional[object]
+    mm_inputs: Optional[MultimodalProcessorOutput]
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -1087,7 +1092,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # The input token ids
     input_ids: Optional[array]  # array[int]
     # The image inputs
-    image_inputs: Optional[object]
+    image_inputs: Optional[MultimodalInputs]
     # The token type ids
     token_type_ids: Optional[List[int]]
     # Dummy sampling params for compatibility
@@ -2144,7 +2149,12 @@ def _check_all_req_types():
         # check its name
         name = class_type[0]
         # GenerateReqInput and EmbeddingReqInput are not io object.
-        if name in ("GenerateReqInput", "EmbeddingReqInput"):
+        # SKip checking MultimodalProcessorOutput
+        if name in (
+            "GenerateReqInput",
+            "EmbeddingReqInput",
+            "MultimodalProcessorOutput",
+        ):
             continue
         is_io_struct = (
             name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
@@ -2174,11 +2184,19 @@ def enc_hook(obj: Any) -> Any:
         tensor_dtype = str(obj.dtype).split(".")[-1]  # e.g., "float32"
         raw_data = obj.flatten().cpu().contiguous().view(torch.uint8).numpy().data
         return (obj.shape, tensor_dtype, raw_data)
+    if isinstance(obj, np.ndarray):
+        raw_data = np.ascontiguousarray(obj).reshape(-1).view(np.uint8).data
+        return (obj.shape, obj.dtype.str, raw_data)
     elif isinstance(obj, array):
         return (obj.typecode, obj.tobytes())
     elif isinstance(obj, np.floating):
         return float(obj)
     elif isinstance(obj, MetricsCollectorWrapper):
+        # Don't serialize the MetricsCollectorWrapper object
+        # due to it hold a MetricsCollector which has _thread.RLock.
+        return None
+    elif isinstance(obj, TraceSpan):
+        # Don't serialize the TraceSpan object due to it hold _thread.RLock.
         return None
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
@@ -2193,20 +2211,26 @@ def enc_hook(obj: Any) -> Any:
 
 def dec_hook(tp: Type, obj: Any) -> Any:
     if tp is torch.Tensor:
-        # Convert ``obj`` (which should be a ``tuple``) to a torch.Tensor
         shape, dtype, data = obj
         tensor_dtype = getattr(torch, dtype)
         return torch.frombuffer(data, dtype=tensor_dtype).reshape(shape)
+    elif tp is np.ndarray:
+        shape, dtype, data = obj
+        return np.frombuffer(data, dtype=np.dtype(dtype)).reshape(shape)
     elif tp is array:
         typecode, raw_data = obj
         res = array(typecode)
         res.frombytes(raw_data)
         return res
     elif tp is TraceContext:
+        # The TraceContext is represented as a dict after encoding,
+        # we need to decode it back to TraceContext
         if isinstance(obj, dict):
             obj = {k: pickle.loads(v) if v is not None else v for k, v in obj.items()}
         return TraceContext(obj)
     elif tp is TraceSpanContext:
+        # The TraceSpanContext is represented as a tuple after encoding,
+        # we need to decode it back to TraceSpanContext
         trace_id, span_id, is_remote, trace_flags, trace_state, _ = obj
         if trace_flags is not None:
             trace_flags = pickle.loads(trace_flags)

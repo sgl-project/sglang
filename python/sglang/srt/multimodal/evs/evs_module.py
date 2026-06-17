@@ -13,7 +13,6 @@
 # ==============================================================================
 
 
-import dataclasses
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -29,12 +28,10 @@ from sglang.utils import logger
 from .evs_core import compute_retention_mask, replace_offsets_with_tokens_per_frame
 
 
-@dataclasses.dataclass(kw_only=True)
 class EVSDataItem(MultimodalDataItem):
     thw_grids: list[tuple[int, int, int]]
 
 
-@dataclasses.dataclass(kw_only=True)
 class VideoEVSDataItem(EVSDataItem):
     pre_chunked_input_ids: torch.Tensor
 
