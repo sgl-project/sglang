@@ -381,7 +381,36 @@ def launch_server_internal(launch_server_func: Callable, server_args: ServerArgs
         kill_process_tree(os.getpid(), include_parent=False)
 
 
+def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
+    """Return True if a server answers /v1/models with 200 at base_url."""
+    try:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        response = requests.get(
+            f"{base_url}/v1/models", headers=headers, timeout=timeout
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
+    base_url = f"http://{server_args.host}:{server_args.port}"
+
+    # Reuse an already-running server instead of forking a second one onto the
+    # same host:port. Forking onto an occupied port spawns an orphan server that
+    # competes for the GPU, OOMs, and (via SIGQUIT) can take down the whole
+    # benchmark -- a race whose outcome depends on how long the run lasts. Probe
+    # first with a short timeout so the common "no server yet" case stays fast.
+    if server_is_up(base_url, timeout=5):
+        print(
+            f"WARNING: a server is already running at {base_url}; reusing it "
+            f"(--host/--port/--model and other server args are ignored). "
+            f"Pass --base-url {base_url} to silence this warning."
+        )
+        return None, base_url
+
     proc = multiprocessing.Process(
         target=launch_server_internal,
         args=(
@@ -390,22 +419,23 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
         ),
     )
     proc.start()
-    base_url = f"http://{server_args.host}:{server_args.port}"
 
     start_time = time.time()
     while time.time() - start_time < DEFAULT_TIMEOUT:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-            }
-            response = requests.get(
-                f"{base_url}/v1/models", headers=headers, timeout=DEFAULT_TIMEOUT
+        # Fail fast if the server died during startup (e.g. OOM) instead of
+        # polling a port nobody will ever bind until the full timeout elapses.
+        if not proc.is_alive():
+            raise RuntimeError(
+                f"Server process exited during startup (exit code "
+                f"{proc.exitcode}); see the traceback above for the cause."
             )
-            if response.status_code == 200:
-                return proc, base_url
-        except requests.RequestException:
-            pass
+        if server_is_up(base_url):
+            return proc, base_url
         time.sleep(10)
+
+    # Timed out: kill the half-started server so it does not linger as an orphan
+    # competing for the GPU after we give up on it.
+    kill_process_tree(proc.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
