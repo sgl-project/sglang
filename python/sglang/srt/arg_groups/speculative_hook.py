@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -49,7 +51,7 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_decoding(server_args: "ServerArgs") -> None:
+def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_draft_model_path is not None
         and server_args.speculative_draft_model_revision is None
@@ -100,6 +102,7 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_algorithm,
             )
 
+    algo = None
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
@@ -121,17 +124,11 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
         if server_args.speculative_adaptive:
             _init_adaptive_speculative_params(server_args)
 
-    if server_args.speculative_algorithm == "DFLASH":
-        _handle_dflash(server_args)
-    elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
-        _handle_frozen_kv_mtp(server_args)
-    elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-        _handle_eagle_family(server_args)
-    elif server_args.speculative_algorithm == "NGRAM":
-        _handle_ngram(server_args)
+    if algo is not None:
+        algo.handle_server_args(server_args)
 
 
-def _handle_dflash(server_args: "ServerArgs") -> None:
+def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
@@ -245,7 +242,7 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
 
-def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
+def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
@@ -260,7 +257,7 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
         )
 
 
-def _handle_eagle_family(server_args: "ServerArgs") -> None:
+def _handle_eagle_family(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_algorithm == "STANDALONE"
         and server_args.enable_dp_attention
@@ -371,7 +368,7 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
 
 
-def _handle_ngram(server_args: "ServerArgs") -> None:
+def _handle_ngram(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("Ngram speculative decoding only supports CUDA device.")
 
@@ -436,7 +433,7 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
         )
 
 
-def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
+def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
         adaptive_unsupported_reason,
     )
@@ -450,7 +447,7 @@ def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
         server_args.speculative_adaptive = False
 
 
-def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
+def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
         resolve_candidate_steps_from_config,
     )
@@ -475,9 +472,7 @@ def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
     server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
 
-def _auto_choose_speculative_params(
-    server_args: "ServerArgs", model_arch: str
-) -> tuple:
+def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) -> tuple:
     """
     Automatically choose the parameters for speculative decoding.
 
