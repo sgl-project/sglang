@@ -74,7 +74,7 @@ class ModelOptFp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
         quant_algo = config.get("quant_algo")
         if quant_algo is None:
             raise ValueError(

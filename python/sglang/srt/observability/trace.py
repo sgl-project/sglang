@@ -407,7 +407,7 @@ class TraceReqContext:
             )
         self.events_cache = []
 
-    def copy_for_thread(self) -> "TraceReqContext":
+    def copy_for_thread(self) -> TraceReqContext:
         """
         Create a copy of this context for use in another thread.
 
