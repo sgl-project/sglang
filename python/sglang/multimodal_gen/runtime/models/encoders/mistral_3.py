@@ -109,6 +109,23 @@ def _make_row_linear(
     return nn.Linear(in_features, out_features, bias=bias)
 
 
+def _can_use_unmasked_causal_attention(
+    attention_mask: Optional[torch.Tensor],
+    config: MistralConfig,
+    past_key_values: Optional[Cache],
+) -> bool:
+    if (
+        getattr(config, "sliding_window", None) is not None
+        or past_key_values is not None
+    ):
+        return False
+    if attention_mask is None:
+        return True
+    if attention_mask.dim() != 2:
+        return False
+    return bool(torch.all(attention_mask > 0).item())
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
@@ -191,7 +208,10 @@ class MistralAttention(nn.Module):
             self.num_key_value_heads,
             softmax_scale=self.scaling,
             causal=True,
-            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            },
             allow_cudnn_sdp=True,
         )
 
@@ -382,20 +402,25 @@ class MistralModel(MistralPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        mask_function = (
-            create_causal_mask
-            if getattr(self.config, "sliding_window", None) is None
-            else create_sliding_window_causal_mask
-        )
-        mask_kwargs = {
-            "config": self.config,
-            _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        causal_mask = mask_function(**mask_kwargs)
+        if _can_use_unmasked_causal_attention(
+            attention_mask, self.config, past_key_values
+        ):
+            causal_mask = None
+        else:
+            mask_function = (
+                create_causal_mask
+                if getattr(self.config, "sliding_window", None) is None
+                else create_sliding_window_causal_mask
+            )
+            mask_kwargs = {
+                "config": self.config,
+                _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask = mask_function(**mask_kwargs)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
