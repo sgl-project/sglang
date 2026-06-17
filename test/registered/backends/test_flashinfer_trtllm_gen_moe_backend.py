@@ -171,7 +171,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
                 "--kv-cache-dtype",
                 "bf16",
                 "--fp8-gemm-backend",
-                "flashinfer_cutlass",
+                "flashinfer_trtllm",
                 "--moe-runner-backend",
                 cls.backend,
                 "--tp-size",
