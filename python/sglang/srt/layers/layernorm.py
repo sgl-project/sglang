@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
+    true_on_policy_rms_norm,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -53,6 +54,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
+_enable_true_on_policy_fused_rms_norm = get_bool_env_var(
+    "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM"
+)
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -243,6 +247,25 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if (
+            _enable_true_on_policy_fused_rms_norm
+            and is_true_on_policy_enabled()
+            and self.has_weight
+            and self.weight.dtype == torch.float32
+            and (residual is None or self.fp32_residual)
+        ):
+            orig_dtype = self.override_orig_dtype or x.dtype
+            return true_on_policy_rms_norm(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                residual=residual,
+                post_residual_addition=post_residual_addition,
+                cast_x_before_out_mul=self.cast_x_before_out_mul,
+                norm_cast_dtype=orig_dtype,
+                weight_cast_dtype=self.weight.dtype,
+                residual_dtype=orig_dtype,
+            )
         if (
             self.weight.dtype != x.dtype
             or self.cast_x_before_out_mul
@@ -469,9 +492,8 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
+            if residual is not None or is_true_on_policy_enabled(
+                get_global_server_args()
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(

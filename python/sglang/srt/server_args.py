@@ -238,8 +238,6 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
-
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
@@ -310,10 +308,6 @@ def add_fp4_gemm_runner_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
 def add_linear_attn_kernel_backend_choices(choices):
@@ -771,8 +765,6 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
-    enable_prefill_only_deterministic_inference: bool = False
-    rl_on_policy_target: Optional[str] = None
     true_on_policy_contract: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
@@ -4310,15 +4302,6 @@ class ServerArgs:
     def _handle_deterministic_inference(self):
         validate_true_on_policy_contract(self)
 
-        if self.enable_prefill_only_deterministic_inference:
-            self.enable_deterministic_inference = True
-
-        if self.rl_on_policy_target is not None:
-            logger.warning(
-                "Enable deterministic inference because of legacy rl_on_policy_target."
-            )
-            self.enable_deterministic_inference = True
-
         if self.true_on_policy_contract is not None:
             logger.warning(
                 "Enable deterministic inference because of true_on_policy_contract."
@@ -4328,10 +4311,9 @@ class ServerArgs:
             # For VLM
             envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
 
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self)
             if (
-                resolve_true_on_policy_runtime_policy(
-                    self
-                ).disable_flashinfer_allreduce_fusion
+                true_on_policy_policy.disable_flashinfer_allreduce_fusion
                 and self.enable_flashinfer_allreduce_fusion
             ):
                 self.enable_flashinfer_allreduce_fusion = False
@@ -4429,9 +4411,10 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    os.environ["NCCL_NVLS_ENABLE"] = "0"
                     self.disable_custom_all_reduce = True
                     logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        "NCCL_ALGO is set to 'allreduce:tree', NCCL_NVLS_ENABLE is set to '0', and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
 
     def _handle_dllm_inference(self):
@@ -6796,18 +6779,6 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
-        )
-        parser.add_argument(
-            "--enable-prefill-only-deterministic-inference",
-            action="store_true",
-            help="Enable prefill-only deterministic inference mode with batch invariant ops.",
-        )
-        parser.add_argument(
-            "--rl-on-policy-target",
-            type=str,
-            default=ServerArgs.rl_on_policy_target,
-            choices=RL_ON_POLICY_TARGET_CHOICES,
-            help="The training system that SGLang needs to match for true on-policy.",
         )
         parser.add_argument(
             "--true-on-policy-contract",
