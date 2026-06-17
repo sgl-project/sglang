@@ -327,6 +327,21 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _calculate_tile_tokens_dim(
+    num_tokens: int, num_experts: int, top_k: int, max_tile: int = 128
+) -> int:
+    """Perfect-balance estimate of trtllm-gen's per-CTA token tile (mirrors
+    flashinfer.utils.calculate_tile_tokens_dim). Used only to size the deferred
+    MoE-finalize workspace; an under-estimate just makes the fused op fall back.
+    """
+    num_tokens_per_expert = (num_tokens * top_k) // max(num_experts, 1)
+    num_tokens_per_expert = int(num_tokens_per_expert * 1.3)
+    tile = 1
+    while tile < max(num_tokens_per_expert, 1):
+        tile <<= 1
+    return min(max(tile, 8), max_tile)
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -2515,7 +2530,77 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
             hidden_dim=self.model_config.hidden_size,
             dtype=self.dtype,
+            moe_finalize_max_token_num=self._compute_moe_finalize_workspace_tokens(
+                FUSE_ALLREDUCE_MAX_BATCH_SIZE
+            ),
         )
+
+    def _compute_moe_finalize_workspace_tokens(
+        self, max_batch_size: int
+    ) -> Optional[int]:
+        """Upper-bound permuted-row count for the deferred MoE-finalize AR fusion.
+
+        The fused kernel all-reduces the *permuted* expert output (``gemm2_out``),
+        whose rows are bounded by ``num_local_experts * tile + num_tokens * top_k``
+        with the trtllm-gen tile capped at 128. This workspace must be sized up
+        front because the fused op runs inside captured CUDA graphs and must never
+        grow the symmetric workspace. Returns ``None`` when deferred finalize is
+        disabled or no deferred-capable MoE layer is present.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get():
+            return None
+
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            _FLASHINFER_MAX_COMM_SIZE,
+        )
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        num_local_experts = 0
+        num_experts = 0
+        top_k = 0
+        moe_world_size = 1
+        for module in self.model.modules():
+            if isinstance(module, FusedMoE) and getattr(
+                module, "supports_deferred_finalize", False
+            ):
+                num_local_experts = max(
+                    num_local_experts, int(module.num_local_experts)
+                )
+                num_experts = max(num_experts, int(module.num_experts))
+                top_k = max(top_k, int(module.top_k))
+                ws = (
+                    module.moe_ep_size if module.moe_ep_size > 1 else module.moe_tp_size
+                )
+                moe_world_size = max(moe_world_size, int(ws))
+
+        if num_local_experts == 0 or top_k == 0:
+            return None
+
+        # Largest token count routed through a captured decode/verify graph (the
+        # only shapes that use the fused path; larger prefill falls back).
+        spec = self.server_args.speculative_num_draft_tokens or 1
+        cg = self.server_args.cuda_graph_config
+        decode_max_bs = (cg.decode.max_bs if cg is not None else 0) or max_batch_size
+        max_decode_tokens = max(decode_max_bs * spec, 1)
+
+        # trtllm-gen pads the permuted expert buffer to roughly
+        # ``num_local_experts * tile + num_tokens * top_k`` where ``tile`` is the
+        # per-CTA token tile. We over-estimate the tile (2x the perfect-balance
+        # estimate, floor 16) so the workspace reliably covers the real shape; if
+        # it ever underflows the fused op simply falls back (no correctness risk).
+        tile = _calculate_tile_tokens_dim(max_decode_tokens, num_experts, top_k)
+        eff_tile = max(2 * tile, 16)
+        bound = (
+            num_local_experts * eff_tile + max_decode_tokens * top_k + num_local_experts
+        )
+
+        # The lamport comm (rows * hidden * 2 bytes * world_size) cannot exceed
+        # MAX_COMM_SIZE; larger shapes fall back, so sizing beyond it is wasteful.
+        hidden = self.model_config.hidden_size
+        max_safe_rows = _FLASHINFER_MAX_COMM_SIZE // max(hidden * 2 * moe_world_size, 1)
+        return max(min(bound, max_safe_rows), 1)
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

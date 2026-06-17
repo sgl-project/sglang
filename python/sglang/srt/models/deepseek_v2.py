@@ -927,6 +927,26 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
+        if deferred_finalize and should_allreduce_fusion:
+            # Defer the finalize across the layer boundary: the next layer's
+            # input-RMSNorm fuses finalize + all-reduce + residual + RMSNorm
+            # (flashinfer kMoEFinalizeARResidualRMSNorm) and keeps residual_out
+            # for Eagle3 capture. Carry the un-finalized gemm2_out as the layer's
+            # hidden_states with the finalize inputs attached.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmMoeFinalizeFusionBundle,
+            )
+
+            deferred_output = final_hidden_states
+            carried = deferred_output.gemm2_out
+            carried._sglang_moe_finalize_bundle = FlashInferTrtllmMoeFinalizeFusionBundle(
+                expanded_idx_to_permuted_idx=deferred_output.expanded_idx_to_permuted_idx,
+                expert_scale_factor=deferred_output.expert_weights,
+                shared_output=shared_output,
+                top_k=deferred_output.top_k,
+            )
+            return carried
+
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,

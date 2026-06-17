@@ -202,6 +202,60 @@ def _forward_with_allreduce_fusion(
     return norm_module.forward(x, residual, post_residual_addition)
 
 
+def _forward_with_moe_finalize_allreduce_fusion(
+    norm_module,
+    gemm2_out: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    shared_expert_output: Optional[torch.Tensor],
+    top_k: int,
+    use_attn_tp_group: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse MoE finalize + all-reduce + residual + RMSNorm.
+
+    Returns (norm_out, residual_out). ``residual_out`` is the post-all-reduce,
+    pre-norm residual that Eagle3 aux capture reads. Falls back to a separate
+    finalize kernel followed by the standard AR+RMSNorm fusion when the fused
+    MoE-finalize kernel is unavailable.
+    """
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        flashinfer_moe_finalize_allreduce_residual_rmsnorm,
+    )
+
+    norm_out, residual_out = flashinfer_moe_finalize_allreduce_residual_rmsnorm(
+        gemm2_out=gemm2_out,
+        residual=residual,
+        weight=weight,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_scale_factor=expert_scale_factor,
+        shared_expert_output=shared_expert_output,
+        eps=norm_module.variance_epsilon,
+        max_token_num=max(residual.shape[0], 2048),
+        use_attn_tp_group=use_attn_tp_group,
+    )
+    if norm_out is not None:
+        return norm_out, residual_out
+
+    # Fallback: run the finalize kernel separately, then the standard
+    # all-reduce + residual + RMSNorm fusion (still emits a fresh residual_out).
+    from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
+    from sglang.jit_kernel.utils import is_arch_support_pdl
+
+    finalized = moe_finalize_fuse_shared(
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_scale_factor,
+        shared_expert_output,
+        top_k,
+        enable_pdl=is_arch_support_pdl(),
+    )
+    return _forward_with_allreduce_fusion(
+        norm_module, finalized, residual, None, weight, use_attn_tp_group
+    )
+
+
 class RMSNorm(MultiPlatformOp):
     def __init__(
         self,
@@ -560,6 +614,29 @@ class RMSNorm(MultiPlatformOp):
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
         return _forward_with_allreduce_fusion(
             self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+        )
+
+    def forward_with_moe_finalize_allreduce_fusion(
+        self,
+        gemm2_out: torch.Tensor,
+        residual: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        expert_scale_factor: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor],
+        top_k: int,
+        use_attn_tp_group: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse the deferred MoE finalize into this layer's AR + residual + RMSNorm."""
+        return _forward_with_moe_finalize_allreduce_fusion(
+            self,
+            gemm2_out,
+            residual,
+            self.weight,
+            expanded_idx_to_permuted_idx,
+            expert_scale_factor,
+            shared_expert_output,
+            top_k,
+            use_attn_tp_group,
         )
 
 
