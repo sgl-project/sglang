@@ -1379,7 +1379,8 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # We can only skip the logits computation when no CUDA graph is involved.
+        # Determine if should skip topk based on sequence length
+        # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
         if not in_piecewise_or_breakable_cuda_graph:
             skip_logits_computation = self._should_skip_logits_computation(
