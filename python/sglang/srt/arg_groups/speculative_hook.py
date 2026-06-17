@@ -452,7 +452,7 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
         server_args.speculative_adaptive = False
 
 
-def _validate_throughput_aware_adaptive(server_args: "ServerArgs") -> None:
+def _validate_throughput_aware_adaptive(server_args: ServerArgs) -> None:
     """Validate throughput_aware strategy config at startup."""
     from sglang.srt.speculative.throughput_aware_controller import (
         _parse_bs_candidates,
@@ -484,7 +484,7 @@ def _validate_throughput_aware_adaptive(server_args: "ServerArgs") -> None:
     )
 
 
-def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
+def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
     if strategy == "throughput_aware":
         from sglang.srt.speculative.throughput_aware_controller import (
