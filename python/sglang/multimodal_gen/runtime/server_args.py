@@ -462,7 +462,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "every served resolution must be declared and captured at "
                 "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
             )
-        if self.bcg_text_buckets is not None and not self.resolved_bcg_text_buckets():
+        if self.bcg_text_buckets is not None and not any(
+            int(b) > 0 for b in self.bcg_text_buckets
+        ):
             raise ValueError(
                 "--bcg-text-buckets must contain at least one positive integer."
             )
