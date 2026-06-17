@@ -169,7 +169,7 @@ class QuarkConfig(QuantizationConfig):
         """Turn off shared-expert fusion when the producer keeps shared experts
         in a higher precision than the routed experts.
         """
-        if not any("shared_expert" in pattern for pattern in self.exclude_layers):
+        if self.can_fuse_shared_expert():
             return
 
         from sglang.srt.server_args import get_global_server_args
