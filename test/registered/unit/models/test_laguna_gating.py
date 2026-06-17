@@ -59,24 +59,30 @@ HEAD_DIM = 16
 def _make_attention(gating):
     from sglang.srt.models.laguna import LagunaAttention
 
-    return LagunaAttention(
-        hidden_size=64,
-        num_heads=NUM_HEADS,
-        num_kv_heads=2,
-        head_dim=HEAD_DIM,
-        layer_id=0,
-        rms_norm_eps=1e-6,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        partial_rotary_factor=1.0,
-        max_position_embeddings=2048,
-        attention_bias=False,
-        sliding_window_size=-1,
-        layer_type="full_attention",
-        gating=gating,
-        quant_config=None,
-        prefix="",
-    )
+    try:
+        return LagunaAttention(
+            hidden_size=64,
+            num_heads=NUM_HEADS,
+            num_kv_heads=2,
+            head_dim=HEAD_DIM,
+            layer_id=0,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            partial_rotary_factor=1.0,
+            max_position_embeddings=2048,
+            attention_bias=False,
+            sliding_window_size=-1,
+            layer_type="full_attention",
+            gating=gating,
+            quant_config=None,
+            prefix="",
+        )
+    except ModuleNotFoundError as exc:
+        # On a bare runner with no CUDA kernels that isn't flagged as sglang's
+        # CPU build, rope's fallback path imports vllm, which may be absent.
+        # The gate wiring under test is unaffected, so skip where it can't build.
+        raise unittest.SkipTest(f"rope kernel backend unavailable: {exc}")
 
 
 class TestLagunaGating(CustomTestCase):
