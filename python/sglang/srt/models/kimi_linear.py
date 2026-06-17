@@ -15,6 +15,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -49,7 +50,10 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import (
+    is_hip,
+    make_layers,
+)
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -529,6 +533,12 @@ class KimiLinearModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream()
+        # AMD/ROCm: dual-stream MoE is opt-in via SGLANG_ROCM_USE_MULTI_STREAM
+        # (default off on AMD), matching the deepseek_v2.DeepseekV2Model
+        # gating from PR #24005. Non-AMD backends keep the original
+        # always-on behavior.
+        if is_hip() and not envs.SGLANG_ROCM_USE_MULTI_STREAM.get():
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
