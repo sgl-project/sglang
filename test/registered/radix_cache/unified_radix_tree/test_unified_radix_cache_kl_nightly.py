@@ -45,6 +45,9 @@ class AccuracyTwoPassMixin:
 
     l3_prefetch_page_size: int = 64
     l3_prefetch_prompt_pages: int = 16
+    # Max tokens that may stay uncached on a full-prompt re-request; the bound
+    # depends on model architecture. Defaults to page_size; subclasses override.
+    l3_prefetch_max_uncached_tokens: int = None
 
     def _run_gsm8k(self):
         from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
@@ -115,6 +118,11 @@ class AccuracyTwoPassMixin:
 
         page = int(self.l3_prefetch_page_size)
         n_tokens = page * int(self.l3_prefetch_prompt_pages)
+        max_uncached = int(
+            self.l3_prefetch_max_uncached_tokens
+            if self.l3_prefetch_max_uncached_tokens is not None
+            else page
+        )
 
         rng = random.Random(987)
         input_ids = [rng.randint(1, 30000) for _ in range(n_tokens)]
@@ -124,11 +132,11 @@ class AccuracyTwoPassMixin:
         results = _generate(self.base_url, [input_ids], max_new_tokens=4)
         cached = int(results[0]["meta_info"]["cached_tokens"])
 
-        expected_min = n_tokens - page
+        expected_min = n_tokens - max_uncached
         self.assertGreaterEqual(
             cached,
             expected_min,
-            f"cached_tokens={cached} < {expected_min} (= input_len - page_size)",
+            f"cached_tokens={cached} < {expected_min} (= input_len - {max_uncached})",
         )
 
 
