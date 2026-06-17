@@ -1302,8 +1302,9 @@ class TestAnthropicServing(unittest.TestCase):
                 {"role": "user", "content": "go"},
             ],
         )
-        # Validator combines top-level system first, then the in-messages turn.
-        self.assertEqual(request.system, ["You are terse.", "One word only."])
+        # Validator combines top-level system first, then the in-messages turn,
+        # joined into a single string.
+        self.assertEqual(request.system, "You are terse.\nOne word only.")
         self.assertEqual([m.role for m in request.messages], ["user", "user"])
 
     def test_top_level_system_only_is_unchanged(self):
