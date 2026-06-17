@@ -135,6 +135,8 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
                 "0.8",
                 "--cuda-graph-max-bs",
                 "32",
+                "--max-total-tokens",
+                "14000",
                 "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
