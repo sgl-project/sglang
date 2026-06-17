@@ -1859,6 +1859,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 block_table,
+                layer_id,
             )
             return topk_indices
         else:
@@ -1882,7 +1883,8 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            return topk_indices[0]
+            topk_indices = _broadcast_indexer_topk_from_rank0(topk_indices[0])
+            return maybe_capture_indexer_topk(layer_id, topk_indices)
 
     def do_npu_cp_balance_indexer(
         self,
@@ -1892,6 +1894,7 @@ class Indexer(MultiPlatformOp):
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
         block_table,
+        layer_id: int,
     ):
         q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
         weights_prev, weights_next = None, None
@@ -1937,7 +1940,12 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev[0], topk_indices_next[0]
+        topk_indices_prev = _broadcast_indexer_topk_from_rank0(topk_indices_prev[0])
+        topk_indices_next = _broadcast_indexer_topk_from_rank0(topk_indices_next[0])
+        return (
+            maybe_capture_indexer_topk(layer_id, topk_indices_prev),
+            maybe_capture_indexer_topk(layer_id, topk_indices_next),
+        )
 
 
 def scattered_to_tp_attn_full(
