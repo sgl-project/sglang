@@ -163,6 +163,29 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Whether to return the sampler's sparse output-token support. When enabled,
+    # TokenizerManager exposes these response-aligned fields in `meta_info`:
+    #
+    # - `output_token_sampling_mask`: one token-id list per generated token,
+    #   containing the support kept after top-k/top-p/min-p truncation. For
+    #   deterministic argmax generation, this is `[sampled_token_id]`.
+    # - `output_token_sampling_logprobs`: selected-token logprobs renormalized
+    #   over the corresponding masks. For deterministic argmax generation, this
+    #   is `0.0`.
+    # - `output_token_sampling_mask_length`: the number of generated-token mask
+    #   entries accumulated so far; useful for streaming clients.
+    #
+    # Internally, the sampler first writes these values to
+    # `LogitsProcessorOutput.next_token_sampling_mask_idx` and
+    # `next_token_sampling_logprobs`; Scheduler copies them through
+    # `Req.output_token_sampling_*`; TokenizerManager finally places them in
+    # response `meta_info`.
+    #
+    # `output_token_logprobs` are raw full-vocab logprobs. In contrast,
+    # `output_token_sampling_logprobs` are truncated/renormalized logprobs
+    # over `output_token_sampling_mask` and are the right choice for RL
+    # training that replays the rollout sampling distribution.
+    return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -390,6 +413,8 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.return_sampling_mask is None:
+            self.return_sampling_mask = False
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -554,6 +579,9 @@ class GenerateReqInput:
         self.top_logprobs_num = normalize_param(
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
+        self.return_sampling_mask = normalize_param(
+            self.return_sampling_mask, False, "return_sampling_mask"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -669,6 +697,7 @@ class GenerateReqInput:
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
+            return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -751,6 +780,10 @@ class TokenizedGenerateReqInput(BaseReq):
     top_logprobs_num: int
     # If return logprobs, the token id to return logprob for
     token_ids_logprob: Optional[List[int]]
+    # Whether to return sparse output-token support from top-k/top-p/min-p
+    # sampling. See GenerateReqInput.return_sampling_mask for the returned
+    # meta_info fields and logprob semantics.
+    return_sampling_mask: bool
     # Whether to stream output
     stream: bool
 
@@ -1158,6 +1191,14 @@ class BatchTokenIDOutput(BaseBatchReq):
     output_token_ids_logprobs_val: TokenLogprobValues
     output_token_ids_logprobs_idx: TokenLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
+    # Per-request chunks of output-token sampling supports. These are copied
+    # from Req.output_token_sampling_* and later accumulated into
+    # meta_info["output_token_sampling_mask"] by TokenizerManager.
+    output_token_sampling_mask: List[List]
+    # Per-request chunks of selected-token logprobs renormalized over the
+    # corresponding sampling supports; later exposed as
+    # meta_info["output_token_sampling_logprobs"].
+    output_token_sampling_logprobs: List[List]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1234,6 +1275,11 @@ class BatchStrOutput(BaseBatchReq):
     output_token_ids_logprobs_val: TokenLogprobValues
     output_token_ids_logprobs_idx: TokenLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
+    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
+    # TokenizerManager exposes these as `output_token_sampling_mask` and
+    # `output_token_sampling_logprobs` in response meta_info.
+    output_token_sampling_mask: List[List]
+    output_token_sampling_logprobs: List[List]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
