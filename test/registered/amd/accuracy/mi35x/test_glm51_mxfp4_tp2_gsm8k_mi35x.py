@@ -10,6 +10,8 @@ import resource
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -43,6 +45,7 @@ def _raise_nofile_limit() -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM51MXFP4TP2GSM8KMI35x(CustomTestCase):
     @classmethod
     def setUpClass(cls):
