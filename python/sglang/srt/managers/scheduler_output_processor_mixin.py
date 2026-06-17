@@ -1233,18 +1233,24 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
-                if req.return_hidden_states:
+                if batch.return_hidden_states:
                     if output_hidden_states is None:
                         output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
-                if req.return_routed_experts:
+                    output_hidden_states.append(
+                        req.hidden_states if req.return_hidden_states else None
+                    )
+                if batch.return_routed_experts:
                     if routed_experts is None:
                         routed_experts = []
-                    routed_experts.append(req.routed_experts)
-                if req.return_indexer_topk:
+                    routed_experts.append(
+                        req.routed_experts if req.return_routed_experts else None
+                    )
+                if batch.return_indexer_topk:
                     if indexer_topk is None:
                         indexer_topk = []
-                    indexer_topk.append(req.indexer_topk)
+                    indexer_topk.append(
+                        req.indexer_topk if req.return_indexer_topk else None
+                    )
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
