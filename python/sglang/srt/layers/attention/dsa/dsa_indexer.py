@@ -1421,9 +1421,9 @@ class Indexer(MultiPlatformOp):
                     (0, self.index_topk), device=x.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
-                bcg_dsa_indexer_graph_split
+                bcg_dsa_indexer_prefill_split
                 if is_in_breakable_cuda_graph()
-                else pcg_dsa_indexer_graph_split
+                else pcg_dsa_indexer_prefill_split
             )
             graph_dispatch_fn(
                 layer_id=layer_id,
@@ -1982,7 +1982,7 @@ class Indexer(MultiPlatformOp):
 
 @register_custom_op(mutates_args=["topk_result"])
 @register_split_op()
-def pcg_dsa_indexer_graph_split(
+def pcg_dsa_indexer_prefill_split(
     layer_id: int,
     x: torch.Tensor,
     q_lora: torch.Tensor,
@@ -2059,7 +2059,7 @@ def pcg_dsa_indexer_graph_split(
     )
 
 
-bcg_dsa_indexer_graph_split = eager_on_graph(True)(pcg_dsa_indexer_graph_split)
+bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
 
 
 def scattered_to_tp_attn_full(

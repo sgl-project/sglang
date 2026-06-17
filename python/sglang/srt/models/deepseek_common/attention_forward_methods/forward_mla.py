@@ -941,7 +941,7 @@ class DeepseekMLAForwardMixin:
 # paying per-submodule host overhead with no fusion benefit.
 #
 # The further module fusion, coalescing this op with the strictly adjacent
-# `pcg_dsa_indexer_graph_split` into a single eager region, is currently
+# `pcg_dsa_indexer_prefill_split` into a single eager region, is currently
 # BCG-only: breakable CUDA graph drops the empty segment and chains adjacent
 # replay fns. Under PCG, `split_graph` leaves each split op in its own eager
 # submodule for now. The adjacency this relies on currently holds on the
