@@ -537,7 +537,7 @@ class StreamingSession(BasePrefixCache):
         req.kv_allocated_len = min(req.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
-        req.output_ids = req.output_ids[:finished_len]
+        req.truncate_output_ids(finished_len)
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
         """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned

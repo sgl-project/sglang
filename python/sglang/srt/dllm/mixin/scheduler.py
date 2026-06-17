@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
@@ -80,12 +79,9 @@ class SchedulerDllmMixin:
                 if new_tokens == 0:
                     continue
 
-                req.full_untruncated_fill_ids[
-                    req.fill_len - new_tokens : req.fill_len
-                ] = array("q", next_token_ids)
                 self.metrics_reporter.num_generated_tokens += new_tokens
 
-                req.output_ids.extend(next_token_ids)
+                req.extend_output_ids(next_token_ids)
                 req.update_finish_state(new_accepted_len=new_tokens)
 
                 if req.finished():

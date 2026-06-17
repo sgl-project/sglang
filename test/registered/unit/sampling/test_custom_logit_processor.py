@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
@@ -26,8 +27,11 @@ from sglang.test.test_utils import CustomTestCase
 # Helper: mock a Req object (used by ThinkingBudget and NGram processors)
 def _make_req(origin_input_ids=None, output_ids=None):
     req = MagicMock()
-    req.origin_input_ids = array("q", origin_input_ids or [])
-    req.output_ids = array("q", output_ids or [])
+    origin = array("q", origin_input_ids or [])
+    output = array("q", output_ids or [])
+    req.origin_input_ids = origin
+    req.output_ids = output
+    req.token_buf = ViewableArray(origin + output)
     return req
 
 

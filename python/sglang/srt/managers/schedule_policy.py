@@ -91,7 +91,7 @@ def match_prefix_for_req(
     include_req: bool = False,
 ):
     if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
+        token_ids = req.token_buf.readonly_view()
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -255,7 +255,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            prefix_ids = r.token_buf.readonly_view()
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
@@ -828,7 +828,7 @@ class PrefillAdder:
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
-            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.fill_len = len(req.get_full_untruncated_fill_ids())
             assert (
                 req.fill_len == len(req.prefix_indices) + req.extend_input_len
             ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
@@ -938,7 +938,7 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(
-                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                    len(req.get_full_untruncated_fill_ids()) - len(req.prefix_indices)
                 )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
@@ -967,7 +967,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
-                req.fill_len = len(req.full_untruncated_fill_ids)
+                req.fill_len = len(req.get_full_untruncated_fill_ids())
                 assert (
                     req.fill_len == len(req.prefix_indices) + req.extend_input_len
                 ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
