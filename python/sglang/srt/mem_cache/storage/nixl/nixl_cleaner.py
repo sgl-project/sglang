@@ -192,8 +192,7 @@ class HiCacheL3Cleaner:
                 idx += len(batch)
 
                 if all(
-                    self._disk_usage_pct(path) < self.low_watermark
-                    for path in hot_dirs
+                    self._disk_usage_pct(path) < self.low_watermark for path in hot_dirs
                 ):
                     break
 
