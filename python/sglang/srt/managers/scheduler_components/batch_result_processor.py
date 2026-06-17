@@ -799,6 +799,7 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token {proposed}: {e}"
             )
             self.abort_request(AbortReq(rid=req.rid))
+            req.update_finish_state()
 
         # _resolve_spec_v2_tokens committed the full proposed list; rollback the
         # suffix that grammar termination dropped.
