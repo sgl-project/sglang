@@ -36,19 +36,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed.parallel_state import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -56,6 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -212,8 +206,8 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_attention_tp_rank()
-    attn_tp_size = get_attention_tp_size()
+    attn_tp_rank = get_parallel().attn_tp_rank
+    attn_tp_size = get_parallel().attn_tp_size
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
 
     return torch.clamp(
@@ -849,7 +843,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         """Make num_token_non_padded local to this attention-TP rank."""
         from sglang.srt.utils.common import require_mlp_tp_gather
 
-        dp_rank = get_attention_dp_rank()
+        dp_rank = get_parallel().attn_dp_rank
         assert self.global_num_tokens_cpu is not None
 
         if require_mlp_tp_gather(server_args):
@@ -1063,7 +1057,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._original_batch_size = self.batch_size
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
@@ -1096,7 +1090,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[get_attention_dp_rank()]
+            num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
         else:
             num_tokens = global_num_tokens[0]
 
@@ -1299,7 +1293,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
         assert self.forward_mode.is_extend()
         tokens = self.input_ids.shape[0]
-        rank_size = get_tensor_model_parallel_world_size()
+        rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
@@ -1359,7 +1353,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_moe_expert_parallel_world_size() > 1
+    return get_parallel().moe_ep_size > 1
 
 
 def build_inner_fb_view(

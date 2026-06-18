@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 # Tokens covered per CTA along the page-block (grid axis-1) dimension.
+# Must be a multiple of page_size (asserted in build_trtllm_mha_page_table).
 _MHA_KV_INDEX_BLOCK_TOKENS = 4096
 # Triton kernels can only read module globals that are tl.constexpr instances.
 _MHA_KV_INDEX_BLOCK_TOKENS_TL = tl.constexpr(_MHA_KV_INDEX_BLOCK_TOKENS)
@@ -55,6 +56,10 @@ def create_trtllm_mha_kv_indices_triton(
     from ``req_to_token`` and converts it to a block id (``slot // PAGE_SIZE``).
     Programs past the request's page count are guarded out, so the work (and the
     DRAM traffic) is bounded by the device-side ``seq_lens`` — no host max needed.
+
+    The SWA lookup assumes valid (``>= 0``) slots, unlike
+    ``translate_loc_from_full_to_swa``'s ``-1`` sentinel handling; page-boundary
+    reads stay within ``seq_len``, so slots are always valid here.
     """
     PAGES_PER_BLOCK: tl.constexpr = _MHA_KV_INDEX_BLOCK_TOKENS_TL // PAGE_SIZE
     pid_req = tl.program_id(0)
@@ -109,6 +114,9 @@ def build_trtllm_mha_page_table(
     assert has_swa == (
         swa_page_table is not None
     ), "full_to_swa and swa_page_table must be provided together"
+    assert (
+        _MHA_KV_INDEX_BLOCK_TOKENS % page_size == 0
+    ), f"page_size={page_size} must divide _MHA_KV_INDEX_BLOCK_TOKENS={_MHA_KV_INDEX_BLOCK_TOKENS}"
     bs, num_pages = page_table.shape
     create_trtllm_mha_kv_indices_triton[
         (bs, get_num_mha_kv_index_blocks(num_pages, page_size))
