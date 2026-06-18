@@ -20,8 +20,8 @@ You can install SGLang using any of the methods below. Please go through `System
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.0.RC1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+26.0.RC1">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+25.5.2">link</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -40,8 +40,8 @@ You can install SGLang using any of the methods below. Please go through `System
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/triton-ascend/releases/v3.2.1">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
@@ -141,7 +141,9 @@ If you are using other versions of `torch` and install `torch_npu`, check [insta
 We provide our own implementation of Triton for Ascend.
 
 ```bash Command
-pip install triton-ascend==3.2.1
+pip install triton-ascend==3.2.1.dev20260530 \
+  --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \
+  --trusted-host triton-ascend.osinfra.cn
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
