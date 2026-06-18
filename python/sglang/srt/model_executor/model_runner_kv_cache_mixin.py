@@ -82,23 +82,28 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        # Use the snapshot taken at the end of this runner's weight-load phase,
-        # not the current free memory: draft-model weights loaded after that
-        # point are charged to the non-static slack, not the static budget.
-        post_model_load_memory = getattr(self, "post_model_load_memory", None)
-        if post_model_load_memory is None:
-            post_model_load_memory = get_available_gpu_memory(
-                self.device,
-                self.gpu_id,
-                distributed=get_world_group().world_size > 1,
-                cpu_group=get_world_group().cpu_group,
-            )
+        # KV pool budget = currently-free GPU memory minus the non-static runtime
+        # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
+        # already resident (model weights, etc.) is thus charged against it.
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
+        rest_memory = available_gpu_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+
+        # Loaded weights (target + draft) can exceed the static budget
+        if rest_memory <= 0:
+            raise ValueError(
+                f"Loaded weights leave no GPU memory for the KV cache under "
+                f"--mem-fraction-static={self.mem_fraction_static}."
+            )
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
@@ -560,9 +565,9 @@ class ModelRunnerKVCacheMixin:
                             self.model_config.hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_head_dim": self.model_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -683,9 +688,9 @@ class ModelRunnerKVCacheMixin:
                             self.model_config.hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_head_dim": self.model_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
