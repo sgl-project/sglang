@@ -1836,10 +1836,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
-        else:
-            disable_reason = (
-                "DeepSeek V4 requires different clamping for shared and routed experts."
-            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True

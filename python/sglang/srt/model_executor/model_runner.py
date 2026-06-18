@@ -1621,6 +1621,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
             )
+            module.deepep_waterfill_balancer.try_bind_static_rank_load()
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(

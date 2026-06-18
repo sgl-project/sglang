@@ -328,6 +328,22 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
+class TestEPLBDispatchArgs(unittest.TestCase):
+    def test_redundant_experts_default_to_static_dispatch(self):
+        server_args = ServerArgs(model_path="dummy", ep_num_redundant_experts=32)
+
+        self.assertEqual(server_args.ep_dispatch_algorithm, "static")
+
+    def test_explicit_dispatch_algorithm_is_preserved(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            ep_num_redundant_experts=32,
+            ep_dispatch_algorithm="dynamic",
+        )
+
+        self.assertEqual(server_args.ep_dispatch_algorithm, "dynamic")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

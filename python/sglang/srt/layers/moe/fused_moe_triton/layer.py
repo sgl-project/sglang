@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_fused_shared_expert_replicas_per_rank,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -197,6 +198,7 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.num_fused_shared_expert_replicas_per_rank = 1
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -210,14 +212,27 @@ class FusedMoE(torch.nn.Module):
         # keep the shared expert as a global slot.
         # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
         if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
-            num_shared_slots = num_fused_shared_experts * self.moe_ep_size
+            self.num_fused_shared_expert_replicas_per_rank = (
+                get_fused_shared_expert_replicas_per_rank()
+            )
+            num_shared_slots = (
+                num_fused_shared_experts
+                * self.moe_ep_size
+                * self.num_fused_shared_expert_replicas_per_rank
+            )
         else:
             num_shared_slots = num_fused_shared_experts
 
         assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
         self._num_global_routed = num_experts - num_shared_slots
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
-        self.num_local_experts = self._num_local_routed + num_fused_shared_experts
+        self.num_local_fused_shared_experts = (
+            num_fused_shared_experts
+            * self.num_fused_shared_expert_replicas_per_rank
+        )
+        self.num_local_experts = (
+            self._num_local_routed + self.num_local_fused_shared_experts
+        )
         self._has_fused_shared = num_fused_shared_experts > 0
         self._fp8_shared_to_fp4_lock = Lock()
         self._fp8_shared_to_fp4_cache: dict[
@@ -724,6 +739,55 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
+            shared_expert_id = (
+                expert_id - self._num_global_routed
+                if self._has_fused_shared and expert_id is not None
+                else -1
+            )
+            if 0 <= shared_expert_id < self.num_fused_shared_experts:
+                shared_replica_base = (
+                    shared_expert_id
+                    * self.num_fused_shared_expert_replicas_per_rank
+                )
+                if require_global_experts and uses_per_rank_fused_shared_slots():
+                    physical_expert_ids = [
+                        rank * self.num_local_experts
+                        + self._num_local_routed
+                        + shared_replica_base
+                        + replica
+                        for rank in range(self.moe_ep_size)
+                        for replica in range(
+                            self.num_fused_shared_expert_replicas_per_rank
+                        )
+                    ]
+                    for physical_expert_id in physical_expert_ids:
+                        self._weight_loader_impl(
+                            param=param,
+                            loaded_weight=loaded_weight,
+                            weight_name=weight_name,
+                            shard_id=shard_id,
+                            expert_id=physical_expert_id,
+                        )
+                else:
+                    physical_expert_ids = [
+                        self._num_global_routed + shared_replica_base + replica
+                        for replica in range(
+                            self.num_fused_shared_expert_replicas_per_rank
+                        )
+                    ]
+                    for physical_expert_id in physical_expert_ids:
+                        self._weight_loader_physical(
+                            param=param,
+                            loaded_weight=loaded_weight,
+                            weight_name=weight_name,
+                            shard_id=shard_id,
+                            expert_id=physical_expert_id,
+                        )
+                return
+
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
@@ -748,14 +812,32 @@ class FusedMoE(torch.nn.Module):
             # Checkpoint shared experts start after logical routed experts, while
             # local fused MoE weights store them after physical routed experts.
             if require_global_experts and uses_per_rank_fused_shared_slots():
+                shared_replica_base = (
+                    shared_expert_id
+                    * self.num_fused_shared_expert_replicas_per_rank
+                )
                 physical_expert_ids = [
                     rank * self.num_local_experts
                     + self._num_local_routed
-                    + shared_expert_id
+                    + shared_replica_base
+                    + replica
                     for rank in range(self.moe_ep_size)
+                    for replica in range(
+                        self.num_fused_shared_expert_replicas_per_rank
+                    )
                 ]
             else:
-                physical_expert_ids = [self._num_global_routed + shared_expert_id]
+                shared_replica_base = (
+                    self._num_global_routed
+                    + shared_expert_id
+                    * self.num_fused_shared_expert_replicas_per_rank
+                )
+                physical_expert_ids = [
+                    shared_replica_base + replica
+                    for replica in range(
+                        self.num_fused_shared_expert_replicas_per_rank
+                    )
+                ]
         else:
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(

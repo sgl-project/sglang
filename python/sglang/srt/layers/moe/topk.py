@@ -97,7 +97,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    get_fused_shared_expert_replicas_per_rank,
+    uses_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -450,13 +453,14 @@ class TopK(MultiPlatformOp):
         )
         return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
-    def forward_cuda(
+    def _forward_cuda_impl(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        apply_deepep_waterfill: bool,
     ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
@@ -512,7 +516,56 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        if apply_deepep_waterfill:
+            return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return topk_output
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self._forward_cuda_impl(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_deepep_waterfill=True,
+        )
+
+    def forward_cuda_without_deepep_waterfill(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self._forward_cuda_impl(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_deepep_waterfill=False,
+        )
+
+    def forward_without_deepep_waterfill(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self.forward_cuda_without_deepep_waterfill(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
 
     def forward_cpu(
         self,
@@ -1494,17 +1547,22 @@ def remap_topk_for_per_rank_shared_slots(
     # topk_ids have already been remapped from logical to physical ids, so the
     # interleaved layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
-    num_local_experts = num_local_routed + num_fused_shared_experts
+    shared_replicas_per_rank = get_fused_shared_expert_replicas_per_rank()
+    num_local_shared = num_fused_shared_experts * shared_replicas_per_rank
+    num_local_experts = num_local_routed + num_local_shared
 
     # Remap routed IDs: insert gaps for shared expert slots (single fused op)
     routed = topk_ids[:, :-num_fused_shared_experts]
-    topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
+    topk_ids[:, :-num_fused_shared_experts] = (
+        routed + (routed // num_local_routed) * num_local_shared
+    )
 
     # Set shared expert IDs to route to home rank (vectorized)
     topk_ids[:, -num_fused_shared_experts:] = (
         ep_rank * num_local_experts
         + num_local_routed
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
+        * shared_replicas_per_rank
     )
 
     # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0

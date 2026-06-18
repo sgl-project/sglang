@@ -3848,9 +3848,14 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
-            self.ep_dispatch_algorithm is None
-        ):
+        if (
+            self.enable_eplb
+            or (self.init_expert_location != "trivial")
+            or self.ep_num_redundant_experts > 0
+        ) and (self.ep_dispatch_algorithm is None):
+            # Redundant physical experts are only reachable after logical topk
+            # ids are remapped to physical ids. Without a dispatch algorithm,
+            # the extra experts are allocated/loaded but never selected.
             self.ep_dispatch_algorithm = "static"
 
         if self.enable_eplb:

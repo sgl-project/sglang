@@ -106,6 +106,7 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    get_fused_shared_expert_replicas_per_rank,
     is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
@@ -549,10 +550,20 @@ class DeepseekV2MoE(nn.Module):
         _uses_per_rank_shared_slots = (
             self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
         )
+        _shared_replicas_per_rank = (
+            get_fused_shared_expert_replicas_per_rank()
+            if _uses_per_rank_shared_slots
+            else 1
+        )
 
         if _uses_per_rank_shared_slots:
-            # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
-            num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
+            # 256 routed + EP_size * replicas shared slots.
+            num_experts_for_moe = (
+                config.n_routed_experts
+                + self.moe_ep_size
+                * self.num_fused_shared_experts
+                * _shared_replicas_per_rank
+            )
             top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
             # Interleaving for A2A dispatch is handled by TopK internally.
         else:
@@ -805,8 +816,13 @@ class DeepseekV2MoE(nn.Module):
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
+        num_local_fused_shared_experts = getattr(
+            self.experts,
+            "num_local_fused_shared_experts",
+            self.num_fused_shared_experts,
+        )
         num_local_experts_for_eplb = (
-            self.experts.num_local_experts - self.num_fused_shared_experts
+            self.experts.num_local_experts - num_local_fused_shared_experts
         )
 
         return [
