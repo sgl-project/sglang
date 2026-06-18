@@ -1941,9 +1941,13 @@ def run_benchmark(args_: argparse.Namespace):
         }.get(args.backend, 30000)
 
     # Base URL the client sends to: --base-url if given, else http://host:port
-    # (IPv6-correct). NetworkAddress is also kept for gserver's host:port form.
+    # (IPv6-correct). NetworkAddress is only needed for gserver's host:port form.
     base_url = resolve_base_url(args.base_url, args.host, args.port)
-    _na = NetworkAddress(args.host, args.port)
+    _na = (
+        NetworkAddress(args.host, args.port)
+        if args.backend == "gserver" and not args.base_url
+        else None
+    )
 
     model_url = f"{base_url}/v1/models"
 
