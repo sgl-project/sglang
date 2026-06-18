@@ -1166,7 +1166,9 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
-            if cfg["BLOCK_SIZE_K"] < block_k:
+            if cfg["BLOCK_SIZE_K"] < block_k and (
+                not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
+            ):
                 clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
                 cfg = {**cfg, "BLOCK_SIZE_K": block_k}
             sanitized[m_key] = cfg
