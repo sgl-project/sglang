@@ -179,9 +179,10 @@ class GPTQMoEAscendKernel:
     
             # Check if the scales are compatible (expanded size must equal K_shard)
             if layer.w13_scales.shape[1] * group_size != k_shard_w13:
-                logger.warning(
+                logger.warning_once(
                     f"w13 scales expanded size {layer.w13_scales.shape[1] * group_size} "
                     f"does not match K_shard {k_shard_w13}. Skipping negative-scale correction."
+                    f"This may break the accuracy, please try another TP-size or use DeepEP."
                 )
                 # pack directly
                 layer.w13_qweight = torch.nn.Parameter(
@@ -251,9 +252,10 @@ class GPTQMoEAscendKernel:
     
             # Check if the scales are compatible
             if layer.w2_scales.shape[1] * group_size != k_shard_w2:
-                logger.warning(
+                logger.warning_once(
                     f"w2 scales expanded size {layer.w2_scales.shape[1] * group_size} "
                     f"does not match K_shard {k_shard_w2}. Skipping negative-scale correction."
+                    f"This may break the accuracy, please try another TP-size or use DeepEP."
                 )
                 # pack directly
                 layer.w2_qweight = torch.nn.Parameter(
