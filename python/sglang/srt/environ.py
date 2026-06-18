@@ -382,6 +382,12 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # FakeKVSender auto-abort threshold: number of poll() calls without send()
+    # before auto-aborting to Failed. Prevents memory leaks from leaked requests
+    # (health checks, connection validation) while avoiding premature abortion
+    # during multi-GPU bootstrap sync. Default 100 polls ≈ 0.1-10s depending on
+    # scheduler loop frequency.
+    SGLANG_DISAGGREGATION_FAKE_AUTO_ABORT_THRESHOLD = EnvInt(100)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
