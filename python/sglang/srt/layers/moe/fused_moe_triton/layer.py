@@ -801,6 +801,13 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif isinstance(method, Fp8MoEMethod):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
 
         loaded_weight = (
             loaded_weight.t().contiguous()
@@ -1023,6 +1030,13 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
+        if isinstance(method, Fp8MoEMethod):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (

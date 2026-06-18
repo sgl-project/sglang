@@ -59,13 +59,14 @@ class HashTopK(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
         )
         self._init_default_tid2eid()
-
-        assert not apply_routed_scaling_factor_on_output, "not implemented"
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -187,6 +188,9 @@ class HashTopK(nn.Module):
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
+
+        if self.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * self.routed_scaling_factor
 
         log2phy_prob = None
         if (
