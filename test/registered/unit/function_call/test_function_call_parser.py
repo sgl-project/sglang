@@ -1692,6 +1692,47 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+    def test_streaming_partial_non_string_param_does_not_throw(self):
+        """Regression: a partial non-string parameter value whose streamed
+        prefix is bare text (e.g. agentic code-exec `python3 -c "..."`) makes
+        partial_json_parser raise MalformedJSON -- a ValueError that is NOT a
+        stdlib json.JSONDecodeError. The detector must tolerate it (fall back
+        to the raw string) rather than let it escape, which would dump the raw
+        DSML buffer into normal_text and wedge the stream.
+        """
+        run_tool = Tool(
+            type="function",
+            function=Function(
+                name="run",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": "object"}},
+                },
+            ),
+        )
+        detector = DeepSeekV32Detector()
+        # `string="false"` selects the JSON-typed parameter path; the value
+        # streams in as bare (not-yet-valid-JSON) text before any closer.
+        chunks = [
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="run">\n',
+            '<｜DSML｜parameter name="code" string="false">python3 -c "',
+            "import json",
+        ]
+        names = {}
+        for chunk in chunks:
+            # Must not raise, and must never leak DSML markers as user content.
+            result = detector.parse_streaming_increment(chunk, [run_tool])
+            self.assertNotIn(
+                "｜DSML｜",
+                result.normal_text,
+                "raw DSML markers leaked into normal_text",
+            )
+            for call in result.calls:
+                if call.name:
+                    names[call.tool_index] = call.name
+        # The tool name is still recovered despite the malformed partial value.
+        self.assertEqual(names, {0: "run"})
+
     def test_self_closing_zero_arg_invoke(self):
         """V32 inherits the same regex; verify self-closing parses to empty
         params here too (V32 model rarely emits this shape, but the parser
