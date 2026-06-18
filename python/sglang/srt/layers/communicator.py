@@ -23,8 +23,6 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
@@ -44,12 +42,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_size,
     get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -77,6 +70,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -189,7 +183,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
-        and get_tensor_model_parallel_world_size() != 6
+        and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
     )
@@ -276,7 +270,7 @@ class AttnTpContext:
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
-            and get_tensor_model_parallel_world_size() > 1
+            and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
@@ -801,7 +795,7 @@ class LayerCommunicator:
                 or (
                     _use_aiter
                     and batch_size > 0
-                    and get_tensor_model_parallel_world_size() != 6
+                    and get_parallel().tp_size != 6
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )
@@ -828,13 +822,13 @@ class CommunicateContext:
 
     @classmethod
     def init_new(cls):
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        attn_dp_size = get_attention_dp_size()
-        attn_cp_size = get_attention_cp_size()
-        attn_cp_rank = get_attention_cp_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
+        attn_dp_size = get_parallel().attn_dp_size
+        attn_cp_size = get_parallel().attn_cp_size
+        attn_cp_rank = get_parallel().attn_cp_rank
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         moe_cp_size = get_moe_cp_size()
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
@@ -1312,7 +1306,7 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        if get_parallel().tp_size == get_parallel().attn_dp_size:
             group = get_tp_group()
         else:
             group = get_attention_tp_group()
@@ -1402,7 +1396,7 @@ class CommunicateSummableTensorPairFn:
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
-            if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            if get_parallel().tp_size == get_parallel().attn_dp_size:
                 group = get_tp_group()
             else:
                 group = get_attention_tp_group()
