@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -23,7 +23,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
@@ -42,11 +42,11 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.entrypoints.http_api_specs import ProfileReqInputSpec
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import (
     ProfileReq,
+    ProfileReqInput,
     ProfileReqType,
     async_sock_recv,
     sock_send,
@@ -3861,7 +3861,7 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInputSpec] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReqInput], Body()] = None):
     if dp_dispatcher is not None:
         profile_req = None
         if obj is not None:

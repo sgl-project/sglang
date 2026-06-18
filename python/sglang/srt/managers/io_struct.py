@@ -32,6 +32,7 @@ import msgspec
 import numpy as np
 import torch
 from pydantic import PlainValidator
+from pydantic_core import core_schema
 from zmq import Socket
 from zmq.asyncio import Socket as AsyncSocket
 
@@ -68,16 +69,96 @@ else:
 logger = logging.getLogger(__name__)
 
 
+_PYDANTIC_HTTP_EXCLUDED_FIELDS = frozenset(
+    {
+        "rid",
+        "http_worker_ipc",
+        "rids",
+        "http_worker_ipcs",
+    }
+)
+
+
+def _msgspec_struct_pydantic_core_schema(cls: type[msgspec.Struct], handler):
+    fields = {}
+    for struct_field in msgspec.structs.fields(cls):
+        if struct_field.name in _PYDANTIC_HTTP_EXCLUDED_FIELDS:
+            continue
+
+        field_schema = handler.generate_schema(struct_field.type)
+        required = (
+            struct_field.default is msgspec.NODEFAULT
+            and struct_field.default_factory is msgspec.NODEFAULT
+        )
+
+        if struct_field.default is not msgspec.NODEFAULT:
+            field_schema = core_schema.with_default_schema(
+                field_schema,
+                default=struct_field.default,
+            )
+        elif struct_field.default_factory is not msgspec.NODEFAULT:
+            field_schema = core_schema.with_default_schema(
+                field_schema,
+                default_factory=struct_field.default_factory,
+            )
+
+        fields[struct_field.name] = core_schema.typed_dict_field(
+            field_schema,
+            required=required,
+        )
+
+    typed_dict_schema = core_schema.typed_dict_schema(
+        fields,
+        cls_name=cls.__name__,
+        extra_behavior="ignore",
+        ref=cls.__name__,
+    )
+
+    def build_struct(value):
+        return value if isinstance(value, cls) else cls(**value)
+
+    dict_to_struct_schema = core_schema.no_info_after_validator_function(
+        build_struct,
+        typed_dict_schema,
+    )
+    return core_schema.json_or_python_schema(
+        json_schema=dict_to_struct_schema,
+        python_schema=core_schema.union_schema(
+            [
+                core_schema.is_instance_schema(cls),
+                dict_to_struct_schema,
+            ],
+            mode="left_to_right",
+        ),
+    )
+
+
+TokenLogprobValues = Optional[List[List[Optional[float]]]]
+TokenLogprobIndices = Optional[List[List[Optional[int]]]]
+TopLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
+TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
+HiddenStateChunk = List[Optional[Union[float, List[float]]]]
+OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
+
+
 # The BaseReq IPC class for IPC object
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     rid: Optional[str] = None
     http_worker_ipc: Optional[str] = None
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler):
+        return _msgspec_struct_pydantic_core_schema(cls, handler)
 
 
 # The BaseBatchReq IPC class for IPC object
 class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     rids: Optional[List[str]] = None
     http_worker_ipcs: Optional[List[Optional[str]]] = None
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler):
+        return _msgspec_struct_pydantic_core_schema(cls, handler)
 
 
 # Parameters for a session
@@ -1152,58 +1233,22 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_token_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_token_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_token_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    input_top_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_top_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_top_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_top_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    input_token_ids_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_token_ids_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_token_ids_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_token_ids_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
+    input_token_logprobs_val: TokenLogprobValues
+    input_token_logprobs_idx: TokenLogprobIndices
+    output_token_logprobs_val: TokenLogprobValues
+    output_token_logprobs_idx: TokenLogprobIndices
+    input_top_logprobs_val: TopLogprobValues
+    input_top_logprobs_idx: TopLogprobIndices
+    output_top_logprobs_val: TopLogprobValues
+    output_top_logprobs_idx: TopLogprobIndices
+    input_token_ids_logprobs_val: TopLogprobValues
+    input_token_ids_logprobs_idx: TopLogprobIndices
+    output_token_ids_logprobs_val: TopLogprobValues
+    output_token_ids_logprobs_idx: TopLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[
-        List[
-            Optional[
-                List[
-                    Optional[
-                        Union[
-                            float, List[Optional[Union[float, List[Optional[float]]]]]
-                        ]
-                    ]
-                ]
-            ]
-        ]
-    ]
+    output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
@@ -1270,58 +1315,22 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_token_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_token_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_token_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    input_top_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_top_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_top_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_top_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    input_token_ids_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    input_token_ids_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
-    output_token_ids_logprobs_val: Optional[
-        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
-    ]
-    output_token_ids_logprobs_idx: Optional[
-        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
-    ]
+    input_token_logprobs_val: TokenLogprobValues
+    input_token_logprobs_idx: TokenLogprobIndices
+    output_token_logprobs_val: TokenLogprobValues
+    output_token_logprobs_idx: TokenLogprobIndices
+    input_top_logprobs_val: TopLogprobValues
+    input_top_logprobs_idx: TopLogprobIndices
+    output_top_logprobs_val: TopLogprobValues
+    output_top_logprobs_idx: TopLogprobIndices
+    input_token_ids_logprobs_val: TopLogprobValues
+    input_token_ids_logprobs_idx: TopLogprobIndices
+    output_token_ids_logprobs_val: TopLogprobValues
+    output_token_ids_logprobs_idx: TopLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[
-        List[
-            Optional[
-                List[
-                    Optional[
-                        Union[
-                            float, List[Optional[Union[float, List[Optional[float]]]]]
-                        ]
-                    ]
-                ]
-            ]
-        ]
-    ]
+    output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
@@ -1714,6 +1723,13 @@ class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
     parameter: list
 
 
+class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
+
+
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
@@ -1750,6 +1766,12 @@ class SlowDownReqInput(BaseReq, kw_only=True):
 
 class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
+
+
+class SeparateReasoningReqInput(BaseReq, kw_only=True):
+    text: str  # The text to parse.
+    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    return_blocks: bool = False  # If True, also return segmented reasoning blocks.
 
 
 class AbortReq(BaseReq, kw_only=True):
@@ -1808,6 +1830,31 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_id: Optional[str] = None
     merge_profiles: bool = False
     profile_prefix: Optional[str] = None
+    profile_stages: Optional[List[str]] = None
+
+
+class ProfileReqInput(BaseReq, kw_only=True):
+    # The output directory
+    output_dir: Optional[str] = None
+    # Specify the steps to start the profiling
+    start_step: Optional[int] = None
+    # If set, it profile as many as this number of steps.
+    # If it is set, profiling is automatically stopped after this step, and
+    # the caller doesn't need to run stop_profile.
+    num_steps: Optional[int] = None
+    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
+    activities: Optional[List[str]] = None
+    # Whether profile by stages (e.g., prefill and decode) separately
+    profile_by_stage: bool = False
+    # Whether to record source information (file and line number) for the ops.
+    with_stack: Optional[bool] = None
+    # Whether to save information about operator’s input shapes.
+    record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
+    # The prefix of the profile filenames
+    profile_prefix: Optional[str] = None
+    # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
 
 
@@ -2130,6 +2177,34 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
     error: str = ""
 
 
+@dataclass
+class ParseFunctionCallReq:
+    text: str  # The text to parse.
+    tools: List[Tool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )
+
+
+@dataclass
+class VertexGenerateReqInput:
+    instances: List[dict]
+    parameters: Optional[dict] = None
+
+
+# The following request types are either defined in other files,
+# or not subclasses of BaseReq/BaseBatchReq, so we skip the check for them.
+_IGNORE_REQ_TYPES_CHECK = (
+    GenerateReqInput.__name__,
+    EmbeddingReqInput.__name__,
+    MultimodalProcessorOutput.__name__,
+    ParseFunctionCallReq.__name__,
+    VertexGenerateReqInput.__name__,
+)
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect
@@ -2139,13 +2214,7 @@ def _check_all_req_types():
     for class_type in all_classes:
         # check its name
         name = class_type[0]
-        # GenerateReqInput and EmbeddingReqInput are not io object.
-        # SKip checking MultimodalProcessorOutput
-        if name in (
-            "GenerateReqInput",
-            "EmbeddingReqInput",
-            "MultimodalProcessorOutput",
-        ):
+        if name in _IGNORE_REQ_TYPES_CHECK:
             continue
         is_io_struct = (
             name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
