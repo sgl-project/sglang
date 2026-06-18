@@ -95,6 +95,7 @@ class BenchArgs:
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
     base_url: str = ""
+    local_tokenizer_path: str = ""
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
@@ -149,6 +150,16 @@ class BenchArgs:
             default=BenchArgs.input_len_step_percentage,
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
+        parser.add_argument(
+            "--local-tokenizer-path",
+            type=str,
+            default=BenchArgs.local_tokenizer_path,
+            help=(
+                "Local tokenizer path to use when benchmarking an external "
+                "SGLang server via --base-url. Defaults to the tokenizer path "
+                "reported by /server_info."
+            ),
+        )
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
@@ -370,7 +381,32 @@ def launch_server_internal(launch_server_func: Callable, server_args: ServerArgs
         kill_process_tree(os.getpid(), include_parent=False)
 
 
+def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
+    """Return True if a server answers /v1/models with 200 at base_url."""
+    try:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        response = requests.get(
+            f"{base_url}/v1/models", headers=headers, timeout=timeout
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
+    base_url = f"http://{server_args.host}:{server_args.port}"
+
+    # Reuse an already-running server instead of forking a second one onto the
+    # occupied port, where it would orphan, compete for the GPU, and OOM.
+    if server_is_up(base_url, timeout=5):
+        print(
+            f"WARNING: reusing the server already running at {base_url} "
+            f"(--model and server-launch args ignored). Pass --base-url to silence."
+        )
+        return None, base_url
+
     proc = multiprocessing.Process(
         target=launch_server_internal,
         args=(
@@ -379,22 +415,21 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
         ),
     )
     proc.start()
-    base_url = f"http://{server_args.host}:{server_args.port}"
 
     start_time = time.time()
     while time.time() - start_time < DEFAULT_TIMEOUT:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-            }
-            response = requests.get(
-                f"{base_url}/v1/models", headers=headers, timeout=DEFAULT_TIMEOUT
+        # Fail fast if the server died during startup (e.g. OOM).
+        if not proc.is_alive():
+            raise RuntimeError(
+                f"Server process exited during startup (exit code "
+                f"{proc.exitcode}); see the traceback above for the cause."
             )
-            if response.status_code == 200:
-                return proc, base_url
-        except requests.RequestException:
-            pass
+        if server_is_up(base_url):
+            return proc, base_url
         time.sleep(10)
+
+    # Timed out: kill the half-started server so it does not linger as an orphan.
+    kill_process_tree(proc.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -905,7 +940,9 @@ def run_benchmark_internal(
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
-        if "tokenizer_path" in server_info:
+        if bench_args.local_tokenizer_path:
+            tokenizer_path = bench_args.local_tokenizer_path
+        elif "tokenizer_path" in server_info:
             tokenizer_path = server_info["tokenizer_path"]
         elif "prefill" in server_info:
             tokenizer_path = server_info["prefill"][0]["tokenizer_path"]

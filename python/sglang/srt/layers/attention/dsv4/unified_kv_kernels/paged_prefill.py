@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# The following kernel is imported from ATOM.
+# Source: atom/model_ops/v4_kernels/paged_prefill.py
+
 """Sparse prefill attention with two KV sources: paged `unified_kv` (history)
 and per-fwd flat `kv` (current chunk's input).
 

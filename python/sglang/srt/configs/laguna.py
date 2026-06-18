@@ -78,6 +78,7 @@ class LagunaConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        gating: bool | str = True,
         sliding_window: int = 512,
         layer_types: Optional[List[str]] = None,
         mlp_layer_types: Optional[List[str]] = None,
@@ -120,6 +121,7 @@ class LagunaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.gating = "per-head" if gating is True else gating
         self.sliding_window = sliding_window
 
         self.num_experts = num_experts

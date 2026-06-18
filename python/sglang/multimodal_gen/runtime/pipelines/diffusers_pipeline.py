@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -667,21 +668,15 @@ class DiffusersPipeline(ComposedPipelineBase):
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        dtype = (
-            torch.bfloat16
-            if torch.get_device_module().is_bf16_supported()
-            else torch.float16
-        )
+        """
+        Determine the dtype to use for model loading.
+        """
+        if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
+            return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
-        dit_precision = server_args.pipeline_config.dit_precision
-        if dit_precision == "fp16":
-            dtype = torch.float16
-        elif dit_precision == "bf16":
-            dtype = torch.bfloat16
-        elif dit_precision == "fp32":
-            dtype = torch.float32
-
-        return dtype
+        # precision-constraint: legacy fallback for callers without pipeline_config;
+        # prefer explicit dit_precision policy when available.
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     def _detect_pipeline_type(self) -> None:
         """Detect if this is an image or video pipeline."""
