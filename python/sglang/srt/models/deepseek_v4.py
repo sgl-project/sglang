@@ -29,7 +29,6 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.environ import envs
@@ -53,11 +52,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_partial,
     dp_scatter,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -119,6 +113,7 @@ from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is
 from sglang.srt.models.triton_ops.deepseek_v4 import (
     rms_normalize_triton as rms_normalize_triton,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -274,11 +269,11 @@ class MQALayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.tp_rank = attn_tp_rank = get_attention_tp_rank()
-        self.tp_size = attn_tp_size = get_attention_tp_size()
+        self.tp_rank = attn_tp_rank = get_parallel().attn_tp_rank
+        self.tp_size = attn_tp_size = get_parallel().attn_tp_size
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_parallel().attn_cp_size
             self.tp_rank = attn_tp_rank = 0
             self.tp_size = attn_tp_size = 1
         self.layer_id = layer_id
@@ -1497,13 +1492,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
-            and get_attention_dp_size() > 1
+            and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
-            and get_attention_tp_size() > 1
+            and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
@@ -1535,7 +1530,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
-            s, r = get_attention_tp_size(), get_attention_tp_rank()
+            s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
             _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
@@ -1649,7 +1644,7 @@ class DeepseekV4Model(nn.Module):
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         if self.dsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_parallel().attn_cp_size
 
     def hc_head(
         self,
@@ -1697,7 +1692,7 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
+        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
                 dtype=input_ids.dtype,
@@ -1779,7 +1774,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
@@ -1819,8 +1814,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
 
     @property
     def routed_experts_weights_of_layer(self):
