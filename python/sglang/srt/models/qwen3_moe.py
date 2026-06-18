@@ -332,13 +332,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
-        print(should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ))
-        print(self.tp_size)
-
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
