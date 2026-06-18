@@ -220,14 +220,12 @@ impl WorkerManager {
                 Ok(json) => json
                     .get("loads")
                     .and_then(|l| l.as_array())
-                    .filter(|loads| !loads.is_empty())
-                    .map(|loads| {
-                        loads
-                            .iter()
-                            .filter_map(|load| {
-                                load.get("num_total_tokens").and_then(|v| v.as_i64())
-                            })
-                            .sum::<i64>() as isize
+                    .and_then(|loads| {
+                        let mut parsed = loads.iter().filter_map(|load| {
+                            load.get("num_total_tokens").and_then(|v| v.as_i64())
+                        });
+                        let first = parsed.next()?;
+                        Some((first + parsed.sum::<i64>()) as isize)
                     })
                     .unwrap_or(-1),
                 _ => -1,
