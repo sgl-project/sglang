@@ -8,8 +8,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    LocalAttention,
     DynamicVarlenMaskMeta,
+    LocalAttention,
     UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,

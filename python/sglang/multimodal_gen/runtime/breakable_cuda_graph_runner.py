@@ -49,9 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 # the server log) surfaces the "[Diffusion BCG] captured ..." lines. A plain
 # __name__ logger lives under sglang.srt.* and is not written to the diffusion
 # server log, which would hide BCG capture/eviction diagnostics.
-logger = logging.getLogger(
-    "sglang.multimodal_gen.runtime.breakable_cuda_graph_runner"
-)
+logger = logging.getLogger("sglang.multimodal_gen.runtime.breakable_cuda_graph_runner")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -168,9 +166,9 @@ def _signature_summary_leaf(sig: Any, *, depth: int = 0) -> Any:
 
 
 def _signature_summary(key: tuple) -> tuple:
-    return tuple(
-        (name, _signature_summary_leaf(value)) for name, value in key[:16]
-    ) + ((("...", len(key) - 16),) if len(key) > 16 else ())
+    return tuple((name, _signature_summary_leaf(value)) for name, value in key[:16]) + (
+        (("...", len(key) - 16),) if len(key) > 16 else ()
+    )
 
 
 def _clone_output(out: Any) -> Any:
