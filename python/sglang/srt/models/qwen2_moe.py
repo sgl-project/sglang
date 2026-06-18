@@ -380,34 +380,64 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return F.sigmoid(shared_logits) * scale, 1.0
         return shared_logits, scale
 
+    def _shared_expert_scale(self) -> float:
+        """1/ep_size pre-scale for the fused shared-expert routing weight.
+
+        Mirrors the scaling applied in _get_shared_expert_weights; see that
+        method for the allreduce-EP rationale.
+        """
+        moe_ep_size = get_parallel().moe_ep_size
+        if moe_ep_size > 1 and not is_deepep_class_backend():
+            return 1.0 / float(moe_ep_size)
+        return 1.0
+
     def _append_shared_to_topk_output(
         self,
         topk_output: StandardTopKOutput,
         hidden_states: torch.Tensor,
     ) -> StandardTopKOutput:
         """Append shared expert ids and weights to topk output before fused MoE."""
-        if not self.enable_shared_expert_fusion:
+        if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return topk_output
-        shared = self._get_shared_expert_weights(hidden_states)
-        if shared is None:
-            return topk_output
-        shared_weights, shared_scale = shared
 
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
-        # AITER returns raw logits + scale for in-kernel sigmoid fusion; CUDA
-        # returns pre-activated weights (scale already folded in) → no fusion.
-        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
-            topk_output.topk_ids,
-            topk_output.topk_weights,
-            shared_weights,
-            self.num_fused_shared_experts,
-            N=self.num_experts,
-            apply_sigmoid=_use_aiter,
-            scale=shared_scale,
-        )
+        if _use_aiter:
+            # HIP/aiter: fuse the shared_expert_gate GEMV + sigmoid + scale into
+            # the append kernel, eliminating the standalone gate GEMM launch.
+            # This subsumes the sigmoid-only fusion: there is no separate gate
+            # GEMM and no _get_shared_expert_weights call on this path.
+            fused_topk_ids, fused_topk_weights = (
+                fused_append_shared_experts_with_weights(
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    None,
+                    self.num_fused_shared_experts,
+                    N=self.num_experts,
+                    fuse_gate=True,
+                    hidden_states=hidden_states,
+                    gate_weight=self.shared_expert_gate.weight,
+                    scale=self._shared_expert_scale(),
+                )
+            )
+        else:
+            # CUDA: _get_shared_expert_weights returns pre-activated weights
+            # (sigmoid + scale already folded in) → legacy append, no fusion.
+            shared = self._get_shared_expert_weights(hidden_states)
+            if shared is None:
+                return topk_output
+            shared_weights, _ = shared
+            fused_topk_ids, fused_topk_weights = (
+                fused_append_shared_experts_with_weights(
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    shared_weights,
+                    self.num_fused_shared_experts,
+                    N=self.num_experts,
+                )
+            )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
             topk_ids=fused_topk_ids,
