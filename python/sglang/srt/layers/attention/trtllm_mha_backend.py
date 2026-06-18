@@ -147,10 +147,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
-        # Reusable eager-path page-table buffers, grown on demand.
-        self._eager_page_table: Optional[torch.Tensor] = None
-        self._eager_swa_page_table: Optional[torch.Tensor] = None
-
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
         # XQA: (q_type must be bf16)
@@ -218,33 +214,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
             ),
         )
-
-    def _get_eager_page_tables(
-        self, batch_size: int, device: torch.device
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Reusable [bs, max_num_pages] eager page-table buffer(s), grown on demand.
-
-        Safe to reuse without clearing: the device build overwrites every used
-        column per request.
-        """
-        has_swa = self._swa_kv_pool is not None
-        if (
-            self._eager_page_table is None
-            or self._eager_page_table.shape[0] < batch_size
-        ):
-            self._eager_page_table = torch.empty(
-                (batch_size, self.max_num_pages), dtype=torch.int32, device=device
-            )
-            self._eager_swa_page_table = (
-                torch.empty(
-                    (batch_size, self.max_num_pages), dtype=torch.int32, device=device
-                )
-                if has_swa
-                else None
-            )
-        page_table = self._eager_page_table[:batch_size]
-        swa_page_table = self._eager_swa_page_table[:batch_size] if has_swa else None
-        return page_table, swa_page_table
 
     def _get_layer_cache_loc(
         self,
@@ -704,8 +673,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        metadata.page_table, metadata.swa_page_table = self._get_eager_page_tables(
-            batch_size, device
+        has_swa = self._swa_kv_pool is not None
+        metadata.page_table = torch.empty(
+            (batch_size, self.max_num_pages), dtype=torch.int32, device=device
+        )
+        metadata.swa_page_table = (
+            torch.empty(
+                (batch_size, self.max_num_pages), dtype=torch.int32, device=device
+            )
+            if has_swa
+            else None
         )
         self._fill_page_table_device(
             metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
