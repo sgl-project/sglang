@@ -99,3 +99,19 @@ def test_npu_cache_slot_gather_preserves_3d_shape_and_values():
 
     assert gathered.shape == (2, 2, 3)
     torch.testing.assert_close(gathered, slots[locs])
+
+
+def test_npu_cache_slot_gather_supports_torch_gather_path():
+    module = _load_minimax_sparse_backend_module()
+    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
+    backend.is_npu = False
+
+    slots = torch.arange(5 * 1 * 4).reshape(5, 1, 4)
+    locs = torch.tensor([4, 2, 0], dtype=torch.int32)
+
+    gathered = backend._gather_cache_slots(
+        slots, locs, "unit test", use_torch_gather=True
+    )
+
+    assert gathered.shape == (3, 1, 4)
+    torch.testing.assert_close(gathered, slots[locs.long()])
