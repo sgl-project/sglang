@@ -6,10 +6,19 @@
 
 #pragma once
 
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#endif
 
+#if defined(__HIP_PLATFORM_AMD__)
+#define FULL_MASK 0xffffffffffffffffULL
+#else
 #define FULL_MASK 0xffffffff
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -72,7 +81,7 @@ struct Allreduce {
   template <typename T, typename Operator>
   static __device__ inline T run(T x, Operator& op) {
     constexpr int OFFSET = THREADS / 2;
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+    x = op(x, __shfl_xor_sync(FULL_MASK, x, OFFSET));
     return Allreduce<OFFSET>::run(x, op);
   }
 };
@@ -81,7 +90,7 @@ template <>
 struct Allreduce<2> {
   template <typename T, typename Operator>
   static __device__ inline T run(T x, Operator& op) {
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+    x = op(x, __shfl_xor_sync(FULL_MASK, x, 1));
     return x;
   }
 };

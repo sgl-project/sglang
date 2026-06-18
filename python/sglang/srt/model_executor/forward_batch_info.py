@@ -1472,11 +1472,13 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if is_cuda() or is_hip():
+if is_cuda():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
+    # On HIP/ROCm, tvm_ffi's JIT compile path looks for /opt/rocm/bin/nvcc (doesn't exist).
+    # The native impl is functionally equivalent with negligible overhead.
     clamp_position = _clamp_position_native
 
 

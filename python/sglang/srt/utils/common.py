@@ -89,7 +89,10 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+# Lazy import: torchvision.io.decode_jpeg may fail if torchvision is built
+# against a different torch version than the currently installed one.
+# Import it at call-site only (only needed for multimodal JPEG decode).
+decode_jpeg = None  # resolved lazily in load_image_from_base64
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -918,6 +921,7 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            from torchvision.io import decode_jpeg  # lazy: avoid load-time torchvision ABI check
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor

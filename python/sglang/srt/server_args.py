@@ -47,7 +47,12 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+try:
+    from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+except RuntimeError:
+    # triton.autotune in chunk_delta_h fires at import and needs a GPU driver.
+    # Fall back to the default chunk size (64) when no GPU driver is available at import time.
+    FLA_CHUNK_SIZE = 64
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,

@@ -622,9 +622,17 @@ class LayerNorm(MultiPlatformOp):
         ):
             orig_shape = x.shape
             x = x.reshape(-1, self.hidden_size)
-            return layer_norm(x, self.weight, self.bias, self.variance_epsilon).view(
-                orig_shape
-            )
+            if x.shape[0] == 0:
+                # aiter CK layernorm2d_fwd crashes on M=0 (empty batch).
+                return x.view(orig_shape)
+            try:
+                return layer_norm(x, self.weight, self.bias, self.variance_epsilon).view(
+                    orig_shape
+                )
+            except RuntimeError:
+                # Fallback: aiter CK layernorm failed (e.g. unsupported shape);
+                # use native torch layernorm instead.
+                return self.forward_native(x.view(orig_shape))
         else:
             return self.forward_native(x)
 

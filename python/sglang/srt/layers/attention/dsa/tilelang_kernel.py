@@ -865,6 +865,13 @@ def sparse_mla_fwd_decode_partial(
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
     H_per_block = padded_H if REPLICATE_H == 1 else 64
+    # On HIP/gfx950 the LDS hard limit is 64KB. The kernel allocates
+    # Q_buf=[H_per_block, dim] + KV_shared=[block_I, dim] in bf16 (2 bytes each).
+    # When dim=256 and H_per_block=64: 2 * 64 * 256 * 2 = 65536 bytes = 64KB,
+    # which exactly hits the limit; auxiliary buffers push it over → hipErrorInvalidConfiguration.
+    # Halve H_per_block when LDS would exceed 48KB to leave headroom.
+    if _is_hip and 2 * H_per_block * dim * 2 > 49152:
+        H_per_block = max(16, H_per_block // 2)
     N_GROUPS = topk // (block_I * inner_iter)
     BI = block_I
     D = dim
@@ -1346,6 +1353,12 @@ def tilelang_sparse_fwd(
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        # sparse_mla_fwd_decode_partial_fp8 asserts d_v == 512 (DeepSeek MLA dim).
+        # Fall back to the bf16 path for models with d_v != 512 (e.g. GLM's d_v=256).
+        if is_fp8_kv and d_v != 512:
+            is_fp8_kv = False
+            kv = kv.to(torch.bfloat16)
+            q = q.to(torch.bfloat16)
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)

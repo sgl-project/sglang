@@ -276,17 +276,35 @@ class BaseIndexerMetadata(ABC):
         """
 
 
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    # from sgl_kernel import hadamard_transform
-    if _is_hip:
-        from fast_hadamard_transform import hadamard_transform
-    else:
-        from sglang.jit_kernel.hadamard import hadamard_transform
+def _hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure PyTorch Walsh-Hadamard transform (fallback for ROCm/HIP).
+    Works in-place iteratively: O(n log n), numerically equivalent to the JIT kernel.
+    """
+    n = x.size(-1)
+    h = 1
+    while h < n:
+        x = x.view(*x.shape[:-1], n // (2 * h), 2 * h)
+        lo = x[..., :h].clone()
+        hi = x[..., h:].clone()
+        x[..., :h] = lo + hi
+        x[..., h:] = lo - hi
+        x = x.view(*x.shape[:-2], n)
+        h *= 2
+    return x * scale
 
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     hidden_size = x.size(-1)
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    if _is_hip:
+        # The JIT Hadamard kernel (fast-hadamard-transform) causes HSA hardware
+        # exceptions on gfx950 during cuda graph capture. Use the pure-torch
+        # Walsh-Hadamard fallback which is cuda-graph-safe on ROCm.
+        return _hadamard_transform_torch(x.float(), hidden_size**-0.5).to(x.dtype)
+    # from sgl_kernel import hadamard_transform  # future: use when available
+    from sglang.jit_kernel.hadamard import hadamard_transform
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
