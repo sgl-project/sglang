@@ -21,7 +21,6 @@ from sglang.srt.layers.attention.utils import (
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -148,10 +147,8 @@ class TritonAttnBackend(AttentionBackend):
         self.dcp_size = getattr(model_runner, "dcp_size", 1)
         self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        ) * self.dcp_size
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
+        ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
