@@ -197,18 +197,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 not self.graph_mode
                 and forward_batch.num_token_non_padded_cpu != num_token_padding
             ):
-                real_batch_size = (
+                batch_size = (
                     forward_batch.num_token_non_padded_cpu // draft_token_num
                 )
                 mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
                 a = a[: forward_batch.num_token_non_padded_cpu]
                 b = b[: forward_batch.num_token_non_padded_cpu]
-                cache_indices = cache_indices[:real_batch_size]
+                cache_indices = cache_indices[:batch_size]
                 self.ssm_state_indices = self.ssm_state_indices[
                     : forward_batch.num_token_non_padded_cpu
                 ]
                 seq_len = forward_batch.num_token_non_padded_cpu
-                batch_size = real_batch_size
             num_accepted_tokens = torch.full(
                 (batch_size,),
                 draft_token_num,
@@ -358,21 +357,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 -1, num_value_heads, head_k_dim, head_v_dim
             )
 
+        num_accept_tokens = torch.full(
+            [batch_size], 1, dtype=torch.int32, device=cache_indices.device
+        )
+        actual_seq_lengths = torch.full(
+            [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+        )
         if self.graph_mode:
-            num_accept_tokens = torch.full(
-                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
-            )
-            actual_seq_lengths = torch.full(
-                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
-            )
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
-            num_accept_tokens = torch.full(
-                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
-            )
-            actual_seq_lengths = torch.full(
-                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
-            )
             ssm_state_indices = self.ssm_state_indices
 
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
