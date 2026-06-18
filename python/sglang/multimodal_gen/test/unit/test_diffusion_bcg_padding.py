@@ -187,9 +187,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         with patch(
             "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
-            return_value=SimpleNamespace(
-                forward_batch=SimpleNamespace(is_warmup=True)
-            ),
+            return_value=SimpleNamespace(forward_batch=SimpleNamespace(is_warmup=True)),
         ):
             self.assertTrue(runner._should_capture_on_call(("sig",)))
 

@@ -2004,7 +2004,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         every bucket); a prompt already longer than ``force_bucket`` is left
         unchanged, exactly as the normal bucket selection would do.
         """
-        buckets = (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
+        buckets = (
+            (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
+        )
         padder = bcg_utils.select_prompt_padder(current_model, call_kwargs)
         if padder is not None:
             return padder(call_kwargs, current_model, buckets)

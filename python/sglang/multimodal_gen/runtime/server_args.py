@@ -856,10 +856,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # so that serving never records a fresh graph. That requires
         # server-based warmup (a real warmup request issued at startup), not
         # request-based warmup which runs no forward until the first request.
-        if (
-            self.enable_breakable_cuda_graph
-            and self.disagg_role == RoleType.MONOLITHIC
-        ):
+        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
             self.warmup = True
             self.server_warmup = True
 

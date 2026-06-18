@@ -101,9 +101,7 @@ def select_text_bucket(seq: int, buckets: tuple[int, ...]) -> int | None:
     return None
 
 
-def pad_tensor_dim(
-    tensor: Any, dim: int, target: int, value: float = 0
-) -> Any:
+def pad_tensor_dim(tensor: Any, dim: int, target: int, value: float = 0) -> Any:
     if not torch.is_tensor(tensor) or tensor.dim() <= dim:
         return tensor
     seq = tensor.shape[dim]
