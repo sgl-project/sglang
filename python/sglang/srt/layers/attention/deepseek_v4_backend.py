@@ -69,7 +69,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm89_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -81,6 +81,8 @@ if TYPE_CHECKING:
 _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_sm89 = is_sm89_supported()
+_use_flashmla_fallback_path = _is_sm120 or _is_sm89
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +134,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if _use_flashmla_fallback_path or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1686,7 +1688,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _use_flashmla_fallback_path:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

@@ -31,7 +31,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm89_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -629,6 +629,10 @@ class C4IndexerBackendMixin:
             # TODO: switch from triton to SYCL when OOM is resolved
 
             fn = fp8_paged_mqa_logits_triton
+        elif is_sm89_supported():
+            from sglang.srt.layers.attention.dsv4.triton_paged_mqa_logits import (
+                fp8_paged_mqa_logits_triton_sm89 as fn,
+            )
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
@@ -722,7 +726,11 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and raw_indices is None
+            and not is_sm89_supported()
+        ):
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
