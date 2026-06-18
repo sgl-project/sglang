@@ -4,7 +4,12 @@ Times ``verify_splitkv_fwd`` against the baseline ``extend_attention_fwd`` on
 the verify shape (a few draft-token queries over a long prefix KV) across
 context lengths and head dims, and reports the per-kernel latency, the speedup,
 and the achieved KV-read bandwidth. Model-independent (head_dim is just a shape
-parameter). GPU + Triton required.
+parameter).
+
+NOTE: this benchmark targets AMD MI35x (gfx950). The verify kernel's block config
+and its CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim) are
+tuned and validated only on gfx950, and the kernel is gated to gfx95 in production
+-- so these numbers are meaningful only on MI35x. GPU + Triton required.
 
     python3 benchmark/kernels/verify_splitkv_triton/bench_verify_splitkv.py
 """
@@ -18,6 +23,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
 )
 from sglang.srt.layers.attention.triton_ops.verify_splitkv import verify_splitkv_fwd
+from sglang.srt.utils import is_gfx95_supported
 
 
 def build_inputs(prefix_len, l_ext, h_q, h_kv, head_dim, v_head_dim, dtype, device):
@@ -43,6 +49,13 @@ def main():
     ap.add_argument("--h-kv", type=int, default=2)
     ap.add_argument("--head-dim", type=int, default=256)
     args = ap.parse_args()
+
+    if not is_gfx95_supported():
+        print(
+            "WARNING: this benchmark is tuned and validated only on AMD MI35x "
+            "(gfx950); the verify kernel is gated to gfx95 in production, so "
+            "numbers on other hardware are not representative."
+        )
 
     if not torch.cuda.is_available():
         raise SystemExit("GPU required")
