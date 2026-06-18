@@ -280,9 +280,9 @@ _BYTES_PER_DST_PAGE = (
     _PBS_DST * _NOPE_ROPE_STRIDE + _PBS_DST * _SCALE_STRIDE
 )  # 64*576 + 64*8 = 37376 + 512 = 37888
 # Padded to 576 alignment
-import math as _math
+import math
 
-_BYTES_PER_DST_PAGE_PADDED = _math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
+_BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
 # Pre-allocated buffer for page-split output per device (lazily sized).
 _split_buf = {}  # device -> tensor
@@ -318,7 +318,7 @@ def _page_split_kernel(
 
     # Copy data region: DATA_PER_SUB bytes from src offset sub*DATA_PER_SUB
     data_src_off = sub * DATA_PER_SUB
-    for start in range(0, DATA_PER_SUB, BLOCK_SIZE):
+    for start in tl.range(0, DATA_PER_SUB, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
         mask = offs < DATA_PER_SUB
         vals = tl.load(src_base + data_src_off + offs, mask=mask)
@@ -326,7 +326,7 @@ def _page_split_kernel(
 
     # Copy scale region: SCALE_PER_SUB bytes
     scale_src_off = SRC_SCALE_OFF + sub * SCALE_PER_SUB
-    for start in range(0, SCALE_PER_SUB, BLOCK_SIZE):
+    for start in tl.range(0, SCALE_PER_SUB, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
         mask = offs < SCALE_PER_SUB
         vals = tl.load(src_base + scale_src_off + offs, mask=mask)
