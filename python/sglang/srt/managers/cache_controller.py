@@ -514,8 +514,7 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            # Budget speculative prefetch at half the host pool, leaving the
-            # rest for the write-back staging path.
+            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
             self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
