@@ -1940,8 +1940,7 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
-    # Base URL the client sends to: --base-url if given, else http://host:port
-    # (IPv6-correct). gserver uses the scheme-less host:port form instead.
+    # Where the client sends requests (gserver uses the scheme-less host:port form).
     base_url = resolve_base_url(args.base_url, args.host, args.port)
 
     model_url = f"{base_url}/v1/models"

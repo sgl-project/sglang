@@ -555,8 +555,7 @@ def resolve_base_url(base_url: str, host: str, port: int) -> str:
 
 def resolve_host_port(base_url: str, host: str, port: int) -> str:
     """Like :func:`resolve_base_url` but returns the scheme-less ``host:port``
-    form (for gRPC-style endpoints): ``base_url`` if set, else ``host:port``
-    (IPv6-correct via :class:`NetworkAddress`)."""
+    form, for gRPC-style endpoints."""
     if base_url:
         return base_url
     return NetworkAddress(host, port).to_host_port_str()
