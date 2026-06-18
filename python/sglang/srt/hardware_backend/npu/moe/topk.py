@@ -42,6 +42,7 @@ def fused_topk_npu(
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    scoring_func = topk_config.scoring_func
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
@@ -84,7 +85,7 @@ def fused_topk_npu(
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
         correction_bias is not None
-        or topk_config.scoring_func == "sigmoid"
+        or scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
@@ -109,6 +110,18 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
         )
+        if renormalize:
+            topk_weights = l1_norm(
+                topk_weights
+                if topk_config.num_fused_shared_experts == 0
+                else topk_weights[:, :-1]
+            )
+            if topk_config.apply_routed_scaling_factor_on_output:
+                topk_weights = topk_weights * (
+                    topk_config.routed_scaling_factor
+                    if topk_config.routed_scaling_factor is not None
+                    else 1.0
+                )
         topk_weights = topk_weights.to(torch.float32)
 
     # torch native is not yet supported num_token_non_padded
