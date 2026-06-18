@@ -54,7 +54,7 @@ D2P_COMPLETE_HEADER = b"D2P_DONE"
 class D2PReplicationTask:
     token_ids: List[int]
     prompt_len: int
-    kv_indices: torch.Tensor
+    src_kv_indices: npt.NDArray[np.int32]
     bootstrap_addr: str
 
 
@@ -229,7 +229,7 @@ class DecodeToPrefillKVReplicator:
         last_node = match_result.last_device_node
         self.tree_cache.inc_lock_ref(last_node)
 
-        kv_indices = match_result.device_indices.clone()
+        src_kv_indices = match_result.device_indices[prompt_len :].cpu().numpy().astype(np.int32)
 
         bootstrap_addr = NetworkAddress(
             req.bootstrap_host, self.bootstrap_port
@@ -238,7 +238,7 @@ class DecodeToPrefillKVReplicator:
         task = D2PReplicationTask(
             token_ids=token_ids,
             prompt_len=prompt_len,
-            kv_indices=kv_indices,
+            src_kv_indices=src_kv_indices,
             bootstrap_addr=bootstrap_addr,
         )
         task._locked_node = last_node
@@ -301,7 +301,7 @@ class DecodeToPrefillKVReplicator:
 
         logger.info(f"D2P: got prefill endpoint={prefill_endpoint}")
         room = task._room
-        src_kv_indices = task.kv_indices[task.prompt_len :].cpu().numpy().astype(np.int32)
+        src_kv_indices = task.src_kv_indices
 
         packed_ptrs = struct.pack(f"{len(self.kv_data_ptrs)}Q", *self.kv_data_ptrs)
         packed_item_lens = struct.pack(f"{len(self.kv_item_lens)}I", *self.kv_item_lens)
