@@ -299,10 +299,12 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     if _is_hip:
-        # The JIT Hadamard kernel (fast-hadamard-transform) causes HSA hardware
-        # exceptions on gfx950 during cuda graph capture. Use the pure-torch
-        # Walsh-Hadamard fallback which is cuda-graph-safe on ROCm.
-        return _hadamard_transform_torch(x.float(), hidden_size**-0.5).to(x.dtype)
+        try:
+            from fast_hadamard_transform import hadamard_transform as _fast_wht
+            return _fast_wht(x, scale=hidden_size**-0.5)
+        except ImportError:
+            # Fallback: pure-torch WHT (generates many small GPU kernels but correct)
+            return _hadamard_transform_torch(x.float(), hidden_size**-0.5).to(x.dtype)
     # from sgl_kernel import hadamard_transform  # future: use when available
     from sglang.jit_kernel.hadamard import hadamard_transform
     return hadamard_transform(x, scale=hidden_size**-0.5)
