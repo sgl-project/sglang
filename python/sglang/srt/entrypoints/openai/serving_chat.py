@@ -360,12 +360,9 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
-        # choice_logprobs covers every token generated in this step. Attach it
-        # to the first chunk we emit this step — reasoning, tool-call, or
-        # regular content — so logprobs are never dropped when a reasoning or
-        # tool parser is active (the branches below would otherwise omit them),
-        # and never duplicated across the multiple chunks one step can produce.
-        # Anything left unattached is flushed on a trailing chunk at the end.
+        # Attach logprobs to the first chunk emitted this step (reasoning,
+        # tool-call, or content) so they aren't dropped when a parser is active
+        # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
         # Handle reasoning content
@@ -438,11 +435,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Flush any logprobs not yet attached to a chunk this step. This happens
-        # when the tool-call parser consumed the delta (or is still buffering
-        # tool-call arguments), so the regular-content branch above never ran.
-        # A standalone logprobs chunk keeps parity with vLLM, which still
-        # returns logprobs while tool calls / reasoning are being streamed.
+        # Flush logprobs unattached this step (e.g. the tool-call parser
+        # consumed the delta, so the content branch never ran).
         if remaining_logprobs is not None:
             yield build_sse_content(
                 chunk_id=content["meta_info"]["id"],
