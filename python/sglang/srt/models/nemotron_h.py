@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -66,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -109,6 +111,8 @@ class NemotronHMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         reduce_results: bool = True,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -118,6 +122,8 @@ class NemotronHMLP(nn.Module):
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -126,6 +132,8 @@ class NemotronHMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -215,6 +223,12 @@ class NemotronHMoE(nn.Module):
                 * config.n_shared_experts,
                 quant_config=quant_config,
                 reduce_results=False,
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_flashinfer()
+                    else {}
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
         else:
@@ -243,10 +257,14 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # torch.compile cannot trace CUDA streams. Take the
-        # non-overlapping path only during dynamo tracing; replay can
-        # use the overlapping fast path since dynamo is no longer active.
-        if _is_cuda and not torch.compiler.is_compiling():
+        overlap = _is_cuda and not torch.compiler.is_compiling()
+        if (
+            overlap
+            and get_moe_a2a_backend().is_flashinfer()
+            and not get_is_capture_mode()
+        ):
+            overlap = False
+        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -311,9 +329,13 @@ class NemotronHMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states += shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
+        if (
+            self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+            and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -412,7 +434,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.layer_communicator = make_layer_communicator(
-            self.norm, for_attn=False, allow_reduce_scatter=True
+            self.norm, for_attn=False, allow_reduce_scatter=True, is_sparse=True
         )
 
 
@@ -497,10 +519,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             hidden_states, residual = self._dp_attn_input(
                 hidden_states, residual, forward_batch
             )
-            if (
-                forward_batch.forward_mode.is_idle()
-                or get_real_num_tokens(hidden_states, forward_batch) == 0
-            ):
+            if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
             output = self._forward_mamba(hidden_states, forward_batch)

@@ -4,7 +4,7 @@
  *
  * Handles single-group (num_expert_group=1) and multi-group cases with
  * sigmoid scoring, bias correction, renormalization and scaling factor.
- * Supports up to 512 experts and topk up to 8.
+ * Supports up to 512 experts and topk up to 32.
  */
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
@@ -20,7 +20,8 @@
 namespace {
 
 static constexpr int WARP_SIZE = 32;
-static constexpr int MAX_TOPK = 8;
+static constexpr int MAX_TOPK = 32;
+static_assert(MAX_TOPK <= WARP_SIZE, "single-warp renormalization requires topk <= WARP_SIZE");
 
 // Pack (value, index) into a single uint64_t for warp-level max reduction.
 // Transform IEEE 754 bits into an unsigned ordering that is monotonic for the

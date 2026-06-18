@@ -10,6 +10,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
@@ -46,21 +47,30 @@ def pad_to_original_num_tokens(
     return padded
 
 
-def _build_layer_scatter_modes() -> LayerScatterModes:
+def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
+    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
+    mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
+    middle_residual_mode = (
+        ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL
+    )
     return LayerScatterModes(
         layer_input_mode=ScatterMode.TP_ATTN_FULL,
         attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=ScatterMode.FULL,
-        middle_residual_mode=ScatterMode.TP_ATTN_FULL,
+        mlp_mode=mlp_mode,
+        middle_residual_mode=middle_residual_mode,
         layer_output_mode=ScatterMode.TP_ATTN_FULL,
     )
 
 
 def make_layer_communicator(
-    layer_norm: RMSNorm, *, for_attn: bool, allow_reduce_scatter: bool = False
+    layer_norm: RMSNorm,
+    *,
+    for_attn: bool,
+    allow_reduce_scatter: bool = False,
+    is_sparse: bool = False,
 ) -> LayerCommunicator:
     return LayerCommunicator(
-        layer_scatter_modes=_build_layer_scatter_modes(),
+        layer_scatter_modes=_build_layer_scatter_modes(is_sparse),
         input_layernorm=layer_norm if for_attn else nn.Identity(),
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
         force_layernorm_before_dp_gather=True,
