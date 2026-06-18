@@ -153,9 +153,7 @@ def bench_rmsnorm(shape, provider: str):
     # bandwidth footprint at `out` only (unchanged); sgl_kernel / flashinfer /
     # jit write into `out`, counted explicitly so the in-place (None-returning)
     # providers still report bandwidth.
-    return marker.do_bench(
-        fn, input_args=(x,), memory_args=(), memory_output=(out,)
-    )
+    return marker.do_bench(fn, input_args=(x,), memory_args=(), memory_output=(out,))
 
 
 # ============================================================================
@@ -256,9 +254,7 @@ def bench_layernorm(shape, provider: str):
 
     # Pass x as input_args so do_bench rotates (clones) it per iteration to
     # avoid the L2-hot effect; memory_args=() keeps the footprint at `out` only.
-    return marker.do_bench(
-        fn, input_args=(x,), memory_args=(), memory_output=(out,)
-    )
+    return marker.do_bench(fn, input_args=(x,), memory_args=(), memory_output=(out,))
 
 
 SEP = "=" * 80
