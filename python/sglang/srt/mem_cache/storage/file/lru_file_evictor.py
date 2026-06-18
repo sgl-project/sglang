@@ -357,7 +357,9 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = _sharded_path(self.file_path, f"{evict_stem}.bin")  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = _sharded_path(
+            self.file_path, f"{evict_stem}.bin"
+        )  # LOCAL PATCH (dsv4-l3-shard)
         try:
             os.remove(tensor_path)
             freed = evict_size
