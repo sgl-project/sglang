@@ -1419,7 +1419,7 @@ async def resume_memory_occupation(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(
     obj: Annotated[Optional[CheckWeightsReqInput], Body()] = None,
-    request: Optional[Request] = None,
+    request: Request = None,
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
