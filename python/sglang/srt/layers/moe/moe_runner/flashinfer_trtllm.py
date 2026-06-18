@@ -55,11 +55,6 @@ elif is_cuda_alike():
 else:
     fp4_quantize = None
 
-# CPU cache of MXFP8 MoE row-index permutations, keyed by shape. Kept on CPU on
-# purpose: a GPU-resident index cache gets clobbered by sglang's weights-region
-# memory reuse across weight-update cycles (-> ~3.83 logprob diff). CPU memory is
-# not touched by that reuse, so cache here and move a fresh copy to the device at
-# use time.
 _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
     tuple, dict[str, torch.Tensor]
 ] = {}
@@ -288,9 +283,6 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    # Compute the row-index permutations once per shape, cache them on CPU, and
-    # move a fresh copy to the device each align (see the cache declaration above
-    # for why CPU). get_*_row_indices depends only on shape, so a shape key suffices.
     w13_weight_u8 = w13_weight.view(torch.uint8)
     w2_weight_u8 = w2_weight.view(torch.uint8)
     cache_key = (
