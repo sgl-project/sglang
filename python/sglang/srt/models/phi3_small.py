@@ -6,7 +6,7 @@ from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -25,6 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -114,7 +115,7 @@ class Phi3SmallSelfAttention(nn.Module):
         self.num_heads = config.num_attention_heads
 
         self.head_dim = self.hidden_size // self.num_heads
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         # Number of total Key Value Heads before tensor parallel
         self.num_key_value_heads = config.num_key_value_heads
         self.num_q_per_kv = self.num_heads // self.num_key_value_heads

@@ -54,12 +54,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         else:
             server_args.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
-            if server_args.enable_mamba_extra_buffer():
-                logger.warning(
-                    "Mamba extra_buffer is disabled because decode disaggregation "
-                    "currently forces chunk cache. Falling back to no_buffer."
-                )
-                server_args.mamba_scheduler_strategy = "no_buffer"
 
     elif server_args.disaggregation_mode == "prefill":
         assert (
