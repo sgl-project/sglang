@@ -48,7 +48,7 @@ from sglang.benchmark.utils import (
     set_ulimit,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import NetworkAddress, resolve_base_url
+from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -1941,15 +1941,14 @@ def run_benchmark(args_: argparse.Namespace):
         }.get(args.backend, 30000)
 
     # Base URL the client sends to: --base-url if given, else http://host:port
-    # (IPv6-correct). NetworkAddress is also kept for gserver's host:port form.
+    # (IPv6-correct). gserver uses the scheme-less host:port form instead.
     base_url = resolve_base_url(args.base_url, args.host, args.port)
-    _na = NetworkAddress(args.host, args.port)
 
     model_url = f"{base_url}/v1/models"
 
     if args.backend == "gserver":
         # gRPC server takes a bare host:port, not an http URL.
-        api_url = args.base_url if args.base_url else _na.to_host_port_str()
+        api_url = resolve_host_port(args.base_url, args.host, args.port)
         args.model = args.model or "default"
     else:
         api_url = f"{base_url}{_BACKEND_API_PATHS[args.backend]}"
