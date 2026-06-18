@@ -1878,25 +1878,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(self):
+        server_args = get_global_server_args()
         self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
+        if server_args.disable_shared_experts_fusion:
             return
 
-        disable_reason = None
-        if get_global_server_args().enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
+        if not (
+            server_args.enforce_shared_experts_fusion
+            or getattr(server_args, "enable_deepep_waterfill", False)
+        ):
+            server_args.disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
+                "DeepSeek V4 shared-experts fusion is disabled unless explicitly "
+                "enforced or required by DeepEP Waterfill.",
             )
             return
+
+        if self.config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={self.config.n_shared_experts}."
+            )
 
         self.num_fused_shared_experts = self.config.n_shared_experts
 

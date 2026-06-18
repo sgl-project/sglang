@@ -3719,7 +3719,7 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "megamoe":
+        if self.enable_deepep_waterfill:
             if self.disable_shared_experts_fusion:
                 logger.warning(
                     "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
