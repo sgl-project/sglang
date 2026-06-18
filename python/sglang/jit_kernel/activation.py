@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -54,6 +55,51 @@ SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
 SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
 
 
+def _activation_vec_size(input: torch.Tensor) -> int:
+    vec_bytes = (
+        32
+        if input.is_cuda and not is_hip_runtime() and get_jit_cuda_arch().major >= 10
+        else 16
+    )
+    return max(1, vec_bytes // input.element_size())
+
+
+def _supports_activation_jit(input: torch.Tensor) -> bool:
+    hidden_size = input.shape[-1] // 2
+    return hidden_size % _activation_vec_size(input) == 0
+
+
+def _run_activation_torch(
+    op_name: str,
+    input: torch.Tensor,
+    out: torch.Tensor,
+    expert_ids: Optional[torch.Tensor],
+    expert_step: int,
+) -> torch.Tensor:
+    hidden_size = input.shape[-1] // 2
+    gate = input[..., :hidden_size].float()
+    up = input[..., hidden_size:]
+    if op_name == "silu":
+        activated = F.silu(gate)
+    elif op_name == "gelu":
+        activated = F.gelu(gate, approximate="none")
+    else:
+        activated = F.gelu(gate, approximate="tanh")
+
+    result = activated.to(dtype=input.dtype) * up
+    if expert_ids is None:
+        out.copy_(result)
+    else:
+        result_2d = result.view(-1, hidden_size)
+        out_2d = out.view(-1, hidden_size)
+        keep = torch.repeat_interleave(expert_ids != -1, expert_step)[
+            : result_2d.shape[0]
+        ]
+        keep = keep.to(device=out_2d.device)
+        out_2d[keep] = result_2d[keep]
+    return out
+
+
 @register_custom_op(mutates_args=["out"])
 def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
@@ -98,6 +144,8 @@ def run_activation(
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
+    if not _supports_activation_jit(input):
+        return _run_activation_torch(op_name, input, out, expert_ids, expert_step)
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
