@@ -560,35 +560,33 @@ class SchedulerBatchResultProcessor:
 
             if req.is_retracted:
                 # reset_for_retract() already zeroes committed/allocated KV.
-                predict_tokens.append(accept_tokens)
-                continue
-
-            if req.finished():
+                pass
+            elif req.finished():
                 if not batch.spec_algorithm.is_dflash():
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len -= 1
-                predict_tokens.append(accept_tokens)
-                continue
-
-            if req.grammar is not None:
-                # Stop accepting once the grammar terminates, so the over-drafted
-                # suffix is never committed to KV nor emitted. This advances the
-                # grammar FSM; the result loop only syncs grammar.finished.
-                accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
-            predict_tokens.append(accept_tokens)
-
-            num_accept_tokens = len(accept_tokens)
-            if batch.spec_algorithm.is_dflash():
-                # DFLASH materialized accepted draft tokens plus the bonus token.
-                req.kv_committed_len += num_accept_tokens
             else:
-                # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len += num_accept_tokens - 1
-            req.spec_verify_ct += 1
+                if req.grammar is not None:
+                    # Stop accepting once the grammar terminates, so the
+                    # over-drafted suffix is never committed to KV nor emitted.
+                    # This advances the grammar FSM; the result loop only syncs
+                    # grammar.finished.
+                    accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                num_accept_tokens = len(accept_tokens)
+                if batch.spec_algorithm.is_dflash():
+                    # DFLASH materialized accepted draft tokens plus the bonus token.
+                    req.kv_committed_len += num_accept_tokens
+                else:
+                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                    req.kv_committed_len += num_accept_tokens - 1
+                req.spec_verify_ct += 1
+
+                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                req.spec_num_correct_drafts += num_correct_drafts
+                req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+            predict_tokens.append(accept_tokens)
 
         return predict_tokens
 
