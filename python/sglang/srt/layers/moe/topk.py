@@ -1165,6 +1165,13 @@ def _mask_topk_ids_padded_region(
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
+    elif _is_npu:
+        # On NPU, bool-indexed scatter `topk_ids[bool_mask, :] = -1` lowers
+        # to aclnnNonzeroV2 and can trigger an aicore timeout under long
+        # workloads; `torch.where` avoids that nonzero scan.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        mask = (indices >= num_token_non_padded).unsqueeze(-1)
+        topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value
