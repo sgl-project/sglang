@@ -52,8 +52,10 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         # land on the same (model) device, matching ForwardBatch's contract.
         fake_args = SimpleNamespace(device="meta")
         with patch.object(tbo, "get_global_server_args", lambda: fake_args):
-            eager = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
-                tbo_split_token_index=3, num_token_non_padded=8
+            eager = (
+                TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
+                    tbo_split_token_index=3, num_token_non_padded=8
+                )
             )
             plugin = TboCudaGraphRunnerPlugin()
 
@@ -67,8 +69,10 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         # so the values are materializable.
         fake_args = SimpleNamespace(device="cpu")
         with patch.object(tbo, "get_global_server_args", lambda: fake_args):
-            eager = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
-                tbo_split_token_index=3, num_token_non_padded=8
+            eager = (
+                TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
+                    tbo_split_token_index=3, num_token_non_padded=8
+                )
             )
         self.assertEqual(eager.dtype, torch.int32)
         self.assertEqual(eager.tolist(), [3, 5])
