@@ -1,4 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -10,11 +11,13 @@ import torch
 
 try:
     from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        fused_linear_compact_state_replay_with_optional_track,
         fused_mamba_state_scatter_with_mask,
     )
 
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
+    fused_linear_compact_state_replay_with_optional_track = None
     fused_mamba_state_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
 
@@ -146,6 +149,70 @@ def _fused_update_like(
         )
 
 
+def _ref_linear_compact_replay(
+    dst,
+    k_norm,
+    delta_v,
+    decay,
+    *,
+    base_indices_raw,
+    accepted_dst_indices_raw,
+    accepted_step_indices_raw,
+    track_dst_indices_raw=None,
+    track_step_indices_raw=None,
+):
+    total_requests = accepted_step_indices_raw.shape[0]
+    src_req_size = k_norm.shape[1]
+    src_step_size = k_norm.shape[2]
+    dst_req_size = dst.shape[1]
+
+    for req in range(total_requests):
+        accepted_step = int(accepted_step_indices_raw[req].item())
+        accepted_dst_idx = int(accepted_dst_indices_raw[req].item())
+        if not (
+            0 <= accepted_step < src_step_size
+            and 0 <= accepted_dst_idx < dst_req_size
+            and req < src_req_size
+        ):
+            continue
+
+        base_idx = int(base_indices_raw[req].item())
+        if not (0 <= base_idx < dst_req_size):
+            continue
+
+        h = dst[:, base_idx].float().clone()
+
+        def replay_range(start: int, stop: int):
+            nonlocal h
+            for t in range(start, stop):
+                k_t = k_norm[:, req, t].float()
+                v_t = delta_v[:, req, t].float()
+                decay_t = decay[:, req, t].float()
+                h = h * decay_t[:, :, None, :] + v_t[:, :, :, None] * k_t[:, :, None, :]
+
+        track_valid = False
+        track_step = -1
+        track_dst_idx = -1
+        if track_dst_indices_raw is not None:
+            assert track_step_indices_raw is not None
+            track_step = int(track_step_indices_raw[req].item())
+            track_dst_idx = int(track_dst_indices_raw[req].item())
+            track_valid = (
+                0 <= track_step <= accepted_step
+                and track_step < src_step_size
+                and 0 <= track_dst_idx < dst_req_size
+            )
+
+        if track_valid:
+            replay_range(0, track_step + 1)
+            dst[:, track_dst_idx] = h.to(dst.dtype)
+            replay_range(track_step + 1, accepted_step + 1)
+        else:
+            replay_range(0, accepted_step + 1)
+
+        dst[:, accepted_dst_idx] = h.to(dst.dtype)
+
+
 def _time_cuda_ms(fn, iters=50, warmup=10):
     """Measure average CUDA time (ms) using CUDA events."""
     for _ in range(warmup):
@@ -241,6 +308,115 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
         torch.testing.assert_close(ssm_fused, ssm_ref)
         torch.testing.assert_close(conv_fused, conv_ref)
+
+
+class TestLinearCompactStateReplayCorrectness(CustomTestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "CUDA without HIP is required for this test.",
+    )
+    def test_replay_without_track_matches_reference(self):
+        if fused_linear_compact_state_replay_with_optional_track is None:
+            self.skipTest(
+                "fused_linear_compact_state_replay_with_optional_track import failed: "
+                f"{_FUSED_IMPORT_ERROR}"
+            )
+
+        torch.manual_seed(1)
+        device = torch.device("cuda")
+        L, C, B, D, H, V, K = 2, 9, 4, 5, 2, 5, 3
+
+        dst0 = torch.randn((L, C, H, V, K), device=device, dtype=torch.float32)
+        k_norm = torch.randn((L, B, D, H, K), device=device, dtype=torch.float32)
+        delta_v = torch.randn((L, B, D, H, V), device=device, dtype=torch.float32)
+        decay = torch.rand((L, B, D, H, K), device=device, dtype=torch.float32) * 0.2
+        decay += 0.8
+
+        base_indices = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device)
+        dst_indices = torch.tensor([5, 6, 7, 8], dtype=torch.int64, device=device)
+        accepted_steps = torch.tensor([0, 3, -1, 2], dtype=torch.int64, device=device)
+
+        ref = dst0.clone()
+        actual = dst0.clone()
+        _ref_linear_compact_replay(
+            ref,
+            k_norm,
+            delta_v,
+            decay,
+            base_indices_raw=base_indices,
+            accepted_dst_indices_raw=dst_indices,
+            accepted_step_indices_raw=accepted_steps,
+        )
+        fused_linear_compact_state_replay_with_optional_track(
+            actual,
+            k_norm,
+            delta_v,
+            decay,
+            base_indices,
+            dst_indices,
+            accepted_steps,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, ref, atol=1e-5, rtol=1e-5)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "CUDA without HIP is required for this test.",
+    )
+    def test_replay_with_track_matches_reference(self):
+        if fused_linear_compact_state_replay_with_optional_track is None:
+            self.skipTest(
+                "fused_linear_compact_state_replay_with_optional_track import failed: "
+                f"{_FUSED_IMPORT_ERROR}"
+            )
+
+        torch.manual_seed(2)
+        device = torch.device("cuda")
+        L, C, B, D, H, V, K = 2, 12, 3, 5, 2, 5, 3
+
+        dst0 = torch.randn((L, C, H, V, K), device=device, dtype=torch.float32)
+        k_norm = torch.randn((L, B, D, H, K), device=device, dtype=torch.float32)
+        delta_v = torch.randn((L, B, D, H, V), device=device, dtype=torch.float32)
+        decay = torch.rand((L, B, D, H, K), device=device, dtype=torch.float32) * 0.2
+        decay += 0.8
+
+        # With track slots, replay first stores the state at track_steps for
+        # prefix-cache tracking, then continues to accepted_steps for the final
+        # committed request state. A negative track step means no track write.
+        base_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
+        accepted_dst_indices = torch.tensor([4, 5, 6], dtype=torch.int32, device=device)
+        accepted_steps = torch.tensor([3, 4, 2], dtype=torch.int64, device=device)
+        track_dst_indices = torch.tensor([7, 8, 9], dtype=torch.int64, device=device)
+        track_steps = torch.tensor([1, -1, 2], dtype=torch.int64, device=device)
+
+        ref = dst0.clone()
+        actual = dst0.clone()
+        _ref_linear_compact_replay(
+            ref,
+            k_norm,
+            delta_v,
+            decay,
+            base_indices_raw=base_indices,
+            accepted_dst_indices_raw=accepted_dst_indices,
+            accepted_step_indices_raw=accepted_steps,
+            track_dst_indices_raw=track_dst_indices,
+            track_step_indices_raw=track_steps,
+        )
+        fused_linear_compact_state_replay_with_optional_track(
+            actual,
+            k_norm,
+            delta_v,
+            decay,
+            base_indices,
+            accepted_dst_indices,
+            accepted_steps,
+            track_dst_indices,
+            track_steps,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, ref, atol=1e-5, rtol=1e-5)
 
 
 class TestMambaStateScatterPerf(unittest.TestCase):

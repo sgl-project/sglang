@@ -124,6 +124,21 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    @property
+    def compact_intermediate_cache_per_req(self) -> int:
+        conv_numel = int(
+            np.sum([np.prod(conv_shape) for conv_shape in self.shape.conv])
+        )
+
+        # Linear compact spec cache stores K, post-beta V, and decay instead
+        # of the full [H, V, K] recurrent state.
+        num_heads, value_dim, key_dim = self.shape.temporal
+        temporal_numel = num_heads * (key_dim + value_dim + key_dim)
+        return (
+            conv_numel * self.dtype.conv.itemsize
+            + temporal_numel * self.dtype.temporal.itemsize
+        ) * len(self.layers)
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateShape:
