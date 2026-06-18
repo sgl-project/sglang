@@ -17,7 +17,8 @@ from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_bool_env_var, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if not is_npu():
     from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -184,6 +185,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
+
+    def _debug_sync_npu(self, tag: str) -> None:
+        if not self.is_npu:
+            return
+        if not get_bool_env_var("SGLANG_MINIMAX_NPU_DEBUG_SYNC", "False"):
+            return
+        logger.warning("[MiniMax/NPU debug] synchronize before: %s", tag)
+        torch.npu.synchronize()
+        logger.warning("[MiniMax/NPU debug] synchronize after: %s", tag)
 
     # ------------------------------------------------------------------
     # Delegation helpers
@@ -506,11 +516,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 locs = self.req_to_token[req_idx, :kv_len].to(
                     device=k_slots.device, dtype=torch.long
                 )
+                maybe_detect_oob(
+                    locs,
+                    0,
+                    k_slots.shape[0],
+                    "MiniMax NPU sparse prefill req_to_token -> main KV",
+                )
+                maybe_detect_oob(
+                    locs,
+                    0,
+                    idx_k_slots.shape[0],
+                    "MiniMax NPU sparse prefill req_to_token -> index KV",
+                )
                 k_tokens = k_slots.index_select(0, locs)
                 v_tokens = v_slots.index_select(0, locs)
                 idx_k_tokens = idx_k_slots.index_select(0, locs)
                 idx_v_tokens = (
                     None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+                )
+                self._debug_sync_npu(
+                    f"sparse prefill gather batch_id={batch_id} q_pos={q_pos}"
                 )
                 cur_idx_o, cur_o = self._npu_sparse_one(
                     q[q_pos],
@@ -546,10 +571,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
         for batch_id in range(q.shape[0]):
+            self._debug_sync_npu(f"sparse decode before metadata batch_id={batch_id}")
             req_idx = int(forward_batch.req_pool_indices[batch_id].item())
             kv_len = int(forward_batch.seq_lens[batch_id].item())
             locs = self.req_to_token[req_idx, :kv_len].to(
                 device=k_slots.device, dtype=torch.long
+            )
+            maybe_detect_oob(
+                locs,
+                0,
+                k_slots.shape[0],
+                "MiniMax NPU sparse decode req_to_token -> main KV",
+            )
+            maybe_detect_oob(
+                locs,
+                0,
+                idx_k_slots.shape[0],
+                "MiniMax NPU sparse decode req_to_token -> index KV",
             )
             k_tokens = k_slots.index_select(0, locs)
             v_tokens = v_slots.index_select(0, locs)
@@ -557,6 +595,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_tokens = (
                 None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
             )
+            self._debug_sync_npu(f"sparse decode gather batch_id={batch_id}")
             cur_idx_o, cur_o = self._npu_sparse_one(
                 q[batch_id],
                 k_tokens,
