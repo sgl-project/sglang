@@ -1545,13 +1545,13 @@ def apply_fp8_linear(
     # to skip the redundant activation quantization. Only the AITER per-token x
     # per-channel a8w8 GEMM is supported here; it mirrors the non-fused HIP branch
     # below exactly (same weight.T layout and weight_scale), so results match.
-    if isinstance(input, tuple):
+    if _use_aiter and isinstance(input, tuple):
         qinput, x_scale = input
         qinput = qinput.view(-1, qinput.shape[-1])
         if x_scale.dim() == 1:
             x_scale = x_scale.view(-1, 1)
         output_shape = [*qinput.shape[:-1], weight.shape[1]]
-        if not (_use_aiter and use_per_token_if_dynamic):
+        if not use_per_token_if_dynamic:
             raise NotImplementedError(
                 "Pre-quantized fp8 input is only supported on the AITER "
                 "per-token / per-channel a8w8 path."
