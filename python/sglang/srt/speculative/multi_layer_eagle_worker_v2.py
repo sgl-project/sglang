@@ -67,7 +67,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     record_stream_each,
     record_stream_for_v2_verify,
-    renorm_draft_probs,
     select_top_k_tokens,
 )
 from sglang.srt.utils import is_npu
@@ -125,11 +124,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
-        if self.server_args.speculative_use_rejection_sampling:
-            raise NotImplementedError(
-                "--speculative-use-rejection-sampling is not supported with "
-                "multi-layer EAGLE (enable_multi_layer_eagle)."
-            )
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
@@ -275,9 +269,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Run draft
-        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
-            forward_batch
-        )
+        parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -327,7 +319,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
-            draft_probs=draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -398,14 +389,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             batch_size = parents_list[0].shape[0]
             parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
-        return parent_list, top_scores_index, draft_tokens, None
-
-    def _renorm_draft_probs(self, next_token_logits, sampling_info=None):
-        return renorm_draft_probs(
-            next_token_logits,
-            sampling_info,
-            self.server_args.speculative_use_rejection_sampling,
-        )
+        return parent_list, top_scores_index, draft_tokens
 
     def draft_extend(self):
         pass
@@ -483,9 +467,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
-            probs = self._renorm_draft_probs(
-                output.logits_output.next_token_logits, batch.sampling_info
-            )
+            probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
@@ -606,9 +588,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
-                probs = self._renorm_draft_probs(
+                probs = torch.softmax(
                     draft_logits_output.logits_output.next_token_logits[select_index],
-                    batch.sampling_info,
+                    dim=-1,
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 # Chain-style: use this step's output hidden_states as next step's input
@@ -806,7 +788,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
                 )
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
