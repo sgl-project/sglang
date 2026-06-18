@@ -106,6 +106,7 @@ def _stub_modules():
             ),
             "sglang.srt.layers.quantization.modelslim.schemes": _module(
                 "sglang.srt.layers.quantization.modelslim.schemes",
+                ModelSlimMXFP8Scheme=_FakeScheme,
                 ModelSlimW4A4Int4=_FakeScheme,
                 ModelSlimW4A4Int4MoE=_FakeScheme,
                 ModelSlimW4A8Int8MoE=_FakeScheme,
