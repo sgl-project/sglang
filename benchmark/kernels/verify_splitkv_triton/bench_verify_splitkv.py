@@ -51,10 +51,11 @@ def main():
     args = ap.parse_args()
 
     if not is_gfx95_supported():
-        print(
-            "WARNING: this benchmark is tuned and validated only on AMD MI35x "
-            "(gfx950); the verify kernel is gated to gfx95 in production, so "
-            "numbers on other hardware are not representative."
+        raise SystemExit(
+            "This benchmark is for AMD MI35x (gfx950) only: the verify kernel's "
+            "block config and CDNA launch hints are tuned/validated there, and the "
+            "kernel is gated to gfx95 in production, so results on other hardware "
+            "are not representative."
         )
 
     if not torch.cuda.is_available():
