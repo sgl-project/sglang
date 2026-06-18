@@ -129,12 +129,16 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "black-forest-labs/flux.2-klein-4b",
+        "flux.2-klein-4b",
+        "glm-image",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
         "qwen-image-2512",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
+        "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
     }
@@ -142,6 +146,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "Flux2KleinPipelineConfig",
+        "GlmImagePipelineConfig",
         "QwenImagePipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -518,7 +524,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image, "
-            "Qwen/Qwen-Image-2512, and Tongyi-MAI/Z-Image/Z-Image-Turbo "
+            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
+            "zai-org/GLM-Image, and black-forest-labs/FLUX.2-klein-4B "
             "are currently supported.",
             pipeline_config_name,
         )
