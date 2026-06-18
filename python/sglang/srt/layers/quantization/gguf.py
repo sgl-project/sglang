@@ -36,6 +36,8 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUUnquantMoEMethod,
 )
 
+from sglang.srt.distributed import get_parallel
+
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 if TYPE_CHECKING:
@@ -861,78 +863,119 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Pre-dequantize MoE weights to FP16 for faster inference."""
-
+        """Pre-dequantize MoE weights to FP16 and shard along intermediate dim for TP."""
+    
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
-
-        # Check if weights are actually loaded (not still UninitializedParameter/empty)
+    
+        tp_size = get_parallel().moe_tp_size
+        tp_rank = get_parallel().moe_tp_rank
+    
+        # ----------------------------------------------------------------
+        # w13 (gate + up projections)
+        # ----------------------------------------------------------------
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
-
-        # Pre-dequantize w13 weights (gate+up projections)
+    
         if w13_qtype not in UNQUANTIZED_TYPES:
             num_experts = w13_qweight.shape[0]
             w13_dequant_list = []
-
+    
             block_size, type_size = gguf.GGML_QUANT_SIZES[w13_qtype]
-
+    
             for e in range(num_experts):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
                 rows = w13_qweight[e].shape[0]
                 cols = w13_qweight[e].shape[1] // type_size * block_size
-
+    
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
                     .reshape(rows, cols)
-                    .transpose(-1, -2)
+                    .transpose(-1, -2)       # -> (intermediate, hidden)
                     .contiguous()
                 )
                 w13_dequant_list.append(dequant)
-
-            w13_full = torch.stack(w13_dequant_list, dim=0)
-
+    
+            w13_full = torch.stack(w13_dequant_list, dim=0)   # (E, 2*full_inter, hidden)
             w13_full = npu_format_cast(w13_full)
+    
+            # TP sharding along intermediate dimension
+            if tp_size > 1:
+                inter_dim = w13_full.shape[1]
+                assert inter_dim % tp_size == 0, f"w13 intermediate dim {inter_dim} not divisible by tp_size {tp_size}"
+                shard_size = inter_dim // tp_size
+                start = tp_rank * shard_size
+                end = start + shard_size
+                w13_full = w13_full[:, start:end, :].contiguous()
+    
             layer.register_buffer("w13_dequant", w13_full, persistent=False)
         else:
-            w13_qweight.data = npu_format_cast(w13_qweight.data)
-            layer.register_buffer("w13_dequant", w13_qweight.data, persistent=False)
-
-        # Pre-dequantize w2 weights (down projection)
+            w13_data = npu_format_cast(w13_qweight.data)     # shape (E, 2*inter_shard, hidden)
+    
+            if tp_size > 1:
+                inter_dim = w13_data.shape[1]
+                shard_size = inter_dim // tp_size
+                start = tp_rank * shard_size
+                end = start + shard_size
+                w13_data = w13_data[:, start:end, :].contiguous()
+    
+            layer.register_buffer("w13_dequant", w13_data, persistent=False)
+    
+        # ----------------------------------------------------------------
+        # w2 (down projection)
+        # ----------------------------------------------------------------
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
-
+    
         if w2_qtype not in UNQUANTIZED_TYPES:
             num_experts = w2_qweight.shape[0]
             w2_dequant_list = []
-
+    
             block_size, type_size = gguf.GGML_QUANT_SIZES[w2_qtype]
-
+    
             for e in range(num_experts):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
                 rows = w2_qweight[e].shape[0]
                 cols = w2_qweight[e].shape[1] // type_size * block_size
-
+    
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
                     .reshape(rows, cols)
-                    .transpose(-1, -2)
+                    .transpose(-1, -2)       # -> (intermediate, hidden)
                     .contiguous()
                 )
                 w2_dequant_list.append(dequant)
-
-            w2_full = torch.stack(w2_dequant_list, dim=0)
-
+    
+            w2_full = torch.stack(w2_dequant_list, dim=0)   # (E, full_inter, hidden)
             w2_full = npu_format_cast(w2_full)
+    
+            # TP sharding along intermediate dimension
+            if tp_size > 1:
+                inter_dim = w2_full.shape[1]
+                assert inter_dim % tp_size == 0, f"w2 intermediate dim {inter_dim} not divisible by tp_size {tp_size}"
+                shard_size = inter_dim // tp_size
+                start = tp_rank * shard_size
+                end = start + shard_size
+                w2_full = w2_full[:, start:end, :].contiguous()
+    
             layer.register_buffer("w2_dequant", w2_full, persistent=False)
         else:
-            w2_qweight.data = npu_format_cast(w2_qweight.data)
-            layer.register_buffer("w2_dequant", w2_qweight.data, persistent=False)
-
+            w2_data = npu_format_cast(w2_qweight.data)     # shape (E, inter_shard, hidden)
+    
+            if tp_size > 1:
+                inter_dim = w2_data.shape[1]
+                shard_size = inter_dim // tp_size
+                start = tp_rank * shard_size
+                end = start + shard_size
+                w2_data = w2_data[:, start:end, :].contiguous()
+    
+            layer.register_buffer("w2_dequant", w2_data, persistent=False)
+    
+        # Clean up original quantized tensors
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
         if hasattr(layer, "w13_qweight"):
