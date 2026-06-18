@@ -790,6 +790,77 @@ class GGUFLinearAscendMethod(LinearMethodBase):
         return out
 
 
+class GGUFMoEAscendMethod(FusedMoEMethodBase):
+    """MoE method for GGUF on Ascend NPU."""
+
+    def __init__(self, quant_config: GGUFConfig):
+        self.quant_config = quant_config
+        self.w13_kernel = NPUUnquantMoEMethod()
+        self.w2_kernel = NPUUnquantMoEMethod()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        tensor_shape = (num_experts, 2 * intermediate_size_per_partition, hidden_size)
+        w13_qweight = GGUFUninitializedParameter(requires_grad=False)
+        set_weight_attrs(
+            w13_qweight,
+            {
+                "input_dim": 1,
+                "output_dim": 0,
+                "tensor_shape": tensor_shape,
+                "is_gguf_weight": True,
+                "data_container": [],
+            },
+        )
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        layer.register_parameter("w13_qweight", w13_qweight)
+
+        w13_qweight_type = Parameter(
+            torch.empty(1, dtype=torch.uint8), requires_grad=False
+        )
+        set_weight_attrs(
+            w13_qweight_type,
+            {"is_gguf_weight_type": True, "weight_type": 0, "ignore_warning": True},
+        )
+        set_weight_attrs(w13_qweight_type, extra_weight_attrs)
+        layer.register_parameter("w13_qweight_type", w13_qweight_type)
+
+        tensor_shape = (num_experts, intermediate_size_per_partition, hidden_size)
+        w2_qweight = GGUFUninitializedParameter(requires_grad=False)
+        set_weight_attrs(
+            w2_qweight,
+            {
+                "input_dim": 1,
+                "output_dim": 0,
+                "tensor_shape": tensor_shape,
+                "is_gguf_weight": True,
+                "data_container": [],
+            },
+        )
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        layer.register_parameter("w2_qweight", w2_qweight)
+
+        w2_qweight_type = Parameter(
+            torch.empty(1, dtype=torch.uint8), requires_grad=False
+        )
+        set_weight_attrs(
+            w2_qweight_type,
+            {"is_gguf_weight_type": True, "weight_type": 0, "ignore_warning": True},
+        )
+        set_weight_attrs(w2_qweight_type, extra_weight_attrs)
+        layer.register_parameter("w2_qweight_type", w2_qweight_type)
+
+        # Store params_dtype for pre-dequantization
+        self.params_dtype = params_dtype
+
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         """Pre-dequantize MoE weights, merge gate/up if needed, transpose & shard for TP."""
     
