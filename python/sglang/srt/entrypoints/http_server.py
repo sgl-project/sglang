@@ -2179,15 +2179,16 @@ def _wait_weights_ready():
     )
 
 
-async def _run_granian_server(
+def _run_granian_server(
     host,
     port,
     log_level,
+    tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
     ssl_ca_certs=None,
     ssl_keyfile_password=None,
-    ssl_verify=False,
+    ssl_verify=False,  # MTls is not supported
     backlog=2048,
     backpressure=2048,
 ):
@@ -2203,11 +2204,16 @@ async def _run_granian_server(
     """
     import signal
 
-    from granian.constants import HTTPModes, Interfaces
+    from granian import Granian
+    from granian.constants import HTTPModes, Interfaces, Loops
     from granian.server.embed import Server as GranianEmbeddedServer
 
-    server = GranianEmbeddedServer(
-        target=app,
+    Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
+    target = (
+        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+    )
+    granian_kwargs = dict(
+        target=target,
         address=host,
         port=port,
         interface=Interfaces.ASGI,
@@ -2222,15 +2228,33 @@ async def _run_granian_server(
         backpressure=backpressure,
     )
 
-    # The embedded server does not install its own signal handlers, so wire
-    # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, server.stop)
-        except (NotImplementedError, ValueError):
-            pass
-    await server.serve()
+    if tokenizer_worker_num > 1:
+        granian_kwargs["workers"] = tokenizer_worker_num
+        granian_kwargs["loop"] = Loops.uvloop
+
+    server = Server(**granian_kwargs)
+
+    if tokenizer_worker_num == 1:
+
+        async def serve():
+            # The embedded server does not install its own signal handlers, so wire
+            # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, server.stop)
+                except (NotImplementedError, ValueError):
+                    pass
+            await server.serve()
+
+        uvloop.run(serve())
+    else:
+        # Granian spawns workers whose multiprocessing parent PID differs from this
+        # process (the shared-memory owner). Propagate this PID through the
+        # environment so the workers' ``get_main_process_id()`` resolves to the
+        # correct shared-memory segment written by ``write_data_for_multi_tokenizer``.
+        envs.SGLANG_GRANIAN_PARENT_PID.set(os.getpid())
+        server.serve()
 
 
 def _setup_and_run_http_server(
@@ -2319,18 +2343,15 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{server_args.host}:{server_args.port}"
                 )
-                ssl_verify = server_args.ssl_verify()
-                uvloop.run(
-                    _run_granian_server(
-                        host=server_args.host,
-                        port=server_args.port,
-                        log_level=server_args.log_level_http or server_args.log_level,
-                        ssl_certfile=server_args.ssl_certfile,
-                        ssl_keyfile=server_args.ssl_keyfile,
-                        ssl_ca_certs=server_args.ssl_ca_certs,
-                        ssl_keyfile_password=server_args.ssl_keyfile_password,
-                        ssl_verify=ssl_verify,
-                    )
+                _run_granian_server(
+                    host=server_args.host,
+                    port=server_args.port,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_verify=False,  # No MTLS supported for now.
                 )
             elif server_args.enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2406,18 +2427,15 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{server_args.host}:{server_args.port}"
                 )
-                ssl_verify = server_args.ssl_verify()
-                uvloop.run(
-                    _run_granian_server(
-                        host=server_args.host,
-                        port=server_args.port,
-                        log_level=server_args.log_level_http or server_args.log_level,
-                        ssl_certfile=server_args.ssl_certfile,
-                        ssl_keyfile=server_args.ssl_keyfile,
-                        ssl_ca_certs=server_args.ssl_ca_certs,
-                        ssl_keyfile_password=server_args.ssl_keyfile_password,
-                        ssl_verify=ssl_verify,
-                    )
+                _run_granian_server(
+                    host=server_args.host,
+                    port=server_args.port,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    tokenizer_worker_num=server_args.tokenizer_worker_num,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
                 )
             else:
                 uvicorn.run(
