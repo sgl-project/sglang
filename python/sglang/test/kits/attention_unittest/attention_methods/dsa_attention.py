@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.dsa import utils as _dsa_utils
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -17,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
@@ -37,8 +37,8 @@ from .dense_attention import (
 
 # Unit tests run without distributed initialization. DSA context-parallel probes
 # should see the single-rank default.
-_dsa_utils.get_attention_cp_size = lambda: 1
-_dsa_utils.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(attn_cp_size=1, attn_cp_rank=0)
+_parallel_override.__enter__()
 
 DSA_PAGE_SIZE = 64
 DSA_INDEX_HEAD_DIM = 128
