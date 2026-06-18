@@ -4191,6 +4191,37 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    def sigterm_handler(signum, frame):
+        """Graceful shutdown of the scheduler process on SIGTERM.
+
+        Exit *normally* via sys.exit() so that Python's cleanup mechanisms run
+        before the process dies:
+          - atexit handlers
+          - object __del__ methods during garbage collection
+          - C++ destructors of extension modules (e.g. Mooncake / hicache RDMA
+            teardown, which would otherwise leak registered memory regions and
+            hang pod teardown).
+
+        Exit code 0 is intentional: the parent's SubprocessWatchdog treats a
+        non-zero / signal-based child exit as a crash and fires SIGQUIT, which
+        would SIGKILL the tree and abort this very cleanup. SystemExit is not an
+        ``Exception``, so the ``except Exception`` below does not catch it and we
+        do not send SIGQUIT to the parent.
+        """
+        # Ignore any further SIGTERM so a second signal (e.g. the DP controller
+        # re-propagating SIGTERM to its children) cannot re-enter this handler
+        # and interrupt the cleanup (atexit / C++ destructors) already running.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        logger.info(
+            f"SIGTERM received in scheduler process (TP{tp_rank} PP{pp_rank}); "
+            "exiting normally to allow cleanup..."
+        )
+        sys.exit(0)
+
+    # Register SIGTERM handler so K8s graceful shutdown (and the parent's
+    # graceful_kill_process_tree) lets us clean up instead of being SIGKILLed.
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
     # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(

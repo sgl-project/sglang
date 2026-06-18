@@ -17,6 +17,7 @@ import faulthandler
 import logging
 import multiprocessing as mp
 import signal
+import sys
 import threading
 import time
 from enum import Enum, auto
@@ -51,6 +52,8 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
+    get_child_process_shutdown_timeout,
+    graceful_kill_process_tree,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -664,6 +667,30 @@ def run_data_parallel_controller_process(
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
+
+    def sigterm_handler(signum, frame):
+        """Propagate graceful shutdown from the DP controller to its schedulers.
+
+        In DP mode the schedulers are children of this controller, which sets
+        PR_SET_PDEATHSIG=SIGKILL on them. If this controller exited immediately
+        on SIGTERM, the kernel would SIGKILL the schedulers mid-cleanup. Instead
+        we SIGTERM the schedulers, wait for them to finish their own cleanup
+        (Mooncake/hicache RDMA teardown), SIGKILL stragglers, then exit normally.
+
+        Exit code 0 keeps the parent's SubprocessWatchdog from treating this as a
+        crash; SystemExit is not an ``Exception``, so the ``except Exception``
+        below does not catch it and we do not send SIGQUIT to the parent.
+        """
+        # Ignore further SIGTERM so re-propagation cannot re-enter this handler.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        logger.info(
+            "SIGTERM received in data_parallel_controller; propagating graceful "
+            "shutdown to scheduler children..."
+        )
+        graceful_kill_process_tree(timeout=get_child_process_shutdown_timeout())
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
 
     configure_logger(server_args)
     if server_args.enable_trace:
