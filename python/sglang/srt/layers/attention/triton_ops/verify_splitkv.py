@@ -35,7 +35,16 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 _MIN_BLOCK_KV = 32
+
+# AMD/CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim); NVIDIA's
+# Triton rejects these kwargs, so only pass them on ROCm. In production this kernel
+# is dispatched only on AMD (see TritonAttnBackend); keeping it NV-safe lets the
+# numerics test run on the CUDA CI lane.
+_IS_HIP = is_hip()
+_AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
 
 # Block-size config keyed on head_dim. The (BLOCK_N, num_warps) tile that best
 # hides latency depends on head_dim: at head_dim=256 (Qwen3 family) a narrower
@@ -468,8 +477,7 @@ class VerifySplitKV:
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
             num_warps=self.num_warps,
             num_stages=1,
-            waves_per_eu=4,
-            matrix_instr_nonkdim=16,
+            **_AMD_LAUNCH_KWARGS,
         )
 
     def _run_combine_kernel(

@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_gfx942_supported,
+    is_hip,
     next_power_of_2,
 )
 
@@ -142,8 +143,12 @@ class TritonAttnBackend(AttentionBackend):
         # reduces to a pure-causal chain, i.e. topk == 1 (the same condition the
         # aiter backend's unified-verify uses). For topk > 1 the tree custom_mask
         # is not causal, so leave the path off and fall back to the baseline.
+        # AMD-only: the kernel uses ROCm/CDNA-specific Triton launch hints
+        # (waves_per_eu, matrix_instr_nonkdim) and is tuned + validated on gfx950;
+        # NVIDIA's Triton rejects those kwargs and the path is unvalidated on NV,
+        # so restrict it to ROCm and fall back to extend_attention_fwd elsewhere.
         self.use_verify_splitkv = (
-            envs.SGLANG_ENABLE_SPLITKV_VERIFY.get() and self.topk == 1
+            is_hip() and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get() and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (
