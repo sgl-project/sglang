@@ -48,7 +48,7 @@ class BenchArgs:
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
     gsp_output_len: int = 256
-    seed: int = 1
+    seed: int = 42
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
@@ -144,7 +144,7 @@ class BenchArgs:
             default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument("--seed", type=int, default=42, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
             action="store_true",
