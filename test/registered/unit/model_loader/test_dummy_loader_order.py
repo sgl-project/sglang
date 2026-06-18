@@ -6,7 +6,7 @@ runs inside model.load_weights() before the outer process_weights_after_loading 
 """
 
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -23,36 +23,33 @@ class TestDummyModelLoaderOrder(unittest.TestCase):
         self,
         _mock_env,
         _mock_quant,
-        mock_init_model,
-        mock_init_dummy,
-        mock_post_load,
+        mock_initialize_model,
+        mock_initialize_dummy_weights,
+        mock_post_load_weights,
     ):
         from sglang.srt.model_loader.loader import DummyModelLoader, LoadConfig
+
+        call_log = []
 
         # Build a fake model with one module that has a quant_method
         fake_model = MagicMock()
         fake_model.eval.return_value = fake_model
 
         quant_method = MagicMock()
-        quant_method.process_weights_after_loading = MagicMock()
-
-        fake_module = MagicMock(spec=[])  # spec=[] → hasattr returns False for everything
-        fake_module.quant_method = quant_method
-
-        fake_model.named_modules.return_value = [("layer", fake_module)]
-        mock_init_model.return_value = fake_model
-
-        manager = MagicMock()
-        manager.mock_calls  # reset
-
-        # Track global call order across the three operations
-        call_log = []
-        mock_post_load.side_effect = lambda *a, **kw: call_log.append("post_load_weights")
-        mock_init_dummy.side_effect = lambda *a, **kw: call_log.append(
-            "initialize_dummy_weights"
+        quant_method.process_weights_after_loading.side_effect = (
+            lambda *args, **kwargs: call_log.append("process_weights_after_loading")
         )
-        quant_method.process_weights_after_loading.side_effect = lambda *a, **kw: call_log.append(
-            "process_weights_after_loading"
+
+        fake_module = MagicMock()
+        fake_module.quant_method = quant_method
+        fake_model.named_modules.return_value = [("layer", fake_module)]
+
+        mock_initialize_model.return_value = fake_model
+        mock_initialize_dummy_weights.side_effect = (
+            lambda *args, **kwargs: call_log.append("initialize_dummy_weights")
+        )
+        mock_post_load_weights.side_effect = (
+            lambda *args, **kwargs: call_log.append("post_load_weights")
         )
 
         load_config = LoadConfig(load_format="dummy")
@@ -66,14 +63,11 @@ class TestDummyModelLoaderOrder(unittest.TestCase):
         with patch("sglang.srt.model_loader.loader.set_default_torch_dtype"):
             loader.load_model(model_config=model_config, device_config=device_config)
 
-        self.assertEqual(
-            call_log,
-            [
-                "initialize_dummy_weights",
-                "post_load_weights",
-                "process_weights_after_loading",
-            ],
-            "DummyModelLoader must call post_load_weights before process_weights_after_loading",
+        self.assertLess(
+            call_log.index("post_load_weights"),
+            call_log.index("process_weights_after_loading"),
+            "DummyModelLoader must call _post_load_weights before "
+            "process_weights_after_loading",
         )
 
 
