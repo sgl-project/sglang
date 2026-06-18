@@ -303,4 +303,5 @@ def _ensure_model_padders_registered() -> None:
     _model_padders_registered = True
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (  # noqa: F401
         qwen_image_bcg,
+        zimage_bcg,
     )
