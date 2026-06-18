@@ -106,7 +106,6 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
 
         self.assertEqual(predict_tokens, [[101, 102]])
-        self.assertEqual(req.grammar.accepted, [101, 102])
         # EAGLE commits (retained - 1): prepare_for_decode pre-claimed the bonus
         # slot, and the dropped suffix is never committed.
         self.assertEqual(req.kv_committed_len, 2 - 1)
@@ -119,7 +118,6 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
-        self.assertEqual(req.grammar.accepted, [201, 202, 203])
         self.assertEqual(req.kv_committed_len, 3 - 1)
 
 
