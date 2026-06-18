@@ -256,9 +256,6 @@ class MoEReduceRSSymmMemContext:
     buf_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
     signal_pad_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
 
-    reduce_stream: torch.cuda.Stream = field(
-        default_factory=lambda: torch.cuda.Stream(priority=-1))
-
     def __post_init__(self):
         assert self.dtype in [torch.bfloat16, torch.float16], \
             "Only float16 / bfloat16 are supported"

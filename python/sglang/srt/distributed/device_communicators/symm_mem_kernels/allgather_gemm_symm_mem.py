@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -7,6 +8,8 @@ import dataclasses
 from typing import List, Optional, Tuple
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -182,8 +185,8 @@ def create_allgather_gemm_context_symm_mem(
 
     mc_ag_a_buf = None
     if enable_multicast:
-        print(
-            "Warning: enable_multicast is deprecated in the symm_mem migration; "
+        logger.warning(
+            "enable_multicast is deprecated in the symm_mem migration; "
             "mc_ag_a_buf will be None. Reactivate via ag_hdl.multicast_ptr if needed."
         )
 
