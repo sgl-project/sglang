@@ -2444,7 +2444,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
-            # Forward parameterized SwiGLU to the kernel (else it runs vanilla SwiGLU and the model generates garbage); swiglu_beta=1.0 only for the GPT-OSS-style +1 shift (gemm1_alpha set), else 0.0 for clamp-limit-only models (e.g. step3p5).
             swiglu_kwargs = {}
             _gemm1_alpha = moe_runner_config.gemm1_alpha
             _gemm1_limit = moe_runner_config.gemm1_clamp_limit
