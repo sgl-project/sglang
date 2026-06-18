@@ -37,6 +37,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
@@ -181,6 +182,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers as a namespace adopted by
     ``build_decode_registry(source=...)``."""
@@ -218,6 +220,10 @@ def _allocate_decode_buffers(
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (max_bs, hidden_size), dtype=dtype
+                )
+            if pp_proxy_topk is not None:
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (max_bs, pp_proxy_topk), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -448,6 +454,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_proxy_topk=(
+                get_dsa_index_topk(self.model_runner.model_config.hf_config)
+                if self.pp_size > 1
+                and is_deepseek_dsa(self.model_runner.model_config.hf_config)
+                else None
             ),
         )
         self.buffers.share_buffers()

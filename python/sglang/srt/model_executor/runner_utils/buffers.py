@@ -107,6 +107,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
+        pp_proxy_topk: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -148,6 +149,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
                         (max_bs, hidden_size), dtype=dtype
+                    )
+                if pp_proxy_topk is not None:
+                    pp_proxy_tensors["topk_indices"] = torch.zeros(
+                        (max_bs, pp_proxy_topk), dtype=torch.int32
                     )
             else:
                 pp_proxy_tensors = None
@@ -316,7 +321,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
+                src = pp_proxy_tensors.tensors.get(key)
+                if src is None:
+                    continue
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
