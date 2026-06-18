@@ -291,11 +291,7 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    # Cache the row-index permutations on the GPU, keyed by shape+device. The cache
-    # is cleared in FusedMoE.weight_loader on every weight reload (see
-    # clear_mxfp8_shuffle_index_cache), so the post-update align recomputes fresh
-    # indices instead of reusing a cached GPU tensor that the weights-region memory
-    # reuse may have clobbered (-> ~3.83 logprob diff).
+    # Reuse precomputed row-index transforms whenever shape/device are unchanged.
     w13_weight_u8 = w13_weight.view(torch.uint8)
     w2_weight_u8 = w2_weight.view(torch.uint8)
     cache_key = (
