@@ -133,6 +133,17 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "qwen/qwen-image-2512",
         "qwen-image",
         "qwen-image-2512",
+        "tongyi-mai/z-image",
+        "tongyi-mai/z-image-turbo",
+        "z-image",
+        "z-image-turbo",
+    }
+)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
+    {
+        "QwenImagePipelineConfig",
+        "ZImagePipelineConfig",
     }
 )
 
@@ -498,16 +509,18 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         pipeline_config = getattr(self, "pipeline_config", None)
+        pipeline_config_name = type(pipeline_config).__name__
         if (
-            type(pipeline_config).__name__ == "QwenImagePipelineConfig"
+            pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image and "
-            "Qwen/Qwen-Image-2512 are currently supported.",
-            type(pipeline_config).__name__,
+            "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image, "
+            "Qwen/Qwen-Image-2512, and Tongyi-MAI/Z-Image/Z-Image-Turbo "
+            "are currently supported.",
+            pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
 
