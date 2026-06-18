@@ -492,16 +492,6 @@ def eagle_sample(
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Catch-all for draft workers/algorithms that don't emit a target-vocab
-        # proposal (STANDALONE: independent vocab; FROZEN_KV_MTP: no draft_probs).
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
