@@ -100,6 +100,8 @@ class StableDiffusion3PipelineConfig(SpatialImagePipelineConfig):
     tokenizer kwargs, instead of stage-level tokenizer overrides.
     """
 
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     task_type: ModelTaskType = ModelTaskType.T2I
 
     dit_config: DiTConfig = field(default_factory=StableDiffusion3TransformerConfig)
