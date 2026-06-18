@@ -550,6 +550,16 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        # V4-specific extra graph buffers. Default no-op on the base class;
+        # DeepseekV4AscendAttnBackend overrides.
+        self._init_dsv4_graph_buffers(max_bs=max_bs, max_num_tokens=max_num_tokens)
+
+    def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
+        """Hook for V4-Flash to preallocate dsv4-specific graph buffers.
+
+        Default no-op. Overridden by DeepseekV4AscendAttnBackend.
+        """
+        pass
 
     def _init_cuda_graph_metadata(
         self,
