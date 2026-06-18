@@ -435,15 +435,11 @@ class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
         self.assertLessEqual(b._evictor._total_bytes, 100)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 # ---------------------------------------------------------------------------
-# Hash-prefix sharding tests (dsv4-l3-shard): files fan into <ab>/<cd>/ subdirs
-# so a single directory never accumulates millions of entries (ext4 htree limit).
-# Covers all four patched paths: write layout, get/exists roundtrip, clear (only
-# .bin removed), and the evictor (os.walk discovery + sharded unlink).
+# Hash-prefix sharding tests: files fan into <ab>/<cd>/ subdirs so a single
+# directory never accumulates millions of entries (ext4 htree limit). Covers the
+# write layout, get/exists roundtrip, clear (only .bin removed, empty shard dirs
+# reaped), and the evictor (os.walk discovery + sharded unlink + empty-dir reap).
 # ---------------------------------------------------------------------------
 class TestFileSharding(HiCacheFileLRUTestBase):
     @staticmethod
@@ -504,6 +500,16 @@ class TestFileSharding(HiCacheFileLRUTestBase):
         self.assertTrue(
             os.path.exists(marker), "clear() must not delete non-.bin files"
         )
+        # Empty shard subdirs are reaped (only the root + its marker remain),
+        # so clear() can't leave up to 256*256 empty dirs behind.
+        leftover_dirs = [
+            os.path.relpath(os.path.join(dp, d), be.file_path)
+            for dp, dirs, _ in os.walk(be.file_path)
+            for d in dirs
+        ]
+        self.assertEqual(
+            leftover_dirs, [], f"empty shard dirs not reaped: {leftover_dirs}"
+        )
 
     def test_evictor_discovers_sharded_files_on_restart(self):
         # Write with one backend, then construct a fresh backend over the same
@@ -534,3 +540,15 @@ class TestFileSharding(HiCacheFileLRUTestBase):
         # on disk (victims were physically unlinked, not orphaned).
         on_disk = set(self._all_bins(be.file_path))
         self.assertEqual(len(on_disk), len(be._evictor._lru))
+        # Eviction also reaps the shard dirs it empties: no fully-empty subdir
+        # should linger under the root.
+        empty = [
+            os.path.relpath(dp, be.file_path)
+            for dp, dirs, files in os.walk(be.file_path)
+            if dp != be.file_path and not dirs and not files
+        ]
+        self.assertEqual(empty, [], f"empty shard dirs left after eviction: {empty}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
