@@ -15,6 +15,9 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -46,7 +49,6 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
@@ -59,7 +61,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 if _is_hip:
@@ -313,7 +314,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
