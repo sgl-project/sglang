@@ -59,7 +59,26 @@ class TestRuntimeContextSingletons(CustomTestCase):
         self.assertIs(get_context().parallel, get_parallel())
 
 
-class TestParallelDelegation(CustomTestCase):
+class _IsolatedOverrides(CustomTestCase):
+    """Base for tests that need a clean override map. setUp snapshots and clears
+    any overrides installed outside this test (e.g. a module-level override in
+    another test file sharing the process); tearDown restores exactly those, so
+    these tests stay deterministic without clobbering unrelated active overrides."""
+
+    def setUp(self):
+        super().setUp()
+        p = get_parallel()
+        self._saved_overrides = dict(p._overrides)
+        p._overrides.clear()
+
+    def tearDown(self):
+        p = get_parallel()
+        p._overrides.clear()
+        p._overrides.update(self._saved_overrides)
+        super().tearDown()
+
+
+class TestParallelDelegation(_IsolatedOverrides):
     def test_size_rank_delegate_to_canonical_getters(self):
         # Patch each getter to a distinct sentinel: a miswired attribute would read
         # a different (unpatched) getter and fail.
@@ -91,11 +110,7 @@ class TestParallelDelegation(CustomTestCase):
         self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
 
 
-class TestParallelOverride(CustomTestCase):
-    def tearDown(self):
-        # never leak an override into another test
-        get_parallel()._overrides.clear()
-
+class TestParallelOverride(_IsolatedOverrides):
     def test_override_takes_precedence(self):
         p = get_parallel()
         with p.override(tp_size=99, tp_rank=3, attn_dp_size=8):
