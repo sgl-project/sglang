@@ -6,22 +6,13 @@ import torch.nn.functional as F
 from torch import nn
 
 # Patch TP world size / rank before importing modules that read them at __init__.
-import sglang.srt.distributed as _distributed
-import sglang.srt.layers.attention.mamba.mamba as _mamba_mod
-import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as _norm_mod
 import sglang.srt.layers.linear as _linear_mod
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.runtime_context import get_parallel
 
-_distributed.get_tensor_model_parallel_world_size = lambda: 1
-_distributed.get_tensor_model_parallel_rank = lambda: 0
-_mamba_mod.get_tensor_model_parallel_world_size = lambda: 1
-_mamba_mod.get_tensor_model_parallel_rank = lambda: 0
-_norm_mod.get_tensor_model_parallel_world_size = lambda: 1
-_norm_mod.get_tensor_model_parallel_rank = lambda: 0
-_linear_mod.get_tensor_model_parallel_world_size = lambda: 1
-_linear_mod.get_tensor_model_parallel_rank = lambda: 0
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+)
+_parallel_override.__enter__()
 
 # RowParallelLinear.forward calls get_tp_group() to manage symmetric memory.
 # Provide a stub group with world_size=1 so use_symmetric_memory short-circuits.

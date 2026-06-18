@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -114,7 +117,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         server_args: ServerArgs,
     ) -> bool:
-        return (target_dtype != torch.float32) and not server_args.disable_autocast
+        # precision-constraint: Causal denoising kernels are validated on bf16;
+        # do not replace this with user precision policy without auditing kernel support.
+        return precision_autocast_enabled(target_dtype, server_args.disable_autocast)
 
     def _prepare_frame_seq_length(self, h: int, w: int) -> int:
         patch_ratio = (
