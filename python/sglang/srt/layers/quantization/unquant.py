@@ -431,7 +431,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             and get_moe_a2a_backend().supports_aiter()
         ):
             if self._aiter_ck_moe_supported(layer):
-                self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+                self._aiter_runner = MoeRunner(
+                    MoeRunnerBackend.AITER, moe_runner_config
+                )
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
                     "moe_runner_backend=aiter is not supported for "
