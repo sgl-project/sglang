@@ -111,6 +111,35 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             ],
         )
 
+    def test_decoder_layer_passes_forward_batch_to_mlp_by_keyword(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        decoder_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3DecoderLayer"
+        )
+        forward = next(
+            node
+            for node in decoder_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        mlp_calls = [
+            node
+            for node in ast.walk(forward)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "mlp"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ]
+
+        self.assertEqual(len(mlp_calls), 1)
+        keyword_names = {keyword.arg for keyword in mlp_calls[0].keywords}
+        self.assertIn("forward_batch", keyword_names)
+        self.assertIn("should_allreduce_fusion", keyword_names)
+        self.assertIn("use_reduce_scatter", keyword_names)
+
     def test_large_gemma_rmsnorm_residual_avoids_npu_triton_kernel(self):
         source = _read("python/sglang/srt/layers/layernorm.py")
         tree = ast.parse(source)
