@@ -743,7 +743,6 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 4096",
-        "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
