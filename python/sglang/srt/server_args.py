@@ -451,6 +451,8 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_rollout_kv: bool = False
+    rollout_kv_pin_ttl_seconds: float = 600.0
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -5159,6 +5161,23 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
+        )
+        parser.add_argument(
+            "--enable-rollout-kv",
+            action="store_true",
+            help="Enable RolloutKV (EPC-RL) prefix pinning for RL workloads. "
+            "When enabled, requests can use rollout_kv_commit / rollout_kv_reuse_only / "
+            "rollout_kv_unprotect custom_params to commit, reuse, and release pinned "
+            "prefix KV cache across RL rollout phases.",
+        )
+        parser.add_argument(
+            "--rollout-kv-pin-ttl-seconds",
+            type=float,
+            default=ServerArgs.rollout_kv_pin_ttl_seconds,
+            help="Time-to-live in seconds for RolloutKV prefix pins. Pins older than "
+            "this value are automatically evicted, recovering memory if follower "
+            "processes crash or rollout_kv_expected_followers is miscounted. "
+            "Set to 0 to disable TTL-based eviction. Default: 600.0.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

@@ -291,6 +291,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
+        self.enable_rollout_kv = params.enable_rollout_kv
+        self._rollout_kv_pin_ttl_seconds = params.rollout_kv_pin_ttl_seconds
         self.eviction_policy = params.eviction_policy.lower()
 
         self.kv_event_queue = []
@@ -345,6 +347,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_leaves.clear()
         self._rollout_kv_pin_counts = defaultdict(int)
         self._rollout_kv_pin_nodes = {}
+        self._rollout_kv_pin_timestamps: dict = {}
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -458,6 +461,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         node = self._rollout_kv_pin_nodes.pop(pin_key, None)
         self._rollout_kv_pin_counts.pop(pin_key, None)
+        self._rollout_kv_pin_timestamps.pop(pin_key, None)
         if node is None or node is self.root_node:
             logger.warning(
                 "RolloutKV attempted to release a missing pin: %s", pin_key
@@ -466,6 +470,36 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(node)
         return True
+
+    def _rollout_kv_evict_expired_pins(self) -> int:
+        """Evict pins whose age exceeds ``_rollout_kv_pin_ttl_seconds``.
+
+        Called lazily at the start of every ``cache_finished_req`` when
+        ``enable_rollout_kv`` is True.  Protects against follower crashes or
+        ``rollout_kv_expected_followers`` mismatches that leave refcounts > 0
+        indefinitely, which would otherwise pin memory forever.
+
+        Returns the number of pins evicted.
+        """
+        if not self._rollout_kv_pin_timestamps or self._rollout_kv_pin_ttl_seconds <= 0:
+            return 0
+        now = time.monotonic()
+        expired = [
+            pk
+            for pk, ts in list(self._rollout_kv_pin_timestamps.items())
+            if now - ts > self._rollout_kv_pin_ttl_seconds
+        ]
+        for pk in expired:
+            age = now - self._rollout_kv_pin_timestamps.get(pk, now)
+            remaining = self._rollout_kv_pin_counts.get(pk, 0)
+            logger.warning(
+                "RolloutKV: evicting stale pin %s (age=%.1fs > ttl=%.1fs, "
+                "remaining_refcount=%d). Likely cause: follower crash or "
+                "rollout_kv_expected_followers mismatch.",
+                pk, age, self._rollout_kv_pin_ttl_seconds, remaining,
+            )
+            self._rollout_kv_release_pin(pk, release_all=True)
+        return len(expired)
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -491,12 +525,19 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it finishes."""
         custom_params = getattr(req.sampling_params, "custom_params", None)
         custom_params = custom_params if isinstance(custom_params, dict) else {}
-        rollout_kv_commit = bool(custom_params.get("rollout_kv_commit", False))
-        rollout_kv_reuse_only = bool(custom_params.get("rollout_kv_reuse_only", False))
-        rollout_kv_unprotect = bool(custom_params.get("rollout_kv_unprotect", False))
-        rollout_kv_auto_unprotect = bool(
-            custom_params.get("rollout_kv_auto_unprotect_on_finish", False)
-        )
+        if self.enable_rollout_kv:
+            self._rollout_kv_evict_expired_pins()
+            rollout_kv_commit = bool(custom_params.get("rollout_kv_commit", False))
+            rollout_kv_reuse_only = bool(custom_params.get("rollout_kv_reuse_only", False))
+            rollout_kv_unprotect = bool(custom_params.get("rollout_kv_unprotect", False))
+            rollout_kv_auto_unprotect = bool(
+                custom_params.get("rollout_kv_auto_unprotect_on_finish", False)
+            )
+        else:
+            rollout_kv_commit = False
+            rollout_kv_reuse_only = False
+            rollout_kv_unprotect = False
+            rollout_kv_auto_unprotect = False
 
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert and not rollout_kv_commit:
@@ -562,6 +603,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._rollout_kv_pin_nodes[rollout_kv_pin_key] = (
                         match_result.last_device_node
                     )
+                    self._rollout_kv_pin_timestamps[rollout_kv_pin_key] = time.monotonic()
                 self._rollout_kv_pin_counts[rollout_kv_pin_key] += add_refs
         else:
             if rollout_kv_unprotect and rollout_kv_pin_key is not None:
