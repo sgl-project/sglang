@@ -19,8 +19,8 @@ QWEN3_30B_MODEL = "Qwen/Qwen3-30B-A3B-FP8"
 class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Qwen3-30B-A3B-FP8 + HiCache + CP + UnifiedRadixCache."""
 
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "page_first"
     max_running_requests = 32
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
