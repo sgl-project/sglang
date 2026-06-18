@@ -2418,9 +2418,9 @@ class DeepseekV2AttentionMLA(
                     ds_scorer_is_graph_safe as _ds_scorer_is_graph_safe,
                 )
 
-                # NOTE: the recall-oracle diagnostic does NOT force eager. It must
-                # ride the production graph-safe path; recall_oracle is threaded
-                # into retrieve_topk_graph_safe below instead.
+                # Selection always rides the production graph-safe path unless a
+                # non-graph-safe scorer variant or the explicit env override forces
+                # eager.
                 _force_eager_select = (
                     os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
                     or not _ds_scorer_is_graph_safe(getattr(_selector, "config", None))

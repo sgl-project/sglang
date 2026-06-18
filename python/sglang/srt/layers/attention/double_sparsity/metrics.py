@@ -105,32 +105,6 @@ def increment_dense_fallback(n: int = 1) -> None:
         obj.inc(n)
 
 
-def record_selection(
-    *,
-    selected_tokens: int,
-    total_valid_tokens: int,
-) -> None:
-    """Record one DS top-K selection call.
-
-    ``selected_tokens`` is the number of non-padding entries in
-    ``selected_indices`` (which after the AC-0 rotation carries token
-    positions, not page indices). ``total_valid_tokens`` is the number
-    of currently-valid tokens in the request's KV window.
-    ``sparsity_rate`` is the ratio.
-    """
-
-    _try_register()
-    sps = _metric_objs.get("selected_tokens_sum")
-    cnt = _metric_objs.get("selected_tokens_count")
-    rate = _metric_objs.get("sparsity_rate")
-    if sps is not None:
-        sps.inc(int(selected_tokens))
-    if cnt is not None:
-        cnt.inc(1)
-    if rate is not None and total_valid_tokens > 0:
-        rate.observe(float(selected_tokens) / float(total_valid_tokens))
-
-
 @dataclass
 class DoubleSparsityRequestStats:
     sparsity_rate: float  # pruned fraction: 1 - selected_tokens / total_tokens

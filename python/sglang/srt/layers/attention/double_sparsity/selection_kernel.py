@@ -77,26 +77,11 @@ def ds_scorer_is_graph_safe(config) -> bool:
     All non-learned variants are graph-safe: ``head_agg`` (mean) lives in the
     absorbed paged score kernel, and ``anchor_mode`` (recency/global/strided) is
     a tensorized fixed-shape post-topK force-include in
-    ``retrieve_topk_graph_safe``. None require ``--disable-cuda-graph``. (The
-    ``recall_oracle`` diagnostic is gated separately by
-    ``ds_recall_oracle_enabled``.) Retained as the single guard predicate so a
-    future non-graph-safe variant can re-introduce a gate here.
+    ``retrieve_topk_graph_safe``. None require ``--disable-cuda-graph``.
+    Retained as the single guard predicate so a future non-graph-safe variant
+    can re-introduce a gate here.
     """
     return True
-
-
-def ds_recall_oracle_enabled(config) -> bool:
-    """``True`` iff the config-borne recall-oracle diagnostic is on.
-
-    Config-borne (not env) so it reaches TP worker subprocesses
-    (BL-20260602-ds-flag-must-be-config-borne-not-env). Like a non-default
-    scorer it forces the eager selector path so the host-syncing oracle hook
-    actually re-runs every decode step (under CUDA-graph replay the Python does
-    not re-run); the validator additionally requires ``--disable-cuda-graph``.
-    """
-    if config is None:
-        return False
-    return bool(getattr(config, "recall_oracle", False))
 
 
 def ds_lifted_budget_decode_available() -> bool:
@@ -1041,7 +1026,7 @@ def retrieve_topk_graph_safe(
     # the top-k just consumed. ``topk_scores`` is the AUTHORITATIVE input to the
     # selection top-k — the bf16 reduced view when bf16 is authoritative, else the
     # fp32 ``scores_view``; the dump upcasts to fp32 (bf16->fp32 is exact). Column
-    # t == logical position t (same domain as selection_capture). Eager decode
+    # t == logical position t (logical-position indexed). Eager decode
     # only (the host copy is illegal under capture); off by default — one getattr
     # here when off. Capture-guarded; this Python does not re-run on graph replay.
     return out_indices, out_lengths

@@ -108,15 +108,6 @@ class DSGraphState:
     # bad-req_pool count here. Zeroed on every call.
     lp_error_scratch: Optional[torch.Tensor] = None          # int32 [1]
 
-    # Opt-in selection-capture mirrors (only when the config-borne
-    # `selection_capture` diagnostic is on). The selector copies every layer's
-    # (selected_indices, valid_lengths) into the layer's row — a device-side
-    # copy that is itself captured, so CUDA-graph replay keeps the mirrors
-    # current and the model runner can read the full per-layer selection of the
-    # last decode step after the forward returns.
-    capture_indices: Optional[torch.Tensor] = None  # int32 [num_layers, max_bs, max_top_k]
-    capture_lengths: Optional[torch.Tensor] = None  # int32 [num_layers, max_bs]
-
     # Host-side replay identity for the selection-capture dump. The DSA
     # backend's pre-replay metadata init stamps these (plain Python values,
     # never touched inside a captured region): `last_replay_graph_key` is the
@@ -148,7 +139,6 @@ def allocate_graph_state(
     partial_topk: int = 0,
     num_local_heads: int = 0,
     label_dim: int = 0,
-    selection_capture_layers: int = 0,
     score_reduce_bf16: bool = False,
     topk_block: int = 1024,
     enable_lifted_budget_decode: bool = False,
@@ -319,19 +309,6 @@ def allocate_graph_state(
             (max_bs, topk_nblocks), dtype=torch.int32, device=device,
         )
 
-    # Selection-capture mirrors — only when the config-borne diagnostic is on
-    # (selection_capture_layers = the DS layer count).
-    capture_indices = None
-    capture_lengths = None
-    if selection_capture_layers > 0:
-        capture_indices = torch.full(
-            (selection_capture_layers, max_bs, max_top_k),
-            -1, dtype=torch.int32, device=device,
-        )
-        capture_lengths = torch.zeros(
-            (selection_capture_layers, max_bs), dtype=torch.int32, device=device,
-        )
-
     # Lifted-budget decode scratch — only when the opt-in path is enabled, since
     # lifted_compact_kv is large ([max_bs*max_top_k, 1, head_dim] bf16).
     lifted_page_table = None
@@ -387,8 +364,6 @@ def allocate_graph_state(
         scratch_req_pool_indices=scratch_req_pool_indices,
         scratch_seq_lens=scratch_seq_lens,
         lp_error_scratch=lp_error_scratch,
-        capture_indices=capture_indices,
-        capture_lengths=capture_lengths,
         lifted_page_table=lifted_page_table,
         lifted_compact_indices=lifted_compact_indices,
         lifted_valid_counts=lifted_valid_counts,

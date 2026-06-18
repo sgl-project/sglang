@@ -369,11 +369,6 @@ class DeepseekSparseAttnBackend(
         # default flashmla_kv. When off, every lifted code path below is skipped
         # and the default decode is byte-identical.
         self.ds_lifted_budget_decode: bool = False
-        # Config-borne selection-capture diagnostic: when on, ds_graph_state
-        # carries per-layer mirrors of (selected_indices, valid_lengths) sized
-        # by the token-label table's layer count (resolved below, after the
-        # bind-published table is read).
-        self.ds_selection_capture: bool = False
         # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
         # sizes the bf16 scratch in ds_graph_state.
         self.ds_score_reduce_bf16: bool = False
@@ -403,9 +398,6 @@ class DeepseekSparseAttnBackend(
                 self.ds_lifted_budget_decode = bool(
                     ds_cfg.enable_lifted_budget_decode
                 )
-                self.ds_selection_capture = bool(
-                    getattr(ds_cfg, "selection_capture", False)
-                )
                 self.ds_score_reduce_bf16 = (
                     getattr(ds_cfg, "score_reduce_dtype", "bf16") == "bf16"
                 )
@@ -433,14 +425,6 @@ class DeepseekSparseAttnBackend(
         self._ds_channel_selection = getattr(
             model_runner.server_args, "_ds_channel_selection", None
         )
-        # Layer count for the selection-capture mirrors == the published channel
-        # selection's layer dimension (the same index space layer_id selects
-        # with). 0 (capture off / unbound) allocates no mirrors.
-        self.ds_selection_capture_layers: int = 0
-        if self.ds_selection_capture and self._ds_channel_selection is not None:
-            self.ds_selection_capture_layers = int(
-                self._ds_channel_selection.shape[0]
-            )
         # Mask channel count (label_dim) for the absorbed scratch — derived from
         # the published channel selection ([L, H, label_dim]); 0 leaves the
         # scratch unallocated (and the selector falls back to the eager path).
@@ -880,7 +864,6 @@ class DeepseekSparseAttnBackend(
                 max_bs=int(forward_batch.batch_size),
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=int(self.req_to_token.shape[1]),
-                selection_capture_layers=self.ds_selection_capture_layers,
                 score_reduce_bf16=self.ds_score_reduce_bf16,
                 enable_lifted_budget_decode=self.ds_lifted_budget_decode,
                 lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
@@ -1256,7 +1239,6 @@ class DeepseekSparseAttnBackend(
                 max_bs=self._ds_graph_max_bs,
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=width,
-                selection_capture_layers=self.ds_selection_capture_layers,
                 score_reduce_bf16=self.ds_score_reduce_bf16,
                 enable_lifted_budget_decode=self.ds_lifted_budget_decode,
                 lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
