@@ -63,6 +63,8 @@ class TransformersModelConfig(EncoderConfig):
 
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)

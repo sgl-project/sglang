@@ -19,6 +19,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     """Configuration for the GlmImage pipeline."""
 
+    def supports_continuous_batching(self):
+        return True
+
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False
