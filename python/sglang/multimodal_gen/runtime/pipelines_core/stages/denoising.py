@@ -2027,6 +2027,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise DenoisingStepPackingError(
                     "step batch kwargs mix list and non-list values"
                 )
+            if key == "encoder_hidden_states" and all(
+                all(torch.is_tensor(item) for item in value) for value in values
+            ):
+                merged = []
+                for value in values:
+                    merged.extend(value)
+                return merged
             if key in {"img_shapes", "txt_seq_lens"}:
                 merged = []
                 for value in values:
