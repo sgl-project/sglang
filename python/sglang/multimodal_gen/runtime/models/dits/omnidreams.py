@@ -26,8 +26,14 @@ from einops import rearrange
 from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
-from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
 
 # RoPE primitives live in omnidreams_rope; re-exported here for callers/tests.
@@ -38,60 +44,10 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (  # noqa:
     rope_dims,
 )
 
-
-# ---- TP / distributed helpers (safe to call before distributed init) ------- #
-def _use_tp() -> bool:
-    """True if tensor parallelism is initialised and > 1 rank."""
-    try:
-        from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-
-        return get_tp_world_size() > 1
-    except (ImportError, AssertionError, RuntimeError):
-        return False
-
-
-def _tp_size() -> int:
-    try:
-        from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-
-        return max(1, get_tp_world_size())
-    except (ImportError, AssertionError, RuntimeError):
-        return 1
-
-
-def _tp_col_linear(
-    in_f: int, out_f: int, bias: bool = True, gather_output: bool = False
-):
-    """Column-parallel linear when TP is active, else a plain ``nn.Linear``."""
-    if _use_tp():
-        from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
-
-        return ColumnParallelLinear(in_f, out_f, bias=bias, gather_output=gather_output)
-    return nn.Linear(in_f, out_f, bias=bias)
-
-
-def _tp_row_linear(in_f: int, out_f: int, bias: bool = True):
-    """Row-parallel linear when TP is active, else a plain ``nn.Linear``."""
-    if _use_tp():
-        from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
-
-        return RowParallelLinear(
-            in_f, out_f, bias=bias, reduce_results=True, input_is_parallel=True
-        )
-    return nn.Linear(in_f, out_f, bias=bias)
-
-
-def _divide(a: int, b: int) -> int:
-    """Integer division that asserts divisibility."""
-    q, r = divmod(a, b)
-    if r != 0:
-        raise ValueError(f"{a} is not divisible by {b}")
-    return q
-
-
-def _local_heads(num_heads: int) -> int:
-    """Number of attention heads visible to this TP rank."""
-    return _divide(num_heads, _tp_size())
+# OmniDreams builds Column/Row/MergedColumnParallelLinear directly (cf. ltx_2.py,
+# flux_2.py). The runtime always initialises model parallelism (world_size==1 on a
+# single card), so get_tp_world_size() is valid and equals 1 when TP is off; the
+# per-rank head count is divide(num_heads, get_tp_world_size()).
 
 
 def _sp_size() -> int:
@@ -280,37 +236,45 @@ class OmniDreamsAttention(nn.Module):
         head_dim: int,
     ) -> None:
         super().__init__()
+        self.is_self_attn = context_dim is None
         context_dim = query_dim if context_dim is None else context_dim
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.local_num_heads = _local_heads(n_heads)
-        self._is_tp = _use_tp()
+        self.local_num_heads = divide(n_heads, get_tp_world_size())
 
         inner_dim_full = head_dim * n_heads
-        self.q_proj = _tp_col_linear(
-            query_dim, inner_dim_full, bias=False, gather_output=False
+        if self.is_self_attn:
+            # Self-attn: q/k/v all project from x -> one packed GEMM (q, k, v order).
+            self.to_qkv = MergedColumnParallelLinear(
+                query_dim, [inner_dim_full] * 3, bias=False, gather_output=False
+            )
+        else:
+            # Cross-attn: q from x, k/v from the (text) context -> pack k/v.
+            self.q_proj = ColumnParallelLinear(
+                query_dim, inner_dim_full, bias=False, gather_output=False
+            )
+            self.to_kv = MergedColumnParallelLinear(
+                context_dim, [inner_dim_full] * 2, bias=False, gather_output=False
+            )
+        self.output_proj = RowParallelLinear(
+            inner_dim_full,
+            query_dim,
+            bias=False,
+            reduce_results=True,
+            input_is_parallel=True,
         )
-        self.k_proj = _tp_col_linear(
-            context_dim, inner_dim_full, bias=False, gather_output=False
-        )
-        self.v_proj = _tp_col_linear(
-            context_dim, inner_dim_full, bias=False, gather_output=False
-        )
-        self.output_proj = _tp_row_linear(inner_dim_full, query_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
 
     def _project_qkv(self, x: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Project Q/K/V, handling the TP ColumnParallelLinear return convention."""
-        if self._is_tp:
-            # TP linears (ColumnParallelLinear) return ``(out, bias)`` tuples.
-            q_raw, _ = self.q_proj(x)
-            k_raw, _ = self.k_proj(ctx)
-            v_raw, _ = self.v_proj(ctx)
+        """Project Q/K/V from the packed GEMM(s) (each linear returns ``(out, bias)``)."""
+        if self.is_self_attn:
+            qkv, _ = self.to_qkv(x)
+            q_raw, k_raw, v_raw = (t.contiguous() for t in qkv.chunk(3, dim=-1))
         else:
-            q_raw = self.q_proj(x)
-            k_raw = self.k_proj(ctx)
-            v_raw = self.v_proj(ctx)
+            q_raw, _ = self.q_proj(x)
+            kv, _ = self.to_kv(ctx)
+            k_raw, v_raw = (t.contiguous() for t in kv.chunk(2, dim=-1))
         return q_raw, k_raw, v_raw
 
     def forward(
@@ -358,7 +322,7 @@ class OmniDreamsAttention(nn.Module):
         if cross_kv is not None:
             # Precomputed cross-attn K/V — skip k_proj/v_proj/k_norm.
             # Q still needs projection since it depends on the current x.
-            q_raw = self.q_proj(x)[0] if self._is_tp else self.q_proj(x)
+            q_raw, _ = self.q_proj(x)
             q = self.q_norm(q_raw.reshape(B, L, n, d))
             k, v = cross_kv
         else:
@@ -381,10 +345,8 @@ class OmniDreamsAttention(nn.Module):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         )
         out = out.transpose(1, 2).reshape(B, L, n * d)
-        if self._is_tp:
-            out, _ = self.output_proj(out)
-            return out
-        return self.output_proj(out)
+        out, _ = self.output_proj(out)
+        return out
 
 
 class OmniDreamsBlock(nn.Module):
@@ -580,7 +542,17 @@ class OmniDreamsDiT(BaseDiT):
 
     _fsdp_shard_conditions = [lambda n, m: isinstance(m, OmniDreamsBlock)]
     _compile_conditions = [lambda n, m: isinstance(m, OmniDreamsBlock)]
-    param_names_mapping: dict = {}
+    # Route the flat checkpoint's separate q/k/v projections into the packed
+    # MergedColumnParallelLinear params: self-attn q/k/v -> to_qkv (shards 0,1,2 of
+    # 3); cross-attn k/v -> to_kv (shards 0,1 of 2). Cross-attn q_proj and both
+    # output_proj keep their names (no merge).
+    param_names_mapping: dict = {
+        r"^(blocks\.\d+\.self_attn)\.q_proj\.(.*)$": (r"\1.to_qkv.\2", 0, 3),
+        r"^(blocks\.\d+\.self_attn)\.k_proj\.(.*)$": (r"\1.to_qkv.\2", 1, 3),
+        r"^(blocks\.\d+\.self_attn)\.v_proj\.(.*)$": (r"\1.to_qkv.\2", 2, 3),
+        r"^(blocks\.\d+\.cross_attn)\.k_proj\.(.*)$": (r"\1.to_kv.\2", 0, 2),
+        r"^(blocks\.\d+\.cross_attn)\.v_proj\.(.*)$": (r"\1.to_kv.\2", 1, 2),
+    }
     reverse_param_names_mapping: dict = {}
 
     def __init__(
@@ -752,7 +724,7 @@ class OmniDreamsDiT(BaseDiT):
         with ``seq_dim=1`` and shape ``[B, sink+window, local_heads, head_dim]``
         (TP-sharded heads when tensor parallelism is active).
         """
-        n = _local_heads(self.arch.num_heads)
+        n = divide(self.arch.num_heads, get_tp_world_size())
         d = self.arch.model_channels // self.arch.num_heads
         total = sink_tokens + window_tokens
         shape = (batch_size, total, n, d)
@@ -789,16 +761,8 @@ class OmniDreamsDiT(BaseDiT):
         for block in self.blocks:
             attn = block.cross_attn
             n, d = attn.local_num_heads, attn.head_dim
-            k_raw, _ = (
-                attn.k_proj(context) if _use_tp() else (attn.k_proj(context), None)
-            )
-            v_raw, _ = (
-                attn.v_proj(context) if _use_tp() else (attn.v_proj(context), None)
-            )
-            if isinstance(k_raw, tuple):
-                k_raw = k_raw[0]
-            if isinstance(v_raw, tuple):
-                v_raw = v_raw[0]
+            kv, _ = attn.to_kv(context)
+            k_raw, v_raw = (t.contiguous() for t in kv.chunk(2, dim=-1))
             k = attn.k_norm(k_raw.reshape(context.shape[0], context.shape[1], n, d))
             v = v_raw.reshape(context.shape[0], context.shape[1], n, d)
             result.append((k, v))
