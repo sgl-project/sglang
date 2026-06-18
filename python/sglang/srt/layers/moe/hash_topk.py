@@ -22,9 +22,12 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 
 class HashTopK(nn.Module):
@@ -194,8 +197,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-
-        if is_hip():
+        if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 
         num_fused_shared_experts = self.num_fused_shared_experts

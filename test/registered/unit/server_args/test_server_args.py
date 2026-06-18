@@ -159,6 +159,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
+            model_path="instance://127.0.0.1:8000/dummy",
             dsa_prefill_cp_mode="round-robin-split",
             prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
