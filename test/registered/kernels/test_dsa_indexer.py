@@ -8,9 +8,8 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Force attention TP size = 1 for this unit test through the global parallel
-# context (the backend reads get_parallel().attn_tp_size). Module-level ref so GC
-# of the context manager doesn't undo the override.
+# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
+# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 

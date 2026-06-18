@@ -60,10 +60,8 @@ class TestRuntimeContextSingletons(CustomTestCase):
 
 
 class _IsolatedOverrides(CustomTestCase):
-    """Base for tests that need a clean override map. setUp snapshots and clears
-    any overrides installed outside this test (e.g. a module-level override in
-    another test file sharing the process); tearDown restores exactly those, so
-    these tests stay deterministic without clobbering unrelated active overrides."""
+    """Give each test a clean override map, restoring afterward only the overrides
+    installed outside it (e.g. by another test file sharing the process)."""
 
     def setUp(self):
         super().setUp()

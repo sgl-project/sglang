@@ -7,9 +7,8 @@ import torch
 
 from sglang.srt.runtime_context import get_parallel
 
-# Force attention TP size = 1 for this unit test through the global parallel
-# context (the backends read get_parallel().attn_tp_size). Module-level ref so GC
-# of the context manager doesn't undo the override.
+# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
+# context manager doesn't undo the override.
 # TODO: have the trtllm_mla / flashinfer backends take tp_size as an argument.
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()

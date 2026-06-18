@@ -37,8 +37,8 @@ from .dense_attention import (
 
 # Unit tests run without distributed initialization. DSA context-parallel probes
 # should see the single-rank default.
-# Force a single-GPU topology via get_parallel() (the layer modules read it at
-# init). Module-level ref so GC of the context manager doesn't undo the override.
+# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
+# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(attn_cp_size=1, attn_cp_rank=0)
 _parallel_override.__enter__()
 
