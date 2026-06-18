@@ -126,7 +126,10 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+    from aiter.ops.shuffle import (
+        shuffle_scale,
+        shuffle_weight,
+    )
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -177,7 +180,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(

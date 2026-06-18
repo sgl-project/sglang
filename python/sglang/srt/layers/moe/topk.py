@@ -170,7 +170,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError:
+    except ImportError as e:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -189,7 +189,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError:
+    except ImportError as e:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax

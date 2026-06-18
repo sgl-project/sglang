@@ -1501,7 +1501,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_attention_tp_size() > 1
-            and get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_none()
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
