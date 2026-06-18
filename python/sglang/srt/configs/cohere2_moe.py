@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cohere2Moe text config used by the Cohere Command-A Plus checkpoints."""
 
-from transformers.configuration_utils import PretrainedConfig
+from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
+try:
+    from huggingface_hub.dataclasses import strict
+except ImportError:  # older huggingface_hub
 
-class Cohere2MoeConfig(PretrainedConfig):
+    def strict(cls):  # type: ignore[misc]
+        return cls
+
+
+@strict
+class Cohere2MoeConfig(PreTrainedConfig):
     model_type = "cohere2_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 

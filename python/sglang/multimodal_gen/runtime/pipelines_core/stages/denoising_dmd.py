@@ -161,13 +161,10 @@ class DmdDenoisingStage(DenoisingStage):
                             attn_metadata=attn_metadata,
                             forward_batch=batch,
                         ):
-                            pred_noise = self._predict_noise(
-                                current_model=current_model,
-                                latent_model_input=latent_model_input.permute(
-                                    0, 2, 1, 3, 4
-                                ),
+                            # Run transformer
+                            pred_noise = current_model(
+                                hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
                                 timestep=t_expand,
-                                target_dtype=target_dtype,
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,

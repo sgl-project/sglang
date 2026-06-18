@@ -34,14 +34,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 
 # Both audio and video DiT use the same sinusoidal_embedding_1d function
 # Import from mova_video_dit where it's defined (mova_audio_dit re-exports it)
 from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
     sinusoidal_embedding_1d,
+)
+
+# Create aliases for backward compatibility
+video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
+audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -67,10 +71,6 @@ from sglang.srt.utils.common import get_compiler_backend
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
-
-# Create aliases for backward compatibility
-video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 
 
 class MOVALatentPreparationStage(PipelineStage):
@@ -158,7 +158,6 @@ class MOVADenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._torch_compiled = False
-        self._dual_tower_bcg_runner = None
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -209,7 +208,6 @@ class MOVADenoisingStage(PipelineStage):
         timestep_index: int,
         attn_metadata,
         forward_batch: Req | None = None,
-        server_args: ServerArgs | None = None,
     ):
         # Set forward context for distributed attention (USPAttention)
         with set_forward_context(
@@ -226,8 +224,6 @@ class MOVADenoisingStage(PipelineStage):
                 timestep=timestep,
                 audio_timestep=audio_timestep,
                 video_fps=video_fps,
-                server_args=server_args,
-                enable_bcg=not getattr(forward_batch, "is_warmup", False),
             )
 
     def _cfg_combine(self, pos, neg, guidance_scale, cfg_rank, enable_cfg_parallel):
@@ -298,19 +294,6 @@ class MOVADenoisingStage(PipelineStage):
             if module is not None:
                 self._maybe_enable_torch_compile(module, server_args, model_config)
         self._torch_compiled = True
-
-    def _maybe_get_dual_tower_bcg_runner(self, server_args: ServerArgs | None):
-        if not getattr(server_args, "enable_breakable_cuda_graph", False):
-            return None
-        if self._dual_tower_bcg_runner is None:
-            from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
-                DiffusionBreakableCudaGraphRunner,
-            )
-
-            self._dual_tower_bcg_runner = DiffusionBreakableCudaGraphRunner(
-                self.forward_dual_tower_dit, get_local_torch_device()
-            )
-        return self._dual_tower_bcg_runner
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs."""
@@ -539,7 +522,6 @@ class MOVADenoisingStage(PipelineStage):
                             idx_step,
                             attn_metadata,
                             batch,
-                            server_args,
                         )
                     else:
                         if enable_cfg_parallel:
@@ -556,7 +538,6 @@ class MOVADenoisingStage(PipelineStage):
                                     idx_step,
                                     attn_metadata,
                                     batch,
-                                    server_args,
                                 )
                                 neg = (None, None)
                             else:
@@ -573,7 +554,6 @@ class MOVADenoisingStage(PipelineStage):
                                     idx_step,
                                     attn_metadata,
                                     batch,
-                                    server_args,
                                 )
                         else:
                             pos = self._predict(
@@ -588,7 +568,6 @@ class MOVADenoisingStage(PipelineStage):
                                 idx_step,
                                 attn_metadata,
                                 batch,
-                                server_args,
                             )
                             neg = self._predict(
                                 cur_visual_dit,
@@ -602,7 +581,6 @@ class MOVADenoisingStage(PipelineStage):
                                 idx_step,
                                 attn_metadata,
                                 batch,
-                                server_args,
                             )
 
                             visual_noise_pred = self._cfg_combine(
@@ -742,8 +720,6 @@ class MOVADenoisingStage(PipelineStage):
         timestep: torch.Tensor,
         audio_timestep: torch.Tensor,
         video_fps: float,
-        server_args: ServerArgs | None = None,
-        enable_bcg: bool = True,
     ):
         """
         Single inference step for MOVA dual-tower denoising.
@@ -848,28 +824,22 @@ class MOVADenoisingStage(PipelineStage):
         visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
         audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
 
-        dual_tower_kwargs = {
-            "visual_dit": visual_dit,
-            "visual_x": visual_x,
-            "audio_x": audio_x,
-            "visual_context": visual_context_emb,
-            "audio_context": audio_context_emb,
-            "visual_t_mod": visual_t_mod,
-            "audio_t_mod": audio_t_mod,
-            "visual_freqs": visual_freqs,
-            "audio_freqs": audio_freqs,
-            "grid_size": grid_size,
-            "video_fps": video_fps,
-            "full_visual_seq_len": full_visual_seq_len,
-            "full_audio_seq_len": full_audio_seq_len,
-        }
-        runner = (
-            self._maybe_get_dual_tower_bcg_runner(server_args) if enable_bcg else None
+        # Forward through dual-tower DiT
+        visual_x, audio_x = self.forward_dual_tower_dit(
+            visual_dit=visual_dit,
+            visual_x=visual_x,
+            audio_x=audio_x,
+            visual_context=visual_context_emb,
+            audio_context=audio_context_emb,
+            visual_t_mod=visual_t_mod,
+            audio_t_mod=audio_t_mod,
+            visual_freqs=visual_freqs,
+            audio_freqs=audio_freqs,
+            grid_size=grid_size,
+            video_fps=video_fps,
+            full_visual_seq_len=full_visual_seq_len,
+            full_audio_seq_len=full_audio_seq_len,
         )
-        if runner is not None:
-            visual_x, audio_x = runner(**dual_tower_kwargs)
-        else:
-            visual_x, audio_x = self.forward_dual_tower_dit(**dual_tower_kwargs)
 
         # Gather sequences back from SP before head/unpatchify
         visual_x = self._gather_sequence_from_sp(visual_x, visual_pad_len, dim=1)
@@ -918,6 +888,7 @@ class MOVADenoisingStage(PipelineStage):
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
+        sp_size = get_sp_world_size()
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences

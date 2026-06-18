@@ -413,7 +413,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.server_args = server_args
         self._logged_parallel_config = False
-        self._bcg_runners = {}
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -436,8 +435,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         headline 2-GPU CFG-parallel recipe (``sp_size == 1``) skips the SP
         branch entirely and compiles cleanly.
         """
-        if getattr(server_args, "enable_breakable_cuda_graph", False):
-            return
         if not server_args.enable_torch_compile or not isinstance(
             transformer, nn.Module
         ):
@@ -522,7 +519,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
         with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
-            call_kwargs = dict(
+            return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
                 timestep=timestep,
@@ -533,48 +530,6 @@ class Cosmos3DenoisingStage(PipelineStage):
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=max_text_seq_len,
             )
-            runner = self._maybe_get_bcg_runner()
-            if runner is not None:
-                # Breakable-CUDA-graph path. Compute the UND K/V + GEN rope
-                # EAGERLY (outside the captured graph) and publish UND K/V onto
-                # the GEN cross-attentions; then drive the captured GEN forward
-                # with only fixed-shape inputs (latents/timestep/rope), so the
-                # capture signature is invariant to prompt content/length and a
-                # single captured graph is reused across requests.
-                cos_sin_gen, gen_rope_positions = self.transformer.precompute_und(
-                    hidden_states=latents,
-                    text_ids=text_ids,
-                    text_mask=text_mask,
-                    fps=fps,
-                    cache_key=cache_key,
-                    max_text_seq_len=max_text_seq_len,
-                )
-                return runner(
-                    hidden_states=latents,
-                    encoder_hidden_states=None,
-                    timestep=timestep,
-                    cache_key=cache_key,
-                    noisy_frame_mask=noisy_frame_mask,
-                    precomputed_cos_sin_gen=cos_sin_gen,
-                    precomputed_gen_rope_positions=gen_rope_positions,
-                )
-            return self.transformer(**call_kwargs)
-
-    def _maybe_get_bcg_runner(self):
-        if not getattr(self.server_args, "enable_breakable_cuda_graph", False):
-            return None
-        key = id(self.transformer)
-        runner = self._bcg_runners.get(key)
-        if runner is None:
-            from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
-                DiffusionBreakableCudaGraphRunner,
-            )
-
-            runner = DiffusionBreakableCudaGraphRunner(
-                self.transformer, get_local_torch_device()
-            )
-            self._bcg_runners[key] = runner
-        return runner
 
     def _manage_device_placement(self, server_args: ServerArgs):
         """Move transformer to GPU if CPU offload is enabled."""
