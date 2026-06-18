@@ -1753,6 +1753,41 @@ class MooncakeKVSender(CommonKVSender):
 
     def abort(self):
         super().abort()
+        # In PD disaggregation, prefill and decode run as separate instances
+        # paired by bootstrap_room. The decode peer blocks in
+        # KVPoll.WaitingForInput until it receives the KV cache or hits
+        # SGLANG_DISAGGREGATION_WAITING_TIMEOUT (default 300s). When a prefill
+        # request is aborted (e.g. the client disconnects) after bootstrap but
+        # before/while the KV cache is sent, the decode peer is never notified
+        # and waits out the full timeout, holding its slot the whole time.
+        # If bootstrap has completed we already know the decode endpoint(s) for
+        # this room, so proactively notify them so the paired decode request
+        # fails fast. This is the prefill->decode counterpart of the existing
+        # decode->prefill abort notification.
+        transfer_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room)
+        if transfer_infos:
+            prefill_unique_rank = (
+                self.kv_mgr.attn_tp_rank
+                * (self.kv_mgr.pp_size * self.kv_mgr.attn_cp_size)
+                + self.kv_mgr.pp_rank * self.kv_mgr.attn_cp_size
+                + self.kv_mgr.attn_cp_rank
+            )
+            for transfer_info in list(transfer_infos.values()):
+                if transfer_info.is_dummy:
+                    continue
+                try:
+                    self.kv_mgr.sync_status_to_decode_endpoint(
+                        transfer_info.endpoint,
+                        transfer_info.dst_port,
+                        transfer_info.room,
+                        KVPoll.Failed,
+                        prefill_unique_rank,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to notify decode endpoint of abort for "
+                        f"room {self.bootstrap_room}: {e}"
+                    )
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
