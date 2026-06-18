@@ -36,6 +36,24 @@ from sglang.srt.utils.common import human_readable_int
 logger = logging.getLogger(__name__)
 
 
+# LOCAL PATCH (dsv4-l3-shard): the HiCacheFile backend now fans .bin files into
+# 2-level hash-prefix subdirs (<ab>/<cd>/<name>.bin) instead of one flat dir, to
+# avoid ext4 directory-index ("htree") ENOSPC at millions of files. The evictor
+# must discover (scan) and unlink files at those sharded paths. This rule MUST
+# stay byte-identical to HiCacheFile._shard_subdir / _sharded_path in
+# hicache_storage.py (kept duplicated rather than imported: the storage package
+# __init__ pulls in the backend factory which imports this module -> a shared
+# import would be circular).
+def _shard_subdir(filename: str) -> str:
+    if len(filename) >= 4:
+        return os.path.join(filename[:2], filename[2:4])
+    return ""
+
+
+def _sharded_path(file_path: str, filename: str) -> str:
+    return os.path.join(file_path, _shard_subdir(filename), filename)
+
+
 def _parse_size_to_bytes(value: Any) -> int:
     """Parse a size to bytes via human_readable_int (e.g. '200G', '1Gi', '1048576').
     None / empty / '0' disables; an invalid value also disables (with a warning)."""
@@ -295,24 +313,25 @@ class LRUFileEvictor:
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
+        # LOCAL PATCH (dsv4-l3-shard): files live in hash-prefix subdirs now, so
+        # walk recursively instead of a single-level listdir. The LRU key stays
+        # the bare stem (filename without .bin); only discovery + the unlink path
+        # change, never the index keys. os.walk on a missing dir yields nothing.
         entries = []
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
-            # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
-                continue
-            fp = os.path.join(self.file_path, fn)
-            try:
-                st = os.stat(fp)
-            except OSError:
-                continue
-            entries.append((st.st_mtime, stem, st.st_size))
+        for root, _dirs, files in os.walk(self.file_path):
+            for fn in files:
+                if not fn.endswith(".bin"):
+                    continue
+                stem = fn[:-4]
+                # Only files belonging to this rank/model.
+                if not stem.endswith(self.config_suffix):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
         for _, stem, size in entries:
             self._lru[stem] = size
@@ -338,7 +357,7 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        tensor_path = _sharded_path(self.file_path, f"{evict_stem}.bin")  # LOCAL PATCH (dsv4-l3-shard)
         try:
             os.remove(tensor_path)
             freed = evict_size
