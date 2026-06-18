@@ -1704,6 +1704,23 @@ class MambaPoolHost(HostKVCache):
             self.layout,
         )
 
+        self.temporal_device_ptrs = torch.tensor(
+            [
+                device_pool.mamba_cache.temporal[i].data_ptr()
+                for i in range(self.num_mamba_layers)
+            ],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.conv_device_ptrs = [
+            torch.tensor(
+                [conv_state[i].data_ptr() for i in range(self.num_mamba_layers)],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+            for conv_state in device_pool.mamba_cache.conv
+        ]
+
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
@@ -1945,8 +1962,8 @@ class MambaPoolHost(HostKVCache):
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
         num_layers: int,
-        device: str,
         io_backend: str,
+        src_ptrs: torch.Tensor,
         staging: Optional[torch.Tensor] = None,
         can_use_jit: bool = False,
     ) -> None:
@@ -1954,11 +1971,6 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            src_ptrs = torch.tensor(
-                [src_layers[i].data_ptr() for i in range(num_layers)],
-                dtype=torch.uint64,
-                device=device,
-            )
             if can_use_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=src_ptrs,
@@ -2046,10 +2058,10 @@ class MambaPoolHost(HostKVCache):
                 src_indices=device_indices,
                 dst_indices=host_indices,
                 num_layers=self.num_mamba_layers,
-                device=self.device_pool.device,
                 io_backend=io_backend,
                 staging=self.temporal_staging_buffer,
                 can_use_jit=self._temporal_can_use_jit,
+                src_ptrs=self.temporal_device_ptrs,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_all_layers_lf_pf(
@@ -2058,10 +2070,10 @@ class MambaPoolHost(HostKVCache):
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     num_layers=self.num_mamba_layers,
-                    device=self.device_pool.device,
                     io_backend=io_backend,
                     staging=self.conv_staging_buffers[conv_idx],
                     can_use_jit=self._conv_can_use_jit[conv_idx],
+                    src_ptrs=self.conv_device_ptrs[conv_idx],
                 )
         else:
             for layer_id in range(self.num_mamba_layers):

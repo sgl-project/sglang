@@ -381,6 +381,16 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         ]
         host._temporal_can_use_jit = True
         host._conv_can_use_jit = [True]
+        host.temporal_device_ptrs = torch.tensor(
+            [layer.data_ptr() for layer in device_pool.mamba_cache.temporal],
+            dtype=torch.uint64,
+        )
+        host.conv_device_ptrs = [
+            torch.tensor(
+                [layer.data_ptr() for layer in device_pool.mamba_cache.conv[0]],
+                dtype=torch.uint64,
+            )
+        ]
 
         src_registry = {
             _ptr_key_from_layers(device_pool.mamba_cache.temporal): list(
