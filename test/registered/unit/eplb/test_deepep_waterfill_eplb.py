@@ -75,8 +75,6 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
             patch.object(topk_module, "is_deepep_class_backend", return_value=True),
-            # topk reads moe-ep via get_parallel().moe_ep_* — force it through the
-            # context instead of monkeypatching the underlying getters.
             get_parallel().override(moe_ep_size=8, moe_ep_rank=7),
             patch.object(
                 topk_module,
