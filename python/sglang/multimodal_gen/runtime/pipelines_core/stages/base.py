@@ -272,6 +272,11 @@ class PipelineStage(StageDedupMixin, ABC):
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        return ()
+
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
         Verify the output for the stage.
