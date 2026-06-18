@@ -1004,7 +1004,7 @@ class MHATokenToKVPool(KVCache):
                 f"size={self.size}, page_size={self.page_size}"
             )
             self.num_pages = total_slots // self.page_size
-            self.kv_cache_layout = "HND"
+            self.kv_cache_layout = "hnd"
         else:
             self.kv_cache_layout = "nhd"
             if _use_aiter:
