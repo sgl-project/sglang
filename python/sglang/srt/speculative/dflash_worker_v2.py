@@ -40,7 +40,7 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -102,17 +102,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        # Without draft windowing, the draft worker aliases the target request->token
-        # mapping and allocation state. With draft windowing enabled, the draft worker
-        # keeps a private compact req->token table over the same global KV index space,
-        # so radix-cache/prefix-hit KV remains reusable while draft attention sees only
-        # the recent window.
-        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-        shared_req_to_token_pool = (
-            None if self.use_compact_draft_cache else target_req_to_token_pool
-        )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
@@ -168,9 +157,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
@@ -252,7 +238,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -276,7 +262,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
         # draft KV is materialized from target hidden states, so there is no
-        # BaseDraftWorker draft/draft_extend split to wrap it in.
+        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property
@@ -287,6 +273,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
         )
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # Without draft windowing, the draft worker aliases the target
+        # request->token mapping and allocation state. With draft windowing
+        # enabled, the draft worker keeps a private compact req->token table
+        # over the same global KV index space, so radix-cache/prefix-hit KV
+        # remains reusable while draft attention sees only the recent window.
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=(
+                None if self.use_compact_draft_cache else req_to_token_pool
+            ),
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    def init_backends(self):
+        disable_cuda_graph = False
+        if is_cuda() and not self.server_args.disable_cuda_graph:
+            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            disable_cuda_graph = available_mem < 1.0
+            if disable_cuda_graph:
+                logger.warning(
+                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                    "memory is available after target backend initialization.",
+                    available_mem,
+                )
+        self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -602,17 +620,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
-        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        if not hasattr(lm_head, "shard_indices"):
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(hs, weight.T)
+                out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+            return out_tokens
+
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
         #   base vocab:  [0, num_org)
@@ -622,14 +650,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
-
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
-
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         def _ensure_local_reduce_buffers(
             chunk_len: int,
@@ -1506,7 +1526,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup

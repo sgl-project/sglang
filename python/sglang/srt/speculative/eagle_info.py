@@ -7,25 +7,9 @@ import torch
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_last_loc,
-)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
+from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import (
-    assign_req_to_token_pool_func,
-    create_extend_after_decode_spec_info,
-)
-from sglang.srt.utils import next_power_of_2
-from sglang.srt.utils.async_probe import maybe_detect_oob
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +27,7 @@ def _draft_runner_of(worker):
 
 
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -66,6 +50,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+
+    @property
+    def max_tree_depth(self) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -93,67 +90,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             seq_lens_sum=0,
             seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
-
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
-        if batch.forward_mode.is_idle():
-            return
-
-        batch.input_ids = self.draft_token
-        maybe_detect_oob(
-            batch.input_ids,
-            0,
-            batch.model_config.vocab_size,
-            "eagle prepare_for_verify input_ids",
-        )
-
-        if page_size == 1:
-            batch.out_cache_loc = alloc_token_slots(
-                batch.tree_cache,
-                len(batch.input_ids),
-            )
-            end_offset = batch.seq_lens + self.draft_token_num
-        else:
-            prefix_lens = batch.seq_lens
-            prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + self.draft_token_num
-            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
-            )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
-
-        bs = batch.batch_size()
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
-        )
-
-        if get_global_server_args().enable_mamba_extra_buffer():
-            batch.mamba_track_indices = torch.tensor(
-                [
-                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                    for req in batch.reqs
-                ],
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            batch.mamba_track_mask = None
-            batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
         self,
@@ -230,8 +166,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
-    # chain). Written by `EagleDraftExtendInput.prepare_extend_after_decode`;
-    # the worker copies it here for next iter's draft.
+    # chain); the worker copies it here post-extend for next iter's draft.
     bonus_tokens: torch.Tensor = None
 
     # shape: (b + 1,)
@@ -243,10 +178,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
-    # V2 reuses `EagleDraftInput` across phases (V1 has a separate
-    # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
-    num_correct_drafts: Optional[torch.Tensor] = None
-    num_accept_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -352,29 +283,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 @dataclass
 class EagleDraftExtendInput(SpecInput):
-    """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
+    """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
+    target prefill / verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
-    the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
-    the next iter's draft.
+    Installed on `batch.spec_info` by the worker's `_draft_extend_for_*`
+    (and synthetically by draft-extend cuda-graph capture), then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
     """
 
-    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward. None when the spec
-    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    # Target-model hidden states for the draft-extend forward; None when the
+    # draft doesn't read hidden_states (e.g., STANDALONE). Shape: decode
+    # (bs * num_draft_tokens, hidden), prefill (extend_num_tokens, hidden).
     hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
-    # Both kept for cuda-graph buffer indexing and the
-    # `create_extend_after_decode_spec_info` kernel.
+    # Both kept for cuda-graph buffer indexing.
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
-    # Batch-state slices for the draft-extend forward. Set by verify (sliced to
-    # reqs continuing into next iter). `prepare_extend_after_decode` copies
-    # these onto `batch.{input_ids, seq_lens, seq_lens_cpu, req_pool_indices}`.
+    # Per-req batch-state slices for the draft-extend forward:
     #   - input_ids:        accept tokens flat over surviving reqs
     #   - seq_lens / _cpu:  per-req sequence length (post-accept)
     #   - req_pool_indices: per-req kv-pool slot
@@ -383,16 +312,19 @@ class EagleDraftExtendInput(SpecInput):
     seq_lens_cpu: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
 
-    # Set by `prepare_extend_after_decode`:
-    #   - positions: kernel-written, shape `[total_accepted]`.
-    #   - bonus_tokens: kernel-written, shape `[bs]`. The worker reads this
-    #     post-extend to populate next iter's `EagleDraftInput.bonus_tokens`.
+    #   - positions: shape `[total_accepted]`.
+    #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
+    #     `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
 
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+
+    # None for draft-extend's idle batch; attention backends fall back to
+    # rebuilding plain metadata from seq_lens when this is None.
+    kv_indptr: torch.Tensor = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
@@ -455,41 +387,6 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-        )
-
-    def prepare_extend_after_decode(
-        self,
-        batch: ScheduleBatch,
-        speculative_num_steps: int,
-    ):
-        # Caller must have installed `self` as `batch.spec_info` before calling.
-        assert batch.spec_info is self
-        if batch.forward_mode.is_idle():
-            return
-
-        # The kernel below populates `self.positions` and `self.bonus_tokens`;
-        # the worker reads `self.bonus_tokens` to construct next iter's
-        # `EagleDraftInput`.
-        batch.input_ids = self.input_ids
-        batch.extend_lens = self.num_accept_tokens_cpu
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = self.seq_lens
-        batch.seq_lens_cpu = self.seq_lens_cpu
-        batch.req_pool_indices = self.req_pool_indices
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
-
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.num_accept_tokens,
-            self.positions,
-            self.bonus_tokens,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
 
     def generate_attn_arg_prefill(

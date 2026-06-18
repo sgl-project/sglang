@@ -36,9 +36,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
-    build_warmup_reqs,
-    prepare_warmup_image_path,
-    should_include_warmup_image,
+    run_async_client_warmup,
+    should_run_synthetic_server_warmup,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
@@ -73,54 +72,21 @@ async def _wait_until_http_ready(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become ready at {health_url}")
 
 
-def _is_realtime_serving(server_args: ServerArgs) -> bool:
-    """A realtime pipeline establishes per-session state over the WebSocket, so
-    the synthetic server-warmup request (which has no session) cannot run — it
-    would fail in the realtime stage and abort startup. Detect it via the
-    realtime-adapter registry and skip server warmup."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
-            get_realtime_model_adapter,
-        )
-
-        get_realtime_model_adapter(server_args)
-        return True
-    except Exception:
-        return False
-
-
 async def _run_server_warmup_after_http_ready(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
     try:
-        if (
-            not server_args.warmup
-            or not server_args.server_warmup
-            or server_args.warmup_resolutions is not None
-            or _is_realtime_serving(server_args)
-        ):
+        if not should_run_synthetic_server_warmup(server_args):
             warmup_done.set()
             return
 
         await _wait_until_http_ready(server_args)
 
-        warmup_input_path = None
-        if should_include_warmup_image(server_args, server_based_warmup=True):
-            warmup_input_path = await prepare_warmup_image_path(server_args)
-
-        warmup_reqs = build_warmup_reqs(
+        await run_async_client_warmup(
             server_args,
-            warmup_resolutions=None,
-            warmup_input_path=warmup_input_path,
-            return_warmup_result=True,
-            server_based_warmup=True,
-            use_model_sampling_defaults=True,
+            async_scheduler_client.forward,
+            fail_open=server_args.warmup_resolutions is None,
         )
-        for req in warmup_reqs:
-            response = await async_scheduler_client.forward(req)
-            if response.error is not None:
-                raise RuntimeError(response.error)
-
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:

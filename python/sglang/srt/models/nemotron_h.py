@@ -29,7 +29,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import ReLU2
@@ -38,6 +37,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -49,7 +52,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -74,7 +80,14 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
+from sglang.srt.models.nemotron_h_utils import (
+    get_real_num_tokens,
+    is_attn_layer,
+    make_layer_communicator,
+    pad_to_original_num_tokens,
+)
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -117,10 +130,10 @@ class NemotronHMLP(nn.Module):
         )
         self.act_fn = ReLU2()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, use_reduce_scatter: bool = False):
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
         return x
 
 
@@ -144,7 +157,7 @@ class NemotronHMoE(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -284,7 +297,9 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, use_reduce_scatter: bool = False
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
         # MoE runner / topk), so final_hidden_states is already scaled.
@@ -296,13 +311,51 @@ class NemotronHMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states += shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class NemotronHMLPDecoderLayer(nn.Module):
+class NemotronHMLPLikeDecoderLayer(nn.Module):
+    """Shared forward for the dense-MLP / MoE decoder layers."""
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+            hidden_states = self.mixer.forward(
+                hidden_states, use_reduce_scatter=use_reduce_scatter
+            )
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+            return hidden_states, residual
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+
+        hidden_states = self.mixer.forward(hidden_states)
+        return hidden_states, residual
+
+
+class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
     def __init__(
         self,
         config: NemotronHConfig,
@@ -315,6 +368,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
 
         hybrid_override_pattern = config.hybrid_override_pattern
         mlp_index = hybrid_override_pattern[: layer_idx + 1].count("-") - 1
+        self.layer_idx = layer_idx
         if isinstance(config.intermediate_size, list):
             if len(config.intermediate_size) == 1:
                 intermediate_size = config.intermediate_size[0]
@@ -332,25 +386,12 @@ class NemotronHMLPDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-    def forward(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
-
-        hidden_states = self.mixer.forward(hidden_states)
-        return hidden_states, residual
+        self.layer_communicator = make_layer_communicator(
+            self.norm, for_attn=False, allow_reduce_scatter=True
+        )
 
 
-class NemotronHMoEDecoderLayer(nn.Module):
+class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
     def __init__(
         self,
         config: NemotronHConfig,
@@ -361,6 +402,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
         super().__init__()
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
+        self.layer_idx = layer_idx
         self.mixer = NemotronHMoE(
             layer_config,
             layer_idx=layer_idx,
@@ -369,25 +411,33 @@ class NemotronHMoEDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = make_layer_communicator(
+            self.norm, for_attn=False, allow_reduce_scatter=True
+        )
 
-    def forward(
+
+class NemotronHAttnLikeDecoderLayer(nn.Module):
+    """Shared DP-attention input prep for the Mamba / full-attention layers."""
+
+    def _set_prev_layer_is_attn(self, config: NemotronHConfig, layer_idx: int) -> None:
+        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
+            config.hybrid_override_pattern[layer_idx - 1]
+        )
+
+    def _dp_attn_input(
         self,
-        *,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
-
-        hidden_states = self.mixer.forward(hidden_states)
-        return hidden_states, residual
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.prev_layer_is_attn and residual is not None:
+            hidden_states = attn_tp_all_reduce(hidden_states)
+        return self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
 
-class NemotronHMambaDecoderLayer(nn.Module):
+class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
     def __init__(
         self,
         config: NemotronHConfig,
@@ -411,15 +461,22 @@ class NemotronHMambaDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self._set_prev_layer_is_attn(config, layer_idx)
 
     def _forward_mamba(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        """Core Mamba forward logic for the eager path; returns the result."""
+        """Core Mamba forward logic, called directly or via split op."""
+        original_num_tokens = hidden_states.shape[0]
+        if forward_batch.forward_mode.is_extend():
+            real_num_tokens = get_real_num_tokens(hidden_states, forward_batch)
+            if real_num_tokens < original_num_tokens:
+                hidden_states = hidden_states[:real_num_tokens]
         attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
-        return attn_backend.linear_attn_backend.forward(
+        output = attn_backend.linear_attn_backend.forward(
             mixer=self.mixer,
             layer_id=self.layer_id,
             hidden_states=hidden_states,
@@ -427,6 +484,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
+        return pad_to_original_num_tokens(output, original_num_tokens)
 
     def forward(
         self,
@@ -435,6 +493,19 @@ class NemotronHMambaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            hidden_states, residual = self._dp_attn_input(
+                hidden_states, residual, forward_batch
+            )
+            if (
+                forward_batch.forward_mode.is_idle()
+                or get_real_num_tokens(hidden_states, forward_batch) == 0
+            ):
+                return torch.zeros_like(hidden_states), residual
+
+            output = self._forward_mamba(hidden_states, forward_batch)
+            return output, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
@@ -465,7 +536,8 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_parallel().attn_tp_rank
+        tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -494,6 +566,8 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -501,6 +575,9 @@ class NemotronHAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -518,14 +595,43 @@ class NemotronHAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        if not is_dp_attention_enabled():
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn.forward(q, k, v, forward_batch)
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        padded_shape = hidden_states.shape[0]
+        real_tokens = get_real_num_tokens(hidden_states, forward_batch)
+        has_padding = real_tokens < padded_shape
+        keep_q_padded = (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_idle()
+            or forward_batch._original_forward_mode is not None
+        )
+        original_out_cache_loc = forward_batch.out_cache_loc
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn.forward(q, k, v, forward_batch)
+        if has_padding and real_tokens > 0:
+            k, v = k[:real_tokens], v[:real_tokens]
+            if original_out_cache_loc is not None:
+                forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
+            if not keep_q_padded:
+                q = q[:real_tokens]
+        attn_output = self.attn.forward(
+            q, k, v, forward_batch, save_kv_cache=real_tokens > 0
+        )
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+        attn_output = pad_to_original_num_tokens(attn_output, padded_shape)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class NemotronHAttentionDecoderLayer(nn.Module):
+class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
     def __init__(
         self,
         config: NemotronHConfig,
@@ -544,6 +650,8 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self._set_prev_layer_is_attn(config, layer_idx)
 
     def forward(
         self,
@@ -552,6 +660,15 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            hidden_states, residual = self._dp_attn_input(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states, forward_batch=forward_batch
+            )
+            return hidden_states, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
@@ -604,6 +721,7 @@ class NemotronHModel(nn.Module):
                 self.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -732,6 +850,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

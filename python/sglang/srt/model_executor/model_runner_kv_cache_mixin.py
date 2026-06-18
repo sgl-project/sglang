@@ -58,18 +58,41 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
+
+def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return torch.float32, torch.float32
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return torch.bfloat16, torch.bfloat16
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
+
+
 _is_npu = is_npu()
 _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
+        # Use the snapshot taken at the end of this runner's weight-load phase,
+        # not the current free memory: draft-model weights loaded after that
+        # point are charged to the non-static slack, not the static budget.
+        post_model_load_memory = getattr(self, "post_model_load_memory", None)
+        if post_model_load_memory is None:
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
@@ -327,6 +350,7 @@ class ModelRunnerKVCacheMixin:
                             ]
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
+                        speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -362,11 +386,22 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
+                # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
+                # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
+                req_to_token_pool_cls = ReqToTokenPool
+                if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+                    from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                        DSV4NPUReqToTokenPool,
+                    )
+
+                    req_to_token_pool_cls = DSV4NPUReqToTokenPool
+
+                self.req_to_token_pool = req_to_token_pool_cls(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -387,7 +422,8 @@ class ModelRunnerKVCacheMixin:
 
         if is_dsv4_model:
             swa_page_size = self.page_size
-            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+            if not _is_npu:
+                assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
             if self.is_draft_worker:
                 from sglang.srt.models.deepseek_v4_nextn import (
@@ -399,18 +435,55 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+
+            # NPU + DSV4 → paged-state subclass: the fused compressor kernel
+            # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
+            # so the CUDA ring-buffer state path can't be shared. CUDA keeps
+            # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                    DSV4NPUTokenToKVPool,
+                    npu_state_pool_size,
+                )
+
+                pool_cls = DSV4NPUTokenToKVPool
+                # Recompute state pool sizes for the NPU paged formula (CUDA's
+                # ring sizes are dropped here). Tail-only allocation keeps the
+                # per-req-budget formula sufficient at any prefill length: long
+                # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
+                # slots (tail = seq_len % 128), and decode is drained by
+                # sliding eviction in ``ScheduleBatch._evict_swa``.
+                c4_state_pool_size = npu_state_pool_size(
+                    ratio=4,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+                c128_state_pool_size = npu_state_pool_size(
+                    ratio=128,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
+                c4_state_pool_size = self.c4_state_pool_size
+                c128_state_pool_size = self.c128_state_pool_size
+
+            self.token_to_kv_pool = pool_cls(
                 max_num_reqs=self.max_running_requests,
+                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
+                # past max_running_requests (pre-alloc), so size to the real capacity.
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
-                c4_state_pool_size=self.c4_state_pool_size,
-                c128_state_pool_size=self.c128_state_pool_size,
+                c4_state_pool_size=c4_state_pool_size,
+                c128_state_pool_size=c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
                 sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
-                state_dtype=self.state_dtype,
+                c4_state_dtype=self.c4_state_dtype,
+                c128_state_dtype=self.c128_state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 indexer_head_dim=self.model_config.index_head_dim,
@@ -421,6 +494,9 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
+                online_mtp_max_draft_tokens=(
+                    self.server_args.max_speculative_num_draft_tokens or 0
+                ),
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
@@ -731,10 +807,21 @@ class ModelRunnerKVCacheMixin:
                 )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
+                or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    # DSV4 on NPU: SWA allocator subclass that also drives the
+                    # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
+                    if is_dsv4_model:
+                        from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+                            DSV4NPUTokenToKVPoolAllocator,
+                        )
+
+                        swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
+                    else:
+                        swa_allocator_cls = SWATokenToKVPoolAllocator
+                    self.token_to_kv_pool_allocator = swa_allocator_cls(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,
@@ -811,6 +898,13 @@ class ModelRunnerKVCacheMixin:
                     )
                 )
 
+            # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
+            # free(req) can release c4/c128 pool pages alongside the slot.
+            if hasattr(self.req_to_token_pool, "register_dsv4_allocator"):
+                self.req_to_token_pool.register_dsv4_allocator(
+                    self.token_to_kv_pool_allocator
+                )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
@@ -880,8 +974,10 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
+            requested_per_worker = max_num_reqs // self.dp_size
+            max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
+            requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
         if self.mambaish_config is not None:
@@ -899,6 +995,13 @@ class ModelRunnerKVCacheMixin:
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
+        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) due to the available KV cache capacity.",
+                requested_per_worker,
+                max_num_reqs,
+            )
         logger.info(
             f"Max concurrent requests (per dp worker) from the finalized token capacity: "
             f"max_num_reqs={max_num_reqs}."
@@ -927,12 +1030,12 @@ class ModelRunnerKVCacheMixin:
             self.c4_state_pool_size = config.c4_state_pool_size
             self.c128_state_pool_size = config.c128_state_pool_size
 
-        # state_dtype is a DSV4 architectural constant (fp32 for c4/c128
-        # state buffers); set unconditionally so draft workers have it before
-        # _init_pools reads it (target path also overwrites this in the
-        # configurator's resolve() for parity, harmless here).
+        # Draft worker does not own the compression-state pools, but keep the
+        # dtype attributes initialized so _init_pools can share one code path.
         if is_deepseek_v4(self.model_config.hf_config):
-            self.state_dtype = torch.float32
+            self.c4_state_dtype, self.c128_state_dtype = (
+                _get_dsv4_compress_state_dtypes()
+            )
 
         self._init_pools()
 
