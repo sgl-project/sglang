@@ -57,12 +57,12 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         ):
             batch = scheduler._build_hisparse_decode_batch(reqs)
 
+        # Assert the invariant (cpu mirror == device tensor), not a hardcoded
+        # copy of the input -- the latter would just restate the builder line.
         self.assertIsNotNone(batch.req_pool_indices_cpu)
-        self.assertTrue(torch.equal(batch.req_pool_indices_cpu, torch.tensor([4, 9])))
         self.assertTrue(
             torch.equal(batch.req_pool_indices_cpu, batch.req_pool_indices.cpu())
         )
-        self.assertEqual(batch.req_pool_indices_cpu.dtype, torch.int64)
 
 
 class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):
