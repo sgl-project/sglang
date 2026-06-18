@@ -360,6 +360,14 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        # choice_logprobs covers every token generated in this step. Attach it
+        # to the first chunk we emit this step — reasoning, tool-call, or
+        # regular content — so logprobs are never dropped when a reasoning or
+        # tool parser is active (the branches below would otherwise omit them),
+        # and never duplicated across the multiple chunks one step can produce.
+        # Anything left unattached is flushed on a trailing chunk at the end.
+        remaining_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -380,8 +388,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
 
         # Handle tool calls
         if request.tool_choice != "none" and request.tools and self.tool_call_parser:
@@ -423,9 +433,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
+
+        # Flush any logprobs not yet attached to a chunk this step. This happens
+        # when the tool-call parser consumed the delta (or is still buffering
+        # tool-call arguments), so the regular-content branch above never ran.
+        # A standalone logprobs chunk keeps parity with vLLM, which still
+        # returns logprobs while tool calls / reasoning are being streamed.
+        if remaining_logprobs is not None:
+            yield build_sse_content(
+                chunk_id=content["meta_info"]["id"],
+                created=int(time.time()),
+                model=request.model,
+                index=index,
+                logprobs=remaining_logprobs,
+            )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
