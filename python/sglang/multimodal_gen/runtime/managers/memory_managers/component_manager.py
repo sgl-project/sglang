@@ -1,8 +1,8 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
+from typing import Mapping, MutableMapping, Protocol, Sequence
 
 import torch
 import torch.nn as nn
@@ -28,8 +28,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
 
 logger = init_logger(__name__)
-
-_T = TypeVar("_T")
 
 
 @dataclass(slots=True)
@@ -75,8 +73,6 @@ class ResidencyState:
     # the ComponentUses of the preceding stages
     future_uses: tuple[ComponentUse, ...] = ()
     batch_is_warmup: bool = False
-    manager_mode: str = "static"
-    trace_enabled: bool = False
 
 
 class ResidencyBatch(Protocol):
@@ -142,7 +138,7 @@ class ComponentResidencyManager:
     ) -> None:
         self.pipeline = pipeline
         self.server_args = server_args
-        self.state = ResidencyState(trace_enabled=False)
+        self.state = ResidencyState()
         self._stage_names_by_id: dict[int, str] = {}
         self._stage_uses_by_index: list[tuple[ComponentUse, ...]] = []
         self._ordered_uses: tuple[ComponentUse, ...] = ()
@@ -158,10 +154,6 @@ class ComponentResidencyManager:
             pipeline.component_residency_strategies
         )
         self._uses_seen: dict[str, ComponentUse] = {}
-
-    @property
-    def enabled(self) -> bool:
-        return True
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -186,13 +178,6 @@ class ComponentResidencyManager:
             self.strategy_for.cache_clear()
         self.server_args = server_args
 
-    def register_strategy(
-        self, component_name: str, strategy: ComponentResidencyStrategy
-    ) -> None:
-        self.pipeline.component_residency_strategies[component_name] = strategy
-        self._custom_strategies[component_name] = strategy
-        self.strategy_for.cache_clear()
-
     def begin_request(
         self,
         stages: Sequence[ComponentResidencyStage],
@@ -201,29 +186,19 @@ class ComponentResidencyManager:
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
-        self.state = ResidencyState(
-            stages=stages, batch_is_warmup=batch.is_warmup, trace_enabled=False
-        )
+        self.state = ResidencyState(stages=stages, batch_is_warmup=batch.is_warmup)
         self._active_use = None
         self._active_use_module = None
         self._disable_active_nvtx()
         self._current_use_index = -1
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
-        if self.enabled:
-            self._stage_uses_by_index = [
-                tuple(stage.component_uses(server_args, self.stage_name(stage)))
-                for stage in stages
-            ]
-            self._ordered_uses = tuple(
-                use for uses in self._stage_uses_by_index for use in uses
-            )
-        else:
-            self._stage_uses_by_index = []
-            self._ordered_uses = ()
-        self._trace(
-            "request_start",
-            detail=f"stages={len(stages)} uses={len(self._ordered_uses)}",
+        self._stage_uses_by_index = [
+            tuple(stage.component_uses(server_args, self.stage_name(stage)))
+            for stage in stages
+        ]
+        self._ordered_uses = tuple(
+            use for uses in self._stage_uses_by_index for use in uses
         )
 
     def before_stage(
@@ -234,25 +209,10 @@ class ComponentResidencyManager:
         server_args: ServerArgs,
     ) -> None:
         """called after stage starts"""
-        if not self.enabled:
-            return
         # update state before entering the stage
         self.state.stage_index = stage_index
         self.state.stage_name = self.stage_name(stage)
         self.state.next_stage_name = self._next_stage_name(stage_index)
-        self._trace("stage_enter", detail=f"index={stage_index}")
-
-    def after_stage(self, stage_index: int) -> None:
-        """called after stage exits"""
-        if not self.enabled:
-            return
-        self._trace("stage_exit", detail=f"index={stage_index}")
-
-    def before_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
-        """component use-site starts"""
-        if not self.enabled:
-            return
-        self.begin_use(use, module=module)
 
     def begin_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Begin one sequential component use interval. this is idempotent
@@ -321,26 +281,8 @@ class ComponentResidencyManager:
         finally:
             self.end_use(use, module=module)
 
-    def call_component(
-        self,
-        use: ComponentUse,
-        module: Callable[..., _T],
-        *args,
-        **kwargs,
-    ) -> _T:
-        with self.use_component(use):
-            return module(*args, **kwargs)
-
-    def prefetch_use(self, use: ComponentUse) -> None:
-        """Prepare a future use without blocking the current use."""
-        if not self.enabled:
-            return
-        self._prefetch_use(use)
-
     def ensure_ready(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Prepare a shared component and wait without making it the active use."""
-        if not self.enabled:
-            return
         self._prepare_forward_use(use, module=module)
 
     def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
@@ -356,19 +298,6 @@ class ComponentResidencyManager:
                 self._active_nvtx_key = None
             hooks.remove_hooks()
             del self._nvtx_hooks_by_use_key[key]
-
-    def prefetch_checkpoint(self, anchor: ComponentUse | None = None) -> None:
-        """Give the manager a timeline overlap point.
-
-        1. Locate the anchor or current use in the ordered timeline.
-        2. Find the next prefetchable memory-intensive use.
-        3. Prepare it opportunistically without waiting.
-        """
-        if not self.enabled:
-            return
-        if anchor is not None:
-            self._mark_current_use(anchor)
-        self._prefetch_next_memory_intensive_use()
 
     def finish_active_use(self, *, prefetch_next: bool = True) -> None:
         """Finish the currently active sequential use, if any."""
@@ -393,14 +322,11 @@ class ComponentResidencyManager:
         """Prepare a component that is about to run and wait until it is ready."""
         module = module or self.get_module(use.component_name)
         if module is None:
-            self._trace("skip_missing", use)
             return None
         strategy = self.strategy_for(use.component_name, module)
         self._uses_seen[use.component_name] = use
         self.state.current_use = use
-        self._trace("prepare", use, strategy, module)
         strategy.prepare_for_use(module, use, self.state)
-        self._trace("wait", use, strategy, module)
         strategy.wait_for_use(module, use, self.state)
         return module
 
@@ -466,32 +392,23 @@ class ComponentResidencyManager:
     def _prefetch_use(self, use: ComponentUse) -> None:
         """Prepare a future component opportunistically without waiting.
 
-        This is called when the component is memory-intensive so it may takes a long time to prefetch.
-
-        manager will perform the prefetch at some checkpoints, if necessary
+        This is called for memory-intensive future uses where H2D placement can
+        overlap with the current stage.
         """
         if not use.allow_prefetch:
             return
         module = self.get_module(use.component_name)
         if module is None:
-            self._trace("skip_missing", use)
             return
         strategy = self.strategy_for(use.component_name, module)
         if isinstance(strategy, VanillaD2HStrategy) and self._active_use is not None:
             # Avoid making two vanilla-offloaded heavy components resident before
             # a budget-aware planner can prove the overlap is safe.
-            self._trace("prefetch_skip_active_vanilla", use, strategy, module)
             return
 
         self._uses_seen[use.component_name] = use
-        self._trace("prefetch", use, strategy, module)
         if strategy.prefetch_for_use(module, use, self.state):
             self._prefetched_use_keys.add(self._use_key(use))
-
-    def after_use(self, use: ComponentUse) -> None:
-        if not self.enabled:
-            return
-        self.end_use(use)
 
     def _finish_use(
         self,
@@ -503,28 +420,18 @@ class ComponentResidencyManager:
         """finish a specific use by keeping them resident or call finish_use hook"""
         module = module or self.get_module(use.component_name)
         if module is None:
-            self._trace("skip_missing", use)
             return
         should_keep = (
             keep_on_warmup and self.state.batch_is_warmup
         ) or self._should_keep_after_use(use)
         if should_keep:
-            self._trace(
-                "keep",
-                use,
-                self.strategy_for(use.component_name, module),
-                module,
-            )
             return
         strategy = self.strategy_for(use.component_name, module)
-        self._trace("finish", use, strategy, module)
         was_on_cuda = self._module_on_cuda(module)
         strategy.finish_use(module, use, self.state)
         self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
 
     def finish_request(self) -> None:
-        if not self.enabled and not self._uses_seen and self._active_use is None:
-            return
         # 1. Close the currently active sequential use.
         self.finish_active_use(prefetch_next=False)
         # 2. Pick components that should be ready for the next request.
@@ -535,36 +442,19 @@ class ComponentResidencyManager:
             if module is None:
                 continue
             if self.state.batch_is_warmup and use.keep_ready_after_warmup:
-                self._trace(
-                    "request_keep_warmup",
-                    use,
-                    self.strategy_for(component_name, module),
-                    module,
-                )
                 continue
             preferred = component_name in preferred_uses
             if not preferred and self._should_keep_single_dit(component_name):
-                self._trace(
-                    "keep",
-                    use,
-                    self.strategy_for(component_name, module),
-                    module,
-                    detail="single_dit",
-                )
                 continue
             strategy = self.strategy_for(component_name, module)
             if preferred and not self.state.batch_is_warmup:
-                self._trace("request_prefetch", use, strategy, module)
                 strategy.prepare_after_request(module, use, self.state)
             else:
-                action = "request_resident" if preferred else "request_finish"
-                self._trace(action, use, strategy, module)
                 was_on_cuda = self._module_on_cuda(module)
                 strategy.finish_request(module, use, self.state, preferred=preferred)
                 self._empty_cache_after_large_release(
                     use, strategy, module, was_on_cuda
                 )
-        self._trace("request_end")
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)
@@ -592,12 +482,6 @@ class ComponentResidencyManager:
         return build_component_residency_strategy(
             component_name, module, self.server_args
         )
-
-    def _stage_uses(self, stage_index: int) -> tuple[ComponentUse, ...]:
-        """Returns the ComponentUse(s) of a specific stage"""
-        if stage_index < 0 or stage_index >= len(self._stage_uses_by_index):
-            return ()
-        return self._stage_uses_by_index[stage_index]
 
     def _next_stage_name(self, stage_index: int) -> str | None:
         next_index = stage_index + 1
@@ -629,7 +513,7 @@ class ComponentResidencyManager:
                 continue
             if self._use_key(use) in self._prefetched_use_keys:
                 return
-            self.prefetch_use(use)
+            self._prefetch_use(use)
             return
 
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
@@ -684,36 +568,6 @@ class ComponentResidencyManager:
     def _use_key(use: ComponentUse) -> tuple[str, str, str | None]:
         return (use.stage_name, use.component_name, use.phase)
 
-    def _trace(
-        self,
-        action: str,
-        use: ComponentUse | None = None,
-        strategy: ComponentResidencyStrategy | None = None,
-        module: nn.Module | None = None,
-        *,
-        component_name: str | None = None,
-        detail: str = "",
-    ) -> None:
-        if not self.state.trace_enabled:
-            return
-        if use is not None:
-            component_name = use.component_name
-        device = self._module_device(module)
-        logger.info(
-            "[component_residency] action=%s stage=%s next_stage=%s component=%s "
-            "strategy=%s phase=%s device=%s warmup=%s mode=%s %s",
-            action,
-            self.state.stage_name,
-            self.state.next_stage_name,
-            component_name,
-            strategy.name if strategy is not None else None,
-            use.phase if use is not None else None,
-            device,
-            self.state.batch_is_warmup,
-            self.state.manager_mode,
-            detail,
-        )
-
     def _module_device(self, module: nn.Module | None) -> str | None:
         if module is None:
             return None
@@ -743,7 +597,6 @@ class ComponentResidencyManager:
         if not torch.get_device_module().is_available():
             return
         torch.get_device_module().empty_cache()
-        self._trace("empty_cache", use, strategy, module, detail="after_release")
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None

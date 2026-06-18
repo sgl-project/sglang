@@ -429,11 +429,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
             ],
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
         run_component_accuracy_check=False,
@@ -492,14 +491,6 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-            run_consistency_check=True,
-        ),
-        _make_modelopt_ci_case(
-            "flux2_modelopt_fp8_t2i",
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
@@ -579,6 +570,18 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "flux2_modelopt_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            tp_size=2,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        MODELOPT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "ideogram4_fp8_tp2_t2i",
         DiffusionServerArgs(
