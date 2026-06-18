@@ -39,6 +39,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark.connection import resolve_base_url
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
@@ -1924,46 +1925,23 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
-    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
-    if not args.base_url:
-        _na = NetworkAddress(args.host, args.port)
-        _host_base = _na.to_url()
-    else:
-        _na = None
-        _host_base = None
+    # Base URL the client sends to: --base-url if given, else http://host:port
+    # (IPv6-correct). NetworkAddress is also kept for gserver's host:port form.
+    base_url = resolve_base_url(args.base_url, args.host, args.port)
+    _na = NetworkAddress(args.host, args.port)
 
-    model_url = (
-        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
-    )
+    model_url = f"{base_url}/v1/models"
 
     if args.backend == "sglang-embedding":
-        api_url = (
-            f"{args.base_url}/v1/embeddings"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/embeddings"
-        )
+        api_url = f"{base_url}/v1/embeddings"
     elif args.backend in ["sglang", "sglang-native"]:
-        api_url = (
-            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
-        )
+        api_url = f"{base_url}/generate"
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = (
-            f"{args.base_url}/v1/completions"
-            if args.base_url
-            else f"{_host_base}/v1/completions"
-        )
+        api_url = f"{base_url}/v1/completions"
     elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
-        api_url = (
-            f"{args.base_url}/v1/chat/completions"
-            if args.base_url
-            else f"{_host_base}/v1/chat/completions"
-        )
+        api_url = f"{base_url}/v1/chat/completions"
     elif args.backend == "trt":
-        api_url = (
-            f"{args.base_url}/v2/models/ensemble/generate_stream"
-            if args.base_url
-            else f"{_host_base}/v2/models/ensemble/generate_stream"
-        )
+        api_url = f"{base_url}/v2/models/ensemble/generate_stream"
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
@@ -1971,12 +1949,7 @@ def run_benchmark(args_: argparse.Namespace):
         api_url = args.base_url if args.base_url else _na.to_host_port_str()
         args.model = args.model or "default"
     elif args.backend == "truss":
-        api_url = (
-            f"{args.base_url}/v1/models/model:predict"
-            if args.base_url
-            else f"{_host_base}/v1/models/model:predict"
-        )
-    base_url = _host_base if args.base_url is None else args.base_url
+        api_url = f"{base_url}/v1/models/model:predict"
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
