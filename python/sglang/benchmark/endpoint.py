@@ -12,10 +12,10 @@ from typing import Callable, Optional
 
 import requests
 
-from sglang.benchmark.connection import resolve_base_url
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import resolve_base_url
 
 DEFAULT_TIMEOUT = 600
 

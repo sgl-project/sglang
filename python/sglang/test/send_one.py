@@ -17,8 +17,8 @@ from typing import Optional
 import requests
 import tabulate
 
-from sglang.benchmark.connection import resolve_base_url
 from sglang.profiler import run_profile
+from sglang.srt.utils.network import resolve_base_url
 
 
 @dataclasses.dataclass
