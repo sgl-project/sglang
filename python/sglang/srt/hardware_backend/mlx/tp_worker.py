@@ -98,7 +98,7 @@ class MlxTpModelWorker(TpModelWorker):
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -185,7 +185,7 @@ class MlxTpModelWorker(TpModelWorker):
                 else:
                     # New prefill
                     prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.fill_ids)
+                    full_token_ids = list(req.get_fill_ids())
                     next_token = self._mlx_runner.prefill(
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
@@ -330,7 +330,7 @@ class MlxTpModelWorker(TpModelWorker):
             else:
                 # New prefill
                 prefix_slot_ids = req.prefix_indices.tolist()
-                full_token_ids = list(req.fill_ids)
+                full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
                         req_id=req.rid,
