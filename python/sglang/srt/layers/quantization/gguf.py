@@ -866,8 +866,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
     
-        tp_size = get_parallel().moe_tp_size
-        tp_rank = get_parallel().moe_tp_rank
+        tp_size = getattr(layer, "moe_tp_size")
+        tp_rank = getattr(layer, "moe_tp_rank")
     
         # ----------------------------------------------------------------
         # w13 (gate + up projections)
