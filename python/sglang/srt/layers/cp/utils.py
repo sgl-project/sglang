@@ -68,14 +68,10 @@ def is_cp_v2_active(forward_batch) -> bool:
 
 def prepare_cp_forward(forward_batch) -> None:
     """Build CP-v2 metadata for an active context-parallel prefill batch."""
+    assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
-
-    input_ids = getattr(forward_batch, "input_ids", None)
-    assert input_ids is not None
-
-    num_tokens = len(input_ids)
-    assert strategy.can_apply(num_tokens, forward_batch)
+    num_tokens = len(forward_batch.input_ids)
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
@@ -92,6 +88,7 @@ def cp_split_before_forward(
     forward_batch,
 ) -> Tuple[Optional[Any], Optional[Any]]:
     """Shard embeddings and positions for CP-v2 model-runner forwarding."""
+    assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
@@ -102,11 +99,9 @@ def cp_split_before_forward(
     )
 
 
-def maybe_cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
+def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
     """Gather CP-v2 hidden states at the model boundary when this batch is active."""
-    if not is_cp_v2_active(forward_batch):
-        return x
-
+    assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
 
@@ -142,7 +137,7 @@ __all__ = [
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",
-    "maybe_cp_gather_after_forward",
+    "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
 ]

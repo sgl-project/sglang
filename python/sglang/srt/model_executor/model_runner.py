@@ -124,10 +124,10 @@ from sglang.srt.layers.attention.attention_registry import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
     cp_split_before_forward,
     get_cp_strategy,
     is_cp_v2_active,
-    maybe_cp_gather_after_forward,
     prepare_cp_forward,
 )
 from sglang.srt.layers.dp_attention import (
@@ -3415,55 +3415,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
 
-        def _forward_model():
-            if not cp_v2_active:
-                return self.model.forward(
-                    forward_batch.input_ids,
-                    forward_positions,
-                    forward_batch,
-                    **kwargs,
-                )
-
-            hidden_states = self.model.model(
-                forward_batch.input_ids,
-                forward_positions,
-                forward_batch,
-                input_embeds=kwargs.get("input_embeds"),
-                pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-            )
-
-            aux_hidden_states = None
-            capture_aux_hidden_states = getattr(
-                self.model, "capture_aux_hidden_states", False
-            )
-            if capture_aux_hidden_states:
-                hidden_states, aux_hidden_states = hidden_states
-
-            if self.model.pp_group.is_last_rank:
-                hidden_states = maybe_cp_gather_after_forward(
-                    hidden_states,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                return self.model.logits_processor(
-                    forward_batch.input_ids,
-                    hidden_states,
-                    self.model.lm_head,
-                    forward_batch,
-                    aux_hidden_states,
-                )
-
-            if capture_aux_hidden_states:
-                return hidden_states, aux_hidden_states
-            return hidden_states
-
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
             if self.device_timer
             else contextlib.nullcontext()
         )
         with ctx:
-            if _is_hip and self.prefill_cuda_graph_runner is not None:
+            if (
+                _is_hip
+                and self.prefill_cuda_graph_runner is not None
+                and not cp_v2_active
+            ):
                 # AMD/HIP: when PCG is enabled but the batch exceeds max captured
                 # size, run eagerly under enable_tc_piecewise_cuda_graph() and
                 # set_tc_piecewise_forward_context() so that (a) Dynamo guards on
@@ -3481,9 +3443,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         dsa_indexers=self.dsa_indexers,
                     ),
                 ):
-                    ret = _forward_model()
+                    ret = self.model.forward(
+                        forward_batch.input_ids,
+                        forward_positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+            elif cp_v2_active:
+                hidden_states = self.model.model(
+                    forward_batch.input_ids,
+                    forward_positions,
+                    forward_batch,
+                    input_embeds=kwargs.get("input_embeds"),
+                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+                )
+
+                aux_hidden_states = None
+                capture_aux_hidden_states = getattr(
+                    self.model, "capture_aux_hidden_states", False
+                )
+                if capture_aux_hidden_states:
+                    hidden_states, aux_hidden_states = hidden_states
+
+                if self.model.pp_group.is_last_rank:
+                    hidden_states = cp_gather_after_forward(
+                        hidden_states,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    ret = self.model.logits_processor(
+                        forward_batch.input_ids,
+                        hidden_states,
+                        self.model.lm_head,
+                        forward_batch,
+                        aux_hidden_states,
+                    )
+                elif capture_aux_hidden_states:
+                    ret = hidden_states, aux_hidden_states
+                else:
+                    ret = hidden_states
             else:
-                ret = _forward_model()
+                ret = self.model.forward(
+                    forward_batch.input_ids,
+                    forward_positions,
+                    forward_batch,
+                    **kwargs,
+                )
         return (ret, can_run_graph)
 
     def forward_idle(

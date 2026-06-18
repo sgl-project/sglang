@@ -19,6 +19,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,16 +44,6 @@ class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
 
-    def _init_zigzag(self, cp_size=4):
-        init_cp_strategy(
-            SimpleNamespace(
-                enable_prefill_cp=True,
-                cp_strategy="zigzag",
-                attn_cp_size=cp_size,
-                attention_backend="fa3",
-            )
-        )
-
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
         self.assertEqual(
@@ -66,21 +57,40 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
         self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
 
-    def test_get_cp_strategy_is_initialized_under_cp_v1_and_cp_v2(self):
-        self._init_zigzag()
+    def test_init_cp_strategy_binds_zigzag_strategy(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="zigzag",
+                attn_cp_size=4,
+            )
+        )
 
-        for enable_v2 in (False, True):
-            with patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=enable_v2,
-            ):
-                self.assertIsNotNone(get_cp_strategy())
-                self.assertTrue(is_cp_enabled())
-                self.assertTrue(is_zigzag())
-                self.assertFalse(is_interleave())
-                self.assertEqual(
-                    get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG
-                )
+        self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_zigzag())
+        self.assertFalse(is_interleave())
+        self.assertEqual(get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG)
+
+    def test_get_cp_strategy_is_initialized_under_cp_v1_and_cp_v2(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="interleave",
+                attn_cp_size=4,
+            )
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
+        ):
+            self.assertIsNotNone(get_cp_strategy())
+            self.assertTrue(is_cp_enabled())
+            self.assertTrue(is_interleave())
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            self.assertIsNotNone(get_cp_strategy())
 
 
 class TestCPZigzagStrategy(CustomTestCase):
@@ -99,10 +109,7 @@ class TestCPZigzagStrategy(CustomTestCase):
 
     def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
         strategy = ZigzagCPStrategy(cp_size=cp_size)
-        with patch(
-            "sglang.srt.layers.dp_attention.get_attention_cp_rank",
-            return_value=rank,
-        ):
+        with get_parallel().override(attn_cp_rank=rank):
             return strategy.build_metadata(
                 num_tokens=sum(extend_seq_lens),
                 seqs_len=seq_lens,
@@ -266,11 +273,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             )
             metas.append(metadata)
             fb = self._forward_batch(metadata, extend_seq_lens)
-            with patch(
-                "sglang.srt.layers.dp_attention.get_attention_cp_rank",
-                return_value=rank,
-            ):
-                local = ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(x, fb)
+            local = ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(x, fb)
             pad = metadata.max_rank_len[0] - local.shape[0]
             if pad:
                 local = torch.nn.functional.pad(
@@ -335,11 +338,14 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
-            helper_x, helper_positions = cp_split_before_forward(
-                x,
-                positions,
-                fb,
-            )
+            with patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+            ):
+                helper_x, helper_positions = cp_split_before_forward(
+                    x,
+                    positions,
+                    fb,
+                )
 
             self.assertTrue(torch.equal(local_x, expected_x))
             self.assertTrue(torch.equal(local_positions, expected_positions))
