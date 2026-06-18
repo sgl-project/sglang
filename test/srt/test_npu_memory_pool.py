@@ -140,8 +140,10 @@ def test_npu_minimax_k_only_index_cache_uses_int32_scatter_indices():
 
     class FakeTorchNpu:
         @staticmethod
-        def npu_scatter_nd_update_(_dst, indices, _src):
+        def npu_scatter_nd_update_(dst, indices, src):
+            assert dst.dim() == 2
             assert indices.dtype == torch.int32
+            assert src.dim() == 2
 
     npu_memory_pool.torch_npu = FakeTorchNpu
 
