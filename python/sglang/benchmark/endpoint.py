@@ -46,7 +46,7 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
         kill_process_tree(os.getpid(), include_parent=False)
 
 
-def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
+def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
     base_url = f"http://{server_args.host}:{server_args.port}"
 
     # Reuse an already-running server instead of forking a second one onto the
@@ -122,5 +122,5 @@ def acquire_endpoint(
             )
         return BenchEndpoint(base_url=base_url)
 
-    proc, url = launch_server_process(launch_server_func, server_args)
+    proc, url = launch_or_reuse_server(launch_server_func, server_args)
     return BenchEndpoint(base_url=url, _proc=proc)
