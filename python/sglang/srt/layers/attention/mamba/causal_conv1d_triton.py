@@ -1144,9 +1144,6 @@ def _causal_conv1d_verify_token_parallel_kernel(
     )
     tl.store(o_ptrs, acc, mask=mask_1d)
 
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
-
 
 def causal_conv1d_update(
     x: torch.Tensor,
@@ -1301,7 +1298,6 @@ def causal_conv1d_update(
         raise ValueError(
             "retrieve_parent_token must be provided and non-empty when retrieve_next_token is provided"
         )
-
 
     # Dispatch: use token-parallel kernel for tree-verify mode (pre-computed parent map,
     # no spec-decoding accept/reject path which uses num_accept_tokens)
