@@ -574,3 +574,49 @@ class SpecFeatureKit:
             self.assertIsInstance(content, dict)
         except Exception:
             self.fail(f"parse JSON failed: {content_json}")
+
+
+class SpecHiddenStatesKit:
+    """return_hidden_states under spec V2 (regression for issue #26163).
+
+    Requires the server launched with --enable-return-hidden-states
+    (set ``enable_return_hidden_states = True`` on the fixture class).
+    """
+
+    def test_return_hidden_states(self):
+        # Two prompts of different lengths to exercise the per-req stride
+        # window: under spec V2 hidden_states is [bs * num_draft_tokens, dim],
+        # so a wrong index aliases a neighbor request's accepted rows.
+        prompts = [
+            "Repeat: the quick brown fox the quick brown fox the quick brown fox",
+            "Count down from ten: ten nine eight",
+        ]
+        res = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                "return_hidden_states": True,
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        outputs = res.json()
+
+        for out in outputs:
+            meta = out["meta_info"]
+            hs = meta["hidden_states"]
+            ct = meta["completion_tokens"]
+            # One hidden-state entry per completion token: hs[0] is the prefill
+            # block (List[List[float]]), hs[1:] are per-decode-token rows.
+            self.assertEqual(
+                len(hs),
+                ct,
+                f"len(hidden_states)={len(hs)} but completion_tokens={ct}",
+            )
+            decode_rows = hs[1:]
+            self.assertGreater(len(decode_rows), 0)
+            hidden_dim = len(decode_rows[0])
+            self.assertGreater(hidden_dim, 0)
+            for row in decode_rows:
+                self.assertIsInstance(row, list)
+                self.assertEqual(len(row), hidden_dim)
