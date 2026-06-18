@@ -727,13 +727,20 @@ class HiCacheController:
 
         op = CacheOperation.merge_ops(self.write_queue)
         # Keeping host (destination) indices on CPU only works with the staged JIT
-        # write-back kernel (CUDA-only). The AOT fallback used when can_use_jit is
-        # False (e.g. ROCm) calls transfer_kv_all_layer_*_lf_pf, which requires GPU
-        # destination indices (TORCH_CHECK is_cuda), so gate this on can_use_jit.
+        # write-back kernel. The AOT fallback used on non-JIT backends (e.g. ROCm)
+        # calls transfer_kv_all_layer_*_lf_pf, which requires GPU destination indices
+        # (TORCH_CHECK is_cuda), so gate this on the write-back JIT predicate.
+        # Prefer can_use_write_back_jit (the accurate per-pool field standardized in
+        # #28434); fall back to can_use_jit until that lands. Both are already gated
+        # on _is_cuda, so no separate is_cuda check is needed.
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_jit", False)
+            and getattr(
+                self.mem_pool_host,
+                "can_use_write_back_jit",
+                getattr(self.mem_pool_host, "can_use_jit", False),
+            )
         ):
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
