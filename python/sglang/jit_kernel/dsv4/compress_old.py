@@ -11,8 +11,15 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -288,7 +295,7 @@ def compress_fused_norm_rope_inplace(
     )
 
 
-def fused_norm_rope_inplace(
+def _fused_norm_rope_inplace_impl(
     kv: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
@@ -306,3 +313,25 @@ def fused_norm_rope_inplace(
         eps,
         0,
     )
+
+
+dsv4_pcg_fused_norm_rope_inplace = register_custom_op(
+    _fused_norm_rope_inplace_impl,
+    op_name="dsv4_pcg_fused_norm_rope_inplace",
+    mutates_args=["kv"],
+)
+
+
+def fused_norm_rope_inplace(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    # PCG (tc_piecewise) routes through an opaque custom op so torch.compile does
+    # not trace into the JIT kernel; the eager path is unchanged.
+    if _is_hip and is_in_tc_piecewise_cuda_graph():
+        dsv4_pcg_fused_norm_rope_inplace(kv, weight, eps, freq_cis, positions)
+        return
+    _fused_norm_rope_inplace_impl(kv, weight, eps, freq_cis, positions)
