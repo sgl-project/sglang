@@ -36,6 +36,12 @@ class FakeKVManager(BaseKVManager):
 
 
 class FakeKVSender(BaseKVSender):
+    # Auto-complete threshold: high enough to avoid premature completion during
+    # normal multi-GPU bootstrap synchronization (where ranks may poll at slightly
+    # different rates due to scheduling delays), but low enough to eventually
+    # clean up truly leaked requests (health checks, connection validation).
+    _AUTO_COMPLETE_THRESHOLD = 100
+
     def __init__(
         self,
         mgr: BaseKVManager,
@@ -47,16 +53,37 @@ class FakeKVSender(BaseKVSender):
         self.kv_mgr = mgr
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
+        self.poll_count = 0  # Track number of times polled before send()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
+
         if not self.has_sent:
-            # Assume handshake completed instantly
+            self.poll_count += 1
+
+            # During normal operation, a request should transition from bootstrap
+            # to prefill within a few polls. If poll_count exceeds the threshold,
+            # it indicates a leaked request (e.g., health check, aborted request)
+            # that will never call send(). Auto-complete to prevent queue accumulation.
+            if self.poll_count >= self._AUTO_COMPLETE_THRESHOLD:
+                logger.warning(
+                    f"FakeKVSender auto-completing after {self.poll_count} polls without send() - "
+                    "likely a leaked request (health check or aborted)"
+                )
+                self.has_sent = True
+                self.conclude_state = KVPoll.Success
+                return KVPoll.Success
+
+            # First poll: return WaitingForInput (proper bootstrap handshake)
+            # Subsequent polls (< threshold): keep returning WaitingForInput to allow
+            # multi-GPU bootstrap synchronization without premature auto-completion
+            if self.poll_count == 1:
+                logger.debug("FakeKVSender poll: WaitingForInput (handshake complete)")
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
-        logger.debug("FakeKVSender poll success")
+        # Assume transfer completed instantly after send()
+        logger.debug("FakeKVSender poll success after send()")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
@@ -79,6 +106,7 @@ class FakeKVSender(BaseKVSender):
         state_indices: Optional[List] = None,
     ):
         self.has_sent = True
+        self.poll_count = 0  # Reset counter after send
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
