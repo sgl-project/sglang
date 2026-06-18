@@ -58,6 +58,24 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
+
+def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return torch.float32, torch.float32
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return torch.bfloat16, torch.bfloat16
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
+
+
 _is_npu = is_npu()
 _is_hip = is_hip()
 
@@ -332,6 +350,7 @@ class ModelRunnerKVCacheMixin:
                             ]
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
+                        speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -367,6 +386,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
@@ -418,7 +438,8 @@ class ModelRunnerKVCacheMixin:
                 swa_page_size=swa_page_size,
                 sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
-                state_dtype=self.state_dtype,
+                c4_state_dtype=self.c4_state_dtype,
+                c128_state_dtype=self.c128_state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 indexer_head_dim=self.model_config.index_head_dim,
@@ -429,6 +450,9 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
+                online_mtp_max_draft_tokens=(
+                    self.server_args.max_speculative_num_draft_tokens or 0
+                ),
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
@@ -944,12 +968,12 @@ class ModelRunnerKVCacheMixin:
             self.c4_state_pool_size = config.c4_state_pool_size
             self.c128_state_pool_size = config.c128_state_pool_size
 
-        # state_dtype is a DSV4 architectural constant (fp32 for c4/c128
-        # state buffers); set unconditionally so draft workers have it before
-        # _init_pools reads it (target path also overwrites this in the
-        # configurator's resolve() for parity, harmless here).
+        # Draft worker does not own the compression-state pools, but keep the
+        # dtype attributes initialized so _init_pools can share one code path.
         if is_deepseek_v4(self.model_config.hf_config):
-            self.state_dtype = torch.float32
+            self.c4_state_dtype, self.c128_state_dtype = (
+                _get_dsv4_compress_state_dtypes()
+            )
 
         self._init_pools()
 

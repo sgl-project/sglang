@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -7,7 +9,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> None:
+def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 model-specific server arg defaults and constraints."""
     from sglang.srt.server_args import ServerArgs
 
@@ -47,7 +49,7 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         )
 
 
-def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
+def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     if not server_args.enable_prefill_cp:
         return

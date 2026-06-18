@@ -29,7 +29,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import ReLU2
@@ -40,8 +39,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -90,6 +87,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -159,7 +157,7 @@ class NemotronHMoE(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -538,8 +536,8 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_rank = get_attention_tp_rank()
-        tp_size = get_attention_tp_size()
+        tp_rank = get_parallel().attn_tp_rank
+        tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
