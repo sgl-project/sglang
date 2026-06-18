@@ -63,6 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.k2 import K2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -114,6 +115,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingPara
 from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.k2 import (
+    K2SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
@@ -397,9 +401,13 @@ def _get_config_info(
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
-    # 3. Use detectors
-    config = maybe_download_model_index(model_path)
-    pipeline_name = config.get("_class_name", "").lower()
+    # 3. Use detectors. Non-diffusers models (raw safetensors, no model_index.json)
+    # have no _class_name to match, so fall back to matching on the model path alone.
+    try:
+        config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "").lower()
+    except Exception:
+        pipeline_name = ""
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
@@ -842,6 +850,13 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
         ],
+    )
+    # Krea-2 (K2) — non-diffusers MMDiT safetensors (see KNOWN_NON_DIFFUSERS pattern)
+    register_configs(
+        sampling_param_cls=K2SamplingParams,
+        pipeline_config_cls=K2PipelineConfig,
+        hf_model_paths=["krea/Krea-2"],
+        model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
     )
     # Qwen-Image
     register_configs(
