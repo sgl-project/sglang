@@ -626,9 +626,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._init_paged_compress_states(enable_memory_saver)
 
-        self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
-        self.cached_loc = None
-
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
