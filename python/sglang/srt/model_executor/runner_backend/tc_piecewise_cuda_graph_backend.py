@@ -40,7 +40,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -54,6 +53,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.server_args import ServerArgs
 
 
