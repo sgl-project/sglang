@@ -47,16 +47,31 @@ class FakeKVSender(BaseKVSender):
         self.kv_mgr = mgr
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
+        self.poll_count = 0  # Track number of times polled in WaitingForInput state
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
-        if not self.has_sent:
-            # Assume handshake completed instantly
-            return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
-        logger.debug("FakeKVSender poll success")
+        if not self.has_sent:
+            # First poll: return WaitingForInput (allows proper bootstrap flow)
+            # Subsequent polls: auto-complete to prevent accumulation in inflight queue
+            # This handles cases where send() is never called (e.g., health checks)
+            self.poll_count += 1
+            if self.poll_count == 1:
+                logger.debug("FakeKVSender poll: WaitingForInput (handshake complete)")
+                return KVPoll.WaitingForInput
+            else:
+                # Auto-complete after first poll to prevent queue accumulation
+                logger.debug(
+                    f"FakeKVSender poll: auto-completing (poll_count={self.poll_count})"
+                )
+                self.has_sent = True
+                self.conclude_state = KVPoll.Success
+                return KVPoll.Success
+
+        # Assume transfer completed instantly after send()
+        logger.debug("FakeKVSender poll success after send()")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
