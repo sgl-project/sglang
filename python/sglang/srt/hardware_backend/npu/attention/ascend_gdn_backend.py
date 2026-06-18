@@ -357,15 +357,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 -1, num_value_heads, head_k_dim, head_v_dim
             )
 
-        num_accept_tokens = torch.full(
-            [batch_size], 1, dtype=torch.int32, device=cache_indices.device
-        )
-        actual_seq_lengths = torch.full(
-            [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
-        )
         if self.graph_mode:
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
+            num_accept_tokens = torch.full(
+                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
+            )
+            actual_seq_lengths = torch.full(
+                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+            )
         else:
+            num_accept_tokens = self.num_accept_tokens
+            actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
