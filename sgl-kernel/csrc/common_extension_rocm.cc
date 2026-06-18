@@ -48,6 +48,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   m.def(
+      "fast_kpool_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_token_indices, int pool_size, "
+      "Tensor? page_table, Tensor? topk_indices_offset, Tensor? row_starts, Tensor? seq_lens) -> ()");
+  m.impl("fast_kpool_topk_transform_fused", torch::kCUDA, &fast_kpool_topk_transform_interface);
+
+  m.def(
       "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
       "page_indices, int page_size, Tensor!? raw_indices) -> ()");
   m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
