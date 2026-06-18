@@ -533,7 +533,6 @@ struct OnlineDecodePlanParams {
   const int64_t* __restrict__ seq_lens;
   const int64_t* __restrict__ req_pool_indices;
   const int32_t* __restrict__ req_to_token;
-  const int64_t* __restrict__ full_to_c128_state;  // (full_cache_size,) int64
   int64_t stride_r2t;
   int32_t state_slot_offset;
   uint32_t batch_size;
@@ -546,7 +545,7 @@ __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams para
   const auto rid = params.req_pool_indices[idx];
   const int32_t chunk_start = static_cast<int32_t>((seq_len - 1u) / 128u * 128u);
   const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t slot = static_cast<int32_t>(params.full_to_c128_state[full_loc]) + params.state_slot_offset;
+  const int32_t slot = full_loc / 128 + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{
       .seq_len = seq_len,
       .write_loc = slot,
@@ -564,7 +563,6 @@ inline void plan_online_decode(
     const tvm::ffi::TensorView seq_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_c128_state,
     const tvm::ffi::TensorView plan_d_dev_,
     const int32_t state_slot_offset) {
   auto B = SymbolicSize{"batch_size"};
@@ -584,10 +582,6 @@ inline void plan_online_decode(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_c128_state);
   TensorMatcher({B, sizeof(DecodePlan)})  //
       .with_dtype<uint8_t>()
       .with_device(device_)
@@ -606,7 +600,6 @@ inline void plan_online_decode(
       .seq_lens = static_cast<const int64_t*>(seq_lens.data_ptr()),
       .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-      .full_to_c128_state = static_cast<const int64_t*>(full_to_c128_state.data_ptr()),
       .stride_r2t = stride_r2t,
       .state_slot_offset = state_slot_offset,
       .batch_size = batch_size,
@@ -680,7 +673,6 @@ struct OnlinePrefillStage1Params {
   CompressPlan* __restrict__ plan_w;
   const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
   const int32_t* __restrict__ req_to_token;      // (num_reqs, max_tokens)
-  const int64_t* __restrict__ full_to_c128_state;  // (full_cache_size,)
   int64_t stride_r2t;
   int32_t state_slot_offset;
   uint32_t num_c;
@@ -701,7 +693,7 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   const int32_t position = static_cast<int32_t>(plan.seq_len - 1u);
   const int32_t chunk_start = (position / 128) * 128;
   const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t main_slot = static_cast<int32_t>(params.full_to_c128_state[full_loc]);
+  const int32_t main_slot = full_loc / 128;
   plan.read_page_0 = main_slot + params.state_slot_offset;
   plan.read_page_1 = main_slot;
   *plan_ptr = plan;
@@ -714,7 +706,6 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView extend_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_c128_state,
     const tvm::ffi::TensorView plan_c_pin,
     const tvm::ffi::TensorView plan_w_pin,
     const tvm::ffi::TensorView plan_c_dev_,
@@ -741,10 +732,6 @@ inline OnlinePrefillPlan plan_online_prefill(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_c128_state);
   TensorMatcher({N, sizeof(CompressPlan)})  //
       .with_dtype<uint8_t>()
       .with_device(cpu)
@@ -870,7 +857,6 @@ inline OnlinePrefillPlan plan_online_prefill(
         .plan_w = plan_w_dev_ptr,
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-        .full_to_c128_state = static_cast<const int64_t*>(full_to_c128_state.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
         .state_slot_offset = state_slot_offset,
         .num_c = num_c_padded,

@@ -628,32 +628,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
-        self.full_to_c128_state_index_mapping: Optional[torch.Tensor] = None
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.full_to_c128_state_index_mapping = torch.empty_like(
-            full_to_swa_index_mapping
-        )
-        valid_full_size = min(
-            full_to_swa_index_mapping.shape[0] - 1,
-            self.c128_state_pool_size * (128 if ONLINE_C128 else 1),
-        )
-        full_indices = torch.arange(
-            valid_full_size,
-            dtype=torch.int64,
-            device=full_to_swa_index_mapping.device,
-        )
-        if ONLINE_C128:
-            state_indices = full_indices // 128
-        else:
-            state_indices = full_indices
-        self.full_to_c128_state_index_mapping[:-1].fill_(0)
-        self.full_to_c128_state_index_mapping[:valid_full_size] = state_indices
-        self.full_to_c128_state_index_mapping[-1] = -1
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()

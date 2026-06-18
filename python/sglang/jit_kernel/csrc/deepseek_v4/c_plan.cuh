@@ -53,7 +53,7 @@ struct Prefill1Params {
   PlanW* plan_w;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4, C128 state loc for c128
+  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4; ignored for c128
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -69,7 +69,7 @@ struct DecodeParams {
   PlanD* plan_d;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4, C128 state loc for c128
+  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4; ignored for c128
   const IDX_T* seq_ptr;  // [batch_size]
   int64_t stride_r2t;
   uint32_t batch_size;
@@ -309,12 +309,12 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
       const auto raw_loc_0 = mapping[position_0];
       const auto raw_loc_1 = mapping[position_1];
-      const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
-      const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
       if (params.compress_ratio == 128) {
-        plan_c.read_page_0 = state_loc_0 / 128;
-        plan_c.read_page_1 = state_loc_1 / 128;
+        plan_c.read_page_0 = raw_loc_0 / 128;
+        plan_c.read_page_1 = raw_loc_1 / 128;
       } else {
+        const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
+        const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
         plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
         plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
       }
@@ -331,10 +331,9 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
     const auto raw_loc = mapping[position];
-    const auto state_loc = params.state_map_ptr[raw_loc];
     plan_w.ragged_id = ragged_id;
     plan_w.write_loc =
-        params.compress_ratio == 128 ? state_loc : compute_loc(state_loc);
+        params.compress_ratio == 128 ? raw_loc : compute_loc(params.state_map_ptr[raw_loc]);
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
     params.plan_w[idx] = PlanW::invalid();
@@ -356,8 +355,10 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
   const auto raw_loc_0 = mapping[position_0];
   const auto raw_loc_1 = mapping[position_1];
-  const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
-  const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+  const auto state_loc_0 =
+      params.compress_ratio == 128 ? raw_loc_0 : params.state_map_ptr[raw_loc_0];
+  const auto state_loc_1 =
+      params.compress_ratio == 128 ? raw_loc_1 : params.state_map_ptr[raw_loc_1];
   const int32_t write_loc = static_cast<int32_t>(
       params.compress_ratio == 128 ? state_loc_1 : compute_loc(state_loc_1));
   const int32_t read_page_0 = static_cast<int32_t>(
@@ -453,8 +454,8 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param req_pool_indices  `[batch_size]` int64_t
  * @param req_to_token      `[num_reqs, max_tokens_per_req]` int64_t
  * @param full_to_state     `[full_cache_size]` int64_t. For c4 this maps
- *                          full loc -> SWA loc; for c128 it maps full loc ->
- *                          C128 state loc.
+ *                          full loc -> SWA loc; ignored for c128, whose
+ *                          state slot is derived directly from full loc.
  * @param seq_lens          `[batch_size]` int64
  * @param extend_lens       `[batch_size]` int64
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
