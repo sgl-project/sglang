@@ -28,7 +28,7 @@ class TestBatchingFDFOJointThreshold(CustomTestCase):
     byte-identical multi-block output.
     """
 
-    model = "inclusionAI/LLaDA2.0-mini"
+    model = "inclusionAI/LLaDA2.1-mini"
     base_url = DEFAULT_URL_FOR_TEST
 
     def _collect_outputs(self, fdfo: bool):

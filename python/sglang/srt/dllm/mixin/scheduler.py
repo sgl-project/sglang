@@ -70,21 +70,9 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
-        if fdfo_mode:
-            assert (
-                result.accept_length_per_req_cpu is not None
-            ), "FDFO dLLM result is missing accept lengths."
-
-        def free_unresolved_block_kv(req: Req):
-            # Release the KV slots of the still-masked block so the next FDFO
-            # round can re-denoise it without leaking the previous allocation.
-            old_prefix_len = len(req.prefix_indices)
-            new_fill_len = req.fill_len
-            if new_fill_len > old_prefix_len:
-                kv_indices_to_free = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, old_prefix_len:new_fill_len
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices_to_free)
+        assert (
+            not fdfo_mode or result.accept_length_per_req_cpu is not None
+        ), "FDFO dLLM result is missing accept lengths."
 
         # Sync mode emits tokens only once a block fully resolves; FDFO always
         # commits (resolved blocks decode, unresolved blocks stash + free KV).
@@ -119,12 +107,20 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
-                    # Block unresolved: stash partial state and free its KV.
+                    # Block unresolved: stash partial state and free the KV slots
+                    # of the still-masked block so the next FDFO round can
+                    # re-denoise it without leaking the previous allocation.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
-                    free_unresolved_block_kv(req)
+                    old_prefix_len = len(req.prefix_indices)
+                    new_fill_len = req.fill_len
+                    if new_fill_len > old_prefix_len:
+                        kv_indices_to_free = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, old_prefix_len:new_fill_len
+                        ]
+                        self.token_to_kv_pool_allocator.free(kv_indices_to_free)
                     continue
 
                 req.dllm_incomplete_ids = array("q")
