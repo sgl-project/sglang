@@ -113,6 +113,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         kv_index.tree(),
         Arc::clone(&tokenizers),
         block_size_oracle,
+        kv_index.engine_load(),
     );
 
     // 5. Register two workers. They share `127.0.0.1` so both
@@ -123,6 +124,9 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let preresolved = EventConfig {
         host: "127.0.0.1".to_string(),
         port_base: port,
+        // These exercise KV events only; None means "worker publishes no
+        // load", so the load subscriber is skipped.
+        load_port_base: None,
         topic: String::new(),
         block_size,
         dp_size: 1,

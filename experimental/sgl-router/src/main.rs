@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
             kv_index.tree(),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            kv_index.engine_load(),
         )
         .context("build policy registry")?,
     );

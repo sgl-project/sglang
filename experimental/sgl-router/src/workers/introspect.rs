@@ -300,6 +300,7 @@ pub(crate) fn resolve_event_config(
         host,
         port_base: block.endpoint_port_base,
         topic: block.topic,
+        load_port_base: block.load_endpoint_port_base,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -346,6 +347,10 @@ pub(crate) struct KvEventsBlock {
     pub endpoint_port_base: u16,
     #[serde(default)]
     pub topic: String,
+    /// Base port of the dedicated load-snapshot socket range. Absent on
+    /// workers that predate load publishing (`None` ⇒ no load subscriber).
+    #[serde(default)]
+    pub load_endpoint_port_base: Option<u16>,
     pub block_size: u32,
     pub dp_size: u32,
 }
@@ -460,6 +465,58 @@ mod tests {
         assert_eq!(cfg.topic, "kv");
         assert_eq!(cfg.block_size, 64);
         assert_eq!(cfg.dp_size, 2);
+    }
+
+    /// This is the primary `/server_info` path, so the load port has to be
+    /// threaded here — not only in the discovery.rs fallback. If it were
+    /// dropped, every worker would look like it predates load publishing, the
+    /// load subscribers would open zero sockets, and nothing would fail.
+    #[tokio::test]
+    async fn fetch_threads_load_endpoint_port_base() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 2,
+                "load_endpoint_port_base": 5559,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert_eq!(cfg.load_port_base, Some(5559));
+    }
+
+    /// An engine predating load publishing omits the key entirely. That must
+    /// leave cache-aware routing fully working rather than failing the block.
+    #[tokio::test]
+    async fn fetch_load_port_absent_does_not_break_kv_events() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events must still parse without the load key");
+        assert_eq!(cfg.load_port_base, None);
+        assert_eq!(cfg.port_base, 5557);
     }
 
     #[tokio::test]
