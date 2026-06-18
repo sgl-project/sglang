@@ -861,13 +861,13 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Pre-dequantize MoE weights to FP16 and shard along intermediate dim for TP."""
+        """Pre-dequantize MoE weights to FP16 and shard intermediate dim for TP."""
     
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
     
-        tp_size = getattr(layer, "moe_tp_size")
-        tp_rank = getattr(layer, "moe_tp_rank")
+        tp_size = get_parallel().moe_tp_size
+        tp_rank = get_parallel().moe_tp_rank
     
         # ----------------------------------------------------------------
         # w13 (gate + up projections)
@@ -883,42 +883,39 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     
             for e in range(num_experts):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
-                rows = w13_qweight[e].shape[0]
-                cols = w13_qweight[e].shape[1] // type_size * block_size
+                rows = w13_qweight[e].shape[0]           # = 2 * intermed_shard
+                cols = w13_qweight[e].shape[1] // type_size * block_size  # = hidden
     
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)
-                    .transpose(-1, -2)       # -> (intermediate, hidden)
+                    .reshape(rows, cols)      # (2*intermed_shard, hidden)
                     .contiguous()
                 )
                 w13_dequant_list.append(dequant)
     
-            w13_full = torch.stack(w13_dequant_list, dim=0)   # (E, 2*full_inter, hidden)
-            w13_full = npu_format_cast(w13_full)
-    
-            # TP sharding along intermediate dimension
+            w13_full = torch.stack(w13_dequant_list, dim=0)   # (E, 2*intermed_shard, hidden)
+            # Apply TP sharding along the intermediate dimension (dim=1)
             if tp_size > 1:
-                inter_dim = w13_full.shape[1]
-                assert inter_dim % tp_size == 0, f"w13 intermediate dim {inter_dim} not divisible by tp_size {tp_size}"
-                shard_size = inter_dim // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
+                full_inter = w13_full.shape[1]
+                assert full_inter % tp_size == 0, f"w13 intermediate dim {full_inter} not divisible by {tp_size}"
+                shard_sz = full_inter // tp_size
+                start = tp_rank * shard_sz
+                end = start + shard_sz
                 w13_full = w13_full[:, start:end, :].contiguous()
     
+            w13_full = npu_format_cast(w13_full)
             layer.register_buffer("w13_dequant", w13_full, persistent=False)
         else:
-            w13_data = npu_format_cast(w13_qweight.data)     # shape (E, 2*inter_shard, hidden)
-    
+            w13_data = w13_qweight.data.clone()   # (E, 2*intermed_shard, hidden)
             if tp_size > 1:
-                inter_dim = w13_data.shape[1]
-                shard_size = inter_dim // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
+                full_inter = w13_data.shape[1]
+                shard_sz = full_inter // tp_size
+                start = tp_rank * shard_sz
+                end = start + shard_sz
                 w13_data = w13_data[:, start:end, :].contiguous()
-    
+            w13_data = npu_format_cast(w13_data)
             layer.register_buffer("w13_dequant", w13_data, persistent=False)
     
         # ----------------------------------------------------------------
@@ -935,42 +932,38 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     
             for e in range(num_experts):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
-                rows = w2_qweight[e].shape[0]
-                cols = w2_qweight[e].shape[1] // type_size * block_size
+                rows = w2_qweight[e].shape[0]           # = intermed_shard
+                cols = w2_qweight[e].shape[1] // type_size * block_size  # = hidden
     
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)
-                    .transpose(-1, -2)       # -> (intermediate, hidden)
+                    .reshape(rows, cols)      # (intermed_shard, hidden)
                     .contiguous()
                 )
                 w2_dequant_list.append(dequant)
     
-            w2_full = torch.stack(w2_dequant_list, dim=0)   # (E, full_inter, hidden)
-            w2_full = npu_format_cast(w2_full)
-    
-            # TP sharding along intermediate dimension
+            w2_full = torch.stack(w2_dequant_list, dim=0)   # (E, intermed_shard, hidden)
             if tp_size > 1:
-                inter_dim = w2_full.shape[1]
-                assert inter_dim % tp_size == 0, f"w2 intermediate dim {inter_dim} not divisible by tp_size {tp_size}"
-                shard_size = inter_dim // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
+                full_inter = w2_full.shape[1]
+                assert full_inter % tp_size == 0, f"w2 intermediate dim {full_inter} not divisible by {tp_size}"
+                shard_sz = full_inter // tp_size
+                start = tp_rank * shard_sz
+                end = start + shard_sz
                 w2_full = w2_full[:, start:end, :].contiguous()
     
+            w2_full = npu_format_cast(w2_full)
             layer.register_buffer("w2_dequant", w2_full, persistent=False)
         else:
-            w2_data = npu_format_cast(w2_qweight.data)     # shape (E, inter_shard, hidden)
-    
+            w2_data = w2_qweight.data.clone()   # (E, intermed_shard, hidden)
             if tp_size > 1:
-                inter_dim = w2_data.shape[1]
-                shard_size = inter_dim // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
+                full_inter = w2_data.shape[1]
+                shard_sz = full_inter // tp_size
+                start = tp_rank * shard_sz
+                end = start + shard_sz
                 w2_data = w2_data[:, start:end, :].contiguous()
-    
+            w2_data = npu_format_cast(w2_data)
             layer.register_buffer("w2_dequant", w2_data, persistent=False)
     
         # Clean up original quantized tensors
