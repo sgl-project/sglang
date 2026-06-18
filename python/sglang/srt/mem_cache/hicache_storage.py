@@ -350,9 +350,9 @@ class HiCacheFile(HiCacheStorage):
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # All LRU / size accounting and disk eviction lives in the evictor so
-        # this backend stays a thin raw-bytes store. Imported lazily: the storage
-        # package __init__ pulls in the backend factory, which imports this
-        # module, so a top-level import here would be circular.
+        # this backend stays a thin raw-bytes store. Imported lazily because
+        # lru_file_evictor imports HiCacheFile at module level for the shared
+        # shard-path helper; a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
         self._evictor = LRUFileEvictor(
@@ -363,21 +363,22 @@ class HiCacheFile(HiCacheStorage):
             extra_config=storage_config.extra_config,
         )
 
-    # LOCAL PATCH (dsv4-l3-shard): fan .bin files into 2-level hash-prefix
-    # subdirs (<ab>/<cd>/<name>.bin) so a single directory never accumulates
-    # millions of entries. Upstream HiCacheFile (incl. latest main) writes all
-    # files flat under file_path -> at ~7.5M files the ext4 directory index
-    # ("htree") is exhausted and writes fail with ENOSPC even though bytes AND
-    # inodes remain free. Sharding caps per-directory entries and also turns the
-    # batch-existence check from one O(total_files) scandir into O(keys) stats.
-    # The shard is derived purely from the leading hex of the .bin FILENAME
-    # (== content-hash prefix), so get/set/exists/evictor all agree. MUST stay
-    # byte-identical to LRUFileEvictor._sharded_path (separate module; no shared
-    # import to avoid the storage-package circular import).
     @staticmethod
     def _shard_subdir(filename: str) -> str:
-        # filename starts with the 64-char hex content hash; first 4 hex chars
-        # give 256x256 buckets. Short/atypical names fall back to a flat bucket.
+        """Map a ``.bin`` filename to its 2-level hash-prefix subdir ``<ab>/<cd>``.
+
+        Pages are fanned into ``<ab>/<cd>/<name>.bin`` so no single directory
+        accumulates millions of entries. A flat layout exhausts the ext4
+        directory index ("htree") at scale (~7.5M files), after which writes
+        fail with ENOSPC even though free bytes and inodes remain. Sharding caps
+        per-directory entries and also turns batched existence checks from one
+        ``O(total_files)`` scandir into ``O(keys)`` stats. The bucket is derived
+        purely from the leading hex of the filename (the content-hash prefix),
+        so get/set/exists and the evictor all resolve the same path -- the
+        evictor imports this exact helper to stay in sync.
+        """
+        # First 4 hex chars give 256x256 buckets; short/atypical names fall
+        # back to a single flat bucket.
         if len(filename) >= 4:
             return os.path.join(filename[:2], filename[2:4])
         return ""
@@ -405,9 +406,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = self._sharded_path(
-            f"{suffixed}.bin"
-        )  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = self._sharded_path(f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -441,9 +440,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = self._sharded_path(
-            f"{suffixed}.bin"
-        )  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = self._sharded_path(f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if os.path.exists(tensor_path):
@@ -460,9 +457,9 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            # LOCAL PATCH (dsv4-l3-shard): ensure the hash-prefix subdir exists
-            # before writing the temp file (tmp + final live in the same shard
-            # dir so os.replace stays an atomic same-filesystem rename).
+            # Create the hash-prefix subdir before writing the temp file; tmp
+            # and final live in the same shard dir so os.replace stays an atomic
+            # same-filesystem rename.
             os.makedirs(os.path.dirname(tensor_path), exist_ok=True)
             tmp_path = (
                 f"{tensor_path}.tmp."
@@ -498,7 +495,7 @@ class HiCacheFile(HiCacheStorage):
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
-        tensor_path = self._sharded_path(f"{key}.bin")  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = self._sharded_path(f"{key}.bin")
         return os.path.exists(tensor_path)
 
     def _collect_existing_component_keys(
@@ -511,11 +508,10 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
-        # LOCAL PATCH (dsv4-l3-shard): probe each target file in its hash-prefix
-        # shard directly. Upstream scandir'd the entire flat file_path on every
-        # batch_exists call -- O(total_files) per lookup, which with millions of
-        # cached pages is a per-request scan over the whole cache dir. Per-target
-        # os.path.exists is O(len(target_files)) and shard-correct.
+        # Probe each target file in its hash-prefix shard directly: a per-target
+        # os.path.exists is O(len(target_files)) and shard-correct, versus
+        # scanning the whole flat file_path -- O(total_files) per call, i.e. a
+        # full cache-dir walk per request once millions of pages accumulate.
         existing_files = set()
         for fname in target_files:
             if os.path.exists(self._sharded_path(fname)):
@@ -634,19 +630,25 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            # LOCAL PATCH (dsv4-l3-shard): files live in hash-prefix subdirs now,
-            # so walk recursively instead of a single-level listdir. Only unlink
-            # cache pages (*.bin) -- NEVER non-.bin metadata such as the init
-            # container's `.sharded-v1` migration sentinel: deleting it would make
-            # the next pod start re-run the flat->sharded migration and wipe the
-            # live L3 tier.
-            for root, _dirs, files in os.walk(self.file_path):
+            # Files live in hash-prefix subdirs, so walk recursively rather than
+            # a single-level listdir. Walk bottom-up (topdown=False) so an empty
+            # shard subdir can be removed right after its pages are unlinked,
+            # otherwise eviction/clear would leak up to 256*256 empty dirs.
+            # Only unlink cache pages (*.bin) -- never non-.bin metadata such as
+            # a migration sentinel; a shard dir that still holds such a file
+            # fails rmdir and is kept. The root file_path itself is never removed.
+            for root, _dirs, files in os.walk(self.file_path, topdown=False):
                 for filename in files:
                     if not filename.endswith(".bin"):
                         continue
                     fp = os.path.join(root, filename)
                     if os.path.isfile(fp):
                         os.remove(fp)
+                if root != self.file_path:
+                    try:
+                        os.rmdir(root)
+                    except OSError:
+                        pass  # not empty (other pages / sentinel) -> keep it
             self._evictor.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
