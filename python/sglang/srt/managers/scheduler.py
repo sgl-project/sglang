@@ -2010,7 +2010,12 @@ class Scheduler(
         )
         if radix_native_session:
             sp = recv_req.session_params
-            if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
+            if (
+                sp.rid is not None
+                or sp.offset is not None
+                or sp.replace is not None
+                or sp.drop_previous_output is not None
+            ):
                 error_msg = (
                     "Invalid request: radix-native sessions do not support "
                     "session_params rid/offset/replace/drop_previous_output; "

@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Bounded guard against a request finishing after close. If a session id falls
+# out of this LRU after 8192 later closes, an extremely late finish can tag
+# again; explicit register_session clears the tombstone for intentional id reuse.
 _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
 
 
@@ -54,7 +57,8 @@ class SessionRadixCacheMixin:
                 leaves.discard(node)
                 if not leaves and sid not in self._closed_session_ids:
                     self._session_leaves.pop(sid, None)
-        node.session_ids = None
+        if hasattr(node, "session_ids"):
+            delattr(node, "session_ids")
 
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
         """Add this request's session id to its leaf's holder set; no-op for non-session reqs."""
@@ -63,17 +67,22 @@ class SessionRadixCacheMixin:
         if sid is None or sid in self._closed_session_ids:
             return
         if node is None:
+            logger.warning(
+                "_tag_session_leaf called without node; falling back to match_prefix"
+            )
             node = self.match_prefix(MatchPrefixParams(key=radix_key)).last_device_node
         if node is not None and node is not self.root_node:
-            if node.session_ids is None:
-                node.session_ids = set()
-            node.session_ids.add(sid)
+            session_ids = getattr(node, "session_ids", None)
+            if session_ids is None:
+                session_ids = set()
+                node.session_ids = session_ids
+            session_ids.add(sid)
             self._session_leaves[sid].add(node)
             logger.debug(
                 "tag session %s: node=%d holders=%d indexed=%d",
                 sid,
                 node.id,
-                len(node.session_ids),
+                len(session_ids),
                 len(self._session_leaves[sid]),
             )
 
@@ -84,30 +93,30 @@ class SessionRadixCacheMixin:
         self._ensure_session_radix_state()
         self._remember_closed_session(session_id)
         indexed = self._session_leaves.pop(session_id, set())
-        pending = [
-            n
-            for n in indexed
-            if n.session_ids is not None and session_id in n.session_ids
-        ]
         freed = 0
-        while pending:
-            node = pending[-1]
-            if node.session_ids is not None:
-                node.session_ids.discard(session_id)
-            if (
-                node is self.root_node
-                or node.lock_ref != 0
-                or len(node.children) != 0
-                or node not in self.evictable_leaves
-                or node.session_ids  # another session still holds this node
-            ):
-                pending.pop()  # chain done, hit a branch/lock/other holder, or evicted
+        for leaf in indexed:
+            if session_id not in getattr(leaf, "session_ids", set()):
                 continue
-            parent = node.parent
-            self.token_to_kv_pool_allocator.free(node.value)
-            self._delete_leaf(node)
-            freed += 1
-            pending[-1] = parent  # walk up the chain
+            node = leaf
+            while True:
+                session_ids = getattr(node, "session_ids", None)
+                if session_ids is not None:
+                    session_ids.discard(session_id)
+                    if not session_ids:
+                        delattr(node, "session_ids")
+                if (
+                    node is self.root_node
+                    or node.lock_ref != 0
+                    or len(node.children) != 0
+                    or node not in self.evictable_leaves
+                    or getattr(node, "session_ids", None)
+                ):
+                    break
+                parent = node.parent
+                self.token_to_kv_pool_allocator.free(node.value)
+                self._delete_leaf(node)
+                freed += 1
+                node = parent
         logger.info(
             "release_session %s: indexed %d leaves, freed %d nodes",
             session_id,

@@ -51,7 +51,9 @@ class TestSessionRadixCache(unittest.TestCase):
 
     def _tag(self, toks, sid):
         self.cache._tag_session_leaf(
-            SimpleNamespace(session_id=sid), RadixKey(array("q", toks))
+            SimpleNamespace(session_id=sid),
+            RadixKey(array("q", toks)),
+            node=self._leaf(toks),
         )
 
     def _cached(self, toks):
@@ -83,7 +85,7 @@ class TestSessionRadixCache(unittest.TestCase):
             )
         finally:
             self.cache.match_prefix = orig_match_prefix
-        self.assertEqual(leaf.session_ids, {"S"})
+        self.assertEqual(getattr(leaf, "session_ids", None), {"S"})
         self.assertIn(leaf, self.cache._session_leaves["S"])
 
     def test_shared_prefix_frees_only_unique_tail(self):
@@ -102,7 +104,9 @@ class TestSessionRadixCache(unittest.TestCase):
         self._tag([1, 2, 3, 4], "A")
         self._insert([1, 2, 3, 4])
         self._tag([1, 2, 3, 4], "B")
-        self.assertEqual(self._leaf([1, 2, 3, 4]).session_ids, {"A", "B"})
+        self.assertEqual(
+            getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A", "B"}
+        )
         self.assertEqual(self.cache.release_session("A"), 0)  # B still holds
         self.assertEqual(self._cached([1, 2, 3, 4]), 4)
         self.assertEqual(self.cache.release_session("B"), 1)  # last holder frees
@@ -128,11 +132,24 @@ class TestSessionRadixCache(unittest.TestCase):
 
         self._insert([5, 6, 7, 8])
         self._tag([5, 6, 7, 8], "S")  # simulates a finish racing after close
-        self.assertIsNone(self._leaf([5, 6, 7, 8]).session_ids)
+        self.assertIsNone(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None))
 
         self.cache.register_session("S")
         self._tag([5, 6, 7, 8], "S")
-        self.assertEqual(self._leaf([5, 6, 7, 8]).session_ids, {"S"})
+        self.assertEqual(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None), {"S"})
+
+    def test_tombstoned_shared_holder_cannot_retag_after_last_holder_close(self):
+        self._insert([1, 2, 3, 4])
+        self._tag([1, 2, 3, 4], "A")
+        self._tag([1, 2, 3, 4], "B")
+
+        self.assertEqual(self.cache.release_session("B"), 0)
+        self.assertEqual(getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A"})
+        self.assertEqual(self.cache.release_session("A"), 1)
+
+        self._insert([5, 6, 7, 8])
+        self._tag([5, 6, 7, 8], "B")
+        self.assertIsNone(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None))
 
 
 if __name__ == "__main__":
