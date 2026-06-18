@@ -458,6 +458,41 @@ class TestEntryPointDispatch(CustomTestCase):
             rtol=5e-2,
         )
 
+    def test_flashinfer_backend_matches_triton(self):
+        """FlashInfer SM120 sparse MLA decode matches Triton reference."""
+        try:
+            from flashinfer.sparse_mla_sm120 import (
+                BatchSparseMLAPagedAttentionWrapper,
+            )
+        except ImportError:
+            self.skipTest("FlashInfer SM120 sparse MLA not available")
+
+        k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
+        q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
+        topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
+
+        kwargs = dict(
+            q=q,
+            k_cache=k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            attn_sink=None,
+            head_dim_v=_D,
+            softmax_scale=_D**-0.5,
+        )
+
+        with mock.patch.object(fmod, "_sm120_default_backend", "triton"):
+            out_triton, _ = flash_mla_with_kvcache_sm120(**kwargs)
+        with mock.patch.object(fmod, "_sm120_default_backend", "flashinfer"):
+            out_fi, _ = flash_mla_with_kvcache_sm120(**kwargs)
+
+        torch.testing.assert_close(
+            out_fi.to(torch.float32),
+            out_triton.to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
 
 if __name__ == "__main__":
     import sys
