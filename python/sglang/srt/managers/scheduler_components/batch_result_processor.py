@@ -722,8 +722,10 @@ class SchedulerBatchResultProcessor:
                     )
                 else:
                     # Spec V2: hidden_states is [bs * speculative_num_draft_tokens, hidden_dim].
+                    # One row per emitted token; next_token_id is already truncated
+                    # at grammar termination, so this stays aligned with output_ids.
                     stride = result.speculative_num_draft_tokens
-                    accept_len = result.num_correct_drafts_per_req_cpu[i] + 1
+                    accept_len = len(next_token_id)
                     start = i * stride
                     req.hidden_states.extend(
                         logits_output.hidden_states[start : start + accept_len]
