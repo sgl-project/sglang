@@ -107,11 +107,6 @@ class ServerArgsAutoTuner:
             components = (
                 self._deployment_config().auto_disable_component_offload_components
             )
-            if args._uses_ltx23_snapshot_two_stage_residency():
-                # ltx2 snapshot mode uses DiT offload to release/prefetch stage DiTs between phases
-                components = tuple(
-                    component for component in components if component != "dit"
-                )
             if (
                 args.dit_cpu_offload
                 and "dit" in components

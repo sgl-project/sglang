@@ -694,6 +694,12 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    # int8-compress radix-cached linear-attn (mamba) checkpoints -> ~2x cached
+    # prefixes at fixed memory (quality-safe; see mem_cache/mamba_checkpoint_pool.py).
+    enable_int8_mamba_checkpoint: bool = False
+    int8_mamba_ckpt_size: Optional[int] = (
+        None  # #int8 checkpoint slots; default 2x the active pool
+    )
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -1009,6 +1015,7 @@ class ServerArgs:
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
@@ -3375,6 +3382,28 @@ class ServerArgs:
                 raise ValueError(
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
+
+    def _handle_int8_mamba_checkpoint(self):
+        # The int8 mamba checkpoint pool is only wired into the built-in
+        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # --enable-hierarchical-cache) and custom radix-cache backends are NOT
+        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
+        # (wrong pool / out-of-range). Reject the combination up front rather than
+        # silently corrupting state.
+        if not self.enable_int8_mamba_checkpoint:
+            return
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported together with "
+                "--enable-hierarchical-cache: the host-offload path "
+                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+            )
+        if self.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint only supports the built-in mamba "
+                f"radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
+                "is not int8-aware. Omit --radix-cache-backend."
+            )
 
     def _handle_linear_attn_backend(self):
         import torch
@@ -6443,6 +6472,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_mamba_cache_size,
             help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--enable-int8-mamba-checkpoint",
+            action="store_true",
+            help="Store radix-cached linear-attn (mamba) states in int8 (separate "
+            "checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        )
+        parser.add_argument(
+            "--int8-mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.int8_mamba_ckpt_size,
+            help="Number of int8 mamba checkpoint slots (default: 2x the active "
+            "mamba pool size).",
         )
         parser.add_argument(
             "--mamba-ssm-dtype",
