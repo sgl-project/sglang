@@ -62,7 +62,7 @@ dependencies = [
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
   "sgl-deep-gemm==0.1.3",
-  "sglang-kernel==0.4.3",
+  "sglang-kernel==0.4.4",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.8",
