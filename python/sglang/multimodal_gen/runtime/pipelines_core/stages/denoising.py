@@ -115,6 +115,13 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
+
+
 @dataclass(slots=True)
 class DenoisingContext:
     """Loop-scoped state shared across the denoising skeleton and its hooks."""
@@ -1844,8 +1851,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
-            return self._bcg_run(runner, call_kwargs, current_model)
-        return current_model(**call_kwargs)
+            model_output = self._bcg_run(runner, call_kwargs, current_model)
+        else:
+            model_output = current_model(**call_kwargs)
+        return _ensure_tensor_model_output(model_output)
 
     @staticmethod
     def _bcg_is_warmup() -> bool:
