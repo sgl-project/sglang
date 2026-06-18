@@ -51,7 +51,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
-    dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -445,6 +445,7 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
         self.attn_mqa = RadixAttention(
@@ -886,7 +887,9 @@ class MQALayer(nn.Module):
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
                 not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+                or self.wo_b.use_dp_attention_reduce
+                or not is_dp_attention_enabled()
+            ), "short-circuiting cross-TP allreduce will lead to hangs"
             return x
 
         attn_backend = get_attn_backend()
@@ -1529,7 +1532,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -1700,7 +1703,7 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
