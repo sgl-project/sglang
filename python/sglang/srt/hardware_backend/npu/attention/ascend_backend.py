@@ -376,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
         """Check if TND layout is supported."""
         d = layer.qk_head_dim
         v = layer.v_head_dim
-        return (d == v and d in (128, 192)) or (d == 192 and v == 128)
+        return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
