@@ -29,6 +29,7 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.environ import envs
@@ -47,10 +48,15 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
+from sglang.srt.layers.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
+    attn_tp_all_reduce,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
@@ -61,7 +67,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import mhc_fused_post_pre
+from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -128,6 +134,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+# NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
+# torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +304,12 @@ class MQALayer(nn.Module):
             if compress_ratio_override is not None
             else config.compress_ratios[layer_id]
         )
-        assert compress_ratio in [0, 4, 128]
+
+        assert compress_ratio in (
+            0,
+            4,
+            128,
+        ), f"V4 compress_ratio: expected one of (0, 4, 128), got {compress_ratio}"
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
@@ -317,11 +333,9 @@ class MQALayer(nn.Module):
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        assert self.compress_ratio in {0, 4, 128}
-        if self.compress_ratio:
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
-        else:
-            original_seq_len = 0
+        # YARN correction applies to ALL layers (dense and compressed share the same
+        # YARN-corrected inv_freq); only the rope base differs (rope_theta vs compress_rope_theta).
+        original_seq_len = rope_scaling["original_max_position_embeddings"]
 
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
@@ -354,7 +368,7 @@ class MQALayer(nn.Module):
 
         self.compressor = None
         self.indexer = None
-        if self.compress_ratio:
+        if self.compress_ratio in (4, 128):
             self.compressor = Compressor(
                 config,
                 layer_id=self.layer_id,
@@ -436,7 +450,8 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
+            and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -811,6 +826,33 @@ class MQALayer(nn.Module):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+        elif _is_npu:
+            q_lora = self.q_norm(q_lora)
+            q, _ = self.wq_b(q_lora)
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+
+            if qkv_a is not None:
+                kv = qkv_a[..., self.q_lora_rank :]
+            else:
+                kv, _ = self.wkv(x)
+            kv = self.kv_norm(kv)
+
+            v4_rope_inplace_npu(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions,
+            )
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
+            kv = None
+            if q_out is not None:
+                q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
@@ -879,9 +921,6 @@ class MQALayer(nn.Module):
         x_quant=None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = get_attn_backend()
@@ -1000,13 +1039,22 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        fused_rope_inplace(
-            o[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-            inverse=True,
-        )
+        if _is_npu:
+            v4_rope_inplace_npu(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions,
+                inverse=True,
+            )
+        else:
+            fused_rope_inplace(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
@@ -1034,6 +1082,8 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            o = attn_tp_all_reduce(o)
 
         return o
 
@@ -1233,6 +1283,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         norm: Optional[nn.Module] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
@@ -1247,6 +1298,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             return x_flat, mixes
 
         shape, dtype = x.size(), x.dtype
+
+        if _is_npu:
+            return npu_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                rms_norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                forward_batch=forward_batch,
+            )
 
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
@@ -1339,6 +1403,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
+        if _is_npu:
+            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
 
@@ -1412,6 +1479,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_scale,
                 self.hc_attn_base,
                 norm=self.input_layernorm,
+                forward_batch=forward_batch,
             )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
@@ -1482,6 +1550,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
                 norm=self.post_attention_layernorm,
+                forward_batch=forward_batch,
             )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1695,7 +1764,9 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Token ids are replicated within an attention-TP group. Use replicate
+            # gather here to avoid summing duplicated ids when attention_tp_size > 1.
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
@@ -1886,6 +1957,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
+
         return self.logits_processor(
             input_ids,
             hidden_states,
@@ -1930,7 +2002,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
-            if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
+            if (
+                self_attn.compress_ratio in (4, 128)
+                and not self_attn.compressor.ape_converted
+            ):
                 self_attn.compressor.apply_ape_hotfix()
             if (
                 self_attn.compress_ratio == 4
@@ -1941,7 +2016,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2339,8 +2416,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Hot weight reload (RL workflows). Use the device-agnostic module
+        # accessor so this works on both CUDA/HIP and NPU.
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
