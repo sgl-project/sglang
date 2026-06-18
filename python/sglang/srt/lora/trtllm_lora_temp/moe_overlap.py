@@ -56,14 +56,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp8_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -191,7 +189,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = fused_pack_topk(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -362,14 +360,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
@@ -463,7 +459,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+    packed_topk_ids = fused_pack_topk(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )
