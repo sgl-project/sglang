@@ -2415,6 +2415,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend = self._get_attention_backend()
 
+        # Record resolved per-mode backends on the backend for model dispatch.
+        self.attn_backend.prefill_attention_backend_str = (
+            self.prefill_attention_backend_str
+        )
+        self.attn_backend.decode_attention_backend_str = (
+            self.decode_attention_backend_str
+        )
+
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
@@ -2422,6 +2430,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.warning(
                 f"Overriding draft attention backend to {draft_attn_backend}."
             )
+            # Single backend for all draft modes (no prefill/decode split).
+            self.prefill_attention_backend_str = draft_attn_backend
+            self.decode_attention_backend_str = draft_attn_backend
             return self._get_attention_backend_from_str(
                 draft_attn_backend,
                 init_new_workspace=init_new_workspace,
@@ -2463,10 +2474,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_new_workspace=init_new_workspace,
             )
 
-        (
-            get_global_server_args().prefill_attention_backend,
-            get_global_server_args().decode_attention_backend,
-        ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
 
     def _get_attention_backend_from_str(
@@ -3285,6 +3292,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch_template=forward_batch,
         )
 
+    def _pp_kwargs(self, pp_proxy_tensors) -> dict:
+        """Build the pp_proxy_tensors forward kwarg, in one place.
+
+        Pipeline-parallel proxy tensors are threaded into model.forward only
+        when the model accepts them (``support_pp``).
+        """
+        return {"pp_proxy_tensors": pp_proxy_tensors} if self.support_pp else {}
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -3308,9 +3323,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
 
         # Launch forward
         ctx = (
@@ -3343,9 +3356,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
         # Setup extra arguments
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if (
@@ -3447,9 +3458,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend.forward_metadata = None
 
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})
             if self.device_timer
