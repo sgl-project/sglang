@@ -1827,6 +1827,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> bool:
         if not states:
             return False
+        if type(self)._run_denoising_step is not DenoisingStage._run_denoising_step:
+            return False
         if getattr(server_args, "enable_cfg_parallel", False):
             return False
 
