@@ -181,7 +181,7 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_adaln_lora = use_adaln_lora
-        self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.layer_norm = LayerNormScaleShift(hidden_size, eps=1e-6)
         patch_dim = spatial_patch_size**2 * temporal_patch_size * out_channels
         self.linear = nn.Linear(hidden_size, patch_dim, bias=False)
         modulation_out_dim = self.NUM_ADALN_CHUNKS * hidden_size
@@ -210,7 +210,7 @@ class FinalLayer(nn.Module):
             shift, scale = modulation.chunk(2, dim=-1)
         else:
             shift, scale = self.adaln_modulation(emb_).chunk(2, dim=-1)
-        x = self.layer_norm(x) * (1.0 + scale) + shift
+        x = self.layer_norm(x, shift, scale)
         return self.linear(x)
 
 

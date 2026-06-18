@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for the 4 OmniDreams performance optimizations.
+"""Unit tests for the 4 OmniDreams performance optimizations.
 
 Tests the correctness of:
 - T1: AdaLN fusion (LayerNormScaleShift replacing nn.LayerNorm + manual scale/shift)
@@ -7,12 +7,16 @@ Tests the correctness of:
 - T3: KV-cache split-copy (no .clone(), correct overlapping-region handling)
 - T4: Text encoder cache (LRU hit/miss, eviction, CPU storage)
 
-All tests are CPU-only; no checkpoint or GPU required.
+No checkpoint required. Most tests are CPU-only; the T1 AdaLN-fusion forward
+checks drive LayerNormScaleShift's fused CuTe/Triton kernel, which is CUDA-only
+(production runs uniformly on cuda; the CPU eager path is not a supported
+target), so they run on the platform device and skip when no GPU is present.
 """
 
 import types
 from collections import OrderedDict
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
@@ -22,19 +26,26 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
     apply_rope_freqs,
 )
 
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="LayerNormScaleShift's fused kernel runs on the platform (GPU) device",
+)
 
 # ============================================================================
 # T1: AdaLN Fusion -- LayerNormScaleShift correctness
 # ============================================================================
 
+
+@requires_gpu
 def test_adaln_fusion_matches_old_pattern():
     """LayerNormScaleShift(x, shift, scale) == norm(x) * (1+scale) + shift."""
     torch.manual_seed(0)
     x_dim = 2048
     B, L = 2, 128
-    x = torch.randn(B, L, x_dim)
-    shift = torch.randn(B, 1, x_dim)
-    scale = torch.randn(B, 1, x_dim)
+    x = torch.randn(B, L, x_dim, device=_DEVICE)
+    shift = torch.randn(B, 1, x_dim, device=_DEVICE)
+    scale = torch.randn(B, 1, x_dim, device=_DEVICE)
 
     # Fused path
     fused = LayerNormScaleShift(x_dim, eps=1e-6)
@@ -48,15 +59,16 @@ def test_adaln_fusion_matches_old_pattern():
     assert diff < 1e-5, f"Fused vs manual mismatch: {diff}"
 
 
+@requires_gpu
 def test_adaln_fusion_handles_varied_shapes():
     """LayerNormScaleShift works for single-batch, single-token, and batched inputs."""
     torch.manual_seed(0)
     fused = LayerNormScaleShift(2048, eps=1e-6)
 
     for B, L in [(1, 1), (1, 256), (4, 128), (8, 64)]:
-        x = torch.randn(B, L, 2048)
-        shift = torch.randn(B, 1, 2048)
-        scale = torch.randn(B, 1, 2048)
+        x = torch.randn(B, L, 2048, device=_DEVICE)
+        shift = torch.randn(B, 1, 2048, device=_DEVICE)
+        scale = torch.randn(B, 1, 2048, device=_DEVICE)
         out = fused(x, shift, scale)
         assert out.shape == (B, L, 2048)
         assert torch.isfinite(out).all()
