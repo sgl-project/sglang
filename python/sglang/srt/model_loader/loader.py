@@ -787,6 +787,14 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        # Used in test_online_quantization.py to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory after loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}",
+            )
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
