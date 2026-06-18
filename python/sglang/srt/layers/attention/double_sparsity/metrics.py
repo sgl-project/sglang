@@ -1,0 +1,307 @@
+"""Prometheus metrics + per-request meta_info for Double Sparsity.
+
+All metric names live under the ``sglang_double_sparsity_*`` namespace per
+(deliberately distinct from any ``sglang_hisparse_*`` namespace,
+because DS is standalone).
+
+Surfaces:
+
+* ``sglang_double_sparsity_channel_mask_valid`` — Gauge per rank, ``1`` once
+  the channel mask file has been loaded and validated, ``0`` otherwise.
+* ``sglang_double_sparsity_dense_fallback_total`` — Counter; ``0`` in
+  healthy runs. Fault-injection paths in tests can drive this without
+  introducing a production fallback.
+* ``sglang_double_sparsity_selected_tokens_sum`` — Counter accumulating the
+  count of tokens selected across batches; pair with ``_count`` for the per-
+  batch average. (After the AC-0 token-level rotation; the older
+  ``selected_pages_*`` names were misleading because the unit is tokens.)
+* ``sglang_double_sparsity_selected_tokens_count`` — Counter incrementing
+  once per (request, layer, step) selection call.
+* ``sglang_double_sparsity_sparsity_rate`` — Histogram of selected /
+  total-valid token ratios. Sampled per call.
+
+Per-request fields surfaced via :func:`meta_info_for_request`:
+
+* ``sparsity_rate``: float in ``[0, 1]``
+* ``selected_tokens``: int, count of selected tokens (was named
+  ``selected_pages`` pre-AC-0; renamed after the token-level rotation).
+* ``dense_fallback``: ``0`` healthy, ``1`` on fault-injected fallback
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+_METRIC_PREFIX = "sglang_double_sparsity"
+
+_lock = threading.Lock()
+_metrics_registered: bool = False
+_metric_objs: Dict[str, Any] = {}
+
+
+def _try_register() -> None:
+    """Lazy-register metrics with prometheus_client when first used.
+
+    SGLang's metrics infrastructure may or may not be active in any given
+    process (CLI tests, calibration scripts, etc.). The lazy path keeps the
+    selection hot path import-light.
+    """
+
+    global _metrics_registered
+    if _metrics_registered:
+        return
+    with _lock:
+        if _metrics_registered:
+            return
+        try:
+            from prometheus_client import Counter, Gauge, Histogram
+        except ImportError:
+            logger.debug(
+                "prometheus_client not available; Double Sparsity metrics are no-ops."
+            )
+            _metrics_registered = True
+            return
+
+        _metric_objs["channel_mask_valid"] = Gauge(
+            f"{_METRIC_PREFIX}_channel_mask_valid",
+            "1 once the Double Sparsity channel mask file has been loaded and validated.",
+        )
+        _metric_objs["dense_fallback_total"] = Counter(
+            f"{_METRIC_PREFIX}_dense_fallback_total",
+            "Number of decode steps that fell back to dense attention. 0 in healthy runs.",
+        )
+        _metric_objs["selected_tokens_sum"] = Counter(
+            f"{_METRIC_PREFIX}_selected_tokens_sum",
+            "Total count of tokens selected across all DS top-K calls.",
+        )
+        _metric_objs["selected_tokens_count"] = Counter(
+            f"{_METRIC_PREFIX}_selected_tokens_count",
+            "Number of DS top-K selection calls.",
+        )
+        _metric_objs["sparsity_rate"] = Histogram(
+            f"{_METRIC_PREFIX}_sparsity_rate",
+            "Selected-tokens / total-valid-tokens ratio per DS top-K call.",
+            buckets=(0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0),
+        )
+        _metrics_registered = True
+
+
+def mark_channel_mask_valid(valid: bool) -> None:
+    _try_register()
+    obj = _metric_objs.get("channel_mask_valid")
+    if obj is not None:
+        obj.set(1 if valid else 0)
+
+
+def increment_dense_fallback(n: int = 1) -> None:
+    _try_register()
+    obj = _metric_objs.get("dense_fallback_total")
+    if obj is not None and n > 0:
+        obj.inc(n)
+
+
+def record_selection(
+    *,
+    selected_tokens: int,
+    total_valid_tokens: int,
+) -> None:
+    """Record one DS top-K selection call.
+
+    ``selected_tokens`` is the number of non-padding entries in
+    ``selected_indices`` (which after the AC-0 rotation carries token
+    positions, not page indices). ``total_valid_tokens`` is the number
+    of currently-valid tokens in the request's KV window.
+    ``sparsity_rate`` is the ratio.
+    """
+
+    _try_register()
+    sps = _metric_objs.get("selected_tokens_sum")
+    cnt = _metric_objs.get("selected_tokens_count")
+    rate = _metric_objs.get("sparsity_rate")
+    if sps is not None:
+        sps.inc(int(selected_tokens))
+    if cnt is not None:
+        cnt.inc(1)
+    if rate is not None and total_valid_tokens > 0:
+        rate.observe(float(selected_tokens) / float(total_valid_tokens))
+
+
+@dataclass
+class DoubleSparsityRequestStats:
+    sparsity_rate: float  # pruned fraction: 1 - selected_tokens / total_tokens
+    selected_tokens: int
+    total_tokens: int
+    dense_fallback: int = 0
+
+
+def meta_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, Any]:
+    """Translate per-request DS stats into the dict surfaced via meta_info.
+
+    Caller wires this into ``ScheduleBatch`` so the values appear in the
+    request's ``meta_info`` payload alongside existing fields. ``total_tokens``
+    is published EXPLICITLY (the true sequence length) so consumers do not have
+    to invert ``sparsity_rate`` (which is the pruned fraction, not selected/total).
+    """
+
+    return {
+        "sparsity_rate": float(stats.sparsity_rate),
+        "selected_tokens": int(stats.selected_tokens),
+        "total_tokens": int(stats.total_tokens),
+        "dense_fallback": int(stats.dense_fallback),
+    }
+
+
+def customized_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, Any]:
+    """Payload to drop into ``recv_obj.customized_info["double_sparsity"]``.
+
+    The tokenizer manager's ``customized_info`` hook (see
+    ``tokenizer_manager.py`` near line 1739) auto-surfaces arbitrary
+    k/v pairs into the request's ``meta_info``. Wiring this from the
+    scheduler is the least-invasive integration point and does not
+    require touching the central ``meta_info`` constructor.
+
+    Integration shape (one line in scheduler):
+
+        recv_obj.customized_info.setdefault({}).update({
+            "double_sparsity": customized_info_for_request(stats),
+        })
+    """
+
+    return meta_info_for_request(stats)
+
+
+def reset_for_testing() -> None:
+    """Clear registered metric state. Tests only.
+
+    Also unregisters the underlying collectors from the default
+    ``prometheus_client.REGISTRY`` so a subsequent ``_try_register()`` does
+    not raise ``ValueError: Duplicated timeseries``. The ``unregister`` call
+    is best-effort: ``KeyError`` is suppressed for collectors that were
+    never registered (e.g. when prometheus_client is unavailable).
+    """
+
+    global _metrics_registered
+    with _lock:
+        try:
+            from prometheus_client import REGISTRY
+        except ImportError:
+            REGISTRY = None
+        if REGISTRY is not None:
+            for obj in list(_metric_objs.values()):
+                try:
+                    REGISTRY.unregister(obj)
+                except KeyError:
+                    pass
+        _metric_objs.clear()
+        _metrics_registered = False
+
+
+# ---------------------------------------------------------------------------
+# Error taxonomy for DS production failures (Prometheus counter + log labels).
+# ---------------------------------------------------------------------------
+
+DS_ERROR_CLASSES = (
+    "bad_mask",
+    "bad_adapter_input",
+    "selector_runtime_error",
+    "rank_mismatch",
+)
+
+
+_DS_ERRORS_COUNTER = None
+
+
+def record_error(
+    cls: str,
+    *,
+    message: str = "",
+    request_id: str = "",
+    layer_id: Optional[int] = None,
+    selector_id: Optional[str] = None,
+) -> None:
+    """Record a DS production failure.
+
+    Increments `sglang_double_sparsity_errors_total{cls}` (best-effort
+    with `prometheus_client`) and emits a WARNING-level structured log
+    line. `layer_id` and `selector_id` are surfaced both in the log
+    message and as structured ``extra`` fields so operators can filter.
+    """
+    if cls not in DS_ERROR_CLASSES:
+        raise ValueError(
+            f"Unknown DS error class {cls!r}; must be one of {DS_ERROR_CLASSES!r}."
+        )
+    global _DS_ERRORS_COUNTER
+    try:
+        from prometheus_client import Counter as _Counter
+        if _DS_ERRORS_COUNTER is None:
+            try:
+                _DS_ERRORS_COUNTER = _Counter(
+                    "sglang_double_sparsity_errors_total",
+                    "Double Sparsity production failures by class.",
+                    ["cls"],
+                )
+            except ValueError:
+                _DS_ERRORS_COUNTER = None
+        if _DS_ERRORS_COUNTER is not None:
+            _DS_ERRORS_COUNTER.labels(cls=cls).inc()
+    except ImportError:
+        pass
+
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+    _logger.warning(
+        "double_sparsity error cls=%s request_id=%s layer_id=%s selector_id=%s message=%s",
+        cls,
+        request_id,
+        layer_id if layer_id is not None else "",
+        selector_id if selector_id is not None else "",
+        message,
+        extra={
+            "ds_error_cls": cls,
+            "ds_request_id": request_id,
+            "ds_layer_id": layer_id,
+            "ds_selector_id": selector_id,
+        },
+    )
+
+
+_TYPED_EXC_TO_CLASS = None
+
+
+def _resolve_typed_exc_to_class():
+    global _TYPED_EXC_TO_CLASS
+    if _TYPED_EXC_TO_CLASS is not None:
+        return _TYPED_EXC_TO_CLASS
+    from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+        DoubleSparsityChannelMaskCorrupt,
+        DoubleSparsityChannelMaskMissing,
+    )
+    from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+        DSAdapterError,
+    )
+    from sglang.srt.layers.attention.double_sparsity.selector import (
+        DoubleSparsityTPMisconfigured,
+    )
+
+    _TYPED_EXC_TO_CLASS = (
+        (DoubleSparsityChannelMaskMissing, "bad_mask"),
+        (DoubleSparsityChannelMaskCorrupt, "bad_mask"),
+        (DSAdapterError, "bad_adapter_input"),
+        (DoubleSparsityTPMisconfigured, "rank_mismatch"),
+    )
+    return _TYPED_EXC_TO_CLASS
+
+
+def classify_ds_exception(exc: BaseException) -> str:
+    """Map a DS typed exception to one of `DS_ERROR_CLASSES`. Unknown
+    exceptions fall through to ``"selector_runtime_error"``."""
+    for exc_cls, label in _resolve_typed_exc_to_class():
+        if isinstance(exc, exc_cls):
+            return label
+    return "selector_runtime_error"
+

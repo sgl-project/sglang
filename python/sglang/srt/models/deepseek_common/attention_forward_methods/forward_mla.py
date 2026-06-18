@@ -236,12 +236,14 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
-            # overlap q_b_proj and indexer during decode
+            # overlap q_b_proj and indexer during decode (NSA-only; DS must
+            # wait for q_b_proj to compute projected Q-noPE for selection)
             if (
                 self.alt_stream is not None
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
+                and not self.use_double_sparsity
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -276,19 +278,29 @@ class DeepseekMLAForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                # DS selector requires projected Q-noPE [bs, H, qk_nope_head_dim].
+                q_nope_for_ds = (
+                    q[..., : self.qk_nope_head_dim]
+                    if self.use_double_sparsity
+                    else None
+                )
                 if q_lora is not None:
                     # See the skip_topk note above: shared layers have no
                     # indexer weights, so this gate must not fall back to
-                    # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
+                    # computing when prev_topk_indices is None. DS selection is
+                    # per-step and must not be short-circuited by skip_topk reuse.
+                    if (
+                        self.use_double_sparsity
+                        or not self.skip_topk
+                        or (self.is_nextn and prev_topk_indices is None)
                     ):
-                        topk_indices = self.indexer(
+                        topk_indices = self._select_topk_indices(
                             x=hidden_states,
                             q_lora=q_lora,
                             positions=positions,
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
+                            q_nope=q_nope_for_ds,
                         )
                     else:
                         topk_indices = maybe_capture_indexer_topk(

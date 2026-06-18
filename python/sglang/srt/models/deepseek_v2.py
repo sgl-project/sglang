@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1639,6 +1641,46 @@ class DeepseekV2AttentionMLA(
                     else:
                         self.next_skip_topk = False
 
+        self.double_sparsity_selector = None
+        self.use_double_sparsity = False
+        if self.use_dsa:
+            _global_server_args = get_global_server_args()
+            if getattr(_global_server_args, "enable_double_sparsity", False):
+                from sglang.srt.layers.attention.double_sparsity import (
+                    DoubleSparsityConfig,
+                    DoubleSparsitySelector,
+                    parse_double_sparsity_config,
+                )
+
+                ds_config_raw = getattr(
+                    _global_server_args, "double_sparsity_config", None
+                )
+                if ds_config_raw is None:
+                    raise ValueError(
+                        "--enable-double-sparsity requires --double-sparsity-config; "
+                        "the server-args validator should have rejected this earlier."
+                    )
+                ds_parsed: DoubleSparsityConfig = parse_double_sparsity_config(
+                    ds_config_raw
+                )
+                self.double_sparsity_selector = DoubleSparsitySelector(
+                    config=ds_parsed,
+                    num_local_heads=self.num_local_heads,
+                    head_dim=self.qk_head_dim,
+                )
+                self.use_double_sparsity = True
+                # Store bind args; actual table allocation deferred to
+                # finalize_double_sparsity_bind() which is called after
+                # ModelRunner.init_memory_pool() so that max_tokens comes
+                # from req_to_token_pool.size, not device_buffer_size.
+                self._ds_deferred_bind_args = dict(
+                    server_args=_global_server_args,
+                    ds_parsed=ds_parsed,
+                    config=config,
+                    attn_tp_rank=attn_tp_rank,
+                    attn_tp_size=attn_tp_size,
+                )
+
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1819,6 +1861,12 @@ class DeepseekV2AttentionMLA(
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
+        # Decode runs on attn_mqa (the absorbed MQA path), which — unlike
+        # attn_mha — was never given kv_b_proj. Attach it on attn_mqa too so the
+        # DS decode layer has the same projection in scope as attn_mha (DS-only;
+        # leaves non-DS behavior unchanged).
+        if self.use_double_sparsity and getattr(self.attn_mqa, "kv_b_proj", None) is None:
+            self.attn_mqa.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
@@ -1929,6 +1977,820 @@ class DeepseekV2AttentionMLA(
             return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
+
+    def finalize_double_sparsity_bind(self) -> None:
+        """Complete DS selector binding using the real KV pool (post-pool-init).
+
+        Called by ModelRunner after init_memory_pool() so that
+        ``max_tokens = req_to_token_pool.size`` rather than ``device_buffer_size``.
+        Idempotent: no-op if already bound or DS not enabled.
+        """
+        if not self.use_double_sparsity:
+            return
+        args = getattr(self, "_ds_deferred_bind_args", None)
+        if args is None:
+            return
+        self._bind_double_sparsity_runtime_data(**args)
+        self._ds_deferred_bind_args = None
+
+    def _bind_double_sparsity_runtime_data(
+        self,
+        *,
+        server_args,
+        ds_parsed,
+        config,
+        attn_tp_rank: int,
+        attn_tp_size: int,
+    ) -> None:
+        """Wire the DS selector out of placeholder mode.
+
+        Reads the validator-loaded channel mask off ``server_args``,
+        slices it for this rank's heads, builds the bind-time absorbed-latent
+        projection, calls ``bind_runtime_data`` exactly once, and runs the
+        TP-misconfig fail-fast check. After this method returns, the selector
+        reports ``IS_PLACEHOLDER == False``.
+        """
+        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            slice_per_rank,
+            verify_bind_shapes,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selector import (
+            assert_tp_configured,
+        )
+
+        full_mask = getattr(server_args, "_double_sparsity_channel_mask", None)
+        if full_mask is None:
+            # The validator loads the mask before attention construction; if it
+            # is missing the validator should have raised. Surface as a typed
+            # error class for consistency with the other startup errors.
+            raise RuntimeError(
+                "Double Sparsity attention init: server_args has no "
+                "_double_sparsity_channel_mask. validate_double_sparsity must "
+                "run before model construction."
+            )
+
+        # Authoritative shape gate: the attention layer is now constructed, so
+        # its per-head no-PE width (qk_nope_head_dim) and head/layer counts are
+        # final. Reject a mask calibrated for a different model shape here with a
+        # diagnostic naming every offending field, rather than letting an in-range
+        # but wrong-width channel selection silently score the wrong channels.
+        # This runs only on the explicit Double Sparsity path; native attention
+        # never reaches it.
+        tp_size = max(attn_tp_size, 1)
+        num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
+        verify_bind_shapes(
+            full_mask,
+            model_nope_head_dim=int(self.qk_nope_head_dim),
+            num_local_heads=int(self.num_local_heads),
+            tp_size=tp_size,
+            num_hidden_layers=num_hidden_layers,
+            server_page_size=int(ds_parsed.page_size),
+            server_label_dim=int(full_mask.label_dim),
+            server_kv_cache_dtype=getattr(server_args, "kv_cache_dtype", None),
+        )
+        logger.info(
+            "double_sparsity bind shape check passed (layer %d, tp_rank %d): "
+            "qk_nope_head_dim=%d qk_rope_head_dim=%d v_head_dim=%d "
+            "kv_lora_rank=%d num_local_heads=%d layers=%d page_size=%d "
+            "label_dim=%d head_dim=%d kv_dtype=%s",
+            self.layer_id,
+            attn_tp_rank,
+            int(self.qk_nope_head_dim),
+            int(self.qk_rope_head_dim),
+            int(self.v_head_dim),
+            int(self.kv_lora_rank),
+            int(self.num_local_heads),
+            num_hidden_layers,
+            int(ds_parsed.page_size),
+            int(full_mask.label_dim),
+            int(full_mask.head_dim),
+            getattr(server_args, "kv_cache_dtype", None),
+        )
+
+        # Per-rank head slice of the calibrated mask. Production safe even at
+        # attn_tp_size == 1 because slice_per_rank accepts tp_size=1.
+        local_mask = slice_per_rank(
+            full_mask,
+            num_local_heads=self.num_local_heads,
+            rank=attn_tp_rank,
+            tp_size=max(attn_tp_size, 1),
+        )
+
+        # AC-12 sensitivity gate: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1
+        # replaces the calibrated channel selection with a deterministically
+        # random one drawn uniformly from [0, head_dim). Used to verify the
+        # NIAH @ 64K negative sensitivity assertion (recall must drop > 20 pp).
+        # Weights and dtype/device are preserved so only the selection
+        # changes. Logged once per (process, layer) so an operator cannot
+        # leave it on by accident.
+        if os.getenv("SGLANG_DS_FAULT_INJECT_CORRUPT_MASK") == "1":
+            from dataclasses import replace as _replace
+            sel = local_mask.channel_selection
+            # Deterministic per-layer seed: layer_id keeps each layer
+            # consistent across restarts but lets layers diverge.
+            gen = torch.Generator(device=sel.device).manual_seed(self.layer_id)
+            head_dim = int(local_mask.head_dim)
+            label_dim = int(sel.shape[-1])
+            if label_dim <= head_dim:
+                # Sample without replacement per (layer, head) row.
+                L, H, _ = sel.shape
+                rows = []
+                for _ in range(L * H):
+                    perm = torch.randperm(head_dim, generator=gen, device=sel.device)
+                    rows.append(perm[:label_dim])
+                corrupted = (
+                    torch.stack(rows, dim=0).view(L, H, label_dim).to(sel.dtype)
+                )
+            else:
+                corrupted = torch.randint(
+                    low=0, high=head_dim, size=sel.shape,
+                    generator=gen, device=sel.device, dtype=sel.dtype,
+                )
+            local_mask = _replace(local_mask, channel_selection=corrupted)
+            logger.warning(
+                "double_sparsity: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1 — "
+                "channel_selection for layer %d was randomly permuted; "
+                "NIAH @ 64K is expected to drop > 20 pp.",
+                self.layer_id,
+            )
+
+        # Publish the channel selection + no-PE head width on server_args. The
+        # selector's KV-write hook marks slots through _ds_channel_selection, and
+        # the DSA backend derives the absorbed scratch label_dim from it (without
+        # this publish the backend reads ds_label_dim=0 and never allocates the
+        # absorbed scratch). The mask loads on CPU but the absorbed scorer indexes
+        # GPU-resident tensors with it, so it must live on the selector's device.
+        setattr(
+            server_args,
+            "_ds_channel_selection",
+            local_mask.channel_selection.to(self.double_sparsity_selector.device),
+        )
+        setattr(server_args, "_ds_qk_nope_head_dim", self.qk_nope_head_dim)
+
+        # Pick the attn TP process group when world > 1; otherwise leave None.
+        # Also bind the coordinator's custom-all-reduce communicator so the
+        # score reduce can take the custom-AR path when the byte size is
+        # eligible (under plain TP the attention-TP group IS the TP
+        # coordinator); the raw process group stays the fallback transport.
+        process_group = None
+        reduce_ca = None
+        if attn_tp_size > 1:
+            try:
+                from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+                _attn_tp_group = get_attention_tp_group()
+                process_group = _attn_tp_group.device_group
+                reduce_ca = getattr(_attn_tp_group, "ca_comm", None)
+                if reduce_ca is not None and getattr(reduce_ca, "disabled", True):
+                    reduce_ca = None
+                if reduce_ca is not None:
+                    # Pin the DS score reduce to two-shot via a per-call
+                    # override: the summation order is part of the selection
+                    # exactness contract, and compact score buffers would
+                    # otherwise flip to one-shot below the size threshold.
+                    # Only this wrapper is pinned — the communicator and all
+                    # default model collectives keep size-based selection.
+                    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                        PinnedDSScoreReduceCA,
+                    )
+
+                    reduce_ca = PinnedDSScoreReduceCA(reduce_ca)
+            except Exception:
+                process_group = None
+                reduce_ca = None
+
+        # Absorbed-latent projection: build the bind-time W_UK rows the selector
+        # scores the resident latent through. Built BEFORE the bind because
+        # bind_runtime_data requires it to already be installed. The block-fp8
+        # kv_b_proj is dequantized with the SAME semantics as the model's own
+        # w_kc extraction (deepseek_weight_loader): weight_scale (or
+        # weight_scale_inv) + the [128, 128] weight block size.
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+            build_absorbed_projection,
+        )
+
+        kv_b_weight = self.kv_b_proj.weight
+        weight_scale_inv = None
+        weight_block_size = None
+        if kv_b_weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            weight_scale_inv = getattr(self.kv_b_proj, "weight_scale", None)
+            if weight_scale_inv is None:
+                weight_scale_inv = getattr(self.kv_b_proj, "weight_scale_inv", None)
+            weight_block_size = [128, 128]
+        # channel_selection is [num_layers, H, label_dim]; the score path slices
+        # [layer_id], so the bind-time projection must use THIS layer's slice to
+        # match.
+        self.double_sparsity_selector.absorbed_w_sel = build_absorbed_projection(
+            kv_b_weight,
+            num_heads=self.num_local_heads,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            v_head_dim=self.v_head_dim,
+            channel_selection=local_mask.channel_selection[self.layer_id],
+            weight_scale_inv=weight_scale_inv,
+            weight_block_size=weight_block_size,
+        )
+
+        self.double_sparsity_selector.bind_runtime_data(
+            channel_mask=local_mask,
+            process_group=process_group,
+            reduce_ca=reduce_ca,
+        )
+        assert_tp_configured(
+            self.double_sparsity_selector, tp_world_size=max(attn_tp_size, 1)
+        )
+
+    def _publish_ds_request_summary(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        error_count: int,
+        layer_id: int,
+    ) -> None:
+        """Publish per-row DS stats onto ``forward_batch.ds_per_request_summary``.
+
+        The scheduler reads this side-channel into ``Req.per_request_summary``
+        so the tokenizer surfaces a single dict per request in
+        ``meta_info["double_sparsity"]``. Stores the latest layer's
+        snapshot (last layer's stats win the per-request summary).
+        """
+        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
+        from sglang.srt.layers.attention.double_sparsity.metrics import (
+            meta_info_for_request,
+        )
+
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is None:
+            return
+        bs = int(valid_lengths.shape[0])
+        # CPU copy: this side-channel is a host-side scalar publication,
+        # not a hot-path tensor; one .tolist() per layer per batch.
+        vl_cpu = valid_lengths.detach().to("cpu").tolist()
+        sl_cpu = seq_lens.detach().to("cpu").tolist()
+
+        if error_count > 0:
+            _ds_metrics.record_error(
+                "bad_adapter_input",
+                message=f"{error_count} bad req_pool_indices in batch at layer {layer_id}",
+                layer_id=layer_id,
+                selector_id=f"layer{layer_id}",
+            )
+
+        # After the AC-0 token-level rotation the selector emits TOKEN
+        # positions, not pages — so the sparsity denominator is the
+        # sequence length in tokens, not (seq_len + page_size - 1) // page_size.
+        records: List[Optional[Dict[str, Any]]] = []
+        for b in range(bs):
+            selected_tokens = int(vl_cpu[b])
+            total_tokens = max(1, int(sl_cpu[b]))
+            stats = SimpleNamespace(
+                sparsity_rate=float(1.0 - selected_tokens / total_tokens),
+                selected_tokens=selected_tokens,
+                total_tokens=total_tokens,
+                dense_fallback=0,
+            )
+            records.append(meta_info_for_request(stats))
+
+        # Stash on forward_batch; the scheduler reads this when assembling
+        # BatchTokenIDOutput. We overwrite per layer; the last layer to
+        # publish wins (consistent with "latest snapshot per request").
+        summary = getattr(forward_batch, "ds_per_request_summary", None)
+        if summary is None:
+            summary = {}
+            setattr(forward_batch, "ds_per_request_summary", summary)
+        summary["double_sparsity"] = records
+
+    def _select_topk_indices(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+        q_nope: Optional[torch.Tensor] = None,
+    ):
+        """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
+
+        Both branches return the same shape — a token-level ``topk_indices``
+        ``int32 [bs, max_top_k]`` tensor (or ``None`` when the NSA backend
+        skips selection for this batch). The caller (``forward_absorb_*``)
+        treats the return uniformly and the downstream
+        ``transform_index_page_table_decode`` runs on both paths without
+        any isinstance dispatch.
+
+        When ``self.use_double_sparsity`` is true the selector returns
+        token-level ``(selected_indices, valid_lengths)`` (logical positions);
+        the page-table adapter (``logical_to_physical``) converts them to
+        physical KV-cache slot indices via ``req_to_token`` gather so
+        the downstream FlashMLA sparse path is unchanged. See
+        :mod:`sglang.srt.layers.attention.double_sparsity.page_table_adapter`.
+        """
+
+        if self.use_double_sparsity:
+            from sglang.srt.layers.attention.double_sparsity.error_containment import (
+                try_run_ds_step,
+            )
+            from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+                logical_to_physical,
+            )
+            from sglang.srt.layers.attention.double_sparsity.selector import (
+                assert_real_selector_or_placeholder_allowed,
+            )
+
+            # Skip sparse selection during short-seq MHA-mode prefill.
+            # Read the MHA decision from the active ForwardContext backend —
+            # the same source handle_attention_dsa uses — not from ForwardBatch,
+            # which has no attn_backend field in production.
+            # Guarded by has_forward_context() so unit tests that do not publish
+            # a ForwardContext are unaffected (no bypass in that case).
+            from sglang.srt.layers.attention.tbo_backend import (
+                TboAttnBackend as _TboAttnBackend,
+            )
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend as _get_attn_backend,
+                has_forward_context as _has_forward_context,
+            )
+            if _has_forward_context():
+                _fc_backend = _get_attn_backend()
+                if isinstance(_fc_backend, _TboAttnBackend):
+                    _fc_backend = _fc_backend.primary
+                if hasattr(_fc_backend, "use_mha") and _fc_backend.use_mha:
+                    return None
+
+            req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+            req_to_token = (
+                req_to_token_pool.req_to_token
+                if req_to_token_pool is not None
+                else None
+            )
+            # Production ForwardBatch does not carry req_to_token_pool on the
+            # decode path, so resolve it from the ForwardContext-published
+            # attention backend (which caches model_runner.req_to_token_pool's
+            # map at init — see dsa_backend). Without this the selector falls
+            # into physical-domain mode and logical_to_physical is skipped
+            # (ds_out filled with -1), so DS decode attends to no tokens and
+            # the output degenerates while only the prompt slots ever score.
+            if req_to_token is None and _has_forward_context():
+                _rtt_backend = _get_attn_backend()
+                if isinstance(_rtt_backend, _TboAttnBackend):
+                    _rtt_backend = _rtt_backend.primary
+                req_to_token = getattr(_rtt_backend, "req_to_token", None)
+
+            def _run() -> torch.Tensor:
+                assert_real_selector_or_placeholder_allowed(
+                    self.double_sparsity_selector
+                )
+                # Invalidate newly-allocated slots before scoring so a reused
+                # physical KV slot cannot be selected based on the stale latent
+                # left by the previously-evicted request. The invalidation runs
+                # on the slot_written validity bitmap (resolved through the
+                # ForwardContext attention backend); the companion
+                # _write_token_labels mark later in dsa_backend.py restores
+                # written=True once the fresh KV write lands. In-place index write
+                # on the preallocated bitmap (graph-safe).
+                _out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+                if _out_cache_loc is not None and _has_forward_context():
+                    _sw_backend = _get_attn_backend()
+                    if isinstance(_sw_backend, _TboAttnBackend):
+                        _sw_backend = _sw_backend.primary
+                    _slot_written = getattr(_sw_backend, "_ds_slot_written", None)
+                    if _slot_written is not None:
+                        # Device-scalar RHS (not Python `False`) so the indexed
+                        # invalidate stays a pure device-side copy — a CPU `False`
+                        # would copy CPU->CUDA, illegal under CUDA-graph capture.
+                        _slot_false = getattr(
+                            _sw_backend, "_ds_slot_written_false", None
+                        )
+                        _slot_written[layer_id, _out_cache_loc.long()] = (
+                            _slot_false if _slot_false is not None else False
+                        )
+                # Use projected Q-noPE for DS selector when available; fall back
+                # to latent q_lora only for the placeholder path (unit tests).
+                queries_for_ds = q_nope if q_nope is not None else q_lora
+
+                # Allocation-free graph-safe path: when the DSA backend has
+                # preallocated ds_graph_state and the selector is bound on
+                # CUDA, route through retrieve_topk_graph_safe (Triton kernel +
+                # in-place topk pipeline). The captured graph stays 0-alloc
+                # after warmup.
+                #
+                # Source-of-truth resolution mirrors the AC-7 MHA bypass above:
+                #   (1) `forward_batch.ds_graph_state` — set by
+                #       `dsa_backend.init_forward_metadata` for dynamic
+                #       non-graph forwards. Production ForwardBatch has no
+                #       `attn_backend` field so this is the eager source.
+                #   (2) `ForwardContext`-published `attn_backend
+                #       .forward_metadata.ds_graph_state` — for the CUDA-graph
+                #       capture/replay path, where the capture initializer
+                #       gets no `forward_batch`.
+                _selector = self.double_sparsity_selector
+                _seq_lens = getattr(forward_batch, "seq_lens", None)
+                _sparse_mask = getattr(forward_batch, "sparse_mask", None)
+                # Resolve `_dsa_metadata` from the active ForwardContext
+                # whenever possible, so both `_ds_graph_state` AND
+                # `ds_topk_indices_out` can fall back to it during CUDA-graph
+                # capture/replay (where the capture-time `ForwardBatch` is
+                # constructed without DS fields — see cuda_graph_runner.py).
+                _dsa_metadata = None
+                if _has_forward_context():
+                    _fc_backend2 = _get_attn_backend()
+                    if isinstance(_fc_backend2, _TboAttnBackend):
+                        _fc_backend2 = _fc_backend2.primary
+                    _dsa_metadata = getattr(
+                        _fc_backend2, "forward_metadata", None
+                    )
+                _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
+                if _ds_graph_state is None and _dsa_metadata is not None:
+                    _ds_graph_state = getattr(
+                        _dsa_metadata, "ds_graph_state", None
+                    )
+                # All non-learned selector variants ride the graph-safe path —
+                # head_agg (mean) in the absorbed score kernel and anchor_mode
+                # (recency/global/strided) as a tensorized post-topK force-include
+                # in retrieve_topk_graph_safe — so ds_scorer_is_graph_safe() is
+                # True and nothing here forces eager. The SGLANG_DS_FORCE_EAGER_SELECT
+                # env escape hatch is retained for debugging. Config-borne flags
+                # reach the TP workers.
+                from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                    ds_scorer_is_graph_safe as _ds_scorer_is_graph_safe,
+                )
+
+                # NOTE: the recall-oracle diagnostic does NOT force eager. It must
+                # ride the production graph-safe path; recall_oracle is threaded
+                # into retrieve_topk_graph_safe below instead.
+                _force_eager_select = (
+                    os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
+                    or not _ds_scorer_is_graph_safe(getattr(_selector, "config", None))
+                )
+                # Graph-safe selection requires BOTH the bind-time absorbed
+                # projection AND the preallocated absorbed scratch (v_h /
+                # weighted-query / int64 mask / fp32 query cast) — without them the
+                # graph-safe path would route through the allocating fallback, so
+                # insist on all of them here so the missing-scratch case fails
+                # closed below instead of allocating.
+                _has_selector_state = (
+                    _selector.absorbed_w_sel is not None
+                    and _ds_graph_state is not None
+                    and _ds_graph_state.scratch_absorbed_v is not None
+                    and _ds_graph_state.scratch_absorbed_qsel is not None
+                    and _ds_graph_state.scratch_absorbed_sel_i64 is not None
+                    and _ds_graph_state.scratch_absorbed_q is not None
+                )
+                _use_graph_safe = (
+                    not _force_eager_select
+                    and _ds_graph_state is not None
+                    and _ds_graph_state.scratch_scores is not None
+                    and _has_selector_state
+                    and _selector.channel_mask is not None
+                    and queries_for_ds.device.type == "cuda"
+                    and _seq_lens is not None
+                    and req_to_token is not None
+                )
+                if _use_graph_safe:
+                    from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+                        radix_topk_scratch as _radix_topk_scratch,
+                    )
+                    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                        retrieve_topk_graph_safe,
+                    )
+
+                    _bs = int(forward_batch.req_pool_indices.shape[0])
+                    _max_seq_len = _ds_graph_state.max_seq_len
+                    if _max_seq_len <= 0:
+                        _max_seq_len = int(req_to_token.shape[1])
+
+                    # Production `req_pool_indices` is int64
+                    # (schedule_batch / cuda_graph_runner). The captured
+                    # selector region requires int32. copy_() casts
+                    # int64 → int32 in-place against pre-allocated
+                    # scratch (no new allocation per call).
+                    _rpi_scratch = _ds_graph_state.scratch_req_pool_indices[:_bs]
+                    _rpi_scratch.copy_(forward_batch.req_pool_indices)
+                    # Prefer `DSAMetadata.cache_seqlens_int32` when the
+                    # metadata-owned int32 view is available; otherwise
+                    # copy_() into the `scratch_seq_lens` int32 view.
+                    _seq_lens_i32 = None
+                    if _dsa_metadata is not None:
+                        _seq_lens_i32 = getattr(
+                            _dsa_metadata, "cache_seqlens_int32", None
+                        )
+                        if _seq_lens_i32 is not None:
+                            _seq_lens_i32 = _seq_lens_i32[:_bs]
+                    if _seq_lens_i32 is None:
+                        _seq_lens_i32 = _ds_graph_state.scratch_seq_lens[:_bs]
+                        _seq_lens_i32.copy_(_seq_lens)
+
+                    # Resident fp8-latent read for the absorbed scorer: the
+                    # RETURNED top-K is the absorbed selection. Read this layer's
+                    # fp8 nope latent + per-128-block scales off the MLA KV pool.
+                    _absorbed_latent_fp8 = None
+                    _absorbed_latent_scales = None
+                    if _selector.absorbed_w_sel is not None:
+                        from sglang.srt.model_executor.forward_context import (
+                            get_token_to_kv_pool as _get_token_to_kv_pool,
+                        )
+
+                        if _has_forward_context():
+                            _kv_pool = _get_token_to_kv_pool()
+                            # Raw uint8 KV buffer for this layer: per-slot bytes are
+                            # [lora fp8 | nblk fp32 scales | rope] as written by the
+                            # pool's quantize_k_cache_separate. Slice the fp8 latent
+                            # and the per-128-block fp32 scales off those bytes (the
+                            # exact unpack the absorbed paged kernel consumes).
+                            _nope_u8 = _kv_pool.kv_buffer[
+                                layer_id - _kv_pool.start_layer
+                            ]
+                            _lora = int(_selector.absorbed_w_sel.shape[-1])
+                            _nblk = _lora // 128
+                            _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora].view(
+                                torch.float8_e4m3fn
+                            )
+                            _absorbed_latent_scales = _nope_u8[
+                                :, 0, _lora : _lora + _nblk * 4
+                            ].view(torch.float32)
+
+                            # Table-free radix fixture: config-borne per-prompt-slot
+                            # resident-latent SHA dump (the absorbed-selection root
+                            # identity). Eager decode only; capture-safe no-op under
+                            # graph capture. Off by default (zero hot-path cost).
+                            if getattr(_selector.config, "latent_capture", False):
+                                from sglang.srt.layers.attention.double_sparsity.latent_capture import (
+                                    maybe_dump_latent_capture,
+                                )
+
+                                maybe_dump_latent_capture(
+                                    forward_batch=forward_batch,
+                                    latent_fp8=_absorbed_latent_fp8,
+                                    latent_scales=_absorbed_latent_scales,
+                                    req_to_token=req_to_token,
+                                    layer_id=layer_id,
+                                )
+
+                    # The validity `written` arg is the slot_written bitmap [L, T]
+                    # (the absorbed kernel masks unwritten slots to -inf via its
+                    # HAS_WRITTEN path). Fail closed if the bitmap is absent — a
+                    # missing guard would let a reused slot's stale latent be
+                    # selected.
+                    _sw_backend = None
+                    if _has_forward_context():
+                        _sw_backend = _get_attn_backend()
+                        if isinstance(_sw_backend, _TboAttnBackend):
+                            _sw_backend = _sw_backend.primary
+                    _written_arg = getattr(_sw_backend, "_ds_slot_written", None)
+                    if _written_arg is None:
+                        raise RuntimeError(
+                            "Double Sparsity requires the slot_written validity "
+                            "bitmap, but it is absent on the attention backend; a "
+                            "reused KV slot's stale latent could be selected. "
+                            "Ensure the DSA backend allocated _ds_slot_written."
+                        )
+                    retrieve_topk_graph_safe(
+                        queries=queries_for_ds,
+                        written=_written_arg,
+                        channel_selection=_selector.channel_mask.channel_selection,
+                        channel_weights=_selector.channel_mask.channel_weights,
+                        layer_id=layer_id,
+                        req_pool_indices=_rpi_scratch,
+                        req_to_token=req_to_token,
+                        seq_lens=_seq_lens_i32,
+                        max_seq_len=_max_seq_len,
+                        max_top_k=_selector.max_top_k,
+                        out_indices=_ds_graph_state.selected_indices,
+                        out_lengths=_ds_graph_state.valid_lengths,
+                        scratch_scores=_ds_graph_state.scratch_scores,
+                        scratch_topk_values=_ds_graph_state.scratch_topk_values,
+                        scratch_topk_indices=_ds_graph_state.scratch_topk_indices,
+                        scratch_invalid_mask=_ds_graph_state.scratch_invalid_mask,
+                        scratch_sorted_vals=_ds_graph_state.scratch_sorted_vals,
+                        scratch_boundary=_ds_graph_state.scratch_boundary,
+                        scratch_valid_i64=_ds_graph_state.scratch_valid_i64,
+                        # Compact selector variants score the [0, W) prefix;
+                        # width dispatch guarantees live rows fit, so a wider
+                        # mask's tail beyond W is dead by construction.
+                        per_request_valid=(
+                            _sparse_mask
+                            if _sparse_mask is None
+                            or _sparse_mask.shape[-1] <= _max_seq_len
+                            else _sparse_mask[:, :_max_seq_len]
+                        ),
+                        scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
+                        scratch_throwaway_idx=_ds_graph_state.scratch_throwaway_idx,
+                        scratch_scores_bf16=getattr(
+                            _ds_graph_state, "scratch_scores_bf16", None
+                        ),
+                        radix_topk_scratch=_radix_topk_scratch(_ds_graph_state),
+                        topk_block=getattr(_ds_graph_state, "topk_block", 1024),
+                        process_group=getattr(_selector, "process_group", None),
+                        reduce_ca=getattr(_selector, "reduce_ca", None),
+                        score_reduce_bf16=(
+                            getattr(_selector.config, "score_reduce_dtype", "bf16")
+                            == "bf16"
+                        ),
+                        recall_oracle=bool(
+                            getattr(_selector.config, "recall_oracle", False)
+                        ),
+                        score_capture=bool(
+                            getattr(_selector.config, "score_capture", False)
+                        ),
+                        scorer_norm=getattr(_selector.config, "scorer_norm", "off"),
+                        head_agg=getattr(_selector.config, "head_agg", "max"),
+                        anchor_mode=getattr(_selector.config, "anchor_mode", "off"),
+                        anchor_budget=getattr(_selector.config, "anchor_budget", 0),
+                        absorbed_latent_fp8=_absorbed_latent_fp8,
+                        absorbed_latent_scales=_absorbed_latent_scales,
+                        absorbed_w_sel=_selector.absorbed_w_sel,
+                        scratch_absorbed_v=getattr(
+                            _ds_graph_state, "scratch_absorbed_v", None
+                        ),
+                        scratch_absorbed_qsel=getattr(
+                            _ds_graph_state, "scratch_absorbed_qsel", None
+                        ),
+                        scratch_absorbed_sel_i64=getattr(
+                            _ds_graph_state, "scratch_absorbed_sel_i64", None
+                        ),
+                        scratch_absorbed_q=getattr(
+                            _ds_graph_state, "scratch_absorbed_q", None
+                        ),
+                    )
+                    selected_indices = _ds_graph_state.selected_indices[:_bs]
+                    valid_lengths = _ds_graph_state.valid_lengths[:_bs]
+                else:
+                    # Fail closed: the eager retrieve_topk fallback does not thread
+                    # the resident fp8 latent, so selection cannot score here.
+                    # Selection only runs through the graph-safe
+                    # retrieve_topk_graph_safe above (which reads the latent).
+                    raise RuntimeError(
+                        "Double Sparsity requires the graph-safe selector path "
+                        "(preallocated ds_graph_state + the resident fp8 latent); "
+                        "the eager retrieve_topk fallback is not wired for "
+                        "production selection."
+                    )
+                # Selection-capture mirrors (config-borne diagnostic): copy this
+                # layer's selection into the per-layer capture buffers. A device
+                # copy, so CUDA-graph capture records it and replay keeps the
+                # mirrors current; eager decode runs it directly. The model
+                # runner reads the mirrors after the forward returns.
+                _cap_idx = (
+                    getattr(_ds_graph_state, "capture_indices", None)
+                    if _ds_graph_state is not None
+                    else None
+                )
+                if _cap_idx is not None and layer_id < _cap_idx.shape[0]:
+                    _cap_bs = selected_indices.shape[0]
+                    _cap_k = min(selected_indices.shape[1], _cap_idx.shape[2])
+                    _cap_idx[layer_id, :_cap_bs, :_cap_k].copy_(
+                        selected_indices[:, :_cap_k]
+                    )
+                    _ds_graph_state.capture_lengths[layer_id, :_cap_bs].copy_(
+                        valid_lengths
+                    )
+                # AC-8: prefer the NSA-metadata-owned buffer, allocated
+                # once per batch in init_forward_metadata (also for
+                # capture/replay). Resolve from the same real production
+                # objects used for `ds_graph_state` above:
+                #   (1) forward_batch.ds_topk_indices_out — dynamic
+                #       non-graph forwards (set by
+                #       dsa_backend.init_forward_metadata).
+                #   (2) ForwardContext-published attention backend's
+                #       forward_metadata.ds_topk_indices_out — CUDA-graph
+                #       capture/replay path (no forward_batch field).
+                # Last resort: lazy `torch.empty_like` for CPU unit tests
+                # that synthesize `forward_batch` without either source.
+                ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
+                if ds_out is None and _dsa_metadata is not None:
+                    ds_out = getattr(_dsa_metadata, "ds_topk_indices_out", None)
+                bs = int(selected_indices.shape[0])
+                if ds_out is None:
+                    ds_out = torch.empty_like(selected_indices)
+                    setattr(forward_batch, "ds_topk_indices_out", ds_out)
+                elif ds_out.shape[0] != bs:
+                    ds_out = ds_out[:bs]
+                _rpi = getattr(forward_batch, "req_pool_indices", None)
+                if req_to_token is not None and _rpi is not None:
+                    _lp_err = (
+                        _ds_graph_state.lp_error_scratch
+                        if _ds_graph_state is not None
+                        else None
+                    )
+                    error_count = logical_to_physical(
+                        selected_indices=selected_indices,
+                        req_pool_indices=_rpi,
+                        req_to_token=req_to_token,
+                        out=ds_out,
+                        error_scratch=_lp_err,
+                    )
+                else:
+                    ds_out.fill_(-1)
+                    error_count = 0
+                # Skip the per-request CPU-side summary while CUDA capture
+                # is recording the stream; the host syncs (.to('cpu') and
+                # .item()) inside _publish_ds_request_summary are illegal
+                # during capture and not needed for the captured replay.
+                if not (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    self._publish_ds_request_summary(
+                        forward_batch=forward_batch,
+                        selected_indices=selected_indices,
+                        valid_lengths=valid_lengths,
+                        error_count=error_count,
+                        layer_id=layer_id,
+                    )
+                return ds_out
+
+            error_state: Dict[str, Any] = {}
+            # `record_error_on_failure=False`: the production
+            # batch-wrapper suppresses the cls-only counter increment
+            # here so the per-row loop below can emit exactly one
+            # record_error per affected row without overcounting.
+            ok, result = try_run_ds_step(
+                _run,
+                request_id="batch",
+                error_state=error_state,
+                layer_id=layer_id,
+                selector_id=f"layer{layer_id}",
+                record_error_on_failure=False,
+            )
+            if not ok:
+                # Non-row-level DS exception (selector RuntimeError /
+                # mask corruption / TP misconfig — anything raised before
+                # row tensors exist). Convert to per-row failure records
+                # so the scheduler aborts each affected request via the
+                # standard AC-9 abort path rather than crashing the batch.
+                error_cls = error_state.get("ds_error_cls", "selector_runtime_error")
+                error_message = error_state.get("ds_error_message", "")
+                bs = int(forward_batch.batch_size) if hasattr(
+                    forward_batch, "batch_size"
+                ) else 1
+                rids = getattr(forward_batch, "rids", None)
+                if rids is None:
+                    rids = getattr(forward_batch, "req_ids", None)
+                records: List[Optional[Dict[str, Any]]] = []
+                from sglang.srt.layers.attention.double_sparsity import (
+                    metrics as _ds_metrics,
+                )
+
+                for _b in range(bs):
+                    rid_str = (
+                        str(rids[_b])
+                        if rids is not None and _b < len(rids)
+                        else f"row{_b}"
+                    )
+                    records.append(
+                        {
+                            "sparsity_rate": 0.0,
+                            "selected_tokens": 0,
+                            "dense_fallback": 1,
+                            "error_class": error_cls,
+                            "error_message": error_message,
+                        }
+                    )
+                    # Per-row record_error: each affected request gets
+                    # its own counter increment + structured log line.
+                    # The earlier `try_run_ds_step` call already
+                    # incremented the counter once with `request_id="batch"`
+                    # — that's a defensive batch-level signal; the
+                    # per-row calls below give operators the actual
+                    # request IDs.
+                    _ds_metrics.record_error(
+                        error_cls,
+                        message=error_message,
+                        request_id=rid_str,
+                        layer_id=layer_id,
+                        selector_id=f"layer{layer_id}-row{_b}",
+                    )
+                summary = getattr(forward_batch, "ds_per_request_summary", None)
+                if summary is None:
+                    summary = {}
+                    setattr(forward_batch, "ds_per_request_summary", summary)
+                summary["double_sparsity"] = records
+
+                # Return an all-(-1) topk_indices so downstream consumers
+                # treat every row as "no selected pages" (the scheduler
+                # will abort them on the next collector pass).
+                max_top_k = self.double_sparsity_selector.max_top_k
+                return torch.full(
+                    (bs, max_top_k),
+                    -1,
+                    dtype=torch.int32,
+                    device=forward_batch.req_pool_indices.device
+                    if hasattr(forward_batch, "req_pool_indices") and forward_batch.req_pool_indices is not None
+                    else "cpu",
+                )
+            return result
+
+        return self.indexer(
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            return_indices=return_indices,
+        )
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch

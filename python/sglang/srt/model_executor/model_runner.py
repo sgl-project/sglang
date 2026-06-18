@@ -851,6 +851,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        # Bind DS attention selectors now that the KV pool is sized: the
+        # deferred bind computes max_tokens from the real req_to_token_pool
+        # instead of the provisional device buffer. Idempotent + DS-gated.
+        if getattr(self.server_args, "enable_double_sparsity", False):
+            for module in self.model.modules():
+                if hasattr(module, "finalize_double_sparsity_bind"):
+                    module.finalize_double_sparsity_bind()
+
         if self.enable_hisparse:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -3571,6 +3579,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
+            )
+
+        # Let a Double Sparsity attention backend publish the per-request DS
+        # summary host-side for models whose attention does not write it on the
+        # model path (e.g. GLM on the dsa backend) — runs every step for eager and
+        # graph decode; a no-op when DS is off or a model-side summary already exists.
+        _ds_publish = getattr(
+            self.attn_backend, "maybe_publish_ds_request_summary", None
+        )
+        if _ds_publish is not None:
+            _ds_publish(forward_batch)
+
+        # Copy Double Sparsity per-request summary side-channel from
+        # forward_batch onto the logits output so the scheduler's
+        # maybe_collect_per_request_summary picks it up. The DS attention
+        # path writes to forward_batch.ds_per_request_summary during
+        # _select_topk_indices.
+        ds_summary = getattr(forward_batch, "ds_per_request_summary", None)
+        if ds_summary is not None:
+            logits_out = getattr(output, "logits_output", None) or output
+            existing = getattr(logits_out, "per_request_summary", None)
+            if existing is None:
+                if hasattr(logits_out, "per_request_summary"):
+                    logits_out.per_request_summary = dict(ds_summary)
+            else:
+                existing.update(ds_summary)
+
+        # Selection-capture diagnostic dump (config-borne `selection_capture`
+        # in the DS config; off by default). Reads the per-layer selection
+        # mirrors the captured graph keeps current and writes one per-rank
+        # file per decode step. Early-returns when the mirrors are absent.
+        if getattr(self.server_args, "enable_double_sparsity", False):
+            from sglang.srt.layers.attention.double_sparsity.selection_capture import (
+                maybe_dump_selection_capture,
+            )
+
+            maybe_dump_selection_capture(
+                forward_batch, self.attn_backend, self.tp_rank
             )
 
         if self.eplb_manager is not None:

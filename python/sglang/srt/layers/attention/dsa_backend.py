@@ -20,6 +20,10 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+    DSGraphState,
+    allocate_graph_state,
+)
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
@@ -731,8 +735,22 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
         self.forward_metadata = metadata
+        if ds_topk_indices_out is not None:
+            # Expose the metadata-owned buffer on forward_batch so
+            # `_select_topk_indices` can write into it via `out=` without
+            # per-step allocation.
+            forward_batch.ds_topk_indices_out = ds_topk_indices_out
+        if ds_graph_state is not None:
+            # Same convention for the allocation-free graph-safe scratch.
+            # `ForwardBatch` is the only object both eager-decode and the
+            # dynamic non-graph forward path reliably see; the CUDA-graph
+            # capture path resolves this same field through ForwardContext
+            # (`get_attn_backend().forward_metadata.ds_graph_state`).
+            forward_batch.ds_graph_state = ds_graph_state
 
     def _cal_indexer_k_start_end(
         self,
@@ -819,6 +837,16 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # DS selector graph state is shared per SELECTOR WIDTH across all
+        # batch-size variants (allocated lazily at the first capture of each
+        # width, sized [max_bs, width]). Per-variant ownership would multiply
+        # the width-proportional scratch and capture mirrors by the ladder
+        # length (~15 GiB at the full ladder — a measured capture-OOM at
+        # mem-fraction 0.7). Sharing is safe: graphs alias the same buffers,
+        # only one graph replays at a time, and every replay fully rewrites
+        # the rows it reads.
+        self._ds_graph_max_bs: int = max_bs
+        self._ds_graph_state_by_width: Dict = {}
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1037,7 +1065,13 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata_key = self._ds_decode_metadata_key(bs)
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
+        if metadata.ds_graph_state is not None:
+            # Stamp the replay identity the selection-capture dump reads
+            # post-forward (host-only; see DSGraphState.last_replay_graph_key).
+            metadata.ds_graph_state.last_replay_graph_key = metadata_key
+            metadata.ds_graph_state.replay_prep_count += 1
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -1202,7 +1236,13 @@ class DeepseekSparseAttnBackend(
         """
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata_key = self._ds_decode_metadata_key(bs)
+        metadata = self.decode_cuda_graph_metadata[metadata_key]
+        if metadata.ds_graph_state is not None:
+            # Stamp the replay identity the selection-capture dump reads
+            # post-forward (host-only; see DSGraphState.last_replay_graph_key).
+            metadata.ds_graph_state.last_replay_graph_key = metadata_key
+            metadata.ds_graph_state.replay_prep_count += 1
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -1353,6 +1393,35 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    def _write_token_labels(
+        self,
+        layer,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Mark physical KV slots valid for selection after a KV-cache write.
+
+        The KV bytes for this layer/slot were just written by set_mla_kv_buffer
+        (the caller), so mark these physical slots valid: selection scores the
+        resident latent directly, and the slot-validity bitmap keeps a reused
+        physical slot's stale latent from being selected before its fresh KV
+        write lands. In-place index write on the preallocated bitmap (graph-safe
+        — no per-step allocation).
+
+        No-ops if DS is not enabled or the bitmap is unavailable.
+        ``k`` shape: ``[T, 1, kv_lora_rank]``.
+        """
+        if not self.enable_double_sparsity:
+            return
+        if self._ds_slot_written is not None:
+            # Device-scalar RHS (not Python `True`) so the indexed mark stays a
+            # pure device-side copy — a CPU `True` would copy CPU->CUDA, which
+            # is illegal under CUDA-graph capture.
+            self._ds_slot_written[layer.layer_id, cache_loc.long()] = (
+                self._ds_slot_written_true
+            )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1415,6 +1484,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
+                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1562,6 +1632,60 @@ class DeepseekSparseAttnBackend(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
+    def maybe_publish_ds_request_summary(self, forward_batch: ForwardBatch) -> None:
+        """Publish per-request DS selected-vs-total token counts onto
+        ``forward_batch.ds_per_request_summary["double_sparsity"]`` so the
+        scheduler/tokenizer surface ``meta_info["double_sparsity"]`` (the
+        per-request selected-vs-total token counts that prove sparse selection).
+
+        The DeepseekV2 model-side publisher only fires on its own attention; GLM
+        (``Glm4MoeAttention``) and any other model on this ``dsa`` backend never
+        reach it, so the per-request DS summary was absent for them. It cannot be
+        published from ``forward_decode`` either: decode runs under CUDA-graph
+        replay, where that Python never executes, and a per-step device→host read
+        of the selected page table would serialize the graph.
+
+        Instead derive it host-side, no GPU sync: the table-free selector's
+        contract is to keep ``min(top_k, valid_tokens)`` token positions, and for
+        decode ``valid_tokens`` is the sequence length, so
+        ``selected = min(ds_max_top_k, seq_len)`` exactly. ``total = seq_len``,
+        ``dense_fallback = 0`` (a sanitized row is aborted via the error-containment
+        seam, not surfaced as a completed-request stat). Called from the model
+        runner's post-forward transport, which runs every step for eager AND graph
+        decode. Decode-only; native-DSA / non-DS paths never reach this (DS gate),
+        and an existing model-side summary is not overwritten.
+        """
+        if not self.enable_double_sparsity:
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        if getattr(forward_batch, "ds_per_request_summary", None) is not None:
+            return
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return
+        from sglang.srt.layers.attention.double_sparsity.metrics import (
+            DoubleSparsityRequestStats,
+            meta_info_for_request,
+        )
+
+        top_k = int(self.ds_max_top_k)
+        records = []
+        for sl in seq_lens_cpu.tolist():
+            total = max(1, int(sl))
+            selected = min(top_k, total)
+            records.append(
+                meta_info_for_request(
+                    DoubleSparsityRequestStats(
+                        sparsity_rate=float(1.0 - selected / total),
+                        selected_tokens=selected,
+                        total_tokens=total,
+                        dense_fallback=0,
+                    )
+                )
+            )
+        forward_batch.ds_per_request_summary = {"double_sparsity": records}
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1614,6 +1738,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
+                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1653,6 +1778,20 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        # Opt-in lifted-budget decode (eager research path): the physical
+        # page_table_1 here is the wider lifted-width selection; attend it via
+        # the dequantized compact KV + flash_mla_sparse_fwd (no 2048 cap) instead
+        # of the default flashmla_kv. Default off => skipped (byte-identical).
+        if getattr(self, "ds_lifted_budget_decode", False):
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_lifted_budget(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1758,6 +1897,78 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
+    def _forward_lifted_budget(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Opt-in lifted-budget decode (graph-safe production path; eager fallback).
+
+        ``page_table_1`` is the wider lifted-width selection of PHYSICAL KV slots
+        (``[bs, lifted_budget_top_k]``, ``-1`` pads). Build the request-local
+        compact KV buffer (dequantizing the selected fp8 slots, or gathering bf16)
+        and attend it with ``flash_mla_sparse_fwd`` (no 2048 cap). The default
+        ``flashmla_kv`` path and its ``dsa_index_topk`` assert are untouched.
+
+        Graph path: when the metadata carries preallocated lifted scratch
+        (``DSGraphState.lifted_compact_kv``), use the FIXED-shape builder + the
+        alloc-free ``out=`` dequant into that scratch so the decode is alloc-free
+        under CUDA-graph capture. Eager fallback (non-graph runs): the dynamic
+        ``build_lifted_compact_kv``.
+        """
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_kv,
+            build_lifted_compact_kv_fixed,
+        )
+
+        bs, width = page_table_1.shape[0], page_table_1.shape[1]
+        fm = getattr(self, "forward_metadata", None)
+        gs = getattr(fm, "ds_graph_state", None) if fm is not None else None
+        lifted_kv = getattr(gs, "lifted_compact_kv", None) if gs is not None else None
+
+        if lifted_kv is not None:
+            # Graph-safe fixed-shape path into preallocated scratch (sliced to the
+            # captured bs/width — both fixed at capture).
+            out_ptf = gs.lifted_page_table[: bs * width]
+            out_ci = gs.lifted_compact_indices[:bs, :width]
+            out_vc = gs.lifted_valid_counts[:bs]
+            out_kv = gs.lifted_compact_kv[: bs * width]
+            valid_lengths = (page_table_1 >= 0).sum(dim=1)
+            build_lifted_compact_kv_fixed(
+                kv_cache,
+                page_table_1,
+                valid_lengths,
+                out_page_table=out_ptf,
+                out_compact_indices=out_ci,
+                out_compact_kv=out_kv,
+                store_is_fp8=self.dsa_kv_cache_store_fp8,
+                out_valid_counts=out_vc,
+            )
+            return self._forward_flashmla_sparse(
+                q_all=q_all,
+                kv_cache=out_kv,
+                page_table_1=out_ci,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+                q_pad_scratch=gs.lifted_q_padded,
+            )
+
+        compact_kv, compact_indices, _ = build_lifted_compact_kv(
+            kv_cache,
+            page_table_1,
+            store_is_fp8=self.dsa_kv_cache_store_fp8,
+        )
+        return self._forward_flashmla_sparse(
+            q_all=q_all,
+            kv_cache=compact_kv,
+            page_table_1=compact_indices,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+        )
+
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -1765,6 +1976,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        q_pad_scratch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -1783,9 +1995,16 @@ class DeepseekSparseAttnBackend(
                 f"TP size may be too large for this model."
             )
 
-            # Pad q to required size
-            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
-            q_padded[:, :num_heads, :] = q_all
+            if q_pad_scratch is not None:
+                # Alloc-free graph path: write real heads into preallocated scratch.
+                # The pad-head tail stays 0 (zero-allocated, never written), so the
+                # padded heads' (trimmed) output cannot perturb the real heads.
+                q_padded = q_pad_scratch[:num_tokens]
+                q_padded[:, :num_heads, :].copy_(q_all)
+            else:
+                # Pad q to required size (eager / non-graph path).
+                q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+                q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
             q_input = q_all
@@ -2101,6 +2320,9 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
+        # Preserve the original latent K before any FP8 quantization so that
+        # _write_token_labels receives the correct tensor regardless of dtype path.
+        k_for_labels = k
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -2134,6 +2356,9 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+            self._write_token_labels(
+                layer, cache_loc, k_for_labels, forward_batch=forward_batch
+            )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
@@ -2249,12 +2474,26 @@ class DeepseekSparseAttnBackend(
             device_sm = get_device_sm()
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            #
+            # Double Sparsity is dense-prefill / sparse-decode by design (classic DS
+            # only sparsifies the decode KV read; prefill attends densely). DSA's
+            # sparse MLA prefill path runs the per-decode-query selection, which is
+            # ill-defined for the per-extend-token prefill batch (it indexes the
+            # per-request req_pool_indices/seq_lens with a per-token batch -> bad
+            # indices -> CUDA illegal access for seq_len > the dense threshold). So
+            # for DS we keep the dense MHA prefill regardless of the length threshold
+            # (subject to the remaining feasibility checks); _select_topk_indices'
+            # use_mha branch then skips DS selection during prefill, and labels are
+            # still written via the MHA_ONE_SHOT _set_mla_kv_buffer hook.
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len
-                <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
+                and (
+                    self.enable_double_sparsity
+                    or max_kv_len
+                    <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+                )  # DS: dense prefill always; DSA: short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
@@ -2560,8 +2799,8 @@ class DeepseekSparseAttnMultiStepBackend:
 
 
 # Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata
+NativeSparseAttnBackend = DeepseekSparseAttnBackend
+NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+NSAMetadata = DSAMetadata
+NSAFlashMLAMetadata = DSAFlashMLAMetadata
+NSAIndexerMetadata = DSAIndexerMetadata
