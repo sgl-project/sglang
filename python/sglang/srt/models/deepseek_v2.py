@@ -47,9 +47,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -72,13 +70,6 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -141,6 +132,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -170,6 +162,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -393,9 +386,17 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            M, N = gate_up.shape
-            x = gate_up.new_empty((M, N // 2))
-            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            if _is_npu:
+                _g, _u = gate_up.chunk(2, dim=-1)
+                _lim = float(self.swiglu_limit)
+                gate_up = torch.cat(
+                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                )
+                x = self.act_fn(gate_up)
+            else:
+                M, N = gate_up.shape
+                x = gate_up.new_empty((M, N // 2))
+                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -501,6 +502,8 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif _is_npu:
+                logits = F.linear(hidden_states, self.weight, None)
             else:
                 if self.is_deepseek_v4:
                     from sglang.jit_kernel.dsv4 import linear_bf16_fp32
@@ -528,8 +531,8 @@ class DeepseekV2MoE(nn.Module):
         mla_enable_prefill_cp: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
+        self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
 
@@ -777,7 +780,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -1511,8 +1514,8 @@ class DeepseekV2AttentionMLA(
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
         self.is_nextn = is_nextn
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -1522,7 +1525,7 @@ class DeepseekV2AttentionMLA(
         # store cp_size whenever either CP flavor is active so rebuild_cp_kv_cache
         # and the FA3 MLA wrapper can reach it on the dense MLA path too.
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_parallel().attn_cp_size
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1738,20 +1741,28 @@ class DeepseekV2AttentionMLA(
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
-        # Determine attention backend used by current forward batch
+        # Determine attention backend name for current forward batch: prefer the
+        # name stamped per-runner on the backend object, else resolve from server args.
+        backend = get_attn_backend()
+        server_args = get_global_server_args()
+        default_prefill_str, default_decode_str = server_args.get_attention_backends()
+        prefill_backend_str = (
+            backend.prefill_attention_backend_str or default_prefill_str
+        )
+        decode_backend_str = backend.decode_attention_backend_str or default_decode_str
         if forward_batch.forward_mode.is_decode_or_idle():
-            attention_backend = get_global_server_args().decode_attention_backend
+            attention_backend = decode_backend_str
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if get_global_server_args().speculative_attention_mode == "decode":
-                attention_backend = get_global_server_args().decode_attention_backend
+            if server_args.speculative_attention_mode == "decode":
+                attention_backend = decode_backend_str
             else:  # default to prefill
-                attention_backend = get_global_server_args().prefill_attention_backend
+                attention_backend = prefill_backend_str
         else:
-            attention_backend = get_global_server_args().prefill_attention_backend
+            attention_backend = prefill_backend_str
         self.current_attention_backend = attention_backend
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
@@ -2130,13 +2141,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            getattr(self, "_gfx95_quant_format", ""),
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=getattr(self, "_gfx95_quant_format", ""),
+            )
         )
 
         hidden_states = self.self_attn(
@@ -2284,7 +2299,7 @@ class DeepseekV2Model(nn.Module):
             is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
         )
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
 
@@ -2369,11 +2384,9 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    # tp_size = get_tensor_model_parallel_world_size()
+                    # tp_size = get_parallel().tp_size
                     is_a2a_moe = is_deepep_class_backend()
-                    tp_size = (
-                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
-                    )
+                    tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -2483,14 +2496,6 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if i in self.layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_attention_tp_group().all_gather(
-                            hidden_states + residual, dim=0
-                        )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2501,6 +2506,9 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                 )
 
         if normal_end_layer != self.end_layer:
@@ -2578,7 +2586,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
@@ -2616,8 +2624,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
         )
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_rank = self.cp_size = None
 
@@ -2674,7 +2682,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
                 "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
-        elif get_moe_expert_parallel_world_size() > 1 and (
+        elif get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = (

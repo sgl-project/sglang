@@ -19,7 +19,6 @@ from torch import nn
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -28,8 +27,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -55,6 +52,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
 
@@ -142,7 +140,7 @@ class LagunaMoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.moe_routed_scaling_factor
         self.router_logit_softcapping = getattr(
             config, "moe_router_logit_softcapping", 0.0
@@ -241,6 +239,7 @@ class LagunaAttention(nn.Module):
         attention_bias: bool,
         sliding_window_size: int,
         layer_type: str,
+        gating: bool | str = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -248,9 +247,16 @@ class LagunaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.layer_id = layer_id
+        if gating not in (True, False, None, "per-head", "per-element"):
+            raise ValueError(
+                f"Unsupported gating value {gating!r}; expected one of "
+                'True, False, None, "per-head", or "per-element".'
+            )
+        self.gating = bool(gating)
+        self.gate_per_head = gating is True or gating == "per-head"
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -287,18 +293,24 @@ class LagunaAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Per-head softplus gate (`gating=True` in HF). Shard like Q so the
-        # local output dim matches `num_heads`.
-        self.g_proj = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_heads,
-            bias=False,
-            gather_output=False,
-            quant_config=None,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("g_proj", prefix),
-        )
+        if self.gating:
+            g_proj_dim = (
+                self.total_num_heads
+                if self.gate_per_head
+                else self.total_num_heads * self.head_dim
+            )
+            self.g_proj = ColumnParallelLinear(
+                hidden_size,
+                g_proj_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=None,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("g_proj", prefix),
+            )
+        else:
+            self.g_proj = None
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -348,11 +360,15 @@ class LagunaAttention(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
 
-        gate, _ = self.g_proj(hidden_states)
-        gate = F.softplus(gate.float()).to(attn_output.dtype)
-        attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
-        attn_output = attn_output * gate.view(-1, self.num_heads, 1)
-        attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
+        if self.gating and self.g_proj is not None:
+            gate, _ = self.g_proj(hidden_states)
+            gate = F.softplus(gate.float()).to(attn_output.dtype)
+            if self.gate_per_head:
+                attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
+                attn_output = attn_output * gate.view(-1, self.num_heads, 1)
+                attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
+            else:
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -401,6 +417,7 @@ class LagunaDecoderLayer(nn.Module):
             # SGLang's window is exclusive; HF's `sliding_window` is inclusive.
             sliding_window_size=config.sliding_window - 1,
             layer_type=layer_type,
+            gating=config.gating,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -748,6 +765,12 @@ class LagunaForCausalLM(nn.Module):
             if name.endswith(".bias") and name not in params_dict:
                 continue
             if name not in params_dict:
+                if ".g_proj." in name:
+                    raise RuntimeError(
+                        f"Checkpoint provides gate weight {name!r} but the model built no "
+                        "g_proj (gating is disabled in the config). Set gating to True, "
+                        '"per-head", or "per-element" to load this checkpoint.'
+                    )
                 logger.warning("Parameter %s not found in params_dict", name)
                 continue
             param = params_dict[name]
