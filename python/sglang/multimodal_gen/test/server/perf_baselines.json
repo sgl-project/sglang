@@ -2692,6 +2692,7 @@
                 "LTX2ImageEncodingStage": 1133.15,
                 "LTX2AVDenoisingStage": 19539.95,
                 "LTX2UpsampleStage": 22.73,
+                "ltx2_lora_switch_stage2": 1.0,
                 "LTX2RefinementStage": 3059.95,
                 "LTX2AVDecodingStage": 1744.05,
                 "per_frame_generation": null
