@@ -60,6 +60,14 @@ _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
 ] = {}
 
 
+def clear_mxfp8_shuffle_index_cache() -> None:
+    """Drop the cached MXFP8 MoE row-index permutations.
+    The cached index tensors are GPU-resident; sglang reuses the weights-region
+    memory across weight-update cycles
+    """
+    _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.clear()
+
+
 def _is_gated(layer: Module) -> bool:
     """Return whether the MoE layer uses a gated activation (default True)."""
     is_gated = (
@@ -283,6 +291,11 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
+    # Cache the row-index permutations on the GPU, keyed by shape+device. The cache
+    # is cleared in FusedMoE.weight_loader on every weight reload (see
+    # clear_mxfp8_shuffle_index_cache), so the post-update align recomputes fresh
+    # indices instead of reusing a cached GPU tensor that the weights-region memory
+    # reuse may have clobbered (-> ~3.83 logprob diff).
     w13_weight_u8 = w13_weight.view(torch.uint8)
     w2_weight_u8 = w2_weight.view(torch.uint8)
     cache_key = (
@@ -292,27 +305,33 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         w13_scale.shape[-1],
         w2_scale.shape[-1],
         epilogue_tile_m,
+        (w13_weight.device.type, w13_weight.device.index),
+        (w2_weight.device.type, w2_weight.device.index),
+        (w13_scale.device.type, w13_scale.device.index),
+        (w2_scale.device.type, w2_scale.device.index),
     )
     cache = _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.get(cache_key)
     if cache is None:
         if is_gated:
             reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
                 w13_weight_u8[0]
-            ).cpu()
+            ).to(w13_weight.device)
         else:
-            reorder_row_indices = torch.arange(gate_up_dim, dtype=torch.long)
+            reorder_row_indices = torch.arange(
+                gate_up_dim, device=w13_weight.device, dtype=torch.long
+            )
         w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
             w13_weight_u8[0], epilogue_tile_m
-        ).cpu()
+        ).to(w13_weight.device)
         w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
             w2_weight_u8[0], epilogue_tile_m
-        ).cpu()
+        ).to(w2_weight.device)
         w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
             w13_scale[0].reshape(gate_up_dim, -1), epilogue_tile_m
-        ).cpu()
+        ).to(w13_scale.device)
         w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
             w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
-        ).cpu()
+        ).to(w2_scale.device)
         cache = {
             "reorder_row_indices": reorder_row_indices,
             "w13_shuffle_row_indices": w13_shuffle_row_indices,
@@ -322,15 +341,11 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         }
         _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8[cache_key] = cache
 
-    reorder_row_indices = cache["reorder_row_indices"].to(w13_weight.device)
-    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"].to(w13_weight.device)
-    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"].to(w2_weight.device)
-    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"].to(
-        w13_scale.device
-    )
-    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"].to(
-        w2_scale.device
-    )
+    reorder_row_indices = cache["reorder_row_indices"]
+    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"]
+    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"]
+    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"]
+    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"]
 
     w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
     w2_shuffled_u8 = torch.empty_like(w2_weight_u8)

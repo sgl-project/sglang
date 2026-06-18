@@ -760,6 +760,15 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif isinstance(method, Fp8MoEMethod):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload so the
+            # post-update align recomputes fresh indices; the cached GPU tensors
+            # can be clobbered by weights-region memory reuse (-> ~3.83 logprob diff).
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
 
         loaded_weight = (
             loaded_weight.t().contiguous()
@@ -982,6 +991,14 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
+        if isinstance(method, Fp8MoEMethod):
+            # Drop the GPU mxfp8 shuffle-index cache on every reload (see
+            # weight_loader / clear_mxfp8_shuffle_index_cache).
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
