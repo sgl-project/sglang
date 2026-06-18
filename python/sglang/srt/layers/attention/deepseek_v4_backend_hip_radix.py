@@ -1316,24 +1316,37 @@ class DeepseekV4HipRadixBackend(
         recompute at store time, matching the pre-cache per-layer behavior, for
         paths that never ran the decode-stream init (eager prefill/extend, idle,
         or a batch re-padded after init -> shape mismatch).
+
+        Cached swa_loc is computed once from committed positions, so every draft-decode
+        step would reuse the same ring slot and break the chain. Recompute from the live
+        per-step positions; only the draft path is affected, the rest keeps the fast path.
         """
         positions = forward_batch.positions
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         unified = getattr(core, "unified", None) if core is not None else None
         cached = unified.swa_loc if unified is not None else None
+        is_multistep_draft_decode = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and self.speculative_num_steps > 1
+        )
         if (
             cached is not None
             and not forward_batch.forward_mode.is_idle()
             and cached.shape[0] == positions.shape[0]
+            and not is_multistep_draft_decode
         ):
-            return cached
-        ring = self.token_to_kv_pool.unified_swa_ring_size
-        req_slot = forward_batch.req_pool_indices.to(torch.int64)
-        if req_slot.shape[0] != positions.shape[0]:
-            req_slot = req_slot.repeat_interleave(
-                positions.shape[0] // req_slot.shape[0]
+            result = cached
+        else:
+            ring = self.token_to_kv_pool.unified_swa_ring_size
+            req_slot = forward_batch.req_pool_indices.to(torch.int64)
+            if req_slot.shape[0] != positions.shape[0]:
+                req_slot = req_slot.repeat_interleave(
+                    positions.shape[0] // req_slot.shape[0]
+                )
+            result = (req_slot * ring + positions.to(torch.int64) % ring).to(
+                torch.int32
             )
-        return (req_slot * ring + positions.to(torch.int64) % ring).to(torch.int32)
+        return result
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
