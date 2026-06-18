@@ -381,7 +381,32 @@ def launch_server_internal(launch_server_func: Callable, server_args: ServerArgs
         kill_process_tree(os.getpid(), include_parent=False)
 
 
+def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
+    """Return True if a server answers /v1/models with 200 at base_url."""
+    try:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        response = requests.get(
+            f"{base_url}/v1/models", headers=headers, timeout=timeout
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
+    base_url = f"http://{server_args.host}:{server_args.port}"
+
+    # Reuse an already-running server instead of forking a second one onto the
+    # occupied port, where it would orphan, compete for the GPU, and OOM.
+    if server_is_up(base_url, timeout=5):
+        print(
+            f"WARNING: reusing the server already running at {base_url} "
+            f"(--model and server-launch args ignored). Pass --base-url to silence."
+        )
+        return None, base_url
+
     proc = multiprocessing.Process(
         target=launch_server_internal,
         args=(
@@ -390,22 +415,21 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
         ),
     )
     proc.start()
-    base_url = f"http://{server_args.host}:{server_args.port}"
 
     start_time = time.time()
     while time.time() - start_time < DEFAULT_TIMEOUT:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-            }
-            response = requests.get(
-                f"{base_url}/v1/models", headers=headers, timeout=DEFAULT_TIMEOUT
+        # Fail fast if the server died during startup (e.g. OOM).
+        if not proc.is_alive():
+            raise RuntimeError(
+                f"Server process exited during startup (exit code "
+                f"{proc.exitcode}); see the traceback above for the cause."
             )
-            if response.status_code == 200:
-                return proc, base_url
-        except requests.RequestException:
-            pass
+        if server_is_up(base_url):
+            return proc, base_url
         time.sleep(10)
+
+    # Timed out: kill the half-started server so it does not linger as an orphan.
+    kill_process_tree(proc.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
