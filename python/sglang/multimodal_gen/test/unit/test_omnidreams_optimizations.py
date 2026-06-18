@@ -13,7 +13,6 @@ checks drive LayerNormScaleShift's fused CuTe/Triton kernel, which is CUDA-only
 target), so they run on the platform device and skip when no GPU is present.
 """
 
-import types
 from collections import OrderedDict
 
 import pytest
@@ -89,9 +88,14 @@ def test_adaln_fusion_preserves_elementwise_affine_false():
 def test_rope_shift_t_cos_sin_format():
     """shift_t returns the [L, D] cache with cos in [:D/2] and sin in [D/2:]."""
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=22, len_w=40, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0, device="cpu",
+        head_dim=128,
+        len_h=22,
+        len_w=40,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
+        t_extrapolation_ratio=1.0,
+        device="cpu",
     )
     cs = rope.shift_t(0)
     L = 22 * 40 * 2
@@ -106,8 +110,12 @@ def test_rope_works_for_all_ar_offsets():
     """apply_rope_freqs is finite and norm-preserving at AR offsets 0, 1, 5."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
     for ar_idx in (0, 1, 5):
@@ -124,8 +132,12 @@ def test_rope_preserves_norm():
     """The cos/sin rotation is norm-preserving (orthogonal rotation per pair)."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
     cs = rope.shift_t(0)
@@ -138,8 +150,12 @@ def test_rope_batch_dimension_broadcast():
     """B>1: each batch element gets the same position-dependent cos/sin."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
     cs = rope.shift_t(0)
@@ -162,6 +178,7 @@ def test_rope_batch_dimension_broadcast():
 # T3: KV-Cache Split-Copy -- no .clone(), correct ordering
 # ============================================================================
 
+
 def _kv_chunk(B, size, n_heads, head_dim, val):
     """Helper: create K/V tensors filled with a constant value."""
     k = torch.full((B, size, n_heads, head_dim), float(val))
@@ -172,8 +189,12 @@ def _kv_chunk(B, size, n_heads, head_dim, val):
 def test_kv_cache_split_copy_steady_state_roll():
     """Split-copy produces the same chunk ordering as the original clone-based approach."""
     c = BlockKVCache(
-        k_shape=(1, 6, 2, 3), v_shape=(1, 6, 2, 3),
-        seq_dim=1, chunk_size=2, window_size=6, sink_size=0,
+        k_shape=(1, 6, 2, 3),
+        v_shape=(1, 6, 2, 3),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=6,
+        sink_size=0,
     )
     # Fill 3 chunks: [10,10], [11,11], [12,12] --> full cache
     for idx, val in enumerate([10, 11, 12]):
@@ -198,20 +219,27 @@ def test_kv_cache_split_copy_steady_state_roll():
 def test_kv_cache_split_copy_no_clone_in_source():
     """Verify BlockKVCache source file has zero .clone() calls in actual code."""
     import inspect
+
     source = inspect.getsource(BlockKVCache._roll_local_window_left)
     # .clone() should not appear in the method body (only possibly in docstrings/comments)
     # Strip comments and check
-    lines = [l for l in source.split('\n') if not l.strip().startswith('#')]
-    code = '\n'.join(lines)
+    lines = [l for l in source.split("\n") if not l.strip().startswith("#")]
+    code = "\n".join(lines)
     # The word "clone" may appear in a comment but not as a .clone() call
-    assert ".clone()" not in code, f".clone() call found in _roll_local_window_left:\n{code}"
+    assert (
+        ".clone()" not in code
+    ), f".clone() call found in _roll_local_window_left:\n{code}"
 
 
 def test_kv_cache_split_copy_overwrite_same_chunk():
     """Re-forward overwrite (same chunk_idx) works with split-copy."""
     c = BlockKVCache(
-        k_shape=(1, 4, 2, 3), v_shape=(1, 4, 2, 3),
-        seq_dim=1, chunk_size=2, window_size=4, sink_size=0,
+        k_shape=(1, 4, 2, 3),
+        v_shape=(1, 4, 2, 3),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=4,
+        sink_size=0,
     )
     for idx, val in enumerate([10, 11]):
         c.before_update(idx)
@@ -235,8 +263,12 @@ def test_kv_cache_split_copy_overlap_handling():
     # chunk=1, window=3: tokens_to_keep=2, copy1=1, copy2=1
     # Layout: [dst0,dst1]=[0,1] [src0,src1]=[1,2] -- dst1 overlaps with src0
     c = BlockKVCache(
-        k_shape=(1, 3, 1, 1), v_shape=(1, 3, 1, 1),
-        seq_dim=1, chunk_size=1, window_size=3, sink_size=0,
+        k_shape=(1, 3, 1, 1),
+        v_shape=(1, 3, 1, 1),
+        seq_dim=1,
+        chunk_size=1,
+        window_size=3,
+        sink_size=0,
     )
     # Fill: [1], [2], [3] -> full cache = [1,2,3]
     for idx, val in enumerate([1, 2, 3]):
@@ -264,8 +296,12 @@ def test_kv_cache_split_copy_overlap_handling():
 def test_kv_cache_split_copy_production_shapes():
     """With OmniDreams production shapes (window=6, chunk=2), split-copy is correct."""
     c = BlockKVCache(
-        k_shape=(1, 6, 16, 128), v_shape=(1, 6, 16, 128),
-        seq_dim=1, chunk_size=2, window_size=6, sink_size=0,
+        k_shape=(1, 6, 16, 128),
+        v_shape=(1, 6, 16, 128),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=6,
+        sink_size=0,
         dtype=torch.float32,
     )
     refs = [torch.randn(1, 2, 16, 128) for _ in range(3)]
@@ -296,6 +332,7 @@ def test_kv_cache_split_copy_production_shapes():
 # a real Qwen2.5-VL model). The test verifies the cache data structure and eviction
 # pattern that OmniDreamsBeforeDenoisingStage._encode_text uses.
 
+
 def test_text_cache_lru_eviction_order():
     """LRU cache evicts oldest entry when full (FIFO-like with move_to_end)."""
     # Simulate the cache data structure and logic from _encode_text
@@ -305,7 +342,7 @@ def test_text_cache_lru_eviction_order():
     for i in range(6):  # Insert 6 entries into a 4-slot cache
         prompt = f"prompt_{i}"
         embeds = torch.tensor([float(i)])  # Stand-in for real embedding
-        
+
         if len(cache) >= max_size:
             cache.popitem(last=False)  # Evict oldest (first inserted)
         cache[prompt] = embeds.detach()
@@ -349,7 +386,7 @@ def test_text_cache_stores_on_cpu():
     """Cached embeddings are stored on CPU to avoid GPU VRAM."""
     cache: OrderedDict[str, torch.Tensor] = OrderedDict()
     embeds = torch.randn(1, 512, 100352)
-    
+
     # Simulate the store logic from _encode_text
     cache["test"] = embeds.detach().cpu()
 
@@ -361,7 +398,7 @@ def test_text_cache_stores_on_cpu():
 def test_text_cache_key_is_prompt_string():
     """Cache key is the raw prompt string; different prompts produce different entries."""
     cache: OrderedDict[str, torch.Tensor] = OrderedDict()
-    
+
     cache["a driving scene"] = torch.zeros(1)
     cache["a rainy scene"] = torch.ones(1)
 

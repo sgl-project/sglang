@@ -153,12 +153,8 @@ class BlockKVCache:
             self._k[s1_dst].copy_(self._k[s1_src])
             self._v[s1_dst].copy_(self._v[s1_src])
             if copy1 < tokens_to_keep:
-                s2_dst = self._seq_slice(
-                    dst_start + copy1, dst_start + tokens_to_keep
-                )
-                s2_src = self._seq_slice(
-                    src_start + copy1, src_start + tokens_to_keep
-                )
+                s2_dst = self._seq_slice(dst_start + copy1, dst_start + tokens_to_keep)
+                s2_src = self._seq_slice(src_start + copy1, src_start + tokens_to_keep)
                 self._k[s2_dst].copy_(self._k[s2_src])
                 self._v[s2_dst].copy_(self._v[s2_src])
 
