@@ -403,6 +403,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
         # Normal extend path
+        if forward_batch.extend_prefix_lens is None:
+            raise RuntimeError(
+                "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
+            )
         has_initial_state = forward_batch.extend_prefix_lens > 0
         conv_states = conv_states_raw.transpose(-1, -2)
 
