@@ -1076,7 +1076,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8.fabric]
+        runner: [linux-sglang-mi35x-di]
 
     runs-on: ${{matrix.runner}}
 
