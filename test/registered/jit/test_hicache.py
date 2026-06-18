@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
+from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
@@ -275,10 +275,10 @@ def _run_page_first_staged_write_back_mha(
         device_pool=device_pool,
         layout=layout,
     )
-    assert can_use_hicache_jit_kernel(
+    assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
-        staged=True,
     )
+    assert host_pool.can_use_write_back_jit
     if element_dim * host_pool.dtype.itemsize % 128 != 0:
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
@@ -386,10 +386,10 @@ def _run_page_first_staged_write_back_mla(
         device_pool=device_pool,
         layout=layout,
     )
-    assert can_use_hicache_jit_kernel(
+    assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
-        staged=True,
     )
+    assert host_pool.can_use_write_back_jit
     if element_dim * host_pool.dtype.itemsize % 128 != 0:
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
