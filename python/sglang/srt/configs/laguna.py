@@ -137,10 +137,7 @@ class LagunaConfig(PretrainedConfig):
         self.layer_types = (
             list(layer_types)
             if layer_types
-            else [
-                "full_attention" if i % 4 == 0 else "sliding_attention"
-                for i in range(num_hidden_layers)
-            ]
+            else ["full_attention" for _ in range(num_hidden_layers)]
         )
         self.mlp_layer_types = (
             list(mlp_layer_types)

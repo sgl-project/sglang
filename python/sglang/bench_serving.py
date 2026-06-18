@@ -48,7 +48,7 @@ from sglang.benchmark.utils import (
     set_ulimit,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, resolve_base_url
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -914,6 +914,22 @@ ASYNC_REQUEST_FUNCS = {
     "trt": async_request_trt_llm,
     "gserver": async_request_gserver,
     "truss": async_request_truss,
+}
+
+# API path appended to the base URL per backend. gserver is special (bare
+# host:port, no path) and is handled separately, so it is not listed here.
+_BACKEND_API_PATHS = {
+    "sglang": "/generate",
+    "sglang-native": "/generate",
+    "sglang-oai": "/v1/completions",
+    "sglang-oai-chat": "/v1/chat/completions",
+    "sglang-embedding": "/v1/embeddings",
+    "vllm": "/v1/completions",
+    "vllm-chat": "/v1/chat/completions",
+    "lmdeploy": "/v1/completions",
+    "lmdeploy-chat": "/v1/chat/completions",
+    "trt": "/v2/models/ensemble/generate_stream",
+    "truss": "/v1/models/model:predict",
 }
 
 
@@ -1924,59 +1940,23 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
-    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
-    if not args.base_url:
-        _na = NetworkAddress(args.host, args.port)
-        _host_base = _na.to_url()
-    else:
-        _na = None
-        _host_base = None
+    # Base URL the client sends to: --base-url if given, else http://host:port
+    # (IPv6-correct). NetworkAddress is also kept for gserver's host:port form.
+    base_url = resolve_base_url(args.base_url, args.host, args.port)
+    _na = NetworkAddress(args.host, args.port)
 
-    model_url = (
-        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
-    )
+    model_url = f"{base_url}/v1/models"
 
-    if args.backend == "sglang-embedding":
-        api_url = (
-            f"{args.base_url}/v1/embeddings"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/embeddings"
-        )
-    elif args.backend in ["sglang", "sglang-native"]:
-        api_url = (
-            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
-        )
-    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = (
-            f"{args.base_url}/v1/completions"
-            if args.base_url
-            else f"{_host_base}/v1/completions"
-        )
-    elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
-        api_url = (
-            f"{args.base_url}/v1/chat/completions"
-            if args.base_url
-            else f"{_host_base}/v1/chat/completions"
-        )
-    elif args.backend == "trt":
-        api_url = (
-            f"{args.base_url}/v2/models/ensemble/generate_stream"
-            if args.base_url
-            else f"{_host_base}/v2/models/ensemble/generate_stream"
-        )
-        if args.model is None:
-            print("Please provide a model using `--model` when using `trt` backend.")
-            sys.exit(1)
-    elif args.backend == "gserver":
+    if args.backend == "gserver":
+        # gRPC server takes a bare host:port, not an http URL.
         api_url = args.base_url if args.base_url else _na.to_host_port_str()
         args.model = args.model or "default"
-    elif args.backend == "truss":
-        api_url = (
-            f"{args.base_url}/v1/models/model:predict"
-            if args.base_url
-            else f"{_host_base}/v1/models/model:predict"
-        )
-    base_url = _host_base if args.base_url is None else args.base_url
+    else:
+        api_url = f"{base_url}{_BACKEND_API_PATHS[args.backend]}"
+
+    if args.backend == "trt" and args.model is None:
+        print("Please provide a model using `--model` when using `trt` backend.")
+        sys.exit(1)
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:

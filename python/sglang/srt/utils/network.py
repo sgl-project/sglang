@@ -543,3 +543,11 @@ class NetworkAddress:
 
     def __repr__(self) -> str:
         return f"NetworkAddress({self.host!r}, {self.port})"
+
+
+def resolve_base_url(base_url: str, host: str, port: int) -> str:
+    """Base URL a client sends to: ``base_url`` if set, else ``http://host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_url()
