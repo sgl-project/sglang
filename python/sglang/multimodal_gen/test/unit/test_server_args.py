@@ -882,7 +882,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_ltx_snapshot_keeps_dit_offload_and_replaces_encoder_cpu_offload(
+    def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
     ):
         args = self._from_dict_with_pipeline_config(
@@ -891,13 +891,12 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
                 "pipeline_class_name": "LTX2TwoStageHQPipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
                 "performance_mode": "auto",
             },
         )
 
-        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -1179,6 +1178,25 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
+    def test_ltx23_snapshot_device_mode_is_deprecated_alias_for_original(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "snapshot",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
     def test_explicit_layerwise_components_preserved_in_ltx23_resident(self):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
@@ -1441,6 +1459,49 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
+
+    def test_ltx23_snapshot_device_mode_cli_alias_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Lightricks/LTX-2.3",
+            "--pipeline-class-name",
+            "LTX2TwoStagePipeline",
+            "--ltx2-two-stage-device-mode",
+            "snapshot",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=140 * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=134,
+            ),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
 class TestFSDPShardConditions(unittest.TestCase):
