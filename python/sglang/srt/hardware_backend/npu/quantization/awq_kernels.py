@@ -151,71 +151,54 @@ class AWQAscendMoEKernel:
                 name, torch.nn.Parameter(tensor, requires_grad=False)
             )
 
-    def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
-        num_experts, input_size, _ = qweight.shape
-        unpacked_weight = (
-            self.w13_kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
-            .view(num_experts, input_size, -1)
-            .transpose(1, 2)
-            .contiguous()
-            .int()
-        )
-        return self.w13_kernel._pack_to_int32(unpacked_weight)
-
-    def _convert_awq_qzeros_to_npu_offset(
-        self, qzeros: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
-        num_experts, num_groups, _ = qzeros.shape
-        offset = (
-            -self.w13_kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
-            .view(num_experts, num_groups, -1)
-            .transpose(1, 2)
-            .contiguous()
-        )
-        return offset.to(dtype)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self._register_or_replace_parameter(
-            layer,
-            "w13_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w13_qweight.data),
+        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
+        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
+        w13_qzeros_list = []
+        w2_qzeros_list = []
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        for i in range(0, self.quant_config.pack_factor):
+            shift_num = shifts[i] * 4
+            w13_qzeros_list.append(
+                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
+            )
+            w2_qzeros_list.append(
+                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
+            )
+            w13_qweight_tmp.bitwise_or_(
+                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
+            )
+            w2_qweight_tmp.bitwise_or_(
+                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
+            )
+
+        w13_qweight_tmp.bitwise_xor_(0x88888888)
+        w2_qweight_tmp.bitwise_xor_(0x88888888)
+
+        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
+            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w2_weight",
-            self._convert_awq_weight_to_npu_layout(layer.w2_qweight.data),
+        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
+        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
+            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w13_weight_scale",
-            layer.w13_scales.data.transpose(1, 2).contiguous(),
+        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
+        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        layer.register_parameter(
+            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w2_weight_scale",
-            layer.w2_scales.data.transpose(1, 2).contiguous(),
+        layer.register_parameter(
+            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w13_weight_offset",
-            self._convert_awq_qzeros_to_npu_offset(
-                layer.w13_qzeros.data, layer.w13_scales.data.dtype
-            ),
+        layer.register_parameter(
+            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
         )
-        self._register_or_replace_parameter(
-            layer,
-            "w2_weight_offset",
-            self._convert_awq_qzeros_to_npu_offset(
-                layer.w2_qzeros.data, layer.w2_scales.data.dtype
-            ),
+        layer.register_parameter(
+            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
         )
 
-        self.w13_kernel.process_weights_after_loading(layer, "w13")
-        self.w2_kernel.process_weights_after_loading(layer, "w13")
-
-        # Delete all old attributes
-        for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
-                     "w2_qweight", "w2_qzeros", "w2_scales"):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
 
