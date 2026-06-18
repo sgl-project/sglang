@@ -143,7 +143,7 @@ DecodingStage (standard single-pass VAE decode)
 | `runtime/pipelines_core/stages/model_specific_stages/omnidreams.py` | BeforeDenoisingStage + DenoisingStage (AR rollout loop) |
 | `runtime/models/dits/omnidreams.py` | OmniDreamsDiT (2.06B, 28 blocks), OmniDreamsBlock, OmniDreamsAttention |
 | `runtime/models/dits/omnidreams_kvcache.py` | BlockKVCache: windowed KV cache with sink + split-copy roll |
-| `runtime/models/dits/omnidreams_rope.py` | RotaryPositionEmbedding3D (NeoX 44:42:42), apply_rope_freqs, to_cos_sin_cache |
+| `runtime/models/dits/omnidreams_rope.py` | RotaryPositionEmbedding3D (NeoX 44:42:42), shift_t cos/sin cache, apply_rope_freqs (reuses NDRotaryEmbedding + _apply_rotary_emb) |
 | `runtime/models/encoders/omnidreams_text.py` | full_concat_embeddings: 28-layer hidden-state mean-normalize -> 100352-dim |
 | `configs/models/dits/omnidreams.py` | OmniDreamsDiTArchConfig (2048-d, 28 blocks, 16 heads, HDMap 16ch) |
 | `configs/pipeline_configs/omnidreams.py` | OmniDreamsPipelineConfig (I2V, bf16 DiT, fp32 VAE, 2-step warp sigma) |
@@ -176,7 +176,7 @@ DecodingStage (standard single-pass VAE decode)
 | # | Optimization | Where | What |
 |---|---|---|---|
 | T1 | AdaLN fusion | OmniDreamsBlock | LayerNormScaleShift replaces norm+scale+shift (CuTe DSL fused kernel on CUDA) |
-| T2 | RoPE kernel | omnidreams_rope.py + DiT | to_cos_sin_cache + _apply_rotary_emb dispatch (FlashInfer/Triton fallback) |
+| T2 | RoPE kernel | omnidreams_rope.py + DiT | shift_t cos/sin cache + _apply_rotary_emb dispatch (FlashInfer/Triton fallback), per-axis freqs via NDRotaryEmbedding |
 | T3 | KV-cache split-copy | BlockKVCache | Split-copy eliminates per-block .clone() during window roll |
 | T4 | Text encoder cache | BeforeDenoisingStage | OrderedDict LRU (max 32) keyed on prompt, embeddings stored on CPU |
 | T5 | Cross-attn KV precompute | OmniDreamsDiT | K/V projected once per prompt, reused across all AR chunks (28 blocks x N chunks x 3 calls) |

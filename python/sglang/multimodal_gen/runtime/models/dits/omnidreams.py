@@ -280,7 +280,6 @@ class OmniDreamsAttention(nn.Module):
     def forward(
         self,
         x: Tensor,
-        rope_freqs: Tensor | None = None,
         context: Tensor | None = None,
         kv_cache=None,
         cross_kv: tuple[Tensor, Tensor] | None = None,
@@ -293,10 +292,9 @@ class OmniDreamsAttention(nn.Module):
         a full bidirectional SDPA (scale 1/sqrt(head_dim)). Cross-attention passes
         ``context`` as K/V source and no RoPE.
 
-        When ``rope_cos_sin`` is provided, it dispatches to the fast framework
-        RoPE backend (FlashInfer on CUDA, Triton fallback) instead of computing
-        cos/sin eagerly per-chunk.  The cache format is ``[L, D]`` with the first
-        D/2 columns = cos and the second D/2 = sin.
+        ``rope_cos_sin`` is the ``[L, D]`` cos|sin cache (first D/2 cos, second
+        D/2 sin) from :meth:`RotaryPositionEmbedding3D.shift_t`; self-attention
+        applies NeoX 3D RoPE from it (cross-attention uses no RoPE).
 
         When ``kv_cache`` (a :class:`BlockKVCache`) is given, this is an AR
         self-attention step: the current chunk's post-RoPE K and V are written
@@ -332,9 +330,9 @@ class OmniDreamsAttention(nn.Module):
             k = self.k_norm(k_raw.reshape(B, Lk, n, d))
             v = v_raw.reshape(B, Lk, n, d)
 
-        if rope_freqs is not None:
-            q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
-            k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
+        if rope_cos_sin is not None:
+            q = apply_rope_freqs(q, rope_cos_sin)
+            k = apply_rope_freqs(k, rope_cos_sin)
         if kv_cache is not None:
             # Write this chunk's (post-RoPE) K/V, then attend over the window.
             kv_cache.update(k, v)
@@ -421,7 +419,6 @@ class OmniDreamsBlock(nn.Module):
         x: Tensor,
         emb: Tensor,
         adaln_lora: Tensor | None,
-        rope_freqs: Tensor | None,
         context: Tensor,
         self_attn_kv_cache=None,
         cross_attn_kv: tuple[Tensor, Tensor] | None = None,
@@ -434,7 +431,6 @@ class OmniDreamsBlock(nn.Module):
             x: ``[B, L, D]`` tokens (flat across views & frames).
             emb: ``[B, D]`` timestep embedding.
             adaln_lora: ``[B, 3D]`` AdaLN-LoRA term.
-            rope_freqs: ``[L, 1, 1, head_dim]`` RoPE freqs for self-attention.
             context: ``[B, Lctx, D]`` cross-attention key/value source.
             self_attn_kv_cache: optional :class:`BlockKVCache`.
             cross_attn_kv: optional precomputed ``(K,V)`` tuple for cross-attn.
@@ -491,7 +487,8 @@ class OmniDreamsBlock(nn.Module):
 
         normed = self.layer_norm_self_attn(x, shift_s, scale_s)
         x = x + gate_s * self.self_attn(
-            normed, rope_freqs=rope_freqs, kv_cache=self_attn_kv_cache,
+            normed,
+            kv_cache=self_attn_kv_cache,
             rope_cos_sin=rope_cos_sin,
         )
 
@@ -808,7 +805,7 @@ class OmniDreamsDiT(BaseDiT):
         guidance=None,
         *,
         condition_video_input_mask: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_cos_sin: torch.Tensor,
         hdmap_condition: torch.Tensor | None = None,
         kv_caches: list | None = None,
         cross_attn_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -824,9 +821,9 @@ class OmniDreamsDiT(BaseDiT):
             timestep: scalar (warped) timestep; scaled by ``timestep_scale`` here.
             condition_video_input_mask: patchified per-frame condition mask
                 ``[B, L, kt*kh*kw]`` (concatenated onto the latent channels).
-            rope_freqs: ``[L, 1, 1, head_dim]`` 3D-RoPE freqs for self-attention.
-                For AR rollout pass ``shift_t(ar_idx)`` so the chunk is rotated by
-                its absolute temporal position.
+            rope_cos_sin: ``[L, D]`` cos|sin RoPE cache for self-attention. For AR
+                rollout pass ``shift_t(ar_idx)`` so the chunk is rotated by its
+                absolute temporal position.
             hdmap_condition: patchified HDMap ``[B, L, additional_concat_ch*kt*kh*kw]``.
             kv_caches: optional per-block list of :class:`BlockKVCache` (length
                 ``num_blocks``) enabling the autoregressive self-attention window.
@@ -883,22 +880,11 @@ class OmniDreamsDiT(BaseDiT):
             view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
 
         context = self.crossattn_proj(encoder_hidden_states)
-        # Precompute cos/sin cache once per forward for the fast RoPE path.
-        # The cache stores cos in [:D/2] and sin in [D/2:] for the full
-        # ``[L, D]`` frequency grid, avoiding per-block cos/sin re-computation.
-        rope_cos_sin: Tensor | None = None
-        if rope_freqs is not None:
-            L, D_full = rope_freqs.shape[0], rope_freqs.shape[-1]
-            half = D_full // 2
-            f = rope_freqs[:, 0, 0, :half]  # [L, half]
-            rope_cos_sin = torch.cat([f.cos(), f.sin()], dim=-1)
-
         for i, block in enumerate(self.blocks):
             x = block(
                 x,
                 t_emb,
                 adaln_lora,
-                rope_freqs,
                 context,
                 self_attn_kv_cache=None if kv_caches is None else kv_caches[i],
                 cross_attn_kv=None if cross_attn_kv is None else cross_attn_kv[i],

@@ -66,20 +66,21 @@ def test_apply_rope_matches_neox_reference_and_preserves_norm():
         w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
-    freqs = emb.shift_t(0)
-    L = freqs.shape[0]
+    cos_sin = emb.shift_t(0)  # [L, D] cos|sin cache (first D/2 cos, second D/2 sin)
+    L = cos_sin.shape[0]
     assert L == 2 * 4 * 5
-    assert freqs.shape[-1] == 128
-    # NeoX builds freqs as [first | first] -> the two halves are identical.
-    assert torch.allclose(freqs[..., :64], freqs[..., 64:])
+    assert cos_sin.shape[-1] == 128
+    # Valid cos/sin cache: cos(theta)^2 + sin(theta)^2 == 1 per column.
+    cos, sin = cos_sin[:, :64], cos_sin[:, 64:]
+    assert torch.allclose(cos**2 + sin**2, torch.ones_like(cos), atol=1e-5)
 
     x = torch.randn(1, L, 16, 128)
-    out = apply_rope_freqs(x, freqs)
-    half = 64
-    f = freqs[..., :half].reshape(L, half).view(1, L, 1, half)
-    cos, sin = f.cos(), f.sin()
-    a, b = x[..., :half], x[..., half:]
-    ref = torch.cat([a * cos - b * sin, b * cos + a * sin], dim=-1)
+    out = apply_rope_freqs(x, cos_sin)
+    # NeoX (non-interleaved) rotation reference from the cache.
+    c = cos.view(1, L, 1, 64)
+    s = sin.view(1, L, 1, 64)
+    a, b = x[..., :64], x[..., 64:]
+    ref = torch.cat([a * c - b * s, b * c + a * s], dim=-1)
     assert torch.allclose(out, ref, atol=1e-6)
     # rotations are norm-preserving
     assert torch.allclose(out.norm(dim=-1), x.norm(dim=-1), atol=1e-4)
@@ -87,12 +88,15 @@ def test_apply_rope_matches_neox_reference_and_preserves_norm():
 
 def test_shift_t_advances_only_time_frequencies():
     emb = RotaryPositionEmbedding3D(head_dim=128, len_h=4, len_w=5, len_t=2)
-    dim_t_half = rope_dims(128)[0] // 2  # 22
+    dt = rope_dims(128)[0] // 2  # 22 (time half-dim)
     f0, f1 = emb.shift_t(0), emb.shift_t(1)
-    # time band (first dim_t_half angles) changes with ar_idx ...
-    assert not torch.allclose(f0[..., :dim_t_half], f1[..., :dim_t_half])
-    # ... spatial bands (h then w) do not.
-    assert torch.allclose(f0[..., dim_t_half:64], f1[..., dim_t_half:64])
+    # The cache is [cos_t | cos_h | cos_w | sin_t | sin_h | sin_w]; advancing the AR
+    # index shifts only the time band (cos_t and sin_t) ...
+    assert not torch.allclose(f0[:, :dt], f1[:, :dt])  # cos_t
+    assert not torch.allclose(f0[:, 64 : 64 + dt], f1[:, 64 : 64 + dt])  # sin_t
+    # ... the spatial bands (h, w) are unchanged.
+    assert torch.allclose(f0[:, dt:64], f1[:, dt:64])  # cos_h | cos_w
+    assert torch.allclose(f0[:, 64 + dt :], f1[:, 64 + dt :])  # sin_h | sin_w
 
 
 # ----------------------------------------------------------------- KV cache -- #
@@ -298,7 +302,7 @@ def test_tiny_dit_single_chunk_forward_and_unpatchify():
         encoder_hidden_states=ctx,
         timestep=torch.tensor([500.0], device=_DEVICE),
         condition_video_input_mask=cond_mask,
-        rope_freqs=rope.shift_t(0).to(_DEVICE),
+        rope_cos_sin=rope.shift_t(0).to(_DEVICE),
         hdmap_condition=hdmap,
     )
     pdim = model.arch.patch_temporal * model.arch.patch_spatial**2
@@ -338,7 +342,7 @@ def test_tiny_dit_autoregressive_kv_cache_path():
             encoder_hidden_states=ctx,
             timestep=torch.tensor([500.0], device=_DEVICE),
             condition_video_input_mask=cond_mask,
-            rope_freqs=rope.shift_t(idx).to(_DEVICE),
+            rope_cos_sin=rope.shift_t(idx).to(_DEVICE),
             hdmap_condition=hdmap,
             kv_caches=caches,
         )

@@ -803,7 +803,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
-            rope_freqs = rope.shift_t(chunk_idx)
+            rope_cos_sin = rope.shift_t(chunk_idx)
             is_first = chunk_idx == 0
             cond_mask = cond_mask_c0 if is_first else cond_mask_zero
             # HD-map is per-chunk: index this chunk's tokens (None -> zeros, i.e.
@@ -824,7 +824,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     encoder_hidden_states=text,
                     timestep=t,
                     condition_video_input_mask=cond_mask,
-                    rope_freqs=rope_freqs,
+                    rope_cos_sin=rope_cos_sin,
                     hdmap_condition=hdmap_chunk,
                     kv_caches=caches,
                     cross_attn_kv=cross_attn_kv,
@@ -855,7 +855,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 encoder_hidden_states=text,
                 timestep=ctx_noise_t,
                 condition_video_input_mask=cond_mask,
-                rope_freqs=rope_freqs,
+                rope_cos_sin=rope_cos_sin,
                 hdmap_condition=hdmap_chunk,
                 kv_caches=caches,
                 cross_attn_kv=cross_attn_kv,

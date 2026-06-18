@@ -203,9 +203,10 @@ class OneDRotaryEmbedding(torch.nn.Module):
         self.use_real = use_real
         self.repeat_interleave_real = repeat_interleave_real
 
-    def build_freqs(self, device):
+    def build_freqs(self, device, theta: float | None = None):
+        theta = self.theta if theta is None else theta
         freqs = 1.0 / (
-            self.theta
+            theta
             ** (
                 torch.arange(0, self.dim, 2, dtype=self.dtype, device=device)[
                     : (self.dim // 2)
@@ -222,7 +223,10 @@ class OneDRotaryEmbedding(torch.nn.Module):
         if self.theta_rescale_factor != 1.0:
             theta *= self.theta_rescale_factor ** (self.dim / (self.dim - 2))
 
-        freqs = self.build_freqs(device)
+        # NOTE: build freqs from the *rescaled* theta (previously self.theta was used,
+        # silently dropping theta_rescale_factor). No-op for rescale==1.0 (all current
+        # callers); OmniDreams uses rescale!=1.0 for spatial-axis extrapolation.
+        freqs = self.build_freqs(device, theta=theta)
 
         freqs = torch.outer(pos * self.interpolation_factor, freqs)
         freqs_cos = freqs.cos()

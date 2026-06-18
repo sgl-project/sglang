@@ -3,7 +3,7 @@
 
 Tests the correctness of:
 - T1: AdaLN fusion (LayerNormScaleShift replacing nn.LayerNorm + manual scale/shift)
-- T2: RoPE kernel (to_cos_sin_cache, fast-path dispatch, B>1 broadcast)
+- T2: RoPE kernel (shift_t cos/sin cache, _apply_rotary_emb dispatch, B>1 broadcast)
 - T3: KV-cache split-copy (no .clone(), correct overlapping-region handling)
 - T4: Text encoder cache (LRU hit/miss, eviction, CPU storage)
 
@@ -70,17 +70,18 @@ def test_adaln_fusion_preserves_elementwise_affine_false():
 
 
 # ============================================================================
-# T2: RoPE Kernel -- to_cos_sin_cache, fast path, B>1 broadcast
+# T2: RoPE Kernel -- shift_t cos/sin cache, _apply_rotary_emb, B>1 broadcast
 # ============================================================================
 
-def test_rope_to_cos_sin_cache_format():
-    """to_cos_sin_cache returns [L, D] with cos in [:D/2] and sin in [D/2:]."""
+
+def test_rope_shift_t_cos_sin_format():
+    """shift_t returns the [L, D] cache with cos in [:D/2] and sin in [D/2:]."""
     rope = RotaryPositionEmbedding3D(
         head_dim=128, len_h=22, len_w=40, len_t=2,
         h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0, device="cpu",
     )
-    cs = rope.to_cos_sin_cache(0)
+    cs = rope.shift_t(0)
     L = 22 * 40 * 2
     assert cs.shape == (L, 128)
     half = 64
@@ -89,50 +90,8 @@ def test_rope_to_cos_sin_cache_format():
     assert identity_error < 1e-6, f"cos^2+sin^2 != 1, error={identity_error}"
 
 
-def test_rope_to_cos_sin_cache_matches_shift_t():
-    """to_cos_sin_cache produces same angles as shift_t -> extract -> cos/sin."""
-    torch.manual_seed(0)
-    rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    for ar_idx in (0, 1, 2):
-        freqs = rope.shift_t(ar_idx)  # [L, 1, 1, 128]
-        cs = rope.to_cos_sin_cache(ar_idx)  # [L, 128]
-        half = 64
-        # First half of cs should be cos of shift_t's first half
-        angles = freqs[:, 0, 0, :half]
-        expected_cos = angles.cos()
-        expected_sin = angles.sin()
-        assert torch.allclose(cs[:, :half], expected_cos, atol=1e-6), f"ar_idx={ar_idx} cos mismatch"
-        assert torch.allclose(cs[:, half:], expected_sin, atol=1e-6), f"ar_idx={ar_idx} sin mismatch"
-
-
-def test_rope_fast_path_same_as_fallback():
-    """apply_rope_freqs with cos_sin_cache == apply_rope_freqs without (fallback)."""
-    torch.manual_seed(0)
-    rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    L = freqs.shape[0]
-
-    for B, H in [(1, 16), (2, 16), (3, 8)]:
-        x = torch.randn(B, L, H, 128)
-        # Fast path
-        out_fast = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
-        # Fallback path
-        out_fallback = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=None)
-        diff = (out_fast - out_fallback).abs().max().item()
-        assert diff < 1e-5, f"B={B} H={H}: fast vs fallback diff={diff}"
-
-
-def test_rope_fast_path_works_for_all_ar_offsets():
-    """Fast path correct at AR offsets 0, 1, 5."""
+def test_rope_works_for_all_ar_offsets():
+    """apply_rope_freqs is finite and norm-preserving at AR offsets 0, 1, 5."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
         head_dim=128, len_h=4, len_w=5, len_t=2,
@@ -140,27 +99,26 @@ def test_rope_fast_path_works_for_all_ar_offsets():
         t_extrapolation_ratio=1.0,
     )
     for ar_idx in (0, 1, 5):
-        freqs = rope.shift_t(ar_idx)
-        cs = rope.to_cos_sin_cache(ar_idx)
-        x = torch.randn(2, freqs.shape[0], 16, 128)
-        out_fast = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
-        out_fallback = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=None)
-        diff = (out_fast - out_fallback).abs().max().item()
-        assert diff < 1e-5, f"ar_idx={ar_idx}: fast vs fallback diff={diff}"
+        cs = rope.shift_t(ar_idx)
+        x = torch.randn(2, cs.shape[0], 16, 128)
+        out = apply_rope_freqs(x, cs)
+        assert torch.isfinite(out).all(), f"ar_idx={ar_idx}: non-finite output"
+        assert torch.allclose(
+            out.norm(dim=-1), x.norm(dim=-1), atol=1e-4
+        ), f"ar_idx={ar_idx}: norm not preserved"
 
 
-def test_rope_fast_path_preserves_norm():
-    """Cos/sin cache path is norm-preserving (like the original)."""
+def test_rope_preserves_norm():
+    """The cos/sin rotation is norm-preserving (orthogonal rotation per pair)."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
         head_dim=128, len_h=4, len_w=5, len_t=2,
         h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    x = torch.randn(2, freqs.shape[0], 16, 128)
-    out = apply_rope_freqs(x, freqs, cos_sin_cache=cs)
+    cs = rope.shift_t(0)
+    x = torch.randn(2, cs.shape[0], 16, 128)
+    out = apply_rope_freqs(x, cs)
     assert torch.allclose(out.norm(dim=-1), x.norm(dim=-1), atol=1e-4)
 
 
@@ -172,19 +130,20 @@ def test_rope_batch_dimension_broadcast():
         h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    L = freqs.shape[0]
+    cs = rope.shift_t(0)
+    L = cs.shape[0]
     B = 4
     x = torch.randn(B, L, 16, 128)
 
-    # Fast path on full batch
-    out_batch = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
+    # Rotate the full batch at once.
+    out_batch = apply_rope_freqs(x.clone(), cs)
 
-    # Reference: rotate each batch element independently (should match)
+    # Reference: rotate each batch element independently (should match).
     for b in range(B):
-        out_single = apply_rope_freqs(x[b:b+1], freqs, cos_sin_cache=cs)
-        assert torch.allclose(out_batch[b:b+1], out_single, atol=1e-6), f"batch {b} mismatch"
+        out_single = apply_rope_freqs(x[b : b + 1], cs)
+        assert torch.allclose(
+            out_batch[b : b + 1], out_single, atol=1e-6
+        ), f"batch {b} mismatch"
 
 
 # ============================================================================
