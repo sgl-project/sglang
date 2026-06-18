@@ -36,8 +36,6 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUUnquantMoEMethod,
 )
 
-from sglang.srt.distributed import get_parallel
-
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 if TYPE_CHECKING:
@@ -868,8 +866,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
     
-        tp_size = get_parallel().moe_tp_size
-        tp_rank = get_parallel().moe_tp_rank
+        tp_size = getattr(layer, "moe_tp_size", 1)
+        tp_size = getattr(layer, "moe_tp_rank", 1)
     
         # ----------------------------------------------------------------
         # w13 (gate + up projections)
