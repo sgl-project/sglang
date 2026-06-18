@@ -55,15 +55,6 @@ elif is_cuda_alike():
 else:
     fp4_quantize = None
 
-_flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
-    tuple, dict[str, torch.Tensor]
-] = {}
-_flashinfer_trtllm_scale_reverse_indices_cache_mxfp8: dict[
-    tuple, torch.Tensor
-] = {}
-_FLASHINFER_TRTLLM_MXFP8_LAYOUT_ATTR = "_sglang_flashinfer_trtllm_mxfp8_layout"
-_FLASHINFER_TRTLLM_MXFP8_RESTORE_ATTR = "_sglang_flashinfer_trtllm_mxfp8_restore"
-
 
 def _is_gated(layer: Module) -> bool:
     """Return whether the MoE layer uses a gated activation (default True)."""
@@ -257,342 +248,16 @@ def _align_mxfp8_moe_weights(
     return padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_intermediate
 
 
-def _inverse_index(
-    indices: torch.Tensor, length: int | None = None, label: str = "indices"
-) -> torch.Tensor:
-    indices = indices.long()
-    if length is None:
-        length = indices.numel()
-    if indices.numel() != length:
-        raise ValueError(
-            f"{label} length mismatch: got {indices.numel()}, expected {length}"
-        )
-    if indices.numel() > 0:
-        min_index = int(indices.min())
-        max_index = int(indices.max())
-        if min_index < 0 or max_index >= length:
-            raise ValueError(
-                f"{label} out of range for length {length}: "
-                f"min={min_index}, max={max_index}"
-            )
-    inverse = torch.full(
-        (indices.numel(),), -1, dtype=torch.long, device=indices.device
-    )
-    inverse[indices] = torch.arange(indices.numel(), device=indices.device)
-    if indices.numel() > 0:
-        missing = torch.nonzero(inverse < 0).flatten()
-        if missing.numel() > 0:
-            sample = missing[:8].detach().cpu().tolist()
-            raise ValueError(
-                f"{label} is not a complete permutation for length {length}; "
-                f"missing {missing.numel()} entries, first missing={sample}"
-            )
-    return inverse
-
-
-def _gated_reorder_row_indices(num_rows: int, device: torch.device) -> torch.Tensor:
-    """TRT-LLM gated-act row order: [0, N/2, 1, N/2+1, ...]."""
-    if num_rows % 2 != 0:
-        raise ValueError(f"gated reorder expects an even row count, got {num_rows}")
-
-    row_indices = torch.arange(num_rows, device=device, dtype=torch.long)
-    half = (num_rows + 1) // 2
-    permuted_row_indices = torch.empty_like(row_indices)
-    permuted_row_indices[0::2] = row_indices[:half]
-    permuted_row_indices[1::2] = row_indices[half:]
-    return permuted_row_indices
-
-
-def _shuffle_matrix_a_row_indices(
-    num_rows: int, epilogue_tile_m: int, device: torch.device
-) -> torch.Tensor:
-    from flashinfer.utils import get_shuffle_matrix_a_row_indices
-
-    dummy = torch.empty((num_rows, 1), dtype=torch.uint8)
-    try:
-        row_indices = get_shuffle_matrix_a_row_indices(dummy, epilogue_tile_m)
-    except AssertionError as exc:
-        raise ValueError(
-            f"shuffle cannot generate row indices for rows={num_rows}, "
-            f"epilogue_tile_m={epilogue_tile_m}"
-        ) from exc
-    return row_indices.to(device=device)
-
-
-def _shuffle_matrix_sf_a_row_indices(
-    num_rows: int, num_cols: int, epilogue_tile_m: int, device: torch.device
-) -> torch.Tensor:
-    from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
-
-    dummy = torch.empty((num_rows, num_cols), dtype=torch.uint8)
-    try:
-        row_indices = get_shuffle_matrix_sf_a_row_indices(dummy, epilogue_tile_m)
-    except AssertionError as exc:
-        raise ValueError(
-            f"scale shuffle cannot generate row indices for rows={num_rows}, "
-            f"cols={num_cols}, epilogue_tile_m={epilogue_tile_m}"
-        ) from exc
-    return row_indices.to(device=device)
-
-
-def _validate_mxfp8_shuffle_indices(
-    cache: dict[str, torch.Tensor], gate_up_dim: int, hidden_size: int
-) -> None:
-    _inverse_index(cache["reorder_row_indices"], gate_up_dim, "w13 gated reorder")
-    _inverse_index(cache["w13_shuffle_row_indices"], gate_up_dim, "w13 shuffle")
-    _inverse_index(cache["w2_shuffle_row_indices"], hidden_size, "w2 shuffle")
-    _inverse_index(
-        cache["w13_scale_shuffle_row_indices"], gate_up_dim, "w13 scale shuffle"
-    )
-    _inverse_index(
-        cache["w2_scale_shuffle_row_indices"], hidden_size, "w2 scale shuffle"
-    )
-
-
-def _mxfp8_shuffle_indices(
-    w13_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    is_gated: bool,
-    epilogue_tile_m: int,
-    use_cache: bool = True,
-) -> dict[str, torch.Tensor]:
-    _, gate_up_dim, _ = w13_weight.shape
-    _, hidden_size, _ = w2_weight.shape
-    cache_key = (
-        is_gated,
-        tuple(w13_weight.shape),
-        tuple(w2_weight.shape),
-        tuple(w13_scale.shape),
-        tuple(w2_scale.shape),
-        epilogue_tile_m,
-        (w13_weight.device.type, w13_weight.device.index),
-        (w2_weight.device.type, w2_weight.device.index),
-        (w13_scale.device.type, w13_scale.device.index),
-        (w2_scale.device.type, w2_scale.device.index),
-    )
-    cache = (
-        _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.get(cache_key)
-        if use_cache
-        else None
-    )
-    if cache is None:
-        if is_gated:
-            reorder_row_indices = _gated_reorder_row_indices(
-                gate_up_dim, w13_weight.device
-            )
-        else:
-            reorder_row_indices = torch.arange(
-                gate_up_dim, device=w13_weight.device, dtype=torch.long
-            )
-        w13_shuffle_row_indices = _shuffle_matrix_a_row_indices(
-            gate_up_dim, epilogue_tile_m, w13_weight.device
-        )
-        w2_shuffle_row_indices = _shuffle_matrix_a_row_indices(
-            hidden_size, epilogue_tile_m, w2_weight.device
-        )
-        w13_scale_shuffle_row_indices = _shuffle_matrix_sf_a_row_indices(
-            gate_up_dim, w13_scale.shape[-1], epilogue_tile_m, w13_scale.device
-        )
-        w2_scale_shuffle_row_indices = _shuffle_matrix_sf_a_row_indices(
-            hidden_size, w2_scale.shape[-1], epilogue_tile_m, w2_scale.device
-        )
-        cache = {
-            "reorder_row_indices": reorder_row_indices,
-            "w13_shuffle_row_indices": w13_shuffle_row_indices,
-            "w2_shuffle_row_indices": w2_shuffle_row_indices,
-            "w13_scale_shuffle_row_indices": w13_scale_shuffle_row_indices,
-            "w2_scale_shuffle_row_indices": w2_scale_shuffle_row_indices,
-        }
-        if use_cache:
-            _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8[cache_key] = cache
-    else:
-        try:
-            _validate_mxfp8_shuffle_indices(cache, gate_up_dim, hidden_size)
-        except ValueError:
-            if use_cache:
-                _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.pop(
-                    cache_key, None
-                )
-            cache = _mxfp8_shuffle_indices(
-                w13_weight,
-                w2_weight,
-                w13_scale,
-                w2_scale,
-                is_gated,
-                epilogue_tile_m,
-                use_cache=False,
-            )
-    return cache
-
-
-def _block_scale_interleave_reverse(scale: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Inverse FlashInfer/TRT-LLM 128x4 scale interleave for one expert."""
-    key = (rows, cols, scale.device.type, scale.device.index)
-    indices = _flashinfer_trtllm_scale_reverse_indices_cache_mxfp8.get(key)
-    if indices is None:
-        row = torch.arange(rows, device=scale.device, dtype=torch.long)[:, None]
-        col = torch.arange(cols, device=scale.device, dtype=torch.long)[None, :]
-        num_sf_tiles_k = (cols + 3) // 4
-        indices = (
-            ((row // 128) * num_sf_tiles_k + col // 4) * 512
-            + (row % 32) * 16
-            + ((row % 128) // 32) * 4
-            + col % 4
-        ).reshape(-1)
-        _flashinfer_trtllm_scale_reverse_indices_cache_mxfp8[key] = indices
-
-    flat = scale.contiguous().view(-1)
-    return flat.index_select(0, indices).view(rows, cols)
-
-
-def restore_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
-    """Restore FlashInfer TRT-LLM MXFP8 MoE tensors back to canonical layout.
-
-    The TRT-LLM runtime layout is an in-place row/gated reorder plus scale
-    interleave. Weight update loaders expect canonical HF/Megatron order, so a
-    single-buffer design must invert that transform before copying new weights.
-    """
-    if getattr(layer, _FLASHINFER_TRTLLM_MXFP8_LAYOUT_ATTR, None) != "runtime":
-        return
-
-    w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
-    w2_weight = cast(torch.Tensor, layer.w2_weight).contiguous()
-    w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv).contiguous()
-    w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv).contiguous()
-
-    # align() records this immediately before flipping the layout to "runtime",
-    # so it is always present once we are past the guard above.
-    restore_meta = getattr(layer, _FLASHINFER_TRTLLM_MXFP8_RESTORE_ATTR, None)
-    assert (
-        restore_meta is not None
-    ), "restore metadata missing for runtime-layout MXFP8 MoE"
-    is_gated = restore_meta["is_gated"]
-    canonical_w13_shape = restore_meta["canonical_w13_shape"]
-    canonical_w2_shape = restore_meta["canonical_w2_shape"]
-    canonical_w13_scale_shape = restore_meta["canonical_w13_scale_shape"]
-    canonical_w2_scale_shape = restore_meta["canonical_w2_scale_shape"]
-
-    # All row-index transforms are pure shape transforms. Recompute them instead
-    # of trusting saved metadata so weight-check reset/update cycles cannot
-    # poison the restore path with stale or clobbered index tensors.
-    cache = _mxfp8_shuffle_indices(
-        w13_weight,
-        w2_weight,
-        w13_scale,
-        w2_scale,
-        is_gated,
-        epilogue_tile_m=128,
-        use_cache=False,
-    )
-
-    inv_reorder = _inverse_index(
-        cache["reorder_row_indices"], w13_weight.shape[1], "w13 gated reorder"
-    )
-    inv_w13_shuffle = _inverse_index(
-        cache["w13_shuffle_row_indices"], w13_weight.shape[1], "w13 shuffle"
-    )
-    inv_w2_shuffle = _inverse_index(
-        cache["w2_shuffle_row_indices"], w2_weight.shape[1], "w2 shuffle"
-    )
-    inv_w13_scale_shuffle = _inverse_index(
-        cache["w13_scale_shuffle_row_indices"],
-        w13_scale.shape[1],
-        "w13 scale shuffle",
-    )
-    inv_w2_scale_shuffle = _inverse_index(
-        cache["w2_scale_shuffle_row_indices"],
-        w2_scale.shape[1],
-        "w2 scale shuffle",
-    )
-
-    w13_u8 = w13_weight.view(torch.uint8)
-    w2_u8 = w2_weight.view(torch.uint8)
-    num_experts, gate_up_dim, _ = w13_weight.shape
-    _, hidden_size, _ = w2_weight.shape
-
-    w13_restored_u8 = torch.empty_like(w13_u8)
-    w2_restored_u8 = torch.empty_like(w2_u8)
-    w13_scale_restored = torch.empty_like(w13_scale)
-    w2_scale_restored = torch.empty_like(w2_scale)
-
-    for i in range(num_experts):
-        w13_restored_u8[i].copy_(
-            w13_u8[i]
-            .index_select(0, inv_w13_shuffle)
-            .index_select(0, inv_reorder)
-        )
-        w2_restored_u8[i].copy_(w2_u8[i].index_select(0, inv_w2_shuffle))
-
-        w13_scale_linear = _block_scale_interleave_reverse(
-            w13_scale[i], gate_up_dim, w13_scale.shape[-1]
-        )
-        w13_scale_restored[i].copy_(
-            w13_scale_linear.index_select(0, inv_w13_scale_shuffle).index_select(
-                0, inv_reorder
-            )
-        )
-
-        w2_scale_linear = _block_scale_interleave_reverse(
-            w2_scale[i], hidden_size, w2_scale.shape[-1]
-        )
-        w2_scale_restored[i].copy_(
-            w2_scale_linear.index_select(0, inv_w2_scale_shuffle)
-        )
-
-    copy_or_rebind_param(
-        layer,
-        "w13_weight",
-        w13_restored_u8[
-            : canonical_w13_shape[0],
-            : canonical_w13_shape[1],
-            : canonical_w13_shape[2],
-        ]
-        .contiguous()
-        .view(torch.float8_e4m3fn),
-    )
-    copy_or_rebind_param(
-        layer,
-        "w2_weight",
-        w2_restored_u8[
-            : canonical_w2_shape[0],
-            : canonical_w2_shape[1],
-            : canonical_w2_shape[2],
-        ]
-        .contiguous()
-        .view(torch.float8_e4m3fn),
-    )
-    copy_or_rebind_param(
-        layer,
-        "w13_weight_scale_inv",
-        w13_scale_restored[
-            : canonical_w13_scale_shape[0],
-            : canonical_w13_scale_shape[1],
-            : canonical_w13_scale_shape[2],
-        ].contiguous(),
-    )
-    copy_or_rebind_param(
-        layer,
-        "w2_weight_scale_inv",
-        w2_scale_restored[
-            : canonical_w2_scale_shape[0],
-            : canonical_w2_scale_shape[1],
-            : canonical_w2_scale_shape[2],
-        ].contiguous(),
-    )
-    layer.w13_weight_scale_inv.format_ue8m0 = True
-    layer.w2_weight_scale_inv.format_ue8m0 = True
-    setattr(layer, _FLASHINFER_TRTLLM_MXFP8_LAYOUT_ATTR, "canonical")
-
-
-def has_mxfp8_moe_runtime_layout_for_flashinfer_trtllm(layer: Module) -> bool:
-    return getattr(layer, _FLASHINFER_TRTLLM_MXFP8_LAYOUT_ATTR, None) == "runtime"
-
-
 def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
     from flashinfer import block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+    )
+    from flashinfer.utils import (
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
+    )
 
     is_gated = _is_gated(layer)
 
@@ -600,10 +265,6 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     w2_weight = cast(torch.Tensor, layer.w2_weight).contiguous()
     w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv).contiguous()
     w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv).contiguous()
-    canonical_w13_shape = tuple(w13_weight.shape)
-    canonical_w2_shape = tuple(w2_weight.shape)
-    canonical_w13_scale_shape = tuple(w13_scale.shape)
-    canonical_w2_scale_shape = tuple(w2_scale.shape)
 
     assert w13_scale.dtype == torch.uint8
     assert w2_scale.dtype == torch.uint8
@@ -618,29 +279,34 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    # Reuse precomputed row-index transforms whenever shape/device are unchanged.
+    # Recompute the row-index transforms on every align. They are cheap
+    # (shape-only) and must NOT be cached on the GPU: sglang reuses the
+    # weights-region memory across weight-update cycles, which can clobber a
+    # cached index tensor into a wrong/garbage permutation -> weights get
+    # shuffled into garbage -> ~3.83 logprob diff. Recomputing each time is
+    # correct by construction and removes any stale/clobbered-cache risk.
     w13_weight_u8 = w13_weight.view(torch.uint8)
     w2_weight_u8 = w2_weight.view(torch.uint8)
-    cache = _mxfp8_shuffle_indices(
-        w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
-    )
-    setattr(
-        layer,
-        _FLASHINFER_TRTLLM_MXFP8_RESTORE_ATTR,
-        {
-            "is_gated": is_gated,
-            "canonical_w13_shape": canonical_w13_shape,
-            "canonical_w2_shape": canonical_w2_shape,
-            "canonical_w13_scale_shape": canonical_w13_scale_shape,
-            "canonical_w2_scale_shape": canonical_w2_scale_shape,
-        },
-    )
-
-    reorder_row_indices = cache["reorder_row_indices"]
-    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"]
-    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"]
-    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"]
-    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"]
+    if is_gated:
+        reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
+            w13_weight_u8[0]
+        ).to(w13_weight.device)
+    else:
+        reorder_row_indices = torch.arange(
+            gate_up_dim, device=w13_weight.device, dtype=torch.long
+        )
+    w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+        w13_weight_u8[0], epilogue_tile_m
+    ).to(w13_weight.device)
+    w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+        w2_weight_u8[0], epilogue_tile_m
+    ).to(w2_weight.device)
+    w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+        w13_scale[0].reshape(gate_up_dim, -1), epilogue_tile_m
+    ).to(w13_scale.device)
+    w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+        w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
+    ).to(w2_scale.device)
 
     w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
     w2_shuffled_u8 = torch.empty_like(w2_weight_u8)
@@ -685,7 +351,6 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     )
     layer.w13_weight_scale_inv.format_ue8m0 = True
     layer.w2_weight_scale_inv.format_ue8m0 = True
-    setattr(layer, _FLASHINFER_TRTLLM_MXFP8_LAYOUT_ATTR, "runtime")
 
 
 def _align_fp4_moe_weights(

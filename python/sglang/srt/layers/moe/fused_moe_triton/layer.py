@@ -760,12 +760,6 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
-        elif isinstance(method, Fp8MoEMethod):
-            method.maybe_restore_flashinfer_trtllm_mxfp8_weight_shape_for_load(
-                layer=self,
-                param=param,
-                weight_name=weight_name,
-            )
 
         loaded_weight = (
             loaded_weight.t().contiguous()
@@ -988,15 +982,6 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
-        if method.__class__.__name__ == "KTEPWrapperMethod":
-            method = method.gpu_method
-
-        if isinstance(method, Fp8MoEMethod):
-            method.maybe_restore_flashinfer_trtllm_mxfp8_weight_shape_for_load(
-                layer=self,
-                param=param,
-                weight_name=weight_name,
-            )
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (

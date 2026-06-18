@@ -1,6 +1,5 @@
 import logging
 import time
-from contextlib import contextmanager
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
@@ -67,11 +66,9 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        with self._canonical_mxfp8_flashinfer_trtllm_moe_layout():
-            named_tensors = [
-                (name, param.data.detach().cpu())
-                for name, param in self._model_state()
-            ]
+        named_tensors = [
+            (name, param.data.detach().cpu()) for name, param in self._model_state()
+        ]
         self._snapshot_tensors = dict(named_tensors)
         assert len(self._snapshot_tensors) == len(
             named_tensors
@@ -86,42 +83,40 @@ class WeightChecker:
     def _compare(self):
         assert self._snapshot_tensors is not None
 
-        with self._canonical_mxfp8_flashinfer_trtllm_moe_layout():
-            skip_compare_names = {
-                name
-                for name, param in self._model_state()
-                if getattr(param, "_skip_weight_check", False)
-            }
-            _check_tensors(
-                expect_tensors=_postprocess_tensors(
-                    self._snapshot_tensors, skip_compare_names
-                ),
-                actual_tensors=_postprocess_tensors(
-                    dict(self._model_state()), skip_compare_names
-                ),
-            )
+        skip_compare_names = {
+            name
+            for name, param in self._model_state()
+            if getattr(param, "_skip_weight_check", False)
+        }
+        _check_tensors(
+            expect_tensors=_postprocess_tensors(
+                self._snapshot_tensors, skip_compare_names
+            ),
+            actual_tensors=_postprocess_tensors(
+                dict(self._model_state()), skip_compare_names
+            ),
+        )
 
     def _compute_checksum(self) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        with self._canonical_mxfp8_flashinfer_trtllm_moe_layout():
-            skip_compare_names = {
-                name
-                for name, param in self._model_state()
-                if getattr(param, "_skip_weight_check", False)
-            }
+        skip_compare_names = {
+            name
+            for name, param in self._model_state()
+            if getattr(param, "_skip_weight_check", False)
+        }
 
-            # Reuse the snapshot/compare postprocess pipeline so fp8 weights are
-            # dequantized to bf16 before hashing — two (qweight, scale) pairs that
-            # produce the same bf16 must produce the same checksum.
-            checksums = {
-                name: _hash_tensor(tensor.data)
-                for name, should_compare, tensor in _postprocess_tensors(
-                    dict(self._model_state()), skip_compare_names
-                )
-                if should_compare
-            }
+        # Reuse the snapshot/compare postprocess pipeline so fp8 weights are
+        # dequantized to bf16 before hashing — two (qweight, scale) pairs that
+        # produce the same bf16 must produce the same checksum.
+        checksums = {
+            name: _hash_tensor(tensor.data)
+            for name, should_compare, tensor in _postprocess_tensors(
+                dict(self._model_state()), skip_compare_names
+            )
+            if should_compare
+        }
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -152,36 +147,6 @@ class WeightChecker:
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
-
-    @contextmanager
-    def _canonical_mxfp8_flashinfer_trtllm_moe_layout(self):
-        """Temporarily expose MXFP8 FlashInfer TRT-LLM MoE tensors as canonical.
-
-        That path stores expert weights/scales in-place in a runtime row-shuffled
-        layout. The weight checker compares against canonical update tensors, so
-        restore just for the check window and then put the runtime layout back.
-        """
-        try:
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_mxfp8_moe_weights_for_flashinfer_trtllm,
-                has_mxfp8_moe_runtime_layout_for_flashinfer_trtllm,
-                restore_mxfp8_moe_weights_for_flashinfer_trtllm,
-            )
-        except ImportError:
-            yield
-            return
-
-        restored_modules = []
-        for _, module in self._model_runner.model.named_modules():
-            if has_mxfp8_moe_runtime_layout_for_flashinfer_trtllm(module):
-                restore_mxfp8_moe_weights_for_flashinfer_trtllm(module)
-                restored_modules.append(module)
-
-        try:
-            yield
-        finally:
-            for module in restored_modules:
-                align_mxfp8_moe_weights_for_flashinfer_trtllm(module)
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
@@ -285,25 +250,14 @@ def _postprocess_tensors(
             if w_s.dtype == torch.int32:
                 # UE8M0 packed format (Blackwell DeepGEMM)
                 w_s_for_dequant = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
-            elif w_s.dtype == torch.uint8:
-                # Canonical MXFP8 E8M0 scales: value = 2^(u8 - 127); decode by
-                # placing the byte into the float32 exponent bits.
-                w_s_for_dequant = (w_s.to(torch.int32) << 23).view(torch.float32)
             else:
                 w_s_for_dequant = w_s
-
-            # Infer the block size from the weight/scale shapes instead of
-            # hardcoding 128x128: MXFP8 uses [1, 32] and a wrong block size
-            # both mis-maps the scales and blows up the repeat_interleave
-            # temporaries by 512x.
-            *_, n, k = w_q.shape
-            *_, n_s, k_s = w_s_for_dequant.shape
-            block_size = [-(-n // n_s), -(-k // k_s)]
 
             w_dequant = block_quant_dequant(
                 w_q,
                 w_s_for_dequant,
-                block_size=block_size,
+                # TODO do not hardcode
+                block_size=[128, 128],
                 dtype=torch.bfloat16,
             )
             yield name, True, w_dequant
