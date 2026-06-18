@@ -1386,12 +1386,6 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            # post_load_weights must run before process_weights_after_loading so
-            # that models which derive tensors from the raw (pre-transpose) weight
-            # layout (e.g. BailingMoE kv_b_proj channel-quant path) see the same
-            # un-transposed shapes as DefaultModelLoader, where post_load_weights
-            # is called from inside model.load_weights() before the outer
-            # process_weights_after_loading loop.
             _post_load_weights(model)
 
             for _, module in model.named_modules():
