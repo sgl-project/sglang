@@ -30,9 +30,12 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyPlan,
     launch_canary_verify_kernel,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
+# AMD folds into the per-PR unit-test suite at the CI-reduced range
+# (build_fast_matrix_cases via get_benchmark_range), not the 900s nightly sweep.
+register_amd_ci(est_time=90, suite="jit-kernel-unit-test-amd")
 
 
 _X_NAMES = [

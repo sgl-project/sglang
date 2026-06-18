@@ -14,9 +14,12 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
+# AMD folds into the per-PR unit-test suite at the CI-reduced range
+# (_BS_AXIS_CI/_SEQ_LEN_AXIS_CI via get_benchmark_range), not the nightly sweep.
+register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 
 _BS_AXIS_FULL: list[int] = [1, 8, 64, 256]
