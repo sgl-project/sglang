@@ -104,8 +104,7 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     server_args = get_global_server_args()
     prefill_backend, decode_backend = server_args.get_attention_backends()
     prefill_backend = (
-        getattr(attn_backend, "prefill_attention_backend_str", None)
-        or prefill_backend
+        getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
     )
     decode_backend = (
         getattr(attn_backend, "decode_attention_backend_str", None) or decode_backend
