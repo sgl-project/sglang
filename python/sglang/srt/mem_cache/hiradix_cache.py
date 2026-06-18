@@ -1353,15 +1353,6 @@ class HiRadixCache(RadixCache):
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
-        logger.debug(
-            "HiCache prefetch finalized for rid=%s min_completed_tokens=%d matched_length=%d "
-            "inserted_host_tokens=%d",
-            req_id,
-            min_completed_tokens,
-            matched_length,
-            loaded_from_storage,
-        )
-
         return True
 
     def terminate_prefetch(self, req_id: str):
