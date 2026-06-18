@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -175,6 +176,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_gpu_index = torch.empty(0, dtype=torch.int32)
         self.gpu_experts_mask_cuda: Optional[torch.Tensor] = None
         self.logical_to_gpu_index_cuda: Optional[torch.Tensor] = None
+        self.tp_rank = get_parallel().tp_rank
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None

@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -199,6 +200,7 @@ class Eagle3MLAModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
 
         target_hidden_size = (
@@ -256,12 +258,13 @@ class Eagle3MLAModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:
