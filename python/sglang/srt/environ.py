@@ -654,6 +654,13 @@ class Envs:
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    # Reject images larger than this many pixels before decoding them. PIL's
+    # Image.open only reads the header, so the size is known before the expensive
+    # full decode + downscale. Without this guard a decompression-bomb-sized image
+    # (e.g. a high-DPI rasterized PDF page) is fully decoded, which can take
+    # minutes. Matches PIL's default decompression-bomb threshold. Set to 0 to
+    # disable the check.
+    SGLANG_IMAGE_MAX_DECODE_PIXELS = EnvInt(89_478_485)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)

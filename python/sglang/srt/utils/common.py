@@ -904,6 +904,24 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+def _check_image_pixels(width: int, height: int) -> None:
+    """Reject images whose pixel count exceeds the configured limit.
+
+    A decompression-bomb-sized image (e.g. a high-DPI rasterized PDF page) can
+    take minutes to fully decode and downscale. PIL's Image.open only reads the
+    header, so the size is known before the expensive decode -- checking here lets
+    us fail fast with a clear error instead of grinding through the decode.
+    """
+    max_pixels = envs.SGLANG_IMAGE_MAX_DECODE_PIXELS.get()
+    num_pixels = width * height
+    if max_pixels > 0 and num_pixels > max_pixels:
+        raise ValueError(
+            f"Image is too large to decode: {width}x{height} = {num_pixels} pixels "
+            f"exceeds the limit of {max_pixels} pixels. Raise "
+            f"SGLANG_IMAGE_MAX_DECODE_PIXELS to allow larger images."
+        )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
@@ -925,7 +943,9 @@ def _load_image(
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    image = Image.open(BytesIO(image_bytes))
+    _check_image_pixels(image.width, image.height)
+    return image
 
 
 def load_image(
