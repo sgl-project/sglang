@@ -428,7 +428,6 @@ class Fp8LinearMethod(LinearMethodBase):
         Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         # Copy the layer attributes
-        output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -468,10 +467,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     assert quant_config.activation_scheme == "dynamic"
                 elif hasattr(quant_config, "linear_activation_scheme"):
                     assert quant_config.linear_activation_scheme == "dynamic"
-                if use_mxfp8 and not is_checkpoint_fp8_serialized:
-                    raise ValueError(
-                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
-                    )
 
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
@@ -514,6 +509,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)
+        elif use_mxfp8:
+            raise ValueError(
+                "MXFP8 requires fp8-serialized checkpoint for linear layers."
+            )
 
     def create_weights(
         self,
@@ -526,23 +525,15 @@ class Fp8LinearMethod(LinearMethodBase):
         skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
-        # Copy the layer attributes
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
         Fp8LinearMethod.create_fp8_weight_(
             layer,
             block_quant=self.block_quant,
             quant_config=self.quant_config,
             use_mxfp8=self.use_mxfp8,
-            output_size_per_partition=output_size_per_partition,
+            output_size_per_partition=sum(output_partition_sizes),
             input_size_per_partition=input_size_per_partition,
             output_partition_sizes=output_partition_sizes,
-            weight_loader=weight_loader,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
             skip_block_quant_check=skip_block_quant_check,
             input_size=input_size,
             output_size=output_size,
@@ -1248,7 +1239,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             extra_weight_attrs=extra_weight_attrs,
         )
 
-        if self.block_quant and get_moe_runner_backend().is_cutlass():
+        if (
+            not self.is_fp4_expert
+            and self.block_quant
+            and get_moe_runner_backend().is_cutlass()
+        ):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
