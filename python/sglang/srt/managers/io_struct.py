@@ -428,6 +428,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -597,6 +598,21 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_extra_key(self, num):
+        """Normalize extra_key for batch processing."""
+        if self.extra_key is None:
+            return
+        if isinstance(self.extra_key, str):
+            self.extra_key = [self.extra_key] * num
+        elif isinstance(self.extra_key, list):
+            if len(self.extra_key) != self.batch_size:
+                raise ValueError(
+                    "The length of extra_key should be equal to the batch size."
+                )
+            self.extra_key = self.extra_key * self.parallel_sample_num
+        else:
+            raise ValueError("extra_key should be a list or a string.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -713,7 +729,7 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1163,8 +1179,6 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1174,6 +1188,11 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
 
 
 @dataclass
@@ -1228,9 +1247,6 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
-
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1240,6 +1256,11 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
 
 
 @dataclass
@@ -2099,10 +2120,10 @@ class GetLoadsReqOutput(BaseReq):
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
-    # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
-    # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
+    # num_used_tokens plus pending tokens not already allocated in the KV pool.
+    # Used for DP balance.
     num_total_tokens: int = field(
-        metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
+        metadata={"metric": ("gauge", "Used tokens plus pending unallocated tokens")}
     )
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
@@ -2128,11 +2149,6 @@ class GetLoadsReqOutput(BaseReq):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
-
-
-@dataclass
-class WatchLoadUpdateReq(BaseReq):
-    loads: List[GetLoadsReqOutput]
 
 
 @dataclass
