@@ -55,6 +55,15 @@ elif is_cuda_alike():
 else:
     fp4_quantize = None
 
+# CPU cache of MXFP8 MoE row-index permutations, keyed by shape. Kept on CPU on
+# purpose: a GPU-resident index cache gets clobbered by sglang's weights-region
+# memory reuse across weight-update cycles (-> ~3.83 logprob diff). CPU memory is
+# not touched by that reuse, so cache here and move a fresh copy to the device at
+# use time.
+_flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
+    tuple, dict[str, torch.Tensor]
+] = {}
+
 
 def _is_gated(layer: Module) -> bool:
     """Return whether the MoE layer uses a gated activation (default True)."""
@@ -279,34 +288,57 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    # Recompute the row-index transforms on every align. They are cheap
-    # (shape-only) and must NOT be cached on the GPU: sglang reuses the
-    # weights-region memory across weight-update cycles, which can clobber a
-    # cached index tensor into a wrong/garbage permutation -> weights get
-    # shuffled into garbage -> ~3.83 logprob diff. Recomputing each time is
-    # correct by construction and removes any stale/clobbered-cache risk.
+    # Compute the row-index permutations once per shape, cache them on CPU, and
+    # move a fresh copy to the device each align (see the cache declaration above
+    # for why CPU). get_*_row_indices depends only on shape, so a shape key suffices.
     w13_weight_u8 = w13_weight.view(torch.uint8)
     w2_weight_u8 = w2_weight.view(torch.uint8)
-    if is_gated:
-        reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
-            w13_weight_u8[0]
-        ).to(w13_weight.device)
-    else:
-        reorder_row_indices = torch.arange(
-            gate_up_dim, device=w13_weight.device, dtype=torch.long
-        )
-    w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
-        w13_weight_u8[0], epilogue_tile_m
-    ).to(w13_weight.device)
-    w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
-        w2_weight_u8[0], epilogue_tile_m
-    ).to(w2_weight.device)
-    w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
-        w13_scale[0].reshape(gate_up_dim, -1), epilogue_tile_m
-    ).to(w13_scale.device)
-    w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
-        w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
-    ).to(w2_scale.device)
+    cache_key = (
+        gate_up_dim,
+        hidden_size,
+        w2_weight.shape[-1],
+        w13_scale.shape[-1],
+        w2_scale.shape[-1],
+        epilogue_tile_m,
+    )
+    cache = _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.get(cache_key)
+    if cache is None:
+        if is_gated:
+            reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
+                w13_weight_u8[0]
+            ).cpu()
+        else:
+            reorder_row_indices = torch.arange(gate_up_dim, dtype=torch.long)
+        w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w13_weight_u8[0], epilogue_tile_m
+        ).cpu()
+        w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w2_weight_u8[0], epilogue_tile_m
+        ).cpu()
+        w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w13_scale[0].reshape(gate_up_dim, -1), epilogue_tile_m
+        ).cpu()
+        w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
+        ).cpu()
+        cache = {
+            "reorder_row_indices": reorder_row_indices,
+            "w13_shuffle_row_indices": w13_shuffle_row_indices,
+            "w2_shuffle_row_indices": w2_shuffle_row_indices,
+            "w13_scale_shuffle_row_indices": w13_scale_shuffle_row_indices,
+            "w2_scale_shuffle_row_indices": w2_scale_shuffle_row_indices,
+        }
+        _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8[cache_key] = cache
+
+    reorder_row_indices = cache["reorder_row_indices"].to(w13_weight.device)
+    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"].to(w13_weight.device)
+    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"].to(w2_weight.device)
+    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"].to(
+        w13_scale.device
+    )
+    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"].to(
+        w2_scale.device
+    )
 
     w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
     w2_shuffled_u8 = torch.empty_like(w2_weight_u8)
