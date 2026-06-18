@@ -121,7 +121,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
-        tp_size = 4
 
         # --- w13 (gate & up) projection ---
         hidden_states = self.config.layer.w13_kernel.apply(
