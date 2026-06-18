@@ -90,7 +90,13 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     channel count. Grayscale (1ch) or RGBA (4ch) images then break the
     downstream torch.cat over a batch of images, which requires a
     consistent channel dimension. Normalize every tensor to 3 channels.
+
+    Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
+    input does not trip a device mismatch against the CUDA image_mean /
+    image_std_inv normalization constants downstream. No-op if already on
+    the device.
     """
+    image = image.cuda()
     if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
         image = image.unsqueeze(0)
     c = image.shape[0]
