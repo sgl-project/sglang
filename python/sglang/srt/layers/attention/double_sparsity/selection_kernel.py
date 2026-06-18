@@ -598,137 +598,6 @@ def _force_include_anchor(
     out = torch.where(out >= big, torch.full_like(out, -1), out).to(torch.int32)
     return out, (out >= 0).to(torch.int32).sum(-1)
 
-
-def _maybe_record_recall_oracle(
-    scores: torch.Tensor,
-    selected_indices: torch.Tensor,
-    layer_id: int,
-    max_top_k: int,
-    process_group=None,
-    recall_oracle: bool = False,
-    absorbed_scores: Optional[torch.Tensor] = None,
-    absorbed_indices: Optional[torch.Tensor] = None,
-) -> None:
-    """Record one recall-oracle sample for the active NIAH trial, if enabled.
-
-    Pure no-op (immediate return) when the oracle is off — so production
-    selection is byte-for-byte unchanged. Enabled either by the config-borne
-    ``recall_oracle`` flag (the path that reaches TP workers) or the env flag
-    (harness / unit tests).
-
-    **Fail-closed when enabled** — a diagnostic must never silently guess or
-    silently drop a sample. With no active trial, an out-of-range harness needle
-    position, or a payload-build exception, we emit an explicit ``failure``
-    record keyed by ``(request_id, trial_id, layer_id, decode_step)`` instead of
-    returning quietly; the sweep asserts on these + on missing successes. We do
-    NOT filter out-of-range positions (that silently masked the absent 64K
-    records) and we do NOT swallow exceptions.
-
-    Records ONLY on the primary TP rank: the scores are identical across ranks
-    after ``all_reduce_token_scores``, so rank-0-only recording avoids 8×
-    duplicate writes + cross-process file contention on the sink.
-    """
-    from sglang.srt.layers.attention.double_sparsity import oracle_artifact_sink as _sink
-
-    if recall_oracle:
-        # Latch the config-borne enable so the sink + trial-file paths resolve
-        # to the fixed cross-process defaults (env does not reach TP workers).
-        _sink.enable_via_config()
-    if not _sink.oracle_enabled():
-        return
-    # Primary-rank guard (scores are all-reduce-identical across TP ranks).
-    try:
-        _rk = -1
-        if (
-            process_group is not None
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
-            _rk = torch.distributed.get_rank(group=process_group)
-        if _rk not in (-1, 0):
-            return  # non-primary rank (silent — every rank but 0)
-    except Exception:
-        pass
-
-    sample_idx = _sink.next_sample_index()
-    trial = _sink.get_active_trial()
-    if trial is None:
-        # Fail-closed: enabled but no trial registered for this decode. Emit a
-        # marker (the harness clears the sink before measured trials, so warmup
-        # markers do not pollute the measured run).
-        _sink.record_oracle_failure(
-            reason="no_active_trial",
-            request_id=None,
-            trial_id=None,
-            layer_id=int(layer_id),
-            decode_step=int(sample_idx),
-        )
-        return
-
-    max_tokens = int(scores.shape[-1])
-    out_of_range = [p for p in trial.needle_positions if not (0 <= p < max_tokens)]
-    if out_of_range:
-        # Fail-closed: reject (do NOT filter) — a partial/empty span would
-        # silently mis-measure recall.
-        _sink.record_oracle_failure(
-            reason="span_out_of_range",
-            request_id=trial.request_id,
-            trial_id=trial.trial_id,
-            layer_id=int(layer_id),
-            decode_step=int(sample_idx),
-            extra={
-                "needle_positions": list(trial.needle_positions),
-                "out_of_range": out_of_range,
-                "max_tokens": max_tokens,
-            },
-        )
-        return
-
-    try:
-        from sglang.srt.layers.attention.double_sparsity.selection_recall_oracle import (
-            oracle_payload_for_row,
-        )
-
-        needle = torch.as_tensor(
-            trial.needle_positions, dtype=torch.int64, device=scores.device
-        )
-        payload = oracle_payload_for_row(
-            scores[0],
-            needle,
-            selected_indices_row=selected_indices[0],
-            stride=1,
-            index_topk=int(max_top_k),
-        )
-        # Side-by-side absorbed-latent payload (score-only diagnostic). Shares the
-        # one record + sample index — do NOT advance next_sample_index again — so
-        # the table and absorbed rows compare at the same (layer, decode_step).
-        if absorbed_scores is not None and absorbed_indices is not None:
-            payload["absorbed"] = oracle_payload_for_row(
-                absorbed_scores[0],
-                needle,
-                selected_indices_row=absorbed_indices[0],
-                stride=1,
-                index_topk=int(max_top_k),
-            )
-        _sink.record_oracle_sample(
-            request_id=trial.request_id,
-            trial_id=trial.trial_id,
-            layer_id=int(layer_id),
-            decode_step=int(sample_idx),
-            payload=payload,
-        )
-    except Exception as _e:
-        # Fail-closed: surface the failure as a record rather than swallowing it.
-        _sink.record_oracle_failure(
-            reason=f"exception:{type(_e).__name__}:{_e}",
-            request_id=trial.request_id,
-            trial_id=trial.trial_id,
-            layer_id=int(layer_id),
-            decode_step=int(sample_idx),
-        )
-        return
-
-
 def absorbed_topk_select(
     *,
     queries: torch.Tensor,
@@ -855,8 +724,6 @@ def retrieve_topk_graph_safe(
     process_group=None,
     reduce_ca=None,
     score_reduce_bf16: bool = False,
-    recall_oracle: bool = False,
-    score_capture: bool = False,
     scorer_norm: str = "off",
     head_agg: str = "max",
     anchor_mode: str = "off",
@@ -984,9 +851,7 @@ def retrieve_topk_graph_safe(
     # reads them: the legacy torch.topk pipeline scans the whole scratch, the
     # recall oracle ranks the full score row, and the anchor force-include is
     # defensive-listed. The sequence-bounded radix selector reads none of them.
-    _store_dead = (
-        radix_topk_scratch is None or recall_oracle or anchor_mode != "off"
-    )
+    _store_dead = radix_topk_scratch is None or anchor_mode != "off"
     # Score the logical positions straight from the resident fp8 latent into
     # scratch_scores IN PLACE. v_h is built into scratch_absorbed_v
     # allocation-free, then the paged absorbed kernel writes the score; from here
@@ -1049,7 +914,6 @@ def retrieve_topk_graph_safe(
     bf16_authoritative = (
         radix_topk_scratch is not None
         and bf16_used
-        and not recall_oracle
         and anchor_mode == "off"
     )
     topk_scores = scores_view
@@ -1058,9 +922,6 @@ def retrieve_topk_graph_safe(
     # The reduce mutates scores_view in place (copy_back) or returns a separate
     # bf16 view, so the pre-reduce values must be cloned NOW. Eager-only,
     # capture-guarded, off by default — one bool check on the hot path when off.
-    pre_reduce_snapshot = None
-    if score_capture and not torch.cuda.is_current_stream_capturing():
-        pre_reduce_snapshot = scores_view.detach().clone()
     if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.cuda.nvtx.range_push("ds_score_allreduce")
         reduced = reduce_token_scores(
@@ -1183,39 +1044,6 @@ def retrieve_topk_graph_safe(
     # t == logical position t (same domain as selection_capture). Eager decode
     # only (the host copy is illegal under capture); off by default — one getattr
     # here when off. Capture-guarded; this Python does not re-run on graph replay.
-    if score_capture and not torch.cuda.is_current_stream_capturing():
-        from sglang.srt.layers.attention.double_sparsity.score_capture import (
-            maybe_dump_score_capture,
-        )
-
-        maybe_dump_score_capture(
-            scores=topk_scores[:bs],
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            layer_id=layer_id,
-            pre_reduce_scores=(
-                pre_reduce_snapshot[:bs] if pre_reduce_snapshot is not None else None
-            ),
-        )
-
-    # Flag-gated recall oracle on the production GPU decode path. ``scores_view``
-    # is the all-reduced + per-request-masked score tensor (after the all_reduce
-    # above, the same tensor the top-K consumed); ``out_indices[:bs]`` is the
-    # selection. Capture-guarded (host syncs illegal during graph capture) and
-    # off by default, so production decode is unaffected. Records only in eager
-    # decode (under graph replay this Python does not re-run).
-    if not torch.cuda.is_current_stream_capturing():
-        # ``scores_view`` is the all-reduced + per-request-masked absorbed-latent
-        # score the top-K above consumed; ``out_indices[:bs]`` is the selection.
-        _maybe_record_recall_oracle(
-            scores_view,
-            out_indices[:bs],
-            layer_id,
-            max_top_k,
-            process_group=process_group,
-            recall_oracle=recall_oracle,
-        )
-
     return out_indices, out_lengths
 
 

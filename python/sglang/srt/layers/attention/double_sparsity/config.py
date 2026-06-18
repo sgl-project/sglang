@@ -27,10 +27,6 @@ _ALLOWED_FIELDS = {
     "head_agg",
     "anchor_mode",
     "anchor_budget",
-    "recall_oracle",
-    "selection_capture",
-    "latent_capture",
-    "score_capture",
     "selector_width_buckets",
     "selector_width_overflow_policy",
     "score_reduce_dtype",
@@ -52,57 +48,6 @@ _ALLOWED_FIELDS = {
 #   selection — "off" (default, none), "recency" (most-recent), "global"
 #   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
 # anchor_budget: how many anchor positions to force-include; 0 disables.
-# recall_oracle: config-borne enable for the fail-closed NIAH recall-oracle
-#   diagnostic (off by default; byte-identical selection). Config-borne so it
-#   reaches TP workers; requires --disable-cuda-graph (the hook does host syncs
-#   illegal under graph capture). NOTE: this disables graph CAPTURE, but the
-#   selector still runs the graph-safe path (retrieve_topk_graph_safe) eagerly —
-#   the oracle hook lives there.
-# score_capture: config-borne enable for the per-(layer, decode-step) absorbed
-#   SCORE-row dump — the post-reduce / post-mask fp32 score tensor the selection
-#   top-k consumes (logical-position indexed, same domain as selection_capture).
-#   The Q2 instrument: compare cold-vs-warm scores at the positions that flip in
-#   the selection. Eager decode only; capture-safe no-op under graph capture.
-#   Off by default (one getattr on the hot path when off; byte-identical
-#   selection). Requires --disable-cuda-graph (the dump host-copies).
-# selection_capture: config-borne enable for the per-(layer, decode-step)
-#   selection dump (selected_indices + valid_lengths). When on, the graph state
-#   allocates per-layer capture buffers, the selector mirrors every layer's
-#   selection into them (a captured device copy, so CUDA-graph replay keeps them
-#   current), and the model runner appends one per-rank dump file per decode
-#   step under cwd/.sglang_ds_selcap. Diagnostic only; off by default
-#   (byte-identical selection, zero hot-path cost when off).
-# selector_width_buckets: compact DS selector score widths (prefix windows) to
-#   capture as additional CUDA-graph variants alongside the always-present
-#   full req_to_token width. Default [5120]; an explicit [] captures full
-#   width only. Selection is bit-identical across widths (prefix-window
-#   semantics; overflow routes to the full-width variant). Each width must be
-#   a positive int; widths at or above the full req_to_token width are
-#   dropped at the runner.
-# selector_width_overflow_policy: how the DS selector-width CUDA-graph ladder
-#   treats a live sequence longer than every compact bucket.
-#   "full_fallback" (default, byte-compatible): also capture the full
-#   req_to_token width as the overflow fallback (today's behavior). "fail_closed":
-#   capture ONLY the compact buckets (no full-width graph — reclaiming its
-#   per-batch DS scratch) and raise a clear error if a live sequence exceeds the
-#   largest captured compact width, declaring a bounded served-width operating
-#   point. Requires >=1 compact bucket below the full width.
-# score_reduce_dtype: transport dtype for the cross-TP score SUM-reduce.
-#   "bf16" (default): scores are cast fp32->bf16 into preallocated scratch,
-#   reduced (custom-all-reduce v2 when the byte size passes its eligibility
-#   check, else NCCL on the raw group), and cast back — halving the reduce
-#   bytes over the static score width. Scoring and top-k stay fp32; the only
-#   numerics change is the reduce transport/output quantization, gated by the
-#   selection-recall bound. "fp32": the original in-place NCCL ring reduce.
-# enable_lifted_budget_decode: opt-in Tier-2.A adjustable-budget decode (AC-4).
-#   When True, the selector may pick more than the DSA index_topk (a wider budget
-#   recovers needles that rank in (index_topk, lifted_budget_top_k]); the opt-in
-#   backend remaps physical selected slots → compact dequantized-KV indices for
-#   flash_mla_sparse_fwd. Default False ⇒ the DSA dsa_index_topk==top_k assert is
-#   untouched. This is the NEW, explicit mechanism — NOT max_top_k / Twilight
-#   fields / the SGLANG_DS_ALLOW_TOPK_MISMATCH ablation escape.
-# lifted_budget_top_k: the fixed (padded) budget for the lifted-budget path; must
-#   be > index_topk and is only meaningful when enable_lifted_budget_decode is on.
 _DEFAULT_LIFTED_BUDGET_TOP_K = 0  # 0 = unset; required (>top_k) when lifted enabled
 _ALLOWED_SCORER_NORM = ("off",)
 _DEFAULT_SCORER_NORM = "off"
@@ -136,10 +81,6 @@ class DoubleSparsityConfig:
     head_agg: str = _DEFAULT_HEAD_AGG
     anchor_mode: str = _DEFAULT_ANCHOR_MODE
     anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
-    recall_oracle: bool = False
-    selection_capture: bool = False
-    latent_capture: bool = False
-    score_capture: bool = False
     selector_width_buckets: List[int] = field(
         default_factory=lambda: list(_DEFAULT_SELECTOR_WIDTH_BUCKETS)
     )
@@ -170,26 +111,6 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'anchor_budget' must be a non-negative integer, "
                 f"got {self.anchor_budget!r}."
-            )
-        if not isinstance(self.recall_oracle, bool):
-            raise ValueError(
-                f"Double Sparsity 'recall_oracle' must be a boolean, "
-                f"got {self.recall_oracle!r}."
-            )
-        if not isinstance(self.selection_capture, bool):
-            raise ValueError(
-                f"Double Sparsity 'selection_capture' must be a boolean, "
-                f"got {self.selection_capture!r}."
-            )
-        if not isinstance(self.latent_capture, bool):
-            raise ValueError(
-                f"Double Sparsity 'latent_capture' must be a boolean, "
-                f"got {self.latent_capture!r}."
-            )
-        if not isinstance(self.score_capture, bool):
-            raise ValueError(
-                f"Double Sparsity 'score_capture' must be a boolean, "
-                f"got {self.score_capture!r}."
             )
         if not isinstance(self.selector_width_buckets, list) or any(
             not isinstance(w, int) or isinstance(w, bool) or w <= 0
@@ -362,14 +283,6 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
         anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
         anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
-        recall_oracle=_coerce_bool(data.get("recall_oracle", False), "recall_oracle"),
-        selection_capture=_coerce_bool(
-            data.get("selection_capture", False), "selection_capture"
-        ),
-        latent_capture=_coerce_bool(
-            data.get("latent_capture", False), "latent_capture"
-        ),
-        score_capture=_coerce_bool(data.get("score_capture", False), "score_capture"),
         selector_width_buckets=_coerce_width_buckets(
             data.get(
                 "selector_width_buckets", list(_DEFAULT_SELECTOR_WIDTH_BUCKETS)

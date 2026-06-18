@@ -181,6 +181,24 @@ class DSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # Double Sparsity output buffer (preallocated by init_forward_metadata
+    # when DS is enabled). The DS adapter writes the expanded topk_indices
+    # into this buffer in-place so the captured path stays
+    # allocation-free. Shape: int32 [bs, max_top_k=2048]. None when DS is
+    # not in use.
+    ds_topk_indices_out: Optional[torch.Tensor] = None
+
+    # Double Sparsity allocation-free graph-safe scratch (preallocated by
+    # init_forward_metadata when DS is enabled). Routes the production
+    # `_select_topk_indices` call through `retrieve_topk_graph_safe`, which
+    # writes its outputs into `ds_graph_state.selected_indices` /
+    # `ds_graph_state.valid_lengths` and uses the nine scratch tensors for
+    # an allocation-free Triton + topk + searchsorted pipeline. None when
+    # DS is not in use (the path falls back to the allocating
+    # `DoubleSparsitySelector.retrieve_topk`).
+    ds_graph_state: Optional["DSGraphState"] = None
+
+
 
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
@@ -336,6 +354,153 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        # Cache the DS enable flag so init_forward_metadata can allocate
+        # the DS adapter's out buffer without re-checking server_args
+        # every batch.
+        self.enable_double_sparsity: bool = bool(
+            getattr(
+                model_runner.server_args, "enable_double_sparsity", False
+            )
+        )
+        self.ds_max_top_k: int = 2048
+        # Opt-in lifted-budget decode (graph-safe production path): the selector
+        # emits a WIDER fixed budget (lifted_budget_top_k > index_topk) and decode
+        # attends the dequantized selected slots via flash_mla_sparse_fwd instead of the
+        # default flashmla_kv. When off, every lifted code path below is skipped
+        # and the default decode is byte-identical.
+        self.ds_lifted_budget_decode: bool = False
+        # Config-borne selection-capture diagnostic: when on, ds_graph_state
+        # carries per-layer mirrors of (selected_indices, valid_lengths) sized
+        # by the token-label table's layer count (resolved below, after the
+        # bind-published table is read).
+        self.ds_selection_capture: bool = False
+        # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
+        # sizes the bf16 scratch in ds_graph_state.
+        self.ds_score_reduce_bf16: bool = False
+        # Compact DS selector widths to capture as extra graph variants
+        # (config-borne; empty = full width only). The CUDA-graph runner reads
+        # this to build its selector-width ladder.
+        self.ds_selector_width_buckets: list = []
+        # Overflow policy for the selector-width ladder (config-borne): the
+        # runner reads this to decide whether to also capture the full
+        # req_to_token width ("full_fallback", default) or fail closed beyond
+        # the largest compact bucket ("fail_closed").
+        self.ds_selector_width_overflow_policy: str = "full_fallback"
+        # Per-variant decode-metadata key channel: the CUDA-graph runner stamps
+        # this around capture/replay metadata init when DS selector-width
+        # keying is active (mirrors the _replay_forward_batch channel). None
+        # means plain int-bs keying (DS off, or width keying inactive).
+        self._ds_graph_variant_key = None
+        if self.enable_double_sparsity:
+            try:
+                from sglang.srt.layers.attention.double_sparsity.config import (
+                    parse_double_sparsity_config,
+                )
+
+                ds_cfg = parse_double_sparsity_config(
+                    model_runner.server_args.double_sparsity_config
+                )
+                self.ds_lifted_budget_decode = bool(
+                    ds_cfg.enable_lifted_budget_decode
+                )
+                self.ds_selection_capture = bool(
+                    getattr(ds_cfg, "selection_capture", False)
+                )
+                self.ds_score_reduce_bf16 = (
+                    getattr(ds_cfg, "score_reduce_dtype", "bf16") == "bf16"
+                )
+                self.ds_selector_width_buckets = list(
+                    getattr(ds_cfg, "selector_width_buckets", []) or []
+                )
+                self.ds_selector_width_overflow_policy = str(
+                    getattr(
+                        ds_cfg, "selector_width_overflow_policy", "full_fallback"
+                    )
+                )
+                # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state, so the
+                # selection/output buffers are lifted-width on the opt-in path.
+                self.ds_max_top_k = (
+                    int(ds_cfg.lifted_budget_top_k)
+                    if ds_cfg.enable_lifted_budget_decode
+                    else int(ds_cfg.top_k)
+                )
+            except Exception:
+                # Fall back to the canonical V3.2 default.
+                self.ds_max_top_k = 2048
+        # Selection context: populated by finalize_double_sparsity_bind()
+        # (called in model_runner before init_attention_backend), so this
+        # attribute is non-None whenever DS is enabled.
+        self._ds_channel_selection = getattr(
+            model_runner.server_args, "_ds_channel_selection", None
+        )
+        # Layer count for the selection-capture mirrors == the published channel
+        # selection's layer dimension (the same index space layer_id selects
+        # with). 0 (capture off / unbound) allocates no mirrors.
+        self.ds_selection_capture_layers: int = 0
+        if self.ds_selection_capture and self._ds_channel_selection is not None:
+            self.ds_selection_capture_layers = int(
+                self._ds_channel_selection.shape[0]
+            )
+        # Mask channel count (label_dim) for the absorbed scratch — derived from
+        # the published channel selection ([L, H, label_dim]); 0 leaves the
+        # scratch unallocated (and the selector falls back to the eager path).
+        self.ds_label_dim: int = (
+            int(self._ds_channel_selection.shape[-1])
+            if self._ds_channel_selection is not None
+            else 0
+        )
+        # Selection sizes its absorbed scratch (and slot_written bitmap) from
+        # ds_label_dim. A zero label_dim would silently size the scratch to 0 and
+        # drop the selector back onto the allocating fallback — fail closed
+        # instead of serving a broken selector.
+        if self.enable_double_sparsity and self.ds_label_dim <= 0:
+            raise RuntimeError(
+                "Double Sparsity is enabled but the channel selection was not "
+                "published on server_args (_ds_channel_selection is absent), so "
+                "ds_label_dim<=0. finalize_double_sparsity_bind() must publish "
+                "_ds_channel_selection before the DSA backend is built."
+            )
+        # Published by finalize_double_sparsity_bind() (which runs before this
+        # backend is constructed). Fall back to the model's own no-PE head width
+        # rather than a fixed default so a missing publish can never silently
+        # truncate a wider no-PE projection to a narrower one.
+        self._ds_qk_nope_head_dim: int = int(
+            getattr(
+                model_runner.server_args,
+                "_ds_qk_nope_head_dim",
+                self.qk_nope_head_dim,
+            )
+        )
+        # Slot-validity bitmap: 1 bool per (local layer, physical KV slot). A
+        # reused physical slot's STALE latent could be selected before the fresh
+        # KV write lands, so this bitmap drives the invalidate-before-select /
+        # mark-after-write lifecycle. Allocated whenever DS is enabled. Indexed by
+        # GLOBAL layer_id, like `_ds_channel_selection`.
+        self._ds_slot_written: Optional[torch.Tensor] = None
+        self._ds_slot_written_true: Optional[torch.Tensor] = None
+        self._ds_slot_written_false: Optional[torch.Tensor] = None
+        if self.enable_double_sparsity:
+            _num_local_layers = int(self._ds_channel_selection.shape[0])
+            _num_kv_slots = self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+            self._ds_slot_written = torch.zeros(
+                (_num_local_layers, _num_kv_slots),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # Device-resident scalar `True`/`False` for the slot_written bitmap
+            # writes (mark-after-write True here; invalidate-before-select False in
+            # deepseek_v2). A Python bool RHS materializes as a CPU scalar, which the
+            # indexed copy moves CPU->CUDA — illegal under CUDA-graph capture. Cached
+            # device scalars keep both writes pure device-side copies (graph-safe).
+            self._ds_slot_written_true = torch.ones(
+                (), dtype=torch.bool, device=self.device
+            )
+            self._ds_slot_written_false = torch.zeros(
+                (), dtype=torch.bool, device=self.device
+            )
+            # Publish so the model layer's selector path (deepseek_v2) can resolve
+            # it through the ForwardContext-published attention backend.
+            setattr(model_runner.server_args, "_ds_slot_written", self._ds_slot_written)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -703,6 +868,29 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (int(forward_batch.batch_size), self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = allocate_graph_state(
+                max_bs=int(forward_batch.batch_size),
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=int(self.req_to_token.shape[1]),
+                selection_capture_layers=self.ds_selection_capture_layers,
+                score_reduce_bf16=self.ds_score_reduce_bf16,
+                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
+                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
+                num_local_heads=self.num_q_heads,
+                label_dim=self.ds_label_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                device=cache_seqlens_int32.device,
+            )
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1004,6 +1192,16 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (bs, self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = self._ds_shared_graph_state(cache_seqlens_int32.device)
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1021,9 +1219,56 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[self._ds_decode_metadata_key(bs)] = metadata
         self.forward_metadata = metadata
+
+    def _ds_decode_metadata_key(self, bs: int):
+        """Per-variant decode metadata key: the runner's graph-variant key when
+        stamped (DS-on decode selector-width keying), else the plain batch
+        size. Keeps DS-off and speculative paths on today's int keys."""
+        variant_key = getattr(self, "_ds_graph_variant_key", None)
+        return bs if variant_key is None else variant_key
+
+    def _ds_selector_width_from_variant(self) -> int:
+        """Selector score width for the graph variant being captured: the
+        width half of the stamped (bs, width) key, else the full
+        req_to_token width (eager forwards and un-stamped captures)."""
+        variant_key = getattr(self, "_ds_graph_variant_key", None)
+        if isinstance(variant_key, tuple):
+            return int(variant_key[1])
+        return int(self.req_to_token.shape[1])
+
+    def _ds_shared_graph_state(self, device) -> "DSGraphState":
+        """The per-WIDTH shared DSGraphState for graph capture/replay.
+
+        One state per selector width serves every batch-size variant of that
+        width: allocated at the max capture batch size on first use, then
+        referenced by each variant's DSAMetadata (stable lifetime — graphs
+        bake these addresses in).
+        """
+        width = self._ds_selector_width_from_variant()
+        state = self._ds_graph_state_by_width.get(width)
+        if state is None:
+            state = allocate_graph_state(
+                max_bs=self._ds_graph_max_bs,
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=width,
+                selection_capture_layers=self.ds_selection_capture_layers,
+                score_reduce_bf16=self.ds_score_reduce_bf16,
+                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
+                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
+                num_local_heads=self.num_q_heads,
+                label_dim=self.ds_label_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                device=device,
+            )
+            self._ds_graph_state_by_width[width] = state
+        return state
+
 
     def _apply_cuda_graph_metadata(
         self,

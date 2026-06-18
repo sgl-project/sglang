@@ -3606,19 +3606,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 existing.update(ds_summary)
 
-        # Selection-capture diagnostic dump (config-borne `selection_capture`
-        # in the DS config; off by default). Reads the per-layer selection
-        # mirrors the captured graph keeps current and writes one per-rank
-        # file per decode step. Early-returns when the mirrors are absent.
-        if getattr(self.server_args, "enable_double_sparsity", False):
-            from sglang.srt.layers.attention.double_sparsity.selection_capture import (
-                maybe_dump_selection_capture,
-            )
-
-            maybe_dump_selection_capture(
-                forward_batch, self.attn_backend, self.tp_rank
-            )
-
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
