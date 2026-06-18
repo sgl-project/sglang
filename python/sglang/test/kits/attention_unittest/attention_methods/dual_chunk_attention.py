@@ -79,8 +79,6 @@ DUAL_CHUNK_SPARSE_SUB_WINDOW_CONFIG = {
 
 # Unit tests run without distributed initialization. Sparse dual-chunk config
 # lookup should see the single-rank default.
-# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
-# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(tp_rank=0)
 _parallel_override.__enter__()
 

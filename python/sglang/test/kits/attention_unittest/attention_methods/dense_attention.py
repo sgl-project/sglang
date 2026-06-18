@@ -26,8 +26,6 @@ from ..mock_server_args import make_mock_server_args
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
-# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
-# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 

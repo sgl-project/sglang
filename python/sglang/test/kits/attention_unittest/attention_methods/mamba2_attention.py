@@ -9,8 +9,6 @@ from torch import nn
 import sglang.srt.layers.linear as _linear_mod
 from sglang.srt.runtime_context import get_parallel
 
-# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
-# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(
     tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
 )

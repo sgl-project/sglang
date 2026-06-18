@@ -27,8 +27,6 @@ from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
-# Force a single-GPU topology via get_parallel(); module-level ref so GC of the
-# context manager doesn't undo the override.
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
