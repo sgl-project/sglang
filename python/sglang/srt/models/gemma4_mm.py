@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -595,7 +596,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        positions += 1
+        if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
+            positions = positions + 1
+        else:
+            positions += 1
+
         per_layer_inputs = None
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
@@ -603,9 +608,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+            # Use torch.where instead of boolean indexing for NPU graph compatibility
+            ple_ids = torch.where(
+                input_ids == self.config.image_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.video_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.audio_token_id, pad_id, ple_ids
+            )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.
