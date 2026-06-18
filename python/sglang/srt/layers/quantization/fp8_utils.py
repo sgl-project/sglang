@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
 )
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -1779,9 +1780,8 @@ def validate_fp8_block_shape(
     block_size: list[int],
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
-    from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
-    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

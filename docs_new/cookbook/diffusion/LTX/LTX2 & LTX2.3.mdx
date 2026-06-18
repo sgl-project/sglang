@@ -61,9 +61,10 @@ For two-stage pipelines, `--ltx2-two-stage-device-mode` controls transformer res
 
 | Mode | When to use it |
 | --- | --- |
-| `snapshot` | Recommended default. Balances latency and VRAM. |
 | `resident` | Best latency on high-VRAM GPUs because both DiTs can stay resident. |
 | `original` | Closest to the original two-stage switching semantics. |
+
+`snapshot` is kept only as a deprecated compatibility alias for `original` and may be removed after two release cycles; use `original` or `resident` in new configs.
 
 Other deployment flags:
 
@@ -81,13 +82,13 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 | Target | Recommended server flags | Notes |
 | --- | --- | --- |
 | LTX-2.3, 1 high-VRAM GPU | `--ltx2-two-stage-device-mode resident` | Fastest two-stage setup when both DiTs fit. |
-| LTX-2.3, 1 standard GPU | `--ltx2-two-stage-device-mode snapshot` | Lower VRAM than `resident`; use this when H100-class memory is tight. |
+| LTX-2.3, 1 standard GPU | `--ltx2-two-stage-device-mode original` | Lower VRAM than `resident`; use this when H100-class memory is tight. |
 | LTX-2, 2 GPUs | `--num-gpus 2 --enable-cfg-parallel` | Fastest verified 2-GPU setup; keep `--dit-layerwise-offload` disabled unless memory is tight. |
 | LTX-2.3, 2 GPUs | `--num-gpus 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 2-GPU setup. |
 | LTX-2.3, 4 GPUs | `--num-gpus 4 --tp-size 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 4-GPU layout: TP2 inside each CFG branch. |
 | Official comparison | `--ltx2-two-stage-device-mode original` | Use this only when matching the original LTX-2.3 stage-switch semantics matters. |
 
-Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `snapshot`.
+Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
 
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
 
