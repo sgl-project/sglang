@@ -979,7 +979,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         gemm1_clamp_limit = None
 
-    # Fail fast: TRTLLM FP4 kernels ignore parameterized swiglu (gemm1_alpha/beta) under ActivationType.Swiglu (verified bit-identical) and reject SwigluBias in activationTypeToGatedActType, so a parameterized model would silently generate garbage.
     if runner_config.gemm1_alpha is not None:
         raise NotImplementedError(
             "flashinfer_trtllm FP4 MoE does not support parameterized "
