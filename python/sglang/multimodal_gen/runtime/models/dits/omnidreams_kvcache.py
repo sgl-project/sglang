@@ -123,8 +123,8 @@ class BlockKVCache:
             f"divisible by chunk_size ({self.chunk_size})"
         )
 
-        self._k = torch.empty(self.k_shape, device=self.device, dtype=self.dtype)
-        self._v = torch.empty(self.v_shape, device=self.device, dtype=self.dtype)
+        self._k = torch.zeros(self.k_shape, device=self.device, dtype=self.dtype)
+        self._v = torch.zeros(self.v_shape, device=self.device, dtype=self.dtype)
 
     # ----- internal helpers ------------------------------------------------- #
     def _seq_slice(self, start: int | None, end: int | None) -> tuple[slice | int, ...]:

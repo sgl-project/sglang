@@ -24,6 +24,7 @@ on GPU (no checkpoint, no GPU required):
 
 import json
 import types
+from collections import OrderedDict
 from itertools import chain
 
 import pytest
@@ -176,6 +177,8 @@ def test_encode_text_normalizes_batchencoding():
     stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
     stage.tokenizer = _DictTokenizer()
     stage.text_encoder = _text_encoder
+    # __init__ is bypassed here, so seed the LRU cache _encode_text reads.
+    stage._text_embed_cache = OrderedDict()
 
     out = stage._encode_text("a prompt", torch.device("cpu"))
     assert out.shape == (1, _TEXT_MAX_LENGTH, n_layers * hidden)
