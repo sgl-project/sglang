@@ -140,9 +140,7 @@ FN_MAP = {
     [(128, 2048), (512, 4096), (1024, 4096), (2048, 8192)],
     [(128, 2048)],
 )
-@marker.benchmark(
-    "impl", ["flashinfer", "jit", "aot_sgl_kernel", "torch_ref"], unit="us"
-)
+@marker.benchmark("impl", ["flashinfer", "jit", "aot_sgl_kernel", "torch_ref"])
 def benchmark(m: int, n: int, impl: str):
     if impl == "flashinfer" and not _FLASHINFER_QUANT_AVAILABLE:
         marker.skip(f"flashinfer quant unavailable: {_FLASHINFER_QUANT_REASON}")

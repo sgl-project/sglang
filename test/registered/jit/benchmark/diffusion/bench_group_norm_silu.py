@@ -88,13 +88,16 @@ def benchmark(case_name: str, dtype_name: str, provider: str):
     x, weight, bias = make_inputs(case, dtype)
 
     if provider == "native":
-        fn = lambda x, weight, bias: native_group_norm_silu(
-            x, weight, bias, case.num_groups
-        )
+
+        def fn(x, weight, bias):
+            return native_group_norm_silu(x, weight, bias, case.num_groups)
+
     else:
-        fn = lambda x, weight, bias: triton_group_norm_silu(
-            x, weight, bias, num_groups=case.num_groups, eps=EPS
-        )
+
+        def fn(x, weight, bias):
+            return triton_group_norm_silu(
+                x, weight, bias, num_groups=case.num_groups, eps=EPS
+            )
 
     # Pass the read tensors as input_args so do_bench rotates (clones) them per
     # iteration; a zero-arg closure reuses the same buffers and reports L2-hot

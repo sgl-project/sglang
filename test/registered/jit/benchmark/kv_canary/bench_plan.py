@@ -211,7 +211,7 @@ def _make_plan_callable(inputs: dict):
 @marker.parametrize(
     "scenario,bs,prefix_len,mode,extend_len,pool_kind", _MATRIX_FULL, _MATRIX_CI
 )
-@marker.benchmark("provider", ["canary", "naive"], unit="us")
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_matrix(
     scenario: str,
     bs: int,
@@ -240,7 +240,7 @@ def benchmark_matrix(
 
 
 @marker.parametrize("bs,total_tokens,pool_kind", _TT_VALS)
-@marker.benchmark("provider", ["canary", "naive"], unit="us")
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_total_tokens(
     bs: int,
     total_tokens: int,
@@ -264,7 +264,7 @@ def benchmark_total_tokens(
 
 
 @marker.parametrize("bs,bs_padded,prefix_len,verify_capacity,pool_kind", _PC_VALS)
-@marker.benchmark("provider", ["canary", "naive"], unit="us")
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark_pool_capacity(
     bs: int,
     bs_padded: int,

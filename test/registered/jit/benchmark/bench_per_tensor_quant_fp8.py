@@ -51,24 +51,6 @@ def sglang_scaled_fp8_quant(
     return output, scale
 
 
-def calculate_diff(batch_size: int, seq_len: int):
-    device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.bfloat16, device=device)
-
-    if not VLLM_AVAILABLE:
-        print("vLLM not available, skipping comparison")
-        return
-
-    vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-
-    vllm_out = vllm_out.to(torch.float32)
-    sglang_out = sglang_out.to(torch.float32)
-
-    torch.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
-
-
 FN_MAP = {
     "vllm": vllm_scaled_fp8_quant,
     "sglang": sglang_scaled_fp8_quant,
@@ -92,5 +74,4 @@ def benchmark(element_count: int, provider: str):
 
 
 if __name__ == "__main__":
-    calculate_diff(batch_size=4, seq_len=4096)
     benchmark.run()

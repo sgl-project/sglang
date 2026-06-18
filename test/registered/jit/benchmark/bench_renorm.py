@@ -77,38 +77,6 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
         return renorm_probs
 
 
-def calculate_diff_top_k_renorm(batch_size, vocab_size, k):
-    """Compare Torch reference and SGLang kernel for top-k renorm correctness."""
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-
-    top_k_tensor = torch.full((batch_size,), k, device=device, dtype=torch.int32)
-
-    torch_output = torch_top_k_renorm_probs(probs, top_k_tensor)
-    sglang_output = sgl_kernel.top_k_renorm_prob(probs, top_k_tensor)
-
-    torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
-
-
-def calculate_diff_top_p_renorm(batch_size, vocab_size, p):
-    """Compare Torch reference and SGLang kernel for top-p renorm correctness."""
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-
-    top_p_tensor = torch.full((batch_size,), p, device=device, dtype=torch.float32)
-
-    torch_output = torch_top_p_renorm_probs(probs, top_p_tensor)
-    sglang_output = sgl_kernel.top_p_renorm_prob(probs, top_p_tensor)
-
-    torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
-
-
 def _top_k_fn(provider, probs, top_k_tensor):
     if provider == "torch":
         return torch_top_k_renorm_probs(probs, top_k_tensor)

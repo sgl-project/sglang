@@ -126,7 +126,7 @@ def _aot_scaled_fp4_mm(a_fp4, b_fp4, a_sf, b_sf, alpha):
     [(128, 4096, 4096), (512, 4096, 4096), (1024, 8192, 4096)],
     [(128, 4096, 4096)],
 )
-@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"], unit="us")
+@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"])
 def benchmark(m: int, n: int, k: int, impl: str):
     if impl == "aot_sgl_kernel" and not _AOT_SCALED_MM_AVAILABLE:
         marker.skip(f"legacy AOT scaled_mm unavailable: {_AOT_SCALED_MM_REASON}")

@@ -132,28 +132,51 @@ def bench_rmsnorm(shape, provider: str):
     out = torch.empty_like(x)
 
     if provider == "pytorch":
-        fn = lambda x: F.rms_norm(x, (hidden_size,), weight, EPS)
+
+        def fn(x):
+            return F.rms_norm(x, (hidden_size,), weight, EPS)
+
     elif provider == "sgl_kernel":
-        fn = lambda x: sgl_kernel.rmsnorm(x, weight, eps=EPS, out=out)
+
+        def fn(x):
+            return sgl_kernel.rmsnorm(x, weight, eps=EPS, out=out)
+
     elif provider == "flashinfer":
-        fn = lambda x: flashinfer_norm.rmsnorm(x, weight, eps=EPS, out=out)
+
+        def fn(x):
+            return flashinfer_norm.rmsnorm(x, weight, eps=EPS, out=out)
+
     elif provider == "jit_rmsnorm":
-        fn = lambda x: jit_rmsnorm(x, weight, out, EPS)
+
+        def fn(x):
+            return jit_rmsnorm(x, weight, out, EPS)
+
     elif provider == "triton_rms_norm_fn":
-        fn = lambda x: rms_norm_fn(x, weight, bias=None, residual=None, eps=EPS)
+
+        def fn(x):
+            return rms_norm_fn(x, weight, bias=None, residual=None, eps=EPS)
+
     elif provider == "quack":
         quack_rmsnorm_fwd = _load_quack_rmsnorm()
-        fn = lambda x: quack_rmsnorm_fwd(x, weight, eps=EPS)
+
+        def fn(x):
+            return quack_rmsnorm_fwd(x, weight, eps=EPS)
+
     else:  # flaggems
         flaggems_rms_norm = _load_flaggems_rmsnorm()
-        fn = lambda x: flaggems_rms_norm(x, (hidden_size,), weight, EPS)
+
+        def fn(x):
+            return flaggems_rms_norm(x, (hidden_size,), weight, EPS)
 
     # Pass x as input_args so do_bench rotates (clones) it per iteration to
-    # avoid the L2-hot effect of reusing one buffer. memory_args=() keeps the
-    # bandwidth footprint at `out` only (unchanged); sgl_kernel / flashinfer /
-    # jit write into `out`, counted explicitly so the in-place (None-returning)
-    # providers still report bandwidth.
-    return marker.do_bench(fn, input_args=(x,), memory_args=(), memory_output=(out,))
+    # avoid the L2-hot effect of reusing one buffer. Count both read inputs and
+    # the output buffer in the reported HBM bandwidth.
+    return marker.do_bench(
+        fn,
+        input_args=(x,),
+        memory_args=(x, weight),
+        memory_output=(out,),
+    )
 
 
 # ============================================================================
@@ -183,36 +206,45 @@ def bench_fused_add_rmsnorm(shape, provider: str):
     weight = torch.randn(hidden_size, device=DEFAULT_DEVICE, dtype=DTYPE)
 
     if provider == "pytorch":
-        fn = lambda x, residual: F.rms_norm(x + residual, (hidden_size,), weight, EPS)
+
+        def fn(x, residual):
+            return F.rms_norm(x + residual, (hidden_size,), weight, EPS)
+
     elif provider == "sgl_kernel":
-        fn = lambda x, residual: sgl_kernel.fused_add_rmsnorm(
-            x, residual, weight, eps=EPS
-        )
+
+        def fn(x, residual):
+            return sgl_kernel.fused_add_rmsnorm(x, residual, weight, eps=EPS)
+
     elif provider == "flashinfer":
-        fn = lambda x, residual: flashinfer_norm.fused_add_rmsnorm(
-            x, residual, weight, eps=EPS
-        )
+
+        def fn(x, residual):
+            return flashinfer_norm.fused_add_rmsnorm(x, residual, weight, eps=EPS)
+
     elif provider == "jit_fused_add_rmsnorm":
-        fn = lambda x, residual: jit_fused_add_rmsnorm(x, residual, weight, EPS)
+
+        def fn(x, residual):
+            return jit_fused_add_rmsnorm(x, residual, weight, EPS)
+
     elif provider == "quack":
         quack_rmsnorm_fwd = _load_quack_rmsnorm()
-        fn = lambda x, residual: quack_rmsnorm_fwd(
-            x, weight, residual=residual, eps=EPS
-        )
+
+        def fn(x, residual):
+            return quack_rmsnorm_fwd(x, weight, residual=residual, eps=EPS)
+
     else:  # flaggems
         flaggems_fused_add = _load_flaggems_fused_add()
-        fn = lambda x, residual: flaggems_fused_add(
-            x, residual, (hidden_size,), weight, EPS
-        )
+
+        def fn(x, residual):
+            return flaggems_fused_add(x, residual, (hidden_size,), weight, EPS)
 
     # sgl_kernel / flashinfer / jit / flaggems fused_add write x + residual in
     # place; passing them as input_args makes do_bench clone both per iter so
     # timing is not L2-hot (the prior input_args=() silently skipped this).
-    # memory_args=() keeps the bandwidth footprint at x + residual (unchanged).
+    # Count both read inputs and in-place outputs in reported HBM bandwidth.
     return marker.do_bench(
         fn,
         input_args=(x, residual),
-        memory_args=(),
+        memory_args=(x, residual, weight),
         memory_output=(x, residual),
     )
 
@@ -240,21 +272,40 @@ def bench_layernorm(shape, provider: str):
     out = torch.empty_like(x)
 
     if provider == "pytorch":
-        fn = lambda x: F.layer_norm(x, (hidden_size,), weight, bias, EPS)
+
+        def fn(x):
+            return F.layer_norm(x, (hidden_size,), weight, bias, EPS)
+
     elif provider == "triton_norm_infer":
-        fn = lambda x: norm_infer(x, weight, bias, eps=EPS, is_rms_norm=False, out=out)
+
+        def fn(x):
+            return norm_infer(x, weight, bias, eps=EPS, is_rms_norm=False, out=out)
+
     elif provider == "flashinfer":
-        fn = lambda x: flashinfer_norm.layernorm(x, fp32_weight, fp32_bias, EPS)
+
+        def fn(x):
+            return flashinfer_norm.layernorm(x, fp32_weight, fp32_bias, EPS)
+
     elif provider == "quack":
         quack_layernorm_fwd = _load_quack_layernorm()
-        fn = lambda x: quack_layernorm_fwd(x, fp32_weight, fp32_bias, EPS)
+
+        def fn(x):
+            return quack_layernorm_fwd(x, fp32_weight, fp32_bias, EPS)
+
     else:  # flaggems
         flaggems_layer_norm = _load_flaggems_layernorm()
-        fn = lambda x: flaggems_layer_norm(x, (hidden_size,), weight, bias)[0]
+
+        def fn(x):
+            return flaggems_layer_norm(x, (hidden_size,), weight, bias)[0]
 
     # Pass x as input_args so do_bench rotates (clones) it per iteration to
-    # avoid the L2-hot effect; memory_args=() keeps the footprint at `out` only.
-    return marker.do_bench(fn, input_args=(x,), memory_args=(), memory_output=(out,))
+    # avoid the L2-hot effect. Count both read inputs and output buffer.
+    return marker.do_bench(
+        fn,
+        input_args=(x,),
+        memory_args=(x, weight, bias),
+        memory_output=(out,),
+    )
 
 
 SEP = "=" * 80

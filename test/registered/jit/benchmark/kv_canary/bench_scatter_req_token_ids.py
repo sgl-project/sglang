@@ -47,7 +47,7 @@ def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
 
 
 @marker.parametrize("bs,seq_len", _BS_SEQ_FULL, _BS_SEQ_CI)
-@marker.benchmark("provider", ["triton"], unit="us")
+@marker.benchmark("provider", ["triton"])
 def benchmark(bs: int, seq_len: int, provider: str):
     inputs = _build_inputs(bs=bs, seq_len=seq_len, device=torch.device(DEFAULT_DEVICE))
     return marker.do_bench(

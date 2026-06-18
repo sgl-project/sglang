@@ -226,7 +226,7 @@ _DSV3_SHAPES = [
     _SQUARE_SHAPES + _DSV3_SHAPES,
     [(1024, 2048, 2048, 8)],
 )
-@marker.benchmark("impl", ["jit", "sgl_kernel"], unit="us")
+@marker.benchmark("impl", ["jit", "sgl_kernel"])
 def benchmark(total_tokens: int, n_g: int, k_g: int, num_experts: int, impl: str):
     if impl == "sgl_kernel" and not _SGL_KERNEL_AVAILABLE:
         marker.skip(f"sgl-kernel baseline unavailable: {_SGL_KERNEL_REASON}")

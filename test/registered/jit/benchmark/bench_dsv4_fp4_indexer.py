@@ -153,7 +153,7 @@ FN_MAP = {
     [(256, 8192), (256, 32768)],
     [(256, 8192)],
 )
-@marker.benchmark("impl", ["fp8", "fp4"], unit="us")
+@marker.benchmark("impl", ["fp8", "fp4"])
 def benchmark(batch: int, seq_len_kv: int, impl: str):
     if not _DEEPGEMM_AVAILABLE:
         marker.skip("DeepGEMM is unavailable.")

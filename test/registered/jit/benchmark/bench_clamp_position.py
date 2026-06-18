@@ -26,7 +26,7 @@ FN_MAP = {
 
 
 @marker.parametrize("size", [2**n for n in range(4, 16)], [256, 4096])
-@marker.benchmark("provider", ["jit", "torch_compile", "torch"], unit="us")
+@marker.benchmark("provider", ["jit", "torch_compile", "torch"])
 def benchmark(size: int, provider: str):
     seq_lens = torch.randint(
         0, 10000, (size,), dtype=torch.int64, device=DEFAULT_DEVICE

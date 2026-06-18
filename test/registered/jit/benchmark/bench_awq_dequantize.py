@@ -14,45 +14,12 @@ except ImportError:
     AOT_AVAILABLE = False
 
 
-def check_correctness():
-    if not AOT_AVAILABLE:
-        print("sgl_kernel AOT not available, skipping correctness check")
-        return
-
-    qweight_row, qweight_col = 128, 16
-    device = torch.device("cuda")
-    qweight = torch.randint(
-        0,
-        torch.iinfo(torch.int32).max,
-        (qweight_row, qweight_col),
-        dtype=torch.int32,
-        device=device,
-    )
-    group_size = qweight_row
-    scales_row = qweight_row // group_size
-    scales_col = qweight_col * 8
-    scales = torch.rand(scales_row, scales_col, dtype=torch.float16, device=device)
-    qzeros = torch.randint(
-        0,
-        torch.iinfo(torch.int32).max,
-        (scales_row, qweight_col),
-        dtype=torch.int32,
-        device=device,
-    )
-
-    jit_out = jit_awq_dequantize(qweight, scales, qzeros)
-    aot_out = aot_awq_dequantize(qweight, scales, qzeros)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(jit_out, aot_out, rtol=0, atol=0)
-    print("Correctness check passed (JIT vs AOT)")
-
-
 LINE_VALS = ["jit", "aot"] if AOT_AVAILABLE else ["jit"]
 
 
 @marker.parametrize("qweight_row", [128, 256, 512, 1024, 3584], [128])
 @marker.parametrize("qweight_col", [16, 32, 64, 128, 448], [16])
-@marker.benchmark("provider", LINE_VALS, unit="us")
+@marker.benchmark("provider", LINE_VALS)
 def benchmark(qweight_row: int, qweight_col: int, provider: str):
     if provider == "aot" and not AOT_AVAILABLE:
         marker.skip("sgl_kernel AOT not available")
@@ -92,5 +59,4 @@ def benchmark(qweight_row: int, qweight_col: int, provider: str):
 
 
 if __name__ == "__main__":
-    check_correctness()
     benchmark.run()

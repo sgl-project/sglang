@@ -64,9 +64,9 @@ def bench_fused_norm_scale_shift(
         layer = RMSNormScaleShift(D, EPS, affine, dtype=DTYPE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda x, shift, scale: layer.forward_native(x, shift, scale)
+        fn = layer.forward_native
     else:
-        fn = lambda x, shift, scale: layer.forward_cuda(x, shift, scale)
+        fn = layer.forward_cuda
 
     # Rotate the read tensors per iteration (do_bench clones input_args); a
     # zero-arg closure would keep them L2-hot and report wrongly fast numbers.
@@ -92,13 +92,9 @@ def bench_fused_scale_residual_norm_scale_shift(
         layer = ScaleResidualRMSNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda residual, x, gate, shift, scale: layer.forward_native(
-            residual, x, gate, shift, scale
-        )
+        fn = layer.forward_native
     else:
-        fn = lambda residual, x, gate, shift, scale: layer.forward_cuda(
-            residual, x, gate, shift, scale
-        )
+        fn = layer.forward_cuda
 
     # Rotate the read tensors per iteration (do_bench clones input_args); a
     # zero-arg closure would keep them L2-hot and report wrongly fast numbers.

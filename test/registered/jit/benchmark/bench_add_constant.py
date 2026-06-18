@@ -15,7 +15,7 @@ CONSTANT = 7
     [128, 1024, 1025, 4096, 4097, 65536, 2**20, 2**22, 2**24],
     [4096, 2**20],
 )
-@marker.benchmark("provider", ["jit_module", "jit_wrapper", "torch"], unit="us")
+@marker.benchmark("provider", ["jit_module", "jit_wrapper", "torch"])
 def benchmark(size: int, provider: str):
     src = torch.arange(size, dtype=torch.int32, device=DEFAULT_DEVICE)
 

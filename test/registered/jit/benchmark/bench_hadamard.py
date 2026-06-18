@@ -46,7 +46,7 @@ if SCIPY_AVAILABLE:
 
 @marker.parametrize("batch_size", [1, 16, 64, 256], [16])
 @marker.parametrize("dim", [64, 256, 1024, 4096, 8192, 16384, 32768], [1024])
-@marker.benchmark("provider", LINE_VALS, unit="us")
+@marker.benchmark("provider", LINE_VALS)
 def benchmark(batch_size: int, dim: int, provider: str):
     if provider == "aot_kernel" and not AOT_AVAILABLE:
         marker.skip("sgl_kernel AOT not available")

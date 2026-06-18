@@ -85,7 +85,7 @@ def _create_concat_mla_k_data(num_tokens):
     [256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
     [256, 1024],
 )
-@marker.benchmark("provider", ["aot", "jit", "torch"], unit="us")
+@marker.benchmark("provider", ["aot", "jit", "torch"])
 def bench_concat_mla_k(num_tokens: int, provider: str):
     k, k_nope, k_rope = _create_concat_mla_k_data(num_tokens)
     return marker.do_bench(
@@ -99,7 +99,7 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
 
 @marker.parametrize("dim_0", [1, 4, 8, 16, 32], [4, 16])
 @marker.parametrize("dim_1", [1, 8, 32, 128], [16])
-@marker.benchmark("provider", ["aot", "jit", "torch"], unit="us")
+@marker.benchmark("provider", ["aot", "jit", "torch"])
 def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
     a = torch.randn(dim_0, dim_1, A_LAST_DIM, dtype=DTYPE, device=DEVICE)
     b = torch.randn(dim_0, dim_1, B_LAST_DIM, dtype=DTYPE, device=DEVICE)

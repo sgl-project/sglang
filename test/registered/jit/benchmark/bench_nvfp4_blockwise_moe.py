@@ -218,7 +218,7 @@ FN_MAP = {
     [(128, 256, 128, 4), (256, 512, 128, 8), (512, 512, 256, 8)],
     [(128, 256, 128, 4)],
 )
-@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"], unit="us")
+@marker.benchmark("impl", ["jit", "aot_sgl_kernel", "torch_ref"])
 def benchmark(total_tokens: int, n: int, k: int, num_experts: int, impl: str):
     if impl == "aot_sgl_kernel" and not _AOT_GROUP_MM_AVAILABLE:
         marker.skip(f"legacy AOT grouped_mm unavailable: {_AOT_GROUP_MM_REASON}")

@@ -69,7 +69,9 @@ def _verify_num_slots(case: BenchCase) -> int:
     return max(2, case.bs * per_req_slots + 1)
 
 
-def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
+def _build_verify_inputs(
+    case: BenchCase, *, device: torch.device
+) -> Tuple[
     torch.Tensor,
     VerifyPlan,
     torch.Tensor,
@@ -169,7 +171,7 @@ def _build_context(
 
 
 @marker.parametrize(_MATRIX_NAMES, _MATRIX_FULL, _MATRIX_CI)
-@marker.benchmark("provider", ["canary", "naive"], unit="us")
+@marker.benchmark("provider", ["canary", "naive"])
 def benchmark(
     scenario: str,
     bs: int,
@@ -232,7 +234,7 @@ def benchmark(
 
 
 @marker.parametrize("kernel_kind_name", _KERNEL_KIND_VALS)
-@marker.benchmark("provider", ["canary"], unit="us")
+@marker.benchmark("provider", ["canary"])
 def benchmark_kernel_kind(
     kernel_kind_name: str,
     provider: str,
