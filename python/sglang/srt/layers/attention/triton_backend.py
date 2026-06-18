@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     next_power_of_2,
 )
 
