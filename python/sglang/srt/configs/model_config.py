@@ -595,27 +595,28 @@ class ModelConfig:
 
     def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
-        self.head_dim = getattr(
-            self.hf_text_config,
-            "head_dim",
-            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
-        )
-        self.v_head_dim = getattr(
-            self.hf_text_config,
-            "v_head_dim",
-            self.head_dim,
-        )
+        self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = (
+                self.hf_text_config.hidden_size
+                // self.hf_text_config.num_attention_heads
+            )
+            setattr(self.hf_text_config, "head_dim", self.head_dim)
 
-        self.swa_head_dim = getattr(
-            self.hf_text_config,
-            "swa_head_dim",
-            self.head_dim,
-        )
-        self.swa_v_head_dim = getattr(
-            self.hf_text_config,
-            "swa_v_head_dim",
-            self.swa_head_dim,
-        )
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        if self.v_head_dim is None:
+            self.v_head_dim = self.head_dim
+            setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
+
+        self.swa_head_dim = getattr(self.hf_text_config, "swa_head_dim", None)
+        if self.swa_head_dim is None:
+            self.swa_head_dim = self.head_dim
+            setattr(self.hf_text_config, "swa_head_dim", self.swa_head_dim)
+
+        self.swa_v_head_dim = getattr(self.hf_text_config, "swa_v_head_dim", None)
+        if self.swa_v_head_dim is None:
+            self.swa_v_head_dim = self.swa_head_dim
+            setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
@@ -1723,6 +1724,13 @@ def is_hybrid_swa_model(
         "LagunaForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
+        # Only treat Laguna as hybrid SWA when it actually has a sliding window.
+        if (
+            "LagunaForCausalLM" in model_architectures
+            and hf_text_config is not None
+            and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
         return True
     # Also recognize models that explicitly opt-in via their HF text config,
     # so custom hybrid-SWA architectures don't need to be added to the allowlist.
