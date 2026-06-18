@@ -23,8 +23,14 @@ class TestSessionRadixCache(unittest.TestCase):
     def setUp(self):
         dtype = torch.float16
         kv = MHATokenToKVPool(
-            size=64, page_size=1, dtype=dtype, head_num=2, head_dim=8,
-            layer_num=1, device="cpu", enable_memory_saver=False,
+            size=64,
+            page_size=1,
+            dtype=dtype,
+            head_num=2,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
         )
         allocator = TokenToKVPoolAllocator(
             size=64, dtype=dtype, device="cpu", kvcache=kv, need_sort=False
