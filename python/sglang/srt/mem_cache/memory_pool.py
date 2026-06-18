@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import functools
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
@@ -64,6 +65,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -80,6 +82,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -88,6 +91,23 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+
+@functools.lru_cache(maxsize=1)
+def _get_store_cache_xpu():
+    """Return the fused ``store_cache_xpu`` kernel from sgl-kernel-xpu, or None.
+
+    The fused SYCL kernel replaces 2x ``index_put`` KV-cache writes with a
+    single kernel launch. It lives in the XPU build of ``sgl_kernel`` and may
+    be absent (older kernel, CPU-only install) — in that case we fall back to
+    ``index_put``. Cached so the import is attempted only once.
+    """
+    try:
+        from sgl_kernel import store_cache_xpu
+
+        return store_cache_xpu
+    except ImportError:
+        return None
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -120,6 +140,22 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
             size_limit=size_limit,
         )
+
+    if _is_xpu and same_kv_dim:
+        # XPU uses the fused SYCL store_cache_xpu kernel from sgl-kernel-xpu
+        # (single launch instead of 2x index_put). The CUDA JIT store_cache
+        # above can't run on XPU, so this is a separate dispatch. Falls through
+        # to the naive index_put below when the kernel isn't installed.
+        store_cache_xpu = _get_store_cache_xpu()
+        if store_cache_xpu is not None:
+            store_cache_xpu(
+                k.view(-1, row_dim),
+                v.view(-1, row_dim),
+                k_cache.view(-1, row_dim),
+                v_cache.view(-1, row_dim),
+                indices,
+            )
+            return
 
     if _is_cpu and _cpu_has_amx_support:
         return torch.ops.sgl_kernel.store_cache_cpu(
