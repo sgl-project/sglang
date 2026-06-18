@@ -198,6 +198,35 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.weight = Parameter(weight.data, requires_grad=False)
             layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
 
+            # For fp8 block weights run with DeepGEMM (e.g. Blackwell SM100),
+            # the weights and scales must be requantized to UE8M0. Otherwise the
+            # kernel combines UE8M0 activation scales with float32 weight scales
+            # and produces garbage output. Mirrors Fp8LinearMethod's block path.
+            # Only requantize when DeepGEMM is the active runner (other backends,
+            # e.g. triton/cutlass, expect float32 scales).
+            from sglang.srt.layers.quantization.fp8_utils import (
+                deepgemm_w8a8_block_fp8_linear_with_fallback,
+                requant_weight_ue8m0_inplace,
+            )
+            from sglang.srt.model_loader.utils import (
+                should_deepgemm_weight_requant_ue8m0,
+            )
+
+            if (
+                should_deepgemm_weight_requant_ue8m0(
+                    weight_block_size=self.weight_block_size,
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
+                )
+                and self.w8a8_block_fp8_linear
+                is deepgemm_w8a8_block_fp8_linear_with_fallback
+                and not getattr(layer.weight_scale, "format_ue8m0", False)
+            ):
+                requant_weight_ue8m0_inplace(
+                    layer.weight, layer.weight_scale, self.weight_block_size
+                )
+                layer.weight_scale.format_ue8m0 = True
+
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
