@@ -385,9 +385,17 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            M, N = gate_up.shape
-            x = gate_up.new_empty((M, N // 2))
-            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            if _is_npu:
+                _g, _u = gate_up.chunk(2, dim=-1)
+                _lim = float(self.swiglu_limit)
+                gate_up = torch.cat(
+                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                )
+                x = self.act_fn(gate_up)
+            else:
+                M, N = gate_up.shape
+                x = gate_up.new_empty((M, N // 2))
+                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -493,6 +501,8 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif _is_npu:
+                logits = F.linear(hidden_states, self.weight, None)
             else:
                 if self.is_deepseek_v4:
                     from sglang.jit_kernel.dsv4 import linear_bf16_fp32
