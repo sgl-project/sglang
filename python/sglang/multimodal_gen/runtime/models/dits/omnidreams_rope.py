@@ -26,9 +26,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
 
-# OmniDreams uses non-interleaved (NeoX) rotation: the pair is (d, d + D/2).
-ROPE_IS_NEOX_STYLE = True
-
 
 def rope_dims(head_dim: int) -> tuple[int, int, int]:
     """Return the (T, H, W) split of a head dim for 3D RoPE.
@@ -117,6 +114,7 @@ def apply_rope_freqs(x: Tensor, cos_sin: Tensor) -> Tensor:
     # cos/sin are shared across batch and heads (_apply_rotary_emb broadcasts heads).
     cos = cos.unsqueeze(0).expand(B, -1, -1).reshape(B * S, half)
     sin = sin.unsqueeze(0).expand(B, -1, -1).reshape(B * S, half)
+    # NeoX (non-interleaved) rotation: the rotated pair is (d, d + D/2).
     return _apply_rotary_emb(
         x.reshape(B * S, H, D), cos, sin, is_neox_style=True, interleaved=False
     ).reshape(B, S, H, D)

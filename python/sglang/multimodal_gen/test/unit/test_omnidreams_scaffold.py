@@ -16,11 +16,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
     OmniDreamsPipelineConfig,
     warp_flow_match_sigmas,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
-    ROPE_IS_NEOX_STYLE,
-    OmniDreamsDiT,
-    rope_dims,
-)
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import rope_dims
 
 _KEY_FIXTURE = os.path.join(
     os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt"
@@ -99,4 +96,3 @@ def test_two_step_flow_match_sigmas():
 def test_rope_layout_neox_44_42_42():
     assert rope_dims(128) == (44, 42, 42)
     assert sum(rope_dims(128)) == 128
-    assert ROPE_IS_NEOX_STYLE is True

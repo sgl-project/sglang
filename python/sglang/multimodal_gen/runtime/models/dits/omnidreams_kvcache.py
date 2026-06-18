@@ -108,7 +108,6 @@ class BlockKVCache:
         assert (
             -tensor_dim <= self.seq_dim < tensor_dim
         ), f"seq_dim must be in [-{tensor_dim}, {tensor_dim}), got {self.seq_dim}"
-        # Normalize seq_dim to a non-negative index.
         self.seq_dim = self.seq_dim if self.seq_dim >= 0 else self.seq_dim + tensor_dim
 
         assert self.sink_size >= 0, "sink_size must be non-negative"

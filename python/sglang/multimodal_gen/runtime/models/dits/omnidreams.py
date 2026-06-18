@@ -35,19 +35,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
-
-# RoPE primitives live in omnidreams_rope; re-exported here for callers/tests.
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (  # noqa: F401
-    ROPE_IS_NEOX_STYLE,
-    RotaryPositionEmbedding3D,
-    apply_rope_freqs,
-    rope_dims,
-)
-
-# OmniDreams builds Column/Row/MergedColumnParallelLinear directly (cf. ltx_2.py,
-# flux_2.py). The runtime always initialises model parallelism (world_size==1 on a
-# single card), so get_tp_world_size() is valid and equals 1 when TP is off; the
-# per-rank head count is divide(num_heads, get_tp_world_size()).
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import apply_rope_freqs
 
 
 def _sp_size() -> int:
