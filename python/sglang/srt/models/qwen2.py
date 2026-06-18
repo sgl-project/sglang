@@ -46,11 +46,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.engram import (
+    EngramStoreConfig,
+    EngramStoreManager,
+    get_global_engram_store_manager,
+    set_global_engram_store_manager,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.models.engram.engram import Engram, backbone_config, engram_cfg
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -420,6 +427,200 @@ class Qwen2Model(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
+
+
+class Qwen2MoelEngram(Qwen2Model):
+    def __init__(
+        self,
+        config: Qwen2Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        engram_layer_ids: Optional[List[int]] = None,
+    ) -> None:
+        super().__init__(
+            config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=decoder_layer_type,
+            alt_stream=alt_stream,
+        )
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.engram_layer_ids = set(engram_layer_ids or engram_cfg.layer_ids)
+        self.engram_modules: Dict[int, Engram] = {}
+        self.engram_store_manager: Optional[EngramStoreManager] = None
+        if self.tp_rank == 0:
+            self._init_engram_modules()
+
+    def _init_engram_modules(self) -> None:
+        if not self.engram_layer_ids:
+            return
+
+        backbone_config.hidden_size = self.config.hidden_size
+        backbone_config.vocab_size = self.config.vocab_size
+        backbone_config.num_layers = self.config.num_hidden_layers
+        if hasattr(self.config, "tokenizer_name_or_path"):
+            engram_cfg.tokenizer_name_or_path = self.config.tokenizer_name_or_path
+        elif hasattr(self.config, "_name_or_path"):
+            engram_cfg.tokenizer_name_or_path = self.config._name_or_path
+        if (
+            hasattr(self.config, "pad_token_id")
+            and self.config.pad_token_id is not None
+        ):
+            engram_cfg.pad_id = self.config.pad_token_id
+
+        self.engram_store_manager = get_global_engram_store_manager()
+        if self.engram_store_manager is None:
+            store_cfg = EngramStoreConfig(
+                store_backend=engram_cfg.store_backend,
+                layer_ids=list(sorted(self.engram_layer_ids)),
+            )
+            self.engram_store_manager = EngramStoreManager(store_cfg)
+            set_global_engram_store_manager(self.engram_store_manager)
+
+        for layer_id in sorted(self.engram_layer_ids):
+            if self.start_layer <= layer_id < self.end_layer:
+                self.engram_modules[layer_id] = Engram(
+                    layer_id=layer_id,
+                    store_manager=self.engram_store_manager,
+                )
+
+    def _prepare_engram_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if hidden_states.dim() == 4:
+            return hidden_states
+        if hidden_states.dim() == 3:
+            batch_size, seq_len, hidden_size = hidden_states.shape
+            return hidden_states.unsqueeze(2).expand(
+                batch_size, seq_len, backbone_config.hc_mult, hidden_size
+            )
+        if hidden_states.dim() == 2:
+            seq_len, hidden_size = hidden_states.shape
+            return (
+                hidden_states.unsqueeze(0)
+                .unsqueeze(2)
+                .expand(1, seq_len, backbone_config.hc_mult, hidden_size)
+            )
+        return None
+
+    def _prepare_engram_input_ids(
+        self, input_ids: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if input_ids is None:
+            return None
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        elif input_ids.dim() > 2:
+            input_ids = input_ids.view(input_ids.size(0), -1)
+        return input_ids.detach()
+
+    def _run_engram(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
+        if engram_hidden_states is None:
+            return None
+        engram = self.engram_modules.get(layer_id)
+        if engram is None:
+            return None
+        engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        if engram_input_ids is None:
+            output = torch.zeros_like(engram_hidden_states)
+        else:
+            output = engram(engram_hidden_states, engram_input_ids)
+        if output.device != hidden_states.device:
+            output = output.to(hidden_states.device)
+        if output.dtype != hidden_states.dtype:
+            output = output.to(hidden_states.dtype)
+        return output
+
+    def _start_engram_prefetch(
+        self,
+        input_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> None:
+        engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        if engram_input_ids is None:
+            return
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        for layer_id in sorted(self.engram_layer_ids):
+            if self.start_layer <= layer_id < self.end_layer:
+                engram = self.engram_modules.get(layer_id)
+                if engram is not None:
+                    engram.start_prefetch(engram_input_ids, device, dtype)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        if self.tp_rank == 0:
+            if (
+                forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                or forward_batch.forward_mode.is_decode()
+            ):
+                self._start_engram_prefetch(input_ids, hidden_states)
+
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+            if i in self.engram_layer_ids:
+                if self.tp_rank == 0:
+                    engram_output = self._run_engram(i, hidden_states, input_ids)
+                    if engram_output is not None:
+                        hidden_states = hidden_states + engram_output.sum() * 0
+                else:
+                    # TODO: Transfer engram embeddings to other ranks if necessary
+                    pass
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Qwen2ForCausalLM(nn.Module):
