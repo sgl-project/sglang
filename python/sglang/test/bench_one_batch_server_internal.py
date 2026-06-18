@@ -2,8 +2,6 @@ import argparse
 import dataclasses
 import itertools
 import json
-import multiprocessing
-import os
 import random
 import re
 import time
@@ -17,12 +15,13 @@ from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.benchmark.datasets import get_dataset
+from sglang.benchmark.endpoint import acquire_endpoint
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_blackwell, kill_process_tree
+from sglang.srt.utils import is_blackwell
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 DEFAULT_TIMEOUT = 600
@@ -370,43 +369,6 @@ class BenchOneCaseResult(BaseModel):
                 ),
             }
             fout.write(json.dumps(res) + "\n")
-
-
-def launch_server_internal(launch_server_func: Callable, server_args: ServerArgs):
-    try:
-        launch_server_func(server_args)
-    except Exception as e:
-        raise e
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
-
-
-def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
-    proc = multiprocessing.Process(
-        target=launch_server_internal,
-        args=(
-            launch_server_func,
-            server_args,
-        ),
-    )
-    proc.start()
-    base_url = f"http://{server_args.host}:{server_args.port}"
-
-    start_time = time.time()
-    while time.time() - start_time < DEFAULT_TIMEOUT:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-            }
-            response = requests.get(
-                f"{base_url}/v1/models", headers=headers, timeout=DEFAULT_TIMEOUT
-            )
-            if response.status_code == 200:
-                return proc, base_url
-        except requests.RequestException:
-            pass
-        time.sleep(10)
-    raise TimeoutError("Server failed to start within the timeout period.")
 
 
 def _warmup_cache(
@@ -883,11 +845,9 @@ def run_benchmark_internal(
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
 
-    # launch a server or use the provided base_url
-    if bench_args.base_url:
-        proc, base_url = None, bench_args.base_url
-    else:
-        proc, base_url = launch_server_process(launch_server_func, server_args)
+    # Resolve the benchmark target: launch a server, or connect to --base-url.
+    endpoint = acquire_endpoint(server_args, bench_args.base_url, launch_server_func)
+    base_url = endpoint.base_url
 
     # Get tokenizer and server info
     if bench_args.backend == "vllm":
@@ -1138,8 +1098,7 @@ def run_benchmark_internal(
             for res, profile_res in zip(results, profile_results, strict=False):
                 res.profile_link = profile_res.profile_link
     finally:
-        if proc:
-            kill_process_tree(proc.pid)
+        endpoint.close()
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 
