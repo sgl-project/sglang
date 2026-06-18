@@ -67,6 +67,7 @@ class TestNgramGenerateTreeMask(CustomTestCase):
             ([1, 255, 256, 257], 8),
             ([2, 17, 257], 12),
             ([1, 128, 300, 1025], 24),
+            ([1, 1024, 4099, 8192, 32768, 65536], 128),
         ]:
             with self.subTest(seq_lens=seq_lens, draft_token_num=draft_token_num):
                 batch = _make_batch(seq_lens)
