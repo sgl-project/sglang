@@ -612,6 +612,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
+        # Optional int8 checkpoint pool: the radix caches states here (int8) instead
+        # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
+        # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_int8_mamba_checkpoint_pool,
+        )
+
+        self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
+            mamba_size=mamba_size,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=device,
+        )
+
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
@@ -821,6 +835,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        # The int8 checkpoint pool holds radix-cached states in its own slots; a
+        # flush/reset drops the radix tree, so its slots must be released too,
+        # otherwise the (now unreferenced) slots leak and break the int8-pool
+        # invariant (int8_available + radix_cached != int8_total).
+        if self.mamba_ckpt_pool is not None:
+            self.mamba_ckpt_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
