@@ -1,6 +1,6 @@
 ---
-title: "Inference Batching"
-description: "Batch compatible native SGLang-Diffusion requests during serving."
+title: "Dynamic Batching"
+description: "Batch compatible queued native SGLang-Diffusion requests during serving."
 tag: "preserve"
 mode: wide
 ---
@@ -38,31 +38,6 @@ Use `--batching-config /path/to/batching_config.json` to load JSON rules when a 
   ]
 }
 ```
-
-## Continuous batching
-
-Continuous batching is an opt-in SGLang-Diffusion serving mode that batches compatible denoising steps from active requests. Unlike dynamic batching, new requests can join while other requests are already denoising, and completed requests can leave without waiting for the original batch to finish.
-
-```bash Command
-sglang serve \
-  --model-path Qwen/Qwen-Image-2512 \
-  --backend sglang \
-  --port 30010 \
-  --batching-mode continuous \
-  --batching-max-size 4 \
-  --batching-delay-ms 5 \
-  --enable-batching-metrics
-```
-
-Continuous batching currently supports native SGLang prompt-only image-generation pipelines that expose a standard denoising stage. Pipelines that route through a progressive-resolution denoising router use the full-resolution standard denoising stage for continuous batching.
-
-Current limitations:
-
-- Native SGLang backend only. Continuous batching is not supported with `--backend diffusers`.
-- Prompt-only requests only. Image-conditioned requests, edits, I2V, TI2V, and other non-text-only tasks are rejected at request admission.
-- Rollout requests, TeaCache, Cache-DiT, startup LoRA adapters, raw-frame streaming responses, disaggregated serving, DiT CPU offload, and DiT layerwise offload are not currently supported.
-- Requests are packed only when their denoising-step inputs are compatible. Requests with incompatible shapes or metadata run separately.
-- The benchmark coverage for this mode currently uses `Qwen/Qwen-Image-2512`.
 
 ## Compatibility
 
