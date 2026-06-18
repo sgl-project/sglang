@@ -1,7 +1,7 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell, is_hip, is_musa
+from sglang.srt.utils.common import is_blackwell, is_hip, is_musa, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +236,11 @@ class DraftBackendFactory:
         )
 
     def _create_dsv4_decode_backend(self):
-        if is_hip():
+        # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its
+        # draft path reuses the Ascend multi-step draft backend.
+        if is_npu():
+            return self._create_ascend_decode_backend()
+        elif is_hip():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4MultiStepBackend,
             )
@@ -333,7 +337,11 @@ class DraftBackendFactory:
         return None
 
     def _create_dsv4_prefill_backend(self):
-        if is_hip():
+        # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its
+        # draft-extend path reuses the Ascend prefill draft backend.
+        if is_npu():
+            return self._create_ascend_prefill_backend()
+        elif is_hip():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4HipRadixBackend,
             )
