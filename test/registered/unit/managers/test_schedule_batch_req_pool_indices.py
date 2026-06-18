@@ -9,6 +9,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -62,6 +63,30 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
             torch.equal(batch.req_pool_indices_cpu, batch.req_pool_indices.cpu())
         )
         self.assertEqual(batch.req_pool_indices_cpu.dtype, torch.int64)
+
+
+class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):
+    def test_host_bookkeeping_requires_req_pool_indices_cpu(self):
+        # Why the mirror must exist: hisparse host bookkeeping indexes
+        # req_pool_indices_cpu element-wise (int(req_pool_indices_cpu[i]) in
+        # _eager_backup_previous_token, the first thing map_last_loc_to_buffer
+        # runs each decode step). A missing mirror (None) raises TypeError there
+        # -- the exact nightly failure the scheduler-side fix prevents. Asserting
+        # the crash directly keeps the "mirror is required" contract honest, with
+        # no mocked attributes (the crash precedes any self access).
+        coord = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        seq_lens = torch.tensor([10], dtype=torch.int64)
+        seq_lens_cpu = torch.tensor([10], dtype=torch.int64)
+        req_pool_indices = torch.tensor([0], dtype=torch.int64)
+        out_cache_loc = torch.tensor([0], dtype=torch.int64)
+        with self.assertRaises(TypeError):
+            coord.map_last_loc_to_buffer(
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu=None,
+            )
 
 
 if __name__ == "__main__":
