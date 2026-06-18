@@ -844,6 +844,37 @@ class VisionIntelXPUAttention(nn.Module):
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
 
+        # XPU flash attention supports head sizes: 64, 96, 128, 192
+        # Pad unsupported head sizes to the nearest supported size
+        head_size = q.size(-1)
+        supported_head_sizes = [64, 96, 128, 192]
+
+        # Compute scale from original head_size (before padding)
+        # Attention scaling should reflect the actual embedding dimension
+        if softmax_scale is None:
+            softmax_scale = head_size**-0.5
+
+        if head_size not in supported_head_sizes:
+            # Find the nearest larger supported head size
+            target_head_size = next(
+                (s for s in supported_head_sizes if s > head_size),
+                None,
+            )
+            if target_head_size is None:
+                raise ValueError(
+                    f"Unsupported head size {head_size} for XPU flash attention. "
+                    f"Supported sizes are {supported_head_sizes}."
+                )
+            pad_size = target_head_size - head_size
+
+            # Pad q, k, v to the target head size
+            q_padded = F.pad(q, (0, pad_size), mode="constant", value=0)
+            k_padded = F.pad(k, (0, pad_size), mode="constant", value=0)
+            v_padded = F.pad(v, (0, pad_size), mode="constant", value=0)
+        else:
+            q_padded, k_padded, v_padded = q, k, v
+            pad_size = 0
+
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -854,7 +885,11 @@ class VisionIntelXPUAttention(nn.Module):
         )
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
-        output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+        output = flash_attn_varlen_func(q_padded, k_padded, v_padded, **fa_kwargs)
+
+        # Slice the output back to the original head size if we padded
+        if pad_size > 0:
+            output = output[..., :head_size]
 
         return output
 
