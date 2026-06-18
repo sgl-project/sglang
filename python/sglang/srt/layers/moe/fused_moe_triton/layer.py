@@ -1140,6 +1140,8 @@ class FusedMoE(torch.nn.Module):
                 ..., :origin_hidden_states_dim
             ].contiguous()
 
+        print(self.reduce_results)
+        self.reduce_results = True
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
