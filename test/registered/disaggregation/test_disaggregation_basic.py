@@ -16,6 +16,7 @@ from transformers import AutoTokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -221,7 +222,9 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServerBase):
+class TestDisaggregationMooncakeSpec(
+    JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
+):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -258,69 +261,6 @@ class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServe
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
-
-    @staticmethod
-    def _grammar_json_schema() -> str:
-        return json.dumps(
-            {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "pattern": "^[\\w]+$"},
-                    "population": {"type": "integer"},
-                    "country": {"type": "string", "pattern": "^[\\w ]+$"},
-                    "capital": {"type": "string", "pattern": "^[\\w ]+$"},
-                },
-                "required": ["name", "population", "country", "capital"],
-            }
-        )
-
-    def _generate_grammar(self, return_logprob: bool):
-        response = requests.post(
-            f"{self.lb_url}/generate",
-            json={
-                "text": "Here is the information of the capital of France in the JSON format.\n",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 256,
-                    "json_schema": self._grammar_json_schema(),
-                },
-                "return_logprob": return_logprob,
-                "logprob_start_len": 0,
-            },
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        out = response.json()
-        self.assertGreater(
-            out["meta_info"]["spec_verify_ct"],
-            0,
-            "expected spec decoding to run (spec_verify_ct > 0)",
-        )
-        return out
-
-    def test_grammar_structured_output_no_trailing_tokens(self):
-        """Output is valid JSON with nothing emitted past grammar completion."""
-        out = self._generate_grammar(return_logprob=False)
-        text = out["text"]
-        parsed = json.loads(text)
-        for key in ("name", "population", "country", "capital"):
-            self.assertIn(key, parsed)
-        self.assertTrue(
-            text.strip().endswith("}"), f"unexpected trailing tokens: {text!r}"
-        )
-
-    def test_grammar_logprob_count_matches_completion_tokens(self):
-        """Trimmed spec tokens keep logprob count == completion token count."""
-        out = self._generate_grammar(return_logprob=True)
-        meta = out["meta_info"]
-        completion_tokens = meta["completion_tokens"]
-        output_logprobs = meta["output_token_logprobs"]
-        self.assertEqual(
-            len(output_logprobs),
-            completion_tokens,
-            "output logprobs must align with retained (trimmed) tokens: "
-            f"got {len(output_logprobs)} logprobs vs {completion_tokens} completion tokens",
-        )
-        json.loads(out["text"])
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
