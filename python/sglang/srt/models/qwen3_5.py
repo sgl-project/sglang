@@ -161,7 +161,7 @@ def _resolve_modelopt_fp4_submodule_quant_config(
         return quant_config
 
     policy = _get_modelopt_fp4_submodule_policy(
-        _get_model_path(config), module_kind, layer_id
+        _get_model_path(config), _get_model_revision(config), module_kind, layer_id
     )
     if policy == _MODELOPT_FP4_POLICY_PACKED:
         return quant_config
@@ -181,7 +181,9 @@ def _resolve_modelopt_fp4_mtp_quant_config(
     if not _is_modelopt_fp4_quant_config(quant_config):
         return quant_config
 
-    policy = _get_modelopt_fp4_submodule_policy(_get_model_path(config), "mtp", None)
+    policy = _get_modelopt_fp4_submodule_policy(
+        _get_model_path(config), _get_model_revision(config), "mtp", None
+    )
     if policy == _MODELOPT_FP4_POLICY_PACKED:
         raise ValueError(
             "Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoints with packed MTP weights "
@@ -206,9 +208,31 @@ def _get_model_path(config: Qwen3_5TextConfig) -> Optional[str]:
     return None
 
 
+def _get_model_revision(config: Qwen3_5TextConfig) -> Optional[str]:
+    try:
+        server_args = get_global_server_args()
+    except Exception:
+        server_args = None
+
+    if server_args is not None:
+        revision = getattr(server_args, "revision", None)
+        if isinstance(revision, str) and revision:
+            return revision
+
+    # Hugging Face configs loaded from a non-default revision commonly keep the
+    # resolved commit hash here. It is also useful for unit tests that do not set
+    # global server args.
+    for attr_name in ("revision", "_commit_hash"):
+        revision = getattr(config, attr_name, None)
+        if isinstance(revision, str) and revision:
+            return revision
+    return None
+
+
 @lru_cache(maxsize=None)
 def _get_modelopt_fp4_submodule_policy(
     model_path: Optional[str],
+    revision: Optional[str],
     module_kind: str,
     layer_id: Optional[int],
 ) -> str:
@@ -216,7 +240,9 @@ def _get_modelopt_fp4_submodule_policy(
         return _MODELOPT_FP4_POLICY_UNKNOWN
 
     try:
-        dtypes = _read_modelopt_fp4_submodule_dtypes(model_path, module_kind, layer_id)
+        dtypes = _read_modelopt_fp4_submodule_dtypes(
+            model_path, revision, module_kind, layer_id
+        )
     except Exception as err:
         logger.warning(
             "Failed to inspect Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoint layout "
@@ -251,12 +277,15 @@ def _get_modelopt_fp4_submodule_policy(
 
 def _read_modelopt_fp4_submodule_dtypes(
     model_path: str,
+    revision: Optional[str],
     module_kind: str,
     layer_id: Optional[int],
 ) -> Set[str]:
     return {
         dtype
-        for key, dtype in _get_modelopt_fp4_checkpoint_weight_dtypes(model_path)
+        for key, dtype in _get_modelopt_fp4_checkpoint_weight_dtypes(
+            model_path, revision
+        )
         if _is_modelopt_fp4_relevant_weight_key(key, module_kind, layer_id)
     }
 
@@ -264,10 +293,11 @@ def _read_modelopt_fp4_submodule_dtypes(
 @lru_cache(maxsize=None)
 def _get_modelopt_fp4_checkpoint_weight_dtypes(
     model_path: str,
+    revision: Optional[str],
 ) -> Tuple[Tuple[str, str], ...]:
     dtypes = []
-    for shard_file in _iter_safetensors_files(model_path):
-        with _open_checkpoint_file(model_path, shard_file) as file_obj:
+    for shard_file in _iter_safetensors_files(model_path, revision):
+        with _open_checkpoint_file(model_path, shard_file, revision) as file_obj:
             header_len = struct.unpack("<Q", file_obj.read(8))[0]
             header = json.loads(file_obj.read(header_len))
         for key, meta in header.items():
@@ -279,9 +309,13 @@ def _get_modelopt_fp4_checkpoint_weight_dtypes(
     return tuple(dtypes)
 
 
-def _iter_safetensors_files(model_path: str) -> Tuple[str, ...]:
-    if _checkpoint_file_exists(model_path, "model.safetensors.index.json"):
-        with _open_checkpoint_file(model_path, "model.safetensors.index.json") as f:
+def _iter_safetensors_files(
+    model_path: str, revision: Optional[str]
+) -> Tuple[str, ...]:
+    if _checkpoint_file_exists(model_path, "model.safetensors.index.json", revision):
+        with _open_checkpoint_file(
+            model_path, "model.safetensors.index.json", revision
+        ) as f:
             weight_map = json.loads(f.read()).get("weight_map", {})
         if isinstance(weight_map, dict):
             return tuple(
@@ -294,31 +328,35 @@ def _iter_safetensors_files(model_path: str) -> Tuple[str, ...]:
                 )
             )
 
-    if _checkpoint_file_exists(model_path, "model.safetensors"):
+    if _checkpoint_file_exists(model_path, "model.safetensors", revision):
         return ("model.safetensors",)
 
-    return _list_safetensors_files(model_path)
+    return _list_safetensors_files(model_path, revision)
 
 
-def _checkpoint_file_exists(model_path: str, file_name: str) -> bool:
+def _checkpoint_file_exists(
+    model_path: str, file_name: str, revision: Optional[str]
+) -> bool:
     if os.path.isdir(model_path):
         return os.path.exists(os.path.join(model_path, file_name))
 
     from huggingface_hub import HfFileSystem
 
-    return bool(HfFileSystem().exists(f"{model_path}/{file_name}"))
+    return bool(HfFileSystem().exists(f"{model_path}/{file_name}", revision=revision))
 
 
-def _open_checkpoint_file(model_path: str, file_name: str):
+def _open_checkpoint_file(model_path: str, file_name: str, revision: Optional[str]):
     if os.path.isdir(model_path):
         return open(os.path.join(model_path, file_name), "rb")
 
     from huggingface_hub import HfFileSystem
 
-    return HfFileSystem().open(f"{model_path}/{file_name}", "rb")
+    return HfFileSystem().open(f"{model_path}/{file_name}", "rb", revision=revision)
 
 
-def _list_safetensors_files(model_path: str) -> Tuple[str, ...]:
+def _list_safetensors_files(
+    model_path: str, revision: Optional[str]
+) -> Tuple[str, ...]:
     if os.path.isdir(model_path):
         return tuple(
             sorted(path.name for path in Path(model_path).glob("*.safetensors"))
@@ -329,7 +367,7 @@ def _list_safetensors_files(model_path: str) -> Tuple[str, ...]:
     fs = HfFileSystem()
     prefix = f"{model_path}/"
     files = []
-    for path in fs.glob(f"{prefix}*.safetensors"):
+    for path in fs.glob(f"{prefix}*.safetensors", revision=revision):
         path = str(path)
         files.append(path.removeprefix(prefix).split("/")[-1])
     return tuple(sorted(files))

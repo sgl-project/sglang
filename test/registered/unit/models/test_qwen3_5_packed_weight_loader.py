@@ -18,13 +18,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.test.test_utils import CustomTestCase
 
 
 class MockQuantConfig:
@@ -57,7 +58,7 @@ def _make_per_tensor_scale_param(num_shards):
     )
 
 
-class TestMakePackedWeightLoader(unittest.TestCase):
+class TestMakePackedWeightLoader(CustomTestCase):
     """Tests for _make_packed_weight_loader broadcast / split logic."""
 
     # ------------------------------------------------------------------ #
@@ -229,8 +230,20 @@ class TestMakePackedWeightLoader(unittest.TestCase):
             self.assertEqual(chunk.shape, torch.Size([1]))
             self.assertAlmostEqual(chunk.item(), 0.75, places=5)
 
+    def test_bind_packed_weight_loaders_includes_weight_scale_2(self):
+        module = _make_mock_module(output_sizes=[16, 16])
+        param = _make_per_tensor_scale_param(num_shards=2)
+        module.weight_scale_2 = param
 
-class TestQwen35ModelOptFp4Loading(unittest.TestCase):
+        before = param.weight_loader
+        gdn = object.__new__(Qwen3_5GatedDeltaNet)
+
+        Qwen3_5GatedDeltaNet._bind_packed_weight_loaders(gdn, module)
+
+        self.assertIsNot(param.weight_loader, before)
+
+
+class TestQwen35ModelOptFp4Loading(CustomTestCase):
     def setUp(self):
         qwen3_5._get_modelopt_fp4_submodule_policy.cache_clear()
         qwen3_5._get_modelopt_fp4_checkpoint_weight_dtypes.cache_clear()
@@ -288,6 +301,47 @@ class TestQwen35ModelOptFp4Loading(unittest.TestCase):
                 ),
                 modelopt,
             )
+
+    def test_modelopt_fp4_policy_uses_server_revision(self):
+        config = SimpleNamespace(_name_or_path="remote/model")
+        modelopt = MockQuantConfig("modelopt_fp4")
+        server_args = SimpleNamespace(revision="refs/pr/1")
+
+        with (
+            patch.object(
+                qwen3_5,
+                "get_global_server_args",
+                return_value=server_args,
+            ),
+            patch.object(
+                qwen3_5,
+                "_get_modelopt_fp4_submodule_policy",
+                return_value=qwen3_5._MODELOPT_FP4_POLICY_PACKED,
+            ) as mock_policy,
+        ):
+            self.assertIs(
+                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
+                    config, modelopt, "attention", 0
+                ),
+                modelopt,
+            )
+
+        mock_policy.assert_called_once_with("remote/model", "refs/pr/1", "attention", 0)
+
+    def test_remote_checkpoint_probe_passes_revision(self):
+        fs = MagicMock()
+        fs.exists.return_value = True
+
+        with patch("huggingface_hub.HfFileSystem", return_value=fs):
+            self.assertTrue(
+                qwen3_5._checkpoint_file_exists(
+                    "remote/model", "model.safetensors", "commit"
+                )
+            )
+
+        fs.exists.assert_called_once_with(
+            "remote/model/model.safetensors", revision="commit"
+        )
 
     def test_modelopt_fp4_policy_scans_safetensors_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
