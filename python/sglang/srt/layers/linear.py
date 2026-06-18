@@ -48,7 +48,6 @@ if TYPE_CHECKING:
         QuantizationConfig,
         QuantizeMethodBase,
     )
-    from sglang.srt.layers.utils.cp_decode_attn_tp import CpDecodeAttnTpContext
 
 _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
@@ -1379,7 +1378,6 @@ class RowParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
-        cp_decode_tp_ctx: Optional["CpDecodeAttnTpContext"] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1396,11 +1394,11 @@ class RowParallelLinear(LinearBase):
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
-
-        self.cp_decode_tp_ctx = cp_decode_tp_ctx
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
+        self.use_decode_attn_tp: bool = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -1535,12 +1533,6 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-
-        use_decode_attn_tp = (
-            self.cp_decode_tp_ctx is not None
-            and self.cp_decode_tp_ctx.use_decode_attn_tp
-        )
-
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
@@ -1551,7 +1543,7 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if (
-            (self.reduce_results and self.tp_size > 1) or use_decode_attn_tp
+            (self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp
         ) and not skip_all_reduce:
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)

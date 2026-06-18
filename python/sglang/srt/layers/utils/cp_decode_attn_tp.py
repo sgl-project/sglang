@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -22,11 +22,22 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+_global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
+
+
+def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
+    """Return the global CpDecodeAttnTpContext singleton."""
+    global _global_cp_decode_attn_tp_ctx
+    if _global_cp_decode_attn_tp_ctx is None:
+        _global_cp_decode_attn_tp_ctx = CpDecodeAttnTpContext()
+    return _global_cp_decode_attn_tp_ctx
 
 
 class CpDecodeAttnTpContext:
@@ -130,12 +141,15 @@ class CpDecodeAttnTpContext:
         forward_batch: ForwardBatch,
         modules: list,
         tensor_attrs: List[Tuple] = None,
+        radix_attn: Optional[RadixAttention] = None,
     ):
         """Activate decode attention TP for the duration of the block.
 
         Args:
             modules: Linear layers (ColumnParallel/RowParallel) to slice.
             tensor_attrs: (obj, attr_name, dim) tuples for absorbed weights.
+            radix_attn: RadixAttention instance whose tp_q_head_num should be
+                overridden to match the sliced head count during decode TP.
         """
         self.set_decode_attn_tp(forward_batch)
         if not self.use_decode_attn_tp:
@@ -144,6 +158,8 @@ class CpDecodeAttnTpContext:
 
         all_attrs = []  # (obj, attr_name) pairs to restore
         size_overrides = []  # (linear, size_attr, orig_size)
+        row_parallel_decode_flags = []  # (RowParallelLinear, orig_flag) to restore
+        orig_tp_q_head_num = None
         try:
             for linear in modules:
                 for obj, attr_name, dim in self._get_linear_attrs(linear):
@@ -160,12 +176,27 @@ class CpDecodeAttnTpContext:
                 setattr(linear, size_attr, orig_size // self.decode_tp_size)
                 size_overrides.append((linear, size_attr, orig_size))
 
+                # Set the decode attn TP flag on RowParallelLinear instances
+                if isinstance(linear, RowParallelLinear):
+                    row_parallel_decode_flags.append(
+                        (linear, linear.use_decode_attn_tp)
+                    )
+                    linear.use_decode_attn_tp = True
+
             if tensor_attrs:
                 for obj, attr_name, dim in tensor_attrs:
                     self._activate(obj, attr_name, dim)
                     all_attrs.append((obj, attr_name))
+
+            if radix_attn is not None:
+                orig_tp_q_head_num = radix_attn.tp_q_head_num
+                radix_attn.tp_q_head_num = orig_tp_q_head_num // self.decode_tp_size
             yield
         finally:
+            if radix_attn is not None and orig_tp_q_head_num is not None:
+                radix_attn.tp_q_head_num = orig_tp_q_head_num
+            for linear, orig_flag in reversed(row_parallel_decode_flags):
+                linear.use_decode_attn_tp = orig_flag
             for linear, size_attr, orig_size in reversed(size_overrides):
                 setattr(linear, size_attr, orig_size)
             for obj, attr_name in reversed(all_attrs):
