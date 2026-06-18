@@ -197,6 +197,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
@@ -212,7 +213,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 cache_v.view(-1, 1, self.head_num, self.v_head_dim),
             )
         else:
-            loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
                 key=cache_k,
                 value=cache_v,
@@ -352,6 +352,8 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
 
+        loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
+        cache_k = cache_k.contiguous()
         k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
             -1, self.head_num, self.head_dim
         )
