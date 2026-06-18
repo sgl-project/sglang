@@ -492,6 +492,17 @@ def eagle_sample(
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
+        # Defense-in-depth behind the spec_hook startup allowlist: validate the
+        # actual kernel inputs (catches draft_probs plumbing regressions or a
+        # startup guard bypassed by a worker subclass) before the Triton kernel.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
+            raise ValueError(
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
+            )
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
