@@ -113,6 +113,9 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache L3 (file backend) + UnifiedRadixCache."""
 
+    l3_prefetch_page_size = 256
+    l3_prefetch_prompt_pages = 4
+
     @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL
@@ -169,6 +172,8 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
     """DeepSeek V4 Flash EAGLE + HiCache L3 should load from storage."""
 
     page_size = 256
+    l3_prefetch_page_size = 256
+    l3_prefetch_prompt_pages = 4
     input_ids = list(range(4000, 4300))
     storage_wait_timeout = 120
     num_gsm8k_questions = 100

@@ -27,7 +27,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):

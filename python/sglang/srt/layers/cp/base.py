@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
+from sglang.srt.runtime_context import get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.server_args import ServerArgs
@@ -93,9 +95,8 @@ class ContextParallelStrategy(ABC):
 
     @property
     def cp_rank(self) -> int:
-        from sglang.srt.layers.dp_attention import get_attention_cp_rank
 
-        return get_attention_cp_rank()
+        return get_parallel().attn_cp_rank
 
     @property
     def per_layer_attn_cp_comm(self) -> bool:
