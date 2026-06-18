@@ -1,0 +1,234 @@
+---
+title: Laguna-M.1
+description: "Deploy poolside's Laguna-M.1 — a 225B-parameter Mixture-of-Experts model (23B active) for agentic coding — with SGLang on NVIDIA H200, B200, B300, GB200, and GB300, across BF16, FP8, and NVFP4."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Laguna-M.1 support is already on SGLang `main` — **softplus per-element attention-output gating** ([PR #28400](https://github.com/sgl-project/sglang/pull/28400)) and a **global-attention fix** ([PR #28604](https://github.com/sgl-project/sglang/pull/28604), since M.1 is full-attention `sliding_window: 0`) — but not yet in a tagged release. The two paths below match the **Python / Docker** toggle in the command panel: install from `main` (Python tab), or use the **Docker** image, which bundles the same build (CUDA 13, covers H200 + all Blackwell). The model loads natively, so no `--trust-remote-code` is needed.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install -U uv
+uv venv --python 3.12 && source .venv/bin/activate
+
+# Laguna-M.1 support is on SGLang main (PRs #28400 + #28604, plus #28649 for FP8), not yet in a
+# tagged release — install from main. The serving runtime is in the base dependencies, no extra needed:
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+uv pip install -e python
+```
+
+Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image (`dev-cu13-618-nightly`) bundles the CUDA-13 runtime and the M.1 code. Once M.1 support lands in a tagged release, `uv pip install sglang` will pull it directly.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+# Pinned nightly with the Laguna-M.1 build (PR #28400 + #28604; CUDA 13 — covers H200 + all Blackwell):
+docker pull lmsysorg/sglang:dev-cu13-618-nightly
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + quantization to generate the launch command. Laguna-M.1 ships a single **Balanced** recipe per cell — poolside's recommended operating point, a good speed/throughput trade-off for typical multi-user serving. The 8-GPU HGX platforms (H200 / B200 / B300) use `--tp 8`; the 4-GPU Grace-Blackwell single nodes (GB200 / GB300) use `--tp 4`.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/poolside/laguna-m1.jsx";
+import { benchmarks } from "/src/snippets/configs/poolside/laguna-m1-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs (parsers, DP-Attention, DeepEP / EP) on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+[Laguna-M.1](https://huggingface.co/poolside/Laguna-M.1) is an open-weight, **225B-parameter** Mixture-of-Experts model (**23B activated per token**) from [poolside](https://poolside.ai), built for agentic coding and long-horizon software-engineering work. It is released under Apache 2.0.
+
+**Key Features:**
+
+- **Large sparse MoE**: 70-layer transformer — the first 3 layers are dense SwiGLU, the remaining 67 are sparse MoE with **256 experts, top-16 routing** (+1 shared expert) and auxiliary-loss-free load balancing.
+- **Global attention with output gating**: global attention across all layers, 64 Q-heads / 8 KV-heads (head dim 128), with **softplus attention output gating** (requires [PR #28400](https://github.com/sgl-project/sglang/pull/28400)).
+- **Long context**: 262,144 tokens, RoPE with YaRN.
+- **Agentic coding**: competitive on SWE-bench Verified, SWE-bench Multilingual, SWE-Bench Pro, and Terminal-Bench 2.0.
+- **Native reasoning**: interleaved thinking between tool calls, toggled per request via `chat_template_kwargs={"enable_thinking": ...}`.
+
+**Available Quantizations:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20%"}} />
+    <col style={{width: "80%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Hugging Face path</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-M.1`](https://huggingface.co/poolside/Laguna-M.1)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-M.1-FP8`](https://huggingface.co/poolside/Laguna-M.1-FP8)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px"}}>[`poolside/Laguna-M.1-NVFP4`](https://huggingface.co/poolside/Laguna-M.1-NVFP4)</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:** Apache 2.0
+
+**Resources:** [Hugging Face](https://huggingface.co/poolside/Laguna-M.1) · [Release blog post](https://poolside.ai/blog/laguna-a-deeper-dive) · [Technical report](https://poolside.ai/assets/laguna/laguna-m1-xs2-technical-report.pdf) · [API platform](https://platform.poolside.ai).
+
+## 2. Configuration Tips
+
+- **Long-context memory**: M.1 is global-attention (no sliding-window), so the 262,144-token KV cache is large. If you hit OOM at full context, lower `--mem-fraction-static` or cap `--context-length`.
+- **FP8 first launch**: FP8 triggers a multi-session DeepGEMM JIT pre-compile on first launch; pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-M.1-FP8` to avoid paying it on every restart.
+- **Parsers** (`poolside_v1`): for agentic / tool-using deployments enable the **Reasoning Parser** and **Tool Call Parser** in the Playground above — they emit `--reasoning-parser poolside_v1` (thinking → `reasoning_content`) and `--tool-call-parser poolside_v1` (structured `tool_calls`).
+- **Thinking default**: thinking is **off by default**; opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
+- **Served model id**: the server registers the model under whatever you pass to `--model-path`, so a client's `model` field must match it — `poolside/Laguna-M.1` (BF16) or `poolside/Laguna-M.1-FP8` / `-NVFP4` for the quantized cells. The §3 examples use the BF16 id; swap in the id you launched.
+- **Recommended sampling**: poolside benchmarks M.1 at `temperature=1.0`, `top_k=20` with thinking enabled. These are per-request sampling params (not launch flags) — e.g. `temperature=1.0, extra_body={"top_k": 20}` on the OpenAI client.
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+Launch with `--reasoning-parser poolside_v1` (or toggle **Reasoning Parser** in the **Parsers** card of the Playground above). Reasoning is **opt-in**: the Laguna chat template gates it on `enable_thinking=True` (passed via `chat_template_kwargs`) — the generic `thinking` key is ignored. The `<think>` trace then lands in `message.reasoning_content`, separate from the final answer in `message.content` — no client-side tag stripping needed.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="poolside/Laguna-M.1",
+    messages=[{"role": "user", "content": "What is 15% of 240? Explain briefly."}],
+    max_tokens=2048,
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+)
+
+message = response.choices[0].message
+print("=============== Reasoning ===============")
+print(message.reasoning_content)
+print("=============== Answer ==================")
+print(message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+=============== Reasoning ===============
+Okay, so I need to find out what 15% of 240 is. Hmm, percentages can sometimes be
+tricky, but let me think. I remember that "percent" means per hundred, right? So 15%
+is the same as 15 per 100 or 15/100. Maybe I can convert that percentage into a decimal
+first? ... 15 divided by 100 is 0.15. ... Now, to find 15% of 240, I just need to
+multiply 240 by 0.15. ... 240 times 0.1 is 24 (10% of 240), and 240 times 0.05 is 12
+(half of that), so 24 + 12 = 36.
+[… verifies the same result several more ways: 15/100 × 240, 240 × 15 ÷ 100,
+1% × 15, and the fraction 3/20 × 240 — all give 36 …]
+So ... all methods are pointing to 36. I'm pretty confident that 15% of 240 is 36.
+=============== Answer ==================
+To find 15% of 240, convert the percentage to a decimal (0.15) and multiply by 240:
+**240 × 0.15 = 36**.
+
+**Step-by-Step Explanation:**
+1. **Convert 15% to a decimal:** 15% = 15/100 = 0.15.
+2. **Multiply by 240:**
+   - Break it down:
+     - 10% of 240 = 24 (since 240 × 0.1 = 24).
+     - 5% of 240 = 12 (half of 24).
+   - Add them: 24 + 12 = **36**.
+
+**Answer:** 15% of 240 is **36**.
+```
+
+</Accordion>
+
+<Note>
+Laguna-M.1's reasoning traces are long — the model explores and re-verifies an answer
+multiple ways. Give it a generous `max_tokens` for harder problems (reasoning regularly
+exceeds 3k tokens). The trace above is abbreviated; the model emits it in full.
+</Note>
+
+### 3.2 Tool Calling
+
+Launch with `--tool-call-parser poolside_v1` (or toggle **Tool Call Parser** in the **Parsers** card of the Playground above). The parser converts Laguna's `<tool_call>` output into the standard OpenAI `tool_calls` structure. Tool calling works with reasoning off (`enable_thinking=False`, the default).
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="poolside/Laguna-M.1",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+
+message = response.choices[0].message
+if message.tool_calls:
+    for call in message.tool_calls:
+        print(f"Tool: {call.function.name}")
+        print(f"Args: {call.function.arguments}")
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Tool: get_weather
+Args: {"location": "Beijing"}
+```
+
+</Accordion>
