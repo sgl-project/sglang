@@ -507,7 +507,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-1]
+        runner: [linux-sglang-mi35x-di]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
