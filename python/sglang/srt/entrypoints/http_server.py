@@ -2249,11 +2249,6 @@ def _run_granian_server(
 
         uvloop.run(serve())
     else:
-        # Granian spawns workers whose multiprocessing parent PID differs from this
-        # process (the shared-memory owner). Propagate this PID through the
-        # environment so the workers' ``get_main_process_id()`` resolves to the
-        # correct shared-memory segment written by ``write_data_for_multi_tokenizer``.
-        envs.SGLANG_GRANIAN_PARENT_PID.set(os.getpid())
         server.serve()
 
 

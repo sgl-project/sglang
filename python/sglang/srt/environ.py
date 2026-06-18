@@ -708,9 +708,6 @@ class Envs:
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
 
-    # HTTP/2 Server
-    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
-
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
