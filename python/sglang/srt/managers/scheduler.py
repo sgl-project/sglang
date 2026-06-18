@@ -985,6 +985,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2424,6 +2425,52 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def process_pending_chunked_abort(self) -> None:
+        """Abort an in-flight chunked-prefill request once it is safe to do so.
+
+        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
+        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
+        the top of the scheduling step stops the next chunk from launching; the
+        chunk already launched is drained when its result is resolved. Under overlap
+        the result lands a step later, so the batch-result processors keep
+        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
+        ``process_batch_result_prefill`` via its chunked branch (the finished req
+        is excluded from streaming and its logprob offset is still accounted).
+        Mirrors ``handle_bootstrap_failure``.
+        """
+        req = self._pending_chunked_abort_req
+        if req is None:
+            return
+        if self.chunked_req is not req:
+            # Already past chunked prefill; the running-batch abort path handles
+            # it. Drop the marker once the request is actually gone.
+            if req.finished() or req.req_pool_idx is None:
+                self._pending_chunked_abort_req = None
+            return
+
+        prepare_abort(req, "Aborted")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        req.to_finish = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.disagg_kv_sender.abort()
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            req.pending_bootstrap = False
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if (
+            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+        ) and not req.kv_committed_freed:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        self.chunked_req = None
+        self._chunked_req_scheduled_last_iter = False
+        self._pending_chunked_abort_req = None
+        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2467,6 +2514,8 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -3684,6 +3733,10 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if (chunked_req := self.chunked_req) is not None:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
