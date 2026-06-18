@@ -936,6 +936,7 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
+        self._handle_ep_dispatch_algorithm_default()
 
         # Validate mm_process_config before dummy-model early return.
         self._handle_multimodal()
@@ -3824,6 +3825,12 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
+        self._handle_ep_dispatch_algorithm_default()
+
+        if self.enable_eplb:
+            assert self.ep_size > 1
+
+    def _handle_ep_dispatch_algorithm_default(self):
         if (
             self.enable_eplb
             or (self.init_expert_location != "trivial")
@@ -3833,9 +3840,6 @@ class ServerArgs:
             # ids are remapped to physical ids. Without a dispatch algorithm,
             # the extra experts are allocated/loaded but never selected.
             self.ep_dispatch_algorithm = "static"
-
-        if self.enable_eplb:
-            assert self.ep_size > 1
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:
