@@ -282,8 +282,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def _block_topk(self, scores: torch.Tensor, seq_len: int) -> torch.Tensor:
         num_heads = scores.shape[0]
         num_blocks = (seq_len + self.block_size_k - 1) // self.block_size_k
+        total_blocks = self.topk_blocks + self.init_blocks + self.local_blocks
         topk_idx = torch.full(
-            (num_heads, self.topk_blocks),
+            (num_heads, total_blocks),
             -1,
             dtype=torch.int32,
             device=scores.device,
@@ -309,15 +310,55 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             block_scores.append(reduced)
 
         score_tensor = torch.stack(block_scores, dim=-1)
-        if self.init_blocks > 0:
-            score_tensor[:, : min(self.init_blocks, num_blocks)] = 1e30
-        if self.local_blocks > 0:
-            local_start = max(0, num_blocks - self.local_blocks)
-            score_tensor[:, local_start:num_blocks] = 1e29
 
         actual_topk = min(self.topk_blocks, num_blocks)
         _, indices = torch.topk(score_tensor, k=actual_topk, dim=-1)
-        topk_idx[:, :actual_topk] = indices.to(torch.int32)
+        topk_idx[:, :actual_topk] = indices.to(topk_idx.dtype)
+        if total_blocks == self.topk_blocks:
+            return topk_idx
+
+        forced_parts = []
+        if self.init_blocks > 0:
+            init_blocks = torch.arange(
+                min(self.init_blocks, num_blocks),
+                dtype=topk_idx.dtype,
+                device=scores.device,
+            ).expand(num_heads, -1)
+            forced_parts.append(init_blocks)
+        if self.local_blocks > 0:
+            local_start = max(0, num_blocks - self.local_blocks)
+            local_blocks = torch.arange(
+                local_start,
+                num_blocks,
+                dtype=topk_idx.dtype,
+                device=scores.device,
+            ).expand(num_heads, -1)
+            forced_parts.append(local_blocks)
+
+        if not forced_parts:
+            return topk_idx[:, : self.topk_blocks]
+
+        candidates = torch.cat([topk_idx[:, : self.topk_blocks], *forced_parts], dim=-1)
+        valid = (candidates >= 0) & (candidates < num_blocks)
+        invalid_value = torch.full_like(candidates, num_blocks)
+        sorted_candidates = torch.sort(
+            torch.where(valid, candidates, invalid_value), dim=-1
+        ).values
+        sorted_valid = sorted_candidates < num_blocks
+        previous = torch.cat(
+            [
+                torch.full_like(sorted_candidates[:, :1], -1),
+                sorted_candidates[:, :-1],
+            ],
+            dim=-1,
+        )
+        keep = sorted_valid & (sorted_candidates != previous)
+        sort_idx = torch.argsort((~keep).int(), dim=-1, stable=True)
+        packed = torch.gather(sorted_candidates, -1, sort_idx)
+        valid_count = keep.sum(dim=-1, keepdim=True)
+        idx_range = torch.arange(packed.shape[-1], device=scores.device)
+        packed = torch.where(idx_range < valid_count, packed, -1)
+        topk_idx[:, : packed.shape[-1]] = packed.to(topk_idx.dtype)
         return topk_idx
 
     def _token_indices_from_blocks(
