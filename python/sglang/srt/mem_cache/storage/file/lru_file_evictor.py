@@ -31,27 +31,21 @@ from collections import OrderedDict
 from typing import Any, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
 
 
-# LOCAL PATCH (dsv4-l3-shard): the HiCacheFile backend now fans .bin files into
-# 2-level hash-prefix subdirs (<ab>/<cd>/<name>.bin) instead of one flat dir, to
-# avoid ext4 directory-index ("htree") ENOSPC at millions of files. The evictor
-# must discover (scan) and unlink files at those sharded paths. This rule MUST
-# stay byte-identical to HiCacheFile._shard_subdir / _sharded_path in
-# hicache_storage.py (kept duplicated rather than imported: the storage package
-# __init__ pulls in the backend factory which imports this module -> a shared
-# import would be circular).
-def _shard_subdir(filename: str) -> str:
-    if len(filename) >= 4:
-        return os.path.join(filename[:2], filename[2:4])
-    return ""
-
-
 def _sharded_path(file_path: str, filename: str) -> str:
-    return os.path.join(file_path, _shard_subdir(filename), filename)
+    """Resolve a ``.bin`` filename to its sharded path under ``file_path``.
+
+    Reuses ``HiCacheFile._shard_subdir`` rather than re-deriving the bucket so
+    the evictor's scan/unlink paths can never desynchronize from the paths the
+    backend writes to. (``HiCacheFile`` imports the evictor lazily inside its
+    ``__init__``, so this module-level import is not circular.)
+    """
+    return os.path.join(file_path, HiCacheFile._shard_subdir(filename), filename)
 
 
 def _parse_size_to_bytes(value: Any) -> int:
@@ -313,10 +307,10 @@ class LRUFileEvictor:
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
-        # LOCAL PATCH (dsv4-l3-shard): files live in hash-prefix subdirs now, so
-        # walk recursively instead of a single-level listdir. The LRU key stays
-        # the bare stem (filename without .bin); only discovery + the unlink path
-        # change, never the index keys. os.walk on a missing dir yields nothing.
+        # Files live in hash-prefix subdirs, so walk recursively rather than a
+        # single-level listdir. The LRU key stays the bare stem (filename without
+        # .bin); only discovery and the unlink path are shard-aware, never the
+        # index keys. os.walk on a missing dir yields nothing.
         entries = []
         for root, _dirs, files in os.walk(self.file_path):
             for fn in files:
@@ -336,6 +330,25 @@ class LRUFileEvictor:
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
+
+    def _rmdir_empty_shard(self, tensor_path: str) -> None:
+        """Remove now-empty hash-prefix subdirs after unlinking a victim.
+
+        ``rmdir`` only succeeds on an empty directory, so a shard still holding
+        other pages is left intact; the backend recreates the dir (``makedirs``
+        with ``exist_ok``) before its next write. Without this, per-file eviction
+        would slowly leak up to 256*256 empty directories.
+        """
+        shard_dir = os.path.dirname(tensor_path)
+        if shard_dir == self.file_path:
+            return  # unsharded fallback bucket; nothing to prune
+        try:
+            os.rmdir(shard_dir)  # inner <cd> level
+            parent = os.path.dirname(shard_dir)
+            if parent != self.file_path:
+                os.rmdir(parent)  # outer <ab> level
+        except OSError:
+            pass  # dir still holds other pages -> keep it
 
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.
@@ -357,12 +370,11 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = _sharded_path(
-            self.file_path, f"{evict_stem}.bin"
-        )  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = _sharded_path(self.file_path, f"{evict_stem}.bin")
         try:
             os.remove(tensor_path)
             freed = evict_size
+            self._rmdir_empty_shard(tensor_path)
         except FileNotFoundError:
             freed = 0  # file already gone; still drop the stale index entry
         except OSError as e:
