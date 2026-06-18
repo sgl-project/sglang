@@ -294,19 +294,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         slots: torch.Tensor,
         locs: torch.Tensor,
         tag: str,
-        use_torch_gather: bool = False,
+        use_direct_row_select: bool = False,
     ) -> torch.Tensor:
+        if use_direct_row_select:
+            locs = locs.to(device=slots.device, dtype=torch.long).contiguous()
+            gathered = torch.index_select(slots, 0, locs)
+            self._debug_sync_npu(tag)
+            return gathered
+
         flat_slots = slots.reshape(slots.shape[0], -1)
-        if use_torch_gather:
-            row_indices = (
-                locs.to(device=slots.device, dtype=torch.long)
-                .view(-1, 1)
-                .expand(-1, flat_slots.shape[1])
-            )
-            gathered = torch.gather(flat_slots, 0, row_indices)
-        else:
-            locs = locs.to(device=slots.device, dtype=torch.int32).contiguous()
-            gathered = torch.index_select(flat_slots, 0, locs)
+        locs = locs.to(device=slots.device, dtype=torch.int32).contiguous()
+        gathered = torch.index_select(flat_slots, 0, locs)
         self._debug_sync_npu(tag)
         return gathered.reshape(locs.shape[0], *slots.shape[1:])
 
@@ -515,8 +513,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_tokens = self._gather_cache_slots(
                     idx_k_slots,
                     locs,
-                    f"sparse prefill gather index K batch_id={batch_id}",
-                    use_torch_gather=True,
+                    f"sparse prefill direct row select index K batch_id={batch_id}",
+                    use_direct_row_select=True,
                 )
                 idx_v_tokens = (
                     None
@@ -524,8 +522,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     else self._gather_cache_slots(
                         idx_v_slots,
                         locs,
-                        f"sparse prefill gather index V batch_id={batch_id}",
-                        use_torch_gather=True,
+                        f"sparse prefill direct row select index V batch_id={batch_id}",
+                        use_direct_row_select=True,
                     )
                 )
                 cur_idx_o, cur_o = self._npu_sparse_one(
@@ -589,8 +587,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_tokens = self._gather_cache_slots(
                 idx_k_slots,
                 locs,
-                f"sparse decode gather index K batch_id={batch_id}",
-                use_torch_gather=True,
+                f"sparse decode direct row select index K batch_id={batch_id}",
+                use_direct_row_select=True,
             )
             idx_v_tokens = (
                 None
@@ -598,8 +596,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else self._gather_cache_slots(
                     idx_v_slots,
                     locs,
-                    f"sparse decode gather index V batch_id={batch_id}",
-                    use_torch_gather=True,
+                    f"sparse decode direct row select index V batch_id={batch_id}",
+                    use_direct_row_select=True,
                 )
             )
             cur_idx_o, cur_o = self._npu_sparse_one(
