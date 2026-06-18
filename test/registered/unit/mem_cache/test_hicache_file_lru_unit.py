@@ -501,7 +501,9 @@ class TestFileSharding(HiCacheFileLRUTestBase):
 
         self.assertTrue(be.clear())
         self.assertEqual(self._all_bins(be.file_path), [])
-        self.assertTrue(os.path.exists(marker), "clear() must not delete non-.bin files")
+        self.assertTrue(
+            os.path.exists(marker), "clear() must not delete non-.bin files"
+        )
 
     def test_evictor_discovers_sharded_files_on_restart(self):
         # Write with one backend, then construct a fresh backend over the same
@@ -514,7 +516,9 @@ class TestFileSharding(HiCacheFileLRUTestBase):
 
         be2 = self.make_backend(max_size="1Gi", subdir="restart")
         self.assertEqual(
-            len(be2._evictor._lru), n, "evictor must rediscover sharded files on restart"
+            len(be2._evictor._lru),
+            n,
+            "evictor must rediscover sharded files on restart",
         )
 
     def test_evictor_unlinks_sharded_victims_under_cap(self):
