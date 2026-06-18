@@ -31,6 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -153,9 +154,6 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -164,12 +162,12 @@ def _forward_with_allreduce_fusion(
         )
 
         if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
+            world_size = get_parallel().attn_tp_size
         else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
             else:
-                world_size = get_moe_tensor_parallel_world_size()
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:
