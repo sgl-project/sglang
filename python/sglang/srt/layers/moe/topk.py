@@ -34,6 +34,8 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
+from sglang.srt.runtime_context import get_parallel
+
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
     from triton_kernels.topk import topk as triton_kernels_topk
@@ -76,8 +78,6 @@ except ImportError:
 
 from sglang.jit_kernel.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1493,8 +1493,8 @@ def _remap_topk_for_deepep(
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
 
-    ep_size = get_moe_expert_parallel_world_size()
-    ep_rank = get_moe_expert_parallel_rank()
+    ep_size = get_parallel().moe_ep_size
+    ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
     # DeepEP interleaved layout must use the physical routed count.
