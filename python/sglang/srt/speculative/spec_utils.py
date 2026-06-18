@@ -693,6 +693,17 @@ def generate_tree_mask(
 
 
 def generate_tree_mask_func(req_masks, tree_masks, batch, draft_token_num, output_ptr):
+    """
+    This kernel implements the below function
+    for i in range(bs):
+        req_mask = torch.ones(
+            (draft_token_num, seq_lens[i]), device=self.device
+        )
+        tree_mask = tree_masks[i] # [draft_token_num, draft_token_num]
+        mask = torch.cat((req_mask, tree_mask),dim=1,).to(torch.bool)
+        ret.append(mask.flatten())
+    ret = torch.cat(ret, dim=0)
+    """
     batch_size = len(batch.reqs)
     seq_lens_cumsum = torch.cumsum(batch.seq_lens, dim=0)
     grid = (batch_size * draft_token_num,)

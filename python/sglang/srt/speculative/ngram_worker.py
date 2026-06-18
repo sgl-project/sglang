@@ -300,27 +300,6 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
-            # tree_mask = []
-            # mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            # for i in range(bs):
-            #     seq_len = batch.seq_lens_cpu[i]
-            #     req_mask = torch.ones(
-            #         (self.draft_token_num, seq_len), device=self.device
-            #     )
-            #     req_mask = torch.cat(
-            #         (
-            #             req_mask,
-            #             torch.from_numpy(mask[i]).to(
-            #                 device=self.device, non_blocking=True
-            #             ),
-            #         ),
-            #         dim=1,
-            #     ).to(torch.bool)
-            #     tree_mask.append(req_mask.flatten())
-            # tree_mask = torch.cat(tree_mask, dim=0)
-
-            # The generate_tree_mask kernel below implements the above code.
             req_masks_size = batch.seq_lens_sum * self.draft_token_num
             tree_mask_size = mask.size
             req_masks = torch.ones(
