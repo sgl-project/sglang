@@ -53,7 +53,7 @@ struct Prefill1Params {
   PlanW* plan_w;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_swa_slots]
+  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4, C128 state loc for c128
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -69,7 +69,7 @@ struct DecodeParams {
   PlanD* plan_d;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_swa_slots]
+  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4, C128 state loc for c128
   const IDX_T* seq_ptr;  // [batch_size]
   int64_t stride_r2t;
   uint32_t batch_size;
@@ -309,10 +309,15 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
       const auto raw_loc_0 = mapping[position_0];
       const auto raw_loc_1 = mapping[position_1];
-      const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-      const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
-      plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
-      plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
+      const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
+      const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+      if (params.compress_ratio == 128) {
+        plan_c.read_page_0 = state_loc_0 / 128;
+        plan_c.read_page_1 = state_loc_1 / 128;
+      } else {
+        plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
+        plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
+      }
       params.plan_c[idx] = plan_c;
     }
   } else if (idx < params.num_c_padded) {
@@ -326,9 +331,10 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
     const auto raw_loc = mapping[position];
-    const auto swa_loc = params.f2s_ptr[raw_loc];
+    const auto state_loc = params.state_map_ptr[raw_loc];
     plan_w.ragged_id = ragged_id;
-    plan_w.write_loc = compute_loc(swa_loc);
+    plan_w.write_loc =
+        params.compress_ratio == 128 ? state_loc : compute_loc(state_loc);
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
     params.plan_w[idx] = PlanW::invalid();
@@ -350,11 +356,14 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
   const auto raw_loc_0 = mapping[position_0];
   const auto raw_loc_1 = mapping[position_1];
-  const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-  const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
-  const auto write_loc = compute_loc(swa_loc_1);
-  const auto read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
-  const auto read_page_1 = write_loc / params.compress_ratio;
+  const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
+  const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+  const int32_t write_loc = static_cast<int32_t>(
+      params.compress_ratio == 128 ? state_loc_1 : compute_loc(state_loc_1));
+  const int32_t read_page_0 = static_cast<int32_t>(
+      params.compress_ratio == 128 ? state_loc_0 / 128 : compute_loc(state_loc_0) / params.compress_ratio);
+  const int32_t read_page_1 = static_cast<int32_t>(
+      params.compress_ratio == 128 ? state_loc_1 / 128 : write_loc / params.compress_ratio);
   params.plan_d[idx] = {
       .seq_len = static_cast<uint32_t>(seq_len),
       .write_loc = write_loc,
@@ -425,9 +434,9 @@ __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy para
   const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
   const auto position_1 = seq_len - 1;
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
-  const auto write_loc = legacy_compute_loc(rid, position_1);
-  const auto read_page_0 = legacy_compute_page(rid, position_0);
-  const auto read_page_1 = legacy_compute_page(rid, position_1);
+  const int32_t write_loc = legacy_compute_loc(rid, position_1);
+  const int32_t read_page_0 = legacy_compute_page(rid, position_0);
+  const int32_t read_page_1 = legacy_compute_page(rid, position_1);
   params.plan_d[idx] = {
       .seq_len = static_cast<uint32_t>(seq_len),
       .write_loc = write_loc,
@@ -443,7 +452,9 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * Inputs (all CPU-resident):
  * @param req_pool_indices  `[batch_size]` int64_t
  * @param req_to_token      `[num_reqs, max_tokens_per_req]` int64_t
- * @param full_to_swa       `[num_swa_slots]` int64_t
+ * @param full_to_state     `[full_cache_size]` int64_t. For c4 this maps
+ *                          full loc -> SWA loc; for c128 it maps full loc ->
+ *                          C128 state loc.
  * @param seq_lens          `[batch_size]` int64
  * @param extend_lens       `[batch_size]` int64
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
@@ -455,7 +466,7 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
 inline PrefillPlan plan_compress_prefill(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView req_to_token,      // GPU
-    const tvm::ffi::TensorView full_to_swa,       // GPU
+    const tvm::ffi::TensorView full_to_state,     // GPU
     const tvm::ffi::TensorView seq_lens,          // CPU/GPU
     const tvm::ffi::TensorView extend_lens,       // CPU/GPU
     const tvm::ffi::TensorView pin_buffer,        // CPU
@@ -482,7 +493,7 @@ inline PrefillPlan plan_compress_prefill(
   TensorMatcher({-1})  //
       .with_dtype<F2S_T>()
       .with_device(device_)
-      .verify(full_to_swa);
+      .verify(full_to_state);
   TensorMatcher({B})  //
       .with_dtype<IDX_T>()
       .with_device(cpu_or_gpu)
@@ -500,7 +511,7 @@ inline PrefillPlan plan_compress_prefill(
   const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
   const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
   const auto r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr());
-  const auto f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr());
+  const auto state_map_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
@@ -541,7 +552,7 @@ inline PrefillPlan plan_compress_prefill(
         .plan_w = static_cast<PlanW*>(W.data_ptr()),
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
-        .f2s_ptr = f2s_ptr,
+        .state_map_ptr = state_map_ptr,
         .stride_r2t = req_to_token.stride(0),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
@@ -617,7 +628,7 @@ inline PrefillPlan plan_compress_prefill(
       .plan_w = static_cast<PlanW*>(W.data_ptr()),
       .rid_ptr = rid_ptr,
       .r2t_ptr = r2t_ptr,
-      .f2s_ptr = f2s_ptr,
+      .state_map_ptr = state_map_ptr,
       .stride_r2t = req_to_token.size(1),
       .num_c = counter_c,
       .num_w = counter_w,
@@ -637,7 +648,7 @@ inline PrefillPlan plan_compress_prefill(
 inline tvm::ffi::Tensor plan_compress_decode(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView req_to_token,      // GPU
-    const tvm::ffi::TensorView full_to_swa,       // GPU
+    const tvm::ffi::TensorView full_to_state,     // GPU
     const tvm::ffi::TensorView seq_lens,          // CPU/GPU
     const int32_t compress_ratio,
     const int32_t swa_page_size,
@@ -657,7 +668,7 @@ inline tvm::ffi::Tensor plan_compress_decode(
   TensorMatcher({-1})  //
       .with_dtype<F2S_T>()
       .with_device(device_)
-      .verify(full_to_swa);
+      .verify(full_to_state);
   TensorMatcher({B})  //
       .with_dtype<IDX_T>()
       .with_device(device_)
@@ -670,7 +681,7 @@ inline tvm::ffi::Tensor plan_compress_decode(
       .plan_d = static_cast<PlanD*>(D.data_ptr()),
       .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
       .r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr()),
-      .f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr()),
+      .state_map_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr()),
       .seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr()),
       .stride_r2t = req_to_token.size(1),
       .batch_size = batch_size,

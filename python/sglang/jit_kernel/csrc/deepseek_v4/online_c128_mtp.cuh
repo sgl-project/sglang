@@ -23,7 +23,7 @@ struct OnlineC128MTPWritePrefixParams {
   const TSeq* __restrict__ seq_lens;
   const TReq* __restrict__ req_pool_indices;
   const int32_t* __restrict__ req_to_token;
-  const int64_t* __restrict__ full_to_swa;
+  const int64_t* __restrict__ full_to_c128_state;
   const float* __restrict__ ape;
   float* __restrict__ state;
   int64_t kv_score_stride_b;
@@ -31,7 +31,6 @@ struct OnlineC128MTPWritePrefixParams {
   int64_t ape_stride_r;
   int64_t state_stride_b;
   int64_t layer_bs;
-  int64_t swa_page_size;
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
 };
@@ -50,13 +49,12 @@ struct OnlineC128MTPCommitPendingParams {
   const TSeq* __restrict__ cur_seq_lens;
   const TReq* __restrict__ cur_req_pool_indices;
   const int32_t* __restrict__ req_to_token;
-  const int64_t* __restrict__ full_to_swa;
+  const int64_t* __restrict__ full_to_c128_state;
   const int64_t* __restrict__ pending_seq_lens;
   float* __restrict__ state;
   int64_t cur_bs;
   int64_t req_to_token_stride_b;
   int64_t state_stride_b;
-  int64_t swa_page_size;
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
   int64_t max_num_reqs;
@@ -95,9 +93,9 @@ __global__ void online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitP
   if ((final_seq & 127) == 0) return;
 
   const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-  const int64_t full_loc = static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
-  const int64_t swa_loc = params.full_to_swa[full_loc];
-  const int64_t slot = swa_loc / params.swa_page_size;
+  const int64_t full_loc =
+      static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
+  const int64_t slot = params.full_to_c128_state[full_loc];
   const float* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
   float* const dst = params.state + slot * params.state_stride_b;
 
@@ -121,8 +119,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
     const int64_t chunk_start = ((seq_before - 1) / 128) * 128;
     const int64_t full_loc =
         static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-    const int64_t swa_loc = params.full_to_swa[full_loc];
-    init_slot = swa_loc / params.swa_page_size;
+    init_slot = params.full_to_c128_state[full_loc];
   }
 
   const int64_t d = static_cast<int64_t>(threadIdx.x);
@@ -176,8 +173,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
       const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
       const int64_t full_loc =
           static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-      const int64_t swa_loc = params.full_to_swa[full_loc];
-      const int64_t slot = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
+      const int64_t slot = params.full_to_c128_state[full_loc] + (step + 1) * params.state_slot_stride;
       float* const out = params.state + slot * params.state_stride_b;
       out[d] = run_max;
       out[kHeadDim + d] = run_sum;
@@ -200,11 +196,10 @@ struct OnlineC128MTPWritePrefixKernel {
       tvm::ffi::TensorView seq_lens,
       tvm::ffi::TensorView req_pool_indices,
       tvm::ffi::TensorView req_to_token,
-      tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView full_to_c128_state,
       tvm::ffi::TensorView ape,
       tvm::ffi::TensorView state,
       int64_t layer_bs,
-      int64_t swa_page_size,
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
       DLDevice device) {
@@ -215,7 +210,7 @@ struct OnlineC128MTPWritePrefixKernel {
         .seq_lens = static_cast<const TSeq*>(seq_lens.data_ptr()),
         .req_pool_indices = static_cast<const TReq*>(req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-        .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
+        .full_to_c128_state = static_cast<const int64_t*>(full_to_c128_state.data_ptr()),
         .ape = static_cast<const float*>(ape.data_ptr()),
         .state = static_cast<float*>(state.data_ptr()),
         .kv_score_stride_b = kv_score_input.stride(0),
@@ -223,7 +218,6 @@ struct OnlineC128MTPWritePrefixKernel {
         .ape_stride_r = ape.stride(0),
         .state_stride_b = state.stride(0),
         .layer_bs = layer_bs,
-        .swa_page_size = swa_page_size,
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
     };
@@ -239,11 +233,10 @@ struct OnlineC128MTPWritePrefixKernel {
       tvm::ffi::TensorView seq_lens,
       tvm::ffi::TensorView req_pool_indices,
       tvm::ffi::TensorView req_to_token,
-      tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView full_to_c128_state,
       tvm::ffi::TensorView ape,
       tvm::ffi::TensorView state,
       int64_t layer_bs,
-      int64_t swa_page_size,
       int64_t num_verify_tokens,
       int64_t state_slot_stride) {
     using namespace host;
@@ -257,7 +250,7 @@ struct OnlineC128MTPWritePrefixKernel {
     TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(seq_lens);
     TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
-    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_swa);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_c128_state);
     TensorMatcher({128, kHeadDim}).with_dtype<float>().with_device(device).verify(ape);
     TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
 
@@ -271,62 +264,22 @@ struct OnlineC128MTPWritePrefixKernel {
     if (seq_dtype.is_type<int32_t>()) {
       if (req_dtype.is_type<int32_t>()) {
         launch<int32_t, int32_t>(
-            kv_score_input,
-            seq_lens,
-            req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            ape,
-            state,
-            layer_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            device.unwrap());
+            kv_score_input, seq_lens, req_pool_indices, req_to_token, full_to_c128_state, ape, state,
+            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
       } else {
         launch<int32_t, int64_t>(
-            kv_score_input,
-            seq_lens,
-            req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            ape,
-            state,
-            layer_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            device.unwrap());
+            kv_score_input, seq_lens, req_pool_indices, req_to_token, full_to_c128_state, ape, state,
+            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
       }
     } else {
       if (req_dtype.is_type<int32_t>()) {
         launch<int64_t, int32_t>(
-            kv_score_input,
-            seq_lens,
-            req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            ape,
-            state,
-            layer_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            device.unwrap());
+            kv_score_input, seq_lens, req_pool_indices, req_to_token, full_to_c128_state, ape, state,
+            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
       } else {
         launch<int64_t, int64_t>(
-            kv_score_input,
-            seq_lens,
-            req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            ape,
-            state,
-            layer_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            device.unwrap());
+            kv_score_input, seq_lens, req_pool_indices, req_to_token, full_to_c128_state, ape, state,
+            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
       }
     }
   }
@@ -405,11 +358,10 @@ struct OnlineC128MTPCommitPendingKernel {
       tvm::ffi::TensorView cur_seq_lens,
       tvm::ffi::TensorView cur_req_pool_indices,
       tvm::ffi::TensorView req_to_token,
-      tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView full_to_c128_state,
       tvm::ffi::TensorView pending_seq_lens,
       tvm::ffi::TensorView state,
       int64_t cur_bs,
-      int64_t swa_page_size,
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
       int64_t max_num_reqs,
@@ -420,13 +372,12 @@ struct OnlineC128MTPCommitPendingKernel {
         .cur_seq_lens = static_cast<const TSeq*>(cur_seq_lens.data_ptr()),
         .cur_req_pool_indices = static_cast<const TReq*>(cur_req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-        .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
+        .full_to_c128_state = static_cast<const int64_t*>(full_to_c128_state.data_ptr()),
         .pending_seq_lens = static_cast<const int64_t*>(pending_seq_lens.data_ptr()),
         .state = static_cast<float*>(state.data_ptr()),
         .cur_bs = cur_bs,
         .req_to_token_stride_b = req_to_token.stride(0),
         .state_stride_b = state.stride(0),
-        .swa_page_size = swa_page_size,
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
         .max_num_reqs = max_num_reqs,
@@ -441,11 +392,10 @@ struct OnlineC128MTPCommitPendingKernel {
   run(tvm::ffi::TensorView cur_seq_lens,
       tvm::ffi::TensorView cur_req_pool_indices,
       tvm::ffi::TensorView req_to_token,
-      tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView full_to_c128_state,
       tvm::ffi::TensorView pending_seq_lens,
       tvm::ffi::TensorView state,
       int64_t cur_bs,
-      int64_t swa_page_size,
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
       int64_t max_num_reqs) {
@@ -459,7 +409,7 @@ struct OnlineC128MTPCommitPendingKernel {
     TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(cur_seq_lens);
     TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(cur_req_pool_indices);
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
-    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_swa);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_c128_state);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
     TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
 
@@ -473,62 +423,22 @@ struct OnlineC128MTPCommitPendingKernel {
     if (seq_dtype.is_type<int32_t>()) {
       if (req_dtype.is_type<int32_t>()) {
         launch<int32_t, int32_t>(
-            cur_seq_lens,
-            cur_req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            pending_seq_lens,
-            state,
-            cur_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            max_num_reqs,
-            device.unwrap());
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_c128_state, pending_seq_lens,
+            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       } else {
         launch<int32_t, int64_t>(
-            cur_seq_lens,
-            cur_req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            pending_seq_lens,
-            state,
-            cur_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            max_num_reqs,
-            device.unwrap());
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_c128_state, pending_seq_lens,
+            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       }
     } else {
       if (req_dtype.is_type<int32_t>()) {
         launch<int64_t, int32_t>(
-            cur_seq_lens,
-            cur_req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            pending_seq_lens,
-            state,
-            cur_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            max_num_reqs,
-            device.unwrap());
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_c128_state, pending_seq_lens,
+            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       } else {
         launch<int64_t, int64_t>(
-            cur_seq_lens,
-            cur_req_pool_indices,
-            req_to_token,
-            full_to_swa,
-            pending_seq_lens,
-            state,
-            cur_bs,
-            swa_page_size,
-            num_verify_tokens,
-            state_slot_stride,
-            max_num_reqs,
-            device.unwrap());
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_c128_state, pending_seq_lens,
+            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       }
     }
   }

@@ -852,7 +852,7 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator,
                 )
                 assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
-                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                self.token_to_kv_pool.register_mapping(
                     swa_allocator.full_to_swa_index_mapping
                 )
 

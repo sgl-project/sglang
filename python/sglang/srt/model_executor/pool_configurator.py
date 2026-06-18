@@ -450,7 +450,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        c128_state_ratio = self.c128_ring_size / self.swa_page_size
+        # C128 state is indexed from full KV positions, not SWA pages. Offline
+        # C128 stores one raw state row per full token; online C128 stores one
+        # running state per 128-token chunk.
+        c128_state_ratio = 1 / 128 if c128_online else 1
         if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
 
@@ -461,10 +464,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
-            + self.swa_ratio
-            * c128_state_ratio
-            * c128_state_bytes
-            * self.num_layers_ca128
+            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
@@ -474,13 +474,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        c128_state_pool_size = full_token // 128 if c128_online else full_token
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size,
+            c128_state_pool_size=c128_state_pool_size,
         )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
