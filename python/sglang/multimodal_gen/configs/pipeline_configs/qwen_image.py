@@ -143,8 +143,6 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
-    supports_breakable_cuda_graph: bool = True
-    breakable_cuda_graph_unsupported_reason: str | None = None
 
     vae_tiling: bool = False
 
@@ -461,11 +459,6 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     """Configuration for the QwenImageEdit pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
-    supports_breakable_cuda_graph: bool = False
-    breakable_cuda_graph_unsupported_reason: str | None = (
-        "Qwen Image edit variants have not shown stable Breakable CUDA graph "
-        "benefits in serving benchmarks."
-    )
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )

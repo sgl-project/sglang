@@ -11,12 +11,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinBasePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
-    Hunyuan3D2PipelineConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
@@ -174,9 +170,9 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             kwargs(47), current_model=self.qwen_model
         )
 
-        self.assertEqual(first["encoder_hidden_states"][0].shape[1], 256)
-        self.assertEqual(first["txt_seq_lens"], [256])
-        self.assertEqual(second["txt_seq_lens"], [256])
+        self.assertEqual(first["encoder_hidden_states"][0].shape[1], 64)
+        self.assertEqual(first["txt_seq_lens"], [64])
+        self.assertEqual(second["txt_seq_lens"], [64])
         self.assertTrue(first["encoder_hidden_states_mask"][0, :19].all())
         self.assertFalse(first["encoder_hidden_states_mask"][0, 19:].any())
         self.assertTrue(second["encoder_hidden_states_mask"][0, :47].all())
@@ -236,7 +232,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.hunyuanvideo_model))
         self.assertEqual(self.stage._bcg_runners, {})
 
-    def test_pipeline_configs_can_mark_bcg_unsupported(self):
+    def test_pipeline_configs_default_to_bcg_unsupported(self):
         for cfg in (
             PipelineConfig(),
             SanaPipelineConfig(),
@@ -244,16 +240,11 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             GlmImagePipelineConfig(),
             Flux2KleinBasePipelineConfig(),
             LTX2PipelineConfig(),
-            QwenImageEditPipelineConfig(),
+            QwenImagePipelineConfig(),
         ):
             self.assertFalse(cfg.supports_breakable_cuda_graph, type(cfg).__name__)
             self.assertIsInstance(cfg.breakable_cuda_graph_unsupported_reason, str)
             self.assertGreater(len(cfg.breakable_cuda_graph_unsupported_reason), 16)
-
-    def test_only_benchmarked_pipeline_configs_opt_into_bcg(self):
-        for cfg in (QwenImagePipelineConfig(), Hunyuan3D2PipelineConfig()):
-            self.assertTrue(cfg.supports_breakable_cuda_graph, type(cfg).__name__)
-            self.assertIsNone(cfg.breakable_cuda_graph_unsupported_reason)
 
     def test_unsupported_pipeline_config_does_not_create_bcg_runner(self):
         self.stage.server_args = SimpleNamespace(

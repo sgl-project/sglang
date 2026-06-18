@@ -43,7 +43,10 @@ from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    DEFAULT_BCG_TEXT_BUCKETS,
+    ServerArgs,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -501,6 +504,12 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
 
 class TestBreakableCudaGraphSupport(unittest.TestCase):
+    def test_default_text_buckets_cover_short_prompts(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+
+        self.assertEqual(DEFAULT_BCG_TEXT_BUCKETS, (64, 128, 256, 512, 1024))
+        self.assertEqual(args.resolved_bcg_text_buckets(), DEFAULT_BCG_TEXT_BUCKETS)
+
     def test_unsupported_pipeline_disables_requested_bcg(self):
         args = _from_dict_without_model_resolution(
             {
@@ -514,19 +523,34 @@ class TestBreakableCudaGraphSupport(unittest.TestCase):
         self.assertFalse(args.warmup)
         self.assertFalse(args.server_warmup)
 
-    def test_supported_pipeline_keeps_requested_bcg(self):
+    def test_qwen_image_models_keep_requested_bcg(self):
+        for model_path in ("Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"):
+            with self.subTest(model_path=model_path):
+                args = _from_dict_without_model_resolution(
+                    {
+                        "model_path": model_path,
+                        "enable_breakable_cuda_graph": True,
+                        "warmup_resolutions": ["1024x1024"],
+                    },
+                    pipeline_config=QwenImagePipelineConfig(),
+                )
+
+                self.assertTrue(args.enable_breakable_cuda_graph)
+                self.assertTrue(args.warmup)
+                self.assertTrue(args.server_warmup)
+
+    def test_qwen_image_edit_model_disables_requested_bcg(self):
         args = _from_dict_without_model_resolution(
             {
-                "model_path": "/fake",
+                "model_path": "Qwen/Qwen-Image-Edit-2511",
                 "enable_breakable_cuda_graph": True,
-                "warmup_resolutions": ["1024x1024"],
             },
             pipeline_config=QwenImagePipelineConfig(),
         )
 
-        self.assertTrue(args.enable_breakable_cuda_graph)
-        self.assertTrue(args.warmup)
-        self.assertTrue(args.server_warmup)
+        self.assertFalse(args.enable_breakable_cuda_graph)
+        self.assertFalse(args.warmup)
+        self.assertFalse(args.server_warmup)
 
 
 class TestWarmupModeNormalization(unittest.TestCase):

@@ -125,7 +125,30 @@ WARMUP_MODES = ("off", "request", "server")
 # Default prompt sequence-length buckets for breakable CUDA graph (BCG) padding.
 # Prompt-conditioning is padded up to the smallest bucket that fits so prompts
 # of different lengths share one captured graph.
-DEFAULT_BCG_TEXT_BUCKETS = (256, 512, 1024, 2048)
+DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
+    {
+        "qwen/qwen-image",
+        "qwen/qwen-image-2512",
+        "qwen-image",
+        "qwen-image-2512",
+    }
+)
+
+
+def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
+    if not model_ref:
+        return set()
+
+    normalized = str(model_ref).strip().rstrip("/").lower()
+    refs = {normalized, os.path.basename(normalized)}
+
+    if "models--" in normalized:
+        hf_cache_name = normalized.split("models--", 1)[1].split("/", 1)[0]
+        refs.add(hf_cache_name.replace("--", "/"))
+
+    return refs
 
 
 @dataclasses.dataclass
@@ -475,7 +498,12 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         pipeline_config = getattr(self, "pipeline_config", None)
-        if getattr(pipeline_config, "supports_breakable_cuda_graph", False):
+        if (
+            type(pipeline_config).__name__ == "QwenImagePipelineConfig"
+            and self._is_breakable_cuda_graph_supported_model()
+        ):
+            pipeline_config.supports_breakable_cuda_graph = True
+            pipeline_config.breakable_cuda_graph_unsupported_reason = None
             return
 
         reason = getattr(
@@ -488,6 +516,11 @@ class ServerArgs(DisaggServerArgsMixin):
             or "pipeline config has not opted into Breakable CUDA graph support",
         )
         self.enable_breakable_cuda_graph = False
+
+    def _is_breakable_cuda_graph_supported_model(self) -> bool:
+        refs = _normalized_bcg_model_refs(self.model_id)
+        refs.update(_normalized_bcg_model_refs(self.model_path))
+        return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""

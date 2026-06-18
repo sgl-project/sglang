@@ -16,8 +16,6 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     """Pipeline configuration for Hunyuan3D image-to-mesh generation."""
 
     task_type: ModelTaskType = ModelTaskType.I2M
-    supports_breakable_cuda_graph: bool = True
-    breakable_cuda_graph_unsupported_reason: str | None = None
 
     # Subfolder paths
     shape_subfolder: str = "hunyuan3d-dit-v2-0"

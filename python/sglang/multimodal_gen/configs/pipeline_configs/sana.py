@@ -44,15 +44,6 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.T2I
 
-    # BCG is disabled for SANA: the DiT is short enough that cudaGraphLaunch,
-    # static input copies, and output cloning outweighed captured-kernel savings
-    # in B200 profiling (denoise ~0.76s eager vs ~2.50s with BCG).
-    supports_breakable_cuda_graph: bool = False
-    breakable_cuda_graph_unsupported_reason: str | None = (
-        "SANA BCG is slower on B200 because graph replay/copy overhead dominates "
-        "the short denoising workload."
-    )
-
     # should_use_guidance=False disables *embedded* guidance (timestep-conditioned
     # guidance token). Standard CFG via guidance_scale is still active.
     should_use_guidance: bool = False
