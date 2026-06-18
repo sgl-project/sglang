@@ -836,7 +836,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
                 "encoder_hidden_states_mask": (
-                    batch.prompt_embeds_mask or batch.prompt_attention_mask
+                    batch.prompt_embeds_mask
+                    if batch.prompt_embeds_mask is not None
+                    else batch.prompt_attention_mask
                 ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
@@ -860,7 +862,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     "encoder_attention_mask": batch.negative_attention_mask,
                     "encoder_hidden_states_mask": (
                         batch.negative_prompt_embeds_mask
-                        or batch.negative_attention_mask
+                        if batch.negative_prompt_embeds_mask is not None
+                        else batch.negative_attention_mask
                     ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
@@ -1994,9 +1997,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ):
         """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
 
-        Generic, model-agnostic padding lives in ``bcg_utils``; model-specific
-        padders (Qwen, Z-Image, ...) live next to their model and register with
-        the ``bcg_utils`` registry, keeping this base stage model-agnostic.
+        Generic padding lives in ``bcg_utils``; Qwen Image registers its
+        prompt-specific padder from ``model_specific_stages/qwen_image_bcg.py``.
 
         ``force_bucket`` pads to exactly that bucket (used by warmup to capture
         every bucket); a prompt already longer than ``force_bucket`` is left
@@ -2015,29 +2017,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not getattr(self.server_args, "enable_breakable_cuda_graph", False):
             return None
         if not isinstance(current_model, nn.Module):
-            return None
-        pipeline_config = getattr(self.server_args, "pipeline_config", None)
-        if not getattr(pipeline_config, "supports_breakable_cuda_graph", False):
-            reason = getattr(
-                pipeline_config,
-                "breakable_cuda_graph_unsupported_reason",
-                None,
-            )
-            logged = getattr(self, "_bcg_unsupported_logged", set())
-            key = type(pipeline_config).__name__
-            if key not in logged:
-                logger.info(
-                    "[Diffusion BCG] disabled for %s: %s",
-                    key,
-                    reason or "pipeline config marks BCG unsupported",
-                )
-                logged.add(key)
-                self._bcg_unsupported_logged = logged
-            return None
-        if bcg_utils.transformer_class_name_matches(current_model, "hunyuanvideo"):
-            # HunyuanVideo's text stream can replay stale prompt conditioning
-            # through BCG attention break points. Keep --enable-bcg correct by
-            # running this transformer eagerly until that path is fixed.
             return None
         key = id(current_model)
         runner = self._bcg_runners.get(key)

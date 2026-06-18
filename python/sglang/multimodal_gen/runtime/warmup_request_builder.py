@@ -262,7 +262,10 @@ def _resolve_warmup_steps(
     # Breakable CUDA graph captures one graph per step-branch at warmup so that
     # serving never records a fresh graph. Run the model's full recommended
     # steps (uncapped) so every step-branch signature is captured up front.
-    if server_args.enable_breakable_cuda_graph and default_steps:
+    if (
+        getattr(server_args, "enable_breakable_cuda_graph", False) is True
+        and default_steps
+    ):
         return max(int(default_steps), warmup_steps)
 
     if not server_based_warmup:

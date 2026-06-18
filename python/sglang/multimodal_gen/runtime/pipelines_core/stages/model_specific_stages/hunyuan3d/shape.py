@@ -335,9 +335,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
 
         pos_cond_kwargs = {"encoder_hidden_states": cond}
         neg_cond_kwargs = {}
-        cfg_policy = server_args.pipeline_config.cfg_policy.build(
-            batch, {}, pos_cond_kwargs, neg_cond_kwargs
-        )
 
         return DenoisingContext(
             scheduler=scheduler,
@@ -357,7 +354,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
             seq_len=None,
             guidance=guidance,
             is_warmup=batch.is_warmup,
-            cfg_policy=cfg_policy,
         )
 
     def _predict_noise(
@@ -367,23 +363,13 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         timestep,
         target_dtype,
         guidance: torch.Tensor,
-        enable_bcg: bool = True,
         **kwargs,
     ):
         """Hunyuan3D-specific noise prediction with normalized timestep."""
         cond = kwargs.get("encoder_hidden_states")
         scheduler = kwargs.get("scheduler")
         timestep_norm = timestep / scheduler.config.num_train_timesteps
-        call_kwargs = {
-            "x": latent_model_input,
-            "t": timestep_norm,
-            "contexts": cond,
-            "guidance": guidance,
-        }
-        runner = self._maybe_get_bcg_runner(current_model) if enable_bcg else None
-        if runner is not None:
-            return runner(**call_kwargs)
-        return current_model(**call_kwargs)
+        return current_model(latent_model_input, timestep_norm, cond, guidance=guidance)
 
     def _predict_noise_with_cfg(
         self,
@@ -395,23 +381,16 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         attn_metadata,
         target_dtype,
         current_guidance_scale,
-        cfg_policy,
-        cfg_gate_state,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
         server_args,
         guidance,
         latents,
     ):
         """Hunyuan3D-specific CFG: concat latents, single forward, then split.
-
-        Hunyuan3D keeps a single positive conditioning branch. Prefer the
-        normalized branch kwargs when ``cfg_policy`` is available so BCG sees the
-        same conditioning path as the generic denoising loop, and fall back to
-        ``prompt_embeds`` for older callers.
         """
-        if cfg_policy is not None and cfg_policy.branches:
-            cond = cfg_policy.branches[0].kwargs.get("encoder_hidden_states")
-        else:
-            cond = batch.prompt_embeds[0] if batch.prompt_embeds else None
+        cond = pos_cond_kwargs.get("encoder_hidden_states")
         do_cfg = batch.do_classifier_free_guidance
 
         if do_cfg:
@@ -555,15 +534,16 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         if isinstance(mesh, list):
             mesh = mesh[0]
 
-        if batch.is_warmup:
-            logger.info("Skipping mesh export during warmup")
-            batch.extra["shape_obj_path"] = None
-            batch.extra["shape_return_path"] = None
-            if self.config.paint_enable:
-                return batch
-            return OutputBatch(output_file_paths=[], metrics=batch.metrics)
-
         if mesh is None:
+            if batch.is_warmup:
+                logger.info(
+                    "Skipping mesh export during warmup "
+                    "(surface extraction returned None)"
+                )
+                batch.extra["_mesh_failed"] = True
+                if self.config.paint_enable:
+                    return batch
+                return OutputBatch(output_file_paths=[], metrics=batch.metrics)
             raise RuntimeError(
                 "Mesh generation failed: surface extraction returned None. "
                 "The surface level may be outside the volume data range."

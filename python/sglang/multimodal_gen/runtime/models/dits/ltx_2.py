@@ -231,9 +231,9 @@ def _ltx2_build_batched_perturbation_states(
             cache_key = tuple(keep_values)
             mask = mask_cache.get(cache_key)
             if mask is None:
-                mask = values.new_empty((len(keep_values),) + (1,) * (values.ndim - 1))
-                for index, keep_value in enumerate(keep_values):
-                    mask[index].fill_(keep_value)
+                mask = torch.tensor(
+                    keep_values, device=values.device, dtype=values.dtype
+                ).view(len(keep_values), *([1] * (values.ndim - 1)))
                 mask_cache[cache_key] = mask
             states[block_idx] = (mask, False)
     return states

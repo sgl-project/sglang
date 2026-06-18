@@ -65,7 +65,6 @@ class TransformersModelConfig(EncoderConfig):
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
-
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
     vae_precision: str = "bf16"

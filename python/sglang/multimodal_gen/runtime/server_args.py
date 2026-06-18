@@ -502,18 +502,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type(pipeline_config).__name__ == "QwenImagePipelineConfig"
             and self._is_breakable_cuda_graph_supported_model()
         ):
-            pipeline_config.supports_breakable_cuda_graph = True
-            pipeline_config.breakable_cuda_graph_unsupported_reason = None
             return
 
-        reason = getattr(
-            pipeline_config, "breakable_cuda_graph_unsupported_reason", None
-        )
         logger.warning(
-            "[Diffusion BCG] disabled for %s: %s",
+            "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image and "
+            "Qwen/Qwen-Image-2512 are currently supported.",
             type(pipeline_config).__name__,
-            reason
-            or "pipeline config has not opted into Breakable CUDA graph support",
         )
         self.enable_breakable_cuda_graph = False
 

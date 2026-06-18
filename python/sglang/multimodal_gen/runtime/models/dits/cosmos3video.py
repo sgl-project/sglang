@@ -47,10 +47,6 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-    is_in_breakable_cuda_graph,
-)
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
@@ -502,15 +498,12 @@ class Cosmos3CrossAttention(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
         )
-        # Set per request by Cosmos3OmniTransformer.precompute_und; read inside
-        # the eager BCG break so replay picks up the current prompt's UND K/V.
-        self._und_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        k_und: torch.Tensor | None,
-        v_und: torch.Tensor | None,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
@@ -566,27 +559,10 @@ class Cosmos3CrossAttention(nn.Module):
         # K/V = [text (replicated on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
-        # UND K/V come from side-state (set per request by precompute_und),
-        # not from the captured graph, so this attention is a BCG break point
-        # and a single captured GEN graph serves any prompt length.
-        if k_und is not None:
-            self._und_kv = (k_und, v_und)
-        out = self._attend_und_break(q, k, v)
+        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
-
-    def _attend_und_break(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> torch.Tensor:
-        """Attend GEN queries over [UND-prefix | GEN] K/V.
-
-        UND K/V are read from ``self._und_kv`` (side-state) rather than passed
-        in, so under breakable CUDA graph capture this runs eagerly and the
-        replayed graph reads the current prompt's UND K/V (any length).
-        """
-        k_und, v_und = self._und_kv
-        return self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
 
 
 # -----------------------------------------------------------------------------
@@ -1055,102 +1031,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         if not isinstance(self.cached_gen_rope_inputs, dict):
             self.cached_gen_rope_inputs = {}
 
-    def _ensure_und(
-        self,
-        *,
-        cache_key,
-        text_ids,
-        text_mask,
-        T,
-        Hp,
-        Wp,
-        fps,
-        device,
-        cache_dtype,
-        sequence_shard_enabled,
-        seq_shard_pad,
-        local_seq_len,
-        batch_size,
-    ):
-        """Compute (or reuse) the UND K/V cache + GEN rope inputs for
-        ``cache_key`` and publish the per-layer UND K/V onto each GEN
-        cross-attention's side-state, so the cross-attention can run as a BCG
-        break point. Returns ``(cos_sin_gen, gen_rope_cache_positions)``."""
-        if (
-            cache_key not in self.cached_kv
-            or cache_key not in self.cached_gen_rope_inputs
-        ):
-            text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
-                text_mask, T, Hp, Wp, fps, device
-            )
-            self.cached_kv[cache_key] = self.language_model(
-                text_ids, text_mask, text_pos_ids
-            )
-            if sequence_shard_enabled:
-                if seq_shard_pad > 0:
-                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
-                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
-                vis_pos_ids = vis_pos_ids.view(
-                    3, batch_size, self.sp_size, local_seq_len
-                )[:, :, self.sp_rank, :]
-            self.cached_gen_rope_inputs[cache_key] = (
-                self.language_model.rotary_emb.build_rope_cache_inputs(
-                    vis_pos_ids, cache_dtype=cache_dtype
-                )
-            )
-        cached_kv_for_key = self.cached_kv[cache_key]
-        for i, layer in enumerate(self.gen_layers):
-            layer.cross_attention._und_kv = cached_kv_for_key[i]
-        return self.cached_gen_rope_inputs[cache_key]
-
-    @torch.no_grad()
-    def precompute_und(
-        self,
-        *,
-        hidden_states,
-        text_ids,
-        text_mask,
-        fps,
-        cache_key="default",
-        max_text_seq_len=None,
-    ):
-        """Eagerly compute UND K/V + GEN rope for a request OUTSIDE any captured
-        region, publishing UND K/V to the GEN cross-attentions. Returns
-        ``(cos_sin_gen, gen_rope_positions)`` to feed the captured GEN forward as
-        fixed-shape inputs (prompt-invariant signature)."""
-        self._ensure_cache_dicts()
-        batch_size, C, T, H, W = hidden_states.shape
-        Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        if max_text_seq_len is None:
-            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
-        if max_text_seq_len < text_ids.shape[1]:
-            text_ids = text_ids[:, :max_text_seq_len]
-            text_mask = text_mask[:, :max_text_seq_len]
-        sequence_shard_enabled = self.sp_size > 1
-        seq_len_orig = T * Hp * Wp
-        seq_shard_pad = 0
-        local_seq_len = None
-        if sequence_shard_enabled:
-            if seq_len_orig % self.sp_size != 0:
-                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-            local_seq_len = (seq_len_orig + seq_shard_pad) // self.sp_size
-        cache_dtype = self.proj_in.weight.dtype
-        return self._ensure_und(
-            cache_key=cache_key,
-            text_ids=text_ids,
-            text_mask=text_mask,
-            T=T,
-            Hp=Hp,
-            Wp=Wp,
-            fps=fps,
-            device=hidden_states.device,
-            cache_dtype=cache_dtype,
-            sequence_shard_enabled=sequence_shard_enabled,
-            seq_shard_pad=seq_shard_pad,
-            local_seq_len=local_seq_len,
-            batch_size=batch_size,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1164,8 +1044,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
-        precomputed_cos_sin_gen: torch.Tensor | None = None,
-        precomputed_gen_rope_positions: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass for denoising.
@@ -1190,17 +1068,16 @@ class Cosmos3OmniTransformer(CachableDiT):
         Returns:
             [B, C, T, H, W] velocity prediction
         """
-        if precomputed_cos_sin_gen is None and (text_ids is None or text_mask is None):
+        if text_ids is None or text_mask is None:
             raise ValueError("Cosmos3 requires text_ids and text_mask to be passed")
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        if precomputed_cos_sin_gen is None:
-            if max_text_seq_len is None:
-                max_text_seq_len = int(text_mask.sum(dim=1).max().item())
-            if max_text_seq_len < text_ids.shape[1]:
-                text_ids = text_ids[:, :max_text_seq_len]
-                text_mask = text_mask[:, :max_text_seq_len]
+        if max_text_seq_len is None:
+            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len < text_ids.shape[1]:
+            text_ids = text_ids[:, :max_text_seq_len]
+            text_mask = text_mask[:, :max_text_seq_len]
 
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
@@ -1261,42 +1138,48 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         self._ensure_cache_dicts()
 
-        if precomputed_cos_sin_gen is not None:
-            # Breakable-CUDA-graph path: UND K/V was published onto each GEN
-            # cross-attention by precompute_und() (eager, outside capture). Rope
-            # inputs are prompt-dependent in value but fixed in shape, so they are
-            # passed in as captured-graph inputs to keep the signature prompt
-            # invariant. The cross-attention reads UND K/V from side-state, so it
-            # runs as a BCG break point and one captured graph serves any prompt.
-            cos_sin_gen = precomputed_cos_sin_gen
-            gen_rope_cache_positions = precomputed_gen_rope_positions
-        else:
-            cos_sin_gen, gen_rope_cache_positions = self._ensure_und(
-                cache_key=cache_key,
-                text_ids=text_ids,
-                text_mask=text_mask,
-                T=T,
-                Hp=Hp,
-                Wp=Wp,
-                fps=fps,
-                device=hidden_states.device,
-                cache_dtype=hidden_gen.dtype,
-                sequence_shard_enabled=sequence_shard_enabled,
-                seq_shard_pad=seq_shard_pad,
-                local_seq_len=(local_seq_len if sequence_shard_enabled else None),
-                batch_size=batch_size,
+        # Compute UND K/V cache for this cache_key if not already cached
+        # This allows reusing the cache across denoising steps for the same text
+        if (
+            cache_key not in self.cached_kv
+            or cache_key not in self.cached_gen_rope_inputs
+        ):
+            text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
+                text_mask, T, Hp, Wp, fps, hidden_states.device
+            )
+            # UND K/V cache is kept FULL on all ranks (not sharded). Text
+            # sequence is short, so memory impact is minimal, and the GEN
+            # cross-attention needs the full K/V on every SP rank.
+            self.cached_kv[cache_key] = self.language_model(
+                text_ids, text_mask, text_pos_ids
+            )
+            if sequence_shard_enabled:
+                if seq_shard_pad > 0:
+                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
+                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
+                vis_pos_ids = vis_pos_ids.view(
+                    3, batch_size, self.sp_size, local_seq_len
+                )[:, :, self.sp_rank, :]
+            self.cached_gen_rope_inputs[cache_key] = (
+                self.language_model.rotary_emb.build_rope_cache_inputs(
+                    vis_pos_ids, cache_dtype=hidden_gen.dtype
+                )
             )
 
-        # Run GEN layers. UND K/V is read from each cross-attention's side-state
-        # (published above), so the per-layer cross-attention is a BCG break
-        # point; the rest of the block is captured.
+        cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]
+
+        # Run GEN layers. `residual` is threaded so each layer's
+        # input_layernorm and post_attention_layernorm can use the
+        # fused add+rmsnorm path instead of separate add + norm kernels.
+        cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
         use_fused_qk_norm_rope = T > 1
         for i, layer in enumerate(self.gen_layers):
+            k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
                 hidden_gen,
-                None,
-                None,
+                k_und,
+                v_und,
                 cos_sin_gen,
                 gen_rope_cache_positions,
                 use_fused_qk_norm_rope,
@@ -1473,25 +1356,3 @@ class Cosmos3OmniTransformer(CachableDiT):
 
 
 EntryClass = Cosmos3OmniTransformer
-
-
-def _install_cosmos3_und_break():
-    """Make ``Cosmos3CrossAttention._attend_und_break`` a breakable-CUDA-graph
-    break point: under BCG capture it runs eagerly between captured segments
-    (reading the live ``self._und_kv``), so one captured GEN graph replays for
-    any prompt. Transparent pass-through when BCG is inactive."""
-    import functools
-
-    inner = Cosmos3CrossAttention._attend_und_break
-    bcg_inner = eager_on_graph(True)(inner)
-
-    @functools.wraps(inner)
-    def _attend_und_break(self, q, k, v):
-        if is_in_breakable_cuda_graph():
-            return bcg_inner(self, q, k, v)
-        return inner(self, q, k, v)
-
-    Cosmos3CrossAttention._attend_und_break = _attend_und_break
-
-
-_install_cosmos3_und_break()

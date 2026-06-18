@@ -238,7 +238,6 @@ class GlmImageAR(PipelineStage):
         )
 
         prior_token_image_ids = None
-        prior_token_image_shapes = None
         if image is not None:
             source_grids = image_grid_thw[:-1]
             prior_token_image_embed = pooled_image_features_to_tensor(
@@ -250,7 +249,6 @@ class GlmImageAR(PipelineStage):
                 prior_token_image_embed, source_grids
             )
             prior_token_image_ids = []
-            prior_token_image_shapes = []
             prior_ids_per_source = torch.split(
                 prior_token_image_ids_d32,
                 source_grids.prod(dim=-1).tolist(),
@@ -264,7 +262,6 @@ class GlmImageAR(PipelineStage):
                         int(source_w),
                     ).squeeze(0)
                 )
-                prior_token_image_shapes.append((int(source_h) * 2, int(source_w) * 2))
 
         # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
         # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
@@ -284,7 +281,7 @@ class GlmImageAR(PipelineStage):
             prior_token_ids_d32, token_h, token_w
         )
 
-        return prior_token_ids, prior_token_image_ids, prior_token_image_shapes
+        return prior_token_ids, prior_token_image_ids
 
     @torch.no_grad()
     def forward(
@@ -292,6 +289,7 @@ class GlmImageAR(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
+
         prompt = batch.prompt
         height = batch.height
         width = batch.width
@@ -309,20 +307,12 @@ class GlmImageAR(PipelineStage):
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
 
-        if batch.seed is not None:
-            seed = int(batch.seed)
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-
         time_start = time.time()
-        prior_token_id, prior_token_image_ids, prior_token_image_shapes = (
-            self.generate_prior_tokens(
-                prompt=prompt,
-                image=ar_condition_images,
-                height=height,
-                width=width,
-            )
+        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+            prompt=prompt,
+            image=ar_condition_images,
+            height=height,
+            width=width,
         )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
@@ -330,7 +320,6 @@ class GlmImageAR(PipelineStage):
 
         batch.prior_token_id = prior_token_id
         batch.prior_token_image_ids = prior_token_image_ids
-        batch.prior_token_image_shapes = prior_token_image_shapes
         batch.height = height
         batch.width = width
 
@@ -401,20 +390,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             and hasattr(self.transformer.config, "sample_size")
             else 128
         )
-
-    @staticmethod
-    def _condition_image_preprocess_size(
-        height: int,
-        width: int,
-        multiple_of: int,
-        prior_token_shape: tuple[int, int] | None = None,
-    ) -> tuple[int, int]:
-        if prior_token_shape is not None:
-            token_h, token_w = prior_token_shape
-            return token_h * multiple_of, token_w * multiple_of
-        return (height // multiple_of) * multiple_of, (
-            width // multiple_of
-        ) * multiple_of
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -653,6 +628,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         device,
         generator,
     ):
+
         shape = (
             batch_size,
             num_channels_latents,
@@ -740,6 +716,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
+
         guidance_scale = batch.guidance_scale
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
@@ -774,7 +751,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         prior_token_id = batch.prior_token_id
         prior_token_image_ids = batch.prior_token_image_ids
-        prior_token_image_shapes = getattr(batch, "prior_token_image_shapes", None)
         prior_token_id = prior_token_id.to(device)
 
         # 3. Encode input prompt
@@ -790,17 +766,15 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         # 4. process images
         if ar_condition_images is not None:
             preprocessed_condition_images = []
-            for idx, img in enumerate(ar_condition_images):
+            for img in ar_condition_images:
+                image_height, image_width = (
+                    img.size[::-1]
+                    if isinstance(img, PIL.Image.Image)
+                    else img.shape[:2]
+                )
                 multiple_of = self.vae_scale_factor * self.transformer.config.patch_size
-                prior_token_shape = (
-                    prior_token_image_shapes[idx]
-                    if prior_token_image_shapes is not None
-                    and idx < len(prior_token_image_shapes)
-                    else None
-                )
-                image_height, image_width = self._condition_image_preprocess_size(
-                    height, width, multiple_of, prior_token_shape
-                )
+                image_height = (image_height // multiple_of) * multiple_of
+                image_width = (image_width // multiple_of) * multiple_of
                 img = self.image_processor.preprocess(
                     img, height=image_height, width=image_width
                 )

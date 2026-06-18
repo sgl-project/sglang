@@ -11,14 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Model-agnostic helpers for breakable CUDA graph (BCG) prompt padding.
+"""Qwen-focused helpers for breakable CUDA graph (BCG) prompt padding.
 
-These are the shared, model-independent primitives used to pad prompt
-conditioning up to a sequence-length bucket so that prompts of different
-lengths reuse one captured graph. Model-specific padders (Qwen, Z-Image, ...)
-live next to their model in ``model_specific_stages`` and register themselves
-through :func:`register_prompt_padder`; the generic masked padder here is the
-default fallback.
+These helpers pad prompt conditioning up to a sequence-length bucket so Qwen
+Image prompts of different lengths reuse one captured graph.
 """
 
 from __future__ import annotations
@@ -305,5 +301,4 @@ def _ensure_model_padders_registered() -> None:
     _model_padders_registered = True
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (  # noqa: F401
         qwen_image_bcg,
-        zimage_bcg,
     )

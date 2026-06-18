@@ -664,7 +664,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         enable_teacache = forward_batch is not None and forward_batch.enable_teacache
 
         if guidance is None:
-            guidance = hidden_states.new_full((hidden_states.shape[0],), 6016.0)
+            guidance = torch.tensor(
+                [6016.0], device=hidden_states.device, dtype=hidden_states.dtype
+            )
 
         img = x = hidden_states
         t = timestep
@@ -696,8 +698,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             self.num_attention_heads,
             self.rope_dim_list,
             self.rope_theta,
-            device=x.device,
         )
+        freqs_cos = freqs_cos.to(x.device)
+        freqs_sin = freqs_sin.to(x.device)
         # Prepare modulation vectors
         vec = self.time_in(t)
 

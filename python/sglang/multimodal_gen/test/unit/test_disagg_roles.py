@@ -39,10 +39,6 @@ from sglang.multimodal_gen.runtime.pipelines.wan_i2v_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-    OutputBatch,
-    Req,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
@@ -573,25 +569,6 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
 
         self.assertEqual(export_stage.role_affinity, RoleType.DECODER)
         self.assertEqual(save_stage.role_affinity, RoleType.DECODER)
-
-    def test_hunyuan3d_shape_save_skips_mesh_export_during_warmup(self):
-        class _ExportShouldNotRun:
-            def export(self, path):
-                raise AssertionError(f"unexpected warmup export to {path}")
-
-        stage = Hunyuan3DShapeSaveStage(
-            config=Hunyuan3D2PipelineConfig(paint_enable=False),
-        )
-        req = Req(prompt="warmup")
-        req.is_warmup = True
-        req.extra["shape_meshes"] = [_ExportShouldNotRun()]
-
-        output = stage.forward(req, SimpleNamespace())
-
-        self.assertIsInstance(output, OutputBatch)
-        self.assertEqual(output.output_file_paths, [])
-        self.assertIsNone(req.extra["shape_obj_path"])
-        self.assertIsNone(req.extra["shape_return_path"])
 
     def test_hunyuan3d_stage_filtering_matches_shape_only_roles(self):
         expected = {
