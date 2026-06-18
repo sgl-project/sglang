@@ -100,14 +100,67 @@ export const benchmarks = [
         ttft_ms: 250727, tpot_ms: 68.55, tokens_per_sec_per_gpu: 641 },
     ],
   },
-  // ---- B300 + FP8 ----  (inferred from B200; benchmarks pending → render "pending")
-  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
-  // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2; benchmarks pending → render "pending")
-  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" } },
+  // ---- B300 + FP8 ----  (8-GPU single node, TP8; measured on v0.5.13.post1, flush-cache every run.
+  // B300 (sm103) trails B200 (sm100) per-GPU here — the deep_gemm/DSA kernels are tuned for sm100 and
+  // fall to a slower path on sm103; the gap should close as sm103 gets first-class kernels.)
+  {
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 503, tpot_ms: 3.24, tokens_per_sec_per_gpu: 34 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 4731, tpot_ms: 9.56, tokens_per_sec_per_gpu: 140 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 6465, tpot_ms: 23.36, tokens_per_sec_per_gpu: 245 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 67814, tpot_ms: 26.19, tokens_per_sec_per_gpu: 265 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 206246, tpot_ms: 56.11, tokens_per_sec_per_gpu: 388 },
+    ],
+  },
+  // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2, TP8; measured on v0.5.13.post1, flush-cache every run.
+  // balanced/HT run plain TP8 (no DP-Attention/DeepEP), so they trail the FP8 dp-attention recipe at high concurrency.)
+  {
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 470, tpot_ms: 2.93, tokens_per_sec_per_gpu: 37 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 3474, tpot_ms: 10.33, tokens_per_sec_per_gpu: 146 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 14123, tpot_ms: 35.47, tokens_per_sec_per_gpu: 157 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 116633, tpot_ms: 40.65, tokens_per_sec_per_gpu: 167 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 525108, tpot_ms: 82.52, tokens_per_sec_per_gpu: 168 },
+    ],
+  },
   // ---- BF16 multi-node (inferred) ----  benchmarks pending
   { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
   { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
