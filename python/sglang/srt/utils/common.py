@@ -1398,10 +1398,7 @@ def graceful_kill_process_tree(
                     pass
             # Best-effort wait for the kernel to reap them.
             kill_deadline = time.monotonic() + 3
-            while (
-                _still_holding_resources(alive)
-                and time.monotonic() < kill_deadline
-            ):
+            while _still_holding_resources(alive) and time.monotonic() < kill_deadline:
                 time.sleep(0.1)
         else:
             logger.info("All child processes terminated gracefully.")
