@@ -417,15 +417,14 @@ def alloc_for_extend(
     # Allocate KV cache (throws exception on failure)
     # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
     # server_args.page_size * dcp_size, so it can be > 1 even when
-    # tree_cache.page_size (== server_args.page_size) is 1. On HIP branch on the
-    # real allocator's page_size so the DCP paged path is taken; keep
-    # tree_cache.page_size elsewhere (the two are equal whenever dcp_size == 1,
-    # so non-HIP behavior is unchanged).
-    page_size = (
-        batch.tree_cache.token_to_kv_pool_allocator.page_size
-        if _is_hip
-        else batch.tree_cache.page_size
-    )
+    # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
+    # path do we branch on the real allocator's page_size so the paged path is
+    # taken; everywhere else tree_cache.page_size is authoritative and the two
+    # are equal (dcp_size == 1), so behavior is unchanged.
+    if _is_hip and get_global_server_args().dcp_size > 1:
+        page_size = batch.tree_cache.token_to_kv_pool_allocator.page_size
+    else:
+        page_size = batch.tree_cache.page_size
     if page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
@@ -504,14 +503,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    # See alloc_for_extend: on HIP the DCP allocator's page_size may exceed
-    # tree_cache.page_size, so branch on the real allocator there; elsewhere the
-    # two are equal so non-HIP behavior is unchanged.
-    page_size = (
-        batch.tree_cache.token_to_kv_pool_allocator.page_size
-        if _is_hip
-        else batch.tree_cache.page_size
-    )
+    # See alloc_for_extend: only on the HIP DCP path can the allocator's
+    # page_size exceed tree_cache.page_size, so branch on the real allocator
+    # there; elsewhere tree_cache.page_size is authoritative (the two are equal
+    # when dcp_size == 1), so non-DCP / non-HIP behavior is unchanged.
+    if _is_hip and get_global_server_args().dcp_size > 1:
+        page_size = batch.tree_cache.token_to_kv_pool_allocator.page_size
+    else:
+        page_size = batch.tree_cache.page_size
     if page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
