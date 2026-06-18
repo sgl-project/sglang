@@ -370,7 +370,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
             cache_k = cache_k.view(self.store_dtype)
 
         k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
-            -1, self.head_num, self.head_dim
+            -1, self.head_num * self.head_dim
         )
         maybe_detect_oob(loc, 0, k_buffer_layer.shape[0], "NPU set_index_k_buffer")
         loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
@@ -378,7 +378,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         torch_npu.npu_scatter_nd_update_(
             k_buffer_layer,
             loc.view(-1, 1),
-            cache_k.view(-1, self.head_num, self.head_dim),
+            cache_k.view(-1, self.head_num * self.head_dim),
         )
         _minimax_npu_debug_sync(f"NPU set_index_k_buffer layer_id={layer_id}")
 
