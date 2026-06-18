@@ -437,3 +437,96 @@ class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Hash-prefix sharding tests (dsv4-l3-shard): files fan into <ab>/<cd>/ subdirs
+# so a single directory never accumulates millions of entries (ext4 htree limit).
+# Covers all four patched paths: write layout, get/exists roundtrip, clear (only
+# .bin removed), and the evictor (os.walk discovery + sharded unlink).
+# ---------------------------------------------------------------------------
+class TestFileSharding(HiCacheFileLRUTestBase):
+    @staticmethod
+    def _hexkey(i: int) -> str:
+        # 64-char hex content-hash-like key (what the radix cache passes).
+        return f"{i:064x}"
+
+    def _all_bins(self, root):
+        out = []
+        for dp, _dirs, files in os.walk(root):
+            for f in files:
+                if f.endswith(".bin"):
+                    out.append(os.path.relpath(os.path.join(dp, f), root))
+        return out
+
+    def test_writes_land_in_two_level_shard_dirs(self):
+        be = self.make_backend()
+        keys = [self._hexkey(i) for i in range(25)]
+        for k in keys:
+            self.assertTrue(be.set(k, value=_t(16, 1)))
+
+        # No .bin directly under the root (flat layout would hit the dir limit).
+        flat = [f for f in os.listdir(be.file_path) if f.endswith(".bin")]
+        self.assertEqual(flat, [], f"no .bin should sit flat at root, got {flat}")
+
+        # Every .bin lives at <ab>/<cd>/<name>.bin (depth 3 from root) and the
+        # shard dirs match the leading hex of the filename.
+        bins = self._all_bins(be.file_path)
+        self.assertEqual(len(bins), len(keys))
+        for rel in bins:
+            parts = rel.split(os.sep)
+            self.assertEqual(len(parts), 3, f"expected <ab>/<cd>/<file>: {rel}")
+            ab, cd, name = parts
+            self.assertEqual((ab, cd), (name[:2], name[2:4]))
+
+    def test_roundtrip_get_and_exists(self):
+        be = self.make_backend()
+        k = self._hexkey(7)
+        self.assertTrue(be.set(k, value=_t(32, 5)))
+        self.assertTrue(be.exists(k))
+        out = be.get(k, _t(32))
+        self.assertIsNotNone(out)
+        self.assertTrue(torch.equal(out, _t(32, 5)))
+        self.assertFalse(be.exists(self._hexkey(999)))
+
+    def test_clear_removes_bin_but_keeps_non_bin_files(self):
+        be = self.make_backend()
+        be.set(self._hexkey(1), value=_t(16, 1))
+        be.set(self._hexkey(2), value=_t(16, 2))
+        # A non-.bin marker at the root (e.g. an external migration sentinel)
+        # must survive clear(), which should only drop cache pages.
+        marker = os.path.join(be.file_path, ".keep_marker")
+        with open(marker, "w") as fh:
+            fh.write("x")
+
+        self.assertTrue(be.clear())
+        self.assertEqual(self._all_bins(be.file_path), [])
+        self.assertTrue(os.path.exists(marker), "clear() must not delete non-.bin files")
+
+    def test_evictor_discovers_sharded_files_on_restart(self):
+        # Write with one backend, then construct a fresh backend over the same
+        # dir: _scan_existing_files must walk the shard subdirs (not a flat
+        # listdir) to rebuild the LRU index.
+        be = self.make_backend(max_size="1Gi", subdir="restart")
+        n = 12
+        for i in range(n):
+            be.set(self._hexkey(i), value=_t(64, i % 7))
+
+        be2 = self.make_backend(max_size="1Gi", subdir="restart")
+        self.assertEqual(
+            len(be2._evictor._lru), n, "evictor must rediscover sharded files on restart"
+        )
+
+    def test_evictor_unlinks_sharded_victims_under_cap(self):
+        # Tiny cap forces eviction; the evictor must unlink files at their
+        # sharded paths (a flat-path unlink would silently leave orphans).
+        be = self.make_backend(max_size="512", eviction_ratio=0.9, subdir="cap")
+        for i in range(20):
+            be.set(self._hexkey(i), value=_t(64, i % 7))
+
+        # Accounting stayed within the cap (eviction actually ran)...
+        self.assertLessEqual(be._evictor._total_bytes, 512)
+        # ...and every byte the evictor still tracks corresponds to a real file
+        # on disk (victims were physically unlinked, not orphaned).
+        on_disk = set(self._all_bins(be.file_path))
+        self.assertEqual(len(on_disk), len(be._evictor._lru))
