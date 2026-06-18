@@ -1,10 +1,7 @@
 """Connection target for HTTP benchmark scripts.
 
-A benchmark is a client: it only needs a base URL to send requests to. That URL
-can come either from a server we launch ourselves or from one already running.
-This module owns the launch-vs-connect decision in a single place so every
-bench script resolves its target the same way, instead of each reinventing the
-``base_url`` / ``host`` / ``port`` handling inline.
+Owns the launch-vs-connect decision in one place: a benchmark only needs a base
+URL, which comes either from a server we launch or one already running.
 """
 
 import dataclasses
@@ -89,11 +86,8 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
 
 @dataclasses.dataclass
 class BenchEndpoint:
-    """A resolved benchmark target: a base URL plus the lifecycle of any server
-    we launched to back it.
-
-    ``close()`` tears down a server we launched; for a connected (pre-existing)
-    server it is a no-op.
+    """A base URL plus the lifecycle of any server we launched to back it.
+    ``close()`` tears down a launched server; for a connected one it is a no-op.
     """
 
     base_url: str
@@ -112,12 +106,8 @@ def acquire_endpoint(
 ) -> BenchEndpoint:
     """Resolve the benchmark target -- the single launch-vs-connect decision.
 
-    - ``base_url`` given: connect to that server. ``server_args`` (host/port/
-      model and all launch flags) describe nothing here and are ignored.
-    - ``base_url`` empty: launch a server from ``server_args`` and connect to it.
-
-    The caller must ``close()`` the returned endpoint to tear down a launched
-    server.
+    base_url given: connect to it (server_args is ignored). base_url empty:
+    launch a server from server_args. Caller must close() the result.
     """
     if base_url:
         ignored = [
