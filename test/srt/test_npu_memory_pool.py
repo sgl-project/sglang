@@ -151,6 +151,7 @@ def test_npu_minimax_k_only_index_cache_uses_reshape_and_cache_by_default():
             assert value.shape == (2, 1, 4)
             assert key_cache.shape == (5, 2, 1, 4)
             assert value_cache.shape == (5, 2, 1, 4)
+            assert key_cache.data_ptr() == value_cache.data_ptr()
             assert slot_indices.dtype == torch.int32
             calls.append((key, value, key_cache, value_cache, slot_indices))
 
@@ -173,3 +174,6 @@ def test_npu_minimax_k_only_index_cache_uses_reshape_and_cache_by_default():
     pool.set_k_buffer(0, loc, cache_k)
 
     assert len(calls) == 1
+    k_size, v_size = pool.get_kv_size_bytes()
+    assert k_size > 0
+    assert v_size == 0

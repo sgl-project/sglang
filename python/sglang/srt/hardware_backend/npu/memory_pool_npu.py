@@ -343,16 +343,15 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self.v_buffer = torch.zeros_like(self.k_buffer)
             if self.use_fia:
                 self.k_buffer = [
                     self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
                     for i in range(self.layer_num)
                 ]
-                self.v_buffer = [
-                    self.v_buffer[i].view(-1, 1, self.head_num, self.head_dim)
-                    for i in range(self.layer_num)
-                ]
+            # K-only index caches use the value side of _npu_reshape_and_cache
+            # only to avoid the scatter writer; keep it aliased to K so the
+            # sparse index cache does not allocate a second full-size buffer.
+            self.v_buffer = self.k_buffer
 
         self._finalize_allocation_log(size)
 
@@ -422,9 +421,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
-        return get_tensor_size_bytes(self.k_buffer), get_tensor_size_bytes(
-            self.v_buffer
-        )
+        return get_tensor_size_bytes(self.k_buffer), 0
 
 
 class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
