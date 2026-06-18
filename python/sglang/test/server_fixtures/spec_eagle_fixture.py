@@ -66,6 +66,9 @@ class SpecEagleServerBase(CustomTestCase):
     dtype = "bfloat16"
     cuda_graph_max_bs = None
     trust_remote_code = True
+    # Launch with --enable-return-hidden-states so SpecHiddenStatesKit can probe
+    # per-request hidden states; per-request gated, so other requests don't pay.
+    enable_return_hidden_states = False
 
     # -- extras --
     # env_overrides: (env_var_obj, value) pairs applied only around launch.
@@ -104,6 +107,8 @@ class SpecEagleServerBase(CustomTestCase):
             args.append("--disable-overlap-schedule")
         if cls.trust_remote_code:
             args.append("--trust-remote-code")
+        if cls.enable_return_hidden_states:
+            args.append("--enable-return-hidden-states")
         if cls.cuda_graph_max_bs is not None:
             args += ["--cuda-graph-max-bs", str(cls.cuda_graph_max_bs)]
         args += [str(a) for a in cls.extra_args]
