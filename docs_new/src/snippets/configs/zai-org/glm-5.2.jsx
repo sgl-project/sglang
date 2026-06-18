@@ -639,21 +639,24 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
-    // No MTP: EAGLE/MTP spec-decode is not yet supported on gfx950 (kernel does
-    // not build; DSA nextn draft path is CUDA-only), so it is disabled in the
-    // Speculative card for AMD. Strategies differ only by batch-shaping levers
-    // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
-    //   low-latency      — validated config: large chunked-prefill, default bs.
+    // No MTP: disabled in the Speculative card for AMD (current gfx950 images are
+    // affected by the block-FP8 accuracy bug below, and num-steps>3 hits a
+    // separate spec-decode kernel build issue). Strategies differ only by
+    // batch-shaping levers (cuda-graph-max-bs / max-running-requests / chunked-prefill):
+    //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
-    // Only the MI355X FP8 low-latency cell is benchmarked; the rest are inferred
-    // from it (verified:false). BF16 (~1.51 TB) only fits single-node on
-    // MI325X (2 TB) / MI355X (2.3 TB); MI300X (1.5 TB) needs multi-node, so its
-    // BF16 cells are omitted until a validated multi-node recipe exists.
+    // ACCURACY: all cells are verified:false. On MI350X/MI355X (gfx950), current
+    // SGLang ROCm images route block-FP8 to aiter gemm_a8w8_blockscale_bpreshuffle,
+    // which is numerically wrong on gfx950 (compounds across layers; GSM8K ~0) —
+    // see the Warning in the page body. gfx942 (MI300X/MI325X) is unaffected but
+    // not yet benchmarked. The configs are correct and will pass once the engine
+    // fix ships. BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X
+    // (2.3 TB); MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
