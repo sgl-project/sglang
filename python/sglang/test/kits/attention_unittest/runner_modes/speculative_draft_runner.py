@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -450,10 +451,7 @@ def _capture_eagle_draft_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -479,10 +477,7 @@ def _capture_frozen_kv_mtp_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
