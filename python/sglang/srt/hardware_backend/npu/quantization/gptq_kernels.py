@@ -130,7 +130,7 @@ class GPTQMoEAscendKernel:
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # ----- zero‑points for w13 and w2 (unchanged) -----
+        # ----- zero‑points (unchanged) -----
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
         )
@@ -175,17 +175,15 @@ class GPTQMoEAscendKernel:
     
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            # K dimension after unpacking for w13
             k_shard_w13 = w13_qweight_tmp.shape[1]
-            expected_scales_size13 = k_shard_w13 // group_size
     
-            if layer.w13_scales.shape[1] != expected_scales_size13:
+            # Check if the scales are compatible (expanded size must equal K_shard)
+            if layer.w13_scales.shape[1] * group_size != k_shard_w13:
                 logger.warning(
-                    f"w13 scales shape[1]={layer.w13_scales.shape[1]} "
-                    f"does not match expected {expected_scales_size13} "
-                    f"(K_shard={k_shard_w13}). Skipping negative-scale correction."
+                    f"w13 scales expanded size {layer.w13_scales.shape[1] * group_size} "
+                    f"does not match K_shard {k_shard_w13}. Skipping negative-scale correction."
                 )
-                # Directly pack without negative‑scale fixup
+                # pack directly
                 layer.w13_qweight = torch.nn.Parameter(
                     torch.ops.npu.npu_convert_weight_to_int4pack(
                         w13_qweight_tmp.reshape(
@@ -207,7 +205,6 @@ class GPTQMoEAscendKernel:
                 neg_mask = scale_expanded < 0
                 if neg_mask.any():
                     neg_mask = neg_mask.transpose(-1, -2)
-                    # Now shapes are guaranteed to match
                     neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
                     w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
                     if w13_qweight_tmp.max() > 7:
@@ -251,15 +248,14 @@ class GPTQMoEAscendKernel:
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
             k_shard_w2 = w2_qweight_tmp.shape[1]
-            expected_scales_size2 = k_shard_w2 // group_size
     
-            if layer.w2_scales.shape[1] != expected_scales_size2:
+            # Check if the scales are compatible
+            if layer.w2_scales.shape[1] * group_size != k_shard_w2:
                 logger.warning(
-                    f"w2 scales shape[1]={layer.w2_scales.shape[1]} "
-                    f"does not match expected {expected_scales_size2} "
-                    f"(K_shard={k_shard_w2}). Skipping negative-scale correction."
+                    f"w2 scales expanded size {layer.w2_scales.shape[1] * group_size} "
+                    f"does not match K_shard {k_shard_w2}. Skipping negative-scale correction."
                 )
-                # Directly pack without negative‑scale fixup
+                # pack directly
                 layer.w2_qweight = torch.nn.Parameter(
                     torch.ops.npu.npu_convert_weight_to_int4pack(
                         w2_qweight_tmp.reshape(
