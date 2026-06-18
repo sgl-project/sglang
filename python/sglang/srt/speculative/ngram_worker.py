@@ -293,7 +293,13 @@ class NGRAMWorker(BaseSpecWorker):
             return
 
         # Extend goes through the plain target forward (the caller's else branch).
-        if not batch.forward_mode.is_decode():
+        # Also skip speculation on a global extend step even when this rank is locally
+        # decode: with --speculative-skip-dp-mlp-sync the scheduler can leave a decode
+        # rank running alongside a rank that is extending (``is_extend_in_batch`` is the
+        # DP-gathered flag). Speculating here would scale ``global_num_tokens`` only on
+        # this rank and desync the MLP-sync collectives. Mirrors EAGLE's dispatch
+        # (eagle_worker_v2.forward_batch_generation: ``is_extend() or is_extend_in_batch``).
+        if not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
             return
 
         bs = len(batch.reqs)
