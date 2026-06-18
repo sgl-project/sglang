@@ -5,16 +5,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import (
-    TYPE_CHECKING,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -49,9 +40,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
-from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
-)
+from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -205,9 +194,7 @@ def _freqs_cis_to_cos_sin(
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )

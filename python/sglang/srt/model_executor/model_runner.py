@@ -179,9 +179,7 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import (
-    PrefillCudaGraphRunner,
-)
+from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
 )
@@ -2586,9 +2584,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "flashinfer_cutlass",
         ]
 
-        from sglang.srt.layers.quantization.fp4_utils import (
-            get_fp4_gemm_runner_backend,
-        )
+        from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 
         model_uses_fp4 = self.model_config.quantization in (
             "modelopt_fp4",
@@ -2599,9 +2595,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
         )
 
-        from sglang.srt.layers.quantization.fp8_utils import (
-            get_fp8_gemm_runner_backend,
-        )
+        from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
         from sglang.srt.utils import is_sm100_supported
 
         model_uses_modelopt_fp8 = self.model_config.quantization in (

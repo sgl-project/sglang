@@ -127,10 +127,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (

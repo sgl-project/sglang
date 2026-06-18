@@ -15,8 +15,8 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -173,8 +173,7 @@ def _has_mega_moe_symm_buffer(
 def _configured_mega_moe_token_caps() -> list[int]:
     max_cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     raw_buckets = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.get()
-        .strip()
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.get().strip()
     )
     if not raw_buckets:
         return [max_cap]
@@ -265,9 +264,7 @@ def _select_mega_moe_token_cap(
     max_cap = caps[-1]
     for cap in caps:
         if num_tokens <= cap:
-            min_free_gb = (
-                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_CAP_BUCKET_MIN_FREE_GB.get()
-            )
+            min_free_gb = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_CAP_BUCKET_MIN_FREE_GB.get()
             if (
                 free_hbm_guard
                 and cap < max_cap
@@ -522,7 +519,9 @@ def _run_mega_routed(
         fuse_env = envs.SGLANG_WATERFILL_FUSE_MEGA_MOE_PREDISPATCH.get()
         topk_stats_interval = envs.SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL.get()
         waterfill_enabled = bool(getattr(moe.topk, "enable_deepep_waterfill", False))
-        has_waterfill_balancer = getattr(moe.topk, "deepep_waterfill_balancer", None) is not None
+        has_waterfill_balancer = (
+            getattr(moe.topk, "deepep_waterfill_balancer", None) is not None
+        )
         force_local_shared = envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get()
         has_no_waterfill_topk = hasattr(moe.topk, "forward_without_deepep_waterfill")
         can_fuse_waterfill_predispatch = (
@@ -676,9 +675,7 @@ def _run_mega_routed(
             shared_weight=waterfill_balancer.shared_weight,
             local_pref_numer=max(envs.SGLANG_WATERFILL_LOCAL_PREF_NUMER.get(), 1),
             local_pref_denom=max(envs.SGLANG_WATERFILL_LOCAL_PREF_DENOM.get(), 1),
-            remote_cost_tokens=max(
-                envs.SGLANG_WATERFILL_REMOTE_COST_TOKENS.get(), 0
-            ),
+            remote_cost_tokens=max(envs.SGLANG_WATERFILL_REMOTE_COST_TOKENS.get(), 0),
             allow_all_ranks=waterfill_dispatch_plan.allow_all_ranks,
             one_way_remote_shared=envs.SGLANG_WATERFILL_ONE_WAY_REMOTE_SHARED.get(),
             old_experts_per_rank=old_experts_per_rank,
@@ -761,7 +758,7 @@ def _should_log_mega_moe_timing() -> bool:
 
 def _maybe_log_waterfill_fuse_predispatch(
     *,
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     num_tokens: int,
     fuse_env: bool,
     use_fp4_acts: bool,
@@ -853,7 +850,7 @@ def _max_expert_block_count(counts: torch.Tensor, block_m: int) -> int:
 
 
 def _mega_moe_shape_summary(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     topk_ids: torch.Tensor,
     num_experts: int,
     source_rank: int,
@@ -908,9 +905,9 @@ def _mega_moe_shape_summary(
         )[:ep_size]
         return counts.detach().cpu().tolist()
 
-    expert_counts = torch.bincount(
-        topk_ids[valid].reshape(-1), minlength=num_experts
-    )[:num_experts]
+    expert_counts = torch.bincount(topk_ids[valid].reshape(-1), minlength=num_experts)[
+        :num_experts
+    ]
     local_start = source_rank * experts_per_rank
     local_end = min(local_start + experts_per_rank, num_experts)
     local_expert_counts = expert_counts[local_start:local_end]
@@ -924,8 +921,8 @@ def _mega_moe_shape_summary(
     distinct_full = torch.zeros_like(distinct_routed)
     for rank in range(ep_size):
         if routed_cols > 0:
-            distinct_routed += ((routed_ranks == rank) & routed_valid).any(dim=1).to(
-                torch.int32
+            distinct_routed += (
+                ((routed_ranks == rank) & routed_valid).any(dim=1).to(torch.int32)
             )
         distinct_full += ((ranks == rank) & valid).any(dim=1).to(torch.int32)
 
@@ -967,16 +964,14 @@ def _mega_moe_shape_summary(
         "active_experts": int((expert_counts > 0).sum().item()),
         "active_local_experts": int((local_expert_counts > 0).sum().item()),
         "max_expert_tokens": int(expert_counts.max().item()),
-        "max_local_expert_tokens": int(local_expert_counts.max().item())
-        if local_expert_counts.numel()
-        else 0,
+        "max_local_expert_tokens": (
+            int(local_expert_counts.max().item()) if local_expert_counts.numel() else 0
+        ),
         "local_expert_tokens_sum": int(local_expert_counts.sum().item()),
         "local_expert_blocks_64": _expert_block_count(local_expert_counts, 64),
         "local_expert_blocks_128": _expert_block_count(local_expert_counts, 128),
         "local_expert_blocks_256": _expert_block_count(local_expert_counts, 256),
-        "max_local_expert_blocks_64": _max_expert_block_count(
-            local_expert_counts, 64
-        ),
+        "max_local_expert_blocks_64": _max_expert_block_count(local_expert_counts, 64),
         "max_local_expert_blocks_128": _max_expert_block_count(
             local_expert_counts, 128
         ),
@@ -999,7 +994,7 @@ def _mega_moe_shape_summary(
 
 
 def _log_mega_moe_timing(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     topk_ids: torch.Tensor,
     num_experts: int,
     num_tokens: int,
@@ -1009,9 +1004,9 @@ def _log_mega_moe_timing(
         return
     timing_events[-1][1].synchronize()
     elapsed = {
-        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[
-            i - 1
-        ][1].elapsed_time(timing_events[i][1])
+        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[i - 1][
+            1
+        ].elapsed_time(timing_events[i][1])
         for i in range(1, len(timing_events))
     }
     counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, moe.moe_ep_size)
@@ -1035,7 +1030,7 @@ def _log_mega_moe_timing(
 
 
 def _maybe_log_mega_moe_topk_stats(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     topk_ids: torch.Tensor,
     num_experts: int,
     num_tokens: int,

@@ -29,10 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_contig_post_quant,
-)
+from sglang.jit_kernel.dsv4 import silu_and_mul_clamp, silu_and_mul_contig_post_quant
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -355,9 +352,7 @@ class DeepseekV2MLP(nn.Module):
             return down_output
 
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
-            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-                fused_clamp_act_mul,
-            )
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 
             if not self._fused_clamp_fp8_checked:
                 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod

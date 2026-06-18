@@ -13,10 +13,7 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.distributed import (
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -36,9 +33,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -224,8 +219,7 @@ class FusedMoE(torch.nn.Module):
         self._num_global_routed = num_experts - num_shared_slots
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
         self.num_local_fused_shared_experts = (
-            num_fused_shared_experts
-            * self.num_fused_shared_expert_replicas_per_rank
+            num_fused_shared_experts * self.num_fused_shared_expert_replicas_per_rank
         )
         self.num_local_experts = (
             self._num_local_routed + self.num_local_fused_shared_experts
@@ -746,8 +740,7 @@ class FusedMoE(torch.nn.Module):
             )
             if 0 <= shared_expert_id < self.num_fused_shared_experts:
                 shared_replica_base = (
-                    shared_expert_id
-                    * self.num_fused_shared_expert_replicas_per_rank
+                    shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
                 )
                 if require_global_experts and uses_per_rank_fused_shared_slots():
                     physical_expert_ids = [
@@ -810,8 +803,7 @@ class FusedMoE(torch.nn.Module):
             # local fused MoE weights store them after physical routed experts.
             if require_global_experts and uses_per_rank_fused_shared_slots():
                 shared_replica_base = (
-                    shared_expert_id
-                    * self.num_fused_shared_expert_replicas_per_rank
+                    shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
                 )
                 physical_expert_ids = [
                     rank * self.num_local_experts
@@ -819,21 +811,16 @@ class FusedMoE(torch.nn.Module):
                     + shared_replica_base
                     + replica
                     for rank in range(self.moe_ep_size)
-                    for replica in range(
-                        self.num_fused_shared_expert_replicas_per_rank
-                    )
+                    for replica in range(self.num_fused_shared_expert_replicas_per_rank)
                 ]
             else:
                 shared_replica_base = (
                     self._num_global_routed
-                    + shared_expert_id
-                    * self.num_fused_shared_expert_replicas_per_rank
+                    + shared_expert_id * self.num_fused_shared_expert_replicas_per_rank
                 )
                 physical_expert_ids = [
                     shared_replica_base + replica
-                    for replica in range(
-                        self.num_fused_shared_expert_replicas_per_rank
-                    )
+                    for replica in range(self.num_fused_shared_expert_replicas_per_rank)
                 ]
         else:
             physical_expert_ids = (

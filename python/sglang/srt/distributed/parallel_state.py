@@ -1816,9 +1816,7 @@ def init_distributed_environment(
 
         init_process_group_kwargs = {}
         if backend == "nccl" and local_rank >= 0:
-            init_process_group_kwargs["device_id"] = torch.device(
-                "cuda", local_rank
-            )
+            init_process_group_kwargs["device_id"] = torch.device("cuda", local_rank)
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(

@@ -24,8 +24,8 @@ import triton.language as tl
 from torch import Tensor
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import get_fused_shared_expert_replicas_per_rank
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import get_fused_shared_expert_replicas_per_rank
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
 _LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
@@ -238,9 +238,7 @@ def _waterfill_expand_kernel(
             ).to(tl.int64)
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
-            ).to(
-                tl.int32
-            )
+            ).to(tl.int32)
             w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
             w_vec = tl.where(
                 src_rank_i32 == r,
@@ -267,9 +265,7 @@ def _waterfill_expand_kernel(
             ).to(tl.int64)
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
-            ).to(
-                tl.int32
-            )
+            ).to(tl.int32)
             w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
             w_vec = tl.where(
                 src_rank_i32 == r,
@@ -331,9 +327,7 @@ def _waterfill_expand_kernel(
             ).to(tl.int64)
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
-            ).to(
-                tl.int32
-            )
+            ).to(tl.int32)
             w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
             w_vec = tl.where(
                 src_rank_i32 == r,
@@ -361,9 +355,7 @@ def _waterfill_expand_kernel(
             ).to(tl.int64)
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
-            ).to(
-                tl.int32
-            )
+            ).to(tl.int32)
             w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
             w_vec = tl.where(
                 src_rank_i32 == r,
@@ -384,8 +376,7 @@ def _waterfill_expand_kernel(
             valid_id = old_id >= 0
             new_id = tl.where(
                 valid_id,
-                old_id
-                + (old_id // old_experts_per_rank) * shared_replicas_per_rank,
+                old_id + (old_id // old_experts_per_rank) * shared_replicas_per_rank,
                 old_id,
             )
             tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
@@ -535,17 +526,14 @@ def _waterfill_expand_rank2_static_kernel(
     chosen_rank = tl.where(total_w > 0, chosen_rank, source_rank).to(tl.int64)
 
     replica_seed = token_idx.to(tl.uint32) ^ (
-        chosen_rank.to(tl.uint32)
-        * tl.full([BLOCK_SIZE], 0x85EBCA6B, dtype=tl.uint32)
+        chosen_rank.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x85EBCA6B, dtype=tl.uint32)
     )
     replica_seed = replica_seed * tl.full(
         [BLOCK_SIZE], 1103515245, dtype=tl.uint32
     ) + tl.full([BLOCK_SIZE], 12345, dtype=tl.uint32)
     shared_replica = (replica_seed % shared_replicas_per_rank).to(tl.int64)
     shared_id = (
-        chosen_rank * new_experts_per_rank
-        + old_experts_per_rank
-        + shared_replica
+        chosen_rank * new_experts_per_rank + old_experts_per_rank + shared_replica
     )
     shared_id = tl.where(
         has_valid,
@@ -663,17 +651,14 @@ def _waterfill_expand_rank2_candidate_kernel(
     chosen_rank = tl.where(total_w > 0, chosen_rank, best_rank).to(tl.int64)
 
     replica_seed = token_idx.to(tl.uint32) ^ (
-        chosen_rank.to(tl.uint32)
-        * tl.full([BLOCK_SIZE], 0x85EBCA6B, dtype=tl.uint32)
+        chosen_rank.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x85EBCA6B, dtype=tl.uint32)
     )
     replica_seed = replica_seed * tl.full(
         [BLOCK_SIZE], 1103515245, dtype=tl.uint32
     ) + tl.full([BLOCK_SIZE], 12345, dtype=tl.uint32)
     shared_replica = (replica_seed % shared_replicas_per_rank).to(tl.int64)
     shared_id = (
-        chosen_rank * new_experts_per_rank
-        + old_experts_per_rank
-        + shared_replica
+        chosen_rank * new_experts_per_rank + old_experts_per_rank + shared_replica
     )
     shared_id = tl.where(
         has_valid,
@@ -906,17 +891,19 @@ class DeepEPWaterfillBalancer:
         ):
             layer_load_by_source = metadata.rank_load_by_source[self.layer_id]
             if layer_load_by_source.sum() > 0:
-                self.static_rank_load_by_source = (
-                    layer_load_by_source.to(dtype=torch.int64).contiguous()
-                )
+                self.static_rank_load_by_source = layer_load_by_source.to(
+                    dtype=torch.int64
+                ).contiguous()
         if self.rank == 0:
             logger.info(
                 "Bound static Waterfill rank_load for layer %s: %s by_source=%s",
                 self.layer_id,
                 self.static_rank_load.detach().cpu().tolist(),
-                self.static_rank_load_by_source.detach().cpu().tolist()
-                if self.static_rank_load_by_source is not None
-                else None,
+                (
+                    self.static_rank_load_by_source.detach().cpu().tolist()
+                    if self.static_rank_load_by_source is not None
+                    else None
+                ),
             )
 
     def _get_expanded_topk_buffers(
@@ -1126,9 +1113,9 @@ class DeepEPWaterfillBalancer:
                     device=device, non_blocking=True
                 )
                 self.static_rank_load_by_source = rank_load_by_source
-            other_rank_load = rank_load_by_source.sum(dim=0) - rank_load_by_source[
-                self.rank
-            ]
+            other_rank_load = (
+                rank_load_by_source.sum(dim=0) - rank_load_by_source[self.rank]
+            )
             rank_load = routed_counts + other_rank_load.to(dtype=routed_counts.dtype)
             return WaterfillDispatchPlan(
                 rank_load=rank_load,
@@ -1221,7 +1208,9 @@ class DeepEPWaterfillBalancer:
 
         local_routed_counts = self.count_local_routed(topk_ids)
         if self.use_static_waterfill:
-            return self._build_static_dispatch_plan(local_routed_counts, topk_ids.device)
+            return self._build_static_dispatch_plan(
+                local_routed_counts, topk_ids.device
+            )
 
         global_routed_counts = DeepEPWaterfillBalancer._all_reduce_dynamic_rank_load(
             local_routed_counts
@@ -1277,9 +1266,7 @@ class DeepEPWaterfillBalancer:
             target_total=dispatch_plan.target_total,
             local_pref_numer=max(envs.SGLANG_WATERFILL_LOCAL_PREF_NUMER.get(), 1),
             local_pref_denom=max(envs.SGLANG_WATERFILL_LOCAL_PREF_DENOM.get(), 1),
-            remote_cost_tokens=max(
-                envs.SGLANG_WATERFILL_REMOTE_COST_TOKENS.get(), 0
-            ),
+            remote_cost_tokens=max(envs.SGLANG_WATERFILL_REMOTE_COST_TOKENS.get(), 0),
             shared_replicas_per_rank=self.shared_replicas_per_rank,
             expanded_topk_ids=expanded_ids,
             expanded_topk_weights=expanded_weights,
