@@ -1965,6 +1965,14 @@ class ServerArgs:
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
+        from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+
+        if (
+            model_arch in CP_V2_DEFAULT_MODEL_CLASSES
+            and not envs.SGLANG_ENABLE_CP_V2.is_set()
+        ):
+            envs.SGLANG_ENABLE_CP_V2.set(True)
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(

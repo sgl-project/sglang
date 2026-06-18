@@ -133,6 +133,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         else:
             prefix_offsets = [0] * bs
 
+        # TODO: move these per-request layout/index computations to a Triton
+        # kernel if Python-side metadata construction becomes a bottleneck.
         per_seq_block_sizes: List[List[int]] = []
         split_list: List[int] = []
         for length in extend_seqs_len:
@@ -202,7 +204,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            device = torch.device(get_global_server_args().device)
+        except Exception:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cu_prev = [0] + list(accumulate(actual_seq_q_prev_list))
         cu_next = [0] + list(accumulate(actual_seq_q_next_list))
 
@@ -291,6 +298,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
         )
 
+    def get_supported_attention_backend(self):
+        return [CPAttentionBackendKind.FLASH_ATTENTION]
+
     def run_attention(
         self,
         q: Any,
@@ -299,11 +309,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
-        del device
-        if attention_backend != CPAttentionBackendKind.FLASH_ATTENTION:
-            raise NotImplementedError(
-                f"{self.name} CP does not support {attention_backend=}"
-            )
+        assert (
+            attention_backend in self.get_supported_attention_backend()
+        ), f"{self.name} CP does not support {attention_backend=}"
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]
@@ -323,7 +331,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
         return torch.cat([result_prev, result_next], dim=0)
 
-    def materialize_full_kv(self, forward_batch, layer: Any, k: Any, v: Any) -> None:
+    def materialize_full_kv(
+        self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
+    ) -> None:
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -337,7 +347,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
         get_token_to_kv_pool().set_kv_buffer(
             layer,
-            KVWriteLoc(cache_loc, getattr(forward_batch, "cp_swa_out_cache_loc", None)),
+            KVWriteLoc(cache_loc, swa_loc),
             key_cache_full,
             value_cache_full,
             layer.k_scale,

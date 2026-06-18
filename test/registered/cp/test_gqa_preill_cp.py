@@ -11,17 +11,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=261, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
 
-QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
+GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
-GSM8K_BASELINE_ACCURACY = 0.85
+GSM8K_BASELINE_ACCURACY = 0.93
 
 
-class TestQwen330B(CustomTestCase):
+class TestGQACP2TP2EP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_30B_MODEL_PATH
+        cls.model = GQA_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -46,11 +46,13 @@ class TestQwen330B(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
+            env={"SGLANG_ENABLE_CP_V2": "0"},
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -73,10 +75,10 @@ class TestQwen330B(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
 
-class TestQwen330BCP(CustomTestCase):
+class TestGQACPTP2CP2EP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_30B_MODEL_PATH
+        cls.model = GQA_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -101,11 +103,13 @@ class TestQwen330BCP(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
+            env={"SGLANG_ENABLE_CP_V2": "0"},
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -128,10 +132,10 @@ class TestQwen330BCP(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
 
-class TestQwen330BCPV2ZigzagDeepEP(CustomTestCase):
+class TestGQACPCP4EP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_30B_MODEL_PATH
+        cls.model = GQA_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -160,7 +164,6 @@ class TestQwen330BCPV2ZigzagDeepEP(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod

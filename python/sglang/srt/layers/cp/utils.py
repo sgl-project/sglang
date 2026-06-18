@@ -14,8 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
-from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
@@ -34,20 +33,49 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 
+CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
+    {
+        "Qwen3MoeForCausalLM",
+    }
+)
 
-def maybe_prepare_cp_forward(forward_batch) -> None:
-    """Build CP-v2 metadata for a prefill batch when the strategy can apply."""
+
+def enable_cp_v2() -> bool:
+    """Return whether the CP-v2 path is enabled for this process."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_ENABLE_CP_V2.get())
+
+
+def is_cp_v2_active(forward_batch) -> bool:
+    """Return whether the current forward batch is running through CP-v2."""
+    if not enable_cp_v2():
+        return False
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+        return False
+
     strategy = get_cp_strategy()
     if strategy is None:
-        return
+        return False
 
     input_ids = getattr(forward_batch, "input_ids", None)
     if input_ids is None:
-        return
+        return False
+
+    return strategy.can_apply(len(input_ids), forward_batch)
+
+
+def prepare_cp_forward(forward_batch) -> None:
+    """Build CP-v2 metadata for an active context-parallel prefill batch."""
+    strategy = get_cp_strategy()
+    assert strategy is not None
+
+    input_ids = getattr(forward_batch, "input_ids", None)
+    assert input_ids is not None
 
     num_tokens = len(input_ids)
-    if not strategy.can_apply(num_tokens, forward_batch):
-        return
+    assert strategy.can_apply(num_tokens, forward_batch)
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
@@ -56,49 +84,40 @@ def maybe_prepare_cp_forward(forward_batch) -> None:
         seqs_len=seq_lens_cpu,
         extend_seqs_len=extend_lens_cpu,
     )
-    forward_batch.cp_v2_active = True
 
 
-def maybe_cp_split_before_forward(
-    model: Any,
+def cp_split_before_forward(
+    complete_hidden_states: Any,
+    complete_position_ids: Any,
     forward_batch,
-    kwargs: Dict[str, Any],
-) -> Optional[Any]:
+) -> Tuple[Optional[Any], Optional[Any]]:
     """Shard embeddings and positions for CP-v2 model-runner forwarding."""
     strategy = get_cp_strategy()
-    if (
-        strategy is None
-        or getattr(forward_batch, "attn_cp_metadata", None) is None
-        or not getattr(forward_batch, "cp_v2_active", False)
-    ):
-        return None
-
-    input_embeds = kwargs.get("input_embeds")
-    if input_embeds is None:
-        embed_layer = model.get_input_embeddings()
-        input_embeds = embed_layer(forward_batch.input_ids)
-    kwargs["input_embeds"] = strategy.shard_hidden_states(input_embeds, forward_batch)
-    return strategy.shard_position_ids(forward_batch.positions, forward_batch)
+    assert strategy is not None
+    assert complete_hidden_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return (
+        strategy.shard_hidden_states(complete_hidden_states, forward_batch),
+        strategy.shard_position_ids(complete_position_ids, forward_batch),
+    )
 
 
-@contextmanager
-def disable_legacy_cp_during_cp_v2(forward_batch):
-    """Prevent model-local legacy CP hooks from double-sharding CP-v2 inputs."""
-    if not getattr(forward_batch, "cp_v2_active", False):
-        yield
-        return
+def maybe_cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
+    """Gather CP-v2 hidden states at the model boundary when this batch is active."""
+    if not is_cp_v2_active(forward_batch):
+        return x
 
-    from sglang.srt.server_args import get_global_server_args
+    strategy = get_cp_strategy()
+    assert strategy is not None
 
-    server_args = get_global_server_args()
-    old_enable_prefill_context_parallel = server_args.enable_prefill_context_parallel
-    server_args.enable_prefill_context_parallel = False
-    try:
-        yield
-    finally:
-        server_args.enable_prefill_context_parallel = (
-            old_enable_prefill_context_parallel
+    if isinstance(x, tuple):
+        hidden_states, *rest = x
+        hidden_states = strategy.gather_hidden_states(
+            hidden_states, forward_batch, stream
         )
+        return (hidden_states, *rest)
+
+    return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -119,8 +138,11 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "disable_legacy_cp_during_cp_v2",
+    "CP_V2_DEFAULT_MODEL_CLASSES",
+    "enable_cp_v2",
     "get_cp_strategy",
-    "maybe_cp_split_before_forward",
-    "maybe_prepare_cp_forward",
+    "is_cp_v2_active",
+    "maybe_cp_gather_after_forward",
+    "cp_split_before_forward",
+    "prepare_cp_forward",
 ]

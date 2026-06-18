@@ -13,6 +13,11 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_split_before_forward,
+    enable_cp_v2,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,32 +53,219 @@ class TestCPStrategyUnit(CustomTestCase):
             )
         )
 
-    def _metadata_for_rank(self, rank, cp_size=4, num_tokens=19):
+    def test_strategy_kind_maps_cli_values(self):
+        self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
+        self.assertEqual(
+            ContextParallelStrategyKind.from_string("zigzag"),
+            ContextParallelStrategyKind.ZIGZAG,
+        )
+        self.assertEqual(
+            ContextParallelStrategyKind.from_string("interleave"),
+            ContextParallelStrategyKind.INTERLEAVE,
+        )
+        self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
+        self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
+
+    def test_get_cp_strategy_is_initialized_under_cp_v1_and_cp_v2(self):
+        self._init_zigzag()
+
+        for enable_v2 in (False, True):
+            with patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=enable_v2,
+            ):
+                self.assertIsNotNone(get_cp_strategy())
+                self.assertTrue(is_cp_enabled())
+                self.assertTrue(is_zigzag())
+                self.assertFalse(is_interleave())
+                self.assertEqual(
+                    get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG
+                )
+
+
+class TestCPZigzagStrategy(CustomTestCase):
+    def setUp(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="zigzag",
+                attn_cp_size=4,
+                attention_backend="fa3",
+            )
+        )
+
+    def tearDown(self):
+        init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
+
+    def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
         strategy = ZigzagCPStrategy(cp_size=cp_size)
         with patch(
             "sglang.srt.layers.dp_attention.get_attention_cp_rank",
             return_value=rank,
         ):
             return strategy.build_metadata(
-                num_tokens=num_tokens,
-                seqs_len=[11, 13],
-                extend_seqs_len=[9, 10],
+                num_tokens=sum(extend_seq_lens),
+                seqs_len=seq_lens,
+                extend_seqs_len=extend_seq_lens,
             )
 
-    def _forward_batch(self, metadata):
+    def _forward_batch(self, metadata, extend_seq_lens):
         return SimpleNamespace(
+            input_ids=torch.arange(sum(extend_seq_lens)),
             forward_mode=_ExtendMode(),
-            extend_seq_lens_cpu=[9, 10],
+            extend_seq_lens_cpu=extend_seq_lens,
             attn_cp_metadata=metadata,
         )
 
-    def _padded_rank_tensors(self, x, cp_size=4):
+    def test_enable_cp_v2_and_is_cp_v2_active(self):
+        active_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+        )
+        inactive_batch = SimpleNamespace(
+            input_ids=torch.arange(7),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[7],
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
+        ):
+            self.assertFalse(enable_cp_v2())
+            self.assertFalse(is_cp_v2_active(active_batch))
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            self.assertTrue(enable_cp_v2())
+            self.assertTrue(is_cp_v2_active(active_batch))
+            self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
+        bs = len(extend_seq_lens)
+        cp_segment_num = cp_size * 2
+        prefix_offsets = [
+            max(int(seq_lens[i]) - int(extend_seq_lens[i]), 0) for i in range(bs)
+        ]
+
+        per_seq_block_sizes = []
+        split_list = []
+        for length in extend_seq_lens:
+            base = length // cp_segment_num
+            rem = length % cp_segment_num
+            block_sizes = [
+                base + 1 if block_id < rem else base
+                for block_id in range(cp_segment_num)
+            ]
+            per_seq_block_sizes.append(block_sizes)
+            split_list.extend(block_sizes)
+
+        per_rank_actual_token = [
+            sum(
+                block_sizes[rank_id] + block_sizes[cp_segment_num - 1 - rank_id]
+                for block_sizes in per_seq_block_sizes
+            )
+            for rank_id in range(cp_size)
+        ]
+        max_rank_len = [max(per_rank_actual_token)] * cp_size
+
+        zigzag_index = list(range(rank, rank + bs * cp_segment_num, cp_segment_num))
+        zigzag_index += list(
+            range(cp_segment_num - rank - 1, bs * cp_segment_num, cp_segment_num)
+        )
+
+        cp_reverse_index = []
+        for batch_id in range(bs):
+            cp_reverse_index.extend(
+                list(range(batch_id, cp_segment_num * bs, 2 * bs))
+                + list(range((cp_segment_num - 1) * bs + batch_id, 0, -2 * bs))
+            )
+
+        reverse_split_len = []
+        for rank_id in range(cp_size):
+            for batch_id in range(bs):
+                reverse_split_len.append(per_seq_block_sizes[batch_id][rank_id])
+            for batch_id in range(bs):
+                reverse_split_len.append(
+                    per_seq_block_sizes[batch_id][cp_segment_num - 1 - rank_id]
+                )
+
+        kv_len_prev_list = []
+        kv_len_next_list = []
+        actual_seq_q_prev_list = []
+        actual_seq_q_next_list = []
+        for batch_id, block_sizes in enumerate(per_seq_block_sizes):
+            kv_len_prev_list.append(
+                prefix_offsets[batch_id] + sum(block_sizes[: rank + 1])
+            )
+            kv_len_next_list.append(
+                prefix_offsets[batch_id] + sum(block_sizes[: cp_segment_num - rank])
+            )
+            actual_seq_q_prev_list.append(block_sizes[rank])
+            actual_seq_q_next_list.append(block_sizes[cp_segment_num - rank - 1])
+
+        return {
+            "bs": bs,
+            "total_seq_lens": sum(extend_seq_lens),
+            "split_list": split_list,
+            "zigzag_index": zigzag_index,
+            "per_rank_actual_token": per_rank_actual_token,
+            "max_rank_len": max_rank_len,
+            "reverse_split_len": reverse_split_len,
+            "cp_reverse_index": cp_reverse_index,
+            "kv_len_prev_list": kv_len_prev_list,
+            "kv_len_next_list": kv_len_next_list,
+            "actual_seq_q_prev_list": actual_seq_q_prev_list,
+            "actual_seq_q_next_list": actual_seq_q_next_list,
+        }
+
+    def _assert_metadata_matches(self, metadata, expected):
+        self.assertEqual(metadata.bs, expected["bs"])
+        self.assertEqual(metadata.total_seq_lens, expected["total_seq_lens"])
+        self.assertEqual(metadata.split_list, expected["split_list"])
+        self.assertEqual(metadata.zigzag_index, expected["zigzag_index"])
+        self.assertEqual(
+            metadata.per_rank_actual_token, expected["per_rank_actual_token"]
+        )
+        self.assertEqual(metadata.max_rank_len, expected["max_rank_len"])
+        self.assertEqual(metadata.reverse_split_len, expected["reverse_split_len"])
+        self.assertEqual(metadata.cp_reverse_index, expected["cp_reverse_index"])
+        self.assertEqual(metadata.kv_len_prev_list, expected["kv_len_prev_list"])
+        self.assertEqual(metadata.kv_len_next_list, expected["kv_len_next_list"])
+        self.assertEqual(
+            metadata.actual_seq_q_prev_list, expected["actual_seq_q_prev_list"]
+        )
+        self.assertEqual(
+            metadata.actual_seq_q_next_list, expected["actual_seq_q_next_list"]
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_q_prev_tensor.cpu().tolist(),
+            [0]
+            + list(
+                torch.tensor(expected["actual_seq_q_prev_list"]).cumsum(dim=0).tolist()
+            ),
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_q_next_tensor.cpu().tolist(),
+            [0]
+            + list(
+                torch.tensor(expected["actual_seq_q_next_list"]).cumsum(dim=0).tolist()
+            ),
+        )
+
+    def _padded_rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
         per_rank = []
         metas = []
         for rank in range(cp_size):
-            metadata = self._metadata_for_rank(rank, cp_size=cp_size)
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
             metas.append(metadata)
-            fb = self._forward_batch(metadata)
+            fb = self._forward_batch(metadata, extend_seq_lens)
             with patch(
                 "sglang.srt.layers.dp_attention.get_attention_cp_rank",
                 return_value=rank,
@@ -88,150 +280,150 @@ class TestCPStrategyUnit(CustomTestCase):
             per_rank.append(local)
         return metas, per_rank
 
-    def test_strategy_kind_maps_cli_values(self):
-        self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
-        self.assertEqual(
-            ContextParallelStrategyKind.from_string("zigzag"),
-            ContextParallelStrategyKind.ZIGZAG,
-        )
-        self.assertEqual(
-            ContextParallelStrategyKind.from_string("interleave"),
-            ContextParallelStrategyKind.INTERLEAVE,
-        )
-        self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
-        self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
-
-    def test_cp_v2_strategy_is_only_active_when_env_enabled(self):
-        self._init_zigzag()
-
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
-        ):
-            self.assertIsNone(get_cp_strategy())
-            self.assertFalse(is_cp_enabled())
-
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ):
-            self.assertIsNotNone(get_cp_strategy())
-            self.assertTrue(is_cp_enabled())
-            self.assertTrue(is_zigzag())
-            self.assertFalse(is_interleave())
-            self.assertEqual(get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG)
-
     def test_zigzag_metadata_for_batched_sequences(self):
-        metadata = self._metadata_for_rank(rank=2)
+        cases = [
+            (4, [11, 13], [9, 10]),
+            (2, [8], [8]),
+            (4, [100000, 200000, 80], [100000, 200000, 64]),
+            (4, [100005, 200011, 25], [100000, 200000, 16]),
+        ]
 
-        self.assertEqual(metadata.bs, 2)
-        self.assertEqual(metadata.total_seq_lens, 19)
-        self.assertEqual(
-            metadata.split_list,
-            [2, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1],
-        )
-        self.assertEqual(metadata.zigzag_index, [2, 10, 5, 13])
-        self.assertEqual(metadata.per_rank_actual_token, [6, 5, 4, 4])
-        self.assertEqual(metadata.max_rank_len, [6, 6, 6, 6])
-        self.assertEqual(
-            metadata.reverse_split_len,
-            [2, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        )
-        self.assertEqual(
-            metadata.cp_reverse_index,
-            [0, 4, 8, 12, 14, 10, 6, 2, 1, 5, 9, 13, 15, 11, 7, 3],
-        )
-        self.assertEqual(metadata.kv_len_prev_list, [6, 8])
-        self.assertEqual(metadata.kv_len_next_list, [9, 11])
-        self.assertEqual(metadata.actual_seq_q_prev_list, [1, 1])
-        self.assertEqual(metadata.actual_seq_q_next_list, [1, 1])
-        self.assertEqual(metadata.total_q_prev_tokens, 2)
-        self.assertEqual(metadata.total_q_next_tokens, 2)
-        self.assertTrue(
-            torch.equal(
-                metadata.cu_seqlens_q_prev_tensor.cpu(), torch.tensor([0, 1, 2])
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                metadata.cu_seqlens_q_next_tensor.cpu(), torch.tensor([0, 1, 2])
-            )
-        )
+        for cp_size, seq_lens, extend_seq_lens in cases:
+            for rank in range(cp_size):
+                with self.subTest(
+                    cp_size=cp_size,
+                    rank=rank,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                ):
+                    metadata = self._metadata_for_rank(
+                        rank,
+                        cp_size=cp_size,
+                        seq_lens=seq_lens,
+                        extend_seq_lens=extend_seq_lens,
+                    )
+                    expected = self._expected_metadata(
+                        rank=rank,
+                        cp_size=cp_size,
+                        seq_lens=seq_lens,
+                        extend_seq_lens=extend_seq_lens,
+                    )
+                    self._assert_metadata_matches(metadata, expected)
 
     def test_zigzag_shards_hidden_states_and_position_ids(self):
-        metadata = self._metadata_for_rank(rank=2)
-        fb = self._forward_batch(metadata)
-        x = torch.arange(19 * 2).view(19, 2)
-        positions = torch.arange(19)
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        positions = torch.arange(sum(extend_seq_lens))
 
-        with patch(
-            "sglang.srt.layers.dp_attention.get_attention_cp_rank",
-            return_value=2,
-        ):
-            strategy = ZigzagCPStrategy(cp_size=4)
+        for rank in range(cp_size):
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            fb = self._forward_batch(metadata, extend_seq_lens)
+            strategy = ZigzagCPStrategy(cp_size=cp_size)
+            chunks = torch.split(x, metadata.split_list, dim=0)
+            position_chunks = torch.split(positions, metadata.split_list, dim=-1)
+            expected_x = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=0)
+            expected_positions = torch.cat(
+                [position_chunks[i] for i in metadata.zigzag_index], dim=-1
+            )
+
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
+            helper_x, helper_positions = cp_split_before_forward(
+                x,
+                positions,
+                fb,
+            )
 
-        expected_indices = [3, 13, 6, 16]
-        self.assertTrue(torch.equal(local_x, x[expected_indices]))
-        self.assertTrue(torch.equal(local_positions, positions[expected_indices]))
+            self.assertTrue(torch.equal(local_x, expected_x))
+            self.assertTrue(torch.equal(local_positions, expected_positions))
+            self.assertTrue(torch.equal(helper_x, expected_x))
+            self.assertTrue(torch.equal(helper_positions, expected_positions))
 
     def test_zigzag_gathers_hidden_states_to_original_order(self):
         cp_size = 4
-        x = torch.arange(19 * 2).view(19, 2)
-        metas, padded_rank_tensors = self._padded_rank_tensors(x, cp_size=cp_size)
-        rank = 2
-        local_x = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
-        fb = self._forward_batch(metas[rank])
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
 
-        with (
-            patch(
-                "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
-                return_value=_FakeCPGroup(padded_rank_tensors),
-            ),
-            patch(
-                "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
-                return_value=torch.no_grad(),
-            ),
-        ):
-            gathered = ZigzagCPStrategy(cp_size=cp_size).gather_hidden_states(
-                local_x, fb, stream=None
-            )
+        for rank in range(cp_size):
+            local_x = padded_rank_tensors[rank][
+                : metas[rank].per_rank_actual_token[rank]
+            ]
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
 
-        self.assertTrue(torch.equal(gathered, x))
+            with (
+                patch(
+                    "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
+                    return_value=_FakeCPGroup(padded_rank_tensors),
+                ),
+                patch(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    return_value=torch.no_grad(),
+                ),
+            ):
+                gathered = ZigzagCPStrategy(cp_size=cp_size).gather_hidden_states(
+                    local_x, fb, stream=None
+                )
+
+            self.assertTrue(torch.equal(gathered, x))
 
     def test_zigzag_gathers_kv_cache_to_original_order(self):
         cp_size = 4
-        kv = torch.arange(19 * 2 * 3).view(19, 2, 3)
-        metas, padded_rank_tensors = self._padded_rank_tensors(kv, cp_size=cp_size)
-        rank = 1
-        local_kv = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
-        fb = self._forward_batch(metas[rank])
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        kv = torch.arange(sum(extend_seq_lens) * 2 * 3).view(sum(extend_seq_lens), 2, 3)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            kv,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
 
-        with (
-            patch(
-                "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
-                return_value=_FakeCPGroup(padded_rank_tensors),
-            ),
-            patch(
-                "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
-                return_value=torch.no_grad(),
-            ),
-        ):
-            gathered = ZigzagCPStrategy(cp_size=cp_size).gather_kv_cache(
-                local_kv, fb, stream=None
-            )
+        for rank in range(cp_size):
+            local_kv = padded_rank_tensors[rank][
+                : metas[rank].per_rank_actual_token[rank]
+            ]
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
 
-        self.assertTrue(torch.equal(gathered, kv))
+            with (
+                patch(
+                    "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
+                    return_value=_FakeCPGroup(padded_rank_tensors),
+                ),
+                patch(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    return_value=torch.no_grad(),
+                ),
+            ):
+                gathered = ZigzagCPStrategy(cp_size=cp_size).gather_kv_cache(
+                    local_kv, fb, stream=None
+                )
+
+            self.assertTrue(torch.equal(gathered, kv))
 
     def test_zigzag_attention_dispatch_runs_prev_then_next(self):
-        with patch(
-            "sglang.srt.layers.dp_attention.get_attention_cp_rank",
-            return_value=0,
-        ):
-            metadata = ZigzagCPStrategy(cp_size=2).build_metadata(
-                num_tokens=8,
-                seqs_len=[8],
-                extend_seqs_len=[8],
-            )
+        cp_size = 2
+        seq_lens = [8]
+        extend_seq_lens = [8]
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
         fb = SimpleNamespace(attn_cp_metadata=metadata)
         q = torch.arange(4 * 2).view(4, 2)
         calls = []
@@ -247,7 +439,7 @@ class TestCPStrategyUnit(CustomTestCase):
             )
             return q_chunk + 100
 
-        out = ZigzagCPStrategy(cp_size=2).run_attention(
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
             q, fb, device=torch.device("cpu"), attn_fn=attn_fn
         )
 

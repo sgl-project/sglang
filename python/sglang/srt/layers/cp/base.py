@@ -184,6 +184,7 @@ class ContextParallelStrategy(ABC):
         layer: Any,
         k: Any,
         v: Any,
+        swa_loc: Optional[Any] = None,
     ) -> None:
         """Write full-layout K/V to the backend cache if needed."""
 
@@ -234,7 +235,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         )
 
 
-def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
+def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     """Return the configured strategy, initializing lazily on first call.
 
     Subprocesses re-import this module with ``_STRATEGY = None`` and never
@@ -254,15 +255,6 @@ def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
         if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
             init_cp_strategy(server_args)
     return _STRATEGY
-
-
-def get_cp_strategy() -> Optional[ContextParallelStrategy]:
-    """Return the configured CP strategy for runtime dispatch."""
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_ENABLE_CP_V2.get():
-        return None
-    return _get_cp_strategy()
 
 
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:

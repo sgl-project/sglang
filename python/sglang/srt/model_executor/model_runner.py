@@ -118,10 +118,11 @@ from sglang.srt.layers.attention.attention_registry import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
-    disable_legacy_cp_during_cp_v2,
+    cp_split_before_forward,
     get_cp_strategy,
-    maybe_cp_split_before_forward,
-    maybe_prepare_cp_forward,
+    is_cp_v2_active,
+    maybe_cp_gather_after_forward,
+    prepare_cp_forward,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -3339,10 +3340,63 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
-        maybe_prepare_cp_forward(forward_batch)
-        cp_v2_positions = maybe_cp_split_before_forward(
-            self.model, forward_batch, kwargs
-        )
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        forward_positions = forward_batch.positions
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+            complete_hidden_states = kwargs.get("input_embeds")
+            if complete_hidden_states is None:
+                embed_layer = self.model.get_input_embeddings()
+                complete_hidden_states = embed_layer(forward_batch.input_ids)
+            sharded_hidden_states, sharded_positions = cp_split_before_forward(
+                complete_hidden_states,
+                forward_batch.positions,
+                forward_batch,
+            )
+            kwargs["input_embeds"] = sharded_hidden_states
+            forward_positions = sharded_positions
+
+        def _forward_model():
+            if not cp_v2_active:
+                return self.model.forward(
+                    forward_batch.input_ids,
+                    forward_positions,
+                    forward_batch,
+                    **kwargs,
+                )
+
+            hidden_states = self.model.model(
+                forward_batch.input_ids,
+                forward_positions,
+                forward_batch,
+                input_embeds=kwargs.get("input_embeds"),
+                pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+            )
+
+            aux_hidden_states = None
+            capture_aux_hidden_states = getattr(
+                self.model, "capture_aux_hidden_states", False
+            )
+            if capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+
+            if self.model.pp_group.is_last_rank:
+                hidden_states = maybe_cp_gather_after_forward(
+                    hidden_states,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                return self.model.logits_processor(
+                    forward_batch.input_ids,
+                    hidden_states,
+                    self.model.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+
+            if capture_aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3368,65 +3422,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         dsa_indexers=self.dsa_indexers,
                     ),
                 ):
-                    ret = self.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
+                    ret = _forward_model()
             else:
-                with disable_legacy_cp_during_cp_v2(forward_batch):
-                    if cp_v2_positions is not None:
-                        ret = self._forward_extend_cp_v2(
-                            forward_batch,
-                            cp_v2_positions,
-                            kwargs,
-                        )
-                    else:
-                        ret = self.model.forward(
-                            forward_batch.input_ids,
-                            forward_batch.positions,
-                            forward_batch,
-                            **kwargs,
-                        )
+                ret = _forward_model()
         return (ret, can_run_graph)
-
-    def _forward_extend_cp_v2(
-        self,
-        forward_batch: ForwardBatch,
-        cp_v2_positions: torch.Tensor,
-        kwargs: dict,
-    ):
-        cp_strategy = get_cp_strategy()
-        assert cp_strategy is not None
-
-        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
-        hidden_states = self.model.model(
-            forward_batch.input_ids,
-            cp_v2_positions,
-            forward_batch,
-            input_embeds=kwargs.get("input_embeds"),
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-        aux_hidden_states = None
-        if getattr(self.model, "capture_aux_hidden_states", False):
-            hidden_states, aux_hidden_states = hidden_states
-
-        if self.model.pp_group.is_last_rank:
-            hidden_states = cp_strategy.gather_hidden_states(
-                hidden_states,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-            return self.model.logits_processor(
-                forward_batch.input_ids,
-                hidden_states,
-                self.model.lm_head,
-                forward_batch,
-                aux_hidden_states,
-            )
-        return hidden_states
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
