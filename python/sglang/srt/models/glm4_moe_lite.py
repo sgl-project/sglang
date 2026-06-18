@@ -547,6 +547,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
     ) -> None:
 
         super().__init__()
+        # Required for MTP: Glm4MoeLiteModelNextN bypasses Glm4MoeLiteForCausalLM.__init__
+        config.moe_layer_freq = 1
         self.hidden_size = config.hidden_size
         self.config = config
         rope_theta, rope_scaling = get_rope_config(config)
