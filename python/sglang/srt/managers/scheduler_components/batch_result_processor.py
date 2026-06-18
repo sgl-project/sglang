@@ -645,28 +645,29 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            # Non-spec and V2: full post-processing
+            # Non-spec and Spec V2: full post-processing.
             next_token_id = next_token_ids[i]
-            new_accepted_len = 1
-            needs_tokenwise_grammar_accept = (
-                not batch.spec_algorithm.is_none() and req.grammar is not None
-            )
-            if batch.spec_algorithm.is_none():
+            is_spec = not batch.spec_algorithm.is_none()
+
+            if not is_spec:
+                # Normal decode: a single sampled token.
                 req.output_ids.append(next_token_id)
-            elif needs_tokenwise_grammar_accept:
+                self._maybe_update_reasoning_tokens(req, next_token_id)
+                req.update_finish_state()
+            elif req.grammar is not None:
+                # Spec + grammar: accept tokens one at a time and stop at the
+                # grammar-terminating token, trimming the over-committed suffix.
+                # The helper advances the output, grammar, and finish state per
+                # token (and syncs grammar.finished).
                 next_token_id = self._accept_spec_v2_grammar_tokens(req, next_token_id)
                 next_token_ids[i] = next_token_id
-                new_accepted_len = len(next_token_id)
             else:
+                # Spec without grammar: accept the whole verified run at once.
                 req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
-
-            if not needs_tokenwise_grammar_accept:
                 self._maybe_update_reasoning_tokens(req, next_token_id)
+                req.update_finish_state(len(next_token_id))
 
             req.time_stats.set_last_decode_finish_time()
-            if not needs_tokenwise_grammar_accept:
-                req.update_finish_state(new_accepted_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
@@ -681,7 +682,7 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                if batch.spec_algorithm.is_none():
+                if not is_spec:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
@@ -697,14 +698,10 @@ class SchedulerBatchResultProcessor:
                         .tolist()
                     )
 
-            if req.grammar is not None:
-                if needs_tokenwise_grammar_accept:
-                    # Already advanced token-by-token above; just sync terminal flag.
-                    req.grammar.finished = req.finished()
-                else:
-                    self._apply_decode_grammar(
-                        req=req, next_token_id=next_token_id, batch=batch
-                    )
+            # Spec + grammar already advanced the grammar (and grammar.finished)
+            # inside _accept_spec_v2_grammar_tokens; only non-spec advances here.
+            if req.grammar is not None and not is_spec:
+                self._apply_decode_grammar(req=req, next_token_id=next_token_id)
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -795,8 +792,10 @@ class SchedulerBatchResultProcessor:
     ) -> List[int]:
         """Accept speculative grammar tokens until the request finishes.
 
-        Returns the retained prefix and rolls back KV commits for dropped suffix
-        tokens.
+        Advances the output, grammar, and finish state one token at a time so
+        the request stops at the exact grammar-terminating token. Returns the
+        retained prefix, rolls back KV commits for the dropped suffix, and syncs
+        ``grammar.finished``.
         """
         accept_tokens = []
         try:
@@ -822,24 +821,16 @@ class SchedulerBatchResultProcessor:
         dropped = len(proposed) - len(accept_tokens)
         if dropped > 0:
             req.kv_committed_len -= dropped
+
+        req.grammar.finished = req.finished()
         return accept_tokens
 
-    def _apply_decode_grammar(
-        self,
-        *,
-        req: Req,
-        next_token_id: Union[int, List[int]],
-        batch: ScheduleBatch,
-    ) -> None:
+    def _apply_decode_grammar(self, *, req: Req, next_token_id: int) -> None:
+        # Non-spec decode: a single token. Spec + grammar advances the grammar
+        # per token in _accept_spec_v2_grammar_tokens instead.
         # FIXME: this try-except block is for handling unexpected xgrammar issue.
         try:
-            if batch.spec_algorithm.is_none():
-                # Normal decode: single token
-                req.grammar.accept_token(next_token_id)
-            else:
-                # Speculative decode: next_token_id is a list of accepted tokens
-                for token_id in next_token_id:
-                    req.grammar.accept_token(token_id)
+            req.grammar.accept_token(next_token_id)
         except ValueError as e:
             # Grammar accept_token can raise ValueError if the token is not in the grammar.
             # This can happen if the grammar is not set correctly or the token is invalid.

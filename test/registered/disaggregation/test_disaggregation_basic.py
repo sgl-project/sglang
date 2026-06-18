@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=890, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=730, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -259,43 +259,8 @@ class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServe
 
         self.assertGreater(metrics["score"], 0.74)
 
-
-class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
-    """Regression for PD disagg + EAGLE Spec V2 + grammar structured output."""
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
-        spec_args = [
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-draft-model-path",
-            DEFAULT_DRAFT_MODEL_EAGLE3,
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",  # Spec V2 only supports topk=1
-            "--speculative-num-draft-tokens",
-            "4",
-            "--grammar-backend",
-            "xgrammar",
-            "--cuda-graph-max-bs",
-            "8",
-            "--dtype=float16",
-            # Cap context to the EAGLE3 draft's native length so the target and
-            # draft ModelConfigs agree (the draft derives 2048 vs the Llama-3.1
-            # target's 131072, which the Spec V2 draft worker otherwise rejects).
-            # 2048 is far above this test's output length.
-            "--context-length",
-            "2048",
-        ]
-        cls.extra_prefill_args = spec_args
-        cls.extra_decode_args = spec_args
-        cls.launch_all()
-
     @staticmethod
-    def _json_schema() -> str:
+    def _grammar_json_schema() -> str:
         return json.dumps(
             {
                 "type": "object",
@@ -309,7 +274,7 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
             }
         )
 
-    def _generate(self, return_logprob: bool):
+    def _generate_grammar(self, return_logprob: bool):
         response = requests.post(
             f"{self.lb_url}/generate",
             json={
@@ -317,7 +282,7 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 256,
-                    "json_schema": self._json_schema(),
+                    "json_schema": self._grammar_json_schema(),
                 },
                 "return_logprob": return_logprob,
                 "logprob_start_len": 0,
@@ -328,13 +293,13 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
         self.assertGreater(
             out["meta_info"]["spec_verify_ct"],
             0,
-            "expected Spec V2 to run (spec_verify_ct > 0)",
+            "expected spec decoding to run (spec_verify_ct > 0)",
         )
         return out
 
-    def test_structured_output_no_trailing_tokens(self):
+    def test_grammar_structured_output_no_trailing_tokens(self):
         """Output is valid JSON with nothing emitted past grammar completion."""
-        out = self._generate(return_logprob=False)
+        out = self._generate_grammar(return_logprob=False)
         text = out["text"]
         parsed = json.loads(text)
         for key in ("name", "population", "country", "capital"):
@@ -343,9 +308,9 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
             text.strip().endswith("}"), f"unexpected trailing tokens: {text!r}"
         )
 
-    def test_logprob_count_matches_completion_tokens(self):
-        """Trimmed Spec V2 tokens keep logprob count == completion token count."""
-        out = self._generate(return_logprob=True)
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        """Trimmed spec tokens keep logprob count == completion token count."""
+        out = self._generate_grammar(return_logprob=True)
         meta = out["meta_info"]
         completion_tokens = meta["completion_tokens"]
         output_logprobs = meta["output_token_logprobs"]
