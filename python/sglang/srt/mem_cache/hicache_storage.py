@@ -396,9 +396,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return self._sharded_path(
-            f"{self._get_component_key(key, component_name)}.bin"
-        )
+        return self._sharded_path(f"{self._get_component_key(key, component_name)}.bin")
 
     def get(
         self,
@@ -407,7 +405,9 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = self._sharded_path(f"{suffixed}.bin")  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = self._sharded_path(
+            f"{suffixed}.bin"
+        )  # LOCAL PATCH (dsv4-l3-shard)
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -441,7 +441,9 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = self._sharded_path(f"{suffixed}.bin")  # LOCAL PATCH (dsv4-l3-shard)
+        tensor_path = self._sharded_path(
+            f"{suffixed}.bin"
+        )  # LOCAL PATCH (dsv4-l3-shard)
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if os.path.exists(tensor_path):
