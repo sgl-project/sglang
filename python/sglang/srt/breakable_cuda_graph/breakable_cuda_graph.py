@@ -94,6 +94,8 @@ def get_current_replay_token() -> int | None:
 
     Eager break-point code can use this to cache metadata within a single replay
     while still rebuilding it for the next replay when static buffers change.
+    This was added for diffusion model adaptation, where Qwen Image rebuilds
+    replay-local varlen attention metadata from the current prompt mask.
     """
     return _current_replay_token_var.get()
 
