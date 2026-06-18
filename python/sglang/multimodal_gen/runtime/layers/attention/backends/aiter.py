@@ -203,5 +203,6 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=True,
+            how_v3_bf16_cvt=2,
         )
         return output
