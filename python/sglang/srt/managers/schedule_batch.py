@@ -2572,9 +2572,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
 
+    def cumulate_penalty_output_tokens(self):
+        # Under overlap batch.input_ids is just a placeholder here -- the
+        # real token is relayed via future_map and resolved at forward
+        # entry. So take the last output token from Req directly
+        # (origin_input_ids[-1] on the first decode, before any output).
+        last_tokens = [
+            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+            for req in self.reqs
+        ]
+        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
+        # pin_memory (matching the prefill-path tensors) keeps the copy async;
+        # is_pin_memory_available falls back to pageable on unsupported devices.
+        latest_output_ids = torch.tensor(
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            latest_output_ids
+        )
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
+            self.req_pool_indices_cpu = (
+                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
+            )
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2591,25 +2616,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            # Under overlap batch.input_ids is just a placeholder here -- the
-            # real token is relayed via future_map and resolved at forward
-            # entry. So take the last output token from Req directly
-            # (origin_input_ids[-1] on the first decode, before any output).
-            latest_output_ids = torch.tensor(
-                [
-                    (
-                        req.output_ids[-1]
-                        if len(req.output_ids)
-                        else req.origin_input_ids[-1]
-                    )
-                    for req in self.reqs
-                ],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                latest_output_ids
-            )
+            self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
@@ -2687,6 +2694,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.req_pool_indices = torch.empty(
+                0, dtype=torch.int64, device=self.device
+            )
+            self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = None
+            self.seq_lens_sum = 0
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2744,6 +2760,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
+            self.req_pool_indices_cpu = (
+                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
+            )
+        if other.req_pool_indices_cpu is None and other.req_pool_indices is not None:
+            other.req_pool_indices_cpu = (
+                other.req_pool_indices.detach().cpu().to(dtype=torch.int64)
+            )
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
