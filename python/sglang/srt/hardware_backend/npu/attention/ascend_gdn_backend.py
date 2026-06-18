@@ -282,10 +282,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 intermediate_state=intermediate_state_cache,
             )
             core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
-            if (
-                (not self.graph_mode)
-                and core_attn_out.shape[0] < num_token_padding
-            ):
+            if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
                 core_attn_out = torch.cat(
                     [
                         core_attn_out,
@@ -358,13 +355,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
         if self.graph_mode:
-            ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
             num_accept_tokens = torch.full(
                 [batch_size], 1, dtype=torch.int32, device=cache_indices.device
             )
             actual_seq_lengths = torch.full(
                 [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
             )
+            ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
             num_accept_tokens = self.num_accept_tokens
             actual_seq_lengths = self.actual_seq_lengths
