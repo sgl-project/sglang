@@ -15,6 +15,7 @@ import logging
 import os
 
 import torch
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +66,7 @@ def _gather_and_dequant(k_cache, indices, page_size):
     raw_pages = k_cache.as_strided(
         (num_pages, page_bytes),
         (page_bytes, 1),
-    ).view(
-        torch.uint8
-    )  # (num_pages, page_bytes) uint8
+    ).view(torch.uint8)  # (num_pages, page_bytes) uint8
     # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
 
     # Compute byte offsets within each page
@@ -280,7 +279,6 @@ _BYTES_PER_DST_PAGE = (
     _PBS_DST * _NOPE_ROPE_STRIDE + _PBS_DST * _SCALE_STRIDE
 )  # 64*576 + 64*8 = 37376 + 512 = 37888
 # Padded to 576 alignment
-import math
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
