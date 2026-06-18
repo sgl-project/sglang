@@ -35,6 +35,24 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 
+
+def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
+    """Zero the padded tail of ``buf`` left as uninitialized torch.empty garbage
+    by varlen backends during PCG replay, so NaN/Inf cannot propagate through
+    residual / MoE routing / allreduce. No-op unless the PCG runner padded this
+    forward (``context.num_tokens > context.raw_num_tokens``)."""
+    pcg_static_tokens = context.num_tokens
+    actual_tokens = context.raw_num_tokens
+    if (
+        pcg_static_tokens is not None
+        and actual_tokens is not None
+        and pcg_static_tokens > actual_tokens
+    ):
+        first_dim = buf.shape[0]
+        elems_per_token = buf.numel() // first_dim
+        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -267,16 +285,7 @@ def unified_attention_with_output(
     # This affects every backend that varlen-writes under PCG, not just ROCm.
     # Use context.raw_num_tokens (pre-padding count from PCG runner) instead of
     # forward_batch.extend_num_tokens, which is None for TARGET_VERIFY batches.
-    pcg_static_tokens = context.num_tokens
-    actual_tokens = context.raw_num_tokens
-    if (
-        pcg_static_tokens is not None
-        and actual_tokens is not None
-        and pcg_static_tokens > actual_tokens
-    ):
-        first_dim = output.shape[0]
-        elems_per_token = output.numel() // first_dim
-        output.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+    _zero_padded_pcg_tail(output, context)
     return
 
 
@@ -339,17 +348,8 @@ def unified_sparse_attention_with_output(
 
     # Zero padded positions so empty-buffer garbage (NaN/Inf) cannot propagate
     # through residual / MoE routing / allreduce — mirrors the dense split op.
-    pcg_static_tokens = context.num_tokens
-    actual_tokens = context.raw_num_tokens
-    if (
-        pcg_static_tokens is not None
-        and actual_tokens is not None
-        and pcg_static_tokens > actual_tokens
-    ):
-        for buf in (attn_out, idx_out):
-            first_dim = buf.shape[0]
-            elems_per_token = buf.numel() // first_dim
-            buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+    for buf in (attn_out, idx_out):
+        _zero_padded_pcg_tail(buf, context)
     return
 
 

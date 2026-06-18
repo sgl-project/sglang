@@ -151,9 +151,14 @@ def _compute_sampled_frame_indices(
         indices = [0]
     if max_frames is not None and len(indices) > max_frames > 0:
         last = indices[-1]
-        step = len(indices) / (max_frames - 1)
-        indices = [indices[int(i * step)] for i in range(max_frames - 1)]
-        indices.append(last)
+        if max_frames == 1:
+            # max_frames == 1 would divide by (max_frames - 1) == 0 below;
+            # keep only the last frame, matching the always-keep-last invariant.
+            indices = [last]
+        else:
+            step = len(indices) / (max_frames - 1)
+            indices = [indices[int(i * step)] for i in range(max_frames - 1)]
+            indices.append(last)
     return indices
 
 

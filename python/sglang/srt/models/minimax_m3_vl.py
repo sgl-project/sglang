@@ -101,6 +101,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             projector_hidden_size=projector_hidden_size,
             quant_config=None,
             prefix=add_prefix("vision_tower", prefix),
+            # Top-level VL config fields; the vision_config dataclass doesn't
+            # carry them, so pass them through from the VL config explicitly.
+            multimodal_projector_bias=getattr(
+                config, "multimodal_projector_bias", True
+            ),
+            patch_merge_bias=getattr(config, "patch_merge_bias", True),
         )
 
         # Language model: M3 (with optional sparse attention).

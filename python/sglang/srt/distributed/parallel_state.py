@@ -63,6 +63,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -765,8 +766,12 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
-        elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
-            torch_symm_mem_comm.all_reduce(input_)
+        elif (
+            torch_symm_mem_comm is not None
+            and not torch_symm_mem_comm.disabled
+            and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -2440,7 +2445,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
         with contextlib.suppress(OSError):
             if rank == source_rank:
                 # create a shared memory segment
-                shm = shared_memory.SharedMemory(create=True, size=128)
+                shm = shared_memory.SharedMemory(
+                    create=True, size=128, name=make_shm_name("nodecheck")
+                )
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
                     [shm.name], src=ranks[source_rank], group=pg

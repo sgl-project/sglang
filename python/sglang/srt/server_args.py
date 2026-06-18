@@ -659,13 +659,16 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
+    flashinfer_allreduce_fusion_backend: Optional[
+        Literal["auto", "trtllm", "mnnvl"]
+    ] = None
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -691,6 +694,12 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    # int8-compress radix-cached linear-attn (mamba) checkpoints -> ~2x cached
+    # prefixes at fixed memory (quality-safe; see mem_cache/mamba_checkpoint_pool.py).
+    enable_int8_mamba_checkpoint: bool = False
+    int8_mamba_ckpt_size: Optional[int] = (
+        None  # #int8 checkpoint slots; default 2x the active pool
+    )
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -701,7 +710,7 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
-    hicache_mem_layout: str = "layer_first"
+    hicache_mem_layout: str = "page_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -1006,6 +1015,7 @@ class ServerArgs:
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
@@ -1200,6 +1210,17 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
+        if (
+            self.enable_flashinfer_allreduce_fusion
+            and self.flashinfer_allreduce_fusion_backend is None
+        ):
+            logger.warning(
+                "--enable-flashinfer-allreduce-fusion is deprecated. "
+                "Please use --flashinfer-allreduce-fusion-backend=auto instead."
+            )
+            self.flashinfer_allreduce_fusion_backend = "auto"
+        self.enable_flashinfer_allreduce_fusion = False
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
             "attention_backend",
@@ -2501,21 +2522,8 @@ class ServerArgs:
                     )
 
                 # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Only the kernel/page_first transfer
-                # path has a safe split K/V implementation.
-                if self.hicache_io_backend != "kernel":
-                    logger.warning(
-                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r})."
-                    )
-                    self.hicache_io_backend = "kernel"
-                if self.hicache_mem_layout != "page_first":
-                    logger.warning(
-                        f"Force hicache_mem_layout to 'page_first' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"asymmetric K/V HiCache requires kernel/page_first."
-                    )
-                    self.hicache_mem_layout = "page_first"
+                # asymmetric K/V allocation. Both kernel/page_first and
+                # direct/page_first_direct have split K/V transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -2852,13 +2860,14 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
-        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-
+        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families). SM90 is not auto-enabled because
+        # auto resolves to mnnvl, which requires a working NVLink multicast fabric
+        # that SM90 nodes do not reliably have; SM90 users can opt in explicitly
+        # via --flashinfer-allreduce-fusion-backend.
         if (
-            not self.enable_flashinfer_allreduce_fusion
+            self.flashinfer_allreduce_fusion_backend is None
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -2875,20 +2884,19 @@ class ServerArgs:
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
-            and (is_sm90_supported() or is_sm100_supported())
+            and is_sm100_supported()
             and self.tp_size > 1
             and not self.enable_dp_attention
-            and self.nnodes == 1
             and self.moe_a2a_backend == "none"
         ):
-            self.enable_flashinfer_allreduce_fusion = True
+            self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
         if self.enforce_disable_flashinfer_allreduce_fusion:
-            self.enable_flashinfer_allreduce_fusion = False
+            self.flashinfer_allreduce_fusion_backend = None
             logger.info(
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
@@ -3450,6 +3458,28 @@ class ServerArgs:
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
 
+    def _handle_int8_mamba_checkpoint(self):
+        # The int8 mamba checkpoint pool is only wired into the built-in
+        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # --enable-hierarchical-cache) and custom radix-cache backends are NOT
+        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
+        # (wrong pool / out-of-range). Reject the combination up front rather than
+        # silently corrupting state.
+        if not self.enable_int8_mamba_checkpoint:
+            return
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported together with "
+                "--enable-hierarchical-cache: the host-offload path "
+                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+            )
+        if self.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint only supports the built-in mamba "
+                f"radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
+                "is not int8-aware. Omit --radix-cache-backend."
+            )
+
     def _handle_linear_attn_backend(self):
         import torch
 
@@ -3473,7 +3503,7 @@ class ServerArgs:
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
@@ -3489,7 +3519,7 @@ class ServerArgs:
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
             prefill == "flashinfer"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
             and cuda_major < 13
         ):
@@ -3595,6 +3625,10 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+        from sglang.srt.layers.cp.base import init_cp_strategy
+
+        init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -4079,8 +4113,6 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
-        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
-        4) Re-run step (1) if step (3) changed I/O backend.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -4094,13 +4126,6 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
-
-        # Step 3: IO-decode backend compatibility (may change io backend).
-        io_changed = self._resolve_io_decode_attention_compatibility()
-
-        # Step 4: Re-normalize layout after io backend changes.
-        if io_changed:
-            self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -4119,6 +4144,20 @@ class ServerArgs:
             self.hicache_mem_layout = "page_first_direct"
             logger.warning(
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
+            )
+
+        # The page_first kernel write-back relies on the CUDA-only JIT staged
+        # kernel. On ROCm it falls back to a kernel that requires CUDA index
+        # tensors and crashes on host write-back, so use layer_first there.
+        if (
+            self.hicache_mem_layout == "page_first"
+            and self.hicache_io_backend == "kernel"
+            and is_hip()
+        ):
+            self.hicache_mem_layout = "layer_first"
+            logger.warning(
+                "page_first kernel write-back requires the CUDA JIT kernel; "
+                "falling back to layer_first layout on ROCm."
             )
 
     def _resolve_storage_layout_compatibility(self):
@@ -4141,41 +4180,6 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
-
-    def _resolve_io_decode_attention_compatibility(self) -> bool:
-        if self.hicache_io_backend != "kernel":
-            return False
-
-        # Only patch settings when the effective decode backend is FA3.
-        effective_decode_backend = (
-            self.decode_attention_backend or self.attention_backend
-        )
-        if effective_decode_backend != "fa3":
-            return False
-
-        if self.decode_attention_backend is not None:
-            self.hicache_io_backend = "direct"
-            logger.warning(
-                "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-            )
-            return True
-
-        # If decode backend is implicit, pick a safe backend without changing io backend.
-        if not self.use_mla_backend():
-            # FlashInfer does not support attention sinks.
-            if (
-                is_flashinfer_available()
-                and not self.get_model_config().has_attention_sinks
-            ):
-                self.decode_attention_backend = "flashinfer"
-            else:
-                self.decode_attention_backend = "triton"
-        else:
-            self.decode_attention_backend = (
-                "flashinfer" if is_sm100_supported() else "triton"
-            )
-        return False
 
     def _handle_load_format(self):
         if (
@@ -4446,6 +4450,11 @@ class ServerArgs:
                 )
                 self.enable_dynamic_batch_tokenizer = False
 
+            logger.info(
+                "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
+                "and min_new_tokens are unavailable."
+            )
+
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
@@ -4533,11 +4542,11 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
-            if self.enable_flashinfer_allreduce_fusion:
+            if self.flashinfer_allreduce_fusion_backend is not None:
                 logger.warning(
-                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                    "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
                 )
-                self.enable_flashinfer_allreduce_fusion = False
+                self.flashinfer_allreduce_fusion_backend = None
 
             # Check sampling backend
             if self.sampling_backend != "ascend":
@@ -4772,6 +4781,14 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
+
+            # Validate preferred_sampling_params doesn't use tokenizer-dependent features
+            if self.skip_tokenizer_init:
+                from sglang.srt.sampling.sampling_params import SamplingParams
+
+                test_params = SamplingParams(**self.preferred_sampling_params)
+                # raises if tokenizer-dependent features used
+                test_params.normalize(None)
 
     def _handle_crash_dump_env(self):
         if not self.crash_dump_folder:
@@ -6380,9 +6397,26 @@ class ServerArgs:
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
+            "--flashinfer-allreduce-fusion-backend",
+            type=str,
+            choices=["auto", "trtllm", "mnnvl"],
+            default=None,
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Defaults to auto. "
+                "'auto': choose mnnvl on SM90 single-node systems and "
+                "SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
+            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--enforce-disable-flashinfer-allreduce-fusion",
@@ -6530,6 +6564,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_mamba_cache_size,
             help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--enable-int8-mamba-checkpoint",
+            action="store_true",
+            help="Store radix-cached linear-attn (mamba) states in int8 (separate "
+            "checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        )
+        parser.add_argument(
+            "--int8-mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.int8_mamba_ckpt_size,
+            help="Number of int8 mamba checkpoint slots (default: 2x the active "
+            "mamba pool size).",
         )
         parser.add_argument(
             "--mamba-ssm-dtype",
@@ -7466,7 +7513,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl, mooncake or mori and is incompatible with --enable-hisparse.",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",

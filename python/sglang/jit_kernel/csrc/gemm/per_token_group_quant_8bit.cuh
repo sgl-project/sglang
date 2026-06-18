@@ -30,7 +30,9 @@ using deepseek_v4::fp8::pack_fp8;
 //     hiding (the AOT kernel's 1-warp blocks left HBM ~80% idle at prefill).
 // The UE8M0 path reuses the dsv4 cast_to_ue8m0/inv_scale_ue8m0 primitives and is
 // byte-identical to `sgl_per_token_group_quant_8bit_v2` (both ceil-round the
-// scale and store the biased exponent byte).
+// scale and store the biased exponent byte). ROCm portability comes from the
+// portable `warp::reduce_max<kThreadsPerGroup>` used directly in the kernel
+// (gfx942-safe; no separate GroupReduceMax helper needed).
 
 template <bool kUE8M0>
 using scale_packed_t_t = std::conditional_t<kUE8M0, uint32_t, float>;

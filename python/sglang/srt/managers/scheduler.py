@@ -39,7 +39,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -688,6 +688,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    model_name=server_args.model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -1098,8 +1099,11 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *8 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 8
+        ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -1785,7 +1789,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
-            load_inquirer_get_loads=lambda req: self.load_inquirer.get_loads(req),
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2438,9 +2441,11 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
+        req_pool_indices = [r.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+            req_pool_indices, dtype=torch.int64, device=device
         )
+        batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)

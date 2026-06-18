@@ -24,6 +24,7 @@ import triton.language as tl
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+MXFP8_E4M3_MAX = 448.0  # max representable magnitude of float8_e4m3fn
 
 
 # --------------------------------------------------------------------------- #
@@ -33,8 +34,12 @@ def _mxfp8_e4m3_quantize_torch(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     """Naive (reference) MXFP8 quantization.
 
     For each block of 32 elements along the last dim, compute a shared E8M0
-    scale (biased exponent of the block amax) and quantize each element to
-    float8_e4m3fn. Returns ``(values [same shape, fp8], scales [..., K//32] u8)``.
+    scale and quantize each element to float8_e4m3fn. The E8M0 exponent is
+    rounded *up* -- ``ceil(log2(amax / e4m3_max)) + 127`` -- so the block amax
+    stays inside the e4m3 range (no clipping) and the full dynamic range is
+    used, matching ``triton_kernels`` ``downcast_to_mxfp`` (ROUND_UP) and the
+    SGLang fp8 quant kernels. Returns ``(values [same shape, fp8], scales
+    [..., K//32] u8)``.
     """
     assert x.shape[-1] % MXFP8_BLOCK_SIZE == 0
     orig_shape = x.shape
@@ -45,12 +50,13 @@ def _mxfp8_e4m3_quantize_torch(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
 
     amax = x_blocked.abs().amax(dim=-1)
     amax = amax.clamp(min=torch.finfo(torch.float32).tiny)
-    scale_biased = torch.floor(torch.log2(amax)) + 127.0
-    scale_biased = scale_biased.clamp(0, 254)
+    scale_biased = (torch.ceil(torch.log2(amax / MXFP8_E4M3_MAX)) + 127.0).clamp(0, 254)
     scales_uint8 = scale_biased.to(torch.uint8)
 
     descale = torch.exp2(scale_biased - 127.0)
-    x_scaled = x_blocked / descale.unsqueeze(-1)
+    x_scaled = (x_blocked / descale.unsqueeze(-1)).clamp(
+        -MXFP8_E4M3_MAX, MXFP8_E4M3_MAX
+    )
     x_fp8 = x_scaled.view(orig_shape).to(MXFP8_VALUE_DTYPE)
 
     scales_uint8 = scales_uint8.view(*orig_shape[:-1], num_blocks)
@@ -84,10 +90,12 @@ def _mxfp8_quant_kernel(
         other=0.0,
     ).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30)  # [BLOCK_M]
-    sb = tl.floor(tl.log2(amax)) + 127.0
+    # Round the E8M0 exponent up (ceil(log2(amax / e4m3_max))) so the block amax
+    # stays inside the e4m3 range and the full dynamic range is used.
+    sb = tl.ceil(tl.log2(amax / 448.0)) + 127.0
     sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
     descale = tl.exp2(sb - 127.0)
-    xq = (x / descale[:, None]).to(xq_ptr.dtype.element_ty)
+    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
     tl.store(
         xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
         xq,
