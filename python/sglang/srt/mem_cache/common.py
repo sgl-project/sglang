@@ -415,8 +415,18 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if allocator.page_size == 1:
+    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
+    # server_args.page_size * dcp_size, so it can be > 1 even when
+    # tree_cache.page_size (== server_args.page_size) is 1. On HIP branch on the
+    # real allocator's page_size so the DCP paged path is taken; keep
+    # tree_cache.page_size elsewhere (the two are equal whenever dcp_size == 1,
+    # so non-HIP behavior is unchanged).
+    page_size = (
+        batch.tree_cache.token_to_kv_pool_allocator.page_size
+        if _is_hip
+        else batch.tree_cache.page_size
+    )
+    if page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -494,8 +504,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if allocator.page_size == 1:
+    # See alloc_for_extend: on HIP the DCP allocator's page_size may exceed
+    # tree_cache.page_size, so branch on the real allocator there; elsewhere the
+    # two are equal so non-HIP behavior is unchanged.
+    page_size = (
+        batch.tree_cache.token_to_kv_pool_allocator.page_size
+        if _is_hip
+        else batch.tree_cache.page_size
+    )
+    if page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:

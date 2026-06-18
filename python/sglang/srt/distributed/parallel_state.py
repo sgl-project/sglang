@@ -1885,6 +1885,11 @@ def initialize_model_parallel(
             parallelism.
         moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
+        decode_context_parallel_size: number of GPUs used for decode context
+            parallelism, which splits the KV cache across GPUs within each
+            tensor-parallel group during decoding. Must be a divisor of
+            tensor_model_parallel_size and is currently only supported on the
+            AMD HIP platform.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize

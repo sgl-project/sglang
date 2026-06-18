@@ -29,7 +29,14 @@ from sglang.srt.mem_cache.triton_ops.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_num_new_pages,
+    is_hip,
+    next_power_of_2,
+)
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -128,8 +135,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
         # shows up as a mysterious "second-request slow" (Run 1) for
         # repeated-prompt benchmarks. Running it once at init time moves
-        # that JIT cost to startup.
-        if torch.cuda.is_available():
+        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
+        # warm-up is gated on _is_hip and skipped on other platforms.
+        if _is_hip and torch.cuda.is_available():
             try:
                 _warmup = torch.arange(1024, dtype=torch.int64, device=device)
                 _ = torch.unique(_warmup // page_size)
