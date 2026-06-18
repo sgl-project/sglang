@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.utils import is_hip, require_mlp_tp_gather
+from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +95,21 @@ class EagerRunner(BaseRunner):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= sa.speculative_eagle_topk
+        # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
+        if require_mlp_sync(sa):
+            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
+            max_bs = ceil_align(max_bs, self.attn_tp_size)
+            max_bs = ceil_align(max_bs, get_cp_padding_align_size())
         prefill_ceiling = (
-            sa.chunked_prefill_size
+            sa.max_prefill_buffer_tokens()
             if sa.chunked_prefill_size and sa.chunked_prefill_size > 0
             else mr.max_total_num_tokens
         )
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
+        if require_mlp_sync(sa):
+            max_num_token = ceil_align(max_num_token, self.attn_tp_size)
+            max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
         self._eager_num_tokens_per_bs = num_tokens_per_bs
         is_encoder_decoder = mr.model_config.is_encoder_decoder
