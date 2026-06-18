@@ -1580,18 +1580,23 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
-class PostProcessWeightsReqInput(BaseReq):
-    # Whether to restore weights before loading new weights
-    restore_weights_before_load: bool = False
-    # Whether to enable quantization post-processing
-    post_process_quantization: bool = False
-    # Whether to call model.post_load_weights() after weight update
-    # (e.g., DeepSeek MLA kv_b_proj decomposition into w_kc/w_vc tensors)
-    post_load_weights: bool = False
+class BeginWeightUpdateReqInput(BaseReq):
+    pass
 
 
 @dataclass
-class PostProcessWeightsReqOutput(BaseReq):
+class BeginWeightUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class EndWeightUpdateReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class EndWeightUpdateReqOutput(BaseReq):
     success: bool
     message: str
 

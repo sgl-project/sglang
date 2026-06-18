@@ -30,7 +30,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -44,6 +43,11 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_loader.loader import (
+    post_load_weights,
+    postprocess_weight,
+    restore_weight,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -173,10 +177,18 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
-    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
-        """Perform optional post-processing on the updated model weights (e.g., Marlin conversion)."""
-        success, message = self.model_runner.post_process_weights(recv_req)
-        return success, message
+    def begin_weight_update(self):
+        """Begin a new weight update session: restore packed weights to a loadable state."""
+        restore_weight(self.model_runner.model, torch.device(self.device))
+        return True, "Success"
+
+    def end_weight_update(self, run_post_load: bool):
+        """End the weight update session: optionally post_load_weights, then quant finalize."""
+        model = self.model_runner.model
+        if run_post_load:
+            post_load_weights(model)
+        postprocess_weight(model, torch.device(self.device))
+        return True, "Success"
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.get_weights_by_name(
