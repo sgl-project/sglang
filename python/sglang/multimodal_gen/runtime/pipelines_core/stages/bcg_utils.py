@@ -11,10 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Qwen-focused helpers for breakable CUDA graph (BCG) prompt padding.
+"""Utilities for breakable CUDA graph (BCG) prompt padding.
 
-These helpers pad prompt conditioning up to a sequence-length bucket so Qwen
-Image prompts of different lengths reuse one captured graph.
+These helpers bucket prompt-conditioning inputs by sequence length so diffusion
+DiT forward calls with different prompt lengths can reuse captured CUDA graphs.
+Model-specific padders can register custom handling; Qwen-Image's rules live in
+model_specific_stages/qwen_image_bcg.py.
 """
 
 from __future__ import annotations
