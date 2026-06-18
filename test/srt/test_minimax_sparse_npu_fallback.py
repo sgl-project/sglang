@@ -85,3 +85,17 @@ def test_npu_block_topk_counts_init_and_local_inside_topk_budget():
 
     assert topk_idx.shape == (1, 2)
     torch.testing.assert_close(topk_idx, torch.tensor([[0, 3]], dtype=torch.int32))
+
+
+def test_npu_cache_slot_gather_preserves_3d_shape_and_values():
+    module = _load_minimax_sparse_backend_module()
+    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
+    backend.is_npu = False
+
+    slots = torch.arange(5 * 2 * 3).reshape(5, 2, 3)
+    locs = torch.tensor([3, 1], dtype=torch.int64)
+
+    gathered = backend._gather_cache_slots(slots, locs, "unit test")
+
+    assert gathered.shape == (2, 2, 3)
+    torch.testing.assert_close(gathered, slots[locs])

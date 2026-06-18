@@ -289,6 +289,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             return cache
         return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
 
+    def _gather_cache_slots(
+        self, slots: torch.Tensor, locs: torch.Tensor, tag: str
+    ) -> torch.Tensor:
+        locs = locs.to(device=slots.device, dtype=torch.int32).contiguous()
+        flat_slots = slots.reshape(slots.shape[0], -1)
+        gathered = torch.index_select(flat_slots, 0, locs)
+        self._debug_sync_npu(tag)
+        return gathered.reshape(locs.shape[0], *slots.shape[1:])
+
     def _block_topk(self, scores: torch.Tensor, seq_len: int) -> torch.Tensor:
         num_heads = scores.shape[0]
         num_blocks = (seq_len + self.block_size_k - 1) // self.block_size_k
@@ -471,7 +480,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             for offset, q_pos in enumerate(range(q_start, q_end)):
                 kv_len = min(prefix_len + offset + 1, total_len)
                 locs = self.req_to_token[req_idx, :kv_len].to(
-                    device=k_slots.device, dtype=torch.long
+                    device=k_slots.device, dtype=torch.int32
                 )
                 maybe_detect_oob(
                     locs,
@@ -485,14 +494,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     idx_k_slots.shape[0],
                     "MiniMax NPU sparse prefill req_to_token -> index KV",
                 )
-                k_tokens = k_slots.index_select(0, locs)
-                v_tokens = v_slots.index_select(0, locs)
-                idx_k_tokens = idx_k_slots.index_select(0, locs)
-                idx_v_tokens = (
-                    None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+                k_tokens = self._gather_cache_slots(
+                    k_slots, locs, f"sparse prefill gather main K batch_id={batch_id}"
                 )
-                self._debug_sync_npu(
-                    f"sparse prefill gather batch_id={batch_id} q_pos={q_pos}"
+                v_tokens = self._gather_cache_slots(
+                    v_slots, locs, f"sparse prefill gather main V batch_id={batch_id}"
+                )
+                idx_k_tokens = self._gather_cache_slots(
+                    idx_k_slots,
+                    locs,
+                    f"sparse prefill gather index K batch_id={batch_id}",
+                )
+                idx_v_tokens = (
+                    None
+                    if idx_v_slots is None
+                    else self._gather_cache_slots(
+                        idx_v_slots,
+                        locs,
+                        f"sparse prefill gather index V batch_id={batch_id}",
+                    )
                 )
                 cur_idx_o, cur_o = self._npu_sparse_one(
                     q[q_pos],
@@ -532,7 +552,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             req_idx = int(forward_batch.req_pool_indices[batch_id].item())
             kv_len = int(forward_batch.seq_lens[batch_id].item())
             locs = self.req_to_token[req_idx, :kv_len].to(
-                device=k_slots.device, dtype=torch.long
+                device=k_slots.device, dtype=torch.int32
             )
             maybe_detect_oob(
                 locs,
@@ -546,13 +566,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_slots.shape[0],
                 "MiniMax NPU sparse decode req_to_token -> index KV",
             )
-            k_tokens = k_slots.index_select(0, locs)
-            v_tokens = v_slots.index_select(0, locs)
-            idx_k_tokens = idx_k_slots.index_select(0, locs)
-            idx_v_tokens = (
-                None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+            k_tokens = self._gather_cache_slots(
+                k_slots, locs, f"sparse decode gather main K batch_id={batch_id}"
             )
-            self._debug_sync_npu(f"sparse decode gather batch_id={batch_id}")
+            v_tokens = self._gather_cache_slots(
+                v_slots, locs, f"sparse decode gather main V batch_id={batch_id}"
+            )
+            idx_k_tokens = self._gather_cache_slots(
+                idx_k_slots,
+                locs,
+                f"sparse decode gather index K batch_id={batch_id}",
+            )
+            idx_v_tokens = (
+                None
+                if idx_v_slots is None
+                else self._gather_cache_slots(
+                    idx_v_slots,
+                    locs,
+                    f"sparse decode gather index V batch_id={batch_id}",
+                )
+            )
             cur_idx_o, cur_o = self._npu_sparse_one(
                 q[batch_id],
                 k_tokens,
