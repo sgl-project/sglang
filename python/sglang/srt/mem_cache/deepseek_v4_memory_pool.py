@@ -638,8 +638,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_c128_state_index_mapping = torch.empty_like(
             full_to_swa_index_mapping
         )
-        full_indices = torch.arange(
+        valid_full_size = min(
             full_to_swa_index_mapping.shape[0] - 1,
+            self.c128_state_pool_size * (128 if ONLINE_C128 else 1),
+        )
+        full_indices = torch.arange(
+            valid_full_size,
             dtype=torch.int64,
             device=full_to_swa_index_mapping.device,
         )
@@ -647,43 +651,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             state_indices = full_indices // 128
         else:
             state_indices = full_indices
-            full_indices = full_indices[full_indices < self.c128_state_pool_size]
-            state_indices = state_indices[: full_indices.numel()]
         self.full_to_c128_state_index_mapping[:-1].fill_(0)
-        self.full_to_c128_state_index_mapping[full_indices] = state_indices
+        self.full_to_c128_state_index_mapping[:valid_full_size] = state_indices
         self.full_to_c128_state_index_mapping[-1] = -1
-
-    def set_c128_state_mapping(self, full_indices: torch.Tensor) -> None:
-        if self.full_to_c128_state_index_mapping is None or full_indices.numel() == 0:
-            return
-        full_indices_i64 = full_indices.to(torch.int64)
-        if ONLINE_C128:
-            state_indices = full_indices_i64 // 128
-        else:
-            state_indices = full_indices_i64
-        self.full_to_c128_state_index_mapping[full_indices_i64] = state_indices
-
-    def clear_c128_state_mapping(self, full_indices: torch.Tensor) -> None:
-        if self.full_to_c128_state_index_mapping is None or full_indices.numel() == 0:
-            return
-        full_indices = full_indices[
-            (full_indices >= 0)
-            & (full_indices < self.full_to_c128_state_index_mapping.shape[0] - 1)
-        ]
-        if full_indices.numel() == 0:
-            return
-        full_indices = full_indices.to(torch.int64)
-        if self.page_size == 1:
-            mapping_indices = full_indices
-        else:
-            pages = torch.unique(full_indices // self.page_size)
-            page_offsets = torch.arange(
-                self.page_size, dtype=full_indices.dtype, device=full_indices.device
-            )
-            mapping_indices = (
-                pages[:, None] * self.page_size + page_offsets[None, :]
-            ).reshape(-1)
-        self.full_to_c128_state_index_mapping[mapping_indices] = 0
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
