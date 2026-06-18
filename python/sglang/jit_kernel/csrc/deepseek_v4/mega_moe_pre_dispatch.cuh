@@ -221,17 +221,14 @@ __global__ __launch_bounds__(1024, 2) void  //
           params.source_rank == 0 ? load0 : load0 + static_cast<int64_t>(params.remote_cost_tokens);
       const int64_t adjusted_load1 =
           params.source_rank == 1 ? load1 : load1 + static_cast<int64_t>(params.remote_cost_tokens);
-      int32_t deficit0 =
-          target_total > adjusted_load0 ? static_cast<int32_t>(target_total - adjusted_load0) : 0;
-      int32_t deficit1 =
-          target_total > adjusted_load1 ? static_cast<int32_t>(target_total - adjusted_load1) : 0;
+      int32_t deficit0 = target_total > adjusted_load0 ? static_cast<int32_t>(target_total - adjusted_load0) : 0;
+      int32_t deficit1 = target_total > adjusted_load1 ? static_cast<int32_t>(target_total - adjusted_load1) : 0;
 
       bool has_valid = false;
       bool has_rank0 = params.source_rank == 0;
       bool has_rank1 = params.source_rank == 1;
       for (uint32_t k = 0; k < params.routed_top_k; ++k) {
-        const int64_t old_id =
-            static_cast<int64_t>(params.topk_idx[token_id * params.routed_top_k + k]);
+        const int64_t old_id = static_cast<int64_t>(params.topk_idx[token_id * params.routed_top_k + k]);
         if (old_id >= 0) {
           has_valid = true;
           const uint32_t old_rank = static_cast<uint32_t>(old_id) / params.old_experts_per_rank;
@@ -277,8 +274,7 @@ __global__ __launch_bounds__(1024, 2) void  //
       }
 
       const int32_t total_w = weight0 + weight1;
-      uint32_t token_seed =
-          token_id ^ (params.source_rank * static_cast<uint32_t>(0x9E3779B9u));
+      uint32_t token_seed = token_id ^ (params.source_rank * static_cast<uint32_t>(0x9E3779B9u));
       token_seed = token_seed * static_cast<uint32_t>(1664525u) + static_cast<uint32_t>(1013904223u);
       const int32_t u = total_w > 0 ? static_cast<int32_t>(token_seed % static_cast<uint32_t>(total_w)) : 0;
       uint32_t chosen_rank = u < weight0 ? 0u : 1u;
@@ -289,23 +285,20 @@ __global__ __launch_bounds__(1024, 2) void  //
         } else {
           bool remote_better = false;
           if (params.source_rank == 0) {
-            remote_better =
-                (adjusted_load1 * params.local_pref_numer < load0 * params.local_pref_denom) && has_rank1;
+            remote_better = (adjusted_load1 * params.local_pref_numer < load0 * params.local_pref_denom) && has_rank1;
           } else {
-            remote_better =
-                (adjusted_load0 * params.local_pref_numer < load1 * params.local_pref_denom) && has_rank0;
+            remote_better = (adjusted_load0 * params.local_pref_numer < load1 * params.local_pref_denom) && has_rank0;
           }
           chosen_rank = remote_better ? (1u - params.source_rank) : params.source_rank;
         }
       }
 
-      uint32_t replica_seed =
-          token_id ^ (chosen_rank * static_cast<uint32_t>(0x85EBCA6Bu));
+      uint32_t replica_seed = token_id ^ (chosen_rank * static_cast<uint32_t>(0x85EBCA6Bu));
       replica_seed = replica_seed * static_cast<uint32_t>(1103515245u) + static_cast<uint32_t>(12345u);
       const uint32_t shared_replica = replica_seed % params.shared_replicas_per_rank;
-      const int64_t shared_id =
-          static_cast<int64_t>(chosen_rank) * static_cast<int64_t>(params.new_experts_per_rank) +
-          static_cast<int64_t>(params.old_experts_per_rank) + static_cast<int64_t>(shared_replica);
+      const int64_t shared_id = static_cast<int64_t>(chosen_rank) * static_cast<int64_t>(params.new_experts_per_rank) +
+                                static_cast<int64_t>(params.old_experts_per_rank) +
+                                static_cast<int64_t>(shared_replica);
       const uint32_t out_off = token_id * params.out_top_k + params.routed_top_k;
       params.buf_topk_idx[out_off] = has_valid ? shared_id : -1;
       params.buf_topk_weights[out_off] = has_valid ? params.shared_weight : 0.0f;
