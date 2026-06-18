@@ -9,9 +9,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-# NPU utility for NZ format conversion
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+import logging
 
+logger = logging.getLogger(__name__)
 
 def unpack_from_int32(
     weight: torch.Tensor,
