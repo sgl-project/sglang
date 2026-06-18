@@ -101,6 +101,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -606,8 +607,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # offline per-kernel analysis -- opt-in via
         # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE; the in-log tables above are
         # unchanged.
-        from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
-
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
