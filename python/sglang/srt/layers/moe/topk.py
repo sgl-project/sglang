@@ -1706,8 +1706,8 @@ def _post_process_topk_ids(
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        ep_size = get_moe_expert_parallel_world_size()
-        ep_rank = get_moe_expert_parallel_rank()
+        ep_size = get_parallel().moe_ep_size
+        ep_rank = get_parallel().moe_ep_rank
         num_local_routed = num_physical_routed_experts // ep_size
         num_local_experts = num_local_routed + num_fused_shared_experts
         shared_id_base = ep_rank * num_local_experts + num_local_routed
