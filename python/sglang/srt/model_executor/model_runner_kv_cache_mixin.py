@@ -1001,6 +1001,7 @@ class ModelRunnerKVCacheMixin:
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 

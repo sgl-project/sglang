@@ -80,7 +80,7 @@ class OnlineC128MTPController:
             req_pool_indices,
             token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
             min(seq_lens.shape[0], req_pool_indices.shape[0]),
-            token_to_kv_pool.max_num_reqs,
+            token_to_kv_pool.get_online_c128_state_num_req_slots(),
         )
 
     def clear(self) -> None:
@@ -200,7 +200,7 @@ class OnlineC128MTPController:
                 cur_bs,
                 num_verify_tokens,
                 runtime.state_slot_offset,
-                token_to_kv_pool.max_num_reqs,
+                token_to_kv_pool.get_online_c128_state_num_req_slots(),
             )
 
         self.clear()

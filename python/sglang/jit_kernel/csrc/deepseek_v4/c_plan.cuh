@@ -297,6 +297,13 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
+  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
+    const auto ring_pos = position % params.ring_size;
+    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
+  };
+  const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
+    return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
+  };
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
     if (plan_c.buffer_len > 0) {
@@ -307,12 +314,12 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_1 = static_cast<int32_t>(plan_c.seq_len - 1);
       // only used for c4, harmless for c128
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
-      const auto raw_loc_0 = mapping[position_0];
-      const auto raw_loc_1 = mapping[position_1];
       if (params.compress_ratio == 128) {
-        plan_c.read_page_0 = raw_loc_0 / 128;
-        plan_c.read_page_1 = raw_loc_1 / 128;
+        plan_c.read_page_0 = compute_c128_page(rid, position_0);
+        plan_c.read_page_1 = compute_c128_page(rid, position_1);
       } else {
+        const auto raw_loc_0 = mapping[position_0];
+        const auto raw_loc_1 = mapping[position_1];
         const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
         const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
         plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
@@ -330,10 +337,13 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
-    const auto raw_loc = mapping[position];
     plan_w.ragged_id = ragged_id;
-    plan_w.write_loc =
-        params.compress_ratio == 128 ? raw_loc : compute_loc(params.state_map_ptr[raw_loc]);
+    if (params.compress_ratio == 128) {
+      plan_w.write_loc = compute_c128_loc(rid, position);
+    } else {
+      const auto raw_loc = mapping[position];
+      plan_w.write_loc = compute_loc(params.state_map_ptr[raw_loc]);
+    }
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
     params.plan_w[idx] = PlanW::invalid();
@@ -350,21 +360,32 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
+  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
+    const auto ring_pos = position % params.ring_size;
+    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
+  };
+  const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
+    return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
+  };
   const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
   const auto position_1 = static_cast<int32_t>(seq_len - 1);
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
-  const auto raw_loc_0 = mapping[position_0];
-  const auto raw_loc_1 = mapping[position_1];
-  const auto state_loc_0 =
-      params.compress_ratio == 128 ? raw_loc_0 : params.state_map_ptr[raw_loc_0];
-  const auto state_loc_1 =
-      params.compress_ratio == 128 ? raw_loc_1 : params.state_map_ptr[raw_loc_1];
-  const int32_t write_loc = static_cast<int32_t>(
-      params.compress_ratio == 128 ? state_loc_1 : compute_loc(state_loc_1));
-  const int32_t read_page_0 = static_cast<int32_t>(
-      params.compress_ratio == 128 ? state_loc_0 / 128 : compute_loc(state_loc_0) / params.compress_ratio);
-  const int32_t read_page_1 = static_cast<int32_t>(
-      params.compress_ratio == 128 ? state_loc_1 / 128 : write_loc / params.compress_ratio);
+  int32_t write_loc;
+  int32_t read_page_0;
+  int32_t read_page_1;
+  if (params.compress_ratio == 128) {
+    write_loc = compute_c128_loc(rid, position_1);
+    read_page_0 = compute_c128_page(rid, position_0);
+    read_page_1 = compute_c128_page(rid, position_1);
+  } else {
+    const auto raw_loc_0 = mapping[position_0];
+    const auto raw_loc_1 = mapping[position_1];
+    const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
+    const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+    write_loc = static_cast<int32_t>(compute_loc(state_loc_1));
+    read_page_0 = static_cast<int32_t>(compute_loc(state_loc_0) / params.compress_ratio);
+    read_page_1 = static_cast<int32_t>(write_loc / params.compress_ratio);
+  }
   params.plan_d[idx] = {
       .seq_len = static_cast<uint32_t>(seq_len),
       .write_loc = write_loc,
@@ -455,7 +476,7 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param req_to_token      `[num_reqs, max_tokens_per_req]` int64_t
  * @param full_to_state     `[full_cache_size]` int64_t. For c4 this maps
  *                          full loc -> SWA loc; ignored for c128, whose
- *                          state slot is derived directly from full loc.
+ *                          state slot is request-scoped.
  * @param seq_lens          `[batch_size]` int64
  * @param extend_lens       `[batch_size]` int64
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)

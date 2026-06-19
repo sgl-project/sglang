@@ -543,9 +543,7 @@ __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams para
   if (idx >= params.batch_size) return;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[idx]);
   const auto rid = params.req_pool_indices[idx];
-  const int32_t chunk_start = static_cast<int32_t>((seq_len - 1u) / 128u * 128u);
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t slot = full_loc / 128 + params.state_slot_offset;
+  const int32_t slot = static_cast<int32_t>(rid) + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{
       .seq_len = seq_len,
       .write_loc = slot,
@@ -690,10 +688,7 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
   const auto rid = params.req_pool_indices[batch_id];
-  const int32_t position = static_cast<int32_t>(plan.seq_len - 1u);
-  const int32_t chunk_start = (position / 128) * 128;
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t main_slot = full_loc / 128;
+  const int32_t main_slot = static_cast<int32_t>(rid);
   plan.read_page_0 = main_slot + params.state_slot_offset;
   plan.read_page_1 = main_slot;
   *plan_ptr = plan;

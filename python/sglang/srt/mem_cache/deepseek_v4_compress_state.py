@@ -151,6 +151,13 @@ class CompressStatePool:
         state_loc = torch.where(swa_loc < 0, -1, state_loc)
         return state_loc
 
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
+        state_loc = torch.where(positions < 0, -1, state_loc)
+        return state_loc
+
     def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:
         return self.kv_score_buffer[state_loc]
 

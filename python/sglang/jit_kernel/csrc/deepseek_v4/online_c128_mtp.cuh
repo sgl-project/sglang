@@ -90,10 +90,7 @@ __global__ void online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitP
   const int64_t final_seq = old_seq + accept;
   if ((final_seq & 127) == 0) return;
 
-  const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-  const int64_t full_loc =
-      static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
-  const int64_t slot = full_loc / 128;
+  const int64_t slot = req;
   const float* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
   float* const dst = params.state + slot * params.state_stride_b;
 
@@ -114,10 +111,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
 
   int64_t init_slot = 0;
   if (has_partial) {
-    const int64_t chunk_start = ((seq_before - 1) / 128) * 128;
-    const int64_t full_loc =
-        static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-    init_slot = full_loc / 128;
+    init_slot = req_idx;
   }
 
   const int64_t d = static_cast<int64_t>(threadIdx.x);
@@ -168,10 +162,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
 
     const int64_t final_seq = seq_before + step + 1;
     if ((final_seq & 127) != 0) {
-      const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-      const int64_t full_loc =
-          static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-      const int64_t slot = full_loc / 128 + (step + 1) * params.state_slot_stride;
+      const int64_t slot = req_idx + (step + 1) * params.state_slot_stride;
       float* const out = params.state + slot * params.state_stride_b;
       out[d] = run_max;
       out[kHeadDim + d] = run_sum;

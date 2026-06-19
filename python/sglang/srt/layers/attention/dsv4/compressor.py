@@ -283,10 +283,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if compress_ratio == 128:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)

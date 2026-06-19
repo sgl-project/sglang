@@ -99,6 +99,11 @@ class MemoryPoolConfigurator:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
 
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        return config
+
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
@@ -450,12 +455,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        # C128 state is indexed from full KV positions, not SWA pages. Offline
-        # C128 stores one raw state row per full token; online C128 stores one
-        # running state per 128-token chunk.
-        c128_state_ratio = 1 / 128 if c128_online else 1
-        if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
+        # C128 state is request-scoped and is finalized after
+        # max_running_requests is known, so it should not scale with
+        # full-token capacity here.
+        c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
@@ -474,15 +477,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        c128_state_pool_size = full_token // 128 if c128_online else full_token
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=c128_state_pool_size,
+            c128_state_pool_size=0,
         )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
@@ -504,6 +505,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_state_pool_size=sizes.c4_state_pool_size,
             c128_state_pool_size=sizes.c128_state_pool_size,
         )
+
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            assert config.max_running_requests is not None
+            config.c128_state_pool_size = config.max_running_requests + 1
+        else:
+            assert config.max_running_requests is not None
+            config.c128_state_pool_size = (
+                config.max_running_requests + 1
+            ) * self.c128_ring_size
+        return config
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
