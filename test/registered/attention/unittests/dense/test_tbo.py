@@ -126,7 +126,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
 
         capture_bs = case.batch_size
         num_tokens = sum(case.extend_lens)
-        wrapper.init_cuda_graph_state(max_bs=capture_bs, max_num_tokens=num_tokens)
+        wrapper.init_static_metadata_buffers(max_bs=capture_bs, max_num_tokens=num_tokens)
         wrapper.init_forward_metadata_out_graph(batch, in_capture=True)
 
     @unittest.skipIf(

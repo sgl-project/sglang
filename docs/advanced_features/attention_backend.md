@@ -361,7 +361,7 @@ Linear attention kernel backends (GDN, KDA) follow a different pattern. They imp
   - Call the plan function for optimizations like split_kv
   - It will be called once per forward
 2. Run with cuda graph. It has two phases (capture and replay) and you need to implement three functions
-- init_cuda_graph_state
+- init_static_metadata_buffers
   - It will be called once during life time
   - Create all common shared buffers
 - init_forward_metadata_capture_cuda_graph

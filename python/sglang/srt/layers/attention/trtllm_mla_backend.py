@@ -272,7 +272,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         return block_kv_indices
 
-    def init_cuda_graph_state(
+    def init_static_metadata_buffers(
         self,
         max_bs: int,
         max_num_tokens: int,
@@ -326,7 +326,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+        super().init_static_metadata_buffers(max_bs, max_num_tokens, kv_indices_buf)
 
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
