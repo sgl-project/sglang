@@ -127,10 +127,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -899,6 +896,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_megamoe()
             )
         return False
 
@@ -1377,6 +1375,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
+            if not self.is_fp4_expert and get_moe_a2a_backend().is_megamoe():
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_experts_weights,
+                    convert_fp8_experts_to_fp4_for_mega_moe,
+                )
+
+                weight_block_size = self.quant_config.weight_block_size
+                convert_fp8_experts_to_fp4_for_mega_moe(layer, weight_block_size)
+                build_mega_moe_experts_weights(layer)
+                return
+
             if (
                 not self.is_fp4_expert
                 and should_deepgemm_weight_requant_ue8m0(
@@ -1387,9 +1396,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and will_use_deepgemm
                 and not layer.w13_weight_scale_inv.format_ue8m0
             ):
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+                assert (
+                    isinstance(layer, DeepEPMoE) or get_moe_a2a_backend().is_megamoe()
+                ), "DeepGemm MoE is only supported with DeepEPMoE or MegaMOE"
                 weight_block_size = self.quant_config.weight_block_size
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size

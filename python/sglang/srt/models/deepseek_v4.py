@@ -2,18 +2,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import time
 from contextlib import nullcontext
-from typing import (
-    TYPE_CHECKING,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -48,9 +40,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
-from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
-)
+from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -204,9 +194,7 @@ def _freqs_cis_to_cos_sin(
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-    )
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -1890,32 +1878,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(self):
+        server_args = get_global_server_args()
         self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
+        if server_args.disable_shared_experts_fusion:
             return
 
-        # Waterfill needs shared-experts fusion so it can dispatch shared
-        # expert tokens to least-loaded EP ranks.
-        if get_global_server_args().enable_deepep_waterfill:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-            self.num_fused_shared_experts = self.config.n_shared_experts
+        if not (
+            server_args.enforce_shared_experts_fusion
+            or getattr(server_args, "enable_deepep_waterfill", False)
+        ):
+            server_args.disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
-                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+                "DeepSeek V4 shared-experts fusion is disabled unless explicitly "
+                "enforced or required by DeepEP Waterfill.",
             )
             return
 
-        get_global_server_args().disable_shared_experts_fusion = True
-        log_info_on_rank0(
-            logger,
-            "DeepSeek V4 requires different clamping for shared and routed experts. "
-            "Shared experts fusion optimization is disabled.",
-        )
+        if self.config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={self.config.n_shared_experts}."
+            )
+
+        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
@@ -2078,6 +2064,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        load_debug_t0 = time.perf_counter()
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2094,13 +2081,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            logger.debug("DSV4_LOAD_WEIGHTS_LIST_BEGIN is_nextn=%s", is_nextn)
             weights = list(weights)
+            logger.debug(
+                "DSV4_LOAD_WEIGHTS_LIST_DONE is_nextn=%s count=%s elapsed=%.3fs",
+                is_nextn,
+                len(weights),
+                time.perf_counter() - load_debug_t0,
+            )
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 logger.info("Skip dequant fp8 wo_a")
+        else:
+            logger.debug("DSV4_LOAD_WEIGHTS_LIST_SKIPPED is_nextn=%s", is_nextn)
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -2150,9 +2146,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
+            num_seen_weights = 0
+            logger.debug(
+                "DSV4_LOAD_WEIGHTS_APPLY_BEGIN is_nextn=%s elapsed=%.3fs",
+                is_nextn,
+                time.perf_counter() - load_debug_t0,
+            )
             for name, loaded_weight in weights:
+                num_seen_weights += 1
+                if num_seen_weights == 1 or num_seen_weights % 100 == 0:
+                    logger.debug(
+                        "DSV4_LOAD_WEIGHTS_APPLY_PROGRESS is_nextn=%s seen=%s "
+                        "name=%s shape=%s elapsed=%.3fs",
+                        is_nextn,
+                        num_seen_weights,
+                        name,
+                        tuple(loaded_weight.shape),
+                        time.perf_counter() - load_debug_t0,
+                    )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
+                    if os.environ.get("SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD") == "1":
+                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
@@ -2378,8 +2393,26 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
+            logger.debug(
+                "DSV4_LOAD_WEIGHTS_FUTURES_BEGIN is_nextn=%s seen=%s "
+                "loaded_params=%s futures=%s elapsed=%.3fs",
+                is_nextn,
+                num_seen_weights,
+                len(loaded_params),
+                len(futures),
+                time.perf_counter() - load_debug_t0,
+            )
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+            logger.debug(
+                "DSV4_LOAD_WEIGHTS_APPLY_DONE is_nextn=%s loaded_params=%s "
+                "seen=%s futures=%s elapsed=%.3fs",
+                is_nextn,
+                len(loaded_params),
+                num_seen_weights,
+                len(futures),
+                time.perf_counter() - load_debug_t0,
+            )
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
@@ -2406,7 +2439,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
+        logger.debug(
+            "DSV4_LOAD_WEIGHTS_POST_BEGIN is_nextn=%s weight_names=%s elapsed=%.3fs",
+            is_nextn,
+            len(weight_names),
+            time.perf_counter() - load_debug_t0,
+        )
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        logger.debug(
+            "DSV4_LOAD_WEIGHTS_DONE is_nextn=%s elapsed=%.3fs",
+            is_nextn,
+            time.perf_counter() - load_debug_t0,
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

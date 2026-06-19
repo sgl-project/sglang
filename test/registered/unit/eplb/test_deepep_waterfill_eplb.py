@@ -74,7 +74,9 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         with (
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
-            patch.object(topk_module, "is_deepep_class_backend", return_value=True),
+            patch.object(
+                topk_module, "uses_per_rank_fused_shared_slots", return_value=True
+            ),
             get_parallel().override(moe_ep_size=8, moe_ep_rank=7),
             patch.object(
                 topk_module,
@@ -112,7 +114,9 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         with (
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
-            patch.object(topk_module, "is_deepep_class_backend", return_value=False),
+            patch.object(
+                topk_module, "uses_per_rank_fused_shared_slots", return_value=False
+            ),
             patch.object(
                 topk_module,
                 "_biased_grouped_topk_postprocess",

@@ -9,9 +9,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -367,6 +365,35 @@ def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def uses_per_rank_fused_shared_slots() -> bool:
+    """Check whether fused shared experts use per-rank physical slots."""
+    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+
+
+def get_fused_shared_expert_replicas_per_rank() -> int:
+    """Number of physical replicas for each logical fused shared expert per EP rank."""
+    if not uses_per_rank_fused_shared_slots():
+        return 1
+
+    env_field = envs.SGLANG_WATERFILL_SHARED_REPLICAS_PER_RANK
+    env_raw = os.environ.get(env_field.name)
+    if env_raw not in (None, ""):
+        return max(env_field.get(), 1)
+
+    server_args = get_global_server_args()
+    if (
+        get_moe_a2a_backend().is_megamoe()
+        and getattr(server_args, "enable_deepep_waterfill", False)
+    ):
+        # Mega-MoE Waterfill needs enough physical shared slots for the fused
+        # DeepGEMM schedule to convert rank balance into throughput. Keep the
+        # non-Waterfill Mega-MoE baseline at one slot so A/B comparisons remain
+        # apples-to-apples.
+        return 4
+
+    return 1
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

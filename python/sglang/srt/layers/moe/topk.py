@@ -82,9 +82,7 @@ except ImportError:
     pass
 
 from sglang.jit_kernel.dsv4 import mask_topk_ids
-from sglang.srt.distributed import (
-    get_tp_group,
-)
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -97,7 +95,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.layers.moe.utils import (
+    get_fused_shared_expert_replicas_per_rank,
+    uses_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -450,13 +451,14 @@ class TopK(MultiPlatformOp):
         )
         return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
-    def forward_cuda(
+    def _forward_cuda_impl(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        apply_deepep_waterfill: bool,
     ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
@@ -512,7 +514,56 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        if apply_deepep_waterfill:
+            return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return topk_output
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self._forward_cuda_impl(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_deepep_waterfill=True,
+        )
+
+    def forward_cuda_without_deepep_waterfill(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self._forward_cuda_impl(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_deepep_waterfill=False,
+        )
+
+    def forward_without_deepep_waterfill(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        return self.forward_cuda_without_deepep_waterfill(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
 
     def forward_cpu(
         self,
@@ -585,7 +636,10 @@ class TopK(MultiPlatformOp):
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if self.topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend():
+        if (
+            self.topk_config.num_fused_shared_experts > 0
+            and uses_per_rank_fused_shared_slots()
+        ):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
@@ -1260,7 +1314,8 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append shared expert columns: ID = num_experts (first shared slot),
             # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
+            # For DeepEP/MegaMOE per-rank shared-slot layouts, post-process replaces
+            # this placeholder ID/weight with the rank-local physical shared slot.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
             if routed_scaling_factor is not None:
@@ -1471,18 +1526,18 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def _remap_topk_for_deepep(
+def remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_fused_shared_experts: int,
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK output to DeepEP interleaved expert layout.
+    """Remap TopK output to an interleaved per-rank shared expert layout.
 
-    DeepEP dispatch needs each rank's shared expert at a unique ID so tokens
-    route to the correct rank. The layout interleaves shared slots among
-    routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+    DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
+    so tokens route to the correct rank. The layout interleaves shared slots
+    among routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
@@ -1495,19 +1550,24 @@ def _remap_topk_for_deepep(
     ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
-    # DeepEP interleaved layout must use the physical routed count.
+    # interleaved layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
-    num_local_experts = num_local_routed + num_fused_shared_experts
+    shared_replicas_per_rank = get_fused_shared_expert_replicas_per_rank()
+    num_local_shared = num_fused_shared_experts * shared_replicas_per_rank
+    num_local_experts = num_local_routed + num_local_shared
 
     # Remap routed IDs: insert gaps for shared expert slots (single fused op)
     routed = topk_ids[:, :-num_fused_shared_experts]
-    topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
+    topk_ids[:, :-num_fused_shared_experts] = (
+        routed + (routed // num_local_routed) * num_local_shared
+    )
 
     # Set shared expert IDs to route to home rank (vectorized)
     topk_ids[:, -num_fused_shared_experts:] = (
         ep_rank * num_local_experts
         + num_local_routed
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
+        * shared_replicas_per_rank
     )
 
     # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0
@@ -1541,6 +1601,9 @@ def _post_process_topk_ids(
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
         log2phy_prob = None
+        use_per_rank_shared_slots = (
+            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+        )
         if (
             expert_location_dispatch_info is not None
             and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
@@ -1550,26 +1613,37 @@ def _post_process_topk_ids(
 
             lplb_solver = get_global_lplb_solver(layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                lplb_solver_input = (
+                    topk_ids[:, :-num_fused_shared_experts]
+                    if use_per_rank_shared_slots
+                    else topk_ids
+                )
+                log2phy_prob = lplb_solver.solve(lplb_solver_input)
 
-        if log2phy_prob is not None:
+        if log2phy_prob is not None and not use_per_rank_shared_slots:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif num_fused_shared_experts > 0 and is_deepep_class_backend():
+        elif use_per_rank_shared_slots:
             # Shared experts appended as extra columns in topk_ids: their value
             # would be out-of-bounds for the logical-to-physical dispatch table,
             # so split, dispatch the routed cols, recombine.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            routed_cols = _biased_grouped_topk_postprocess(
-                routed_cols, expert_location_dispatch_info, num_token_non_padded
-            )
+            if log2phy_prob is not None:
+                routed_cols = topk_ids_logical_to_physical(
+                    routed_cols, expert_location_dispatch_info, log2phy_prob
+                )
+                _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
+            else:
+                routed_cols = _biased_grouped_topk_postprocess(
+                    routed_cols, expert_location_dispatch_info, num_token_non_padded
+                )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
-            # so keep the routed physical ids separately for statistics.
+            # Per-rank shared-slot dispatch later inserts local shared slots into
+            # topk_ids, so keep the routed physical ids separately for stats.
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
@@ -1619,15 +1693,15 @@ def _post_process_topk_ids(
             N,  # base id for shared experts
         )
 
-    # DeepEP: remap to interleaved expert layout where each rank's shared
-    # expert has a unique ID for dispatch routing.
-    if num_fused_shared_experts > 0 and is_deepep_class_backend():
+    # DeepEP/MegaMoE: remap to interleaved expert layout where each rank's
+    # shared expert has a unique ID for dispatch routing.
+    if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        topk_ids, topk_weights = _remap_topk_for_deepep(
+        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,

@@ -38,9 +38,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import (
-    get_linear_attn_spec_by_arch,
-)
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -938,6 +936,7 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
+        self._handle_ep_dispatch_algorithm_default()
 
         # Validate mm_process_config before dummy-model early return.
         self._handle_multimodal()
@@ -2614,9 +2613,7 @@ class ServerArgs:
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import (
-                apply_nemotron_h_defaults,
-            )
+            from sglang.srt.arg_groups.nemotron_h_hook import apply_nemotron_h_defaults
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
@@ -3709,13 +3706,6 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
-            )
-            self.moe_a2a_backend = "deepep"
-
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             and self.moe_a2a_backend != "megamoe"
@@ -3725,6 +3715,24 @@ class ServerArgs:
                 "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
                 "auto-configuring --moe-a2a-backend megamoe."
             )
+
+        if self.enable_deepep_waterfill and self.moe_a2a_backend not in (
+            "deepep",
+            "megamoe",
+        ):
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
+
+        if self.enable_deepep_waterfill:
+            if self.disable_shared_experts_fusion:
+                logger.warning(
+                    "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                )
+                self.disable_shared_experts_fusion = False
+            self.enforce_shared_experts_fusion = True
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
@@ -3745,12 +3753,6 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
             if self.enable_deepep_waterfill:
-                if self.disable_shared_experts_fusion:
-                    logger.warning(
-                        "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
-                    )
-                    self.disable_shared_experts_fusion = False
-                self.enforce_shared_experts_fusion = True
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )
@@ -3829,13 +3831,21 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
-            self.ep_dispatch_algorithm is None
-        ):
-            self.ep_dispatch_algorithm = "static"
+        self._handle_ep_dispatch_algorithm_default()
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_ep_dispatch_algorithm_default(self):
+        if (
+            self.enable_eplb
+            or (self.init_expert_location != "trivial")
+            or self.ep_num_redundant_experts > 0
+        ) and (self.ep_dispatch_algorithm is None):
+            # Redundant physical experts are only reachable after logical topk
+            # ids are remapped to physical ids. Without a dispatch algorithm,
+            # the extra experts are allocated/loaded but never selected.
+            self.ep_dispatch_algorithm = "static"
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:
