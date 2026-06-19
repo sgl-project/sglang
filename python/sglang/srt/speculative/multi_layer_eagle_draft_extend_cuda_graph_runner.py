@@ -289,7 +289,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -536,7 +536,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
-    def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
+    def execute(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -739,5 +739,5 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def get_last_runner(self):
         return self.runners[-1] if self.runners else None
 
-    def can_run(self, forward_batch):
-        return self.runners[0].can_run(forward_batch)
+    def can_run_graph(self, forward_batch):
+        return self.runners[0].can_run_graph(forward_batch)
