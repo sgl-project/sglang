@@ -55,10 +55,14 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         suffix_ids = suffix_inputs["input_ids"]
         suffix_mask = suffix_inputs["attention_mask"].bool()
 
+        # Pad to the batch's longest sequence (no padding for a single prompt) so
+        # the joint stream carries only valid tokens and attention needs no mask.
+        # The Qwen3-VL encoder is causal with right padding, so valid-token hidden
+        # states are identical to fixed max-length padding.
         inputs = self.tokenizer(
             text,
             truncation=True,
-            padding="max_length",
+            padding="longest",
             max_length=_MAX_LENGTH + _DROP_IDX - _SUFFIX_START_IDX,
             return_tensors="pt",
         ).to(device)

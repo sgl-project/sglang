@@ -47,22 +47,25 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def attention(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    mask: Tensor | None = None,
-    scale: float | None = None,
-    gqa: bool = False,
+    q: Tensor, k: Tensor, v: Tensor, gqa: bool = False, key_mask: Tensor | None = None
 ) -> Tensor:
-    x = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
-    )
+    # GQA is expanded explicitly (enable_gqa would disqualify SDPA's flash kernel).
+    if gqa:
+        n_rep = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+    # With no padding (single/same-prompt batch) key_mask is None, so PyTorch SDPA
+    # picks its flash kernel. A ragged batch passes an additive [B,1,1,L] mask,
+    # which routes to the mem-efficient kernel instead.
+    attn_mask = None
+    if key_mask is not None:
+        attn_mask = torch.where(
+            key_mask[:, None, None, :],
+            q.new_zeros(()),
+            q.new_full((), torch.finfo(q.dtype).min),
+        )
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
     return rearrange(x, "B H L D -> B L (H D)")
-
-
-def _mask(mask: Tensor) -> Tensor:
-    """Expand a (B, L) key-padding mask into a (B, 1, L, L) attention mask."""
-    return mask.unsqueeze(1).unsqueeze(2) * mask.unsqueeze(1).unsqueeze(3)
 
 
 def temb(
@@ -190,7 +193,10 @@ class Attention(nn.Module):
         self.wo = nn.Linear(dim, dim, bias=bias)
 
     def forward(
-        self, qkv: Tensor, freqs: Tensor | None = None, mask: Tensor | None = None
+        self,
+        qkv: Tensor,
+        freqs: Tensor | None = None,
+        key_mask: Tensor | None = None,
     ) -> Tensor:
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
@@ -203,8 +209,9 @@ class Attention(nn.Module):
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
-        out = self.wo(attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
-        return out
+
+        attn = attention(q, k, v, gqa=self.gqa, key_mask=key_mask)
+        return self.wo(attn * F.sigmoid(gate))
 
 
 class LastLayer(nn.Module):
@@ -236,8 +243,8 @@ class TextFusionBlock(nn.Module):
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.prenorm(x), mask=mask)
+    def forward(self, x: Tensor, key_mask: Tensor | None = None) -> Tensor:
+        x = x + self.attn(self.prenorm(x), key_mask=key_mask)
         x = x + self.mlp(self.postnorm(x))
         return x
 
@@ -273,16 +280,16 @@ class TextFusionTransformer(nn.Module):
             ]
         )
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, key_mask: Tensor | None = None) -> Tensor:
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
-            x = block(x.contiguous(), mask=None)
+            x = block(x.contiguous())
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
         x = self.projector(x)
         x = x.squeeze(-1)
         for block in self.refiner_blocks:
-            x = block(x, mask=mask)
+            x = block(x, key_mask=key_mask)
         return x
 
 
@@ -303,11 +310,11 @@ class SingleStreamBlock(nn.Module):
         self.mlp = SwiGLU(features, multiplier, bias)
 
     def forward(
-        self, x: Tensor, vec: Tensor, freqs: Tensor, mask: Tensor | None = None
+        self, x: Tensor, vec: Tensor, freqs: Tensor, key_mask: Tensor | None = None
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask
+            (1 + prescale) * self.prenorm(x) + preshift, freqs, key_mask
         )
         x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
         return x
@@ -397,27 +404,22 @@ class K2Transformer2DModel(CachableDiT):
         t = self.tmlp(temb(t, self.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
-        txtmask = _mask(mask[:, : context.shape[1]])
+        # A single or same-prompt batch has no padding, so attention runs maskless
+        # (flash). A ragged batch carries an invalid-token mask -> mem-efficient.
+        txt_key = joint_key = None
+        if mask is not None and not bool(mask.all()):
+            txt_key = mask[:, : context.shape[1]]
+            joint_key = mask
 
-        context = self.txtfusion(context, mask=txtmask)
+        context = self.txtfusion(context, key_mask=txt_key)
         context = self.txtmlp(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
-
-        # Pad joint sequence to a multiple of `seq_multiple_of`.
-        fulllen = combined.shape[1]
-        _padlen = (-fulllen) % self.seq_multiple_of
-        if _padlen > 0:
-            combined = F.pad(combined, (0, 0, 0, _padlen))
-            mask = F.pad(mask, (0, _padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, _padlen))
-
-        mask = _mask(mask)
         freqs = self.posemb(pos)
 
         for block in self.blocks:
-            combined = block(combined, tvec, freqs, mask)
+            combined = block(combined, tvec, freqs, joint_key)
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]
