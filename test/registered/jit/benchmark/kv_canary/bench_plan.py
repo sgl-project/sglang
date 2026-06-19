@@ -31,6 +31,9 @@ register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 # previously gate on is_in_ci(); their axes below are now reduced via
 # get_benchmark_range so AMD PRs don't pay the full nightly sweep.
 register_amd_ci(est_time=120, suite="jit-kernel-unit-test-amd")
+# AMD nightly mirror of the CUDA nightly registration. Note: amd_ci_exec.sh sets
+# SGLANG_IS_IN_CI, so this still runs the CI-reduced range (same as CUDA nightly).
+register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _TOTAL_TOKENS_AXIS: list[int] = [256, 4096, 65536, 262144]
