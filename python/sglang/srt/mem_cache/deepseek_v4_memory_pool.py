@@ -39,7 +39,11 @@ def get_compress_state_ring_size(
             raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
-        return 16 if compress_ratio == 4 else 256
+        # c4 ring: speculative doubles from 8→16 (safe for EAGLE 2-token draft)
+        # c128 ring: keep at swa_page_size (128) — doubling to 256 wastes ~8 GB
+        # for only 2 draft tokens. 128 = minimum safe value (covers all positions
+        # within a page: state_loc = page * ring_size + loc % ring_size).
+        return 8 if compress_ratio == 4 else 128
     else:
         return 8 if compress_ratio == 4 else 128
 

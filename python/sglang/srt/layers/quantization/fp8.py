@@ -1377,6 +1377,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
+                # SM120 Triton: store E8M0 scales as uint8 (1 byte) for
+                # in-kernel exp2(x-127) decode.  Saves ~75% scale memory.
+                elif _is_cuda and is_sm120_supported():
+                    layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+                    layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+                    for scale_param in (
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                    ):
+                        # float32 → float8_e8m0fnu → uint8 (lossless, all E8M0
+                        # values are exact powers of 2)
+                        scale_param.data = (
+                            scale_param.data.to(torch.float8_e8m0fnu)
+                            .view(torch.uint8)
+                        )
+
             if (
                 not self.is_fp4_expert
                 and should_deepgemm_weight_requant_ue8m0(

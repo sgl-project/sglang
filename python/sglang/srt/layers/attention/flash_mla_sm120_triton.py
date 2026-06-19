@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import is_sm120_supported
+
 logger = logging.getLogger(__name__)
 
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -36,13 +38,25 @@ _D = _NOPE_DIM + _ROPE_DIM  # 512
 _TOKEN_DATA_STRIDE = 576  # bytes per token in data section
 _SCALE_STRIDE = 8  # bytes per token in scale section
 
+# Autotune configs: base 3 for all platforms, SM120-only extras.
+# Only configs that actually won autotune on SM120 hardware are included:
+#   - BLOCK_T=8,  W4, S2: winner for topk_rounded 1-16 (short sequences)
+#   - BLOCK_T=16, W4, S3: winner for topk_rounded 16 (mid-length)
+# Removed never-selected configs: (BLOCK_T=16,W8,S3), (BLOCK_T=32,W8,S3).
+_tiled_sparse_decode_configs = [
+    triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2),
+]
+if is_sm120_supported():
+    _tiled_sparse_decode_configs += [
+        triton.Config({"BLOCK_T": 8}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=3),
+    ]
+
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2),
-    ],
+    configs=_tiled_sparse_decode_configs,
     key=["topk_rounded"],
 )
 @triton.jit
