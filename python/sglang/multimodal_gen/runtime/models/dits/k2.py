@@ -17,8 +17,13 @@ from einops import rearrange
 from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.k2 import K2DitConfig
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -149,12 +154,20 @@ class SwiGLU(nn.Module):
         super().__init__()
         mlpdim = int(2 * features / 3) * multiplier
         mlpdim = multiple * ((mlpdim + multiple - 1) // multiple)
-        self.gate = nn.Linear(features, mlpdim, bias=bias)
-        self.up = nn.Linear(features, mlpdim, bias=bias)
-        self.down = nn.Linear(mlpdim, features, bias=bias)
+        # Tensor-parallel: gate/up shard the hidden dim by column, down all-reduces.
+        self.gate = ColumnParallelLinear(
+            features, mlpdim, bias=bias, gather_output=False
+        )
+        self.up = ColumnParallelLinear(features, mlpdim, bias=bias, gather_output=False)
+        self.down = RowParallelLinear(
+            mlpdim, features, bias=bias, input_is_parallel=True
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        gate, _ = self.gate(x)
+        up, _ = self.up(x)
+        out, _ = self.down(F.silu(gate) * up)
+        return out
 
 
 class Attention(nn.Module):
@@ -164,18 +177,33 @@ class Attention(nn.Module):
         self.kvheads = kvheads if kvheads is not None else heads
         self.headdim = dim // self.heads
 
-        self.wq = nn.Linear(dim, self.headdim * self.heads, bias=bias)
-        self.wk = nn.Linear(dim, self.headdim * self.kvheads, bias=bias)
-        self.wv = nn.Linear(dim, self.headdim * self.kvheads, bias=bias)
-        self.gate = nn.Linear(dim, dim, bias=bias)
+        # Tensor-parallel: q/k/v/gate shard heads by column, wo all-reduces.
+        # Separate (non-fused) parallel linears keep the reference param names, so
+        # the identity checkpoint mapping holds (each shards via its weight_loader).
+        tp = get_tp_world_size()
+        assert (
+            self.heads % tp == 0 and self.kvheads % tp == 0
+        ), f"heads={self.heads}, kvheads={self.kvheads} must be divisible by tp={tp}"
+        self.local_heads = self.heads // tp
+        self.local_kvheads = self.kvheads // tp
+
+        self.wq = ColumnParallelLinear(
+            dim, self.headdim * self.heads, bias=bias, gather_output=False
+        )
+        self.wk = ColumnParallelLinear(
+            dim, self.headdim * self.kvheads, bias=bias, gather_output=False
+        )
+        self.wv = ColumnParallelLinear(
+            dim, self.headdim * self.kvheads, bias=bias, gather_output=False
+        )
+        self.gate = ColumnParallelLinear(dim, dim, bias=bias, gather_output=False)
         self.qknorm = QKNorm(self.headdim)
-        self.wo = nn.Linear(dim, dim, bias=bias)
-        # Flash attention via the platform backend (native GQA, no kv expand).
-        # Parameterless, so the identity checkpoint mapping is unaffected.
+        self.wo = RowParallelLinear(dim, dim, bias=bias, input_is_parallel=True)
+        # Native GQA flash via the platform backend; parameterless.
         self.attn = USPAttention(
-            num_heads=self.heads,
+            num_heads=self.local_heads,
             head_size=self.headdim,
-            num_kv_heads=self.kvheads,
+            num_kv_heads=self.local_kvheads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -188,12 +216,15 @@ class Attention(nn.Module):
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
     ) -> Tensor:
-        q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+        q, _ = self.wq(qkv)
+        k, _ = self.wk(qkv)
+        v, _ = self.wv(qkv)
+        gate, _ = self.gate(qkv)
 
         q, k, v = (
-            rearrange(q, "B L (H D) -> B H L D", H=self.heads),
-            rearrange(k, "B L (H D) -> B H L D", H=self.kvheads),
-            rearrange(v, "B L (H D) -> B H L D", H=self.kvheads),
+            rearrange(q, "B L (H D) -> B H L D", H=self.local_heads),
+            rearrange(k, "B L (H D) -> B H L D", H=self.local_kvheads),
+            rearrange(v, "B L (H D) -> B H L D", H=self.local_kvheads),
         )
 
         q, k, v = self.qknorm(q, k, v)
@@ -209,7 +240,8 @@ class Attention(nn.Module):
             attn_mask=key_mask,
             attn_mask_meta=mask_meta,
         ).flatten(2)
-        return self.wo(out * F.sigmoid(gate))
+        out, _ = self.wo(out * F.sigmoid(gate))
+        return out
 
 
 class LastLayer(nn.Module):
