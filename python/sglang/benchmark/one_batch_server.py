@@ -531,6 +531,10 @@ def run_one_case(
         gsp_system_prompt_len=gsp_system_prompt_len,
         gsp_question_len=gsp_question_len,
         gsp_output_len=gsp_output_len,
+        # The generated-shared-prefix dataset's from_args requires these; the
+        # batch-bench path only ever uses the uniform group distribution.
+        gsp_group_distribution="uniform",
+        gsp_zipf_alpha=None,
     )
     tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
     dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
