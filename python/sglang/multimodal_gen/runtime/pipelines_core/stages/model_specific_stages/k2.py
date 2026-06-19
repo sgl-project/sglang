@@ -10,6 +10,9 @@ import torch
 from einops import rearrange
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_k2_flow import (
     K2FlowMatchScheduler,
 )
@@ -44,6 +47,17 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         self.processor = processor
         self.transformer = transformer
         self.scheduler = scheduler
+
+    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
+        # Declare the text encoder so the residency manager can CPU-offload it
+        # (with --text-encoder-cpu-offload) for the denoise loop, where it is idle.
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "text_encoder",
+                target_dtype=torch.bfloat16,
+            )
+        ]
 
     @torch.no_grad()
     def _encode(self, prompts, device, dtype):
@@ -90,14 +104,20 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         patch = arch.patch
         vsf = pipeline_config.get_vae_scale_factor()
 
-        # Text conditioning (positive + negative for CFG).
-        prompt_embeds, prompt_mask = self._encode(prompts, device, dtype)
+        # Text conditioning (positive + negative for CFG). The residency manager
+        # pages the encoder to GPU for this block only, then offloads it for the
+        # denoise loop (frees ~8GB) when --text-encoder-cpu-offload is set.
         neg_prompts = (
             batch.negative_prompt
             if isinstance(batch.negative_prompt, list)
             else [batch.negative_prompt or ""] * n
         )
-        neg_embeds, neg_mask = self._encode(neg_prompts, device, dtype)
+        with self.use_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        ) as text_encoder:
+            self.text_encoder = text_encoder
+            prompt_embeds, prompt_mask = self._encode(prompts, device, dtype)
+            neg_embeds, neg_mask = self._encode(neg_prompts, device, dtype)
 
         # Initial noise latents, packed to [B, S_img, channels*patch**2].
         seed = batch.seed if batch.seed is not None else 0

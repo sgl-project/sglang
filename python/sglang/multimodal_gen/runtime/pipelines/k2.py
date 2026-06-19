@@ -126,19 +126,25 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
-        device = get_local_torch_device()
         transformer = self._load_transformer(server_args)
 
         logger.info("Loading text encoder %s", TEXT_ENCODER_REPO)
         te_dtype = torch.bfloat16
+        # Loaded on CPU; the component residency manager moves it to the GPU only
+        # for text encoding and offloads it during the denoise loop (frees ~8GB)
+        # when --text-encoder-cpu-offload is set. Keeping it off the GPU at load
+        # also avoids co-residence with the DiT exceeding a 32GB card.
         text_encoder = (
             Qwen3VLForConditionalGeneration.from_pretrained(
                 TEXT_ENCODER_REPO, torch_dtype=te_dtype
             )
-            .to(device=device, dtype=te_dtype)
             .eval()
             .requires_grad_(False)
         )
+        # K2 is text-only: drop the unused vision tower to shrink the encoder and
+        # its CPU<->GPU page. (The LM head stays — the encoder forward needs it.)
+        if getattr(getattr(text_encoder, "model", None), "visual", None) is not None:
+            del text_encoder.model.visual
         tokenizer = AutoTokenizer.from_pretrained(
             TEXT_ENCODER_REPO, max_length=_TEXT_MAX_LENGTH
         )

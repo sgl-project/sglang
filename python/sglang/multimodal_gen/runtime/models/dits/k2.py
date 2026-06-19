@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -403,7 +406,7 @@ class SingleStreamBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 # Top-level model
 # --------------------------------------------------------------------------- #
-class K2Transformer2DModel(CachableDiT):
+class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """K2 single-stream MMDiT for the SGLang diffusion runtime.
 
     Attribute names follow the released K2 checkpoint, so weights load with an
@@ -471,6 +474,9 @@ class K2Transformer2DModel(CachableDiT):
             nn.GELU(approximate="tanh"), nn.Linear(ac.features, ac.features * 6)
         )
         self.seq_multiple_of = ac.seq_multiple_of
+        # The 28 single-stream blocks (the ~24GB bulk) are streamed layer-by-layer
+        # under --dit-layerwise-offload, keeping only a small working set resident.
+        self.layer_names = ["blocks"]
 
     def _forward_impl(
         self,
