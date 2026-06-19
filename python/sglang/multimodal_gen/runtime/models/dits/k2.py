@@ -8,6 +8,7 @@ names follow the released K2 checkpoint, so weights load without remapping.
 """
 
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -54,6 +55,34 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
     xk_ = freqs[..., 0] * xk_[..., 0] + freqs[..., 1] * xk_[..., 1]
     return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
+
+
+def _fused_qknorm_rope_enabled() -> bool:
+    return os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+def _can_use_fused_qknorm_rope(head_dim: int, dtype: torch.dtype) -> bool:
+    from sglang.jit_kernel.diffusion.qknorm_rope import (
+        can_use_fused_inplace_qknorm_rope,
+    )
+
+    return can_use_fused_inplace_qknorm_rope(head_dim, head_dim, False, dtype)
+
+
+def _qknorm_rope_cos_sin_cache(freqs: Tensor) -> Tensor:
+    """``[num_tokens, head_dim]`` cos|sin cache for the fused QKNorm+RoPE kernel.
+
+    K2's ``rope`` packs each token's rotation as ``[[cos, -sin], [sin, cos]]`` in a
+    ``[B, N, head_dim//2, 2, 2]`` tensor; the kernel wants the per-token cosines then
+    sines concatenated. Positions come from the image grid (batch-invariant), so the
+    first batch row is representative.
+    """
+    return torch.cat([freqs[0, :, :, 0, 0], freqs[0, :, :, 1, 0]], dim=-1).float()
 
 
 def temb(
@@ -250,25 +279,62 @@ class Attention(nn.Module):
         v, _ = self.wv(qkv)
         gate, _ = self.gate(qkv)
 
-        q, k, v = (
-            rearrange(q, "B L (H D) -> B H L D", H=self.local_heads),
-            rearrange(k, "B L (H D) -> B H L D", H=self.local_kvheads),
-            rearrange(v, "B L (H D) -> B H L D", H=self.local_kvheads),
-        )
+        hd = self.headdim
+        # Fast path: fuse RMSNorm(q), RMSNorm(k) and RoPE into one in-place kernel on
+        # the [B, S, H, D] layout USPAttention consumes (also skips the [B, H, L, D]
+        # transpose round-trip the eager path needs). Eager fallback below preserves
+        # parity off CUDA / for unsupported dtypes.
+        if (
+            freqs is not None
+            and q.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and _fused_qknorm_rope_enabled()
+            and _can_use_fused_qknorm_rope(hd, q.dtype)
+        ):
+            from sglang.jit_kernel.diffusion.qknorm_rope import (
+                fused_inplace_qknorm_rope,
+            )
 
-        q, k, v = self.qknorm(q, k, v)
-        if freqs is not None:
-            q, k = ropeapply(q, k, freqs)
-
-        # USPAttention expects [B, S, H, D]; a [B, S] key mask + varlen metadata
-        # routes a ragged batch through the FA varlen fast path, else maskless.
-        out = self.attn(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-            attn_mask=key_mask,
-            attn_mask_meta=mask_meta,
-        ).flatten(2)
+            b, s = qkv.shape[0], qkv.shape[1]
+            q = q.view(b, s, self.local_heads, hd)
+            k = k.view(b, s, self.local_kvheads, hd)
+            v = v.view(b, s, self.local_kvheads, hd)
+            positions = torch.arange(s, device=q.device, dtype=torch.long)
+            if b > 1:
+                positions = positions.repeat(b)
+            fused_inplace_qknorm_rope(
+                q.reshape(-1, self.local_heads, hd),
+                k.reshape(-1, self.local_kvheads, hd),
+                (self.qknorm.qnorm.scale.float() + 1.0).to(q.dtype),
+                (self.qknorm.knorm.scale.float() + 1.0).to(k.dtype),
+                _qknorm_rope_cos_sin_cache(freqs),
+                positions,
+                is_neox=False,
+                eps=self.qknorm.qnorm.eps,
+                head_dim=hd,
+                rope_dim=hd,
+            )
+            out = self.attn(
+                q, k, v, attn_mask=key_mask, attn_mask_meta=mask_meta
+            ).flatten(2)
+        else:
+            q, k, v = (
+                rearrange(q, "B L (H D) -> B H L D", H=self.local_heads),
+                rearrange(k, "B L (H D) -> B H L D", H=self.local_kvheads),
+                rearrange(v, "B L (H D) -> B H L D", H=self.local_kvheads),
+            )
+            q, k, v = self.qknorm(q, k, v)
+            if freqs is not None:
+                q, k = ropeapply(q, k, freqs)
+            # USPAttention expects [B, S, H, D]; a [B, S] key mask + varlen metadata
+            # routes a ragged batch through the FA varlen fast path, else maskless.
+            out = self.attn(
+                q.transpose(1, 2).contiguous(),
+                k.transpose(1, 2).contiguous(),
+                v.transpose(1, 2).contiguous(),
+                attn_mask=key_mask,
+                attn_mask_meta=mask_meta,
+            ).flatten(2)
         out, _ = self.wo(out * F.sigmoid(gate))
         return out
 
