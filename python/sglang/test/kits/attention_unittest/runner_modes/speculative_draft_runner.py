@@ -373,6 +373,14 @@ def _build_eagle_draft_fixture(
         settings.speculative_num_steps,
     ).create_decode_backend()
     fixture.runner.draft_attn_backend = draft_attn_backend
+    # Mirror ModelRunner.init_backends: bound static metadata buffers must
+    # exist before any forward path (eager OR cuda-graph capture) touches the
+    # backend, since use_bound was deprecated and _compute_forward_metadata is
+    # bound-only.
+    draft_attn_backend.init_static_metadata_buffers(
+        max_bs=settings.capture_batch_size,
+        max_num_tokens=settings.capture_batch_size * settings.speculative_num_steps,
+    )
     worker = _EagleDraftWorkerHarness(
         fixture=fixture,
         draft_attn_backend=draft_attn_backend,
