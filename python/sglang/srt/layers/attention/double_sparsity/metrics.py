@@ -13,7 +13,7 @@ Surfaces:
   introducing a production fallback.
 * ``sglang_double_sparsity_selected_tokens_sum`` — Counter accumulating the
   count of tokens selected across batches; pair with ``_count`` for the per-
-  batch average. (After the AC-0 token-level rotation; the older
+  batch average. (After the token-level rotation; the older
   ``selected_pages_*`` names were misleading because the unit is tokens.)
 * ``sglang_double_sparsity_selected_tokens_count`` — Counter incrementing
   once per (request, layer, step) selection call.
@@ -24,7 +24,7 @@ Per-request fields surfaced via :func:`meta_info_for_request`:
 
 * ``sparsity_rate``: float in ``[0, 1]``
 * ``selected_tokens``: int, count of selected tokens (was named
-  ``selected_pages`` pre-AC-0; renamed after the token-level rotation).
+  ``selected_pages`` earlier; renamed after the token-level rotation).
 * ``dense_fallback``: ``0`` healthy, ``1`` on fault-injected fallback
 """
 

@@ -1,10 +1,10 @@
 """Unit tests for standalone Double Sparsity (placeholder scaffolding).
 
-Covers the round-0 backbone: config parsing surface (AC-11 absence of
-``selection_mode`` / ``top_p``), selector ABI shape (AC-2), validator
+Covers the runtime backbone: config parsing surface (absence of
+``selection_mode`` / ``top_p``), selector ABI shape, validator
 fail-fast behaviour for missing-config and HiSparse mutual-exclusion
-(AC-1 + DEC-8), and the ``_select_topk_indices`` config-gated branch on
-``DeepseekV2AttentionMLA`` (AC-2 hook).
+(), and the ``_select_topk_indices`` config-gated branch on
+``DeepseekV2AttentionMLA`` (hook).
 
 Real selection kernels, FP8 page-signature projection, CUDA-graph
 capture, NIAH / MMLU quality runs, and the upstream-shaped ship-gate are
@@ -333,8 +333,7 @@ class TestValidator(unittest.TestCase):
         )
 
     def test_marks_channel_mask_valid_on_success(self):
-        """Round-13 fix [P2]: a healthy validator pass must set the AC-10
-        ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.
+        """a healthy validator pass must set the ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.
         """
 
         try:
@@ -454,7 +453,7 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
 
     def test_ds_branch_contains_placeholder_failure_per_row(self):
         """Non-row DS failures (e.g. selector RuntimeError from the
-        placeholder guard) are now contained per AC-9: instead of
+        placeholder guard) are now contained per instead of
         raising and crashing the batch, the DS branch publishes a
         per-row failure record to forward_batch.ds_per_request_summary
         and returns an all-(-1) topk_indices tensor. The scheduler then
@@ -485,7 +484,7 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         self.assertEqual(summary[0]["dense_fallback"], 1)
 
     def test_ds_branch_sanitizes_bad_pool_row_and_records_error(self):
-        """AC-2 + AC-9 live path: a bad req_pool_index (out of range for
+        """live path: a bad req_pool_index (out of range for
         req_to_token) causes that row's physical slots to be all -1 via
         the adapter's error-containment path. The DS branch returns normally
         and publishes a per-request summary record.
@@ -755,7 +754,7 @@ class TestChannelMaskLoader(unittest.TestCase):
             load_channel_mask("/nonexistent/path.safetensors")
 
     def test_load_rejects_out_of_range_channel_indices(self):
-        """Round-9 fix [P2]: a content-hash-valid file whose
+        """a content-hash-valid file whose
         channel_selection has values >= head_dim must be rejected at load.
         """
 
@@ -833,7 +832,7 @@ class TestChannelMaskLoader(unittest.TestCase):
 
 
 class TestChannelMaskSlicePerRank(unittest.TestCase):
-    """Round-2 fix [P2]: TP head sharding helper."""
+    """TP head sharding helper."""
 
     def test_slice_per_rank_returns_local_block(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
@@ -1178,7 +1177,7 @@ class TestDSIndexerCacheGate(unittest.TestCase):
 
 
 class TestDoubleSparsityErrorTaxonomy(unittest.TestCase):
-    """AC-3 anchor (observability): error counter + structured logs.
+    """anchor (observability): error counter + structured logs.
 
     The Prometheus counter is registered at module-import time when
     prometheus_client is available; the registration is best-effort
@@ -1219,7 +1218,7 @@ class TestDoubleSparsityErrorTaxonomy(unittest.TestCase):
 
 
 class TestDoubleSparsityRequestSummary(unittest.TestCase):
-    """AC-3 anchor: meta_info[\"double_sparsity\"] is a per-request summary
+    """anchor: meta_info[\"double_sparsity\"] is a per-request summary
     dict (not a list of per-token dicts) for any N > 1 generated tokens.
     """
 
@@ -1244,7 +1243,7 @@ class TestDoubleSparsityRequestSummary(unittest.TestCase):
         self.assertIn(
             "per_request_summary",
             fields,
-            "BatchTokenIDOutput must carry per_request_summary for AC-3.",
+            "BatchTokenIDOutput must carry per_request_summary for .",
         )
         # Each entry in the list is a per-request dict (not a list-of-dicts):
         for entry in per_request_summary["double_sparsity"]:
@@ -1366,7 +1365,7 @@ class TestMlaNopeExtractionDualShape(unittest.TestCase):
 
 
 class TestCalibrateCorpusEmpty(unittest.TestCase):
-    """Round-7 fix [P3]: empty corpus must raise a clear ValueError."""
+    """empty corpus must raise a clear ValueError."""
 
     def test_empty_file_raises_value_error(self):
         from sglang.srt.layers.attention.double_sparsity.calibrate import (
@@ -1385,7 +1384,7 @@ class TestCalibrateCorpusEmpty(unittest.TestCase):
 
 
 class TestCalibrateHooksFireRequirement(unittest.TestCase):
-    """Round-9 fix [P2]: real-path calibration must raise when one or more
+    """real-path calibration must raise when one or more
     layers' K-projection hooks never fire — otherwise zero-importance rows
     silently land in the channel mask.
     """
@@ -1443,7 +1442,7 @@ class TestCalibrateHooksFireRequirement(unittest.TestCase):
 
 
 class TestCalibrateMethod1(unittest.TestCase):
-    """AC-4: Method 1 Q+K joint importance in _collect_channel_importance.
+    """Method 1 Q+K joint importance in _collect_channel_importance.
 
     Verifies that the calibrator computes mean(abs(Q_nope * K_nope)) rather
     than K-only L2, falls back gracefully when Q is absent, and that

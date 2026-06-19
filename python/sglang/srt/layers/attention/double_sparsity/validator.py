@@ -6,7 +6,7 @@ inside the Double Sparsity package per the upstream-shaped path budget
 
 Enforces, at server startup:
 
-* mutual-exclusion with ``--enable-hisparse`` (DEC-8),
+* mutual-exclusion with ``--enable-hisparse``,
 * rejection of ``--disaggregation-mode`` (HiSparse owns the PD path),
 * presence of ``--double-sparsity-config`` JSON with at least
   ``channel_mask_path``,
@@ -14,7 +14,7 @@ Enforces, at server startup:
 * backend / KV-dtype pairing: ``fp8_e4m3 ↔ flashmla_kv``,
   ``bfloat16 ↔ flashmla_sparse``,
 * unsupported page-size rejection (page must be in ``{32, 64, 128}``),
-* capability check (DEC-10): the running model must expose the ``nsa.Indexer``
+* capability check: the running model must expose the ``nsa.Indexer``
   hook surface — proxied via :func:`is_deepseek_dsa` so GLM-5.1 falls in for
   free once it ships the same indexer interface,
 * channel-mask file existence + content-hash verification (delegates to
@@ -128,7 +128,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             # The lifted-budget graph scratch (DSGraphState.lifted_compact_kv etc.)
             # is sized by max_bs, but speculative target-verify expands the decode
             # rows to bs * num_draft_tokens, which would undersize/overflow the
-            # scratch. The Loop-7 lifted op-point is non-speculative; fail closed
+            # scratch. The lifted op-point is non-speculative; fail closed
             # rather than risk a wrong-output / OOB scratch slice.
             raise ValueError(
                 "Double Sparsity enable_lifted_budget_decode is not supported with "
@@ -138,9 +138,9 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                 "decode rows. Disable one of the two."
             )
 
-    # Production-path selector-variant safety (future-proof guard). As of R9 ALL
-    # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) [R6] and
-    # anchor_mode (recency/global/strided) [R9] — are graph-safe, so
+    # Production-path selector-variant safety (future-proof guard). All
+    # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) and
+    # anchor_mode (recency/global/strided) — are graph-safe, so
     # ds_scorer_is_graph_safe() is True and this guard does not fire. It remains as
     # the single startup gate so any future non-graph-safe variant can re-enable it.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (

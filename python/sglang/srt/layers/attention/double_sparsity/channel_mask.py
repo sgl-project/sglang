@@ -29,8 +29,7 @@ Schema (``safetensors``):
 
 The validator drops two fields the earlier draft carried: ``model_revision_sha``
 (passed for LoRA fine-tunes that miscalibrate) and ``tp_world_size``
-(derivable from runtime; embedding it invited the rank-divergence bug DEC-9
-settles).
+(derivable from runtime; embedding it invited the rank-divergence bug settles).
 """
 
 from __future__ import annotations

@@ -12,17 +12,17 @@ blocks of 512 tokens each. ``--dataset`` overrides with a path to an external
 newline-delimited corpus. ``--allow-synthetic`` enables a small NIAH-shaped
 synthetic fallback reserved for CI and developer smoke tests only.
 
-Production recipe (GLM-5.1-FP8 on H200 cluster, FP8 serving) — the loop8 DEC-3
-recipe that produced the committed mask (see
-``development/loop11b/run_calibrate.sh`` + the calibration provenance):
+Production recipe (GLM-5.1-FP8 on H200 cluster, FP8 serving) — the validated
+recipe that produces the channel mask (see benchmarks/DOUBLE_SPARSITY.md for the
+mask + corpus provenance):
 
     python -m sglang.srt.layers.attention.double_sparsity.calibrate \\
-        --model /cluster-storage/models/.../GLM-5.1-FP8 \\
+        --model /path/to/GLM-5.1-FP8 \\
         --dtype fp8_e4m3 --kv-cache-dtype fp8_e4m3 --tp 8 \\
-        --output /cluster-storage/models/glm51-fp8-channel-mask-s256.safetensors \\
+        --output /path/to/glm51-fp8-channel-mask.safetensors \\
         --label-dim 32 --page-size 64 --num-samples 256 --block-size 512 \\
         --seed 42 \\
-        --dataset development/loop11b/artifacts/calib_corpus_pileval.txt -v
+        --dataset /path/to/calibration-corpus.txt -v
 
 (``--label-dim 32`` is GLM-proportionate — it covers GLM's wider
 ``qk_nope_head_dim``; the earlier DeepSeek-V3.2 mask used ``--dtype bfloat16

@@ -2077,7 +2077,7 @@ class DeepseekV2AttentionMLA(
             tp_size=max(attn_tp_size, 1),
         )
 
-        # AC-12 sensitivity gate: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1
+        # sensitivity gate: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1
         # replaces the calibrated channel selection with a deterministically
         # random one drawn uniformly from [0, head_dim). Used to verify the
         # NIAH @ 64K negative sensitivity assertion (recall must drop > 20 pp).
@@ -2238,7 +2238,7 @@ class DeepseekV2AttentionMLA(
                 selector_id=f"layer{layer_id}",
             )
 
-        # After the AC-0 token-level rotation the selector emits TOKEN
+        # After the token-level rotation the selector emits TOKEN
         # positions, not pages — so the sparsity denominator is the
         # sequence length in tokens, not (seq_len + page_size - 1) // page_size.
         records: List[Optional[Dict[str, Any]]] = []
@@ -2377,7 +2377,7 @@ class DeepseekV2AttentionMLA(
                 # in-place topk pipeline). The captured graph stays 0-alloc
                 # after warmup.
                 #
-                # Source-of-truth resolution mirrors the AC-7 MHA bypass above:
+                # Source-of-truth resolution mirrors the MHA bypass above:
                 #   (1) `forward_batch.ds_graph_state` — set by
                 #       `dsa_backend.init_forward_metadata` for dynamic
                 #       non-graph forwards. Production ForwardBatch has no
@@ -2624,7 +2624,7 @@ class DeepseekV2AttentionMLA(
                     _ds_graph_state.capture_lengths[layer_id, :_cap_bs].copy_(
                         valid_lengths
                     )
-                # AC-8: prefer the NSA-metadata-owned buffer, allocated
+                # prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for
                 # capture/replay). Resolve from the same real production
                 # objects used for `ds_graph_state` above:
@@ -2697,7 +2697,7 @@ class DeepseekV2AttentionMLA(
                 # mask corruption / TP misconfig — anything raised before
                 # row tensors exist). Convert to per-row failure records
                 # so the scheduler aborts each affected request via the
-                # standard AC-9 abort path rather than crashing the batch.
+                # standard abort path rather than crashing the batch.
                 error_cls = error_state.get("ds_error_cls", "selector_runtime_error")
                 error_message = error_state.get("ds_error_message", "")
                 bs = int(forward_batch.batch_size) if hasattr(

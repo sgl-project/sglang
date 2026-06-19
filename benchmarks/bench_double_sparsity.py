@@ -37,18 +37,24 @@ import tempfile
 
 import numpy as np
 
-# Loop-11b validated conc-64 reference (regression gate, NOT a 30-TPS SLO).
+# Validated conc-64 reference (regression gate, NOT a 30-TPS SLO).
 REF_DECODE_TPS = 26.9
 REF_P99_TTFT_S = 25.1
 # Parity band: decode TPS >= -10% of reference AND P99 TTFT <= +20% of reference.
 DECODE_TPS_FLOOR = 0.90 * REF_DECODE_TPS  # ~24.2
 P99_TTFT_CEIL_S = 1.20 * REF_P99_TTFT_S  # ~30.1
 
-# Fixed conc-64 workload (mirrors the loop-11b candidate exactly).
+# Fixed conc-64 workload. The validated candidate ran a SINGLE shared-prefix
+# group whose prompts-per-group equals the prompt count, so every request shares
+# the one system prompt (the prefix-reuse the workload is built to exercise). The
+# stock generated-shared-prefix dataset otherwise defaults to 64 groups x 16
+# prompts and ignores --num-prompts, which is a different request shape — so the
+# group count and prompts-per-group are pinned explicitly below.
 GSP_SYSTEM_PROMPT_LEN = 2253
-GSP_QUESTION_LEN = 1843  # ISL ~4096, ~55% shared prefix
+GSP_QUESTION_LEN = 1843  # ISL ~4096, system prompt is ~55% of each input
 GSP_OUTPUT_LEN = 512
 GSP_RANGE_RATIO = 1.0
+GSP_NUM_GROUPS = 1
 MAX_CONCURRENCY = 64
 
 
@@ -75,6 +81,10 @@ def build_bench_cmd(args, output_file: str) -> list[str]:
         str(GSP_OUTPUT_LEN),
         "--gsp-range-ratio",
         str(GSP_RANGE_RATIO),
+        "--gsp-num-groups",
+        str(GSP_NUM_GROUPS),
+        "--gsp-prompts-per-group",
+        str(args.num_prompts),
         "--max-concurrency",
         str(MAX_CONCURRENCY),
         "--num-prompts",
@@ -145,6 +155,15 @@ def main() -> int:
     else:
         p99_ttft_s = float(np.percentile(result["ttfts"], 99))
 
+    # Guard the request shape: the single shared-prefix group must have produced
+    # exactly num_prompts requests. A mismatch means the dataset grouping drifted
+    # (e.g. the stock 64x16 default), so the numbers would not reflect the conc-64
+    # workload — fail closed rather than report a result on the wrong shape.
+    actual_completed = result.get("completed")
+    if actual_completed is None:
+        actual_completed = len(result["output_lens"])
+    shape_ok = actual_completed == args.num_prompts
+
     tps_ok = decode_tps >= DECODE_TPS_FLOOR
     ttft_ok = p99_ttft_s <= P99_TTFT_CEIL_S
     verdict = {
@@ -156,7 +175,12 @@ def main() -> int:
         "reference_p99_ttft_s": REF_P99_TTFT_S,
         "tps_within_band": tps_ok,
         "ttft_within_band": ttft_ok,
-        "parity": tps_ok and ttft_ok,
+        "gsp_num_groups": GSP_NUM_GROUPS,
+        "gsp_prompts_per_group": args.num_prompts,
+        "expected_prompts": args.num_prompts,
+        "actual_completed": actual_completed,
+        "request_shape_ok": shape_ok,
+        "parity": tps_ok and ttft_ok and shape_ok,
         "num_prompts": args.num_prompts,
         "seed": args.seed,
         "bench_json": output_file,
@@ -170,10 +194,20 @@ def main() -> int:
         with open(os.path.join(args.evidence_dir, "bench_result.json"), "w") as f:
             json.dump(result, f)
 
+    if not shape_ok:
+        print(
+            f"FAIL (wrong workload shape): completed {actual_completed} requests, "
+            f"expected {args.num_prompts} (1 shared-prefix group). The result does "
+            f"not reflect the conc-64 workload.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     if verdict["parity"]:
         print(
-            f"PASS: p50 decode TPS {decode_tps:.2f} >= {DECODE_TPS_FLOOR:.1f} "
-            f"and P99 TTFT {p99_ttft_s:.2f}s <= {P99_TTFT_CEIL_S:.1f}s",
+            f"PASS: {actual_completed} reqs (1 group); p50 decode TPS "
+            f"{decode_tps:.2f} >= {DECODE_TPS_FLOOR:.1f} and P99 TTFT "
+            f"{p99_ttft_s:.2f}s <= {P99_TTFT_CEIL_S:.1f}s",
             flush=True,
         )
         return 0

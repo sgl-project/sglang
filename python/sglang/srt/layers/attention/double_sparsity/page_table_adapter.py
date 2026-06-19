@@ -16,7 +16,7 @@ with ``-1`` preserved for padding slots.
 
 Error tracking: the adapter returns a scalar ``error_count`` alongside
 ``physical_slots``.  Callers pass this count to the error-containment
-counter used by the AC-8 ``error_containment`` check.  Errors occur only
+counter used by the ``error_containment`` check.  Errors occur only
 when ``req_pool_indices`` values are out of range for ``req_to_token``.
 """
 

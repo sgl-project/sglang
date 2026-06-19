@@ -1,4 +1,4 @@
-"""AC-7: Double Sparsity per-request abort path.
+"""Double Sparsity per-request abort path.
 
 When the DS adapter sanitizes a row it stamps an ``error_class`` into the
 request's ``meta_info["double_sparsity"]`` summary. The scheduler's

@@ -521,7 +521,7 @@ def _force_include_anchor(
     Fully tensorized (no per-row Python loop, no ``.item()`` host sync, fixed
     shapes), so it is graph-safe and is used by BOTH the eager logical path and
     the graph-safe Triton path — guaranteeing identical selection. Bit-identical
-    to the former per-row reference (fuzz-verified) including the R3 over-budget
+    to the former per-row reference (fuzz-verified) including the over-budget
     clamp (``effective_budget = min(anchor_budget, valid_count, seq_len)``) and
     strided set-dedup.
     """
@@ -902,7 +902,7 @@ def retrieve_topk_graph_safe(
         and anchor_mode == "off"
     )
     topk_scores = scores_view
-    # DEC-9 scorepath exp-1: snapshot the PRE-reduce per-rank score (scores_view
+    # scorepath exp-1: snapshot the PRE-reduce per-rank score (scores_view
     # straight off the absorbed paged kernel, before the cross-TP all-reduce).
     # The reduce mutates scores_view in place (copy_back) or returns a separate
     # bf16 view, so the pre-reduce values must be cloned NOW. Eager-only,
@@ -1010,7 +1010,7 @@ def retrieve_topk_graph_safe(
         out_lengths[:bs].copy_(valid_i64_view.squeeze(-1))
     torch.cuda.nvtx.range_pop()
 
-    # Graph-safe anchor-budget force-include (R9): tensorized, fixed-shape, no
+    # Graph-safe anchor-budget force-include: tensorized, fixed-shape, no
     # host sync — bit-identical to the eager path (same _force_include_anchor).
     # Off by default; under CUDA-graph capture the extra ops are captured once and
     # replay reuses their memory (alloc-free on replay).
@@ -1022,7 +1022,7 @@ def retrieve_topk_graph_safe(
         out_indices[:bs, :max_top_k].copy_(a_idx)
         out_lengths[:bs].copy_(a_len)
 
-    # Flag-gated SCORE capture (DEC-9 Q2 instrument): dump the absorbed score row
+    # Flag-gated SCORE capture (instrument instrument): dump the absorbed score row
     # the top-k just consumed. ``topk_scores`` is the AUTHORITATIVE input to the
     # selection top-k — the bf16 reduced view when bf16 is authoritative, else the
     # fp32 ``scores_view``; the dump upcasts to fp32 (bf16->fp32 is exact). Column
