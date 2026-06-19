@@ -1,15 +1,26 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.triton_ops.cache_locs import assign_req_to_token_pool_func
+from sglang.srt.utils.async_probe import maybe_detect_oob
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +103,7 @@ class EagleVerifyInput(SpecInput):
         )
 
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+    def prepare_for_verify(self, batch: "ScheduleBatch", page_size: int):
 
         if batch.forward_mode.is_idle():
             return

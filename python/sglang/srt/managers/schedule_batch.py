@@ -2255,14 +2255,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _alloc_mamba_track_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot for tracking, evicting tree nodes if needed."""
-        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if (
             slot is None
             and self.tree_cache is not None
             and self.tree_cache.supports_mamba()
         ):
             self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         assert slot is not None, (
             "Cannot allocate mamba tracking slot even after eviction. "
             "Try increasing --mamba-full-memory-ratio or --max-mamba-cache-size."
