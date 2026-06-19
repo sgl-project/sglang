@@ -58,30 +58,26 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        kwargs = {
+        return {
             "prior_token_id": batch.prior_token_id,
             "prior_token_drop": batch.prior_token_drop_cond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
+            "kv_caches": batch.kv_caches,
+            "kv_caches_mode": "read",
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        if getattr(batch, "prior_token_image_ids", None) is not None:
-            kwargs["kv_caches"] = batch.kv_caches
-            kwargs["kv_caches_mode"] = "read"
-        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        kwargs = {
+        return {
             "prior_token_id": batch.prior_token_id,
             "prior_token_drop": batch.prior_token_drop_uncond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
+            "kv_caches": batch.kv_caches,
+            "kv_caches_mode": "skip",
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        if getattr(batch, "prior_token_image_ids", None) is not None:
-            kwargs["kv_caches"] = batch.kv_caches
-            kwargs["kv_caches_mode"] = "skip"
-        return kwargs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
