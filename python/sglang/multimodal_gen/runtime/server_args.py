@@ -129,12 +129,14 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "glm-image",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
         "qwen-image-2512",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
+        "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
     }
@@ -142,6 +144,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "GlmImagePipelineConfig",
         "QwenImagePipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -518,8 +521,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image, "
-            "Qwen/Qwen-Image-2512, and Tongyi-MAI/Z-Image/Z-Image-Turbo "
-            "are currently supported.",
+            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
+            "and zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
