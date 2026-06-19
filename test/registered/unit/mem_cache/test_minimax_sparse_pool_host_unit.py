@@ -316,9 +316,18 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             page_size,
             device="cuda" if io_backend == "kernel" else "cpu",
         )
+        # page_first kernel routes the main-KV backup through the staged
+        # write-back kernel (staged_write_back.cuh), whose verifier requires
+        # dst_indices on CPU/CUDAHost; the index-k backup (hicache.cuh)
+        # requires CUDA indices. Feed a CPU copy to the main-KV call only.
+        kv_host_indices = (
+            host_indices.cpu()
+            if (io_backend, layout) == ("kernel", "page_first")
+            else host_indices
+        )
 
         kv_host.backup_from_device_all_layer(
-            device_pool.main_pool, host_indices, device_indices, io_backend
+            device_pool.main_pool, kv_host_indices, device_indices, io_backend
         )
         index_host.backup_from_device_all_layer(
             device_pool.index_k_pool, host_indices, device_indices, io_backend
