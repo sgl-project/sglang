@@ -168,3 +168,38 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     if FP4_GEMM_RUNNER_BACKEND is None:
         FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.AUTO
     return FP4_GEMM_RUNNER_BACKEND
+
+
+# NVFP4 activation-quantization algorithm: "absmax" (default flashinfer path)
+# or "scalesweep" (ScaleSweep MSE, see sgl-project/sglang#27246).
+FP4_QUANT_ALGO: str = "absmax"
+
+
+def initialize_fp4_quant_config(server_args: ServerArgs) -> None:
+    """Initialize the NVFP4 activation-quant algorithm from server args."""
+    global FP4_QUANT_ALGO
+    FP4_QUANT_ALGO = server_args.fp4_quant_algo
+
+
+def get_fp4_quant_algo() -> str:
+    """Get the selected NVFP4 activation-quant algorithm."""
+    return FP4_QUANT_ALGO
+
+
+def fp4_quantize_activation(
+    input: torch.Tensor, input_scale_inv: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations to NVFP4, dispatching on the selected algorithm.
+
+    Returns ``(packed uint8 FP4, swizzled FP8-E4M3 block scales)`` matching the
+    flashinfer ``fp4_quantize`` output, so it is drop-in for the FP4 GEMM.
+    """
+    if get_fp4_quant_algo() == "scalesweep":
+        from sglang.srt.layers.quantization.scalesweep_nvfp4 import (
+            scaled_fp4_quant as _scalesweep_fp4_quant,
+        )
+
+        return _scalesweep_fp4_quant(
+            input, input_scale_inv, is_sf_swizzled_layout=True
+        )
+    return fp4_quantize(input, input_scale_inv)
