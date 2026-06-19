@@ -527,7 +527,6 @@ def _run_mega_routed(
         can_fuse_waterfill_predispatch = (
             fuse_env
             and not use_fp4_acts
-            and not timing_call
             and topk_stats_interval <= 0
             and waterfill_enabled
             and has_waterfill_balancer
