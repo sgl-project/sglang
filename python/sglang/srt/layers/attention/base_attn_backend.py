@@ -102,8 +102,11 @@ class AttentionBackend(ABC):
         + eager fallback at non-captured bs). Sized once at ``(max_bs,
         max_num_tokens)`` and sliced per static shape by
         ``init_forward_metadata_out_graph``.
+
+        Defaults to a no-op so backends that never bind static buffers (CPU /
+        XPU eager-only paths) inherit the right behavior. Backends that DO
+        need static buffers (every cuda-graph-capable backend) override.
         """
-        raise NotImplementedError()
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,

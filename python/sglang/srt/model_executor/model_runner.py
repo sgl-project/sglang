@@ -908,6 +908,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch.
         self.eager_runner = EagerRunner(self)
 
+        # Allocate the attention backend's static metadata buffers at the union
+        # max sized by EagerRunner (max_running_requests-aligned, ≥ any captured
+        # cg bucket). Both eager (graph-disabled mode AND eager fallback at
+        # non-captured bs) and the cuda-graph runners then share the same
+        # backend buffers — backends bind into them, and load_metadata refills
+        # per-iter. This is the foundation for collapsing the `use_bound` seam.
+        self._init_static_metadata_buffers_from_eager()
+
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
@@ -934,6 +942,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _init_static_metadata_buffers_from_eager(self) -> None:
+        """Allocate the attention backend's static metadata buffers at the
+        union-max batch size, so both the eager path and the cuda-graph
+        runners' captured buckets share one bound buffer set.
+
+        Sized at ``(max_bs, max_bs * num_tokens_per_bs)`` where ``max_bs`` is
+        ``max(eager_max_bs, max(capture_bs))``. The capture path applies its
+        own alignment (2BO doubles ``mul_base``, ``require_gathered_buffer``
+        multiplies by ``attn_tp_size``, ``attn_cp_size`` adds another factor)
+        which can pad the maximum decode bucket above the EagerRunner's
+        ``max_running_requests + MLP-sync`` alignment — backends that bind
+        per-bs buffers must cover that padded shape too.
+
+        Per-batch token dimension stays at decode shape: static metadata
+        buffers serve decode-shape replays (cuda-graph buckets + eager
+        fallback at non-captured bs); prefill paths allocate per-iter
+        buffers and don't index into this pool, so widening
+        ``max_num_tokens`` to the prefill ceiling would bloat decode-only
+        buffers like ``cuda_graph_kv_indices`` (≈ ``max_num_tokens *
+        max_context_len`` for FlashInfer) with no consumer on the prefill
+        side.
+
+        Also initializes each ``decode_attn_backend_group[i]`` for pdmux (its
+        backends are separate instances from ``attn_backend``).
+        """
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        eager_max_bs = self.eager_runner._eager_max_bs
+        num_tokens_per_bs = self.eager_runner._eager_num_tokens_per_bs
+        # Match decode-graph capture's bucket alignment: 2BO / gathered_buffer
+        # / attn_cp_size can pad max(capture_bs) above eager's alignment.
+        try:
+            capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+            capture_max_bs = max(capture_bs) if capture_bs else 0
+        except Exception:
+            capture_max_bs = 0
+        max_bs = max(eager_max_bs, capture_max_bs)
+        decode_max_num_tokens = max_bs * num_tokens_per_bs
+        self.attn_backend.init_static_metadata_buffers(max_bs, decode_max_num_tokens)
+        for ab in self.decode_attn_backend_group:
+            if ab is not self.attn_backend:
+                ab.init_static_metadata_buffers(max_bs, decode_max_num_tokens)
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:

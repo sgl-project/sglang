@@ -338,6 +338,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
+        # ModelRunner.init_backends already called
+        # _init_static_metadata_buffers_from_eager on the draft worker's
+        # ORIGINAL attn_backend; the two freshly-built backends here bypass
+        # that. Initialize them with the same sizing so per-bs static buffers
+        # (cuda_graph_kv_indices, draft_extend_num_tokens_per_bs, etc.) exist
+        # before init_cuda_graphs / first forward.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        eager_runner = self.draft_runner.eager_runner
+        eager_max_bs = eager_runner._eager_max_bs
+        num_tokens_per_bs = eager_runner._eager_num_tokens_per_bs
+        try:
+            capture_bs, _ = get_batch_sizes_to_capture(
+                self.draft_runner, num_tokens_per_bs
+            )
+            capture_max_bs = max(capture_bs) if capture_bs else 0
+        except Exception:
+            capture_max_bs = 0
+        max_bs = max(eager_max_bs, capture_max_bs)
+        max_num_tokens = max_bs * num_tokens_per_bs
+        self.draft_attn_backend.init_static_metadata_buffers(max_bs, max_num_tokens)
+        if self.draft_extend_attn_backend is not None:
+            self.draft_extend_attn_backend.init_static_metadata_buffers(
+                max_bs, max_num_tokens
+            )
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
