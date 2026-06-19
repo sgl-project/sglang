@@ -17,7 +17,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -487,9 +486,7 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(
-    server_args: ServerArgs, model_config: Optional[ModelConfig] = None
-) -> None:
+def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
@@ -500,10 +497,9 @@ def initialize_fp8_gemm_config(
 
     backend = Fp8GemmRunnerBackend(backend)
 
-    is_mxfp8 = model_config is not None and model_config.quantization == "mxfp8"
     if (
         backend.is_auto()
-        and is_mxfp8
+        and server_args.quantization == "mxfp8"
         and _is_sm100_supported
         and is_flashinfer_available()
     ):
