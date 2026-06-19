@@ -371,7 +371,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
-    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
+    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
         """Eager/replay seam, resolved by backend STATE (no argument).
 
         Returns True when this ``(bs, forward_mode)`` has a pre-bound
@@ -556,15 +556,13 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
-        # Single eager == replay == capture metadata path; `use_bound` selects
-        # the pre-bound cuda-graph wrapper vs the persistent eager wrapper.
-        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
-        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
+        # Single eager == replay == capture metadata path. The seam between
+        # the captured per-bs cuda-graph wrapper and the persistent eager
+        # wrapper is internal to _compute_forward_metadata.
+        self._compute_forward_metadata(forward_batch, in_capture=in_capture)
 
         # in_capture-only tail: fast_decode_plan install + binding the freshly
-        # refilled SWA buffer slice onto the just-created capture metadata. These
-        # depend on in_capture (not use_bound) so they stay out of the converged
-        # body, which is merged into a shared helper in a follow-up commit.
+        # refilled SWA buffer slice onto the just-created capture metadata.
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
@@ -582,18 +580,18 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
     def _compute_forward_metadata(
-        self, forward_batch: ForwardBatch, *, use_bound: bool
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
     ):
         """Single source of truth for FlashInfer forward metadata, shared by
         eager, capture, and replay.
 
-        ``use_bound`` selects the wrapper the metadata is planned into: the
-        per-bs pre-bound cuda-graph wrapper (capture / replay / eager-at-
-        captured-bs) vs the persistent eager wrapper. Plain EXTEND (and eager
-        DLLM_EXTEND) only ever run with use_bound=False (the decode graph never
-        captures plain EXTEND). The in_capture-only side effects (pre-roll,
-        fast_decode_plan install, capture SWA binding) live in
-        init_forward_metadata_out_graph around this call.
+        Internally selects between the per-bs pre-bound cuda-graph wrapper
+        (capture / replay / eager-at-captured-bs) and the persistent eager
+        wrapper. Plain EXTEND (and eager DLLM_EXTEND) only ever run through
+        the eager wrapper (the decode graph never captures plain EXTEND). The
+        ``in_capture``-only side effects (pre-roll, fast_decode_plan install,
+        capture SWA binding) live in ``init_forward_metadata_out_graph``
+        around this call.
         """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -604,11 +602,15 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        # Internalize the captured-bucket seam — every caller goes through
+        # this method; the public API does not expose it.
+        _has_captured = in_capture or self._has_captured_metadata(bs, forward_mode)
+
         # Eager-only SWA write-target translation (the bound path refills the
         # captured cuda_graph_swa_out_cache_loc buffer in the tail below).
         swa_out_cache_loc = None
         if (
-            not use_bound
+            not _has_captured
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
         ):
@@ -618,7 +620,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         if forward_mode.is_decode_or_idle():
-            if use_bound:
+            if _has_captured:
                 self.indices_updater_decode.update(
                     req_pool_indices[:bs],
                     seq_lens[:bs],
@@ -648,7 +650,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
                 )
         elif forward_mode.is_target_verify():
-            if use_bound:
+            if _has_captured:
                 self.indices_updater_prefill.update(
                     req_pool_indices[:bs],
                     seq_lens[:bs],
@@ -680,7 +682,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     False,
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
-        elif forward_mode.is_dllm_extend() and use_bound:
+        elif forward_mode.is_dllm_extend() and _has_captured:
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -695,7 +697,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             # Plain EXTEND (and eager DLLM_EXTEND) -- eager only; the decode
             # graph never captures plain EXTEND, and eager DLLM_EXTEND lands here
-            # with use_bound=False (matching the old eager body's `else`).
+            # with captured=False (matching the old eager body's `else`).
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
@@ -744,12 +746,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
             )
 
-        # Bound-path SWA: refill the captured write-target buffer from the live
-        # out_cache_loc before replay (bound onto the metadata at capture by the
-        # in_capture tail below). The eager (use_bound=False) path instead
+        # Captured-bucket SWA: refill the captured write-target buffer from
+        # the live out_cache_loc before replay (bound onto the metadata at
+        # capture by the in_capture tail below). The fresh path instead
         # threads swa_out_cache_loc through the metadata constructed above.
         if (
-            use_bound
+            _has_captured
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
         ):
