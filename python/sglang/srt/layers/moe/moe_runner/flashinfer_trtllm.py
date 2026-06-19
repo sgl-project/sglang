@@ -652,11 +652,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
     else:
         router_logits = None
         topk_config = None
@@ -685,9 +681,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
             a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k
+                hidden_states, quant_info.weight_block_k, column_major_scales=True
             )
-            a_sf_t = a_sf.t().contiguous()
+            a_sf_t = a_sf.t()
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
@@ -1053,11 +1049,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
 
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
         moe_kwargs = dict(
             routing_logits=router_logits,
             routing_bias=correction_bias,

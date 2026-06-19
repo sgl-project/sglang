@@ -55,11 +55,34 @@ const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
 ];
 
 /// Histogram bucket upper bounds (seconds) for
-/// `sgl_router_request_duration_seconds` and `sgl_router_ttft_seconds`.
-/// Standard latency ladder spanning 5 ms → 30 s; the `+Inf` bucket catches
-/// anything slower (a request that outlives the upstream's own timeouts).
+/// `sgl_router_request_duration_seconds`. Standard latency ladder spanning
+/// 5 ms → 30 s; the `+Inf` bucket catches anything slower (a request that
+/// outlives the upstream's own timeouts).
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for `sgl_router_ttft_seconds`.
+///
+/// From 0.1 s up these edges are IDENTICAL to the SGLang engine's
+/// `sglang:time_to_first_token_seconds` histogram (defined in
+/// `python/sglang/srt/observability/metrics_collector.py`). Matching edges is
+/// what makes a `histogram_quantile` comparison between the router and the
+/// engine meaningful: the quantile interpolates within the same bucket on both
+/// sides, so `quantile(router) - quantile(engine)` reflects real router
+/// overhead rather than grid skew. With mismatched grids the two interpolations
+/// run on different bucket widths and the difference can even go negative — the
+/// router P50 reading *below* the engine P50 despite the router sitting in
+/// front of it.
+///
+/// The four sub-100 ms edges have no engine counterpart (the engine's first
+/// bucket is `[0, 0.1]`, so it cannot resolve a sub-100 ms TTFT at all). They
+/// are router-only headroom: harmless for the comparison (they sit below the
+/// engine's range) while letting the router resolve a genuinely fast TTFT.
+const TTFT_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
+    0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
+    400.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -332,8 +355,9 @@ impl MetricsRegistry {
     /// the interval from request receipt to the first response chunk arriving
     /// from the upstream worker. Recorded only for successful *streaming*
     /// responses; non-streaming "first token" equals total latency, which
-    /// `sgl_router_request_duration_seconds` already captures. Shares the
-    /// latency bucket ladder ([`REQUEST_DURATION_BUCKETS`]).
+    /// `sgl_router_request_duration_seconds` already captures. Uses
+    /// [`TTFT_BUCKETS`], whose edges align with the engine's TTFT histogram so
+    /// the two are directly comparable in `histogram_quantile`.
     pub fn observe_ttft(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -342,7 +366,7 @@ impl MetricsRegistry {
         let mut guard = self.ttft_seconds.lock();
         let hist = guard
             .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS));
+            .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -821,8 +845,31 @@ mod tests {
             out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.05"} 1"#),
             "expected le=0.05 bucket = 1; got:\n{out}",
         );
-        // le=0.25 is cumulative over both observations.
-        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.25"} 2"#));
+        // le=0.2 (an engine-aligned edge) is cumulative over both observations.
+        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
+    }
+
+    #[test]
+    fn ttft_buckets_align_with_engine_grid() {
+        // The engine's `sglang:time_to_first_token_seconds` edges from 0.1 s up.
+        // These MUST all appear verbatim in the router's TTFT histogram, else a
+        // `histogram_quantile` comparison silently interpolates on mismatched
+        // grids. The sub-100 ms head (0.005..0.05) is router-only and not
+        // asserted here.
+        let reg = MetricsRegistry::new();
+        reg.observe_ttft("m", 0.5);
+        let out = reg.render();
+        for le in [
+            "0.1", "0.2", "0.4", "0.6", "0.8", "1", "2", "4", "6", "8", "10", "20", "40", "60",
+            "80", "100", "200", "400",
+        ] {
+            assert!(
+                out.contains(&format!(
+                    r#"sgl_router_ttft_seconds_bucket{{model_id="m",le="{le}"}}"#
+                )),
+                "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
+            );
+        }
     }
 
     #[test]
