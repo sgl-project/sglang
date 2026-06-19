@@ -26,20 +26,12 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
-# AMD folds into the per-PR unit-test suite at the CI-reduced range. Unlike the
-# other kv_canary benches, the total-tokens and pool-capacity sweeps did not
-# previously gate on is_in_ci(); their axes below are now reduced via
-# get_benchmark_range so AMD PRs don't pay the full nightly sweep.
-register_amd_ci(est_time=120, suite="jit-kernel-unit-test-amd")
-# AMD nightly mirror of the CUDA nightly registration. Note: amd_ci_exec.sh sets
-# SGLANG_IS_IN_CI, so this still runs the CI-reduced range (same as CUDA nightly).
+# AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _TOTAL_TOKENS_AXIS: list[int] = [256, 4096, 65536, 262144]
 _TOTAL_TOKENS_BS_AXIS: list[int] = [1, 32, 256]
-_TOTAL_TOKENS_AXIS_CI: list[int] = [256, 4096]
-_TOTAL_TOKENS_BS_AXIS_CI: list[int] = [1, 32]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -50,15 +42,9 @@ class _TotalTokensBenchCase:
 
 
 def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
-    bs_axis = get_benchmark_range(
-        full_range=_TOTAL_TOKENS_BS_AXIS, ci_range=_TOTAL_TOKENS_BS_AXIS_CI
-    )
-    total_tokens_axis = get_benchmark_range(
-        full_range=_TOTAL_TOKENS_AXIS, ci_range=_TOTAL_TOKENS_AXIS_CI
-    )
     cases: list[_TotalTokensBenchCase] = []
-    for bs in bs_axis:
-        for total_tokens in total_tokens_axis:
+    for bs in _TOTAL_TOKENS_BS_AXIS:
+        for total_tokens in _TOTAL_TOKENS_AXIS:
             if total_tokens < bs:
                 continue
             for pool_kind in POOL_AXIS:
@@ -74,9 +60,6 @@ _POOL_CAPACITY_VERIFY_CAP_AXIS: list[int] = [16384, 262144, 1398028]
 _POOL_CAPACITY_BS_AXIS: list[int] = [1, 4, 32]
 _POOL_CAPACITY_PREFIX_LEN: int = 512
 _POOL_CAPACITY_BS_PADDED_AXIS: list[Optional[int]] = [None, 4096]
-_POOL_CAPACITY_VERIFY_CAP_AXIS_CI: list[int] = [16384]
-_POOL_CAPACITY_BS_AXIS_CI: list[int] = [1, 32]
-_POOL_CAPACITY_BS_PADDED_AXIS_CI: list[Optional[int]] = [None, 4096]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -101,21 +84,10 @@ class _PoolCapacityBenchCase:
 
 
 def _build_pool_capacity_cases() -> list[_PoolCapacityBenchCase]:
-    bs_axis = get_benchmark_range(
-        full_range=_POOL_CAPACITY_BS_AXIS, ci_range=_POOL_CAPACITY_BS_AXIS_CI
-    )
-    verify_cap_axis = get_benchmark_range(
-        full_range=_POOL_CAPACITY_VERIFY_CAP_AXIS,
-        ci_range=_POOL_CAPACITY_VERIFY_CAP_AXIS_CI,
-    )
-    bs_padded_axis = get_benchmark_range(
-        full_range=_POOL_CAPACITY_BS_PADDED_AXIS,
-        ci_range=_POOL_CAPACITY_BS_PADDED_AXIS_CI,
-    )
     cases: list[_PoolCapacityBenchCase] = []
-    for bs in bs_axis:
-        for verify_capacity in verify_cap_axis:
-            for bs_padded in bs_padded_axis:
+    for bs in _POOL_CAPACITY_BS_AXIS:
+        for verify_capacity in _POOL_CAPACITY_VERIFY_CAP_AXIS:
+            for bs_padded in _POOL_CAPACITY_BS_PADDED_AXIS:
                 if bs_padded is not None and bs_padded < bs:
                     continue
                 cases.append(
