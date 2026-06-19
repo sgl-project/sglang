@@ -118,6 +118,13 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
             self.coordinator._indexcache_prefetch_layers_after,
             {0: (1,)},
         )
+        self.assertIsNotNone(
+            self.coordinator.indexcache_prefetch_top_k_device_locs_buffers
+        )
+        self.assertEqual(
+            tuple(self.coordinator.indexcache_prefetch_top_k_device_locs_buffers.shape),
+            (1, self.coordinator.max_prefetch_num_reqs, TOP_K),
+        )
 
     def test_indexcache_prefetch_shared_layer_swap_in(self):
         """Full layer can preload KV for its following Shared layer."""
@@ -139,12 +146,25 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
         self.coordinator.num_real_reqs[0] = rpi.shape[0]
+        prefetch_buffers = (
+            self.coordinator.indexcache_prefetch_top_k_device_locs_buffers
+        )
+        self.assertIsNotNone(prefetch_buffers)
 
-        self.coordinator.prefetch_indexcache_shared_layers(rpi, sls, batch, layer_id=0)
+        self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=0)
+        self.coordinator.prefetch_indexcache_shared_layers(
+            rpi,
+            sls,
+            batch,
+            layer_id=0,
+        )
         locs = self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=1)
         torch.cuda.synchronize()
 
         self.assertFalse(self.coordinator._indexcache_prefetch_pending[1])
+        self.assertEqual(
+            locs.data_ptr(), prefetch_buffers[0, : rpi.shape[0]].data_ptr()
+        )
         self._assert_kv_correct(
             locs[0], tokens, layer_id=1, count=TOP_K, msg="IndexCache prefetch: "
         )
@@ -213,10 +233,18 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
         self.coordinator.num_real_reqs[0] = rpi.shape[0]
+        prefetch_buffers = (
+            self.coordinator.indexcache_prefetch_top_k_device_locs_buffers
+        )
+        self.assertIsNotNone(prefetch_buffers)
 
         def graph_body():
+            self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=0)
             self.coordinator.prefetch_indexcache_shared_layers(
-                rpi, sls, batch, layer_id=0
+                rpi,
+                sls,
+                batch,
+                layer_id=0,
             )
             return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=1)
 
@@ -233,6 +261,9 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
 
         self.assertFalse(self.coordinator._indexcache_prefetch_pending[1])
         self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
+        self.assertEqual(
+            locs.data_ptr(), prefetch_buffers[0, : rpi.shape[0]].data_ptr()
+        )
         self._assert_kv_correct(
             locs[0],
             tokens,
@@ -303,14 +334,21 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
             synthetic_current_layer_compute()
 
         def no_overlap_body():
+            self._reset_layer_hot_cache_tags_for_reqs(reqs, layer_id=0)
             self._reset_layer_hot_cache_tags_for_reqs(reqs, layer_id=1)
+            self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=0)
             synthetic_current_layer_compute()
             return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=1)
 
         def overlap_body():
+            self._reset_layer_hot_cache_tags_for_reqs(reqs, layer_id=0)
             self._reset_layer_hot_cache_tags_for_reqs(reqs, layer_id=1)
+            self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=0)
             self.coordinator.prefetch_indexcache_shared_layers(
-                rpi, sls, batch, layer_id=0
+                rpi,
+                sls,
+                batch,
+                layer_id=0,
             )
             synthetic_current_layer_compute()
             return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id=1)
@@ -324,21 +362,21 @@ class TestHiSparseIndexCacheUnit(unittest.TestCase):
             no_hisparse_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(no_hisparse_graph):
                 no_hisparse_body()
+            no_hisparse_ms = self._measure_cuda_graph_ms(no_hisparse_graph, iters=iters)
 
             no_overlap_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(no_overlap_graph):
                 no_overlap_locs = no_overlap_body()
+            no_overlap_ms = self._measure_cuda_graph_ms(no_overlap_graph, iters=iters)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.all(no_overlap_locs[:, :TOP_K] >= 0))
 
             overlap_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(overlap_graph):
                 overlap_locs = overlap_body()
-
-            no_hisparse_ms = self._measure_cuda_graph_ms(no_hisparse_graph, iters=iters)
-            no_overlap_ms = self._measure_cuda_graph_ms(no_overlap_graph, iters=iters)
             overlap_ms = self._measure_cuda_graph_ms(overlap_graph, iters=iters)
             torch.cuda.synchronize()
 
-            self.assertTrue(torch.all(no_overlap_locs[:, :TOP_K] >= 0))
             self.assertTrue(torch.all(overlap_locs[:, :TOP_K] >= 0))
 
             speedup = no_overlap_ms / overlap_ms if overlap_ms > 0 else float("inf")

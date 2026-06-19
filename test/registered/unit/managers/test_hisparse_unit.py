@@ -176,6 +176,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator._indexcache_prefetch_enabled = False
         for i in range(len(self.coordinator._indexcache_prefetch_pending)):
             self.coordinator._indexcache_prefetch_pending[i] = False
+        if hasattr(self.coordinator, "_indexcache_prefetch_buffer_slots"):
+            for i in range(len(self.coordinator._indexcache_prefetch_buffer_slots)):
+                self.coordinator._indexcache_prefetch_buffer_slots[i] = -1
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 

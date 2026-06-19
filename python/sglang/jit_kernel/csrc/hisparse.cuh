@@ -164,6 +164,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     void* __restrict__ device_buffer_k,
     void* __restrict__ device_buffer_v,
     int32_t* __restrict__ top_k_device_locs,
+    int32_t* __restrict__ miss_tokens_out,
+    int32_t* __restrict__ miss_slots_out,
+    int32_t* __restrict__ miss_counts_out,
     const ReqPoolIndicesT* __restrict__ req_pool_indices,
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
@@ -173,6 +176,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t lru_slot_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
+    int64_t miss_tokens_stride,
+    int64_t miss_slots_stride,
     int64_t page_size,
     int64_t item_size_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
@@ -205,6 +210,9 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
+    if (tid == 0 && miss_counts_out != nullptr) {
+      miss_counts_out[bid] = 0;
+    }
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
@@ -402,11 +410,18 @@ __global__ void load_cache_to_device_buffer_kernel(
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
+      if (miss_tokens_out != nullptr) {
+        miss_tokens_out[bid * miss_tokens_stride + miss_offset] = my_token;
+        miss_slots_out[bid * miss_slots_stride + miss_offset] = static_cast<int32_t>(evict_slot);
+      }
     }
   }
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if (tid == 0 && miss_counts_out != nullptr) {
+    miss_counts_out[bid] = total_misses;
+  }
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -443,6 +458,96 @@ __global__ void load_cache_to_device_buffer_kernel(
           /*src_index=*/static_cast<int32_t>(src_loc));
     } else {
       // Generic path: device + host both linear, stride = item_size_bytes.
+      const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+      auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+      transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+
+      if constexpr (!IsMLA) {
+        const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+        auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+        transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+      }
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout, typename ReqPoolIndicesT>
+__global__ void load_cache_to_device_buffer_io_only_kernel(
+    const int32_t* __restrict__ source_top_k_device_locs,
+    int32_t* __restrict__ target_top_k_device_locs,
+    const int32_t* __restrict__ miss_tokens,
+    const int32_t* __restrict__ miss_slots,
+    const int32_t* __restrict__ miss_counts,
+    const int32_t* __restrict__ source_device_buffer_tokens,
+    int32_t* __restrict__ target_device_buffer_tokens,
+    const int16_t* __restrict__ source_lru_slots,
+    int16_t* __restrict__ target_lru_slots,
+    const int64_t* __restrict__ host_cache_locs,
+    const int32_t* __restrict__ device_buffer_locs,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    const ReqPoolIndicesT* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t source_top_k_stride,
+    int64_t target_top_k_stride,
+    int64_t miss_tokens_stride,
+    int64_t miss_slots_stride,
+    int64_t token_stride_0,
+    int64_t lru_slot_stride_0,
+    int64_t host_stride,
+    int64_t buffer_stride_0,
+    int64_t item_size_bytes) {
+  static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int64_t rid = req_pool_indices[bid];
+
+  const int64_t token_offset = rid * token_stride_0;
+  const int64_t lru_offset = rid * lru_slot_stride_0;
+  const int64_t buffer_offset = rid * buffer_stride_0;
+  const int64_t host_offset = rid * host_stride;
+
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    target_top_k_device_locs[bid * target_top_k_stride + i] = source_top_k_device_locs[bid * source_top_k_stride + i];
+  }
+
+  // Full and Shared layers consume the same top-k sequence. Mirror the Full
+  // layer's hot-buffer metadata so future Shared-layer IO-only prefetches can
+  // keep using Full-layer miss decisions without recomputing top-k diffs.
+  for (int i = tid; i < HOT_BUFFER_SIZE + 1; i += BLOCK_SIZE) {
+    target_device_buffer_tokens[token_offset + i] = source_device_buffer_tokens[token_offset + i];
+  }
+  for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+    target_lru_slots[lru_offset + i] = source_lru_slots[lru_offset + i];
+  }
+
+  const int total_misses = miss_counts[bid];
+  const int64_t miss_token_offset = bid * miss_tokens_stride;
+  const int64_t miss_slot_offset = bid * miss_slots_stride;
+  const int64_t* req_host_cache_locs = host_cache_locs + host_offset;
+  const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
+
+  for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+    const int32_t miss_token = miss_tokens[miss_token_offset + miss_idx];
+    const int32_t evict_slot = miss_slots[miss_slot_offset + miss_idx];
+    const int64_t src_loc = req_host_cache_locs[miss_token];
+    const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+
+    if constexpr (IsDsv4Layout) {
+      device::hisparse::transfer_item(
+          /*dst_cache=*/device_buffer_k,
+          /*src_cache=*/const_cast<void*>(host_cache_k),
+          /*dst_index=*/static_cast<int32_t>(dst_loc),
+          /*src_index=*/static_cast<int32_t>(src_loc));
+    } else {
       const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
       auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
@@ -501,6 +606,9 @@ void load_cache_to_device_buffer(
         device_buffer_k.data_ptr(),
         (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
         static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        nullptr,
+        nullptr,
+        nullptr,
         req_pool_indices_ptr,
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
@@ -510,6 +618,8 @@ void load_cache_to_device_buffer(
         lru_slot_stride_0,
         top_k_tokens_stride,
         top_k_device_locs_stride,
+        0,
+        0,
         page_size,
         item_size_bytes);
   };
@@ -566,6 +676,217 @@ void load_cache_to_device_buffer(
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+void load_cache_to_device_buffer_with_miss(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView miss_tokens,
+    tvm::ffi::TensorView miss_slots,
+    tvm::ffi::TensorView miss_counts,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes) {
+  using namespace host;
+
+  const int64_t bs = top_k_tokens.shape()[0];
+  const int64_t host_stride = host_cache_locs.shape()[1];
+  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
+  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
+  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
+  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const int64_t miss_tokens_stride = miss_tokens.strides()[0];
+  const int64_t miss_slots_stride = miss_slots.strides()[0];
+  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    if constexpr (smem_bytes > 48u * 1024u) {
+      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<int32_t*>(miss_tokens.data_ptr()),
+        static_cast<int32_t*>(miss_slots.data_ptr()),
+        static_cast<int32_t*>(miss_counts.data_ptr()),
+        req_pool_indices_ptr,
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        miss_tokens_stride,
+        miss_slots_stride,
+        page_size,
+        item_size_bytes);
+  };
+
+  const auto seq_dtype = seq_lens.dtype();
+  const auto rpi_dtype = req_pool_indices.dtype();
+  const bool seq_is_i64 = (seq_dtype.code == kDLInt && seq_dtype.bits == 64);
+  const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
+
+  if (seq_is_i64 && rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int64_t,
+            int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else if (seq_is_i64 && !rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int64_t,
+            int32_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  } else if (!seq_is_i64 && rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int32_t,
+            int64_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int32_t,
+            int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+void load_cache_to_device_buffer_io_only(
+    tvm::ffi::TensorView source_top_k_device_locs,
+    tvm::ffi::TensorView target_top_k_device_locs,
+    tvm::ffi::TensorView miss_tokens,
+    tvm::ffi::TensorView miss_slots,
+    tvm::ffi::TensorView miss_counts,
+    tvm::ffi::TensorView source_device_buffer_tokens,
+    tvm::ffi::TensorView target_device_buffer_tokens,
+    tvm::ffi::TensorView source_lru_slots,
+    tvm::ffi::TensorView target_lru_slots,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t item_size_bytes) {
+  using namespace host;
+
+  const int64_t bs = source_top_k_device_locs.shape()[0];
+  const int64_t source_top_k_stride = source_top_k_device_locs.strides()[0];
+  const int64_t target_top_k_stride = target_top_k_device_locs.strides()[0];
+  const int64_t miss_tokens_stride = miss_tokens.strides()[0];
+  const int64_t miss_slots_stride = miss_slots.strides()[0];
+  const int64_t token_stride_0 = source_device_buffer_tokens.strides()[0];
+  const int64_t lru_slot_stride_0 = source_lru_slots.strides()[0];
+  const int64_t host_stride = host_cache_locs.shape()[1];
+  const int64_t buffer_stride_0 = device_buffer_locs.strides()[0];
+  const auto device = LaunchKernel::resolve_device(source_top_k_device_locs.device());
+
+  auto launch = [&](auto kernel_fn, const auto* req_pool_indices_ptr) {
+    LaunchKernel(bs, BLOCK_SIZE, device)(
+        kernel_fn,
+        static_cast<const int32_t*>(source_top_k_device_locs.data_ptr()),
+        static_cast<int32_t*>(target_top_k_device_locs.data_ptr()),
+        static_cast<const int32_t*>(miss_tokens.data_ptr()),
+        static_cast<const int32_t*>(miss_slots.data_ptr()),
+        static_cast<const int32_t*>(miss_counts.data_ptr()),
+        static_cast<const int32_t*>(source_device_buffer_tokens.data_ptr()),
+        static_cast<int32_t*>(target_device_buffer_tokens.data_ptr()),
+        static_cast<const int16_t*>(source_lru_slots.data_ptr()),
+        static_cast<int16_t*>(target_lru_slots.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        req_pool_indices_ptr,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        source_top_k_stride,
+        target_top_k_stride,
+        miss_tokens_stride,
+        miss_slots_stride,
+        token_stride_0,
+        lru_slot_stride_0,
+        host_stride,
+        buffer_stride_0,
+        item_size_bytes);
+  };
+
+  const auto rpi_dtype = req_pool_indices.dtype();
+  const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
+  if (rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_io_only_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int64_t>,
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_io_only_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int32_t>,
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }
 }
