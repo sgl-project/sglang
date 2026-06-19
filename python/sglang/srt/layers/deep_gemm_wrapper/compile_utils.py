@@ -416,12 +416,17 @@ def _deep_gemm_execution_hook(
     yield
 
 
-def pp_parallel_deep_gemm_warmup(model_runner) -> None:
+def pp_parallel_deep_gemm_warmup(runner) -> None:
     """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
     DeepGEMM JIT compiles in parallel instead of serially via the warmup
     /generate flowing through the pipeline. Opt-in via
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+
+    Driven from BaseRunner.warmup(), which passes the runner; the dummy
+    forwards go through runner._dummy_run (the autotune/dummy-run machinery now
+    lives on BaseRunner). ModelRunner state is read via runner.model_runner.
     """
+    model_runner = runner.model_runner
     # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
     # cover the brackets real /generate hits (smallest decode shape,
     # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
@@ -466,11 +471,11 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
     with torch.inference_mode():
         for bs in batch_sizes:
             if run_decode:
-                model_runner._dummy_run(
+                runner._dummy_run(
                     batch_size=bs, forward_mode_override=ForwardMode.DECODE
                 )
             if run_extend:
-                model_runner._dummy_run(
+                runner._dummy_run(
                     batch_size=bs, forward_mode_override=ForwardMode.EXTEND
                 )
 
