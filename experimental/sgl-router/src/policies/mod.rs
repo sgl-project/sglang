@@ -77,8 +77,9 @@ pub fn request_tokens_for(
 
 /// Tokenize `text` for `model_id` via the shared registry. Returns `None` if
 /// no tokenizer is loaded (the model_id may be misconfigured) or if encoding
-/// fails / yields no tokens. Errors log at debug — they degrade routing but
-/// are not fatal.
+/// fails / yields no tokens. An encode error logs at WARN (a loaded-but-erroring
+/// tokenizer silently disables the offload); the no-text / empty-output paths
+/// are expected and stay quiet.
 fn tokenize_text(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
@@ -89,7 +90,14 @@ fn tokenize_text(
         Ok(ids) if !ids.is_empty() => Some(ids),
         Ok(_) => None,
         Err(e) => {
-            tracing::debug!(
+            // WARN, not DEBUG: a tokenizer that is loaded but consistently
+            // erroring silently turns the whole tokenization offload into a
+            // no-op, so the failure must be visible above DEBUG. Sustained
+            // failure logs once per request; the volume signal is the
+            // `sgl_router_ingress_tokenize_errors_total` counter (which the
+            // chat handler bumps on the chat-encode failure), so no
+            // rate-limiter here.
+            tracing::warn!(
                 model = %model_id,
                 error = %e,
                 "ingress tokenize failed; routing/forwarding skips this prompt",

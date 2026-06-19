@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, SelectionContext};
+use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -330,6 +330,19 @@ pub async fn chat_completions(
         }
         _ => None,
     };
+
+    // Surface a broken offload: when the encoder SHOULD have produced
+    // engine-equivalent ids but didn't, the chat request silently fell back to
+    // engine-side tokenization. Count only that case (see
+    // `ingress_tokenize_offload_failed`); successful forwards and expected
+    // omissions are not problems.
+    if ingress_tokenize_offload_failed(
+        ctx.tokenizers.has_chat_encoder(&model_str),
+        request_value.as_ref(),
+        request_tokens.as_ref(),
+    ) {
+        ctx.metrics.record_ingress_tokenize_error(&metrics_model);
+    }
 
     // PD-disagg bootstrap fields (prefill worker address + a per-request
     // room). Present only when a decode peer was resolved.
@@ -790,6 +803,38 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
+/// Whether the ingress tokenization offload was expected to fire but failed —
+/// the condition behind `sgl_router_ingress_tokenize_errors_total`.
+///
+/// True only when ALL of:
+///   * the model has a chat encoder (`has_chat_encoder`), so a chat request
+///     on it SHOULD have produced engine-equivalent ids;
+///   * the request is a chat request (`messages` array present);
+///   * the tokens are absent OR not engine-equivalent — i.e. `encode_chat`
+///     render/encode failed and the request silently fell back to engine-side
+///     tokenization.
+///
+/// Non-chat-encoder / non-`messages` requests never expected the offload, so
+/// they are not failures. A tools / multimodal / thinking request on a
+/// chat-encoder model still gets engine-equivalent ids (`encode_chat`
+/// succeeded; the safe-predicate withholds forwarding for other reasons), so it
+/// is an expected omission, not a failure.
+fn ingress_tokenize_offload_failed(
+    has_chat_encoder: bool,
+    request_value: Option<&serde_json::Value>,
+    request_tokens: Option<&RequestTokens>,
+) -> bool {
+    if !has_chat_encoder {
+        return false;
+    }
+    let chat_request =
+        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    if !chat_request {
+        return false;
+    }
+    !request_tokens.is_some_and(|t| t.engine_equivalent)
+}
+
 /// Whether the final chat message has `role: "assistant"` (a prefix /
 /// continuation turn the engine's template path special-cases).
 fn last_message_is_assistant(value: &serde_json::Value) -> bool {
@@ -1047,6 +1092,65 @@ mod tests {
             Some(&serde_json::Value::Number(2.into()))
         );
         assert!(parsed.get("input_ids").is_none());
+    }
+
+    /// A chat request on a chat-encoder model that yields engine-equivalent
+    /// ids (encode succeeded) is NOT a failure — the offload worked.
+    #[test]
+    fn offload_failed_false_when_tokens_engine_equivalent() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+        };
+        assert!(!ingress_tokenize_offload_failed(
+            true,
+            Some(&value),
+            Some(&tokens)
+        ));
+    }
+
+    /// A chat request on a chat-encoder model whose tokenization yielded NO
+    /// tokens (encode_chat returned None → request_tokens None) IS a failure:
+    /// the encoder should have fired but didn't.
+    #[test]
+    fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    /// Encode produced ids but NOT via the chat encoder (raw fallback,
+    /// `engine_equivalent = false`) on a chat-encoder model + chat request →
+    /// the chat-encode render/encode failed and fell through to the raw path.
+    #[test]
+    fn offload_failed_true_when_tokens_not_engine_equivalent() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: false,
+        };
+        assert!(ingress_tokenize_offload_failed(
+            true,
+            Some(&value),
+            Some(&tokens)
+        ));
+    }
+
+    /// Non-chat-encoder models never expected the offload → not a failure even
+    /// with no tokens.
+    #[test]
+    fn offload_failed_false_without_chat_encoder() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
+    }
+
+    /// A non-chat (no `messages`) request on a chat-encoder model — e.g.
+    /// `/v1/completions` `prompt` — never expected the chat-encode offload, so
+    /// the absence of engine-equivalent ids is not a failure.
+    #[test]
+    fn offload_failed_false_for_non_messages_request() {
+        let value = serde_json::json!({"prompt":"hi"});
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
     #[test]

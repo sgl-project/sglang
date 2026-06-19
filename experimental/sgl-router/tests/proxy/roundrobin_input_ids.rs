@@ -146,3 +146,46 @@ async fn round_robin_tool_request_omits_input_ids() {
         "tool requests must not forward input_ids under any policy; got {body}"
     );
 }
+
+/// A successful plain-chat forward on a chat-encoder model must NOT emit
+/// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
+/// offload was expected but the encoder failed. A tool request on the same model
+/// is an *expected* omission (its ids are still engine-equivalent; the
+/// safe-predicate withholds forwarding for other reasons), so it must not emit
+/// the error counter either.
+#[tokio::test]
+async fn successful_forward_does_not_emit_ingress_tokenize_error() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+
+    let status = send(
+        Arc::clone(&ctx),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there friend"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let status = send(
+        Arc::clone(&ctx),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"),
+        "the error counter family must be exposed; got:\n{m}",
+    );
+    assert!(
+        !m.contains("sgl_router_ingress_tokenize_errors_total{"),
+        "healthy forwards (and expected omissions) must not emit the error counter; got:\n{m}",
+    );
+}
