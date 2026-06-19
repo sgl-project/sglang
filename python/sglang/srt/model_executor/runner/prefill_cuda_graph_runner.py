@@ -19,7 +19,7 @@ Backend selection comes from cuda_graph_config.prefill:
                       torch.compile's internal cache. Multi-batch supported.
   - "breakable" — BreakableCudaGraphBackend: segmented capture (no
                       torch.compile). Captures with bs=1; rejects multi-req
-                      prefill in can_run.
+                      prefill in can_run_graph.
   - "full"      — rejected at config validation; not supported for prefill.
   - "disabled"  — handled at the model_runner level — runner not
                       constructed.
@@ -420,7 +420,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -451,7 +451,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: replay_prepare bucket-pads
+        # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
@@ -648,7 +648,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
+    def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
@@ -782,11 +782,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    def replay(
+    def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 

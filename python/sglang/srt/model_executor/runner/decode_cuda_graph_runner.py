@@ -101,6 +101,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -154,6 +155,7 @@ def build_replay_fb_view(
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
@@ -508,7 +510,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -602,6 +604,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+
+        # Optionally persist the shaped capture trace (record_shapes=True) for
+        # offline per-kernel analysis -- opt-in via
+        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE; the in-log tables above are
+        # unchanged.
+        export_cuda_graph_capture_trace(
+            prof_context,
+            runner_name=type(self).__name__,
+            tp_rank=get_tensor_model_parallel_rank(),
+        )
 
     def capture_prepare(
         self,
@@ -943,7 +955,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.backend.cleanup()
             self.capture()
 
-    def replay_prepare(
+    def load_batch(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -951,7 +963,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
-            # Pre-planned (plan-stream replay_prepare already ran).
+            # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -1045,7 +1057,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.bs, stream_idx, variant_label
         )
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -1058,7 +1070,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx, self.backend.replay_session():
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            self.load_batch(forward_batch, pp_proxy_tensors)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
