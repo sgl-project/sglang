@@ -818,6 +818,9 @@ class Envs:
     # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    # Optional torch symmetric-memory backend override for DeepGEMM Mega-MoE.
+    # Leave empty to use SGLang's auto choice.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND = EnvStr("")
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK
