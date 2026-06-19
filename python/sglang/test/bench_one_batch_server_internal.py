@@ -559,13 +559,22 @@ def run_one_case(
         else:
             json_schema = None
 
+        # At large batch sizes, per-token SSE streaming events add enough
+        # client-side overhead to skew the measured timing. Raise the effective
+        # stream_interval so the server emits far fewer events; TTFT is then
+        # recovered from the server-reported throughput below instead of from
+        # per-event timestamps.
+        reduce_sse = batch_size > 256
+        effective_stream_interval = (
+            max(stream_interval, output_len) if reduce_sse else stream_interval
+        )
         payload = {
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
                 "ignore_eos": True,
                 "json_schema": json_schema,
-                "stream_interval": stream_interval,
+                "stream_interval": effective_stream_interval,
             },
             "return_logprob": return_logprob,
             "stream": True,
@@ -682,9 +691,6 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
-    overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":
         # vLLM does not expose these metrics via API
@@ -697,6 +703,19 @@ def run_one_case(
         internal_state = server_info.get("internal_states", [{}])
         last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
         acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
+
+    if reduce_sse and last_gen_throughput > 0:
+        # With SSE suppressed, the per-token last_ttft measured above is
+        # unreliable, so estimate it from total decode time. last_gen_throughput
+        # is per-DP-rank, so scale by dp_size to get aggregate throughput across
+        # all ranks.
+        dp_size = server_info.get("dp_size", 1)
+        decode_time = batch_size * output_len / (last_gen_throughput * dp_size)
+        last_ttft = latency - decode_time
+
+    input_throughput = batch_size * input_len / last_ttft
+    output_throughput = batch_size * output_len / (latency - last_ttft)
+    overall_throughput = batch_size * (input_len + output_len) / latency
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
