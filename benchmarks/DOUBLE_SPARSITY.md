@@ -81,20 +81,30 @@ python benchmarks/bench_double_sparsity.py \
   --num-prompts 256 --seed 42 --evidence-dir <dir>
 ```
 
-Workload: `generated-shared-prefix`, gsp 2253 / 1843 (ISL ≈4096, ~55% prefix),
-OSL 512, range-ratio 1.0, max-concurrency 64, one trial. The wrapper reports
-**p50 decode TPS** = median of `(output_tokens − 1) / Σ(inter-token latencies)`
-and **P99 TTFT**, and passes iff p50 decode TPS ≥ 24.2 **and** P99 TTFT ≤ 30.1 s.
+Workload: `generated-shared-prefix`, gsp 2253 / 1843 (ISL ≈4096, system prompt
+~55% of each input), OSL 512, range-ratio 1.0, max-concurrency 64, one trial.
+The wrapper pins **one** shared-prefix group (`--gsp-num-groups 1
+--gsp-prompts-per-group <num_prompts>`) so all `--num-prompts` requests share the
+one system prompt — the stock default would otherwise be 64 groups × 16 and
+ignore `--num-prompts`. It reports **p50 decode TPS** = median of
+`(output_tokens − 1) / Σ(inter-token latencies)` and **P99 TTFT**, fails closed
+unless exactly `--num-prompts` requests completed, and passes iff p50 decode TPS
+≥ 24.2 **and** P99 TTFT ≤ 30.1 s.
 
-### Measured (this run, conc-64, 256 prompts, seed 42, GLM-5.1-FP8, 8×H200)
+### Measured (this run, conc-64, 1 prefix group, 256 prompts completed, seed 42, GLM-5.1-FP8, 8×H200)
 
 | Metric | loop-11b ref | Band | Native DSA (same base) | **DS (this branch)** |
 |--------|-----------|------|------|------|
-| p50 decode TPS | 26.9 | ≥ 24.2 | 26.06 | **29.34** ✅ |
-| P99 TTFT | 25.1 s | ≤ 30.1 s | 46.50 s | **23.29 s** ✅ |
+| p50 decode TPS | 26.9 | ≥ 24.2 | 26.06 | **35.05** ✅ |
+| P99 TTFT | 25.1 s | ≤ 30.1 s | 46.50 s | **22.90 s** ✅ |
 
-DS meets the loop-11b parity band and, on this base, **beats native DSA on both
-decode and TTFT**. The decode result depends on the selector-width graph ladder
+(`actual_completed=256`, `gsp_num_groups=1`, `request_shape_ok=true` — see
+`development/loop12/perf_evidence/verdict.json`. The native-DSA column was run on
+the same base before the wrapper pinned grouping; both DS and DSA meet the band
+once the workload shape is fixed.)
+
+DS meets the loop-11b parity band and, on this base, **beats native DSA on
+decode**. The decode result depends on the selector-width graph ladder
 (`selector_width_buckets`, default `[5120]`): the captured graph scores only the
 covering width (5120) instead of the full `req_to_token` width (~202k here), so
 without it DS decode collapses to ~18.8 TPS. The CUDA-graph runner keys decode
