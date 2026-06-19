@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -395,7 +396,8 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
-def dispatch_w8a8_mxfp8_linear(backend: Fp8GemmRunnerBackend) -> Callable:
+def dispatch_w8a8_mxfp8_linear() -> Callable:
+    backend = get_fp8_gemm_runner_backend()
     if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
@@ -485,7 +487,9 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+def initialize_fp8_gemm_config(
+    server_args: ServerArgs, model_config: Optional[ModelConfig] = None
+) -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
@@ -494,7 +498,18 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
 
-    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+    backend = Fp8GemmRunnerBackend(backend)
+
+    is_mxfp8 = model_config is not None and model_config.quantization == "mxfp8"
+    if (
+        backend.is_auto()
+        and is_mxfp8
+        and _is_sm100_supported
+        and is_flashinfer_available()
+    ):
+        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    FP8_GEMM_RUNNER_BACKEND = backend
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
@@ -503,13 +518,6 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     if FP8_GEMM_RUNNER_BACKEND is None:
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
     return FP8_GEMM_RUNNER_BACKEND
-
-
-def resolve_mxfp8_linear_backend() -> Fp8GemmRunnerBackend:
-    backend = get_fp8_gemm_runner_backend()
-    if backend.is_auto() and _is_sm100_supported and is_flashinfer_available():
-        return Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
-    return backend
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
@@ -1105,7 +1113,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if resolve_mxfp8_linear_backend().is_flashinfer_trtllm():
+    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1116,7 +1124,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="trtllm",
         )
-    elif resolve_mxfp8_linear_backend().is_flashinfer_cutlass():
+    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
         weight_scale_t = (
             weight_scale.contiguous().t()
             if weight_scale.ndim == 2

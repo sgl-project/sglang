@@ -59,11 +59,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
-    resolve_mxfp8_linear_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -356,10 +356,8 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        self.mxfp8_backend = None
         if self.use_mxfp8:
-            self.mxfp8_backend = resolve_mxfp8_linear_backend()
-            self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear(self.mxfp8_backend)
+            self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
@@ -589,7 +587,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        backend = self.mxfp8_backend
+        backend = get_fp8_gemm_runner_backend()
         if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
@@ -794,9 +792,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if self.mxfp8_backend.is_flashinfer_cutlass():
+            backend = get_fp8_gemm_runner_backend()
+            if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
-            elif self.mxfp8_backend.is_flashinfer_trtllm():
+            elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
