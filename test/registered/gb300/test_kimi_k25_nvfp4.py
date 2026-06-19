@@ -17,7 +17,7 @@ COMMON_ARGS = [
     "--quantization=modelopt_fp4",
     "--attention-backend=trtllm_mla",
     "--moe-runner-backend=flashinfer_trtllm",
-    "--mem-fraction-static=0.8",
+    "--mem-fraction-static=0.75",
     "--enable-multimodal",
     "--enable-metrics",
 ]
@@ -49,7 +49,7 @@ class TestKimiK25Nvfp4(unittest.TestCase):
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=COMMON_ARGS + TP_MTP_ARGS,
-                variant="TP4",
+                variant="TP4+MTP",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
