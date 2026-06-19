@@ -163,7 +163,6 @@ def _row_linear(
     tp_size = _tp_size()
     use_row_parallel = tp_size > 1 and in_features % tp_size == 0
     if quant_config is None and get_global_server_args().original_dtype == "auto":
-        print("!", get_global_server_args().original_dtype)
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
                 in_features,
