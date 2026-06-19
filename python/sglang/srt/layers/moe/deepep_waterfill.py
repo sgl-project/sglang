@@ -239,7 +239,7 @@ def _waterfill_expand_kernel(
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
             ).to(tl.int32)
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.zeros([BLOCK_SIZE], dtype=tl.int32) + w
             w_vec = tl.where(
                 src_rank_i32 == r,
                 w_vec,
@@ -266,7 +266,7 @@ def _waterfill_expand_kernel(
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
             ).to(tl.int32)
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.zeros([BLOCK_SIZE], dtype=tl.int32) + w
             w_vec = tl.where(
                 src_rank_i32 == r,
                 w_vec,
@@ -328,7 +328,7 @@ def _waterfill_expand_kernel(
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
             ).to(tl.int32)
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.zeros([BLOCK_SIZE], dtype=tl.int32) + w
             w_vec = tl.where(
                 src_rank_i32 == r,
                 w_vec,
@@ -356,7 +356,7 @@ def _waterfill_expand_kernel(
             w = tl.where(
                 target_total > adjusted_load_r, target_total - adjusted_load_r, 0
             ).to(tl.int32)
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.zeros([BLOCK_SIZE], dtype=tl.int32) + w
             w_vec = tl.where(
                 src_rank_i32 == r,
                 w_vec,
