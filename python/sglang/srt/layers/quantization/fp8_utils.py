@@ -1429,8 +1429,8 @@ def channel_quant_to_tensor_quant(
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Reshape per-output-channel scale [N] -> [N, 1, ...] to broadcast over K dims.
-    if x_s.dim() < x_q_channel.dim():
-        x_s = x_s.view(x_s.shape + (1,) * (x_q_channel.dim() - x_s.dim()))
+    while x_s.dim() < x_q_channel.dim():
+        x_s = x_s.unsqueeze(-1)
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
     x_q_tensor, scale = (
         scaled_fp8_quant(x_dq_channel)

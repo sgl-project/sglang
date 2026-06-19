@@ -446,8 +446,14 @@ class Indexer(MultiPlatformOp):
     ):
         # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
         # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
-        if isinstance(x, tuple) and len(x) >= 3:
-            x = x[2]
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_q_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -540,8 +546,14 @@ class Indexer(MultiPlatformOp):
     ):
         # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
         # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
-        if isinstance(x, tuple) and len(x) >= 3:
-            x = x[2]
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         # Compute only key, skip query
         key, _ = self.wk(x)
         key = self.k_norm(key)
