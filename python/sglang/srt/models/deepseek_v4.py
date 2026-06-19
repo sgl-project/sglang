@@ -2444,6 +2444,18 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
+    # The dequant itself is a trivially parallel elementwise multiply that runs
+    # orders of magnitude faster on the GPU. Checkpoint tensors are loaded on
+    # the host, so running this on the CPU makes weight loading CPU-bound and
+    # very slow for large models (e.g. DeepSeek-V4). Offload the math to the
+    # current CUDA device when one is available, then move the result back to
+    # the input device so downstream weight-loading behavior is unchanged.
+    src_device = weight.device
+    if src_device.type != "cuda" and torch.cuda.is_available():
+        compute_device = torch.device("cuda", torch.cuda.current_device())
+        weight = weight.to(compute_device)
+        scale = scale.to(compute_device)
+
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
     )
@@ -2451,7 +2463,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    return result.to(torch.bfloat16)
+    return result.to(device=src_device, dtype=torch.bfloat16)
 
 
 def _dequant_fp8_wo_a(
