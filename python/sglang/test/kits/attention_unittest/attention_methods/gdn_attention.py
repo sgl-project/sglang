@@ -586,6 +586,21 @@ def build_gdn_attention_fixture(
     initialize_linear_attn_config(runner.server_args)
     linear_backend = GDNAttnBackend(runner)
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
+    # Mirror ModelRunner.init_backends: allocate static metadata buffers up
+    # front for backends that own them (use_bound deprecated → eager writes
+    # into the bound buffers). Init on the inner full_backend (HybridLinear
+    # routes through it).
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+    if (
+        type(full_backend).init_static_metadata_buffers
+        is not AttentionBackend.init_static_metadata_buffers
+    ):
+        full_backend.init_static_metadata_buffers(
+            max_bs=case.batch_size,
+            max_num_tokens=case.num_input_tokens,
+        )
+
     actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
         num_v_heads=case.num_v_heads,
