@@ -869,7 +869,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.moe_a2a_backend, "megamoe")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
-    def test_waterfill_megamoe_auto_configures_cap_buckets(self):
+    def test_waterfill_megamoe_does_not_auto_configure_cap_buckets(self):
         buckets = (
             server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS
         )
@@ -889,7 +889,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
                 # handler directly.
                 server_args._handle_a2a_moe()
 
-                self.assertEqual(buckets.get(), "4096,8320")
+                self.assertEqual(buckets.get(), "")
         finally:
             if old_present:
                 os.environ[buckets.name] = old_value
