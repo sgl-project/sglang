@@ -17,6 +17,8 @@ from einops import rearrange
 from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.k2 import K2DitConfig
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -44,28 +46,6 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
     xk_ = freqs[..., 0] * xk_[..., 0] + freqs[..., 1] * xk_[..., 1]
     return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
-
-
-def attention(
-    q: Tensor, k: Tensor, v: Tensor, gqa: bool = False, key_mask: Tensor | None = None
-) -> Tensor:
-    # GQA is expanded explicitly (enable_gqa would disqualify SDPA's flash kernel).
-    if gqa:
-        n_rep = q.shape[1] // k.shape[1]
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.repeat_interleave(n_rep, dim=1)
-    # With no padding (single/same-prompt batch) key_mask is None, so PyTorch SDPA
-    # picks its flash kernel. A ragged batch passes an additive [B,1,1,L] mask,
-    # which routes to the mem-efficient kernel instead.
-    attn_mask = None
-    if key_mask is not None:
-        attn_mask = torch.where(
-            key_mask[:, None, None, :],
-            q.new_zeros(()),
-            q.new_full((), torch.finfo(q.dtype).min),
-        )
-    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    return rearrange(x, "B H L D -> B L (H D)")
 
 
 def temb(
@@ -189,14 +169,24 @@ class Attention(nn.Module):
         self.wv = nn.Linear(dim, self.headdim * self.kvheads, bias=bias)
         self.gate = nn.Linear(dim, dim, bias=bias)
         self.qknorm = QKNorm(self.headdim)
-        self.gqa = self.heads != self.kvheads
         self.wo = nn.Linear(dim, dim, bias=bias)
+        # Flash attention via the platform backend (native GQA, no kv expand).
+        # Parameterless, so the identity checkpoint mapping is unaffected.
+        self.attn = USPAttention(
+            num_heads=self.heads,
+            head_size=self.headdim,
+            num_kv_heads=self.kvheads,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+        )
 
     def forward(
         self,
         qkv: Tensor,
         freqs: Tensor | None = None,
         key_mask: Tensor | None = None,
+        mask_meta: dict | None = None,
     ) -> Tensor:
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
@@ -210,8 +200,16 @@ class Attention(nn.Module):
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
 
-        attn = attention(q, k, v, gqa=self.gqa, key_mask=key_mask)
-        return self.wo(attn * F.sigmoid(gate))
+        # USPAttention expects [B, S, H, D]; a [B, S] key mask + varlen metadata
+        # routes a ragged batch through the FA varlen fast path, else maskless.
+        out = self.attn(
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
+            v.transpose(1, 2).contiguous(),
+            attn_mask=key_mask,
+            attn_mask_meta=mask_meta,
+        ).flatten(2)
+        return self.wo(out * F.sigmoid(gate))
 
 
 class LastLayer(nn.Module):
@@ -243,8 +241,13 @@ class TextFusionBlock(nn.Module):
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x: Tensor, key_mask: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.prenorm(x), key_mask=key_mask)
+    def forward(
+        self,
+        x: Tensor,
+        key_mask: Tensor | None = None,
+        mask_meta: dict | None = None,
+    ) -> Tensor:
+        x = x + self.attn(self.prenorm(x), key_mask=key_mask, mask_meta=mask_meta)
         x = x + self.mlp(self.postnorm(x))
         return x
 
@@ -280,7 +283,12 @@ class TextFusionTransformer(nn.Module):
             ]
         )
 
-    def forward(self, x: Tensor, key_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        key_mask: Tensor | None = None,
+        mask_meta: dict | None = None,
+    ) -> Tensor:
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
@@ -289,7 +297,7 @@ class TextFusionTransformer(nn.Module):
         x = self.projector(x)
         x = x.squeeze(-1)
         for block in self.refiner_blocks:
-            x = block(x, key_mask=key_mask)
+            x = block(x, key_mask=key_mask, mask_meta=mask_meta)
         return x
 
 
@@ -310,11 +318,16 @@ class SingleStreamBlock(nn.Module):
         self.mlp = SwiGLU(features, multiplier, bias)
 
     def forward(
-        self, x: Tensor, vec: Tensor, freqs: Tensor, key_mask: Tensor | None = None
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        key_mask: Tensor | None = None,
+        mask_meta: dict | None = None,
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, key_mask
+            (1 + prescale) * self.prenorm(x) + preshift, freqs, key_mask, mask_meta
         )
         x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
         return x
@@ -405,13 +418,16 @@ class K2Transformer2DModel(CachableDiT):
         tvec = self.tproj(t)
 
         # A single or same-prompt batch has no padding, so attention runs maskless
-        # (flash). A ragged batch carries an invalid-token mask -> mem-efficient.
-        txt_key = joint_key = None
+        # (native-GQA flash). A ragged batch builds varlen metadata from the
+        # key mask and takes the FA varlen path instead.
+        txt_key = txt_meta = joint_key = joint_meta = None
         if mask is not None and not bool(mask.all()):
             txt_key = mask[:, : context.shape[1]]
+            txt_meta = build_varlen_mask_meta(txt_key)
             joint_key = mask
+            joint_meta = build_varlen_mask_meta(mask)
 
-        context = self.txtfusion(context, key_mask=txt_key)
+        context = self.txtfusion(context, key_mask=txt_key, mask_meta=txt_meta)
         context = self.txtmlp(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]
@@ -419,7 +435,7 @@ class K2Transformer2DModel(CachableDiT):
         freqs = self.posemb(pos)
 
         for block in self.blocks:
-            combined = block(combined, tvec, freqs, joint_key)
+            combined = block(combined, tvec, freqs, joint_key, joint_meta)
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]
