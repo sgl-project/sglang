@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -74,6 +75,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -125,6 +127,18 @@ _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
+
+# Fused QK-norm + 3D mRoPE + KV-cache store (ROCm/aiter). Imported lazily and
+# guarded so the common (non-aiter) path stays byte-identical.
+_has_fused_qk_norm_mrope = False
+if _use_aiter:
+    try:
+        from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
+
+        _has_fused_qk_norm_mrope = True
+        logger.info("aiter fused_qk_norm_mrope_3d kernel available")
+    except ImportError:
+        pass
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -850,6 +864,108 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # Fused QK-norm + 3D mRoPE + KV-cache store (ROCm/aiter, decode only).
+        self.use_fused_qk_norm_mrope = (
+            _has_fused_qk_norm_mrope
+            and isinstance(self.rotary_emb, MRotaryEmbedding)
+            and getattr(self.rotary_emb, "mrope_section", None) is not None
+        )
+        if self.use_fused_qk_norm_mrope:
+            # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
+            # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph
+            # capture. Explicit device='cpu' is required because SGLang builds
+            # models inside a `with torch.device('cuda'):` context.
+            self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+            self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+
+    def forward_prepare_aiter_fused_mrope(
+        self, positions, hidden_states, forward_batch
+    ):
+        """Fused QK-norm + 3D mRoPE + KV-cache write for decode (ROCm/aiter).
+
+        The fused HIP kernel replaces split -> QK GemmaRMSNorm -> mRoPE ->
+        cache write, so KV is already in the paged cache when this returns.
+        Returns (q, None, None, gate); caller passes save_kv_cache=False.
+
+        Gemma QK-norm uses (1 + weight); the fused kernel applies a plain
+        RMSNorm (weight * x), so we feed the precomputed `gemma_weight`
+        (= weight + 1) instead of the raw weight.
+        """
+        qkv, _ = self.qkv_proj(hidden_states)
+        num_tokens = qkv.shape[0]
+
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            # q and gate are interleaved per head: [q(hd), gate(hd)] * num_heads
+            q_gate = q_gate.view(num_tokens, self.num_heads, 2, self.head_dim)
+            q = q_gate[:, :, 0, :].reshape(num_tokens, self.q_size)
+            gate = q_gate[:, :, 1, :].reshape(num_tokens, self.q_size)
+            # The fused op consumes a plain contiguous [q, k, v] buffer.
+            qkv = torch.cat((q, k, v), dim=-1).contiguous()
+        else:
+            gate = None
+            qkv = qkv.contiguous()
+
+        qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
+
+        token_to_kv_pool = get_token_to_kv_pool()
+        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        slot_mapping = forward_batch.out_cache_loc
+
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if cos_sin.dtype != qkv.dtype:
+            cos_sin = cos_sin.to(dtype=qkv.dtype)
+
+        q_out = torch.empty(
+            num_tokens,
+            self.num_heads,
+            self.head_dim,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+
+        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            qkv_3d,
+            self.q_norm.gemma_weight,
+            self.k_norm.gemma_weight,
+            cos_sin,
+            positions,
+            num_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.is_neox_style,
+            self.rotary_emb.mrope_section,
+            self.rotary_emb.mrope_interleaved,
+            self.q_norm.variance_epsilon,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            self._fused_k_scale,
+            self._fused_v_scale,
+            None,
+            None,
+            False,
+            False,
+            0,
+            0,
+            # rotary_dim: MUST be passed explicitly for partial-rotary models
+            # (Qwen3.5 uses partial_rotary_factor=0.25 -> rotary_dim=64). When
+            # left at the default 0 the kernel falls back to head_size/2 (=128)
+            # and the internal check `sum(mrope_section) == rotary_dim/2` fails
+            # (mrope_section=[11,11,10] sums to 32 == 64/2, not 128), which
+            # previously aborted cuda-graph capture with
+            # "mrope_section sum (32) must equal rotary_dim/2 (128)".
+            self.rotary_emb.rotary_dim,
+        )
+
+        q = q_out.reshape(num_tokens, -1)
+        return q, None, None, gate
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -958,7 +1074,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_hip and self.attn_output_gate:
+        save_kv_cache = True
+        if self.use_fused_qk_norm_mrope and forward_batch.forward_mode.is_decode():
+            q, k, v, gate = self.forward_prepare_aiter_fused_mrope(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            save_kv_cache = False
+        elif _is_hip and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_hip(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -979,7 +1103,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
 
         if self.attn_output_gate:
             if not _is_npu:
