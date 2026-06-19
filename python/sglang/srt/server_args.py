@@ -3736,6 +3736,7 @@ class ServerArgs:
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            self._handle_megamoe_waterfill_cap_buckets()
 
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -3829,6 +3830,35 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_megamoe_waterfill_cap_buckets(self):
+        """Enable conservative MegaMoE cap buckets for Waterfill by default.
+
+        B200 MegaMoE Waterfill benefits from a smaller eager DeepGEMM symmetric
+        buffer for medium prefill/decode shapes, while still needing the max
+        cap for large source-token batches. Preserve explicit user settings,
+        including an explicitly empty bucket list.
+        """
+        if not self.enable_deepep_waterfill:
+            return
+
+        buckets = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS
+        if buckets.is_set():
+            return
+
+        max_cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        if max_cap < 2048:
+            return
+
+        half_bucket = (max_cap // 2) // 1024 * 1024
+        if half_bucket <= 0 or half_bucket >= max_cap:
+            return
+
+        buckets.set(f"{half_bucket},{max_cap}")
+        logger.info(
+            "Auto-configuring DeepGEMM Mega-MoE cap buckets for Waterfill: %s.",
+            buckets.get(),
+        )
 
     def _handle_ep_dispatch_algorithm_default(self):
         if (

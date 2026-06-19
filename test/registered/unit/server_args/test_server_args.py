@@ -869,6 +869,56 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.moe_a2a_backend, "megamoe")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_waterfill_megamoe_auto_configures_cap_buckets(self):
+        buckets = (
+            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS
+        )
+        old_present = buckets.name in os.environ
+        old_value = os.environ.get(buckets.name)
+        try:
+            buckets.clear()
+            with server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8320
+            ):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    moe_a2a_backend="megamoe",
+                    enable_deepep_waterfill=True,
+                )
+                # dummy-model path short-circuits __post_init__; invoke the
+                # handler directly.
+                server_args._handle_a2a_moe()
+
+                self.assertEqual(buckets.get(), "4096,8320")
+        finally:
+            if old_present:
+                os.environ[buckets.name] = old_value
+            else:
+                buckets.clear()
+
+    def test_waterfill_megamoe_preserves_explicit_cap_buckets(self):
+        with (
+            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8320
+            ),
+            server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.override(
+                ""
+            ),
+        ):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                enable_deepep_waterfill=True,
+            )
+            # dummy-model path short-circuits __post_init__; invoke the handler
+            # directly.
+            server_args._handle_a2a_moe()
+
+            self.assertEqual(
+                server_args_module.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK_BUCKETS.get(),
+                "",
+            )
+
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",
