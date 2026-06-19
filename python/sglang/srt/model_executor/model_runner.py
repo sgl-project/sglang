@@ -913,7 +913,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # cg bucket). Both eager (graph-disabled mode AND eager fallback at
         # non-captured bs) and the cuda-graph runners then share the same
         # backend buffers — backends bind into them, and load_metadata refills
-        # per-iter. This is the foundation for collapsing the `use_bound` seam.
+        # per-iter. This is the foundation for the captured-bucket seam that
+        # each backend internalizes inside its `_compute_forward_metadata`.
         self._init_static_metadata_buffers_from_eager()
 
         # cuda-graph capture: prefill before decode, so both coalesce onto the
