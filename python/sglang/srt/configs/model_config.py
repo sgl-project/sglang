@@ -825,7 +825,8 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
-        # only GLM-Image used vision_vocab_size instead of vocab_size for lm_head and Logits Processor that used in GraphMode for buffer
+        # GLM-Image is the only model here whose output head predicts vision tokens.
+# Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
 
