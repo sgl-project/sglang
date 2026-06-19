@@ -162,8 +162,6 @@ def test_rope(
     is_neox: bool,
     dtype: torch.dtype,
 ) -> None:
-    if DEVICE is None:
-        pytest.skip("No CUDA or XPU device available")
 
     num_qo_heads = num_kv_heads * gqa_ratio
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
@@ -222,8 +220,6 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
-    if DEVICE is None:
-        pytest.skip("No CUDA or XPU device available")
 
     num_qo_heads, num_kv_heads = 8, 2
 
@@ -260,8 +256,6 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
-    if DEVICE is None:
-        pytest.skip("No CUDA or XPU device available")
 
     from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
 

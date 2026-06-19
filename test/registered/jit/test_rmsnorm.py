@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.srt.utils import get_device
@@ -62,11 +63,6 @@ SUPPORTED_HIDDEN_SIZE_LIST = get_ci_test_range(
     [256, 1024, 16384],
 )
 
-try:
-    DEVICE = get_device()
-except RuntimeError:
-    DEVICE = None
-
 
 @pytest.mark.parametrize(
     "batch_size,hidden_size",
@@ -91,7 +87,7 @@ def test_rmsnorm(
         else:
             output_sglang = input.clone()
             sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
-        torch.testing.assert_close(output_sglang, output_ref, atol=0.1, rtol=0.02)
+        triton.testing.assert_close(output_sglang, output_ref, atol=0.1, rtol=0.02)
         return
 
     input_flashinfer = input.clone()
@@ -105,7 +101,7 @@ def test_rmsnorm(
         output_sglang = input.clone()
         sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
 
-    torch.testing.assert_close(output_sglang, output_flashinfer, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(output_sglang, output_flashinfer, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 8192, 8704, 16384])
