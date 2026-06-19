@@ -103,6 +103,9 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     _weight_update_in_progress: bool = False
     _weight_update_loaded: bool = False
+    # Runner selector for the open session, recorded at begin_weight_update and
+    # reused by end_weight_update so the same set is restored and finalized.
+    _weight_update_selector: str = "all"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -278,9 +281,14 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Begin a weight-update session: restore in-place-packed weights to a
-        loadable state on every runner (target + draft), so the draft model is
-        prepared identically to the target."""
-        for _, runner in self.get_model_runners("all"):
+        loadable state on the selected runners (target and/or draft), so the draft
+        model is prepared identically to the target. The selector is recorded and
+        reused by end_weight_update so the same set is finalized."""
+        assert (
+            not self._weight_update_in_progress
+        ), "begin_weight_update called while a weight-update session is already open"
+        self._weight_update_selector = recv_req.selector
+        for _, runner in self.get_model_runners(recv_req.selector):
             runner.begin_weight_update()
         self._weight_update_in_progress = True
         self._weight_update_loaded = False
@@ -288,15 +296,15 @@ class SchedulerWeightUpdaterManager:
         return BeginWeightUpdateReqOutput(True, "Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
-        """End the weight-update session on every runner (target + draft): quant
-        finalize on the full model, plus model.post_load_weights only when
-        load_weights was bypassed this session (e.g. P2P/RDMA).
+        """End the weight-update session on the runners begin_weight_update opened
+        (its recorded selector): quant finalize on each, plus model.post_load_weights
+        only when load_weights was bypassed this session (e.g. P2P/RDMA).
         """
         assert (
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
         run_post_load = not self._weight_update_loaded
-        for _, runner in self.get_model_runners("all"):
+        for _, runner in self.get_model_runners(self._weight_update_selector):
             runner.end_weight_update(run_post_load=run_post_load)
         self._weight_update_in_progress = False
         torch.distributed.barrier(group=self.tp_cpu_group)

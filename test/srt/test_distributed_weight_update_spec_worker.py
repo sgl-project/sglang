@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -241,3 +243,45 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
         mr.ModelRunner.end_weight_update(runner, run_post_load=False)
     post_load.assert_not_called()
     postprocess.assert_called_once()
+
+
+def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
+    # begin(selector="draft") opens the session on the draft only; the target is
+    # untouched, and the selector is recorded for end to reuse.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier"):
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+
+    target_runner.begin_weight_update.assert_not_called()
+    draft_runner.begin_weight_update.assert_called_once_with()
+    assert manager._weight_update_selector == "draft"
+
+
+def test_end_weight_update_reuses_session_selector_from_begin():
+    # end has no selector of its own; it finalizes exactly the set begin opened.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier"):
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+    target_runner.end_weight_update.assert_not_called()
+    draft_runner.end_weight_update.assert_called_once()
+
+
+def test_begin_weight_update_rejects_reentry():
+    # A second begin while a session is open would leave the first session's
+    # restored runners unfinalized — reject it loudly.
+    manager = _session_manager(Mock(), Mock())
+    manager._weight_update_in_progress = True
+
+    with patch("torch.distributed.barrier"):
+        with pytest.raises(AssertionError, match="already open"):
+            manager.begin_weight_update(BeginWeightUpdateReqInput())

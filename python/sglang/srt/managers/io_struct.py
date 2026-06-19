@@ -1583,7 +1583,10 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 @dataclass
 class BeginWeightUpdateReqInput(BaseReq):
-    pass
+    # Which model runners this update session covers: "target" (main model only),
+    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
+    # the whole begin -> update -> end session; end finalizes the same set.
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 @dataclass
