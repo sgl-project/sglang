@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     get_param_names_mapping,
     set_default_torch_dtype,
 )
@@ -78,15 +79,65 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         if hasattr(vae_config, "post_init"):
             vae_config.post_init()
 
-    def _resolve_dit_weights(self) -> str:
-        if os.path.isfile(self.model_path) and self.model_path.endswith(".safetensors"):
-            return self.model_path
-        # Directory layout: default to the distilled turbo checkpoint.
+    def _resolve_dit_weights(self) -> list[str]:
+        """Resolve the K2 MMDiT to a list of safetensors shard paths.
+
+        Handles a single ``.safetensors`` file, a local directory, and a Hugging
+        Face repo id (downloaded first). Within a directory it prefers the named
+        ``turbo``/``raw`` checkpoints, then discovers single or sharded weights in
+        a diffusers-style ``transformer/`` subfolder, then at the root.
+        """
+        path = self.model_path
+        if os.path.isfile(path) and path.endswith(".safetensors"):
+            return [path]
+        if not os.path.isdir(path):
+            # HF repo id (or any non-local path): resolve to a local snapshot.
+            path = maybe_download_model(path)
+        # Prefer the distilled turbo checkpoint, then the raw one, by name.
         for name in ("turbo.safetensors", "raw.safetensors"):
-            candidate = os.path.join(self.model_path, name)
+            candidate = os.path.join(path, name)
             if os.path.isfile(candidate):
-                return candidate
-        raise FileNotFoundError(f"No K2 MMDiT safetensors found at {self.model_path}")
+                return [candidate]
+        # Otherwise discover all safetensors (single or sharded, via the index) in
+        # a diffusers-style transformer/ subfolder, then at the root.
+        for sub in ("transformer", "."):
+            files = _list_safetensors_files(os.path.join(path, sub))
+            if files:
+                return files
+        raise FileNotFoundError(
+            f"No K2 MMDiT safetensors found at {self.model_path} (looked for "
+            "turbo.safetensors / raw.safetensors, a transformer/ subfolder, and "
+            "*.safetensors at the root)."
+        )
+
+    def _dit_load_error_hint(
+        self, dit_weights: list[str], model, exc: Exception
+    ) -> str:
+        """Build an actionable message when the strict DiT load fails.
+
+        Surfaces the checkpoint vs. model parameter naming so a renamed public
+        checkpoint can be fixed with a ``param_names_mapping`` entry.
+        """
+        ckpt_keys: list[str] = []
+        try:
+            from safetensors import safe_open
+
+            for f in dit_weights:
+                with safe_open(f, framework="pt") as sf:
+                    ckpt_keys.extend(sf.keys())
+        except Exception:
+            pass
+        model_keys = list(model.state_dict().keys())
+        only_ckpt = sorted(set(ckpt_keys) - set(model_keys))[:8]
+        only_model = sorted(set(model_keys) - set(ckpt_keys))[:8]
+        return (
+            f"Failed to load the K2 MMDiT from {dit_weights}: {exc}\n"
+            f"Checkpoint has {len(ckpt_keys)} tensors; the model expects "
+            f"{len(model_keys)} params. If the published checkpoint renamed "
+            "parameters, add a param_names_mapping in K2ArchConfig.\n"
+            f"  checkpoint-only keys (sample): {only_ckpt}\n"
+            f"  model-only keys (sample): {only_model}"
+        )
 
     def _load_transformer(self, server_args: ServerArgs):
         dit_weights = self._resolve_dit_weights()
@@ -101,22 +152,27 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         default_dtype = resolve_precision(
             server_args, "dit", precision_attr="dit_precision"
         )
-        server_args.model_paths["transformer"] = os.path.dirname(dit_weights) or "."
+        server_args.model_paths["transformer"] = os.path.dirname(dit_weights[0]) or "."
 
         with set_default_torch_dtype(default_dtype), torch.device("meta"):
             model = model_cls(config=dit_config, hf_config={})
 
-        load_model_from_full_model_state_dict(
-            model,
-            safetensors_weights_iterator([dit_weights]),
-            get_local_torch_device(),
-            default_dtype,
-            strict=True,
-            cpu_offload=server_args.dit_cpu_offload,
-            param_names_mapping=get_param_names_mapping(
-                dit_config.arch_config.param_names_mapping
-            ),
-        )
+        try:
+            load_model_from_full_model_state_dict(
+                model,
+                safetensors_weights_iterator(dit_weights),
+                get_local_torch_device(),
+                default_dtype,
+                strict=True,
+                cpu_offload=server_args.dit_cpu_offload,
+                param_names_mapping=get_param_names_mapping(
+                    dit_config.arch_config.param_names_mapping
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                self._dit_load_error_hint(dit_weights, model, exc)
+            ) from exc
         for n, p in model.named_parameters():
             p.requires_grad = False
         return model
