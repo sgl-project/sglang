@@ -35,7 +35,9 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>  // for std::min
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 // Forward mode enum (must match Python ForwardMode in sglang/srt/layers/attention/dsa_backend.py)
 enum ForwardModeEnum { DECODE = 0, TARGET_VERIFY = 1, DRAFT_EXTEND = 2 };
