@@ -22,6 +22,20 @@ COMMON_ARGS = [
     "--enable-metrics",
 ]
 
+TP_MTP_ARGS = [
+    "--speculative-algorithm=EAGLE",
+    "--speculative-num-steps=3",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=4",
+]
+
+DP_MTP_ARGS = [
+    "--speculative-algorithm=EAGLE",
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
+]
+
 
 class TestKimiK25Nvfp4(unittest.TestCase):
     """Kimi-K2.5 NVFP4 on GB300 (4x B200 NVL4, tp=4).
@@ -34,14 +48,16 @@ class TestKimiK25Nvfp4(unittest.TestCase):
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS,
+                extra_args=COMMON_ARGS + TP_MTP_ARGS,
                 variant="TP4",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                extra_args=COMMON_ARGS
+                + ["--dp-size=4", "--enable-dp-attention"]
+                + DP_MTP_ARGS,
+                variant="TP4+DP4+DPA+MTP",
             ),
         ]
 

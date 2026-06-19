@@ -16,16 +16,22 @@ COMMON_ARGS = [
     "--tool-call-parser=glm47",
     "--quantization=modelopt_fp4",
     "--moe-runner-backend=flashinfer_trtllm",
-    "--kv-cache-dtype=bfloat16",
     "--mem-fraction-static=0.9",
     "--enable-metrics",
 ]
 
-MTP_ARGS = [
+TP_MTP_ARGS = [
     "--speculative-algorithm=EAGLE",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",
+]
+
+DP_MTP_ARGS = [
+    "--speculative-algorithm=EAGLE",
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
 ]
 
 
@@ -37,21 +43,15 @@ class TestGlm5Nvfp4(unittest.TestCase):
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS,
-                variant="TP4",
-            ),
-            ModelLaunchSettings(
-                MODEL_PATH,
-                tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                extra_args=COMMON_ARGS + TP_MTP_ARGS,
+                variant="TP4+MTP",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=COMMON_ARGS
                 + ["--dp-size=4", "--enable-dp-attention"]
-                + MTP_ARGS,
+                + DP_MTP_ARGS,
                 variant="TP4+DP4+DPA+MTP",
             ),
         ]
