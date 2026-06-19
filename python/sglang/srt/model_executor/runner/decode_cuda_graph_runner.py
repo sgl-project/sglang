@@ -779,6 +779,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
+        # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
+        # wide pool, so they may alias a buffer seeded by an earlier runner (the
+        # eager registry fills them with 0). The capture-time attention-metadata
+        # plan reads these as the per-request KV length, and the prefill wrapper
+        # (DLLM_EXTEND) asserts kv_len >= qo_len, so restore the fill value the
+        # captured graph needs before capturing.
+        self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+        self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
