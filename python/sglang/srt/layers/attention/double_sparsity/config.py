@@ -5,8 +5,8 @@ The configuration surface is intentionally narrow: ``top_k``, ``page_size``,
 ``selection_mode`` / ``top_p`` / ``min_top_k`` / ``max_top_k`` — top-p selection
 (Twilight) is a separate follow-on with its own ABI design.
 
-``top_k`` counts maximum **tokens** per request (not pages).  At Option B
-operating point this matches the model's intrinsic ``index_topk=2048``.
+``top_k`` counts maximum **tokens** per request (not pages).  At the DSA
+index-topk operating point this matches the model's intrinsic ``index_topk=2048``.
 ``device_buffer_size`` is the score-scratch buffer cap (maximum concurrently
 live tokens for the decode scoring scratch tensor).
 """

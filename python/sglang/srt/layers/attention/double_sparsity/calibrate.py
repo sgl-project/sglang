@@ -424,8 +424,8 @@ def _collect_channel_importance(
       ``[T, H, nope+rope]`` FIRST, then slice ``[..., :nope_dim]``.
 
     The reshape-before-slice order is critical: flat-slicing first picks V or
-    RoPE columns from later heads (the exact bug fixed in dsa_backend.py
-    Round 3).
+    RoPE columns from later heads (the exact bug fixed in dsa_backend.py:
+    flat-slicing would pick V/RoPE columns from later heads).
 
     For standard attention (Llama / GLM):
     * K side — ``k_proj`` or ``wk`` output → reshape ``[T, H, head_dim]``.

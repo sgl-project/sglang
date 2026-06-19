@@ -75,7 +75,7 @@ if _TRITON_AVAILABLE:
         scores_stride_b: tl.constexpr,
         SHIFT: tl.constexpr,         # bits below the digit being counted
         PREFIX_SHIFT: tl.constexpr,  # SHIFT + radix bits (start of the fixed prefix)
-        PREFIX_BITS: tl.constexpr,   # number of key bits already fixed (0 in round 1)
+        PREFIX_BITS: tl.constexpr,   # number of key bits already fixed (0 on the first radix pass)
         NBINS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):

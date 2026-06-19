@@ -93,18 +93,22 @@ unless exactly `--num-prompts` requests completed, and passes iff p50 decode TPS
 
 ### Measured (this run, conc-64, 1 prefix group, 256 prompts completed, seed 42, GLM-5.1-FP8, 8×H200)
 
-| Metric | loop-11b ref | Band | Native DSA (same base) | **DS (this branch)** |
+| Metric | loop-11b ref | Band | Native DSA (same base, context only) | **DS (this branch)** |
 |--------|-----------|------|------|------|
 | p50 decode TPS | 26.9 | ≥ 24.2 | 26.06 | **35.05** ✅ |
-| P99 TTFT | 25.1 s | ≤ 30.1 s | 46.50 s | **22.90 s** ✅ |
+| P99 TTFT | 25.1 s | ≤ 30.1 s | 46.50 s (not in band) | **22.90 s** ✅ |
 
-(`actual_completed=256`, `gsp_num_groups=1`, `request_shape_ok=true` — see
-`development/loop12/perf_evidence/verdict.json`. The native-DSA column was run on
-the same base before the wrapper pinned grouping; both DS and DSA meet the band
-once the workload shape is fixed.)
+The **accepted** result is the DS column, measured on the corrected single-group
+workload: `actual_completed=256`, `gsp_num_groups=1`, `request_shape_ok=true`,
+`parity=true` — see `development/loop12/perf_evidence/verdict.json`. The
+native-DSA column is **same-base context only**: it was a separate earlier run
+made *before* the wrapper pinned the GSP grouping, so it is NOT a corrected-shape
+measurement and is not a pass/fail baseline. Its 46.50 s P99 TTFT is shown only
+to illustrate that the high conc-64 TTFT on this base is not DS-specific (DS, at
+22.90 s, is well inside the band).
 
-DS meets the loop-11b parity band and, on this base, **beats native DSA on
-decode**. The decode result depends on the selector-width graph ladder
+DS meets the loop-11b parity band. The decode result depends on the
+selector-width graph ladder
 (`selector_width_buckets`, default `[5120]`): the captured graph scores only the
 covering width (5120) instead of the full `req_to_token` width (~202k here), so
 without it DS decode collapses to ~18.8 TPS. The CUDA-graph runner keys decode

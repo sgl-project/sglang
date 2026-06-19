@@ -6,7 +6,7 @@ that the FlashMLA ``flashmla_kv`` sparse path consumes.
 
 The DS selector returns logical sequence positions (0-indexed within the
 request's sequence) sorted ascending with ``-1`` padding.  FlashMLA's
-sparse path (Option B) consumes ``int32[bs, get_dsa_index_topk]`` physical
+sparse path consumes ``int32[bs, get_dsa_index_topk]`` physical
 token indices — the same values that ``dsa_indexer.py`` uses for
 ``page_table_1`` (values from ``req_to_token``).
 

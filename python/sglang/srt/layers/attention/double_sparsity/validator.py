@@ -215,9 +215,9 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
 
     # top_k vs get_dsa_index_topk(hf_config) boot assert.
     # DS must pick the same number of tokens as the DSA lightning indexer so the
-    # Option B apples-to-apples comparison holds (top_k == index_topk). Two
+    # apples-to-apples comparison holds (top_k == index_topk). Two
     # sanctioned exceptions, each with its OWN mechanism:
-    #   * top_k > index_topk (a WIDER budget) is the Tier-2.A lifted-budget path:
+    #   * top_k > index_topk (a WIDER budget) is the lifted-budget path:
     #     opt in via enable_lifted_budget_decode + lifted_budget_top_k. It is NOT
     #     unlocked by SGLANG_DS_ALLOW_TOPK_MISMATCH (which is an equality-mismatch
     #     ablation, not the lifted-budget ABI).
@@ -248,7 +248,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                 if config.top_k > model_topk and not lifted:
                     raise ValueError(
                         f"Double Sparsity top_k={config.top_k} > DSA index_topk={model_topk}. "
-                        "A wider-than-index_topk budget is the Tier-2.A lifted-budget path: "
+                        "A wider-than-index_topk budget is the lifted-budget path: "
                         "set enable_lifted_budget_decode=true + lifted_budget_top_k in "
                         "--double-sparsity-config. (Do NOT use SGLANG_DS_ALLOW_TOPK_MISMATCH "
                         "for this — that is an equality-mismatch ablation, not the "
@@ -259,7 +259,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                         raise ValueError(
                             f"Double Sparsity top_k={config.top_k} does not match the model's "
                             f"DSA index_topk={model_topk}. The two must agree for the "
-                            "Option B apples-to-apples comparison. Either set "
+                            "apples-to-apples comparison. Either set "
                             f"top_k={model_topk} in --double-sparsity-config or set "
                             "SGLANG_DS_ALLOW_TOPK_MISMATCH=1 to override."
                         )
