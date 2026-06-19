@@ -1,7 +1,9 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
@@ -156,3 +158,86 @@ def test_disk_update_target_failure_short_circuits_draft_and_flush():
     assert "target boom" in output.message
     draft_runner.update_weights_from_disk.assert_not_called()
     manager.flush_cache.assert_not_called()
+
+
+def _session_manager(target_runner, draft_runner):
+    return _manager(
+        tp_worker=SimpleNamespace(iter_runners=lambda: [("", target_runner)]),
+        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
+    )
+
+
+def test_begin_weight_update_restores_target_and_draft():
+    # The session begins on every runner (target + draft): the draft model is
+    # restored to a loadable state identically to the target.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier"):
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+    assert output.success is True
+    target_runner.begin_weight_update.assert_called_once_with()
+    draft_runner.begin_weight_update.assert_called_once_with()
+    assert manager._weight_update_in_progress is True
+    assert manager._weight_update_loaded is False
+
+
+def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
+    # No load_weights happened this session (e.g. P2P/RDMA), so end runs
+    # post_load_weights then quant finalize on BOTH target and draft.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_loaded = False
+
+    with patch("torch.distributed.barrier"):
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+    assert output.success is True
+    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
+    draft_runner.end_weight_update.assert_called_once_with(run_post_load=True)
+    assert manager._weight_update_in_progress is False
+
+
+def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
+    # A distributed/tensor load happened this session, so post_load is skipped on
+    # both runners; only quant finalize runs.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_loaded = True
+
+    with patch("torch.distributed.barrier"):
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+    target_runner.end_weight_update.assert_called_once_with(run_post_load=False)
+    draft_runner.end_weight_update.assert_called_once_with(run_post_load=False)
+
+
+def test_model_runner_begin_end_wire_to_loader_hooks():
+    # ModelRunner.begin/end delegate to the loader: begin restores; end runs
+    # post_load only when requested, always finalizes quant layout.
+    import sglang.srt.model_executor.model_runner as mr
+
+    runner = SimpleNamespace(model=object(), device="cpu")
+
+    with patch.object(mr, "restore_weight") as restore:
+        mr.ModelRunner.begin_weight_update(runner)
+    restore.assert_called_once()
+
+    with patch.object(mr, "post_load_weights") as post_load, patch.object(
+        mr, "postprocess_weight"
+    ) as postprocess:
+        mr.ModelRunner.end_weight_update(runner, run_post_load=True)
+    post_load.assert_called_once()
+    postprocess.assert_called_once()
+
+    with patch.object(mr, "post_load_weights") as post_load, patch.object(
+        mr, "postprocess_weight"
+    ) as postprocess:
+        mr.ModelRunner.end_weight_update(runner, run_post_load=False)
+    post_load.assert_not_called()
+    postprocess.assert_called_once()
