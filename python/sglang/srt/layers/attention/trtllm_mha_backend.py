@@ -144,20 +144,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Whether `(bs, forward_mode)` has a captured cuda-graph metadata
-        object — only True when a cuda-graph runner previously captured this
-        bucket. Internal to `_compute_forward_metadata` (not part of the
-        backend API; see that method for the seam semantics).
-        """
-        if forward_mode.is_decode_or_idle():
-            return bs in self.decode_cuda_graph_metadata
-        if forward_mode.is_target_verify():
-            return bs in self.target_verify_metadata
-        if forward_mode.is_draft_extend_v2():
-            return bs in getattr(self, "draft_extend_metadata", {})
-        return False
-
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
@@ -255,8 +241,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        # cu_seqlens_q is always pre-allocated (was previously gated on
+        # speculative_num_draft_tokens > 0). The per-iter view rebuild in
+        # _compute_forward_metadata slices [:bs+1] for every mode, so the
+        # shared buffer must exist for both spec and non-spec deployments.
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -269,8 +265,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         }
 
-        # SWA write-target buffer; bound as a [:num_tokens] view in
-        # _build_cuda_graph_metadata, refilled before each replay in
+        # SWA write-target buffer; sliced as a [:num_tokens] view per-iter
+        # by _compute_forward_metadata, and refilled before each replay in
         # init_forward_metadata_out_graph.
         self.cuda_graph_swa_out_cache_loc = (
             torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
@@ -282,12 +278,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
-            self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
-            )
-            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            )
             self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -348,104 +338,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
             }
 
-    def _build_cuda_graph_metadata(
-        self,
-        bs: int,
-        num_tokens: int,
-        forward_mode: ForwardMode,
-        spec_info,
-        device: torch.device,
-    ) -> TRTLLMMHAMetadata:
-        """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
-        metadata = TRTLLMMHAMetadata()
-
-        if forward_mode.is_decode_or_idle():
-            if spec_info is not None:
-                # Draft Decode (topk = 1)
-                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
-                    "cache_seqlens"
-                ][:bs]
-                metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
-                    : bs + 1
-                ]
-                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
-                    : bs + 1
-                ]
-                metadata.page_table = self.decode_cuda_graph_metadata[
-                    "page_table_draft_decode"
-                ][:bs, :]
-                self._bind_swa_page_table(
-                    metadata,
-                    self.decode_cuda_graph_metadata,
-                    "swa_page_table_draft_decode",
-                    bs,
-                )
-                self.decode_cuda_graph_metadata[bs] = metadata
-            else:
-                # Normal Decode
-                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
-                    "cache_seqlens"
-                ][:bs]
-                metadata.cu_seqlens_q = torch.arange(
-                    0, bs + 1, dtype=torch.int32, device=device
-                )
-                metadata.cu_seqlens_k = torch.zeros(
-                    bs + 1, dtype=torch.int32, device=device
-                )
-                metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
-                    :bs, :
-                ]
-                self._bind_swa_page_table(
-                    metadata,
-                    self.decode_cuda_graph_metadata,
-                    "swa_page_table",
-                    bs,
-                )
-                self.decode_cuda_graph_metadata[bs] = metadata
-        elif forward_mode.is_target_verify():
-            # Target Verify (topk = 1)
-            tokens_per_req = num_tokens // bs
-            metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
-                :bs
-            ]
-            metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
-                : bs + 1
-            ]
-            metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
-                : bs + 1
-            ]
-            metadata.max_seq_len_q = tokens_per_req
-            metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
-            self._bind_swa_page_table(
-                metadata,
-                self.target_verify_metadata,
-                "swa_page_table",
-                bs,
-            )
-            self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = num_tokens // bs
-            metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
-                :bs
-            ]
-            metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
-            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][: bs + 1]
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
-            self._bind_swa_page_table(
-                metadata,
-                self.draft_extend_metadata,
-                "swa_page_table",
-                bs,
-            )
-            self.draft_extend_metadata[bs] = metadata
-
-        # Bind the SWA write-target buffer slice (refilled at replay).
-        if self.use_sliding_window_kv_pool:
-            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-
-        return metadata
-
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
@@ -494,16 +386,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if in_capture:
-            num_tokens = forward_batch.positions.numel()
-            self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
-            )
-
-        # Single eager == replay == capture metadata path. The seam between
-        # the pre-bound per-bs cuda-graph metadata (refilled in place) and a
-        # freshly-built per-iter object is internal to _compute_forward_metadata;
-        # callers do not need to know which path is taken.
+        # Single eager == replay == capture path: capturable modes rebuild a
+        # metadata view per-iter from the shared max-bs buffers (storage stable
+        # across iters → cuda graph captured data_ptrs stay valid); plain
+        # EXTEND builds a fresh per-iter metadata. No pre-bound dict needed.
         self._compute_forward_metadata(forward_batch, in_capture=in_capture)
 
     def _compute_forward_metadata(
@@ -512,57 +398,80 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Single source of truth for TRTLLM-MHA forward metadata, shared by
         eager, capture, and replay.
 
-        Internally selects between the pre-bound per-bs cuda-graph metadata
-        (refilled in place at capture / replay / eager-at-captured-bs) and a
-        fresh per-iter object (pure-eager / non-captured bs; plain EXTEND;
-        eager draft_extend_v2). The captured pre-roll
-        (_build_cuda_graph_metadata) is called by init_forward_metadata_out_graph
-        before this method when ``in_capture`` is True.
+        Capturable modes (decode_or_idle / target_verify / draft_extend_v2)
+        rebuild a metadata view per-iter from the shared max-bs buffers
+        allocated in ``init_static_metadata_buffers``; storage is stable
+        across iters so cuda graph captured data_ptrs remain valid. Plain
+        EXTEND (and eager DLLM_EXTEND) builds a fresh per-iter metadata.
         """
         bs = forward_batch.batch_size
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        # Internalize the captured-bucket seam — every caller goes through this
-        # function; the public API does not expose it.
-        _has_captured_metadata = in_capture or self._has_captured_metadata(
-            bs, forward_mode
-        )
-
-        if _has_captured_metadata:
-            # Bound cuda-graph path (replay / capture / eager-at-captured-bs):
-            # refill the pre-bound per-bs metadata in place. Mirrors the old
-            # _apply_cuda_graph_metadata body exactly ([:bs] slicing, in-place
-            # copy_ into the captured buffer slices).
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        ):
+            # Capturable modes: rebuild a TRTLLMMHAMetadata view per-iter
+            # from the shared max-bs buffers (init_static_metadata_buffers
+            # allocates them once). Storage is stable across iters so cuda
+            # graph data_ptrs stay valid — capture, replay, and eager all
+            # execute this single body.
             seq_lens = forward_batch.seq_lens[:bs]
             seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
             req_pool_indices = forward_batch.req_pool_indices[:bs]
-            metadata = None
+            metadata = TRTLLMMHAMetadata()
             if forward_mode.is_decode_or_idle():
                 if spec_info is not None:
-                    # Draft Decode
-                    # Here we only support topk = 1 for now.
-                    metadata = self.decode_cuda_graph_metadata[bs]
+                    # Draft Decode (topk = 1)
                     metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                         "cache_seqlens"
                     ][:bs]
+                    metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_q"
+                    ][: bs + 1]
+                    metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_k"
+                    ][: bs + 1]
+                    metadata.page_table = self.decode_cuda_graph_metadata[
+                        "page_table_draft_decode"
+                    ][:bs, :]
+                    self._bind_swa_page_table(
+                        metadata,
+                        self.decode_cuda_graph_metadata,
+                        "swa_page_table_draft_decode",
+                        bs,
+                    )
                     metadata.cache_seqlens_int32.copy_(
                         seq_lens + self.speculative_step_id + 1
                     )
                     metadata.max_seq_len_k = seq_lens.max().item() + (
                         self.speculative_step_id + 1
                     )
-
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
                 else:
                     # Normal Decode
-                    metadata = self.decode_cuda_graph_metadata[bs]
+                    metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                        "cache_seqlens"
+                    ][:bs]
+                    metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_q"
+                    ][: bs + 1]
+                    metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_k"
+                    ][: bs + 1]
+                    metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
+                        :bs, :
+                    ]
+                    self._bind_swa_page_table(
+                        metadata, self.decode_cuda_graph_metadata, "swa_page_table", bs
+                    )
                     max_len = seq_lens_cpu.max().item()
                     max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                     metadata.max_seq_len_k = max_len
-
                     metadata.cache_seqlens_int32.copy_(seq_lens)
 
                 metadata.cu_seqlens_k[1:].copy_(
@@ -579,14 +488,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
             elif forward_mode.is_target_verify():
-                # Here we only support topk = 1 for now.
-                metadata = self.target_verify_metadata[bs]
+                # Target Verify (topk = 1)
+                metadata.cache_seqlens_int32 = self.target_verify_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
+                metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                self._bind_swa_page_table(
+                    metadata, self.target_verify_metadata, "swa_page_table", bs
+                )
                 metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
-
                 metadata.max_seq_len_k = (
                     seq_lens_cpu.max().item() + metadata.max_seq_len_q
                 )
-                max_len = seq_lens_cpu.max().item()
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
@@ -602,43 +522,41 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
             elif forward_mode.is_draft_extend_v2():
-                metadata = self.draft_extend_metadata[bs]
+                metadata.cache_seqlens_int32 = self.draft_extend_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
+                metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
+                self._bind_swa_page_table(
+                    metadata, self.draft_extend_metadata, "swa_page_table", bs
+                )
                 metadata.cache_seqlens_int32.copy_(seq_lens)
-
                 metadata.max_seq_len_k = seq_lens_cpu.max().item()
-                max_len = seq_lens_cpu.max().item()
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
-                if forward_mode.is_draft_extend_v2():
-                    num_tokens_per_bs = spec_info.num_tokens_per_req
-                    if num_tokens_per_bs <= 0:
-                        # Capture uses a synthetic EagleDraftExtendInput; infer the
-                        # fixed V2 stride from the capture buffer when it is unset.
-                        num_tokens_per_bs = int(
-                            spec_info.num_accept_tokens[:bs].max().item()
-                        )
-                    metadata.max_seq_len_q = num_tokens_per_bs
-                    metadata.cu_seqlens_q[1:].copy_(
-                        torch.arange(
-                            num_tokens_per_bs,
-                            bs * num_tokens_per_bs + 1,
-                            num_tokens_per_bs,
-                            dtype=torch.int32,
-                            device=metadata.cu_seqlens_q.device,
-                        )
+                num_tokens_per_bs = spec_info.num_tokens_per_req
+                if num_tokens_per_bs <= 0:
+                    # Capture uses a synthetic EagleDraftExtendInput; infer the
+                    # fixed V2 stride from the capture buffer when it is unset.
+                    num_tokens_per_bs = int(
+                        spec_info.num_accept_tokens[:bs].max().item()
                     )
-                else:
-                    extend_lens = spec_info.num_accept_tokens[:bs]
-                    if spec_info.num_accept_tokens_cpu:
-                        metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-                    else:
-                        metadata.max_seq_len_q = 1
-
-                    metadata.cu_seqlens_q[1:].copy_(
-                        torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.arange(
+                        num_tokens_per_bs,
+                        bs * num_tokens_per_bs + 1,
+                        num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=metadata.cu_seqlens_q.device,
                     )
-
+                )
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
@@ -782,12 +700,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             self.forward_metadata = metadata
 
-        # Captured-bucket SWA: refill the captured write-target buffer from
-        # the live out_cache_loc before replay (the per-bs metadata holds a
-        # view bound in _build_cuda_graph_metadata). The fresh path sets
-        # metadata.swa_out_cache_loc directly inside the body above.
+        # Capturable-mode SWA: refill the shared write-target buffer from the
+        # live out_cache_loc before replay. The plain-EXTEND fresh path sets
+        # metadata.swa_out_cache_loc directly inside its body above.
         if (
-            _has_captured_metadata
+            (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
         ):
