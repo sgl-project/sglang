@@ -9,7 +9,8 @@
 // and crashes under load. Pin dockerImages + benchmarks.sglang_version to a build at a commit
 // ≥ #28604. See /sgl-workspace/laguna-m1-day0-checklist.md (step 2) + laguna-m1-results.md.
 //
-// Model is now natively supported (#28400) → NO --trust-remote-code needed.
+// --trust-remote-code is required: M.1 ships custom config code on the Hub (the transformers-native
+// `laguna` config is incompatible). Carried on every cell.
 //
 // Hardware: H200 (Hopper) + B200/B300/GB200/GB300 (Blackwell).
 //   - BF16 runs everywhere.
@@ -151,7 +152,7 @@ sgl-eval run gsm8k \\
 
   // One Balanced cell per valid (hw × quant): H200×{BF16,FP8}; each Blackwell×{BF16,FP8,NVFP4}.
   // Blackwell FP8 cells add `--fp8-gemm-backend triton` (DeepGEMM UE8M0 workaround, pending #28662);
-  // H200 FP8 needs no such flag. Baseline recipe (parsers poolside_v1, NO --trust-remote-code) on every cell.
+  // H200 FP8 needs no such flag. Baseline recipe (parsers poolside_v1 + --trust-remote-code) on every cell.
   // TP: H200/B200/B300 = --tp 8; GB200/GB300 = --tp 4 (4-GPU single node).
   // verified:true = ran that exact command on that hardware and it served correctly + passed a
   // GSM8K-class eval. Absent verified = yellow/unverified badge.
@@ -164,6 +165,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -180,6 +182,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -195,6 +198,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -211,6 +215,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -226,6 +231,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -239,6 +245,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -252,6 +259,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -265,6 +273,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
@@ -278,6 +287,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
@@ -291,6 +301,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
@@ -304,6 +315,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
@@ -317,6 +329,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
@@ -330,6 +343,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
@@ -343,6 +357,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 4",
