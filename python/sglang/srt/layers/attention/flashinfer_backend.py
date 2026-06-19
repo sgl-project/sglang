@@ -1545,6 +1545,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(seq_lens)
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)

@@ -37,6 +37,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
+    TLI = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -112,6 +113,9 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_tli(self) -> bool:
+        return self == SpeculativeAlgorithm.TLI
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
@@ -157,7 +161,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_tli()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.
@@ -169,6 +173,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_tli,
         )
 
         if self.is_dflash():
@@ -177,6 +182,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
             _handle_eagle_family(server_args)
+        elif self.is_tli():
+            _handle_tli(server_args)
         elif self.is_ngram():
             _handle_ngram(server_args)
 
@@ -232,6 +239,10 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return StandaloneWorkerV2
+        elif self.is_tli():
+            from sglang.srt.speculative.tli_worker import TLIWorker
+
+            return TLIWorker
         elif self.is_ngram():
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
@@ -303,7 +314,11 @@ def create_dummy_verify_input(
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
     spec_info = None
-    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+    if (
+        spec_algorithm.is_eagle()
+        or spec_algorithm.is_standalone()
+        or spec_algorithm.is_tli()
+    ):
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:

@@ -134,6 +134,7 @@ class EagleDraftWorkerBase(ABC):
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_model_runner.spec_algorithm.is_standalone()
+            or draft_model_runner.spec_algorithm.is_tli()
             else CaptureHiddenMode.FULL
         )
         batch.forward_mode = (
@@ -257,6 +258,7 @@ class EagleDraftWorkerBase(ABC):
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_model_runner.spec_algorithm.is_standalone()
+            or draft_model_runner.spec_algorithm.is_tli()
             else CaptureHiddenMode.LAST
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)

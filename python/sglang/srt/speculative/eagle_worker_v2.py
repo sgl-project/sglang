@@ -965,6 +965,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
+                or self.speculative_algorithm.is_tli()
                 else CaptureHiddenMode.FULL
             )
             batch.capture_hidden_mode = target_capture_mode
@@ -1002,6 +1003,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.speculative_algorithm.is_standalone()
+                    or self.speculative_algorithm.is_tli()
                     else CaptureHiddenMode.LAST
                 )
                 batch.spec_info = EagleDraftInput.create_idle_input(

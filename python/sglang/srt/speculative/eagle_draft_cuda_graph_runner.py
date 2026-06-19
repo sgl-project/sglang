@@ -261,6 +261,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_tli()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -340,6 +341,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_tli()
             else CaptureHiddenMode.LAST
         )
         spec_info = EagleDraftInput(
@@ -438,6 +440,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 max_num_tokens // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_tli()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)

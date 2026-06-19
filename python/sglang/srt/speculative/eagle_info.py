@@ -190,14 +190,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         """Decode-phase `hidden_states` width: draft self-chain output
         (draft model writes its own last hidden back via `capture_for_decode`
         and the draft loop). Returns None when the draft architecture doesn't
-        consume the field (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
+        consume the field (e.g., STANDALONE, TLI)."""
+        if (
+            worker.speculative_algorithm.is_standalone()
+            or worker.speculative_algorithm.is_tli()
+        ):
             return None
         return _draft_runner_of(worker).model_config.spec_hidden_size
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
+        if (
+            worker.speculative_algorithm.is_standalone()
+            or worker.speculative_algorithm.is_tli()
+        ):
             return None
         return _draft_runner_of(worker).model_config.dtype
 
@@ -337,8 +343,11 @@ class EagleDraftExtendInput(SpecInput):
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
         widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
         None when the draft architecture doesn't consume the field
-        (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
+        (e.g., STANDALONE, TLI)."""
+        if (
+            worker.speculative_algorithm.is_standalone()
+            or worker.speculative_algorithm.is_tli()
+        ):
             return None
         target_cfg = worker.target_worker.model_runner.model_config
         if not (
@@ -361,7 +370,10 @@ class EagleDraftExtendInput(SpecInput):
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
+        if (
+            worker.speculative_algorithm.is_standalone()
+            or worker.speculative_algorithm.is_tli()
+        ):
             return None
         return worker.target_worker.model_runner.model_config.dtype
 

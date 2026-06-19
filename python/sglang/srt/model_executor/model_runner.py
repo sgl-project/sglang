@@ -471,7 +471,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
         if (
-            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
+            (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or self.spec_algorithm.is_tli()
+            )
             and not self.is_draft_worker
             and server_args.speculative_draft_model_path
         ):
@@ -2822,7 +2826,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.is_draft_worker,
         )
         if spec_info is not None and (
-            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_tli()
         ):
             # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
             # during forward; provide a dummy so warmup doesn't crash.

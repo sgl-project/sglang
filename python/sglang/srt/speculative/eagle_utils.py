@@ -330,6 +330,7 @@ def eagle_prepare_for_verify(
     capture_mode = (
         CaptureHiddenMode.NULL
         if target_worker.model_runner.spec_algorithm.is_standalone()
+        or target_worker.model_runner.spec_algorithm.is_tli()
         else CaptureHiddenMode.FULL
     )
     batch.capture_hidden_mode = capture_mode

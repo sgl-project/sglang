@@ -368,6 +368,68 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_tli(server_args: ServerArgs) -> None:
+    if server_args.enable_dp_attention:
+        raise ValueError("TLI speculative decoding does not support dp attention.")
+
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "TLI speculative decoding requires setting "
+            "--speculative-draft-model-path to a model with a different "
+            "but overlapping vocabulary."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for TLI speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap scheduler is disabled when using TLI speculative decoding "
+        "(spec v2 is not supported yet)."
+    )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using "
+            "TLI speculative decoding."
+        )
+
+    if server_args.speculative_num_steps is None:
+        assert (
+            server_args.speculative_eagle_topk is None
+            and server_args.speculative_num_draft_tokens is None
+        )
+        (
+            server_args.speculative_num_steps,
+            server_args.speculative_eagle_topk,
+            server_args.speculative_num_draft_tokens,
+        ) = _auto_choose_speculative_params(server_args, "TLI")
+
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk != 1
+    ):
+        raise ValueError(
+            "TLI speculative decoding only supports speculative_eagle_topk == 1."
+        )
+    server_args.speculative_eagle_topk = 1
+
+    if (
+        server_args.speculative_num_draft_tokens
+        != server_args.speculative_num_steps + 1
+    ):
+        logger.warning(
+            "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+            "for TLI speculative decoding."
+        )
+        server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+
+
 def _handle_ngram(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("Ngram speculative decoding only supports CUDA device.")
@@ -478,7 +540,7 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if server_args.speculative_algorithm == "STANDALONE":
+    if server_args.speculative_algorithm in ("STANDALONE", "TLI"):
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
