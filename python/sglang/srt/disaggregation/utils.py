@@ -638,6 +638,22 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # unified_kv: the SWA ring lives in the unified buffers (no separate
+            # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
+            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
+                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
+            ):
+                ring_ptrs, ring_lens, ring_item_lens = (
+                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
+                )
+                if ring_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.SWA_RING,
+                        ring_ptrs,
+                        ring_lens,
+                        ring_item_lens,
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

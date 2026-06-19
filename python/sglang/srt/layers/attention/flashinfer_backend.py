@@ -556,7 +556,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -627,24 +627,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
-            )
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged,
-                False,
-                False,
-                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -812,11 +794,7 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-        elif (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-            or forward_mode.is_dllm_extend()
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
                 forward_mode.is_target_verify()
                 and spec_info is not None

@@ -1861,7 +1861,7 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
 #   1. Multi-query-per-request: `num_input_tokens = sum(input_lens)`.
 #   2. Routes through `forward_extend` rather than `forward_decode`.
 #      Production picks `dsa_decode_impl` (default `flashmla_kv`)
-#      because `is_draft_extend(include_v2=True)` is in the
+#      because `is_draft_extend_v2()` is in the
 #      decode-impl branch (`dsa_backend.py:1352-1358`).
 #   3. DraftBackendFactory returns a single `DeepseekSparseAttnBackend`
 #      (not a multi-step wrapper) via `_create_dsa_prefill_backend`.
