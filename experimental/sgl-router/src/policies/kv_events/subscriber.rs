@@ -1,12 +1,14 @@
 //! Per-worker, per-DP-rank ZMQ subscriber for SGLang's `ZmqEventPublisher`.
 //!
-//! This module owns the I/O plumbing between SGLang workers (which publish
-//! KV-cache events on a PUB socket — see
-//! `python/sglang/srt/disaggregation/kv_events.py`) and the in-memory hash
-//! tree consumed by [`super::index::KvEventIndex`]. Each `(worker_url,
-//! dp_rank)` pair gets its own SUB socket on its own tokio task, decodes
-//! msgpack batches via [`super::wire`], and forwards [`WorkerEvent`]s to
-//! a shared mpsc channel.
+//! This module owns the I/O plumbing between SGLang workers (which publish on
+//! a PUB socket via `python/sglang/srt/utils/event_publisher.py` —
+//! KV-cache events from `disaggregation/kv_events.py`, load gauges from
+//! `managers/scheduler_components/load_publisher.py`) and the in-memory state
+//! consumed by [`super::index::KvEventIndex`]. Each `(worker_url, dp_rank)`
+//! pair gets its own SUB socket on its own tokio task, decodes msgpack frames
+//! by [`SubKind`] (KV batches via [`super::wire`], load via
+//! [`crate::policies::engine_load`]), and forwards [`WorkerEvent`]s to a
+//! shared mpsc channel.
 //!
 //! # Wire format (3-frame multipart)
 //!
@@ -70,6 +72,7 @@ use zeromq::{Socket, SocketRecv, SubSocket, ZmqMessage};
 use super::discovery::EventConfig;
 use super::tree::KvWorkerId;
 use super::wire::{decode_event_batch, KvEventBatch};
+use crate::policies::engine_load::{decode_load_stat, LoadStat};
 
 /// Maximum number of consecutive `recv()` errors before the subscriber
 /// gives up and exits its task. ZMQ's internal reconnect handles transient
@@ -92,7 +95,25 @@ const CONNECT_BACKOFF_CAP: Duration = Duration::from_secs(2);
 /// signal is handled correctly.
 const END_SEQ_SENTINEL: i64 = -1;
 
+/// Which topic a subscriber task listens on, and therefore what kind of
+/// [`WorkerEvent`] it produces. KV-cache events feed the hash tree (with
+/// sequence-ordered dedup); load snapshots feed the engine-load table (a
+/// gauge — no sequence semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubKind {
+    /// Cache-delta topic (`BlockStored` / `BlockRemoved` / `AllBlocksCleared`).
+    Kv,
+    /// Load-snapshot topic (`LoadStat`).
+    Load,
+}
+
 /// Message forwarded from a per-worker subscriber task to the pump.
+///
+/// The variants partition by subscriber [`SubKind`]: `Batch` and
+/// `PublisherReset` come only from a `SubKind::Kv` subscriber and carry the
+/// cache stream's sequence/replay semantics; `Load` comes only from a
+/// `SubKind::Load` subscriber and is a seqless gauge. A given subscriber
+/// never emits both families.
 #[derive(Debug)]
 pub enum WorkerEvent {
     /// A normal decoded event batch.
@@ -104,6 +125,14 @@ pub enum WorkerEvent {
         seq: i64,
         /// Decoded batch payload.
         batch: KvEventBatch,
+    },
+    /// A runtime load snapshot from the load topic. Carries no sequence
+    /// number: load is a gauge, applied last-value-wins with no dedup.
+    Load {
+        /// Identity of the SGLang worker (DP rank) that produced this load.
+        worker: KvWorkerId,
+        /// Latest load snapshot for this `(worker, dp_rank)`.
+        load: LoadStat,
     },
     /// The publisher emitted its `END_SEQ` (-1) sentinel, signalling
     /// shutdown. A re-connecting publisher will restart its sequence
@@ -117,6 +146,7 @@ impl WorkerEvent {
     pub fn worker(&self) -> &KvWorkerId {
         match self {
             Self::Batch { worker, .. } => worker,
+            Self::Load { worker, .. } => worker,
             Self::PublisherReset { worker } => worker,
         }
     }
@@ -142,19 +172,32 @@ struct Inner {
 
 /// Owns one ZMQ SUB connection per `(worker_url, dp_rank)`. Forwards
 /// decoded batches to a tokio mpsc channel supplied at construction time.
+///
+/// A registry is single-kind: a [`SubKind::Kv`] registry subscribes to the
+/// cache topic and emits [`WorkerEvent::Batch`]; a [`SubKind::Load`] registry
+/// subscribes to the load topic and emits [`WorkerEvent::Load`]. The index
+/// runs one of each, both feeding the same pump channel, so KV and load
+/// subscribers for the same worker never collide in the handle map.
 pub struct KvEventSubscriberRegistry {
     inner: Arc<Inner>,
+    kind: SubKind,
 }
 
 impl KvEventSubscriberRegistry {
-    /// Build an empty registry. `tx` is where decoded events flow out;
-    /// the channel buffer capacity is the caller's choice.
+    /// Build an empty KV-cache registry. `tx` is where decoded events flow
+    /// out; the channel buffer capacity is the caller's choice.
     pub fn new(tx: mpsc::Sender<WorkerEvent>) -> Self {
+        Self::with_kind(tx, SubKind::Kv)
+    }
+
+    /// Build an empty registry of the given kind.
+    pub fn with_kind(tx: mpsc::Sender<WorkerEvent>, kind: SubKind) -> Self {
         Self {
             inner: Arc::new(Inner {
                 tx,
                 handles: Mutex::new(HashMap::new()),
             }),
+            kind,
         }
     }
 
@@ -174,6 +217,24 @@ impl KvEventSubscriberRegistry {
     /// If `cfg.port_base + dp_rank` overflows `u16`, that rank is skipped
     /// with a `warn!` log and the remaining ranks proceed.
     pub async fn add_worker(&self, worker_url: &str, cfg: &EventConfig) {
+        // (port_base, topic) depend on this registry's kind. KV uses the cache
+        // socket + configured topic; Load uses the dedicated load socket (own
+        // port range) and subscribe-all (that socket carries only load). A Load
+        // registry whose worker advertises no load port (older engine) opens no
+        // sockets at all.
+        let (port_base, topic) = match self.kind {
+            SubKind::Kv => (cfg.port_base, cfg.topic.clone()),
+            SubKind::Load => match cfg.load_port_base {
+                Some(p) => (p, String::new()),
+                None => {
+                    debug!(
+                        worker_url = %worker_url,
+                        "kv-events: worker advertises no load port; skipping load subscribers"
+                    );
+                    return;
+                }
+            },
+        };
         let mut handles = self.inner.handles.lock().await;
         for dp_rank in 0..cfg.dp_size {
             let id = KvWorkerId {
@@ -188,13 +249,14 @@ impl KvEventSubscriberRegistry {
                 );
                 continue;
             }
-            let port = match u16::try_from(cfg.port_base as u32 + dp_rank) {
+            let port = match u16::try_from(port_base as u32 + dp_rank) {
                 Ok(p) => p,
                 Err(_) => {
                     warn!(
                         worker_url = %worker_url,
                         dp_rank,
-                        port_base = cfg.port_base,
+                        port_base,
+                        kind = ?self.kind,
                         "ZMQ event port overflows u16; skipping this rank"
                     );
                     continue;
@@ -205,7 +267,8 @@ impl KvEventSubscriberRegistry {
             let join = spawn_subscriber_task(
                 id.clone(),
                 endpoint,
-                cfg.topic.clone(),
+                topic.clone(),
+                self.kind,
                 self.inner.tx.clone(),
                 cancel.clone(),
             );
@@ -286,11 +349,12 @@ fn spawn_subscriber_task(
     id: KvWorkerId,
     endpoint: String,
     topic: String,
+    kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_subscriber(id, endpoint, topic, tx, cancel).await;
+        run_subscriber(id, endpoint, topic, kind, tx, cancel).await;
     })
 }
 
@@ -305,6 +369,7 @@ async fn run_subscriber(
     id: KvWorkerId,
     endpoint: String,
     topic: String,
+    kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
 ) {
@@ -313,6 +378,7 @@ async fn run_subscriber(
         dp_rank = id.dp_rank,
         endpoint = %endpoint,
         topic = %topic,
+        kind = ?kind,
         "starting kv-event subscriber"
     );
 
@@ -337,7 +403,7 @@ async fn run_subscriber(
                 match res {
                     Ok(msg) => {
                         errors_in_a_row = 0;
-                        if let Some(event) = decode_message(&id, msg) {
+                        if let Some(event) = decode_message(&id, msg, kind) {
                             if tx.send(event).await.is_err() {
                                 // The pump (or the entire index) is gone.
                                 // This is unexpected mid-stream; warn so
@@ -462,8 +528,9 @@ async fn connect_with_backoff(
 
 /// Validate, parse, and decode a single 3-frame multipart ZMQ message.
 /// Returns `None` (with logging) for any non-event input (bad frame
-/// count, sentinel sequence, or msgpack decode error).
-fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
+/// count, sentinel sequence, or msgpack decode error). `kind` selects
+/// whether to emit a KV [`WorkerEvent::Batch`] or a [`WorkerEvent::Load`].
+fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<WorkerEvent> {
     if msg.len() != 3 {
         warn!(
             worker_url = %id.url,
@@ -498,41 +565,77 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
     let seq = i64::from_be_bytes(seq_bytes);
 
     if seq == END_SEQ_SENTINEL {
-        info!(
-            worker_url = %id.url,
-            dp_rank = id.dp_rank,
-            "publisher signalled shutdown (END_SEQ); forwarding cursor reset"
-        );
-        return Some(WorkerEvent::PublisherReset { worker: id.clone() });
+        match kind {
+            SubKind::Kv => {
+                info!(
+                    worker_url = %id.url,
+                    dp_rank = id.dp_rank,
+                    "publisher signalled shutdown (END_SEQ); forwarding cursor reset"
+                );
+                return Some(WorkerEvent::PublisherReset { worker: id.clone() });
+            }
+            // Load has no cursor / replay state to reset — just drop.
+            SubKind::Load => return None,
+        }
     }
 
-    let batch = match decode_event_batch(payload.as_ref()) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
+    // Decode by kind: the cache topic carries `KvEventBatch`es, the load
+    // topic carries bare `LoadStat` snapshots — two independent wire formats
+    // on two independent sockets.
+    match kind {
+        SubKind::Kv => {
+            let batch = match decode_event_batch(payload.as_ref()) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        worker_url = %id.url,
+                        dp_rank = id.dp_rank,
+                        seq,
+                        error = %e,
+                        "failed to decode KV event batch payload; dropping"
+                    );
+                    return None;
+                }
+            };
+            trace!(
                 worker_url = %id.url,
                 dp_rank = id.dp_rank,
                 seq,
-                error = %e,
-                "failed to decode KV event batch payload; dropping"
+                n_events = batch.events.len(),
+                "decoded KV event batch"
             );
-            return None;
+            Some(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch,
+            })
         }
-    };
-
-    trace!(
-        worker_url = %id.url,
-        dp_rank = id.dp_rank,
-        seq,
-        n_events = batch.events.len(),
-        "decoded KV event batch"
-    );
-
-    Some(WorkerEvent::Batch {
-        worker: id.clone(),
-        seq,
-        batch,
-    })
+        SubKind::Load => {
+            let load = match decode_load_stat(payload.as_ref()) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(
+                        worker_url = %id.url,
+                        dp_rank = id.dp_rank,
+                        seq,
+                        error = %e,
+                        "failed to decode load snapshot payload; dropping"
+                    );
+                    return None;
+                }
+            };
+            trace!(
+                worker_url = %id.url,
+                dp_rank = id.dp_rank,
+                seq,
+                "decoded load snapshot"
+            );
+            Some(WorkerEvent::Load {
+                worker: id.clone(),
+                load,
+            })
+        }
+    }
 }
 
 /// Pull the host out of a routing URL like `http://10.0.0.1:30000` or
@@ -591,6 +694,7 @@ mod tests {
                 host: extract_host(worker_url).unwrap_or_else(|| "127.0.0.1".to_string()),
                 port_base,
                 topic: String::new(),
+                load_port_base: None,
                 block_size: 64,
                 dp_size,
                 is_bigram: false,
@@ -615,6 +719,29 @@ mod tests {
                 }
                 None => mp::write_nil(&mut buf).unwrap(),
             }
+            buf
+        }
+
+        /// Encode a LoadStat batch `[ts, [["LoadStat", running, waiting,
+        /// num_tokens, max_total]], dp_rank?]` in msgspec's array layout.
+        /// Encode a bare LoadStat msgpack array `["LoadStat", running, waiting,
+        /// num_tokens, max_total, attn_dp_rank]` — the payload on the load
+        /// socket (no EventBatch envelope).
+        pub fn encode_load_stat(
+            running: u64,
+            waiting: u64,
+            num_tokens: u64,
+            max_total: u64,
+            attn_dp_rank: u32,
+        ) -> Vec<u8> {
+            let mut buf = Vec::new();
+            mp::write_array_len(&mut buf, 6).unwrap();
+            mp::write_str(&mut buf, "LoadStat").unwrap();
+            mp::write_uint(&mut buf, running).unwrap();
+            mp::write_uint(&mut buf, waiting).unwrap();
+            mp::write_uint(&mut buf, num_tokens).unwrap();
+            mp::write_uint(&mut buf, max_total).unwrap();
+            mp::write_uint(&mut buf, attn_dp_rank as u64).unwrap();
             buf
         }
 
@@ -644,6 +771,9 @@ mod tests {
         pub fn expect_batch(ev: WorkerEvent) -> (KvWorkerId, i64, KvEventBatch) {
             match ev {
                 WorkerEvent::Batch { worker, seq, batch } => (worker, seq, batch),
+                WorkerEvent::Load { worker, .. } => {
+                    panic!("expected Batch, got Load for {worker:?}")
+                }
                 WorkerEvent::PublisherReset { worker } => {
                     panic!("expected Batch, got PublisherReset for {worker:?}")
                 }
@@ -1252,32 +1382,61 @@ mod tests {
 
         // Wrong frame count.
         let one_frame = ZmqMessage::from(Bytes::from_static(b"only"));
-        assert!(decode_message(&id, one_frame).is_none());
+        assert!(decode_message(&id, one_frame, SubKind::Kv).is_none());
 
         // Sentinel seq = -1 now surfaces as PublisherReset (not None) so
         // the downstream pump can clear its cursor before a reconnecting
         // publisher restarts from seq=1.
         let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
-        let reset = decode_message(&id, sentinel).expect("END_SEQ forwards");
+        let reset = decode_message(&id, sentinel, SubKind::Kv).expect("END_SEQ forwards");
         assert!(matches!(reset, WorkerEvent::PublisherReset { .. }));
 
         // Bad seq frame length.
         let mut bad_seq = ZmqMessage::from(Bytes::new());
         bad_seq.push_back(Bytes::from_static(b"abc")); // 3 bytes, not 8
         bad_seq.push_back(Bytes::from_static(b""));
-        assert!(decode_message(&id, bad_seq).is_none());
+        assert!(decode_message(&id, bad_seq, SubKind::Kv).is_none());
 
         // Bad payload.
         let bad_payload = helpers::build_multipart(1, vec![0xff, 0xfe]);
-        assert!(decode_message(&id, bad_payload).is_none());
+        assert!(decode_message(&id, bad_payload, SubKind::Kv).is_none());
 
         // Happy path.
         let payload = helpers::encode_all_blocks_cleared_batch(0.0, None);
         let good = helpers::build_multipart(7, payload);
-        let event = decode_message(&id, good).expect("should decode");
+        let event = decode_message(&id, good, SubKind::Kv).expect("should decode");
         let (worker, seq, _batch) = helpers::expect_batch(event);
         assert_eq!(seq, 7);
         assert_eq!(worker, id);
+    }
+
+    /// A `SubKind::Load` subscriber decodes a bare LoadStat frame into
+    /// `WorkerEvent::Load`, and drops the END_SEQ sentinel (no cursor state).
+    #[test]
+    fn decode_message_load_kind() {
+        let id = KvWorkerId {
+            url: "http://x".to_string(),
+            dp_rank: 1,
+        };
+
+        // END_SEQ is dropped for the load topic.
+        let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
+        assert!(decode_message(&id, sentinel, SubKind::Load).is_none());
+
+        // A bare LoadStat frame becomes WorkerEvent::Load.
+        let payload = helpers::encode_load_stat(5, 2, 100, 1000, 1);
+        let msg = helpers::build_multipart(3, payload);
+        let event = decode_message(&id, msg, SubKind::Load).expect("should decode load");
+        match event {
+            WorkerEvent::Load { worker, load } => {
+                assert_eq!(worker, id);
+                assert_eq!(load.num_running_reqs, 5);
+                assert_eq!(load.num_waiting_reqs, 2);
+                assert_eq!(load.num_tokens, 100);
+                assert_eq!(load.max_total_num_tokens, 1000);
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
     }
 
     /// Restart-resume contract: after a worker is removed and then re-added
