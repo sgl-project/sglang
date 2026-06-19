@@ -26,7 +26,7 @@ from sglang.srt.layers.moe.moe_runner.torch_npu import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput, StandardCombineInput, CombineInput
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
 
 __all__ = ["GPTQMoEAscendScheme", "GPTQMarlinMoEScheme"]
