@@ -17,6 +17,8 @@ from typing import Any, List, Tuple
 
 import torch
 
+from sglang.srt.utils import is_xpu
+
 from .utils import (
     KERNEL_PATH,
     CPPArgList,
@@ -49,9 +51,8 @@ def _get_sycl_aot_flags() -> List[str]:
     Falls back to generic spir64 if device can't be detected.
     """
     try:
-        import torch
 
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if is_xpu():
             dev_name = torch.xpu.get_device_name(0).lower()
             # BMG (Arc B-series, Battlemage) — IP version 20
             if (
@@ -194,12 +195,6 @@ def _get_icpx_version() -> str:
         return result.stdout.strip()
     except Exception:
         return ""
-
-
-@cache_once
-def is_xpu_available() -> bool:
-    """Check if XPU is available."""
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
 @cache_once
@@ -384,7 +379,7 @@ def load_jit_sycl(
     :rtype: SYCLModule
     """
 
-    if not is_xpu_available():
+    if not is_xpu():
         raise RuntimeError("XPU is not available. Cannot compile SYCL kernels.")
 
     if not is_icpx_available():
@@ -560,7 +555,6 @@ def load_jit_sycl(
 
 __all__ = [
     "load_jit_sycl",
-    "is_xpu_available",
     "is_icpx_available",
     "make_cpp_args",
     "CPPArgList",

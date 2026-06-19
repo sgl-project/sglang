@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import is_hip, is_xpu

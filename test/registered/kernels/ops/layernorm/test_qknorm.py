@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import get_device
@@ -105,8 +106,8 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
         torch_impl_qknorm(q_k_ref[0], q_k_ref[1], q_weight, k_weight)
     else:
         sglang_aot_qknorm(q_k_ref[0], q_k_ref[1], q_weight, k_weight)
-    torch.testing.assert_close(q_k_jit[0], q_k_ref[0], atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(q_k_jit[1], q_k_ref[1], atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(q_k_jit[0], q_k_ref[0], atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(q_k_jit[1], q_k_ref[1], atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
