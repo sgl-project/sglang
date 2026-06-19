@@ -28,7 +28,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Callable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import human_readable_int
@@ -70,11 +70,18 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
+        shard_dir_fn: Callable[[str], str],
         extra_config: Optional[dict] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
+        # Maps a suffixed key to the (relative) shard subdir its .bin file
+        # lives in. Supplied by HiCacheFile so both classes agree on layout
+        # without this module depending on hicache_storage.py (which would
+        # reintroduce the circular import this evictor is lazily imported to
+        # avoid -- see the module docstring).
+        self._shard_dir_fn = shard_dir_fn
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -294,25 +301,26 @@ class LRUFileEvictor:
         return fs[1] - value_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
-        """Seed LRU index from disk on startup (oldest mtime first)."""
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
+        """Seed LRU index from disk on startup (oldest mtime first).
+
+        Files now live under 2-level shard subdirectories rather than flat in
+        ``file_path``, so this walks the tree instead of a single listdir.
+        """
         entries = []
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
-            # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
-                continue
-            fp = os.path.join(self.file_path, fn)
-            try:
-                st = os.stat(fp)
-            except OSError:
-                continue
-            entries.append((st.st_mtime, stem, st.st_size))
+        for dirpath, _dirnames, filenames in os.walk(self.file_path):
+            for fn in filenames:
+                if not fn.endswith(".bin"):
+                    continue
+                stem = fn[:-4]
+                # Only files belonging to this rank/model.
+                if not stem.endswith(self.config_suffix):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
         for _, stem, size in entries:
             self._lru[stem] = size
@@ -338,7 +346,9 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        tensor_path = os.path.join(
+            self.file_path, self._shard_dir_fn(evict_stem), f"{evict_stem}.bin"
+        )
         try:
             os.remove(tensor_path)
             freed = evict_size
