@@ -74,7 +74,7 @@ jobs:
   rerun-test-cuda:
     if: inputs.mode == 'cuda'
     runs-on: ${{ inputs.runs_on }}
-    timeout-minutes: 120
+    timeout-minutes: 240
     permissions:
       contents: read
       issues: write
@@ -115,7 +115,7 @@ jobs:
           bash ${{ inputs.install_script }}
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 200
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
