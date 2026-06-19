@@ -41,7 +41,6 @@ PER_COMMIT_SUITES = {
         "jit-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
-        "stage-c-test-4-gpu-amd-mi35x",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
