@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner import stats_logger as stats_logger_module
 from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker
 from sglang.srt.kv_canary.state import CanaryDeviceState
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
     make_config,
@@ -20,6 +20,7 @@ from sglang.test.kv_canary.runner_test_base import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestSelfUnitManagerHealth(CanaryManagerTestCase):

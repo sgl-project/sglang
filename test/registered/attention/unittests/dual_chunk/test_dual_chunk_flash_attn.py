@@ -13,9 +13,11 @@ from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention 
     DualChunkAttentionCase,
     make_dual_chunk_cases,
     make_dual_chunk_sparse_cases,
+    make_dual_chunk_sparse_sub_window_cases,
     make_dual_chunk_sparse_threshold_gated_cases,
     run_dual_chunk_attention_case,
     run_dual_chunk_sparse_attention_case,
+    run_dual_chunk_sparse_sub_window_case,
     run_dual_chunk_sparse_threshold_gated_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
@@ -75,6 +77,9 @@ class TestDualChunkFlashAttentionBackendCorrectness(CustomTestCase):
     SPARSE_THRESHOLD_GATED_CASES = make_dual_chunk_sparse_threshold_gated_cases(
         "dual_chunk_flash_attn"
     )
+    SPARSE_SUB_WINDOW_CASES = make_dual_chunk_sparse_sub_window_cases(
+        "dual_chunk_flash_attn"
+    )
     # Replay prefix_lens must each be >= capture_prefix_len (= fill-value - 1).
     # Dual-chunk's `get_cuda_graph_seq_len_fill_value()` returns 1, so capture
     # uses prefix=0. We pick a 3-request batch with varied lengths to exercise
@@ -106,34 +111,10 @@ class TestDualChunkFlashAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dual_chunk_sparse_threshold_gated_case(self, case)
 
-    # Sub-context-window sparse pruning: BLOCKED on production-side
-    # edge cases.
-    #
-    # The `run_dual_chunk_sparse_sub_window_case` helper in
-    # `common/attention_methods/dual_chunk_attention.py` is left in
-    # place for when those production gaps are fixed, but no test
-    # method invokes it today. See `dual_chunk/README.md` →
-    # "Sub-context-window sparse pruning" for the engineering paths
-    # and the two production bugs surfaced while attempting to land
-    # this coverage:
-    #
-    #  - `dual_chunk_flashattention_backend.py:1110-1122`: when a chunk's
-    #    `intra_vertical_indices.nelement() == 0`, the fallback appends
-    #    `torch.arange(0, intra_K_size, max(1, intra_K_size/5))` which
-    #    can produce more elements than the `vertical_size`-slot buffer
-    #    allows, raising `RuntimeError: The size of tensor a (4) must
-    #    match the size of tensor b (5)`. Triggered by
-    #    `vertical_size in [4, 5]` with `seq_len=128`.
-    #  - With `vertical_size=8` to avoid the overflow above, the sparse
-    #    kernel raises a `cudaErrorIllegalAddress` deep inside
-    #    `_vertical_slash_sparse_attention`, suggesting the
-    #    `convert_vertical_slash_indexes` block math expects different
-    #    invariants than what a `vertical_size + slash_size < chunk_len`
-    #    config supplies.
-    #
-    # The all-column + threshold-gated cases above keep the integration
-    # path covered; sub-window correctness needs production hardening
-    # before unit-test coverage is safe.
+    def test_sparse_dual_chunk_sub_window_cases(self):
+        for case in self.SPARSE_SUB_WINDOW_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dual_chunk_sparse_sub_window_case(self, case)
 
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_DECODE_CASES:

@@ -22,15 +22,18 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
-)
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -121,13 +124,16 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if (
+            forward_batch.forward_mode.is_extend()
+            and get_tc_piecewise_forward_context() is not None
+        ):
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
                 output = torch.empty_like(q)
             if is_in_breakable_cuda_graph():
-                bcg_unified_attention_with_output(
+                breakable_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
             else:
@@ -167,7 +173,7 @@ def unified_attention_with_output(
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    context = get_forward_context()
+    context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
@@ -178,6 +184,13 @@ def unified_attention_with_output(
         key = key[:real_num_tokens]
     if value is not None:
         value = value[:real_num_tokens]
+
+    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+    # attn_mha) that share the same layer_id. The attention_layers list only
+    # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
+    # the companion attn_mha so the backend sees correct head/dim metadata.
+    if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
+        attention_layer = attention_layer._pcg_mha_companion
 
     kwargs = {}
     if q_rope is not None:
@@ -218,7 +231,28 @@ def unified_attention_with_output(
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip:
+        # During PCG replay on AMD, varlen attention kernels only fill positions
+        # 0..actual_tokens-1 and leave padded positions with uninitialized
+        # garbage from torch.empty.  Zero these so garbage (NaN/Inf) does not
+        # propagate through residual connections, MoE routing, and allreduce.
+        # Use context.raw_num_tokens (pre-padding count from PCG runner)
+        # instead of forward_batch.extend_num_tokens, because
+        # extend_num_tokens is None for TARGET_VERIFY (EAGLE) batches.
+        pcg_static_tokens = context.num_tokens
+        actual_tokens = context.raw_num_tokens
+        if (
+            pcg_static_tokens is not None
+            and actual_tokens is not None
+            and pcg_static_tokens > actual_tokens
+        ):
+            first_dim = output.shape[0]
+            elems_per_token = output.numel() // first_dim
+            output.view(first_dim, elems_per_token)[actual_tokens:].zero_()
     return
 
 
-bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)
+breakable_unified_attention_with_output = eager_on_graph(True)(
+    unified_attention_with_output
+)
