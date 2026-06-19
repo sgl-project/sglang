@@ -68,6 +68,9 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_evict_dsv4_state,
+)
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -1743,6 +1746,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
+    # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
+    out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2596,10 +2602,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
-            self.req_pool_indices_cpu = (
-                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2624,7 +2626,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
@@ -2692,17 +2695,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
+            # Filter out all requests. Stale tensors are left as-is: is_empty()
+            # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
-            self.req_pool_indices = torch.empty(
-                0, dtype=torch.int64, device=self.device
-            )
-            self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
-            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-            self.out_cache_loc = None
-            self.seq_lens_sum = 0
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2760,15 +2755,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
-        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
-            self.req_pool_indices_cpu = (
-                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
-        if other.req_pool_indices_cpu is None and other.req_pool_indices is not None:
-            other.req_pool_indices_cpu = (
-                other.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2886,6 +2872,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every eviction_interval tokens to reduce the overhead.
                     if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
+
+                    # DSV4-NPU only (no-op elsewhere): the small paged compress-state
+                    # pool must drain every decode step, independent of SWA cadence.
+                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer

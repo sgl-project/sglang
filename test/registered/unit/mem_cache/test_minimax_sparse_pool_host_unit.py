@@ -311,18 +311,10 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
         device_indices = self._token_indices_for_pages(
             device_pages, page_size, device="cuda"
         )
-        # page_first kernel routes through the staged write-back kernel
-        # (staged_write_back.cuh), whose verifier requires dst_indices on
-        # CPU/CUDAHost; layer_first kernel (hicache.cuh) accepts CUDA indices.
-        host_indices_device = (
-            "cpu"
-            if (io_backend, layout) == ("kernel", "page_first")
-            else ("cuda" if io_backend == "kernel" else "cpu")
-        )
         host_indices = self._token_indices_for_pages(
             host_pages,
             page_size,
-            device=host_indices_device,
+            device="cuda" if io_backend == "kernel" else "cpu",
         )
 
         kv_host.backup_from_device_all_layer(
