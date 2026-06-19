@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32

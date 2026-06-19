@@ -11,18 +11,21 @@ import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUUnquantMoEMethod,
 )
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -31,12 +34,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
-
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUUnquantMoEMethod,
-)
-
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -860,27 +857,26 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         # Store params_dtype for pre-dequantization
         self.params_dtype = params_dtype
 
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         """Pre‑dequantize GGUF MoE weights – weights are already TP‑sharded."""
-    
+
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
-    
+
         # ----------------------------------------------------------------
         # w13 (gate + up)
         # ----------------------------------------------------------------
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
         num_experts = w13_qweight.shape[0]
-    
+
         # In some loaders, gate & up remain separate → merge them now.
         # We expect w13 to have 2*intermediate_size_per_partition rows per expert.
         current_rows = w13_qweight.shape[1] if w13_qweight.dim() == 3 else 0
         # Use w2's per‑expert rows to infer the expected w13 size (2x)
-        w2_rows = layer.w2_qweight.shape[1]          # intermediate_size_per_partition
+        w2_rows = layer.w2_qweight.shape[1]  # intermediate_size_per_partition
         expected_rows = 2 * w2_rows
-    
+
         if current_rows == 0 or current_rows == w2_rows:
             # Need to merge from data_container (or already only one of gate/up loaded)
             data = w13_qweight.data_container  # list of tensors
@@ -888,14 +884,16 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 merged = []
                 for e in range(num_experts):
                     gate = data[2 * e]
-                    up   = data[2 * e + 1]
+                    up = data[2 * e + 1]
                     merged.append(torch.cat([gate, up], dim=0))
-                w13_qweight = torch.stack(merged, dim=0)        # (E, 2*inter_shard, hidden_quant)
+                w13_qweight = torch.stack(
+                    merged, dim=0
+                )  # (E, 2*inter_shard, hidden_quant)
             else:
                 raise RuntimeError(
                     f"w13_qweight has unexpected data_container size: {len(data)}"
                 )
-    
+
         # Dequantize
         if w13_qtype not in UNQUANTIZED_TYPES:
             dequant_list = []
@@ -908,23 +906,23 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)           # (2*inter_shard, hidden)
+                    .reshape(rows, cols)  # (2*inter_shard, hidden)
                     .contiguous()
                 )
                 dequant_list.append(dequant)
-            w13_full = torch.stack(dequant_list, dim=0)   # (E, 2*inter_shard, hidden)
+            w13_full = torch.stack(dequant_list, dim=0)  # (E, 2*inter_shard, hidden)
         else:
             w13_full = w13_qweight.data.to(self.params_dtype).clone()
-    
+
         w13_full = npu_format_cast(w13_full)
         layer.register_buffer("w13_dequant", w13_full, persistent=False)
-    
+
         # ----------------------------------------------------------------
         # w2 (down projection)
         # ----------------------------------------------------------------
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
-    
+
         if w2_qtype not in UNQUANTIZED_TYPES:
             dequant_list = []
             block_size, type_size = gguf.GGML_QUANT_SIZES[w2_qtype]
@@ -936,17 +934,17 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)           # (inter_shard, hidden)
+                    .reshape(rows, cols)  # (inter_shard, hidden)
                     .contiguous()
                 )
                 dequant_list.append(dequant)
-            w2_full = torch.stack(dequant_list, dim=0)       # (E, inter_shard, hidden)
+            w2_full = torch.stack(dequant_list, dim=0)  # (E, inter_shard, hidden)
         else:
             w2_full = w2_qweight.data.to(self.params_dtype).clone()
-    
+
         w2_full = npu_format_cast(w2_full)
         layer.register_buffer("w2_dequant", w2_full, persistent=False)
-    
+
         # Clean up original quantized tensors
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
@@ -976,6 +974,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_dequant,
         )
         return self.runner.run(dispatch_output, quant_info)
+
 
 class GGUFEmbeddingAscendMethod(GGUFLinearAscendMethod):
     """Embedding method for GGUF on Ascend NPU."""

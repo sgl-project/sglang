@@ -405,7 +405,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         )
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
@@ -420,8 +420,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     def apply(
         self,
         layer,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
             w13_weight=layer.w13_weight,

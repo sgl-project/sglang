@@ -33,6 +33,7 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
     Standard NPU MoE finalize routing.
     Reassembles the results of the expert calculations in the original token order.
     """
+
     def __init__(self, drop_pad_mode: int = 0):
         self.drop_pad_mode = drop_pad_mode
 

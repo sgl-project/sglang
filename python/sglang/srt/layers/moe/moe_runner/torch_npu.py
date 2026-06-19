@@ -10,10 +10,10 @@ import torch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUGeluAndMul,
     NPUSwiglu,
+    NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
-    NPUSwigluDeepEPKernel,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
@@ -44,6 +45,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
+
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -110,7 +112,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
     def run(
         self,
         runner_input: TorchNpuRunnerInput,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: TorchNpuQuantInfo,
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TorchNpuRunnerOutput:
@@ -145,7 +147,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states, pertoken_scale = self.activation._apply_activation(
                 hidden_states
             )
-        
+
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -262,9 +264,8 @@ def post_permute_torch_npu_to_torch_npu(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TorchNpuCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
-        TorchNpuCombineInput
-    )
+    from sglang.srt.layers.moe.token_dispatcher.torch_npu import TorchNpuCombineInput
+
     return TorchNpuCombineInput(hidden_states=runner_output.hidden_states)
 
 
@@ -275,9 +276,8 @@ def post_permute_torch_npu_to_deepep_normal(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPNormalCombineInput
-    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
     return DeepEPNormalCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
@@ -292,9 +292,8 @@ def post_permute_torch_npu_to_deepep_ll(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPLLCombineInput
-    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],

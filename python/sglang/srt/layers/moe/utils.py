@@ -260,7 +260,9 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 
     # 1. Parse quant config to determine the output dtype of dispatcher
     if dispatcher.quant_config is not None:
-        dispatcher_output_dtype = dispatcher.quant_config.get("dispatcher_output_dtype", None)
+        dispatcher_output_dtype = dispatcher.quant_config.get(
+            "dispatcher_output_dtype", None
+        )
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 

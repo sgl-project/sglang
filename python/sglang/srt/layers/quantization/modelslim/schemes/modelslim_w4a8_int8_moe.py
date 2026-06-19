@@ -49,7 +49,10 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         self.tp_size = tp_size
         self.is_per_channel_weight = group_size == 0
         self.activation_use_clip = activation_use_clip
-        self.kernel = NPUW4A8Int8MoEMethod(is_per_channel_weight = self.is_per_channel_weight, activation_use_clip = self.activation_use_clip)
+        self.kernel = NPUW4A8Int8MoEMethod(
+            is_per_channel_weight=self.is_per_channel_weight,
+            activation_use_clip=self.activation_use_clip,
+        )
 
     def create_weights(
         self,
@@ -94,7 +97,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         )
         layer.register_parameter(f"{prefix}_weight_scale", scale)
         set_weight_attrs(scale, extra_weight_attrs)
-        
+
         # ---- offset ----
         offset = torch.nn.Parameter(
             torch.empty(num_experts, 2 * out_features, 1, dtype=torch.float32),
@@ -132,7 +135,9 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         # ---- bias for scale (activation clip path) ----
         # This parameter is always created; the kernel uses it only when activation_use_clip is True.
         scale_bias = torch.nn.Parameter(
-            torch.empty(num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32),
+            torch.empty(
+                num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32
+            ),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
@@ -140,6 +145,4 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
-        self.kernel.process_weights_after_loading(
-            layer, self.weight_prefix
-        )
+        self.kernel.process_weights_after_loading(layer, self.weight_prefix)

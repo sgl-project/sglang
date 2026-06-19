@@ -11,16 +11,18 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.moe.moe_runner.torch_npu import TorchNpuQuantInfo
 
+import logging
+
 from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
     HiddenStatesDynamicQuant,
 )
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
-import logging
 
 logger = logging.getLogger(__name__)
 
+
 # DEPRECATED METHOD
-# TODO: Remove in future realeses 
+# TODO: Remove in future realeses
 def fused_moe_npu(
     x,
     w1,
@@ -100,7 +102,6 @@ def fused_moe_npu(
         export_for_source_row=topk_ids,
     )
     return final_hidden_states
-
 
 
 class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
@@ -505,15 +506,21 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         # Process scale
         scale = getattr(layer, f"{weight_prefix}_weight_scale")  # shape [E, N, 1]
         scale = scale.data.transpose(-1, -2).contiguous()  # [E, N, 1] -> [E, 1, N]
-        setattr(layer, f"{weight_prefix}_weight_scale",
-                torch.nn.Parameter(scale, requires_grad=False))
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale, requires_grad=False),
+        )
 
         # Process offset
         offset = getattr(layer, f"{weight_prefix}_weight_offset", None)
         if offset is not None:
             offset = offset.data.transpose(-1, -2).contiguous()
-            setattr(layer, f"{weight_prefix}_weight_offset",
-                    torch.nn.Parameter(offset, requires_grad=False))
+            setattr(
+                layer,
+                f"{weight_prefix}_weight_offset",
+                torch.nn.Parameter(offset, requires_grad=False),
+            )
 
         # Process weight: unpack, transpose, repack
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")

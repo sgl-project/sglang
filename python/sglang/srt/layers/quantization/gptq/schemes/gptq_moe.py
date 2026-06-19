@@ -5,28 +5,27 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.linear import set_weight_attrs
-from sglang.srt.layers.moe import MoeRunnerConfig
-
-from .gptq_scheme import GPTQMoESchemeBase
-
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4MoEMethod,
 )
-
+from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-
 from sglang.srt.layers.moe.moe_runner.torch_npu import (
     TorchNpuQuantInfo,
 )
 
+from .gptq_scheme import GPTQMoESchemeBase
+
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput, StandardCombineInput, CombineInput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
 
 __all__ = ["GPTQMoEAscendScheme", "GPTQMarlinMoEScheme"]
@@ -139,7 +138,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
     def create_moe_runner(
         self,
         layer: torch.nn.Module,
-        moe_runner_config: "MoeRunnerConfig",
+        moe_runner_config: MoeRunnerConfig,
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
@@ -153,12 +152,12 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
-        
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
             w13_weight=layer.w13_qweight,

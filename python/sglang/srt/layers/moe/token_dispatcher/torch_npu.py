@@ -6,11 +6,8 @@ import torch
 
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     NPUFinalizeRouting,
-    NPUMoETokenUnpermute,
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
-    NPUMoEInitRouting_Quant,
-    NPUMoEInitRouting_v1,
     NPUMoEInitRouting_v2,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -21,8 +18,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
-    get_ascend_dispatcher_output_dtype,
     DispatcherOutputDtype,
+    get_ascend_dispatcher_output_dtype,
 )
 
 

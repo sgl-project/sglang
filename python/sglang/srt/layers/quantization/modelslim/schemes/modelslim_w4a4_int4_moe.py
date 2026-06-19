@@ -62,6 +62,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         prefix is "w13" or "w2".
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
@@ -90,7 +91,12 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         offset_shape = scale_shape  # offset always matches scale
 
         self._create_weight_params(
-            layer, self.weight_prefix, weight_shape, scale_shape, offset_shape, extra_weight_attrs
+            layer,
+            self.weight_prefix,
+            weight_shape,
+            scale_shape,
+            offset_shape,
+            extra_weight_attrs,
         )
 
     @staticmethod

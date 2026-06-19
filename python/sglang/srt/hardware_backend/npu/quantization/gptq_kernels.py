@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 def unpack_from_int32(
     weight: torch.Tensor,
@@ -55,6 +54,7 @@ def unpack_from_int32(
     offset = pow(2, num_bits) // 2
     unpacked_weight = (unpacked_weight - offset).to(torch.int8)
     return unpacked_weight
+
 
 class GPTQLinearAscendKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
@@ -125,7 +125,7 @@ class GPTQLinearAscendKernel:
 
 
 class GPTQMoEAscendKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
@@ -146,7 +146,7 @@ class GPTQMoEAscendKernel:
         )
         if not self.use_v2_format:
             layer.w13_qzeros += 1
-    
+
         w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
             -1, layer.w2_qzeros.shape[-1]
         )
@@ -162,7 +162,7 @@ class GPTQMoEAscendKernel:
         )
         if not self.use_v2_format:
             layer.w2_qzeros += 1
-    
+
         # ----- w13 -----
         w13_qweight_2d = (
             layer.w13_qweight.data.transpose(-1, -2)
@@ -172,11 +172,11 @@ class GPTQMoEAscendKernel:
         w13_qweight_tmp = unpack_from_int32(
             w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
-    
+
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
             k_shard_w13 = w13_qweight_tmp.shape[1]
-    
+
             # Check if the scales are compatible (expanded size must equal K_shard)
             if layer.w13_scales.shape[1] * group_size != k_shard_w13:
                 logger.warning_once(
@@ -195,7 +195,9 @@ class GPTQMoEAscendKernel:
                         .reshape(-1, layer.w13_qweight.shape[2])
                         .to(torch.int32)
                     )
-                    .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                    .reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1
+                    )
                     .contiguous(),
                     requires_grad=False,
                 )
@@ -211,7 +213,7 @@ class GPTQMoEAscendKernel:
                     if w13_qweight_tmp.max() > 7:
                         w13_qweight_tmp.clamp_(max=7)
                     layer.w13_scales.data.abs_()
-    
+
                 layer.w13_qweight = torch.nn.Parameter(
                     torch.ops.npu.npu_convert_weight_to_int4pack(
                         w13_qweight_tmp.reshape(
@@ -222,7 +224,9 @@ class GPTQMoEAscendKernel:
                         .reshape(-1, layer.w13_qweight.shape[2])
                         .to(torch.int32)
                     )
-                    .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                    .reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1
+                    )
                     .contiguous(),
                     requires_grad=False,
                 )
@@ -235,7 +239,7 @@ class GPTQMoEAscendKernel:
                 .contiguous(),
                 requires_grad=False,
             )
-    
+
         # ----- w2 -----
         w2_qweight_2d = (
             layer.w2_qweight.data.transpose(-1, -2)
@@ -245,11 +249,11 @@ class GPTQMoEAscendKernel:
         w2_qweight_tmp = unpack_from_int32(
             w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
-    
+
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
             k_shard_w2 = w2_qweight_tmp.shape[1]
-    
+
             # Check if the scales are compatible
             if layer.w2_scales.shape[1] * group_size != k_shard_w2:
                 logger.warning_once(
@@ -268,7 +272,9 @@ class GPTQMoEAscendKernel:
                         .reshape(-1, layer.w2_qweight.shape[2])
                         .to(torch.int32)
                     )
-                    .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
+                    .reshape(
+                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1
+                    )
                     .contiguous(),
                     requires_grad=False,
                 )
@@ -284,7 +290,7 @@ class GPTQMoEAscendKernel:
                     if w2_qweight_tmp.max() > 7:
                         w2_qweight_tmp.clamp_(max=7)
                     layer.w2_scales.data.abs_()
-    
+
                 layer.w2_qweight = torch.nn.Parameter(
                     torch.ops.npu.npu_convert_weight_to_int4pack(
                         w2_qweight_tmp.reshape(
@@ -295,7 +301,9 @@ class GPTQMoEAscendKernel:
                         .reshape(-1, layer.w2_qweight.shape[2])
                         .to(torch.int32)
                     )
-                    .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
+                    .reshape(
+                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1
+                    )
                     .contiguous(),
                     requires_grad=False,
                 )
