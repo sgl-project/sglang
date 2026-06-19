@@ -153,7 +153,9 @@ class EagleDraftWorkerBase(ABC):
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+            forward_batch
+        )
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
@@ -260,7 +262,9 @@ class EagleDraftWorkerBase(ABC):
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+            forward_batch
+        )
         return forward_batch, can_cuda_graph
 
 
