@@ -269,6 +269,14 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
+    # KV cache
+    # Store the MHA (dense) KV cache in HND layout [num_pages, num_kv_heads,
+    # page_size, head_dim] instead of the default NHD [num_pages, page_size,
+    # num_kv_heads, head_dim]. HND lets a (page, head) pair be folded into a single
+    # paged index (free reshape), which paged backends like trtllm_mha consume
+    # directly and which is required for per-kv-head sparse page tables (DP attn).
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
@@ -829,6 +837,13 @@ class Envs:
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # MiniMax-M3 sparse attention: store the main K/V plus the index K (and
+    # optional index V) into their KV pools in a single fused JIT launch
+    # (minimax_store_kv_index) instead of 2-3 separate set_*_buffer copies.
+    # Falls back to the separate stores when the main and index caches do not
+    # share a store dtype (e.g. fp8 KV cache) or on non-CUDA devices.
+    SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
 
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
