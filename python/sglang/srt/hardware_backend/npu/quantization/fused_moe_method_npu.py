@@ -15,7 +15,9 @@ from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
     HiddenStatesDynamicQuant,
 )
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+import logging
 
+logger = logging.getLogger(__name__)
 
 # DEPRECATED METHOD
 # TODO: Remove in future realeses 
