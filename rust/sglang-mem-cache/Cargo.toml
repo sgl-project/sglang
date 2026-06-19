@@ -21,9 +21,5 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 tch = { version = "0.22", features = ["python-extension"] }
 thiserror = "1"
 
-# NOTE (deferred): Python packaging is not wired up yet. To make this importable
-# as `sglang.srt.mem_cache._mem_cache_core`, add to python/pyproject.toml:
-#   [[tool.setuptools-rust.ext-modules]]
-#   target = "sglang.srt.mem_cache._mem_cache_core"
-#   path = "../rust/sglang-mem-cache/Cargo.toml"
-#   binding = "PyO3"
+# Python packaging is wired through python/pyproject.toml as
+# `sglang.srt.mem_cache._mem_cache_core`.

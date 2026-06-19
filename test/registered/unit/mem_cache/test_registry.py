@@ -88,6 +88,9 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
         with self.assertRaises(ValueError):
             register_radix_cache_backend("dupe", MagicMock())
 
+    def test_builtin_rust_unified_backend_registered(self):
+        self.assertIn("rust_unified", registered_radix_cache_backends())
+
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
     def test_dispatches_to_registered_factory(self):
@@ -142,6 +145,28 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
 
         self.assertIs(result, inner)
+
+    def test_rust_unified_registration_does_not_load_native_extension(self):
+        with patch(
+            "sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"
+        ) as load_native_symbols:
+            self.assertIn("rust_unified", registered_radix_cache_backends())
+            load_native_symbols.assert_not_called()
+
+    def test_rust_unified_factory_loads_native_extension_when_selected(self):
+        factory = get_radix_cache_factory("rust_unified")
+        self.assertIsNotNone(factory)
+
+        with patch(
+            "sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols",
+            side_effect=ModuleNotFoundError(
+                "RustUnifiedRadixCache requires native extension "
+                "sglang.srt.mem_cache._mem_cache_core"
+            ),
+        ) as load_native_symbols:
+            with self.assertRaisesRegex(ModuleNotFoundError, "_mem_cache_core"):
+                factory(_make_ctx(backend="rust_unified"))
+            load_native_symbols.assert_called_once()
 
 
 class TestDefaultRadixCacheFactory(CustomTestCase):

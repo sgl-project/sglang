@@ -8,9 +8,8 @@
 //!     bridge (`py_interop::PyTensor`, vendored from `pyo3-tch`) that the Python
 //!     `RustUnifiedRadixCache` orchestrator calls into.
 //!
-//! Still deferred: the Python build/packaging wiring (a
-//! `[[tool.setuptools-rust.ext-modules]]` block in python/pyproject.toml) and
-//! the test / bench wrappers.
+//! The Python build wiring lives in `python/pyproject.toml`; test and bench
+//! wrappers are staged separately from the core wrapper.
 
 // PyO3 proc macro generates Into<PyErr> conversions that clippy flags.
 #![allow(clippy::useless_conversion)]

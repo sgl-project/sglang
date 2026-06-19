@@ -58,26 +58,61 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.registry import register_radix_cache_backend
-from sglang.srt.server_args import get_global_server_args
-
-# NOTE (deferred): this native module is produced by the PyO3 wrapper + build
-# wiring, which are intentionally NOT ported yet. The import will not resolve
-# until the torch bridge (`radix_cache_wrapper.rs` / `tensor_ext::PyTensor`) and
-# the build glue land. The ported Rust core logic lives in rust/sglang-mem-cache/
-# — see that crate's lib.rs for what remains.
-from sglang.srt.mem_cache._mem_cache_core import (
-    ComponentType,
-    RadixCacheInfraPyError,
-    RadixCacheRuntimePyError,
-    RustBigramRadixCacheWrapper,
-    RustPageRadixCacheWrapper,
+from sglang.srt.mem_cache.registry import (
+    get_radix_cache_factory,
+    register_radix_cache_backend,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+
+ComponentType: Any = None
+RadixCacheInfraPyError: Any = None
+RadixCacheRuntimePyError: Any = None
+RustBigramRadixCacheWrapper: Any = None
+RustPageRadixCacheWrapper: Any = None
+_NATIVE_SYMBOLS_LOADED = False
+
+
+def _load_native_symbols() -> None:
+    """Load the PyO3 extension only when the Rust backend is selected."""
+    global ComponentType
+    global RadixCacheInfraPyError
+    global RadixCacheRuntimePyError
+    global RustBigramRadixCacheWrapper
+    global RustPageRadixCacheWrapper
+    global _NATIVE_SYMBOLS_LOADED
+
+    if _NATIVE_SYMBOLS_LOADED:
+        return
+
+    try:
+        from sglang.srt.mem_cache._mem_cache_core import (
+            ComponentType as NativeComponentType,
+            RadixCacheInfraPyError as NativeRadixCacheInfraPyError,
+            RadixCacheRuntimePyError as NativeRadixCacheRuntimePyError,
+            RustBigramRadixCacheWrapper as NativeRustBigramRadixCacheWrapper,
+            RustPageRadixCacheWrapper as NativeRustPageRadixCacheWrapper,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "sglang.srt.mem_cache._mem_cache_core":
+            raise ModuleNotFoundError(
+                "RustUnifiedRadixCache requires native extension "
+                "sglang.srt.mem_cache._mem_cache_core. Install SGLang with "
+                "`python -m pip install -e python` or build the package before "
+                "using `--radix-cache-backend rust_unified`."
+            ) from exc
+        raise
+
+    ComponentType = NativeComponentType
+    RadixCacheInfraPyError = NativeRadixCacheInfraPyError
+    RadixCacheRuntimePyError = NativeRadixCacheRuntimePyError
+    RustBigramRadixCacheWrapper = NativeRustBigramRadixCacheWrapper
+    RustPageRadixCacheWrapper = NativeRustPageRadixCacheWrapper
+    _NATIVE_SYMBOLS_LOADED = True
 
 
 # Initial capacity hint for the Rust tree node pool. The pool grows on demand;
@@ -96,6 +131,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
     """
 
     def __init__(self, params: CacheInitParams):
+        _load_native_symbols()
+
         # Required fields per `PrefixCacheTrait`. External code reads these
         # directly (e.g. observability `available_and_evictable_str`).
         self.disable = params.disable
@@ -1134,13 +1171,15 @@ class RustUnifiedRadixCache(BasePrefixCache):
 def install_rust_radix_cache() -> None:
     """Register Rust Unified Radix Cache.
 
-    NOTE (deferred): registration is intentionally NOT wired up in this pass —
-    this function is defined but never invoked, so the ``"rust_unified"`` backend
-    is not yet selectable via ``--radix-cache-backend``. Call it from package
-    import (or the factory) once the Rust bridge / build glue land.
+    The native extension is loaded by the factory, not during registration, so
+    importing the default registry path remains safe before the extension is
+    built.
     """
+    if get_radix_cache_factory("rust_unified") is not None:
+        return
 
     def factory(ctx):
+        _load_native_symbols()
         if ctx.enable_hierarchical_cache:
             raise RadixCacheInfraPyError(
                 "RustUnifiedRadixCache: hierarchical cache (HiCache) not supported"
