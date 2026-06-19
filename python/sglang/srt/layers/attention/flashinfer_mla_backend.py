@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -15,16 +17,23 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_utils import (
+    draft_kv_indices_buffer_width,
+    draft_kv_indices_used_len,
+    generate_draft_decode_kv_indices,
+)
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -73,7 +82,7 @@ class FlashInferMhaChunkKVRunner:
     ):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -328,7 +337,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # fast_mla_decode_plan needs _cached_module from the initial
                 # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            elif forward_mode.is_target_verify():
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -373,17 +382,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -402,7 +400,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
-                and not is_in_piecewise_cuda_graph()
+                and not is_in_tc_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
@@ -464,7 +462,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -485,7 +483,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -642,7 +640,7 @@ class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -751,7 +749,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -892,8 +890,6 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
-
         if topk > 1:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
@@ -943,6 +939,17 @@ class FlashInferMLAMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
+        required_kv_indices_len = draft_kv_indices_used_len(
+            seq_lens_sum, self.topk, bs, self.speculative_num_steps
+        )
+        assert_buffer_fits(
+            required_kv_indices_len,
+            kv_indices_buffer.shape[1],
+            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            bs=bs,
+            seq_lens_sum=seq_lens_sum,
+        )
+
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -967,16 +974,16 @@ class FlashInferMLAMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
+                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
             ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.zeros(
-            (
-                self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * self.max_context_len,
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )
@@ -993,8 +1000,13 @@ class FlashInferMLAMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
+        # it needs the topk factor, matching the eager init_forward_metadata.
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )

@@ -38,6 +38,10 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
+    prefill_attention_backend_str: Optional[str] = None
+    decode_attention_backend_str: Optional[str] = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -85,8 +89,38 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # Most attention backends can rebuild and replace forward metadata before
+    # every forward. BCG capture is different: some backends expose metadata
+    # tensors to kernels across graph breaks, so the captured graph depends on
+    # those tensor addresses. Such backends opt in here, create the metadata
+    # object during capture, and refresh its dynamic fields before each replay.
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
+        raise NotImplementedError()
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """Create forward metadata whose tensor addresses will be graph-captured."""
+        raise NotImplementedError()
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh captured metadata for the current batch before BCG replay.
+
+        Implementations should update ``capture_metadata`` in place where graph
+        address stability is required, assign any safe per-replay objects, and
+        make the backend's active ``forward_metadata`` point to the captured
+        metadata object.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):

@@ -64,7 +64,7 @@ def launch_endpoints_per_forward(
     tag_filter: Callable[[CanaryLaunchTag], bool],
     verify_plan: VerifyPlan,
     write_plan: WritePlan,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
