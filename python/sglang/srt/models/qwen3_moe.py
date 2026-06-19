@@ -838,6 +838,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 forward_batch
             )
         )
+
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
