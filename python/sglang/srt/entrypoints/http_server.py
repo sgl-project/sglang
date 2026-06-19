@@ -1135,10 +1135,7 @@ async def update_weights_from_disk(
         success,
         message,
         num_paused_requests,
-    ) = await _global_state.tokenizer_manager.update_weights_from_disk(
-        obj,
-        request,
-    )
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
 
     content = {
         "success": success,
@@ -1167,8 +1164,7 @@ async def init_weights_send_group_for_remote_instance(
         success,
         message,
     ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-        obj,
-        request,
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1186,8 +1182,7 @@ async def send_weights_to_remote_instance(
         success,
         message,
     ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-        obj,
-        request,
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1241,8 +1236,7 @@ async def init_weights_update_group(
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj,
-        request,
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1260,10 +1254,7 @@ async def destroy_weights_update_group(
     (
         success,
         message,
-    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(
-        obj,
-        request,
-    )
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -1302,8 +1293,7 @@ async def update_weights_from_distributed(
         success,
         message,
     ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
-        obj,
-        request,
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1320,8 +1310,7 @@ async def update_weights_from_ipc(
 ):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
-        obj,
-        request,
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1373,10 +1362,7 @@ async def get_weights_by_name(
 ):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(
-            obj,
-            request,
-        )
+        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
@@ -1392,10 +1378,7 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(
-            obj,
-            request,
-        )
+        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -1407,10 +1390,7 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(
-            obj,
-            request,
-        )
+        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -1424,10 +1404,7 @@ async def check_weights(
     if obj is None:
         obj = CheckWeightsReqInput()
     success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(
-            obj,
-            request,
-        )
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
     body = {"success": success, "message": message}
     if ranks is not None:
@@ -1446,10 +1423,7 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     to let it run in full batch size.
     """
     try:
-        await _global_state.tokenizer_manager.slow_down(
-            obj,
-            request,
-        )
+        await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -1460,10 +1434,7 @@ async def load_lora_adapter(
     obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.load_lora_adapter(
-        obj,
-        request,
-    )
+    result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     result = msgspec.structs.asdict(result)
 
     if result.get("success", False):
@@ -1484,8 +1455,7 @@ async def load_lora_adapter_from_tensors(
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
-        obj,
-        request,
+        obj, request
     )
     result = msgspec.structs.asdict(result)
 
@@ -1501,10 +1471,7 @@ async def unload_lora_adapter(
     obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.unload_lora_adapter(
-        obj,
-        request,
-    )
+    result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     result = msgspec.structs.asdict(result)
 
     if result.get("success", False):
@@ -1523,10 +1490,7 @@ async def unload_lora_adapter(
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.tokenizer_manager.open_session(
-            obj,
-            request,
-        )
+        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -1540,10 +1504,7 @@ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Req
 async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
-        await _global_state.tokenizer_manager.close_session(
-            obj,
-            request,
-        )
+        await _global_state.tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
