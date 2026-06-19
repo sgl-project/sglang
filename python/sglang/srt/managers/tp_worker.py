@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -90,6 +92,14 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self.model_runner.update_weights_from_disk(
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        )
+        return success, message
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.init_weights_update_group(
             recv_req.master_address,
@@ -130,6 +140,11 @@ class BaseTpWorker(ABC):
             recv_req.ports,
             recv_req.group_name,
         )
+        return success, message
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update weights from IPC for checkpoint-engine integration."""
+        success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

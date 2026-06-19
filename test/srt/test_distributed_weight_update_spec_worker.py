@@ -6,7 +6,6 @@ import pytest
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
-    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -23,10 +22,6 @@ def _distributed_req(selector="all"):
         flush_cache=False,
         selector=selector,
     )
-
-
-def _disk_req(flush_cache=True):
-    return UpdateWeightFromDiskReqInput(model_path="/tmp/model", flush_cache=flush_cache)
 
 
 def _manager(tp_worker, draft_worker):
@@ -102,64 +97,6 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
     target_runner.receive_weights_from_distributed.assert_called_once()
     target_runner.load_weights.assert_called_once_with(weights)
     draft_worker.iter_runners.assert_not_called()
-
-
-def _disk_manager(target_runner, draft_runner):
-    return _manager(
-        tp_worker=SimpleNamespace(iter_runners=lambda: [("", target_runner)]),
-        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
-    )
-
-
-def test_disk_update_fans_out_to_all_runners_and_flushes():
-    # disk update reaches both the target and the draft runner via get_model_runners,
-    # and the target's success drives the post-update cache flush.
-    target_runner = Mock()
-    target_runner.update_weights_from_disk.return_value = (True, "ok")
-    draft_runner = Mock()
-    draft_runner.update_weights_from_disk.return_value = (True, "ok")
-    manager = _disk_manager(target_runner, draft_runner)
-
-    output = manager.update_weights_from_disk(_disk_req(flush_cache=True))
-
-    assert output.success is True
-    # Both runners load from the same recv_req.model_path.
-    target_runner.update_weights_from_disk.assert_called_once()
-    draft_runner.update_weights_from_disk.assert_called_once()
-    manager.flush_cache.assert_called_once()
-
-
-def test_disk_update_flushes_on_target_success_even_when_draft_fails():
-    # Pre-refactor behavior preserved: the target's KV cache is flushed off the
-    # target's own success, independent of a later draft failure; the overall result
-    # still reports the failure.
-    target_runner = Mock()
-    target_runner.update_weights_from_disk.return_value = (True, "ok")
-    draft_runner = Mock()
-    draft_runner.update_weights_from_disk.return_value = (False, "draft boom")
-    manager = _disk_manager(target_runner, draft_runner)
-
-    output = manager.update_weights_from_disk(_disk_req(flush_cache=True))
-
-    assert output.success is False
-    assert "draft boom" in output.message
-    manager.flush_cache.assert_called_once()
-
-
-def test_disk_update_target_failure_short_circuits_draft_and_flush():
-    # The target runs first; its failure stops the fanout before the draft and skips
-    # the flush (target never succeeded).
-    target_runner = Mock()
-    target_runner.update_weights_from_disk.return_value = (False, "target boom")
-    draft_runner = Mock()
-    manager = _disk_manager(target_runner, draft_runner)
-
-    output = manager.update_weights_from_disk(_disk_req(flush_cache=True))
-
-    assert output.success is False
-    assert "target boom" in output.message
-    draft_runner.update_weights_from_disk.assert_not_called()
-    manager.flush_cache.assert_not_called()
 
 
 def _session_manager(target_runner, draft_runner):
