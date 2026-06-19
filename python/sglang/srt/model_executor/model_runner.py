@@ -1944,7 +1944,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(
+    def load_weights(self, weights) -> None:
+        """Load an in-memory list of (name, tensor) weights into this runner's model."""
+        self.model.load_weights(weights)
+
+    def receive_weights_from_distributed(
         self,
         names,
         dtypes,
@@ -1952,54 +1956,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         group_name,
         load_format: Optional[str] = None,
     ):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
+        """Receive one weight broadcast from the training engine over this runner's
+        `_model_update_group`. Only the runner that joined the group (the target /
+        main model) can receive; the caller loads the result into each runner."""
 
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
-
-        return self.update_weights_from_distributed_to_model_runners(
-            [self], names, dtypes, shapes, group_name, load_format
-        )
-
-    def update_weights_from_distributed_to_model_runners(
-        self,
-        model_runners,
-        names,
-        dtypes,
-        shapes,
-        group_name,
-        load_format: Optional[str] = None,
-    ):
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
 
-        try:
-            weights = self._receive_weights_from_distributed(
-                names, dtypes, shapes, group_name, load_format
-            )
-            for model_runner in model_runners:
-                model_runner.model.load_weights(weights)
-            return True, "Succeeded to update parameter online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def _receive_weights_from_distributed(
-        self, names, dtypes, shapes, group_name, load_format: Optional[str] = None
-    ):
         if load_format == "flattened_bucket":
             return self._receive_bucketed_weights_from_distributed(
                 names, dtypes, shapes, group_name

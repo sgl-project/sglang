@@ -21,7 +21,7 @@ assistant-side KV extension.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -31,7 +31,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
-from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -79,6 +78,9 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -201,17 +203,8 @@ class FrozenKVMTPWorker(TpModelWorker):
     def clear_cache_pool(self):
         pass
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
-            [self.draft_model_runner, self.target_worker.model_runner],
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)]
 
     def _resolve_draft_backend_type(self) -> str:
         return (
