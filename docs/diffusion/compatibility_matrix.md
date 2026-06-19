@@ -53,11 +53,10 @@ default parameters when initializing and generating videos.
    - LTX-2 and LTX-2.3 support both T2V and TI2V (`--image-path`) on one-stage and two-stage pipelines (including HQ).
    - The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
    - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
-4. LTX-2 / LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {original,snapshot,resident}`:
-   - `snapshot` is the default and recommended mode.
+4. LTX-2 / LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {original,resident}`:
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
-   - Example (one prior run): `original` `154.67s`, `snapshot` `114.05s`, `resident` `75.71s`; peak VRAM trend is `original < snapshot < resident`.
+   - `snapshot` is still accepted as a deprecated alias for `original` and may be removed after two release cycles.
 5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
    `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from
