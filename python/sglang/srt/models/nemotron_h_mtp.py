@@ -147,6 +147,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             _pat[(layer_idx - 1) % len(_pat)]
         )
+        self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
