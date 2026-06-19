@@ -165,3 +165,109 @@ fn match_prefix_is_consistent_with_concurrent_clear() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mutator.join().unwrap();
 }
+
+/// Reader storm concurrent with a writer hammering insert/remove on DISTINCT
+/// chain roots — the exact pattern the sharding targets. The writer's events
+/// touch a different chain root each round, so they land on (probabilistically)
+/// different shards than the readers' fixed warm chains; under the old single
+/// lock every such write blocked every reader, while sharded the two only
+/// contend when they collide on a shard.
+///
+/// The test asserts CORRECTNESS under that contention, deterministically:
+///   * `seed` warm chains are pre-inserted and never removed, so a reader
+///     querying a warm chain MUST always get a full match with the warm
+///     worker present — proving the writer's churn on other roots never
+///     corrupts an unrelated reader's result.
+///   * The writer's own scratch chains are fully removed each round, so after
+///     join the tree contains only the warm chains (exact `node_count`).
+///
+/// No sleeps, no wall-clock — the threads run a fixed number of bounded
+/// iterations, so the test is deterministic and cannot flake on timing.
+#[test]
+fn readers_unaffected_by_writer_on_distinct_roots() {
+    let tree = Arc::new(HashTree::new());
+
+    // Warm worker holds a set of fixed chains that the readers query and the
+    // writer never touches. Distinct roots (1_000 apart) so they spread
+    // across shards.
+    let warm = KvWorkerId {
+        url: "http://warm:30000".into(),
+        dp_rank: 0,
+    };
+    const WARM_CHAINS: i64 = 16;
+    let warm_chain = |c: i64| -> Vec<i64> { vec![c * 1_000, c * 1_000 + 1, c * 1_000 + 2] };
+    for c in 0..WARM_CHAINS {
+        tree.insert(&warm, None, &warm_chain(c));
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Writer: churns scratch chains on roots far from the warm space, each a
+    // distinct root, insert then immediate remove. Bounded iteration count.
+    let writer = {
+        let tree = tree.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let scratch = KvWorkerId {
+                url: "http://scratch:30000".into(),
+                dp_rank: 0,
+            };
+            for round in 0..20_000i64 {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // Roots in a disjoint range from the warm chains.
+                let base = 1_000_000 + round * 7;
+                let chain = [base, base + 1, base + 2, base + 3];
+                tree.insert(&scratch, None, &chain);
+                tree.remove(&scratch, &chain);
+            }
+        })
+    };
+
+    // Readers: each repeatedly queries every warm chain and asserts the warm
+    // worker is always present at full depth, regardless of writer churn.
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let tree = tree.clone();
+        let warm = warm.clone();
+        readers.push(thread::spawn(move || {
+            for _ in 0..2_000 {
+                for c in 0..WARM_CHAINS {
+                    let chain = warm_chain(c);
+                    let m = tree.match_prefix(None, &chain);
+                    assert_eq!(
+                        m.matched_blocks,
+                        chain.len(),
+                        "warm chain {c} must always fully match despite writer churn",
+                    );
+                    assert!(
+                        m.workers.contains(&warm),
+                        "warm worker must always hold its own untouched chain",
+                    );
+                }
+            }
+        }));
+    }
+
+    for r in readers {
+        r.join().expect("reader thread panicked under contention");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer
+        .join()
+        .expect("writer thread panicked under contention");
+
+    // After the storm, only the warm chains remain (scratch fully removed
+    // every round). 16 chains × 3 nodes = 48 non-root nodes.
+    assert_eq!(
+        tree.node_count(),
+        (WARM_CHAINS * 3) as usize,
+        "writer's scratch churn must leave no residual nodes",
+    );
+    for c in 0..WARM_CHAINS {
+        let m = tree.match_prefix(None, &warm_chain(c));
+        assert_eq!(m.matched_blocks, 3);
+        assert!(m.workers.contains(&warm));
+    }
+}
