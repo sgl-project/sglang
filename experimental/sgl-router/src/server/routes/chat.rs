@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::SelectionContext;
+use crate::policies::{request_tokens_for, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -131,15 +131,27 @@ pub async fn chat_completions(
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
-    // Parse the body into a JSON value once, here at ingress — but only when
-    // the policy actually consumes tokens (cache-aware). For load-only
-    // policies `parse_probe`'s minimal probe is enough, so they keep avoiding
-    // the full `serde_json::Value` allocation over a (up to 1 MiB) body. When
-    // parsed, this single value is reused for both the routing tokenization and
-    // the outgoing-body injection below (no re-parse inside the policy, and PD
-    // bootstrap injection reuses it too). `parse_probe` already validated the
-    // object shape.
-    let request_value: Option<serde_json::Value> = if policy.needs_request_tokens() {
+    // Tokenize once at ingress whenever it can pay off — decoupled from the
+    // routing policy, because forwarding `input_ids` is a property of the
+    // MODEL (does it have a chat encoder so the router can produce
+    // engine-equivalent tokens?), not of how we pick the worker. Two gates:
+    //
+    //   * `has_chat_encoder` → a chat request on this model yields
+    //     engine-equivalent ids we can forward as `input_ids` so the engine
+    //     skips re-tokenizing. This enables the offload for EVERY policy —
+    //     sticky and round-robin included — not just cache-aware.
+    //   * `needs_request_tokens()` → the cache-aware policy ALSO wants the
+    //     raw-prompt path tokenized for tree matching even on a model with no
+    //     chat encoder (`/v1/completions` / `text`), which the first gate
+    //     alone wouldn't trigger.
+    //
+    // When neither holds, `parse_probe`'s minimal probe is enough, so we keep
+    // avoiding the full `serde_json::Value` allocation over a (up to 1 MiB)
+    // body. When parsed, this single value is reused for the routing
+    // tokenization and the outgoing-body injection below (and PD bootstrap
+    // injection). `parse_probe` already validated the object shape.
+    let want_tokens = ctx.tokenizers.has_chat_encoder(&model_str) || policy.needs_request_tokens();
+    let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".into())
         })?)
@@ -147,14 +159,14 @@ pub async fn chat_completions(
         None
     };
 
-    // Tokenize once at ingress (only the cache-aware policy reaches this; its
-    // `needs_request_tokens()` gated the parse above). The ids feed both the
-    // routing decision (below) and — when engine-equivalent — the engine
-    // itself, forwarded as `input_ids` so it skips re-tokenizing the same
-    // prompt.
+    // The ids feed both the routing decision (cache-aware consumes them; other
+    // policies ignore them) and — when engine-equivalent — the engine itself,
+    // forwarded as `input_ids` so it skips re-tokenizing the same prompt. The
+    // ingress owns the tokenize via the shared registry, so the choice of
+    // policy never changes whether we tokenize.
     let request_tokens = request_value
         .as_ref()
-        .and_then(|v| policy.request_tokens(&model_id, v));
+        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -309,8 +321,8 @@ pub async fn chat_completions(
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
-    // `request_value` is `Some` (the cache-aware path), so the predicate
-    // always has a parsed body to inspect.
+    // `request_value` is `Some` (a model the ingress tokenized for), so the
+    // predicate always has a parsed body to inspect.
     let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
     {
         (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
