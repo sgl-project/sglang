@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
+def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -31,16 +33,10 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
                 )
-            if server_args.disaggregation_transfer_backend not in (
-                "nixl",
-                "mooncake",
-                "mori",
-            ):
+            if server_args.disaggregation_transfer_backend == "fake":
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache currently "
-                    "requires --disaggregation-transfer-backend in "
-                    "('nixl', 'mooncake', 'mori'), but got "
-                    f"{server_args.disaggregation_transfer_backend!r}"
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
                 raise ValueError(
@@ -58,12 +54,6 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
         else:
             server_args.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
-            if server_args.enable_mamba_extra_buffer():
-                logger.warning(
-                    "Mamba extra_buffer is disabled because decode disaggregation "
-                    "currently forces chunk cache. Falling back to no_buffer."
-                )
-                server_args.mamba_scheduler_strategy = "no_buffer"
 
     elif server_args.disaggregation_mode == "prefill":
         assert (
