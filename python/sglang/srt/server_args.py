@@ -1178,12 +1178,6 @@ class ServerArgs:
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
 
-            if self.tokenizer_worker_num > 1:
-                raise ValueError(
-                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
-                    "Multi-worker HTTP/2 support will be added in a future release."
-                )
-
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -2338,9 +2332,9 @@ class ServerArgs:
                     )
                 elif is_sm120_supported() and is_mxfp4_quant_format:
                     # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "triton_kernel"
+                    self.moe_runner_backend = "marlin"
                     logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
@@ -2780,6 +2774,8 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                "NemotronHForCausalLM",
+                "NemotronHPuzzleForCausalLM",
             ]
             and is_sm100_supported()
             and self.tp_size > 1
@@ -3436,6 +3432,17 @@ class ServerArgs:
         self.prefill_cp_mode = mode
 
     def _handle_context_parallelism(self):
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+
+            model_config = self.get_model_config()
+            model_arch = model_config.hf_config.architectures[0]
+            if (
+                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
+                and not envs.SGLANG_ENABLE_CP_V2.is_set()
+            ):
+                envs.SGLANG_ENABLE_CP_V2.set(True)
+
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
