@@ -1059,9 +1059,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
     # -----------------------------------------------------------------
-    # replay
+    # execute
     # -----------------------------------------------------------------
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
