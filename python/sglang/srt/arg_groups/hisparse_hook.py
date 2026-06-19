@@ -103,6 +103,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     hf_config = server_args.get_model_config().hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
+    is_hip = _is_hip()
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
@@ -114,7 +115,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
-    if is_v4_hisparse:
+    if is_hip and is_v4_hisparse:
         # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
