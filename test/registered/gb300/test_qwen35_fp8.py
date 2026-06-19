@@ -38,7 +38,7 @@ DP_MTP_ARGS = [
 
 
 class TestQwen35Fp8(unittest.TestCase):
-    """Qwen3.5-397B FP8 on GB300 (4x B200 NVL4, tp=4)."""
+    """Qwen3.5-397B FP8 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_qwen35_fp8(self):
         variants = [

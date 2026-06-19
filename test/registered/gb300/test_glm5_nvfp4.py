@@ -36,7 +36,7 @@ DP_MTP_ARGS = [
 
 
 class TestGlm5Nvfp4(unittest.TestCase):
-    """GLM-5 NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
+    """GLM-5 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_glm5_nvfp4(self):
         variants = [
