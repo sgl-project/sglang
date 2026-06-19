@@ -22,6 +22,7 @@ from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -5370,6 +5371,83 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestHermesDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = HermesDetector()
+
+    def _calls(self, result: StreamingParseResult):
+        return [(c.name, json.loads(c.parameters)) for c in result.calls]
+
+    def test_parse_simple(self):
+        text = (
+            '<tool_call>{"name": "search", "arguments": {"query": "NYC"}}</tool_call>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(self._calls(result), [("search", {"query": "NYC"})])
+
+    def test_argument_string_containing_end_token_is_not_dropped(self):
+        # Regression: a `<tool_call>(.*?)</tool_call>` regex truncates the JSON at
+        # the first `</tool_call>` inside a string value, silently dropping the
+        # whole call. The call must be parsed intact instead.
+        text = (
+            '<tool_call>{"name": "search", '
+            '"arguments": {"query": "explain the </tool_call> token"}}</tool_call>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            self._calls(result),
+            [("search", {"query": "explain the </tool_call> token"})],
+        )
+
+    def test_multiple_calls_with_end_token_in_arguments(self):
+        text = (
+            '<tool_call>{"name": "search", "arguments": '
+            '{"query": "a </tool_call> b"}}</tool_call>'
+            '<tool_call>{"name": "search", "arguments": {"query": "c"}}</tool_call>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            self._calls(result),
+            [("search", {"query": "a </tool_call> b"}), ("search", {"query": "c"})],
+        )
+
+    def test_streaming_and_batch_agree_on_end_token_in_arguments(self):
+        text = (
+            '<tool_call>{"name": "search", '
+            '"arguments": {"query": "close </tool_call> tag"}}</tool_call>'
+        )
+        batch = self._calls(self.detector.detect_and_parse(text, self.tools))
+
+        streamer = HermesDetector()
+        names: dict = {}
+        args: dict = {}
+        for ch in text:
+            res = streamer.parse_streaming_increment(ch, self.tools)
+            for c in res.calls or []:
+                idx = c.tool_index if c.tool_index is not None else 0
+                if c.name:
+                    names[idx] = c.name
+                if c.parameters:
+                    args[idx] = args.get(idx, "") + c.parameters
+        stream = [(names.get(i), json.loads(args[i])) for i in sorted(args)]
+
+        self.assertEqual(batch, [("search", {"query": "close </tool_call> tag"})])
+        self.assertEqual(stream, batch)
 
 
 if __name__ == "__main__":

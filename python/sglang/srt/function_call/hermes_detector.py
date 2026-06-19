@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -12,6 +11,10 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ``JSONDecoder`` is stateless and thread-safe; reuse one instance instead of
+# allocating a fresh decoder on every parse.
+_JSON_DECODER = json.JSONDecoder()
 
 
 class HermesDetector(BaseFormatDetector):
@@ -26,34 +29,39 @@ class HermesDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL
-        )
         self._normal_text_buffer = ""
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        """
-        One-time parsing: Detects and parses tool calls in the provided text.
-        """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        """One-time parsing: detect and parse every tool call in ``text``."""
+        first = text.find(self.bot_token)
+        if first == -1:
+            return StreamingParseResult(normal_text=text, calls=[])
+        normal_text = text[:first].strip()
 
+        # Decode one JSON value after each ``<tool_call>`` with a string-aware
+        # decoder instead of a ``<tool_call>(.*?)</tool_call>`` regex. The
+        # non-greedy regex stops at the first ``</tool_call>``, so an argument
+        # string that legitimately contains the literal end-token truncates the
+        # payload and the whole call is silently dropped -- which also makes this
+        # non-streaming path disagree with the streaming path. ``raw_decode``
+        # correctly ignores ``</tool_call>`` occurring inside string values.
         calls = []
+        pos = first
         try:
-            for match in self.tool_call_regex.findall(text):
-                raw = match[0] or match[1]
-                if not raw:
-                    continue
-                parsed = json.loads(raw.strip())
-                if isinstance(parsed, list):
-                    calls.extend(self.parse_base_json(parsed, tools))
-                else:
-                    calls.extend(self.parse_base_json(parsed, tools))
+            while (start := text.find(self.bot_token, pos)) != -1:
+                cursor = start + len(self.bot_token)
+                while cursor < len(text) and text[cursor] in " \t\r\n":
+                    cursor += 1
+                try:
+                    obj, pos = _JSON_DECODER.raw_decode(text, cursor)
+                except json.JSONDecodeError:
+                    # Truncated or malformed payload (e.g. a partial tail); the
+                    # remaining tool calls, if any, cannot be parsed reliably.
+                    break
+                calls.extend(self.parse_base_json(obj, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
