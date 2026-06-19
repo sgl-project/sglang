@@ -828,6 +828,15 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
+    # MiniMax-M3 sparse decode indexer: replace the 2-stage split-K Triton block
+    # topk (_topk_index_partial_kernel + _topk_index_merge_kernel) with a single
+    # JIT CUDA radix-select kernel (minimax_decode_topk).
+    SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
+    SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+    SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
