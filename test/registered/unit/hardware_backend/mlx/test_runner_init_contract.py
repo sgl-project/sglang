@@ -1,19 +1,8 @@
-"""Contract guard for ``MlxModelRunnerStub.initialize`` vs base ``ModelRunner``.
+"""Guard the MLX initialize override against ModelRunner contract drift.
 
-Regression guard for #28660. Since #23862 the base ``ModelRunner`` stores
-``pre_model_load_memory`` as an instance attribute and calls ``self.initialize()``
-with no extra arguments (``model_runner.py``: the call site is ``self.initialize()``
-and the def is ``def initialize(self)``). The MLX override in ``MlxModelRunnerStub``
-previously kept a required ``pre_model_load_memory`` parameter, so the base's
-zero-argument call raised ``TypeError`` at MLX init. #28660 dropped the parameter.
-
-This test pins the contract: the override must remain callable exactly the way the
-base invokes it, so a future base-contract change (or a re-introduced required
-parameter) fails loudly here instead of at runtime on Apple Silicon.
-
-Pure signature inspection -- no model, GPU, server, or weights. Importing the stub
-transitively pulls ``mlx.core`` (via ``kv_cache/auxiliary_state.py``), so the test
-is MLX-gated and runs on Apple/MLX CI, not on non-Apple upstream CI.
+MlxModelRunnerStub.initialize must stay callable exactly as ModelRunner invokes
+it. The check is signature-only and MLX-gated because importing the stub pulls in
+mlx.core.
 """
 
 from __future__ import annotations
