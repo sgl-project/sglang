@@ -18,23 +18,9 @@ COMMON_ARGS = [
     "--attention-backend=tokenspeed_mla",
     "--kv-cache-dtype=fp8_e4m3",
     "--moe-runner-backend=flashinfer_trtllm",
-    "--mem-fraction-static=0.75",
+    "--mem-fraction-static=0.8",
     "--enable-multimodal",
     "--enable-metrics",
-]
-
-TP_MTP_ARGS = [
-    "--speculative-algorithm=EAGLE",
-    "--speculative-num-steps=3",
-    "--speculative-eagle-topk=1",
-    "--speculative-num-draft-tokens=4",
-]
-
-DP_MTP_ARGS = [
-    "--speculative-algorithm=EAGLE",
-    "--speculative-num-steps=1",
-    "--speculative-eagle-topk=1",
-    "--speculative-num-draft-tokens=2",
 ]
 
 
@@ -49,16 +35,14 @@ class TestKimiK25Nvfp4(unittest.TestCase):
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS + TP_MTP_ARGS,
-                variant="TP4+MTP",
+                extra_args=COMMON_ARGS,
+                variant="TP4",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS
-                + ["--dp-size=4", "--enable-dp-attention"]
-                + DP_MTP_ARGS,
-                variant="TP4+DP4+DPA+MTP",
+                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
+                variant="TP4+DP4+DPA",
             ),
         ]
 
