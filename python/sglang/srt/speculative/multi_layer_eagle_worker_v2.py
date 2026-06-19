@@ -23,7 +23,6 @@ from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -700,6 +699,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [(f"draft_step_{i}", r) for i, r in enumerate(self.draft_runner_list)]
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -870,15 +872,3 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
-
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
-            self.draft_worker.draft_runner_list + [self.target_worker.model_runner],
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
