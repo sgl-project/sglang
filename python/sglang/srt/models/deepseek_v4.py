@@ -257,6 +257,17 @@ def deepseek_v4_attention_with_output(
     ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip and output.shape[0] > real_num_tokens:
+        # PCG replay pads the batch to a captured bucket; the attention kernel
+        # only filled output[:real_num_tokens], leaving the padded tail with
+        # uninitialized garbage from torch.empty. Zero it so NaN/Inf cannot
+        # propagate through inverse-RoPE / wo / MoE routing / allreduce.
+        # Mirrors radix_attention.unified_attention_with_output (PR #22299);
+        # here the slice boundary is real_num_tokens so write/zero stay consistent.
+        first_dim = output.shape[0]
+        elems_per_token = output.numel() // first_dim
+        output.view(first_dim, elems_per_token)[real_num_tokens:].zero_()
     return
 
 
