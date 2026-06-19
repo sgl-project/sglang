@@ -32,8 +32,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -97,14 +95,6 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
-
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.init_weights_update_group(
             recv_req.master_address,
@@ -145,11 +135,6 @@ class BaseTpWorker(ABC):
             recv_req.ports,
             recv_req.group_name,
         )
-        return success, message
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
     def begin_weight_update(self):
@@ -415,10 +400,12 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
-    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # The target worker shares this class (is_draft_worker=False) and returns [].
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # All (role, ModelRunner) pairs this worker contributes to a weight update.
+        # The target (is_draft_worker=False) yields its own runner under the empty
+        # role; a draft worker yields its draft runner(s).
         if not self.is_draft_worker:
-            return []
+            return [("", self.model_runner)]
         if self.model_runner_list:
             return [
                 (f"draft_step_{i}", r) for i, r in enumerate(self.model_runner_list)

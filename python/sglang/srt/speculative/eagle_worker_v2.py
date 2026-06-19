@@ -26,10 +26,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.managers.io_struct import (
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromIPCReqInput,
-)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -922,7 +918,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_worker.draft_runner)]
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
@@ -1480,21 +1476,3 @@ class EAGLEWorkerV2(BaseSpecWorker):
         out = x.clone()
         out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
         return out
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
-            recv_req
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."

@@ -127,13 +127,27 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        """In-place update of the weights from disk."""
+        """In-place update of the weights from disk, fanning out to all runners
+        (target + draft). The draft loads from the same recv_req.model_path as the
+        target: in an RL rollout both are refreshed from one checkpoint, and
+        load_weights matches by parameter name."""
         with self._observe_weight_load("disk"):
-            success, message = self.tp_worker.update_weights_from_disk(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
+            success, message = True, "Success"
+            target_success = False
+            for role, runner in self.get_model_runners("all"):
+                success, message = runner.update_weights_from_disk(
+                    recv_req.model_path,
+                    recv_req.load_format,
+                    recapture_cuda_graph=recv_req.recapture_cuda_graph,
+                )
+                if role == "":
+                    target_success = success
+                if not success:
+                    break
+            # Flush once the target succeeded, even if a later draft fails — matches
+            # the pre-refactor behavior where the target's KV cache was flushed off
+            # the target's own success, independent of the draft result.
+            if target_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
@@ -152,16 +166,27 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success, message)
 
-    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft} selector to (role, ModelRunner) pairs, target
-        first. role is "" for the target runner; draft roles come from the draft
-        worker's iter_draft_runners()."""
+    def iter_weight_update_workers(self, selector: str = "all") -> List[Tuple[str, Any]]:
+        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
+        first: the target worker and, when present, the draft worker. This is the
+        worker-level inclusion decision; each worker then contributes its own runners
+        via iter_runners()."""
         parsed = _parse_runner_selector(selector)
-        runners: List[Tuple[str, Any]] = []
+        workers: List[Tuple[str, Any]] = []
         if "target" in parsed:
-            runners.append(("", self.tp_worker.model_runner))
+            workers.append(("target", self.tp_worker))
         if "draft" in parsed and self.draft_worker is not None:
-            runners += self.draft_worker.iter_draft_runners()
+            workers.append(("draft", self.draft_worker))
+        return workers
+
+    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
+        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs, target
+        first. Derived from iter_weight_update_workers: each selected worker yields its
+        own runners via iter_runners() — role "" for the target runner, draft roles
+        from the draft worker."""
+        runners: List[Tuple[str, Any]] = []
+        for _, worker in self.iter_weight_update_workers(selector):
+            runners += worker.iter_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -227,13 +252,20 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update the online model parameter from IPC for checkpoint-engine integration."""
+        """Update the online model parameter from IPC for checkpoint-engine
+        integration, fanning out to all runners (target + draft)."""
         with self._observe_weight_load("ipc"):
-            success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_ipc(recv_req)
-            if tp_success:
+            success, message = True, "Success"
+            target_success = False
+            for role, runner in self.get_model_runners("all"):
+                success, message = runner.update_weights_from_ipc(recv_req)
+                if role == "":
+                    target_success = success
+                if not success:
+                    break
+            # Flush off the target's own success, even if a later draft fails — see
+            # update_weights_from_disk for the rationale.
+            if target_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)

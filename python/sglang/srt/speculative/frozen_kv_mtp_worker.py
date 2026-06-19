@@ -203,7 +203,7 @@ class FrozenKVMTPWorker(TpModelWorker):
     def clear_cache_pool(self):
         pass
 
-    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)]
 
     def _resolve_draft_backend_type(self) -> str:
