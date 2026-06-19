@@ -72,6 +72,32 @@ def temb(
     return torch.cat((cos, sin), dim=-1).to(dtype=dtype)
 
 
+def norm_scale_shift(
+    x: Tensor, weight: Tensor, scale: Tensor, shift: Tensor, eps: float
+) -> Tensor:
+    """Fused RMSNorm + modulation: ``rms_norm(x) * weight * (1 + scale) + shift``.
+
+    ``weight`` is the effective RMSNorm weight (K2 stores ``scale``, so callers
+    pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
+    """
+    if x.is_cuda and x.shape[-1] % 256 == 0:
+        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+            fused_norm_scale_shift,
+        )
+
+        return fused_norm_scale_shift(
+            x.contiguous(),
+            weight.contiguous(),
+            None,
+            scale.contiguous(),
+            shift.contiguous(),
+            "rms",
+            eps,
+        )
+    normed = F.rms_norm(x.float(), (x.shape[-1],), weight=weight.float(), eps=eps)
+    return (normed.to(x.dtype) * (1 + scale) + shift).to(x.dtype)
+
+
 # --------------------------------------------------------------------------- #
 # Submodules
 # --------------------------------------------------------------------------- #
@@ -253,7 +279,7 @@ class LastLayer(nn.Module):
 
     def forward(self, x: Tensor, tvec: Tensor) -> Tensor:
         scale, shift = self.modulation(tvec)
-        x = (1 + scale) * self.norm(x) + shift
+        x = norm_scale_shift(x, self.norm.scale + 1, scale, shift, self.norm.eps)
         x = self.linear(x)
         return x
 
@@ -359,9 +385,18 @@ class SingleStreamBlock(nn.Module):
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, key_mask, mask_meta
+            norm_scale_shift(
+                x, self.prenorm.scale + 1, prescale, preshift, self.prenorm.eps
+            ),
+            freqs,
+            key_mask,
+            mask_meta,
         )
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+        x = x + postgate * self.mlp(
+            norm_scale_shift(
+                x, self.postnorm.scale + 1, postscale, postshift, self.postnorm.eps
+            )
+        )
         return x
 
 
