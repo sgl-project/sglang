@@ -14,8 +14,8 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     print_info_once,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -57,6 +58,8 @@ if _is_musa:
 
 if _is_npu:
     import torch_npu
+if _is_xpu:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -105,9 +108,11 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None
+    _max_seqlen: Optional[int] = None
 
     def set_data(self, value: Any) -> None:
         self.data = value
+        self._max_seqlen = None
 
     def get_data(self) -> Optional[Any]:
         return self.data
@@ -152,6 +157,21 @@ def resolve_seqlens(
         resolved_seqlens, torch.Tensor
     ), "cu_seqlens must be a torch.Tensor"
     return resolved_seqlens
+
+
+def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
+    """Return max segment length, caching it on a stable carrier so the
+    device->host sync (.item()) happens once per forward instead of once per layer.
+    """
+    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+        cached = getattr(source, "_max_seqlen", None)
+        if cached is None:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            cached = int(seq_lens.max().item())
+            source._max_seqlen = cached
+        return cached
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    return int(seq_lens.max().item())
 
 
 class VisionSdpaAttention(nn.Module):
@@ -327,7 +347,7 @@ class VisionTritonAttention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -400,7 +420,7 @@ class VisionFlash3Attention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -713,27 +733,26 @@ class VisionAscendAttention(nn.Module):
             seq_len_arg = cu_seqlens
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
-            output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu_seqlens[1:].to(torch.int32)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        torch_npu._npu_flash_attention_unpad(
+        seq_len_arg = seq_len_arg.tolist()
+        output = torch_npu.npu_fused_infer_attention_score(
             query=q,
             key=k,
             value=v,
-            seq_len=seq_len_arg,
-            scale_value=scale_value,
+            actual_seq_lengths=seq_len_arg,
+            actual_seq_lengths_kv=seq_len_arg,
+            scale=scale_value,
             num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            out=output,
-        )
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=0,
+            input_layout="TND",
+        )[0]
         return output
 
 
@@ -791,6 +810,55 @@ class VisionAMXAttention(nn.Module):
         return output
 
 
+class VisionIntelXPUAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not (_is_xpu):
+            raise Exception("VisionIntelXPUAttention is only available for Intel XPU")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+
+        cu_seqlens_source = cu_seqlens
+        cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+
+        fa_kwargs = dict(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+        )
+        if s_aux is not None:
+            fa_kwargs["sinks"] = s_aux
+        output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+
+        return output
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
@@ -800,6 +868,7 @@ QKV_BACKEND_IMPL = {
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
     "amx_attn": VisionAMXAttention,
+    "xpu_attn": VisionIntelXPUAttention,
 }
 
 
@@ -856,8 +925,8 @@ class VisionAttention(nn.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads
@@ -1030,7 +1099,7 @@ class VisionAttention(nn.Module):
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn"
+            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():

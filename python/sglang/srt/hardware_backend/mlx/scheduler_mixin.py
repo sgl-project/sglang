@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 import mlx.core as mx
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
@@ -72,19 +73,19 @@ class MlxPendingJob:
     """
 
     lazy_tokens: Optional[mx.array]
-    prefills: list["MlxPendingPrefill"]
-    extends: list["MlxPendingExtend"]
-    decode: Optional["MlxPendingDecode"]
+    prefills: list[MlxPendingPrefill]
+    extends: list[MlxPendingExtend]
+    decode: Optional[MlxPendingDecode]
     mode: str
-    batch_copy: "ScheduleBatch"
-    schedule_batch: "ScheduleBatch"
+    batch_copy: ScheduleBatch
+    schedule_batch: ScheduleBatch
     reqs: List[Req]
 
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
 
-    def _finalize_mlx_pending_job(self: "Scheduler", pending: MlxPendingJob):
+    def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         result = self.tp_worker.finalize_mlx_result(
             pending.prefills,
             pending.extends,
@@ -99,7 +100,7 @@ class SchedulerMlxOverlapMixin:
         self.process_batch_result(pending.batch_copy, result)
 
     @DynamicGradMode()
-    def event_loop_overlap_mlx(self: "Scheduler"):
+    def event_loop_overlap_mlx(self: Scheduler):
         """MLX-specific overlap loop modelled on ``mlx_lm.generate.generate_step``.
 
         At steady state we keep TWO in-flight MLX graphs queued on the
@@ -141,7 +142,14 @@ class SchedulerMlxOverlapMixin:
         pending_curr: Optional[MlxPendingJob] = None
         pending_next: Optional[MlxPendingJob] = None
 
-        def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
+        def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
+            # Materialize batch.input_ids from CPU staging (prefill) or the
+            # FutureMap relay (decode) before the forward. With deferred input
+            # materialization, get_next_batch_to_run leaves input_ids unset; the
+            # CUDA paths call resolve_forward_inputs for this, but the MLX overlap
+            # loop must do it too, otherwise async_forward_batch_generation_mlx
+            # dereferences a None input_ids.
+            resolve_forward_inputs(batch, self.future_map)
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )

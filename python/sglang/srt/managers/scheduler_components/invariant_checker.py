@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-import warnings
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Deque,
     List,
     Optional,
     Tuple,
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
+BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
@@ -52,6 +56,9 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    recent_busy_msgs: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
+    )
 
     @staticmethod
     def _check_pool_invariant(
@@ -107,6 +114,9 @@ class SchedulerInvariantChecker:
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
+        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        if ckpt_pool is not None:
+            return self._check_mamba_pool_with_int8(ps, ckpt_pool)
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -128,13 +138,12 @@ class SchedulerInvariantChecker:
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
             )
-            free_mamba_pages = set(
-                self.req_to_token_pool.mamba_pool.free_slots.tolist()
-            )
+            mamba_allocator = self.req_to_token_pool.mamba_allocator
+            free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(range(1, mamba_allocator.size + 1))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
@@ -143,6 +152,37 @@ class SchedulerInvariantChecker:
                 f", leaked_mamba_pages={leaked_mamba_pages or None}"
             )
         return leak, msg
+
+    def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
+        """Two-pool invariant for int8 mamba checkpoints.
+
+        The radix-cached states live in the int8 checkpoint pool, NOT the active
+        bf16 pool. So the single-pool equation (active.available + radix_cached ==
+        active.size) is wrong -- it double-counts the radix states against a pool
+        that does not hold them. Instead check the two pools independently:
+
+          * active bf16 pool: backs running requests only; the radix owns ZERO
+            active slots. Checked at idle (in-flight == 0) -> available == total.
+          * int8 checkpoint pool: backs the radix-cached states; its occupancy is
+            exactly the radix evictable + protected counts.
+        """
+        active_leak, active_msg = self._check_pool_invariant(
+            "mamba-active",
+            ps.mamba_available_size,
+            ps.mamba_evictable_size,  # 0 in int8 mode (radix owns no active slots)
+            0,
+            self.pool_stats_observer.session_held_mamba_slots(),
+            self.req_to_token_pool.mamba_pool.size,
+        )
+        int8_leak, int8_msg = self._check_pool_invariant(
+            "mamba-int8",
+            ckpt_pool.available_size(),
+            self.tree_cache.mamba_evictable_size(),
+            self.tree_cache.mamba_protected_size(),
+            0,
+            ckpt_pool.num_slots,
+        )
+        return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _get_total_uncached_sizes(
         self,
@@ -156,12 +196,17 @@ class SchedulerInvariantChecker:
         """
         # After decode: running_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
-        batches = [self.get_last_batch()]
+        # Use identity (is / is not), not membership or ==: ScheduleBatch's
+        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
+        last_batch = self.get_last_batch()
+        running_batch = self.get_running_batch()
+        batches = [last_batch]
         if (
-            self.get_running_batch() not in (None, self.get_last_batch())
-            and not self.get_running_batch().is_empty()
+            running_batch is not None
+            and running_batch is not last_batch
+            and not running_batch.is_empty()
         ):
-            batches.append(self.get_running_batch())
+            batches.append(running_batch)
 
         full_uncached = 0
         swa_uncached = 0
@@ -188,13 +233,6 @@ class SchedulerInvariantChecker:
         if self.get_last_batch() is None:
             return
 
-        spec_topk = self.server_args.speculative_eagle_topk or 1
-        if spec_topk > 1:
-            warnings.warn(
-                "Runtime memory check (busy) is not supported when speculation topk > 1."
-            )
-            return
-
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
 
@@ -204,10 +242,24 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
-        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            logger.info(f"[Mem Check (BUSY)] {full_msg}")
-            if swa_msg:
-                logger.info(f"[Mem Check (BUSY)] {swa_msg}")
+        level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+        full_line = f"[Mem Check (BUSY)] {full_msg}"
+        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+
+        if level > 1:
+            # Verbose: log every iteration.
+            logger.info(full_line)
+            if swa_line:
+                logger.info(swa_line)
+        elif level == 1:
+            # Quiet: buffer and stay silent; flush the recent ones only on a leak.
+            self.recent_busy_msgs.append(full_line)
+            if swa_line:
+                self.recent_busy_msgs.append(swa_line)
+            if full_leak or swa_leak:
+                for msg in self.recent_busy_msgs:
+                    logger.info(msg)
+
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
@@ -276,7 +328,7 @@ class SchedulerInvariantChecker:
 
 
 def create_scheduler_watchdog(
-    scheduler: "Scheduler", watchdog_timeout: float, soft: bool = False
+    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
         if scheduler.is_initializing:

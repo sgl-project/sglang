@@ -147,6 +147,55 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_prompt_token_ids=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "return_prompt_token_ids is not supported with streaming"
+        ):
+            self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_meta_info=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "return_meta_info is not supported with streaming"
+        ):
+            self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_convert_to_internal_request_input_ids_bypasses_template(self):
+        self.tm.tokenizer = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            stop=["STOP"],
+            return_prompt_token_ids=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            adapted, processed = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+        self.assertEqual(processed, req)
+        self.assertEqual(adapted.input_ids, [101, 102, 103])
+        self.assertTrue(adapted.return_prompt_token_ids)
+        self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        conv_mock.assert_not_called()
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
@@ -508,6 +557,157 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
+
+    def test_jinja_rejects_non_object_tool_call_arguments(self):
+        """History tool call arguments must parse to a JSON object."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for arguments in ['"Beijing"', '["Beijing"]']:
+            with self.subTest(arguments=arguments):
+                self.tm.tokenizer.apply_chat_template.reset_mock()
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+                    self.chat._process_messages(req, is_multimodal=False)
+
+                self.tm.tokenizer.apply_chat_template.assert_not_called()
+
+    def test_jinja_accepts_object_tool_call_arguments_string(self):
+        """OpenAI JSON string arguments are converted to dicts for templates."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            {"city": "Beijing"},
+        )
+
+    def test_dsv_encoders_reject_non_object_tool_call_arguments(self):
+        """DeepSeek encoders should reject history tool call scalars as BadRequest."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '"Beijing"',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+                    self.chat._process_messages(req, is_multimodal=False)
+
+    def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
+        """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Beijing"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -1290,6 +1490,39 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def test_non_streaming_chat_response_returns_requested_prompt_ids_and_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_prompt_token_ids=True,
+            return_meta_info=True,
+        )
+        ret = [
+            {
+                "text": "Answer",
+                "prompt_token_ids": [11, 12, 13],
+                "meta_info": {
+                    "id": "chatcmpl-token-ids",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.prompt_token_ids, [11, 12, 13])
+        self.assertEqual(choice.meta_info, ret[0]["meta_info"])
+        dumped_choice = response.model_dump()["choices"][0]
+        self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
+        self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
+
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming chat responses emit cached token details in sglext."""
 
@@ -1709,7 +1942,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         response = self.chat._build_chat_response(req, [ret_item], created=0)
         msg = response.choices[0].message
-        self.assertIsNone(msg.content)
+        self.assertEqual(msg.content, "")
         self.assertEqual(msg.reasoning_content, "42")
 
     # --- poolside_v1 (Laguna-XS.2) regression tests ---
