@@ -2500,17 +2500,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        if (
-            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and self.pp_size > 1
-            and not self.spec_algorithm.is_speculative()
-        ):
-            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
-                pp_parallel_deep_gemm_warmup,
-            )
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if (
+                envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
+                and self.pp_size > 1
+                and not self.spec_algorithm.is_speculative()
+            ):
+                from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+                    pp_parallel_deep_gemm_warmup,
+                )
 
-            pp_parallel_deep_gemm_warmup(self)
+                pp_parallel_deep_gemm_warmup(self)
+
+            if envs.SGLANG_JIT_DEEPGEMM_SHARD_PRECOMPILE.get():
+                deep_gemm_wrapper.sync_deep_gemm_precompile_markers()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.

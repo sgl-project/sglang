@@ -206,6 +206,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
+def sync_deep_gemm_precompile_markers():
+    return compile_utils.sync_deep_gemm_precompile_markers()
+
+
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None or not ENABLE_JIT_DEEPGEMM:
