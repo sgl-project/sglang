@@ -759,7 +759,11 @@ fn build_outgoing_body(
 /// the router rendered matches the engine. The only way to diverge is an engine
 /// build that applies a non-default thinking mode the router can't observe from
 /// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on.
+/// cache-aware routing already depends on. The same assumption covers
+/// `add_special_tokens`: the router renders specials via the chat template, which
+/// matches the engine on tokenizers that auto-add them (the common case); a
+/// tokenizer that does not would diverge by a leading special, again undetectable
+/// from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;

@@ -10,19 +10,19 @@
 //! # Selection algorithm
 //!
 //! Given `workers` (already filtered to healthy + matching pool by the
-//! caller) and a `SelectionContext` carrying the JSON request body:
+//! caller) and a `SelectionContext` carrying the JSON request body and the
+//! ingress-precomputed routing tokens:
 //!
 //! 1. **Load-imbalance fast-path.** If `max_load - min_load >
 //!    balance_abs_threshold` AND `max_load > min_load *
 //!    balance_rel_threshold`, skip the cache lookup and pick the
 //!    lowest-load worker. This prevents one hot worker from dominating
 //!    cache-aware selection while every other worker idles.
-//! 2. **Tokenize.** For chat requests (`messages`) on a model with a chat
-//!    encoder (a Jinja template, or a built-in encoder like DeepSeek-V4's),
-//!    render it and tokenize the result so the query tokens match what the
-//!    engine cached (BOS + role markers + content); otherwise tokenize the raw
-//!    `prompt`/`text`. On any failure (no body, no tokenizer, encode error,
-//!    empty tokens), fall through to step 4 (min-load fallback).
+//! 2. **Routing tokens.** Prefer the ingress-precomputed ids
+//!    (`ctx.request_tokens()`); fall back to tokenizing the body here
+//!    (chat-encoder-aware for chat traffic, raw `prompt`/`text` otherwise)
+//!    for callers that didn't pre-tokenize. On any failure (no tokens, no
+//!    tokenizer, encode error, empty), fall through to step 4 (min-load).
 //! 3. **Hash + match.** Compute block hashes via
 //!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
@@ -1080,9 +1080,8 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
-    /// Byte-slice helper mirroring the old `CacheAwareZmqPolicy::extract_prompt_text`
-    /// over the now-shared free function, so the extraction-shape tests below
-    /// stay terse.
+    /// Byte-slice helper over the shared `extract_prompt_text_from_value` free
+    /// function, so the extraction-shape tests below stay terse.
     fn extract_prompt_text(body: &[u8]) -> Option<String> {
         let v: serde_json::Value = serde_json::from_slice(body).ok()?;
         crate::policies::extract_prompt_text_from_value(&v)
