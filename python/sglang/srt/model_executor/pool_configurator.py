@@ -206,11 +206,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_ratio = parse_hisparse_config(
                         mr.server_args
                     ).host_to_device_ratio
-                cell_size += (
-                    indexer_size_per_token
-                    * num_layers
-                    * element_size
-                    * indexer_ratio
+                cell_size += int(
+                    indexer_size_per_token * num_layers * element_size * indexer_ratio
                 )
         else:
             cell_size = (
