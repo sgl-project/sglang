@@ -132,6 +132,29 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads

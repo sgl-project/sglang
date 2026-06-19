@@ -121,7 +121,7 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x B200 NVL4) nightly suite
+        # GB300 (4x GB300 NVL4) nightly suite
         "nightly-4-gpu-gb300",
         # Nightly precision regression (per-layer hidden state comparison)
         "nightly-precision-8-gpu-h200",
