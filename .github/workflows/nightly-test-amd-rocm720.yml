@@ -1064,7 +1064,8 @@ jobs:
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    # TP=4 workload: runs on the dedicated 4-GPU mi35x slice, not a whole 8-GPU node.
+    runs-on: linux-mi35x-gpu-4
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1760,7 +1761,8 @@ jobs:
 
   nightly-4-gpu-mi35x-minimax-m25-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    # TP=4 workload: runs on the dedicated 4-GPU mi35x slice, not a whole 8-GPU node.
+    runs-on: linux-mi35x-gpu-4
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

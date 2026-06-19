@@ -35,6 +35,7 @@ on:
           - multimodal-gen-test-1-gpu-amd
           - multimodal-gen-test-2-gpu-amd
           - stage-c-test-4-gpu-amd
+          - stage-c-test-4-gpu-amd-mi35x
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd
@@ -1036,7 +1037,50 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0, 1]
+        part: [0]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+  # MI35x stage-c tests that only need 4 GPUs (e.g. DeepSeek-R1-MXFP4 TP=4).
+  # Split off the 8-GPU mi35x suite so they no longer hold a whole 8-GPU node
+  # and instead run on the dedicated 4-GPU mi35x slice.
+  stage-c-test-4-gpu-amd-mi35x:
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd-mi35x,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-4]
+        part: [0]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1058,7 +1102,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-4-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-mi35x-disaggregation-amd:
@@ -1194,6 +1238,7 @@ jobs:
         stage-b-test-2-gpu-large-amd,
         stage-b-test-large-8-gpu-mi35x-disaggregation-amd,
         stage-c-test-4-gpu-amd,
+        stage-c-test-4-gpu-amd-mi35x,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
       ]
