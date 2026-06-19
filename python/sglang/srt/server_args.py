@@ -304,7 +304,7 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-MAMBA_SCHEDULER_STRATEGY_CHOICES = [
+MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
     "no_buffer",
     "extra_buffer",
@@ -668,7 +668,7 @@ class ServerArgs:
         "auto"
     )
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -692,8 +692,14 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
-    mamba_scheduler_strategy: str = "auto"
+    mamba_radix_cache_strategy: str = "auto"
     mamba_track_interval: int = 256
+    # int8-compress radix-cached linear-attn (mamba) checkpoints -> ~2x cached
+    # prefixes at fixed memory (quality-safe; see mem_cache/mamba_checkpoint_pool.py).
+    enable_int8_mamba_checkpoint: bool = False
+    int8_mamba_ckpt_size: Optional[int] = (
+        None  # #int8 checkpoint slots; default 2x the active pool
+    )
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -1009,6 +1015,7 @@ class ServerArgs:
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
@@ -1171,12 +1178,6 @@ class ServerArgs:
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
 
-            if self.tokenizer_worker_num > 1:
-                raise ValueError(
-                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
-                    "Multi-worker HTTP/2 support will be added in a future release."
-                )
-
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -1268,12 +1269,6 @@ class ServerArgs:
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
-
-        # Mamba scheduler strategy
-        if self.mamba_scheduler_strategy == "auto":
-            # TODO: when extra_buffer is more verified, we can set the default path based on
-            #       [overlap, non-overlap]
-            self.mamba_scheduler_strategy = "no_buffer"
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -1534,9 +1529,9 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own __init__; config-time
-        rules can be added here as they're discovered.
+        """Breakable (segmented capture, no torch.compile). Breakable enforces
+        memory-saver rejection in its own __init__; config-time rules can be
+        added here as they're discovered.
         """
         rules = [
             # MLA prefill takes a different attn-forward path under BCG (no
@@ -1967,11 +1962,7 @@ class ServerArgs:
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=_hybrid_spec.support_mamba_cache,
-                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -2016,7 +2007,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
@@ -2341,9 +2332,9 @@ class ServerArgs:
                     )
                 elif is_sm120_supported() and is_mxfp4_quant_format:
                     # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "triton_kernel"
+                    self.moe_runner_backend = "marlin"
                     logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
@@ -2440,21 +2431,8 @@ class ServerArgs:
                     )
 
                 # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Only the kernel/page_first transfer
-                # path has a safe split K/V implementation.
-                if self.hicache_io_backend != "kernel":
-                    logger.warning(
-                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r})."
-                    )
-                    self.hicache_io_backend = "kernel"
-                if self.hicache_mem_layout != "page_first":
-                    logger.warning(
-                        f"Force hicache_mem_layout to 'page_first' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"asymmetric K/V HiCache requires kernel/page_first."
-                    )
-                    self.hicache_mem_layout = "page_first"
+                # asymmetric K/V allocation. Both kernel/page_first and
+                # direct/page_first_direct have split K/V transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -2622,16 +2600,9 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["KimiLinearForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=False,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=True,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
@@ -2692,22 +2663,20 @@ class ServerArgs:
                     ):
                         sm100_default_attn_backend = "trtllm_mha"
 
-                self._handle_mamba_radix_cache(
-                    model_arch=model_arch,
-                    support_mamba_cache=True,
-                    support_mamba_cache_extra_buffer=True,
-                    sm100_default_attention_backend=sm100_default_attn_backend,
-                )
+                    if self.attention_backend is None:
+                        self.attention_backend = sm100_default_attn_backend
+                        self.page_size = (
+                            64 if sm100_default_attn_backend == "trtllm_mha" else 1
+                        )
+
+                self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
             # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
             # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=True,
-                sm100_default_attention_backend="triton",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "triton"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -2738,10 +2707,9 @@ class ServerArgs:
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                sm100_default_attention_backend="triton",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "triton"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch == "GraniteMoeHybridForCausalLM":
             hf_config = self.get_model_config().hf_config
@@ -2750,29 +2718,21 @@ class ServerArgs:
                 for layer_type in getattr(hf_config, "layer_types", [])
             )
             if has_mamba:
-                self._handle_mamba_radix_cache(
-                    model_arch=model_arch,
-                    sm100_default_attention_backend="flashinfer",
-                )
+                if is_sm100_supported() and self.attention_backend is None:
+                    self.attention_backend = "flashinfer"
+                self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Lfm2ForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-                sm100_default_attention_backend="flashinfer",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "flashinfer"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
 
         elif model_arch in ["ZayaForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
@@ -2814,6 +2774,8 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                "NemotronHForCausalLM",
+                "NemotronHPuzzleForCausalLM",
             ]
             and is_sm100_supported()
             and self.tp_size > 1
@@ -2833,100 +2795,68 @@ class ServerArgs:
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
 
-    def _handle_mamba_radix_cache(
-        self,
-        model_arch: str,
-        support_mamba_cache: bool = True,
-        support_mamba_cache_extra_buffer: bool = True,
-        sm100_default_attention_backend: str = None,
-        fallback_attention_backend: str = "triton",
-    ):
-        self.uses_mamba_radix_cache = True
+    def _support_mamba_cache_extra_buffer(self, model_arch: str):
+        if model_arch in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3NextForCausalLM",
+            "InternS2PreviewForConditionalGeneration",
+            "MiniCPMV4_6ForConditionalGeneration",
+            "BailingMoeV2_5ForCausalLM",
+            "FalconH1ForCausalLM",
+            "GraniteMoeHybridForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+        ]:
+            return self.linear_attn_backend == "triton"
 
-        if (
-            is_sm100_supported()
-            and self.attention_backend is None
-            and sm100_default_attention_backend is not None
-        ):
-            self.attention_backend = sm100_default_attention_backend
-            logger.info(
-                f"Use {sm100_default_attention_backend} as attention backend on sm100 for {model_arch}"
-            )
+        return False
 
-        if not support_mamba_cache:
-            logger.warning(
-                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
-            )
-            self.disable_radix_cache = True
+    def _validate_mamba_no_buffer(self, model_arch: str):
+        assert self.page_size in (1, None), "no_buffer only supports page_size=1."
+        assert (
+            self.disable_overlap_schedule
+        ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+        assert (
+            self.attention_backend != "trtllm_mha"
+        ), "no_buffer do not support trtllm_mha attention backend."
+
+    def _validate_mamba_extra_buffer(self, model_arch: str):
+        assert self._support_mamba_cache_extra_buffer(
+            model_arch
+        ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+        assert (
+            is_cuda() or is_musa() or is_npu()
+        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+        if self.speculative_num_draft_tokens is not None:
+            assert (
+                not self.enable_mamba_extra_buffer_lazy()
+            ), "extra_buffer_lazy unsupported with spec."
+            assert self.mamba_track_interval >= self.speculative_num_draft_tokens
+        if self.page_size is not None:
+            assert self.mamba_track_interval % self.page_size == 0
+            assert self.mamba_cache_chunk_size is not None
+
+    def _handle_mamba_radix_cache(self, model_arch: str):
+        if self.disable_radix_cache:
             return
 
-        if not support_mamba_cache_extra_buffer:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
-
-        if self.enable_mamba_extra_buffer():  # extra_buffer
-            if self.disable_radix_cache:
-                raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache. "
-                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
-                    "Please use --mamba-scheduler-strategy no_buffer instead."
-                )
-
-            assert (
-                is_cuda() or is_musa() or is_npu()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
-            if self.speculative_num_draft_tokens is not None:
-                assert not self.enable_mamba_extra_buffer_lazy(), (
-                    "extra_buffer_lazy is not yet supported with speculative decoding. "
-                    "Use --mamba-scheduler-strategy extra_buffer instead."
-                )
-                assert (
-                    self.mamba_track_interval >= self.speculative_num_draft_tokens
-                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
-
-            if self.page_size is not None:
-                assert (
-                    self.mamba_track_interval % self.page_size == 0
-                ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                assert self.mamba_cache_chunk_size is not None
-        elif not self.disable_radix_cache:  # no_buffer
-            if self.page_size is not None and self.page_size != 1:
-                logger.warning(
-                    f"{model_arch} with radix cache requires page_size=1 in the current "
-                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
-                    "Automatically setting page_size=1."
-                )
-                self.page_size = 1
-            if self.speculative_algorithm is None:
-                logger.warning(
-                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
-                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if self.attention_backend == "trtllm_mha":
-                    logger.warning(
-                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        f"Try to use --attention-backend {fallback_attention_backend} if radix cache is necessary."
-                    )
-                    self.disable_radix_cache = True
-                    self.disable_overlap_schedule = False
+        self.uses_mamba_radix_cache = True
+        if self.mamba_radix_cache_strategy == "auto":
+            wants_overlap = not self.disable_overlap_schedule
+            wants_paging = self.page_size is not None and self.page_size > 1
+            if (
+                wants_overlap or wants_paging
+            ) and self._support_mamba_cache_extra_buffer(model_arch):
+                self.mamba_radix_cache_strategy = "extra_buffer"
             else:
-                if not self.disable_radix_cache:
-                    if is_hip():
-                        # On ROCm, extra_buffer is unsupported.
-                        # Automatically disable radix cache instead.
-                        logger.warning(
-                            f"Speculative decoding for {model_arch} is not compatible "
-                            "with radix cache on ROCm devices. "
-                            "Automatically disabling radix cache."
-                        )
-                        self.disable_radix_cache = True
-                    else:
-                        raise ValueError(
-                            f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer."
-                        )
+                self.mamba_radix_cache_strategy = "no_buffer"
+                self.disable_overlap_schedule = True
+
+        if self.enable_mamba_extra_buffer():
+            self._validate_mamba_extra_buffer(model_arch)
+        else:
+            self._validate_mamba_no_buffer(model_arch)
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -3389,6 +3319,28 @@ class ServerArgs:
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
 
+    def _handle_int8_mamba_checkpoint(self):
+        # The int8 mamba checkpoint pool is only wired into the built-in
+        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # --enable-hierarchical-cache) and custom radix-cache backends are NOT
+        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
+        # (wrong pool / out-of-range). Reject the combination up front rather than
+        # silently corrupting state.
+        if not self.enable_int8_mamba_checkpoint:
+            return
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported together with "
+                "--enable-hierarchical-cache: the host-offload path "
+                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+            )
+        if self.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint only supports the built-in mamba "
+                f"radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
+                "is not int8-aware. Omit --radix-cache-backend."
+            )
+
     def _handle_linear_attn_backend(self):
         import torch
 
@@ -3412,7 +3364,7 @@ class ServerArgs:
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
@@ -3428,7 +3380,7 @@ class ServerArgs:
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
             prefill == "flashinfer"
-            and torch.cuda.is_available()
+            and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
             and cuda_major < 13
         ):
@@ -3480,6 +3432,17 @@ class ServerArgs:
         self.prefill_cp_mode = mode
 
     def _handle_context_parallelism(self):
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+
+            model_config = self.get_model_config()
+            model_arch = model_config.hf_config.architectures[0]
+            if (
+                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
+                and not envs.SGLANG_ENABLE_CP_V2.is_set()
+            ):
+                envs.SGLANG_ENABLE_CP_V2.set(True)
+
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
@@ -3534,6 +3497,10 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+        from sglang.srt.layers.cp.base import init_cp_strategy
+
+        init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -4015,6 +3982,26 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
+        # Step 3: HiCache is not yet supported with the DeepSeek-V4 hip unified_kv
+        # layout, so fall back to the default tilelang FlashMLA backend.
+        self._resolve_unified_kv_hicache_compatibility()
+
+    def _resolve_unified_kv_hicache_compatibility(self):
+        # The DeepSeek-V4 unified_kv layout (SGLANG_HACK_FLASHMLA_BACKEND=
+        # unified_kv_triton) keeps swa/c4/c128 in a single per-layer buffer and
+        # has no HiCache host-pool support yet, so reset the backend to the
+        # default (tilelang) so the server still starts.
+        if not self.enable_hierarchical_cache:
+            return
+
+        if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
+            envs.SGLANG_HACK_FLASHMLA_BACKEND.set("tilelang")
+            logger.warning(
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is not yet "
+                "compatible with --enable-hierarchical-cache; falling back to "
+                "SGLANG_HACK_FLASHMLA_BACKEND=tilelang."
+            )
+
     def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -4032,6 +4019,20 @@ class ServerArgs:
             self.hicache_mem_layout = "page_first_direct"
             logger.warning(
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
+            )
+
+        # The page_first kernel write-back relies on the CUDA-only JIT staged
+        # kernel. On ROCm it falls back to a kernel that requires CUDA index
+        # tensors and crashes on host write-back, so use layer_first there.
+        if (
+            self.hicache_mem_layout == "page_first"
+            and self.hicache_io_backend == "kernel"
+            and is_hip()
+        ):
+            self.hicache_mem_layout = "layer_first"
+            logger.warning(
+                "page_first kernel write-back requires the CUDA JIT kernel; "
+                "falling back to layer_first layout on ROCm."
             )
 
     def _resolve_storage_layout_compatibility(self):
@@ -4350,9 +4351,9 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
-            if not is_cuda():
+            if not (is_cuda() or is_hip()):
                 logger.warning(
-                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                     "Disabling breakable CUDA graph."
                 )
                 self.debug_cuda_graph = False
@@ -6440,6 +6441,19 @@ class ServerArgs:
             help="The maximum size of the mamba cache.",
         )
         parser.add_argument(
+            "--enable-int8-mamba-checkpoint",
+            action="store_true",
+            help="Store radix-cached linear-attn (mamba) states in int8 (separate "
+            "checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        )
+        parser.add_argument(
+            "--int8-mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.int8_mamba_ckpt_size,
+            help="Number of int8 mamba checkpoint slots (default: 2x the active "
+            "mamba pool size).",
+        )
+        parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
             default=None,
@@ -6455,9 +6469,18 @@ class ServerArgs:
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",
+            dest="mamba_radix_cache_strategy",
             type=str,
-            choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
-            default=ServerArgs.mamba_scheduler_strategy,
+            action=DeprecatedAliasStoreAction,
+            new_flag="--mamba-radix-cache-strategy",
+            default=ServerArgs.mamba_radix_cache_strategy,
+            help="Deprecated alias for --mamba-radix-cache-strategy.",
+        )
+        parser.add_argument(
+            "--mamba-radix-cache-strategy",
+            type=str,
+            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            default=ServerArgs.mamba_radix_cache_strategy,
             help="The strategy to use for mamba radix cache.",
         )
         parser.add_argument(
@@ -7725,10 +7748,16 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_scheduler_strategy in ("extra_buffer", "extra_buffer_lazy")
+        return (
+            self.disable_radix_cache is False
+            and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
+        )
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return self.mamba_scheduler_strategy == "extra_buffer_lazy"
+        return (
+            self.disable_radix_cache is False
+            and self.mamba_radix_cache_strategy == "extra_buffer_lazy"
+        )
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
