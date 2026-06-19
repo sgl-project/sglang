@@ -422,7 +422,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         fixture = self._build_target_verify_metadata_fixture(case)
         backend = fixture.backend
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-            backend.init_cuda_graph_state(
+            backend.init_static_metadata_buffers(
                 max_bs=bs,
                 max_num_tokens=bs * num_draft_tokens,
             )

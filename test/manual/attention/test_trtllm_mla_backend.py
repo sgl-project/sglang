@@ -1017,7 +1017,7 @@ class TestTRTLLMMLA(CustomTestCase):
         batch_size = config["batch_size"]
 
         # Initialize CUDA graph state
-        backend.init_cuda_graph_state(
+        backend.init_static_metadata_buffers(
             max_bs=batch_size, max_num_tokens=config["max_seq_len"] * batch_size
         )
 
