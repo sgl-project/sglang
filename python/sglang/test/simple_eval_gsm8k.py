@@ -123,32 +123,41 @@ class GSM8KEval(Eval):
             return "wrapped_raw"
         return None
 
-    def _build_prompt(self, idx: int, question: str, sampler: SamplerBase) -> str:
+    def _build_prompt(
+        self,
+        idx: int,
+        question: str,
+        sampler: SamplerBase,
+        prompt_style: Optional[str] = None,
+    ) -> str:
         prefix = self._build_prefix(idx)
-        prompt_style = self._chat_prompt_style(sampler)
+        # prompt_style is sampler-dependent (idx-invariant); hoist it once in
+        # __call__ and pass it through instead of recomputing per sample.
+        if prompt_style is None:
+            prompt_style = self._chat_prompt_style(sampler)
         if prompt_style == "explicit_answer":
-            return (
-                CHAT_MODE_INSTRUCTION
-                + self._chat_few_shot_prompt
-                + "Now solve this problem:\n\n"
-                + f"Question: {self._lines[idx]['question']}"
-            )
-        if prompt_style == "wrapped_raw":
-            return (
-                CHAT_MODE_INSTRUCTION
-                + prefix
-                + "Now solve this problem:\n\n"
-                + question
-            )
-        return prefix + question
+            few_shot = self._chat_few_shot_prompt
+            question_part = f"Question: {self._lines[idx]['question']}"
+        elif prompt_style == "wrapped_raw":
+            few_shot = prefix
+            question_part = question
+        else:
+            return prefix + question
+        return (
+            CHAT_MODE_INSTRUCTION
+            + few_shot
+            + "Now solve this problem:\n\n"
+            + question_part
+        )
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
+        prompt_style = self._chat_prompt_style(sampler)
+
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
-            prompt_style = self._chat_prompt_style(sampler)
-            prompt_content = self._build_prompt(idx, question, sampler)
+            prompt_content = self._build_prompt(idx, question, sampler, prompt_style)
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]
