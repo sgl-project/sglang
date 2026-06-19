@@ -101,6 +101,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -603,6 +604,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+
+        # Optionally persist the shaped capture trace (record_shapes=True) for
+        # offline per-kernel analysis -- opt-in via
+        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE; the in-log tables above are
+        # unchanged.
+        export_cuda_graph_capture_trace(
+            prof_context,
+            runner_name=type(self).__name__,
+            tp_rank=get_tensor_model_parallel_rank(),
+        )
 
     def capture_prepare(
         self,
