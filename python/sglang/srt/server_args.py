@@ -1529,9 +1529,9 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own __init__; config-time
-        rules can be added here as they're discovered.
+        """Breakable (segmented capture, no torch.compile). Breakable enforces
+        memory-saver rejection in its own __init__; config-time rules can be
+        added here as they're discovered.
         """
         rules = [
             # MLA prefill takes a different attn-forward path under BCG (no
@@ -2007,7 +2007,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
@@ -4351,9 +4351,9 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
-            if not is_cuda():
+            if not (is_cuda() or is_hip()):
                 logger.warning(
-                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                     "Disabling breakable CUDA graph."
                 )
                 self.debug_cuda_graph = False

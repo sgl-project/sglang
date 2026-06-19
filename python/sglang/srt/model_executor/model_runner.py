@@ -61,7 +61,9 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    dsa_layer_skips_topk,
     get_num_indexer_layers,
+    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -838,6 +840,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
+
+    def get_pp_proxy_topk_size(self) -> Optional[int]:
+        hf_config = self.model_config.hf_text_config
+        if (
+            self.pp_size <= 1
+            or self.pp_rank == 0
+            or not is_deepseek_dsa(hf_config)
+            or not dsa_layer_skips_topk(hf_config, self.start_layer)
+        ):
+            return None
+        return getattr(hf_config, "index_topk", None)
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -2758,6 +2771,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
             hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
+            pp_proxy_topk_size=self.get_pp_proxy_topk_size(),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -3416,13 +3430,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check piecewies cuda graph
         can_run_graph = (
             self.prefill_cuda_graph_runner is not None
-            and self.prefill_cuda_graph_runner.can_run(forward_batch)
+            and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
         )
         if get_cp_strategy() is not None:
             can_run_graph = False
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
-            # replay_prepare time. Move timing into the prefill cuda graph
+            # load_batch time. Move timing into the prefill cuda graph
             # runner to capture only the model.forward part.
             ctx = (
                 self.device_timer.wrap(metadata={"category": "extend"})
@@ -3430,7 +3444,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with ctx:
-                ret = self.prefill_cuda_graph_runner.replay(forward_batch, **kwargs)
+                ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
         if not self.server_args.enable_pdmux:
@@ -3704,7 +3718,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             can_run_graph = bool(
                 mode_check()
                 and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run(forward_batch)
+                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -3717,7 +3731,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.replay(
+                ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )

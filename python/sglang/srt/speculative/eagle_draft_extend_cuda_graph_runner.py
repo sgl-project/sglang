@@ -71,7 +71,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     Subclasses DecodeCudaGraphRunner to inherit the outer capture
     loop + backend scaffolding. Overrides capture_one_shape,
-    replay, can_run for EAGLE-specific draft-extend semantics.
+    replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
     def __init__(
@@ -255,7 +255,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -427,7 +427,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     ),
                 )
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers

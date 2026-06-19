@@ -182,6 +182,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk_size: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers as a namespace adopted by
     ``build_decode_registry(source=...)``."""
@@ -219,6 +220,10 @@ def _allocate_decode_buffers(
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (max_bs, hidden_size), dtype=dtype
+                )
+            if pp_proxy_topk_size is not None:
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (max_num_token, pp_proxy_topk_size), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -450,6 +455,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -510,7 +516,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -955,7 +961,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.backend.cleanup()
             self.capture()
 
-    def replay_prepare(
+    def load_batch(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -963,7 +969,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
-            # Pre-planned (plan-stream replay_prepare already ran).
+            # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -1057,7 +1063,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.bs, stream_idx, variant_label
         )
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -1070,7 +1076,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx, self.backend.replay_session():
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            self.load_batch(forward_batch, pp_proxy_tensors)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
