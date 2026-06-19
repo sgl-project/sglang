@@ -116,12 +116,6 @@ class MlxModelRunnerStub(ModelRunner):
 
         Creates minimal req_to_token_pool and token_to_kv_pool_allocator
         with a dummy KV cache (zero GPU memory) so the scheduler works.
-
-        Signature mirrors the base ``ModelRunner.initialize(self)``: since
-        commit 75998d0421b (#23862) the base computes ``pre_model_load_memory``
-        as an instance attribute before calling ``self.initialize()`` with no
-        argument, so the override must take none either. The value is unused
-        here (the stub builds a zero-GPU dummy KV cache).
         """
         from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
