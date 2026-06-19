@@ -16,7 +16,7 @@ from sglang.srt.layers.moe import (
 from .awq_scheme import AWQMoESchemeBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput, StandardCombineInput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput, StandardCombineInput, CombineInput
     from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMarlinConfig
 
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
