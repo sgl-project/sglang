@@ -26,6 +26,9 @@ def fused_moe_npu(
     topk_output,
     moe_runner_config,
 ):
+    logger.warning_once(
+        f"The fused_moe_npu method deprecated and will be removed in future releases"
+    )
     topk_weights, topk_ids, _ = topk_output
     original_dtype = x.dtype
     num_tokens = x.shape[0]
