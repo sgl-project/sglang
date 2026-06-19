@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-4-gpu-amd-mi35x")
+register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 DEEPSEEK_R1_MODEL_PATH = "amd/DeepSeek-R1-MXFP4-Preview"
 SERVER_LAUNCH_TIMEOUT = 1800
@@ -30,12 +30,12 @@ class TestDeepseekR1MXFP4(CustomTestCase):
 
         # Workaround: AITER custom all-gather corrupts CUDA-graph IPC buffer
         # registration and triggers a decode-time "Memory access fault" on
-        # MI35x. Disable until the AITER-side fix lands (see PR body).
+        # MI35x TP=8. Disable until the AITER-side fix lands (see PR body).
         envs.SGLANG_USE_AITER_AG.set(False)
 
         other_args = [
             "--tp",
-            "4",
+            "8",
             "--chunked-prefill-size",
             "131072",
             "--model-loader-extra-config",
@@ -90,8 +90,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-r1-mxfp4)\n" f"{speed=:.2f} token/s\n"
             )
-        # Report-only: the previous >75 tok/s gate was calibrated for TP=8.
-        # Decode throughput at TP=4 differs; re-calibrate before re-enabling.
+        self.assertGreater(speed, 75)
 
 
 class TestDeepseekR1MXFP4MTP(CustomTestCase):
@@ -106,7 +105,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
 
         other_args = [
             "--tp",
-            "4",
+            "8",
             "--chunked-prefill-size",
             "131072",
             "--speculative-algorithm",
@@ -176,8 +175,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
             self.assertGreater(acc_length, 2.04)
-            # Report-only: the previous >150 tok/s gate was calibrated for TP=8.
-            # Decode throughput at TP=4 differs; re-calibrate before re-enabling.
+            self.assertGreater(speed, 150)
 
 
 if __name__ == "__main__":
