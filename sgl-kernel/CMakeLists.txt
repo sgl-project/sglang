@@ -13,6 +13,9 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# GitHub Artifactory
+set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -46,56 +49,42 @@ clear_cuda_arches(CMAKE_FLAG)
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
+    URL_HASH SHA256=09237099a70f80bff1dc8bb80c843a674bb4fdcb46e43cc6993e711c5ca89bb5
 )
 FetchContent_Populate(repo-cutlass)
 
 # fmt
 FetchContent_Declare(
     repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
+    URL      https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
+    URL_HASH SHA256=c314292789d28c3c3b420e75a7b2d1706f685f7fb63289128d46aeaea2c6be71
 )
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.6.0
-    GIT_SHALLOW    OFF
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
+    URL_HASH SHA256=be270ed11ca5a8fbd9d7941c5bbe9a23a9f6e2ffd372c8398346928bee464774
 )
 FetchContent_Populate(repo-triton)
 
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
+    URL      https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
+    URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
 )
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/65c54cc5a6d29fee56036484c749bc5b8e00fd66.tar.gz
+    URL_HASH SHA256=53307eefba65d9ac26092433a8bc4d48182ce0bb27132e69ab0b8d6ff8ee47db
 )
 FetchContent_Populate(repo-flash-attention)
-
-# mscclpp
-FetchContent_Declare(
-    repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-mscclpp)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -115,6 +104,14 @@ else()
 endif()
 
 option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
+
+set(DEFAULT_SGL_KERNEL_ENABLE_FA3 OFF)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    message(STATUS "For aarch64, disable FA3 by default")
+endif()
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(DEFAULT_SGL_KERNEL_ENABLE_FA3 ON)
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -176,7 +173,7 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
-option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -233,8 +230,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -250,7 +246,6 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
@@ -258,6 +253,7 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
+    "csrc/elementwise/dsv4_norm_rope.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
@@ -321,7 +317,6 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -371,17 +366,8 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-# mscclpp option
-set(MSCCLPP_USE_CUDA ON)
-set(MSCCLPP_BYPASS_GPU_CHECK ON)
-set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(
-    ${repo-mscclpp_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
-)
-
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE

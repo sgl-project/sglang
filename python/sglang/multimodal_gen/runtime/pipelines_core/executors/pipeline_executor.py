@@ -7,7 +7,7 @@ Base class for all pipeline executors.
 
 import contextlib
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
@@ -53,7 +54,7 @@ class PipelineExecutor(ABC):
     def begin_component_residency_request(
         self,
         stages: List["PipelineStage"],
-        batch: Req,
+        batch: Any,
         server_args: ServerArgs,
     ) -> None:
         self.component_residency_manager.begin_request(stages, batch, server_args)
@@ -62,7 +63,7 @@ class PipelineExecutor(ABC):
         self,
         stage: "PipelineStage",
         stage_index: int,
-        batch: Req,
+        batch: Any,
         server_args: ServerArgs,
     ) -> None:
         stage.set_component_residency_manager(self.component_residency_manager)
@@ -70,11 +71,57 @@ class PipelineExecutor(ABC):
             stage, stage_index, batch, server_args
         )
 
-    def after_stage(self, stage_index: int) -> None:
-        self.component_residency_manager.after_stage(stage_index)
-
     def finish_component_residency_request(self) -> None:
         self.component_residency_manager.finish_request()
+
+    @contextlib.contextmanager
+    def _component_residency_request(
+        self,
+        stages: List["PipelineStage"],
+        payload: Any,
+        server_args: ServerArgs,
+    ):
+        self.begin_component_residency_request(stages, payload, server_args)
+        try:
+            yield
+        finally:
+            self.finish_component_residency_request()
+
+    @staticmethod
+    def _is_warmup_payload(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return bool(payload) and all(
+                getattr(item, "is_warmup", False) for item in payload
+            )
+        return getattr(payload, "is_warmup", False)
+
+    def _should_use_stage_nvtx(self, payload: Any, server_args: ServerArgs) -> bool:
+        return server_args.enable_layerwise_nvtx_marker and not self._is_warmup_payload(
+            payload
+        )
+
+    def _run_stage_with_executor_hooks(
+        self,
+        stage: "PipelineStage",
+        stage_index: int,
+        payload: Any,
+        server_args: ServerArgs,
+        run_stage: Callable[["PipelineStage", Any], Any],
+        use_nvtx: bool,
+    ) -> Any:
+        stage_name = stage._component_stage_name()
+        self.before_stage(stage, stage_index, payload, server_args)
+        with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+            payload = self.run_stage_with_context(
+                stage, payload, server_args, run_stage
+            )
+        return payload
+
+    @staticmethod
+    def _step_stage_profiler() -> None:
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_stage()
 
     def execute_with_profiling(
         self,

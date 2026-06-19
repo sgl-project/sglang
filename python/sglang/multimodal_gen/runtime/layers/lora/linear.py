@@ -246,7 +246,7 @@ class BaseLayerWithLoRA(nn.Module):
         self,
         lora_list: list[LoRAWeightEntry],
     ) -> bool:
-        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "0") != "1":
+        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "1") != "1":
             return False
         for _, _, lora_path, _, _, _ in lora_list:
             if lora_path and "distilled-lora" in lora_path.lower():
@@ -257,6 +257,18 @@ class BaseLayerWithLoRA(nn.Module):
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
             self.strength = strength
+            if self.lora_weights_list:
+                self.lora_weights_list = [
+                    (lora_A, lora_B, lora_path, strength, lora_rank, lora_alpha)
+                    for (
+                        lora_A,
+                        lora_B,
+                        lora_path,
+                        _,
+                        lora_rank,
+                        lora_alpha,
+                    ) in self.lora_weights_list
+                ]
 
         if self.disable_lora:
             return
@@ -390,6 +402,30 @@ class BaseLayerWithLoRA(nn.Module):
                 del cpu_weight_on_device
 
         self.merged = False
+
+    @torch.no_grad()
+    def commit_merged_as_base(self) -> None:
+        """Promote the currently merged weights to the permanent base.
+
+        Re-snapshots ``cpu_weight`` so the merged weights become the restore
+        target and resets adapter bookkeeping (``merged=False``). A later dynamic
+        ``set_lora_weights`` then adds its delta on top of the merged base instead
+        of unmerging it.
+        """
+        if not self.merged:
+            return
+        weight = self.base_layer.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        # clone(): to("cpu") may alias storage; we must not mutate this backup.
+        self.cpu_weight = weight.detach().to("cpu").clone()
+        self.merged = False
+        self.disable_lora = True
+        self.lora_weights_list = []
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_path = None
+        self.strength = 1.0
 
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
