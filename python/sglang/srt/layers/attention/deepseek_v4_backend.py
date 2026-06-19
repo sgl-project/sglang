@@ -934,20 +934,10 @@ class DeepseekV4AttnBackend(
                 )
             )
 
-    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Eager/replay seam, resolved by backend STATE (no argument).
-
-        Returns True when this ``(bs, forward_mode)`` has a pre-bound cuda-graph
-        metadata object in ``cuda_graph_metadata_of_bucket_and_bs[bucket][bs]``:
-        i.e. at graph replay (the runner always pads to a captured bucket) and
-        harmlessly at an eager forward that lands on a captured bs+mode in a
-        graph-enabled server -- ``replay_cuda_graph_metadata_from`` then copies
-        into the bound metadata, which ``out_graph`` always rebuilds before the
-        next ``graph.replay()``, so a transient eager build cannot leak into a
-        later replay. Returns False for pure-eager runs (no metadata was ever
-        captured for this bs/mode, or the cuda-graph state was never inited) and
-        for any mode without a graph bucket (e.g. plain EXTEND) -> build fresh
-        eager metadata.
+    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Whether ``(bs, forward_mode)`` has a captured cuda-graph metadata
+        object in ``cuda_graph_metadata_of_bucket_and_bs[bucket][bs]``. Internal
+        to ``_compute_forward_metadata``; see that method for the seam.
         """
         bucket_metadata = getattr(self, "cuda_graph_metadata_of_bucket_and_bs", None)
         if bucket_metadata is None:
@@ -963,14 +953,10 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ) -> None:
-        # Single eager == replay == capture metadata path; `use_bound` selects
-        # the pre-bound cuda-graph metadata object vs a fresh eager build.
-        use_bound = in_capture or self._use_cuda_graph_buffers(
-            forward_batch.batch_size, forward_batch.forward_mode
-        )
-        self._compute_forward_metadata(
-            forward_batch, use_bound=use_bound, in_capture=in_capture
-        )
+        # Single eager == replay == capture metadata path. The seam between
+        # the captured cuda-graph bucket metadata and a fresh eager build is
+        # internal to _compute_forward_metadata.
+        self._compute_forward_metadata(forward_batch, in_capture=in_capture)
 
         if in_capture:
             # Preserve _current_capture_raw for on_after_cuda_graph_warmup
@@ -988,20 +974,20 @@ class DeepseekV4AttnBackend(
         self,
         forward_batch: ForwardBatch,
         *,
-        use_bound: bool,
         in_capture: bool = False,
     ) -> None:
         """Single source of truth for DSV4 forward metadata, shared by eager,
         capture, and replay.
 
-        ``use_bound`` selects where the metadata is planned: the per-bs pre-bound
-        cuda-graph metadata object (capture / replay / eager-at-captured-bs, via
-        replay_cuda_graph_metadata_from) vs a fresh eager build. ``in_capture``
-        synthesizes a dummy out_cache_loc / capture-time seq-len locals (the
-        captured graph does no real cache writes); it is only ever True together
-        with use_bound=True. Plain EXTEND has no graph bucket and only ever runs
-        with use_bound=False (the decode graph never captures it), so
-        _GraphBucket.of is resolved lazily inside the bound branch.
+        Internally selects between the per-bs pre-bound cuda-graph metadata
+        object (capture / replay / eager-at-captured-bs, via
+        ``replay_cuda_graph_metadata_from``) and a fresh eager build. The
+        ``in_capture`` flag synthesizes a dummy out_cache_loc / capture-time
+        seq-len locals (the captured graph does no real cache writes); it is
+        only ever True together with the captured-bucket path. Plain EXTEND has
+        no graph bucket and only ever runs through the fresh path (the decode
+        graph never captures it), so ``_GraphBucket.of`` is resolved lazily
+        inside the captured branch.
         """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -1032,7 +1018,13 @@ class DeepseekV4AttnBackend(
             verify_bs=verify_bs,
         )
 
-        if use_bound:
+        # Internalize the captured-bucket seam — every caller goes through
+        # this method; the public API does not expose it.
+        _has_captured = in_capture or self._has_captured_metadata(
+            bs, forward_batch.forward_mode
+        )
+
+        if _has_captured:
             if in_capture:
                 # Captured graph does no real cache writes, so synthesize a dummy
                 # out_cache_loc per bucket (replay supplies the real value).
