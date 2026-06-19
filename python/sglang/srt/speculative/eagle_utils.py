@@ -338,12 +338,12 @@ def eagle_prepare_for_verify(
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
         target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
             verify_forward_batch
         )
     )
     if can_run_cuda_graph:
-        target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+        target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
         )
         verify_forward_batch.mark_forward_metadata_ready()

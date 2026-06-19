@@ -799,7 +799,7 @@ def build_prefill_registry(
     carried from the batch (a read input) rather than written in-graph.
 
     Padding policies match the inline copy/zero in
-    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
     / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
     padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
     tokens *are* processed by the graph, so they must be benign), then the head
