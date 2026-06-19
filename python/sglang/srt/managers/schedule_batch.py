@@ -2602,10 +2602,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
-            self.req_pool_indices_cpu = (
-                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2699,17 +2695,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
+            # Filter out all requests. Stale tensors are left as-is: is_empty()
+            # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
-            self.req_pool_indices = torch.empty(
-                0, dtype=torch.int64, device=self.device
-            )
-            self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
-            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-            self.out_cache_loc = None
-            self.seq_lens_sum = 0
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2767,15 +2755,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
-        if self.req_pool_indices_cpu is None and self.req_pool_indices is not None:
-            self.req_pool_indices_cpu = (
-                self.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
-        if other.req_pool_indices_cpu is None and other.req_pool_indices is not None:
-            other.req_pool_indices_cpu = (
-                other.req_pool_indices.detach().cpu().to(dtype=torch.int64)
-            )
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
