@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -24,10 +24,70 @@ device_module = get_device_module()
 from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    load_cache_to_device_buffer_mla_io_only,
+    load_cache_to_device_buffer_mla_with_miss,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg_get(config, name: str, default=None):
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def build_indexcache_prefetch_layers_after(
+    config,
+    *,
+    start_layer: int,
+    layer_num: int,
+) -> Dict[int, Tuple[int, ...]]:
+    """Return Full-layer -> consecutive Shared layers served by its top-k.
+
+    This mirrors DeepseekV2AttentionMLA.skip_topk/next_skip_topk semantics:
+    Shared layers reuse the nearest preceding Full layer's top-k indices.
+    """
+    if layer_num <= 1:
+        return {}
+
+    index_topk_pattern = _cfg_get(config, "index_topk_pattern", None)
+    index_topk_freq = int(_cfg_get(config, "index_topk_freq", 1) or 1)
+    index_skip_topk_offset = _cfg_get(config, "index_skip_topk_offset", None)
+
+    if index_topk_pattern is None and index_topk_freq <= 1:
+        return {}
+
+    end_layer = start_layer + layer_num
+    num_hidden_layers = int(_cfg_get(config, "num_hidden_layers", end_layer))
+
+    def is_shared_layer(layer_id: int) -> bool:
+        if layer_id < 0 or layer_id >= num_hidden_layers:
+            return False
+        if index_topk_pattern is not None:
+            if layer_id >= len(index_topk_pattern):
+                return False
+            return str(index_topk_pattern[layer_id]).upper().startswith("S")
+        if index_skip_topk_offset is not None:
+            offset = int(index_skip_topk_offset)
+            if offset <= 0:
+                return False
+            return max(layer_id - offset + 1, 0) % index_topk_freq != 0
+        return max(layer_id - 1, 0) % index_topk_freq != 0
+
+    layers_after: Dict[int, Tuple[int, ...]] = {}
+    for layer_id in range(start_layer, end_layer):
+        if is_shared_layer(layer_id):
+            continue
+        shared_layers = []
+        next_layer = layer_id + 1
+        while next_layer < end_layer and is_shared_layer(next_layer):
+            shared_layers.append(next_layer)
+            next_layer += 1
+        if shared_layers:
+            layers_after[layer_id] = tuple(shared_layers)
+    return layers_after
 
 
 class HiSparseAct(NamedTuple):
@@ -56,6 +116,7 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
+        max_prefetch_num_reqs: Optional[int] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -106,6 +167,10 @@ class HiSparseCoordinator:
         self.page_size = self.mem_pool_device.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
+        max_prefetch_num_reqs = max_prefetch_num_reqs or max_num_req_slots
+        self.max_prefetch_num_reqs = max(
+            1, min(max_num_req_slots, max_prefetch_num_reqs)
+        )
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
@@ -177,6 +242,16 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self.indexcache_prefetch_top_k_device_locs_buffers: Optional[torch.Tensor] = (
+            None
+        )
+        self.indexcache_prefetch_miss_tokens_buffer: Optional[torch.Tensor] = None
+        self.indexcache_prefetch_miss_slots_buffer: Optional[torch.Tensor] = None
+        self.indexcache_prefetch_miss_counts_buffer: Optional[torch.Tensor] = None
+        self._indexcache_prefetch_source_top_k_device_locs: Optional[torch.Tensor] = (
+            None
+        )
+        self._indexcache_prefetch_source_layer_idx: Optional[int] = None
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -185,8 +260,98 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+        # IndexCache + HiSparse: a Full layer's top-k token ids are reused by
+        # following Shared layers. Fire those Shared-layer swap-ins on a side
+        # stream and keep their page tables, so Shared layers can consume the
+        # prefetched result without running swap-in again.
+        self.indexcache_prefetch_stream = device_module.Stream()
+        self.indexcache_prefetch_streams = [self.indexcache_prefetch_stream]
+        self._indexcache_prefetch_events = [
+            device_module.Event() for _ in range(layer_num)
+        ]
+        self._indexcache_prefetch_pending = [False] * layer_num
+        self._indexcache_prefetch_buffer_slots = [-1] * layer_num
+        self._indexcache_prefetch_layers_after: Dict[int, Tuple[int, ...]] = {}
+        self._indexcache_prefetch_enabled = False
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def configure_indexcache_prefetch(self, config) -> None:
+        """Build the Full-layer -> Shared-layers prefetch plan from DSA config."""
+        self._indexcache_prefetch_layers_after.clear()
+        self._indexcache_prefetch_enabled = False
+        self.indexcache_prefetch_top_k_device_locs_buffers = None
+        self.indexcache_prefetch_miss_tokens_buffer = None
+        self.indexcache_prefetch_miss_slots_buffer = None
+        self.indexcache_prefetch_miss_counts_buffer = None
+        self._indexcache_prefetch_source_top_k_device_locs = None
+        self._indexcache_prefetch_source_layer_idx = None
+        self.indexcache_prefetch_streams = [self.indexcache_prefetch_stream]
+        for i in range(len(self._indexcache_prefetch_pending)):
+            self._indexcache_prefetch_pending[i] = False
+            self._indexcache_prefetch_buffer_slots[i] = -1
+
+        if self.is_dsv4_hisparse:
+            return
+
+        layer_num = self.mem_pool_device.layer_num
+        if layer_num <= 1:
+            return
+
+        start_layer = getattr(self.mem_pool_device, "start_layer", 0)
+        self._indexcache_prefetch_layers_after = build_indexcache_prefetch_layers_after(
+            config,
+            start_layer=start_layer,
+            layer_num=layer_num,
+        )
+
+        self._indexcache_prefetch_enabled = bool(self._indexcache_prefetch_layers_after)
+        if self._indexcache_prefetch_enabled:
+            max_prefetch_targets = max(
+                len(targets)
+                for targets in self._indexcache_prefetch_layers_after.values()
+            )
+            self.indexcache_prefetch_top_k_device_locs_buffers = torch.full(
+                (max_prefetch_targets, self.max_prefetch_num_reqs, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.indexcache_prefetch_miss_tokens_buffer = torch.empty(
+                (self.max_prefetch_num_reqs, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.indexcache_prefetch_miss_slots_buffer = torch.empty(
+                (self.max_prefetch_num_reqs, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.indexcache_prefetch_miss_counts_buffer = torch.empty(
+                (self.max_prefetch_num_reqs,), dtype=torch.int32, device=self.device
+            )
+            self.indexcache_prefetch_streams = [
+                device_module.Stream() for _ in range(max_prefetch_targets)
+            ]
+            logger.info(
+                "HiSparse IndexCache prefetch enabled for %d Full layers, "
+                "%d target buffers, max_prefetch_num_reqs=%d",
+                len(self._indexcache_prefetch_layers_after),
+                max_prefetch_targets,
+                self.max_prefetch_num_reqs,
+            )
+
+    def _local_layer_index(self, layer_id: int) -> Optional[int]:
+        if self.is_dsv4_hisparse and 0 <= layer_id < self.mem_pool_device.layer_num:
+            return layer_id
+        start_layer = getattr(self.mem_pool_device, "start_layer", 0)
+        if start_layer == 0 and 0 <= layer_id < self.mem_pool_device.layer_num:
+            return layer_id
+        local_layer_id = layer_id - start_layer
+        if 0 <= local_layer_id < self.mem_pool_device.layer_num:
+            return local_layer_id
+        return None
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -604,6 +769,162 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def _record_tensor_on_indexcache_prefetch_stream(
+        self, tensor: torch.Tensor
+    ) -> None:
+        if tensor.is_cuda:
+            for stream in self.indexcache_prefetch_streams:
+                tensor.record_stream(stream)
+
+    def wait_for_indexcache_prefetch(
+        self, layer_id: int, num_reqs: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        layer_idx = self._local_layer_index(layer_id)
+        if layer_idx is None or not self._indexcache_prefetch_pending[layer_idx]:
+            return None
+        self._indexcache_prefetch_events[layer_idx].wait(device_module.current_stream())
+        self._indexcache_prefetch_pending[layer_idx] = False
+        buffer_slot = self._indexcache_prefetch_buffer_slots[layer_idx]
+        self._indexcache_prefetch_buffer_slots[layer_idx] = -1
+        if (
+            buffer_slot >= 0
+            and self.indexcache_prefetch_top_k_device_locs_buffers is not None
+        ):
+            if num_reqs is None:
+                num_reqs = self.max_prefetch_num_reqs
+            return self.indexcache_prefetch_top_k_device_locs_buffers[
+                buffer_slot, :num_reqs
+            ]
+        return None
+
+    def wait_for_pending_indexcache_prefetch(self) -> None:
+        if not any(self._indexcache_prefetch_pending):
+            return
+        current_stream = device_module.current_stream()
+        for stream in self.indexcache_prefetch_streams:
+            current_stream.wait_stream(stream)
+        for i in range(len(self._indexcache_prefetch_pending)):
+            self._indexcache_prefetch_pending[i] = False
+            self._indexcache_prefetch_buffer_slots[i] = -1
+
+    def prefetch_indexcache_shared_layers(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: Optional[torch.Tensor],
+        layer_id: int,
+    ) -> None:
+        """Prefetch HiSparse KV for Shared layers served by this Full layer."""
+        if (
+            not self._indexcache_prefetch_enabled
+            or top_k_result is None
+            or layer_id not in self._indexcache_prefetch_layers_after
+        ):
+            return
+
+        target_layers = self._indexcache_prefetch_layers_after[layer_id]
+        if not target_layers:
+            return
+
+        num_reqs = req_pool_indices.size(0)
+        if (
+            self.indexcache_prefetch_top_k_device_locs_buffers is None
+            or num_reqs > self.max_prefetch_num_reqs
+        ):
+            return
+        source_layer_idx = self._local_layer_index(layer_id)
+        can_use_io_only = (
+            source_layer_idx is not None
+            and self._indexcache_prefetch_source_layer_idx == source_layer_idx
+            and self._indexcache_prefetch_source_top_k_device_locs is not None
+            and self.indexcache_prefetch_miss_tokens_buffer is not None
+            and self.indexcache_prefetch_miss_slots_buffer is not None
+            and self.indexcache_prefetch_miss_counts_buffer is not None
+            and not self.is_dsv4_hisparse
+        )
+
+        current_stream = device_module.current_stream()
+        for buffer_slot, target_layer_id in enumerate(target_layers):
+            prefetch_stream = self.indexcache_prefetch_streams[
+                min(buffer_slot, len(self.indexcache_prefetch_streams) - 1)
+            ]
+            prefetch_stream.wait_stream(current_stream)
+            with device_module.stream(prefetch_stream):
+                layer_idx = self._local_layer_index(target_layer_id)
+                if layer_idx is None:
+                    continue
+                top_k_indices = self.indexcache_prefetch_top_k_device_locs_buffers[
+                    buffer_slot, :num_reqs
+                ]
+                if can_use_io_only:
+                    load_cache_to_device_buffer_mla_io_only(
+                        source_top_k_device_locs=(
+                            self._indexcache_prefetch_source_top_k_device_locs[
+                                :num_reqs
+                            ]
+                        ),
+                        target_top_k_device_locs=top_k_indices,
+                        miss_tokens=self.indexcache_prefetch_miss_tokens_buffer[
+                            :num_reqs
+                        ],
+                        miss_slots=self.indexcache_prefetch_miss_slots_buffer[
+                            :num_reqs
+                        ],
+                        miss_counts=self.indexcache_prefetch_miss_counts_buffer[
+                            :num_reqs
+                        ],
+                        source_device_buffer_tokens=self.req_device_buffer_tokens[
+                            source_layer_idx
+                        ],
+                        target_device_buffer_tokens=self.req_device_buffer_tokens[
+                            layer_idx
+                        ],
+                        source_lru_slots=self.lru_slots[source_layer_idx],
+                        target_lru_slots=self.lru_slots[layer_idx],
+                        host_cache_locs=self.req_to_host_pool,
+                        device_buffer_locs=self.req_device_buffer_token_locs[layer_idx],
+                        host_cache=self.mem_pool_host.kv_buffer[layer_idx],
+                        device_buffer=self.mem_pool_device.kv_buffer[layer_idx],
+                        req_pool_indices=req_pool_indices,
+                        item_size_bytes=self.item_size_bytes,
+                        num_top_k=self.top_k,
+                        hot_buffer_size=self.device_buffer_size,
+                        block_size=1024,
+                        num_real_reqs=self.num_real_reqs,
+                    )
+                else:
+                    self._swap_in_selected_pages_to_buffer(
+                        req_pool_indices=req_pool_indices,
+                        compressed_seq_lens=compressed_seq_lens,
+                        top_k_result=top_k_result,
+                        layer_id=target_layer_id,
+                        top_k_indices=top_k_indices,
+                        clear_output=True,
+                    )
+                self._indexcache_prefetch_events[layer_idx].record(prefetch_stream)
+                self._indexcache_prefetch_pending[layer_idx] = True
+                self._indexcache_prefetch_buffer_slots[layer_idx] = buffer_slot
+
+        self._record_tensor_on_indexcache_prefetch_stream(req_pool_indices)
+        self._record_tensor_on_indexcache_prefetch_stream(compressed_seq_lens)
+        self._record_tensor_on_indexcache_prefetch_stream(top_k_result)
+        if self._indexcache_prefetch_source_top_k_device_locs is not None:
+            self._record_tensor_on_indexcache_prefetch_stream(
+                self._indexcache_prefetch_source_top_k_device_locs
+            )
+        if self.indexcache_prefetch_miss_tokens_buffer is not None:
+            self._record_tensor_on_indexcache_prefetch_stream(
+                self.indexcache_prefetch_miss_tokens_buffer
+            )
+        if self.indexcache_prefetch_miss_slots_buffer is not None:
+            self._record_tensor_on_indexcache_prefetch_stream(
+                self.indexcache_prefetch_miss_slots_buffer
+            )
+        if self.indexcache_prefetch_miss_counts_buffer is not None:
+            self._record_tensor_on_indexcache_prefetch_stream(
+                self.indexcache_prefetch_miss_counts_buffer
+            )
+
     def naive_load_topk(
         self,
         req_pool_indices: torch.Tensor,
@@ -738,6 +1059,7 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_indexcache_prefetch()
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
@@ -791,28 +1113,88 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
         num_reqs = req_pool_indices.size(0)
-
+        prefetched_top_k_indices = self.wait_for_indexcache_prefetch(layer_id, num_reqs)
+        if prefetched_top_k_indices is not None:
+            return prefetched_top_k_indices
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
-        top_k_indices.fill_(-1)
+        capture_miss_for_indexcache = (
+            self._indexcache_prefetch_enabled
+            and layer_id in self._indexcache_prefetch_layers_after
+            and self.indexcache_prefetch_miss_tokens_buffer is not None
+            and self.indexcache_prefetch_miss_slots_buffer is not None
+            and self.indexcache_prefetch_miss_counts_buffer is not None
+            and num_reqs <= self.max_prefetch_num_reqs
+            and not self.is_dsv4_hisparse
+        )
+        if capture_miss_for_indexcache:
+            self._indexcache_prefetch_source_top_k_device_locs = top_k_indices
+            self._indexcache_prefetch_source_layer_idx = self._local_layer_index(
+                layer_id
+            )
+        else:
+            self._indexcache_prefetch_source_top_k_device_locs = None
+            self._indexcache_prefetch_source_layer_idx = None
+        return self._swap_in_selected_pages_to_buffer(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=compressed_seq_lens,
+            top_k_result=top_k_result,
+            layer_id=layer_id,
+            top_k_indices=top_k_indices,
+            clear_output=True,
+            miss_tokens=(
+                self.indexcache_prefetch_miss_tokens_buffer[:num_reqs]
+                if capture_miss_for_indexcache
+                else None
+            ),
+            miss_slots=(
+                self.indexcache_prefetch_miss_slots_buffer[:num_reqs]
+                if capture_miss_for_indexcache
+                else None
+            ),
+            miss_counts=(
+                self.indexcache_prefetch_miss_counts_buffer[:num_reqs]
+                if capture_miss_for_indexcache
+                else None
+            ),
+        )
+
+    def _swap_in_selected_pages_to_buffer(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        top_k_indices: torch.Tensor,
+        clear_output: bool,
+        miss_tokens: Optional[torch.Tensor] = None,
+        miss_slots: Optional[torch.Tensor] = None,
+        miss_counts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        layer_idx = self._local_layer_index(layer_id)
+        if layer_idx is None:
+            start_layer = getattr(self.mem_pool_device, "start_layer", 0)
+            end_layer = start_layer + self.mem_pool_device.layer_num
+            raise ValueError(
+                f"HiSparse layer_id {layer_id} is outside local layer range "
+                f"[{start_layer}, {end_layer})"
+            )
+
+        if clear_output:
+            top_k_indices.fill_(-1)
 
         # todo, adjustable for performance
         block_size = 1024
-        swap_in_fn = (
-            load_cache_to_device_buffer_dsv4_mla
-            if self.is_dsv4_hisparse
-            else load_cache_to_device_buffer_mla
-        )
-        swap_in_fn(
+        common_kwargs = dict(
             top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            device_buffer_tokens=self.req_device_buffer_tokens[layer_idx],
             host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer_locs=self.req_device_buffer_token_locs[layer_idx],
+            host_cache=self.mem_pool_host.kv_buffer[layer_idx],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_idx],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
+            lru_slots=self.lru_slots[layer_idx],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
@@ -820,4 +1202,23 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
+        if (
+            miss_tokens is not None
+            and miss_slots is not None
+            and miss_counts is not None
+            and not self.is_dsv4_hisparse
+        ):
+            load_cache_to_device_buffer_mla_with_miss(
+                **common_kwargs,
+                miss_tokens=miss_tokens,
+                miss_slots=miss_slots,
+                miss_counts=miss_counts,
+            )
+        else:
+            swap_in_fn = (
+                load_cache_to_device_buffer_dsv4_mla
+                if self.is_dsv4_hisparse
+                else load_cache_to_device_buffer_mla
+            )
+            swap_in_fn(**common_kwargs)
         return top_k_indices

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,7 +35,15 @@ def _jit_sparse_module(
             (
                 "load_cache_to_device_buffer",
                 f"load_cache_to_device_buffer<{template_args}>",
-            )
+            ),
+            (
+                "load_cache_to_device_buffer_with_miss",
+                f"load_cache_to_device_buffer_with_miss<{template_args}>",
+            ),
+            (
+                "load_cache_to_device_buffer_io_only",
+                f"load_cache_to_device_buffer_io_only<{template_args}>",
+            ),
         ],
     )
 
@@ -55,6 +64,17 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+@functools.cache
+def _get_tvm_ffi_use_torch_stream():
+    """Make TVM-FFI launches follow torch current stream/cuda graph capture."""
+    try:
+        import tvm_ffi
+
+        return tvm_ffi.use_torch_stream
+    except (ImportError, AttributeError):
+        return nullcontext
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
@@ -64,12 +84,13 @@ def transfer_cache_dsv4_mla(
 ) -> None:
     """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
     module = _jit_dsv4_transfer_module(block_size)
-    module.transfer_cache_dsv4_mla(
-        src_ptrs,
-        dst_ptrs,
-        src_indices,
-        dst_indices,
-    )
+    with _get_tvm_ffi_use_torch_stream()():
+        module.transfer_cache_dsv4_mla(
+            src_ptrs,
+            dst_ptrs,
+            src_indices,
+            dst_indices,
+        )
 
 
 def _load_cache_to_device_buffer_mla(
@@ -112,23 +133,24 @@ def _load_cache_to_device_buffer_mla(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
 
-    module.load_cache_to_device_buffer(
-        top_k_tokens,
-        device_buffer_tokens,
-        host_cache_locs,
-        device_buffer_locs,
-        host_cache,
-        empty,
-        device_buffer,
-        empty,
-        top_k_device_locs,
-        req_pool_indices,
-        seq_lens,
-        lru_slots,
-        num_real_reqs,
-        page_size,
-        item_size_bytes,
-    )
+    with _get_tvm_ffi_use_torch_stream()():
+        module.load_cache_to_device_buffer(
+            top_k_tokens,
+            device_buffer_tokens,
+            host_cache_locs,
+            device_buffer_locs,
+            host_cache,
+            empty,
+            device_buffer,
+            empty,
+            top_k_device_locs,
+            req_pool_indices,
+            seq_lens,
+            lru_slots,
+            num_real_reqs,
+            page_size,
+            item_size_bytes,
+        )
 
 
 def load_cache_to_device_buffer_mla(
@@ -169,6 +191,130 @@ def load_cache_to_device_buffer_mla(
         block_size=block_size,
         num_real_reqs=num_real_reqs,
     )
+
+
+def load_cache_to_device_buffer_mla_with_miss(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    miss_tokens: torch.Tensor,
+    miss_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+) -> None:
+    """MLA HiSparse swap-in that also exports miss tokens and evicted slots."""
+    assert (
+        hot_buffer_size >= num_top_k
+    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla=True,
+        is_dsv4_layout=False,
+    )
+    empty = torch.empty(0)
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
+        )
+
+    with _get_tvm_ffi_use_torch_stream()():
+        module.load_cache_to_device_buffer_with_miss(
+            top_k_tokens,
+            device_buffer_tokens,
+            host_cache_locs,
+            device_buffer_locs,
+            host_cache,
+            empty,
+            device_buffer,
+            empty,
+            top_k_device_locs,
+            miss_tokens,
+            miss_slots,
+            miss_counts,
+            req_pool_indices,
+            seq_lens,
+            lru_slots,
+            num_real_reqs,
+            page_size,
+            item_size_bytes,
+        )
+
+
+def load_cache_to_device_buffer_mla_io_only(
+    source_top_k_device_locs: torch.Tensor,
+    target_top_k_device_locs: torch.Tensor,
+    miss_tokens: torch.Tensor,
+    miss_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+    source_device_buffer_tokens: torch.Tensor,
+    target_device_buffer_tokens: torch.Tensor,
+    source_lru_slots: torch.Tensor,
+    target_lru_slots: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+) -> None:
+    """Shared-layer IndexCache prefetch: mirror metadata and copy Full misses."""
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla=True,
+        is_dsv4_layout=False,
+    )
+    empty = torch.empty(0)
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [source_top_k_device_locs.size(0)],
+            dtype=torch.int32,
+            device=source_top_k_device_locs.device,
+        )
+
+    with _get_tvm_ffi_use_torch_stream()():
+        module.load_cache_to_device_buffer_io_only(
+            source_top_k_device_locs,
+            target_top_k_device_locs,
+            miss_tokens,
+            miss_slots,
+            miss_counts,
+            source_device_buffer_tokens,
+            target_device_buffer_tokens,
+            source_lru_slots,
+            target_lru_slots,
+            host_cache_locs,
+            device_buffer_locs,
+            host_cache,
+            empty,
+            device_buffer,
+            empty,
+            req_pool_indices,
+            num_real_reqs,
+            item_size_bytes,
+        )
 
 
 def load_cache_to_device_buffer_dsv4_mla(

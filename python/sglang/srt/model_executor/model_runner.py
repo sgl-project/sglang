@@ -866,6 +866,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hisparse_top_k = getattr(
                 self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
             )
+            max_prefetch_num_reqs = self.max_running_requests
+            decode_cuda_graph_config = self.server_args.cuda_graph_config.decode
+            if decode_cuda_graph_config.max_bs is not None:
+                max_prefetch_num_reqs = max(
+                    max_prefetch_num_reqs, decode_cuda_graph_config.max_bs
+                )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -878,7 +884,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                max_prefetch_num_reqs=max_prefetch_num_reqs,
             )
+            indexcache_config = self.model_config.hf_text_config
+            hf_config = self.model_config.hf_config
+            text_config_has_indexcache = (
+                getattr(indexcache_config, "index_topk_pattern", None) is not None
+                or int(getattr(indexcache_config, "index_topk_freq", 1) or 1) > 1
+                or getattr(indexcache_config, "index_skip_topk_offset", None)
+                is not None
+            )
+            hf_config_has_indexcache = (
+                getattr(hf_config, "index_topk_pattern", None) is not None
+                or int(getattr(hf_config, "index_topk_freq", 1) or 1) > 1
+                or getattr(hf_config, "index_skip_topk_offset", None) is not None
+            )
+            if not text_config_has_indexcache and hf_config_has_indexcache:
+                indexcache_config = hf_config
+            self.hisparse_coordinator.configure_indexcache_prefetch(indexcache_config)
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
