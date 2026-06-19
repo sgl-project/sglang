@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 
+from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
@@ -255,11 +256,15 @@ def _run_page_first_staged_write_back_mha(
     layout: str, element_dim: int, page_count: int
 ) -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
+    head_num = (
+        element_dim // 128 if element_dim >= 128 and element_dim % 128 == 0 else 1
+    )
+    head_dim = element_dim // head_num
     device_pool = MHATokenToKVPool(
         size=pool_size,
         page_size=PAGE_SIZE,
-        head_num=element_dim // 128,
-        head_dim=128,
+        head_num=head_num,
+        head_dim=head_dim,
         dtype=torch.bfloat16,
         layer_num=NUM_LAYERS,
         device=DEVICE,
@@ -270,7 +275,12 @@ def _run_page_first_staged_write_back_mha(
         device_pool=device_pool,
         layout=layout,
     )
-    assert host_pool.can_use_jit
+    assert can_use_write_back_jit_kernel(
+        element_size=element_dim * host_pool.dtype.itemsize,
+    )
+    assert host_pool.can_use_write_back_jit
+    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+        assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
@@ -297,6 +307,14 @@ def _run_page_first_staged_write_back_mha(
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
     host_indices = _token_indices_for_pages(host_pages, device="cpu")
     assert not host_indices.is_cuda
+    expected_k = [
+        device_pool.k_buffer[layer_id][device_indices.to(dtype=torch.int64)].cpu()
+        for layer_id in range(NUM_LAYERS)
+    ]
+    expected_v = [
+        device_pool.v_buffer[layer_id][device_indices.to(dtype=torch.int64)].cpu()
+        for layer_id in range(NUM_LAYERS)
+    ]
 
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
@@ -329,6 +347,25 @@ def _run_page_first_staged_write_back_mha(
             _assert_page_filled(host_pool.k_data_refs[layer_id], untouched_page, -7)
             _assert_page_filled(host_pool.v_data_refs[layer_id], untouched_page, -11)
 
+    for layer_id in range(NUM_LAYERS):
+        device_pool.k_buffer[layer_id].zero_()
+        device_pool.v_buffer[layer_id].zero_()
+    load_indices = device_indices.to(dtype=torch.int64)
+    host_indices_load = _token_indices_for_pages(host_pages)
+    for layer_id in range(NUM_LAYERS):
+        host_pool.load_to_device_per_layer(
+            device_pool, host_indices_load, load_indices, layer_id, "kernel"
+        )
+    torch.cuda.synchronize()
+
+    for layer_id in range(NUM_LAYERS):
+        assert torch.equal(
+            device_pool.k_buffer[layer_id][load_indices].cpu(), expected_k[layer_id]
+        )
+        assert torch.equal(
+            device_pool.v_buffer[layer_id][load_indices].cpu(), expected_v[layer_id]
+        )
+
 
 def _run_page_first_staged_write_back_mla(
     layout: str, element_dim: int, page_count: int
@@ -349,7 +386,12 @@ def _run_page_first_staged_write_back_mla(
         device_pool=device_pool,
         layout=layout,
     )
-    assert host_pool.can_use_jit
+    assert can_use_write_back_jit_kernel(
+        element_size=element_dim * host_pool.dtype.itemsize,
+    )
+    assert host_pool.can_use_write_back_jit
+    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+        assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
@@ -374,6 +416,10 @@ def _run_page_first_staged_write_back_mla(
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
     host_indices = _token_indices_for_pages(host_pages, device="cpu")
     assert not host_indices.is_cuda
+    expected = [
+        device_pool.kv_buffer[layer_id][device_indices.to(dtype=torch.int64)].cpu()
+        for layer_id in range(NUM_LAYERS)
+    ]
 
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
@@ -396,6 +442,21 @@ def _run_page_first_staged_write_back_mla(
     for layer_id in range(NUM_LAYERS):
         for untouched_page in [0, page_count + 1]:
             _assert_page_filled(host_pool.data_refs[layer_id], untouched_page, -13)
+
+    for layer_id in range(NUM_LAYERS):
+        device_pool.kv_buffer[layer_id].zero_()
+    load_indices = device_indices.to(dtype=torch.int64)
+    host_indices_load = _token_indices_for_pages(host_pages)
+    for layer_id in range(NUM_LAYERS):
+        host_pool.load_to_device_per_layer(
+            device_pool, host_indices_load, load_indices, layer_id, "kernel"
+        )
+    torch.cuda.synchronize()
+
+    for layer_id in range(NUM_LAYERS):
+        assert torch.equal(
+            device_pool.kv_buffer[layer_id][load_indices].cpu(), expected[layer_id]
+        )
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -426,6 +487,14 @@ def test_hicache_page_first_staged_write_back_mla(
     layout: str, element_dim: int, page_count: int
 ) -> None:
     _run_page_first_staged_write_back_mla(layout, element_dim, page_count)
+
+
+def test_hicache_page_first_staged_write_back_mha_staged_only_alignment() -> None:
+    _run_page_first_staged_write_back_mha("page_first", 72, 65)
+
+
+def test_hicache_page_first_staged_write_back_mla_staged_only_alignment() -> None:
+    _run_page_first_staged_write_back_mla("page_first", 72, 65)
 
 
 if __name__ == "__main__":
