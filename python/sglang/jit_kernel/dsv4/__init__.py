@@ -12,12 +12,12 @@ from .compress import (
 from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
 )
 from .gemm import linear_bf16_fp32
-from .hisparse import hisparse_offload_to_host
 from .moe import (
     hash_topk,
     mask_topk_ids,
@@ -38,11 +38,11 @@ __all__ = [
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
+    "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
     "make_name",
     "linear_bf16_fp32",
-    "hisparse_offload_to_host",
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",
     "topk_transform_512",

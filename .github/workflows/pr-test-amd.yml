@@ -7,7 +7,6 @@ on:
   schedule:
     - cron: '0 */6 * * *' # Run every 6 hours (UTC)
   pull_request:
-    branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -63,7 +62,7 @@ on:
         description: 'AMD runner pool to dispatch GPU jobs to'
         required: false
         type: choice
-        default: mi300
+        default: mi325
         options:
           - mi300
           - mi325
@@ -94,6 +93,17 @@ on:
         required: false
         type: boolean
         default: false
+
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
+# pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
@@ -140,10 +150,17 @@ jobs:
 
       - name: Set continue-on-error for schedule/full runs
         id: set-continue-on-error
+        env:
+          # `bypass-fastfail` PR label: also disable within-suite fast-fail
+          # here. The shared actions/wait-for-jobs already honors the same
+          # label to skip cross-stage waits.
+          BYPASS_FASTFAIL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bypass-fastfail') }}
         run: |
-          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" || "${{ inputs.continue_on_error }}" == "true" ]]; then
+          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" \
+             || "${{ inputs.continue_on_error }}" == "true" \
+             || "$BYPASS_FASTFAIL_LABEL" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }})"
+            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fastfail=$BYPASS_FASTFAIL_LABEL)"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
             echo "Continue-on-error: DISABLED"
@@ -168,19 +185,40 @@ jobs:
               - ".github/workflows/pr-test-amd.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
+              - "test/registered/jit/**"
               - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
+              - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/diffusion/**"
-              - "python/sglang/jit_kernel/tests/diffusion/**"
-              - "python/sglang/jit_kernel/benchmark/diffusion/**"
+              - "test/registered/jit/diffusion/**"
+              - "test/registered/jit/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
+  # =============================================== extra (scheduled) ====================================================
+  # Chain the label-gated AMD extra tier into the scheduled run, mirroring
+  # pr-test.yml's `call-pr-test-extra`. On `schedule` (and run_all_tests
+  # dispatch) the extra suite runs on `main` without needing the
+  # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
+  # events). Targeted /rerun-stage dispatches (target_stage set) are excluded.
+  # Not added to `pr-test-amd-finish` so the base AMD gate never depends on
+  # the opt-in extra suite.
+  call-pr-test-amd-extra:
+    if: |
+      (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
+      !(inputs.target_stage || inputs.target_stage_select)
+    uses: ./.github/workflows/pr-test-amd-extra.yml
+    with:
+      ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      aiter_ref: ${{ inputs.aiter_ref }}
+      continue_on_error: true
+    secrets: inherit
+
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
-    name: ${{ format('sgl-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    name: ${{ format('sgl-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -192,7 +230,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -212,7 +250,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 14
+        timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
@@ -238,7 +276,7 @@ jobs:
           exit $failures
 
   sgl-kernel-unit-test-2-gpu-amd:
-    name: ${{ format('sgl-kernel-unit-test-2-gpu-amd (linux-{0}-2gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    name: ${{ format('sgl-kernel-unit-test-2-gpu-amd (linux-{0}-2gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -250,7 +288,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -270,26 +308,16 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
-          failures=0
-          run_pytest() {
-            if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
-              "$@" || failures=$((failures + 1))
-            else
-              "$@"
-            fi
-          }
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
-          exit $failures
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite sgl-kernel-unit-test-2-gpu-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
-    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -301,7 +329,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -321,12 +349,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
-    name: ${{ format('jit-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    name: ${{ format('jit-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -338,7 +366,7 @@ jobs:
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -358,7 +386,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run JIT kernel unit tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -389,7 +417,7 @@ jobs:
           max-wait-minutes: '240'
 
   stage-b-test-1-gpu-small-amd:
-    name: ${{ format('stage-b-test-1-gpu-small-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
+    name: ${{ format('stage-b-test-1-gpu-small-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -405,7 +433,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -429,7 +457,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
-    name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -441,7 +469,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -504,7 +532,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
-    name: ${{ format('stage-b-test-1-gpu-large-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
+    name: ${{ format('stage-b-test-1-gpu-large-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -520,7 +548,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2]
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -544,7 +572,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd:
-    name: ${{ format('stage-b-test-2-gpu-large-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
+    name: ${{ format('stage-b-test-2-gpu-large-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -560,7 +588,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1]
-    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -889,7 +917,7 @@ jobs:
           max-wait-minutes: '480'
 
   stage-c-test-4-gpu-amd:
-    name: ${{ format('stage-c-test-4-gpu-amd (linux-{0}-4gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
+    name: ${{ format('stage-c-test-4-gpu-amd (linux-{0}-4gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -905,7 +933,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0]
-    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -945,7 +973,7 @@ jobs:
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd:
-    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
+    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -958,12 +986,12 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+      RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
-    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
+        part: [0, 1, 2, 3]
+    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -990,7 +1018,7 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd-mi35x:
     needs: [check-changes, call-gate, wait-for-stage-b-amd]

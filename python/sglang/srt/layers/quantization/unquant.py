@@ -254,6 +254,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if hasattr(layer, "w13_weight_bias"):
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.float(), requires_grad=False
+                )
+            if hasattr(layer, "w2_weight_bias"):
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.float(), requires_grad=False
+                )
 
         if (
             self.use_deep_gemm
@@ -286,6 +294,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
                 )
                 tmp_weights1 = (
                     layer.w13_weight.data[i]
@@ -487,6 +496,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     else ActivationType.Swiglu
                 ),
             )[0]
+
+            if (
+                not layer.should_fuse_routed_scaling_factor_in_topk
+                and moe_runner_config.routed_scaling_factor is not None
+            ):
+                output.mul_(moe_runner_config.routed_scaling_factor)
+
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -565,6 +581,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
@@ -601,6 +621,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         assert moe_runner_config.activation in [
             "silu",
             "gelu",
+            "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
@@ -638,7 +659,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -693,7 +714,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+            if self.moe_runner_config.gemm1_clamp_limit is not None:
+                from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+                hidden_states, _ = swiglu_quant(
+                    hidden_states,
+                    group_list=expert_tokens,
+                    group_list_type=1,
+                    need_quant=False,
+                    do_limit=True,
+                    limit=self.moe_runner_config.gemm1_clamp_limit,
+                )
+            else:
+                hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
 
@@ -727,7 +760,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def _forward_npu_deepep(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,
