@@ -218,6 +218,65 @@ def compute_local_num_token_non_padded(
 
 
 @dataclass
+class DSV4OutCacheLoc:
+    """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
+
+    Bundles slot indices for full/SWA pools, the two compressed-KV pools
+    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
+    the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
+    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
+    derived via translate_kv_loc_to_compress_state_loc there).
+
+    All fields are token-level slot ids in their respective pools (NOT page
+    ids). Attention backends convert to page ids via ``// page_size`` when
+    constructing PA_ND block tables.
+
+    State fields default to ``None`` so the bundle is constructible from
+    paths that allocate KV but not state (or vice versa); the NPU allocator
+    fills all six on real alloc, CUDA paths leave state ones None and use
+    the ring-hash translation instead.
+    """
+
+    out_full_loc: torch.Tensor
+    out_swa_loc: torch.Tensor
+    out_c4_loc: torch.Tensor
+    out_c128_loc: torch.Tensor
+    out_c4_state_loc: Optional[torch.Tensor] = None
+    out_c128_state_loc: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DSV4StateLens:
+    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
+
+    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
+    threaded through ``mem_cache/common.py`` to
+    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
+
+      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
+        state-slot count (the paged allocator's ``prefix`` contract).
+      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
+      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
+
+    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
+    take: scheduler only produces this object, common only forwards it, the
+    allocator only consumes it.
+    """
+
+    c4_prefix_lens: torch.Tensor
+    c4_prefix_lens_cpu: torch.Tensor
+    c4_seq_lens: torch.Tensor
+    c4_seq_lens_cpu: torch.Tensor
+    c4_extend_num_tokens: int
+    c128_prefix_lens: torch.Tensor
+    c128_prefix_lens_cpu: torch.Tensor
+    c128_seq_lens: torch.Tensor
+    c128_seq_lens_cpu: torch.Tensor
+    c128_extend_num_tokens: int
+
+
+@dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
 
@@ -286,6 +345,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+    # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
+    # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
+    out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -615,6 +677,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
+            out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

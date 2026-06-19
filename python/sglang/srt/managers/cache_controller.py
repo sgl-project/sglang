@@ -726,10 +726,12 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # For now, kernel write-back keeps host indices on CPU only for page_first.
-        # More layouts can use this path once their write-back kernels accept CPU
-        # destination indices.
-        if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
             host_indices, device_indices = self.move_indices(
