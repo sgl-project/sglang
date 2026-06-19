@@ -644,6 +644,11 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
+    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # extend_attention_fwd for unsupported cases or when set false (e.g. for
+    # debugging). Correctness is unaffected; this only changes performance.
+    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
