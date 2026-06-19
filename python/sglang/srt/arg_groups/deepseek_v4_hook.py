@@ -15,24 +15,35 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
+    if server_args.kv_cache_dtype == "auto":
+        server_args.kv_cache_dtype = "fp8_e4m3"
+        logger.warning(
+            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
+        )
+
+    if server_args.device == "npu":
+        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
+        # the Ascend V4 subclass); only the pool geometry / dtype differ.
+        # set_default_server_args() pins all three backends to "ascend" for
+        # generic NPU models; undo that here so V4 stays consistently on dsv4.
+        server_args.prefill_attention_backend = "dsv4"
+        server_args.decode_attention_backend = "dsv4"
+        server_args.page_size = 128
+        server_args.kv_cache_dtype = "bfloat16"
+
     logger.info(
-        f"Use dsv4 attention backend for {model_arch}, setting page_size to 256."
+        f"Use dsv4 attention backend for {model_arch}, setting page_size to {server_args.page_size}."
     )
+    assert server_args.kv_cache_dtype in [
+        "fp8_e4m3",
+        "bfloat16",
+    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
         )
-
-    if server_args.kv_cache_dtype == "auto":
-        server_args.kv_cache_dtype = "fp8_e4m3"
-        logger.warning(
-            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
-        )
-    assert server_args.kv_cache_dtype in [
-        "fp8_e4m3"
-    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:
         assert (

@@ -11,6 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import get_dcp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
@@ -37,6 +38,7 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
+    is_gfx95_supported,
     is_gfx942_supported,
     next_power_of_2,
 )
@@ -117,6 +119,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
             extend_attention_fwd_with_lse,
         )
+        from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+            verify_splitkv_fwd,
+        )
 
         super().__init__()
 
@@ -129,6 +134,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_with_lse
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
+        # Split-KV EAGLE-verify kernel (ROCm/Triton). Registered here; enabled
+        # below once topk is known (the path is only valid at topk == 1).
+        self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -143,6 +151,21 @@ class TritonAttnBackend(AttentionBackend):
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # Split-KV verify matches extend_attention_fwd only when the EAGLE tree
+        # reduces to a pure-causal chain, i.e. topk == 1 (the same condition the
+        # aiter backend's unified-verify uses). For topk > 1 the tree custom_mask
+        # is not causal, so leave the path off and fall back to the baseline.
+        # gfx95-only (MI350X/CDNA4): the kernel uses ROCm/CDNA Triton launch hints
+        # (waves_per_eu, matrix_instr_nonkdim) and its block config is tuned and
+        # validated only on gfx950. NVIDIA's Triton rejects those kwargs, and the
+        # path is unvalidated on NV and on other AMD archs, so restrict it to gfx95
+        # and fall back to extend_attention_fwd everywhere else.
+        self.use_verify_splitkv = (
+            is_gfx95_supported()
+            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
+            and self.topk == 1
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.dcp_size = getattr(model_runner, "dcp_size", 1)
         self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
@@ -1267,6 +1290,43 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
+        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
+        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
+        # returns True if it ran (o written), or False for any case it cannot
+        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
+        # sliding-window / ragged / topk>1), so we fall through to
+        # extend_attention_fwd below. Correctness is never at risk.
+        if (
+            self.use_verify_splitkv
+            and forward_batch.forward_mode.is_target_verify()
+            and self.verify_splitkv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+                max_bs=self.req_to_token_pool.size,
+            )
+        ):
+            return o
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
