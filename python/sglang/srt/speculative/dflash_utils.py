@@ -762,7 +762,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
 
     (
         retrieve_index,
@@ -791,7 +790,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_samples=uniform_samples,
         uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
         target_probs=target_probs,
-        draft_probs=draft_probs,
         threshold_single=threshold_single,
         threshold_acc=threshold_acc,
         deterministic=True,
