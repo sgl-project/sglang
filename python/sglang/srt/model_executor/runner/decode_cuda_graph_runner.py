@@ -358,6 +358,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _autotune_buffers(self):
+        """Reuse these static decode buffers (sized to max_bs) for the warmup
+        flashinfer-autotune dummy forward instead of allocating a throwaway set
+        — see BaseRunner._autotune_buffers / BaseRunner._dummy_run.
+
+        The dummy forward derives its shape from max_bs and must match these
+        buffers exactly; _dummy_run asserts that. Every autotune-reachable
+        decode shape (plain decode, spec target-verify) matches. DLLM would not
+        (its buffers hold block_size tokens/bs while the dummy run derives 1),
+        but DLLM does not use a flashinfer MoE backend, so autotune never runs
+        for it and this is never reached there.
+        """
+        return self.buffers, self.max_bs
+
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
