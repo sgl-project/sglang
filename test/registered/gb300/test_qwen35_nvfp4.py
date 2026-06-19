@@ -38,7 +38,7 @@ MTP_ARGS = [
 
 
 class TestQwen35Nvfp4(unittest.TestCase):
-    """Qwen3.5-397B NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
+    """Qwen3.5-397B NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_qwen35_nvfp4(self):
         variants = [

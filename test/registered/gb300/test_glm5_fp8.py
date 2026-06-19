@@ -29,7 +29,7 @@ MTP_ARGS = [
 
 
 class TestGlm5Fp8(unittest.TestCase):
-    """GLM-5.1 FP8 on GB300 (4x B200 NVL4, tp=4)."""
+    """GLM-5.1 FP8 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_glm5_fp8(self):
         variants = [

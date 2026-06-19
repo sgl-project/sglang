@@ -23,7 +23,7 @@ COMMON_ARGS = [
 
 
 class TestKimiK25(unittest.TestCase):
-    """Kimi-K2.5 (native INT4) on GB300 (4x B200 NVL4, tp=4).
+    """Kimi-K2.5 (native INT4) on GB300 (4x GB300 NVL4, tp=4).
 
     No EAGLE/MTP support for Kimi-K2.5 — only TP and TP+DP+DPA variants.
     """
