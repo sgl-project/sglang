@@ -500,6 +500,7 @@ def _run_mega_routed(
     fused_waterfill_predispatch = False
     waterfill_dispatch_plan = None
     waterfill_balancer = None
+    one_way_remote_shared_for_fused_waterfill = False
 
     def mark_timing(name: str) -> None:
         if not timing_call:
@@ -516,7 +517,10 @@ def _run_mega_routed(
         # Static redundant-expert placement can be active with enable_eplb=False.
         # Let the helper decide from ep_dispatch_algorithm instead of gating here.
         dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        fuse_env = envs.SGLANG_WATERFILL_FUSE_MEGA_MOE_PREDISPATCH.get()
+        fuse_env_field = envs.SGLANG_WATERFILL_FUSE_MEGA_MOE_PREDISPATCH
+        fuse_env_raw = os.environ.get(fuse_env_field.name)
+        fuse_env_explicit = fuse_env_raw not in (None, "")
+        fuse_env = fuse_env_field.get() if fuse_env_explicit else False
         topk_stats_interval = envs.SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL.get()
         waterfill_enabled = bool(getattr(moe.topk, "enable_deepep_waterfill", False))
         has_waterfill_balancer = (
@@ -524,9 +528,14 @@ def _run_mega_routed(
         )
         force_local_shared = envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get()
         has_no_waterfill_topk = hasattr(moe.topk, "forward_without_deepep_waterfill")
+        # Mega-MoE normally materializes Waterfill's expanded [N, routed_topk + 1]
+        # tensors, then immediately copies/quantizes them into DeepGEMM's
+        # symmetric buffer.  For the common DSV4 EP=TP=2 FP8 path, the
+        # pre-dispatch kernel can append the shared-expert column directly while
+        # writing that buffer.  Keep the env as an explicit override, but default
+        # to the fused path when all correctness constraints are met.
         can_fuse_waterfill_predispatch = (
-            fuse_env
-            and not use_fp4_acts
+            not use_fp4_acts
             and topk_stats_interval <= 0
             and waterfill_enabled
             and has_waterfill_balancer
@@ -534,6 +543,12 @@ def _run_mega_routed(
             and not force_local_shared
             and has_no_waterfill_topk
         )
+        if fuse_env_explicit:
+            can_fuse_waterfill_predispatch = (
+                fuse_env and can_fuse_waterfill_predispatch
+            )
+        else:
+            fuse_env = can_fuse_waterfill_predispatch
         if can_fuse_waterfill_predispatch:
             topk_output = moe.topk.forward_without_deepep_waterfill(
                 hidden_states,
@@ -547,6 +562,18 @@ def _run_mega_routed(
                 num_tokens,
             )
             fused_waterfill_predispatch = waterfill_dispatch_plan is not None
+            one_way_env_field = envs.SGLANG_WATERFILL_ONE_WAY_REMOTE_SHARED
+            one_way_env_raw = os.environ.get(one_way_env_field.name)
+            one_way_env_explicit = one_way_env_raw not in (None, "")
+            # The measured DSV4 Mega-MoE fused path does not convert two-way
+            # shared-expert traffic into a reliable kernel speedup: it keeps the
+            # same DeepGEMM padded shape and can add remote shared work on both
+            # ranks.  For the fused rank-2 path, default to one-way remote shared
+            # so only the routed-heavy source rank sends shared tokens remotely.
+            # Keep the env as an explicit override.
+            one_way_remote_shared_for_fused_waterfill = (
+                one_way_env_field.get() if one_way_env_explicit else True
+            )
             if not fused_waterfill_predispatch:
                 topk_output = waterfill_balancer.expand_topk(topk_output, num_tokens)
         else:
@@ -676,7 +703,7 @@ def _run_mega_routed(
             local_pref_denom=max(envs.SGLANG_WATERFILL_LOCAL_PREF_DENOM.get(), 1),
             remote_cost_tokens=max(envs.SGLANG_WATERFILL_REMOTE_COST_TOKENS.get(), 0),
             allow_all_ranks=waterfill_dispatch_plan.allow_all_ranks,
-            one_way_remote_shared=envs.SGLANG_WATERFILL_ONE_WAY_REMOTE_SHARED.get(),
+            one_way_remote_shared=one_way_remote_shared_for_fused_waterfill,
             old_experts_per_rank=old_experts_per_rank,
             new_experts_per_rank=new_experts_per_rank,
             shared_replicas_per_rank=shared_replicas_per_rank,
