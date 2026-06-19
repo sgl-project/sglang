@@ -529,6 +529,13 @@ def _build_eagle_draft_extend_fixture(
         testcase.skipTest(f"{case.backend} draft-extend backend is not available")
     fixture.runner.draft_extend_attn_backend = draft_extend_attn_backend
     fixture.runner.attn_backend = draft_extend_attn_backend
+    # Mirror ModelRunner.init_backends: bound static metadata buffers must
+    # exist before any forward path touches the backend (use_bound deprecated).
+    draft_extend_attn_backend.init_static_metadata_buffers(
+        max_bs=settings.capture_batch_size,
+        max_num_tokens=settings.capture_batch_size
+        * (settings.speculative_num_draft_tokens or settings.speculative_num_steps),
+    )
     worker_cls = (
         _EagleDraftExtendV2WorkerHarness
         if case.forward_mode.is_draft_extend_v2()
