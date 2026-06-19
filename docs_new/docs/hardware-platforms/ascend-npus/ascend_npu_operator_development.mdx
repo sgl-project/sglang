@@ -417,8 +417,8 @@ import sgl_kernel_npu
 
 class TestHelloworld(unittest.TestCase):
     def test_helloworld_basic(self):
-        x = torch.randn(1024, dtype=torch.bfloat16, device="npu")
-        y = torch.randn(1024, dtype=torch.bfloat16, device="npu")
+        x = torch.randn(2048, dtype=torch.float16, device="npu")
+        y = torch.randn(2048, dtype=torch.float16, device="npu")
 
         z = torch.ops.npu.helloworld(x, y)
         expected = x + y

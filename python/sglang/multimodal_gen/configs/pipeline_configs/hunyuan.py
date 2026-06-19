@@ -117,6 +117,37 @@ class HunyuanConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        if encoder_index == 1:
+            return outputs.pooler_output
+        return None
+
+    def get_pos_prompt_embeds(self, batch):
+        return batch.prompt_embeds[0]
+
+    def get_neg_prompt_embeds(self, batch):
+        return batch.negative_prompt_embeds[0]
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        prompt_attention_mask = batch.prompt_attention_mask[0]
+        return {
+            "encoder_attention_mask": prompt_attention_mask,
+            "encoder_hidden_states_mask": prompt_attention_mask,
+            "pooled_projections": (
+                batch.pooled_embeds[0] if batch.pooled_embeds else None
+            ),
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        negative_attention_mask = batch.negative_attention_mask[0]
+        return {
+            "encoder_attention_mask": negative_attention_mask,
+            "encoder_hidden_states_mask": negative_attention_mask,
+            "pooled_projections": (
+                batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
+            ),
+        }
+
 
 @dataclass
 class FastHunyuanConfig(HunyuanConfig):

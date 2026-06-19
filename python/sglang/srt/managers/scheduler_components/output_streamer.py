@@ -18,7 +18,6 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-    GetLoadsReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -44,7 +43,6 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
-    load_inquirer_get_loads: Callable[..., Any]
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -144,8 +142,6 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
         )
-        load = self.load_inquirer_get_loads(GetLoadsReqInput(include=["core"]))
-
         for req in reqs:
             if req is skip_req:
                 continue
@@ -159,7 +155,6 @@ class SchedulerOutputStreamer:
 
         # Send to detokenizer
         payload = acc.to_payload(
-            load=load,
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
             has_reqs=bool(reqs),
@@ -270,6 +265,9 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    image_tokens: list = field(default_factory=list)
+    audio_tokens: list = field(default_factory=list)
+    video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
@@ -377,6 +375,22 @@ class _GenerationStreamAccumulator:
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
+        # Multimodal prompt token counts. In disagg decode mode the prefill node
+        # already computed these and transferred them via the metadata buffer
+        # (req.mm_*), so prefer the pre-stored values; otherwise compute them
+        # from the request's multimodal items.
+        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
+            image_t = req.mm_image_tokens
+            audio_t = req.mm_audio_tokens
+            video_t = req.mm_video_tokens
+        elif req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.image_tokens.append(image_t)
+        self.audio_tokens.append(audio_t)
+        self.video_tokens.append(video_t)
+
         self.retraction_counts.append(req.retraction_count)
 
         self.time_stats.append(req.time_stats)
@@ -460,9 +474,14 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_idx.append([])
 
         if self.return_hidden_states:
-            self.output_hidden_states.append(
-                req.hidden_states if req.return_hidden_states else None
-            )
+            if req.return_hidden_states:
+                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
+                hs = req.hidden_states
+                if req.finished_len is not None:
+                    hs = hs[: req.finished_len]
+                self.output_hidden_states.append(hs)
+            else:
+                self.output_hidden_states.append(None)
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
@@ -479,7 +498,7 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
-        self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
     ) -> Optional[BatchTokenIDOutput]:
         if not (has_reqs or is_idle_batch):
             return None
@@ -504,6 +523,9 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            image_tokens=self.image_tokens,
+            audio_tokens=self.audio_tokens,
+            video_tokens=self.video_tokens,
             input_token_logprobs_val=self.input_token_logprobs_val,
             input_token_logprobs_idx=self.input_token_logprobs_idx,
             output_token_logprobs_val=self.output_token_logprobs_val,
@@ -524,6 +546,5 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
-            load=load,
             dp_ranks=dp_ranks,
         )
