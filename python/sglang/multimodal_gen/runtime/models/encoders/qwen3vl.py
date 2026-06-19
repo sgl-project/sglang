@@ -99,6 +99,14 @@ def _make_text_linear(
         use_tensor_parallel and tp_size > 1 and out_features % tp_size == 0
     )
     if use_weight_only_fp8:
+        return Qwen3VLColumnParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            gather_output=gather_output,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         if use_column_parallel:
             return WeightOnlyFP8ColumnParallelLinear(
                 in_features,
@@ -154,6 +162,13 @@ def _make_text_row_linear(
         use_tensor_parallel and tp_size > 1 and in_features % tp_size == 0
     )
     if use_weight_only_fp8:
+        return Qwen3VLRowParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
                 in_features,

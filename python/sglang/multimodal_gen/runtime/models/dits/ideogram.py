@@ -26,12 +26,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
-    WeightOnlyFP8ColumnParallelLinear,
-    WeightOnlyFP8Linear,
-    WeightOnlyFP8MergedColumnParallelLinear,
-    WeightOnlyFP8RowParallelLinear,
-)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
     qwen3_apply_rotary_pos_emb,
@@ -86,15 +80,23 @@ def _linear(
 ):
     tp_size = _tp_size()
     use_column_parallel = tp_size > 1 and out_features % tp_size == 0
-    if quant_config is None:
-        if use_column_parallel:
-            return WeightOnlyFP8ColumnParallelLinear(
-                in_features,
-                out_features,
-                bias=bias,
-                gather_output=gather_output,
-            )
-        return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+    # if quant_config is None:
+    #    return Ideogram4ColumnParallelLinear(
+    #        in_features,
+    #        out_features,
+    #        bias=bias,
+    #        gather_output=gather_output,
+    #        quant_config=quant_config,
+    #        prefix=prefix,
+    #    )
+    #    if use_column_parallel:
+    #        return WeightOnlyFP8ColumnParallelLinear(
+    #            in_features,
+    #            out_features,
+    #            bias=bias,
+    #            gather_output=gather_output,
+    #        )
+    #    return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
     if use_column_parallel:
         return Ideogram4ColumnParallelLinear(
             in_features,
@@ -125,15 +127,23 @@ def _merged_column_linear(
         output_size % tp_size == 0 for output_size in output_sizes
     )
     out_features = sum(output_sizes)
-    if quant_config is None:
-        if use_column_parallel:
-            return WeightOnlyFP8MergedColumnParallelLinear(
-                in_features,
-                output_sizes,
-                bias=bias,
-                gather_output=False,
-            )
-        return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+    # if quant_config is None:
+    #    return Ideogram4MergedColumnParallelLinear(
+    #        in_features,
+    #        output_sizes,
+    #        bias=bias,
+    #        gather_output=False,
+    #        quant_config=quant_config,
+    #        prefix=prefix,
+    #    )
+    #    if use_column_parallel:
+    #        return WeightOnlyFP8MergedColumnParallelLinear(
+    #            in_features,
+    #            output_sizes,
+    #            bias=bias,
+    #            gather_output=False,
+    #        )
+    #    return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
     if use_column_parallel:
         return Ideogram4MergedColumnParallelLinear(
             in_features,
@@ -161,15 +171,22 @@ def _row_linear(
 ):
     tp_size = _tp_size()
     use_row_parallel = tp_size > 1 and in_features % tp_size == 0
-    if quant_config is None:
-        if use_row_parallel:
-            return WeightOnlyFP8RowParallelLinear(
-                in_features,
-                out_features,
-                bias=bias,
-                input_is_parallel=True,
-            )
-        return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+    # if quant_config is None:
+    #    return Ideogram4RowParallelLinear(
+    #        in_features,
+    #        out_features,
+    #        bias=bias,
+    #        quant_config=quant_config,
+    #        prefix=prefix,
+    #    )
+    #    if use_row_parallel:
+    #        return WeightOnlyFP8RowParallelLinear(
+    #            in_features,
+    #            out_features,
+    #            bias=bias,
+    #            input_is_parallel=True,
+    #        )
+    #    return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
     if use_row_parallel:
         return Ideogram4RowParallelLinear(
             in_features,
