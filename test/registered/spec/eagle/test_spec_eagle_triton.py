@@ -1,4 +1,4 @@
-"""triton attention backend (EAGLE3 spec v2 + EAGLE/Llama-2 spec v1).
+"""triton attention backend (EAGLE3 topk=1 chain + EAGLE/Llama-2 topk=8 tree).
 
 triton runs everywhere, so this stays on the cheap (5090) runner.
 """
@@ -11,6 +11,7 @@ from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
+    SpecHiddenStatesKit,
     SpecLogprobKit,
     SpecPenaltyKit,
 )
@@ -37,10 +38,17 @@ class TestEagle3Triton(
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2Triton(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
-    """EAGLE/Llama-2 topk=8 on triton (spec v1)."""
+class TestEagleLlama2Triton(
+    EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit, SpecHiddenStatesKit
+):
+    """EAGLE/Llama-2 topk=8 tree on triton.
+
+    Hosts SpecHiddenStatesKit: topk>1 exercises the tree accept-path
+    compaction that the per-req hidden-state stride slicing depends on.
+    """
 
     attention_backend = "triton"
+    enable_return_hidden_states = True
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
