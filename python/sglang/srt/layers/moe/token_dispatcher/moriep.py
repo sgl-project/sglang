@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -662,7 +663,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     recv_scales,
                     recv_topk_ids,
                     packed_recv_count,
-                ) = dispatch_fn(hidden_states, topk_weights, scale, topk_ids)
+                ) = dispatch_fn(
+                    hidden_states,
+                    topk_weights,
+                    scale,
+                    topk_ids,
+                    call_local_expert_count=True,
+                )
                 if self.enable_sdma:
                     self.mori_op.dispatch_recv()
 
@@ -688,10 +695,21 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 recv_scales,
                 recv_topk_ids,
                 packed_recv_count,
-            ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+            ) = self.mori_op.dispatch(
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                call_local_expert_count=True,
+            )
 
-        # TODO(billishyahao): EPLB
-        # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+        # Use low_latency hook instead of normal since mori local_expert_count is
+        # a GPU tensor, while the normal hook expects a Python list (CPU).  The
+        # low_latency path accumulates counts directly on GPU via
+        # _DeepepLowLatencySinglePassGatherer, which is CUDA-graph safe.
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            self.mori_op.local_expert_count
+        )
 
         return (
             packed_recv_hidden,
@@ -870,7 +888,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             is mori.ops.EpDispatchCombineKernelType.AsyncLL
         ), "mori asyncll mismatch"
 
-        self.mori_op.dispatch_recv()
+        self.mori_op.dispatch_recv(call_local_expert_count=True)
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            self.mori_op.local_expert_count
+        )
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,

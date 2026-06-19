@@ -18,7 +18,10 @@ import torch
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    world_group_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -95,12 +98,15 @@ class PipelineStage(StageDedupMixin, ABC):
         total: int | None = None,
         *,
         disable: bool = False,
+        batch: Req | None = None,
         **kwargs,
     ) -> tqdm:
+        is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        disable = disable or (batch is not None and batch.is_warmup)
         return tqdm(
             iterable=iterable,
             total=total,
-            disable=disable or get_world_rank() != 0,
+            disable=disable or not is_main_rank,
             **kwargs,
         )
 

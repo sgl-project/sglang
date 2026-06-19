@@ -100,7 +100,7 @@ class LMCRadixCache(RadixCache):
     def __init__(
         self,
         params: CacheInitParams,
-        model_config: Optional["ModelConfig"] = None,
+        model_config: Optional[ModelConfig] = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,

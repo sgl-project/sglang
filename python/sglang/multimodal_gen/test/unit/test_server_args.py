@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.models.fsdp import (
@@ -18,6 +19,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineCon
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+    SanaWMPipelineConfig,
+    SanaWMRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
@@ -38,12 +43,62 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
+@contextmanager
+def _mock_cuda_platform(
+    *,
+    memory_gb: int = 80,
+    available_memory_gb: int | dict[int, int] | None = None,
+):
+    def get_available_gpu_memory(device_id=0, **_kwargs):
+        if isinstance(available_memory_gb, dict):
+            return available_memory_gb[device_id]
+        if available_memory_gb is not None:
+            return available_memory_gb
+        return memory_gb
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
+            return_value=memory_gb * 1024**3,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
+            side_effect=get_available_gpu_memory,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+            return_value=True,
+        ),
+    ):
+        yield
+
+
+def _from_dict_without_model_resolution(
+    kwargs, pipeline_config: PipelineConfig | None = None
+):
+    pipeline_config = pipeline_config or QwenImagePipelineConfig()
+    with (
+        patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+        _mock_cuda_platform(),
+    ):
+        return ServerArgs.from_dict(kwargs)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_tilde_model_path_is_expanded(self):
         args = self._from_dict_without_model_resolution(
@@ -614,6 +669,7 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -634,6 +690,35 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_streaming",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -1295,6 +1380,10 @@ class TestModelIdResolution(unittest.TestCase):
         info = _get_config_info(path)
         self.assertIsNotNone(info)
 
+    def test_sana_wm_model_path_resolves_registry(self):
+        info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
+        self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
+
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
         # with an unresolvable path, expect RuntimeError from the detector step
@@ -1306,10 +1395,7 @@ class TestPerRoleParallelism(unittest.TestCase):
     """Test per-role parallelism args and get_role_parallelism helper."""
 
     def _from_dict(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_defaults_are_none(self):
         args = self._from_dict({"model_path": "/fake"})
@@ -1351,14 +1437,33 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(par["ring_degree"], 2)
 
     def test_decoder_overrides(self):
-        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        args = self._from_dict({"model_path": "/fake", "decoder_sp": 2})
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         par = args.get_role_parallelism(RoleType.DECODER)
-        self.assertEqual(par["tp_size"], 2)
-        self.assertIsNone(par["sp_degree"])
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
         self.assertIsNone(par["ulysses_degree"])
         self.assertIsNone(par["ring_degree"])
+
+    def test_decoder_tp_is_alias_of_decoder_sp(self):
+        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        self.assertEqual(args.decoder_sp, 2)
+        par = args.get_role_parallelism(RoleType.DECODER)
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
+
+    def test_conflicting_decoder_tp_and_decoder_sp_raise(self):
+        with self.assertRaisesRegex(ValueError, "decoder_tp is deprecated"):
+            self._from_dict(
+                {
+                    "model_path": "/fake",
+                    "decoder_tp": 2,
+                    "decoder_sp": 4,
+                }
+            )
 
     def test_monolithic_returns_all_none(self):
         args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
@@ -1375,14 +1480,72 @@ class TestPerRoleParallelism(unittest.TestCase):
                 "model_path": "/fake",
                 "encoder_tp": 1,
                 "denoiser_tp": 2,
-                "decoder_tp": 4,
+                "decoder_sp": 4,
             }
         )
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         self.assertEqual(args.get_role_parallelism(RoleType.ENCODER)["tp_size"], 1)
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
-        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["tp_size"], 4)
+        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
+
+    def test_disagg_args_import_path_stays_compatible(self):
+        from sglang.multimodal_gen.runtime.disaggregation import disagg_args
+        from sglang.multimodal_gen.runtime.server_args_disagg import (
+            DisaggServerArgsMixin,
+        )
+
+        self.assertIs(disagg_args.DisaggArgsMixin, DisaggServerArgsMixin)
+        self.assertIs(
+            disagg_args.DISAGG_RESULT_PORT_OFFSETS,
+            DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS,
+        )
+
+    def test_gpu_ids_normalize_lists_and_commas(self):
+        args = self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "6", "7 8"]})
+
+        self.assertEqual(args.gpu_ids, [0, 1, 6, 7, 8])
+
+    def test_gpu_ids_reject_duplicates(self):
+        with self.assertRaisesRegex(ValueError, "duplicate GPU ids"):
+            self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "1"]})
+
+    def test_pool_endpoints_use_role_and_scheduler_ports(self):
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "disagg_role": "denoiser",
+                "disagg_server_addr": "tcp://127.0.0.1:30000",
+                "scheduler_port": 5600,
+                "host": "0.0.0.0",
+                "disagg_p2p_hostname": "10.0.0.7",
+            }
+        )
+
+        self.assertEqual(args.derive_pool_result_endpoint(), "tcp://127.0.0.1:30002")
+        self.assertEqual(
+            args.derive_pool_work_endpoint(),
+            f"tcp://0.0.0.0:{args.scheduler_port}",
+        )
+        self.assertEqual(
+            args.derive_pool_control_endpoint(),
+            f"tcp://0.0.0.0:{args.scheduler_port + 1}",
+        )
+        self.assertEqual(
+            args.derive_pool_control_advertised_endpoint(),
+            f"tcp://10.0.0.7:{args.scheduler_port + 1}",
+        )
+
+    def test_pool_result_endpoint_validates_addr_and_role(self):
+        args = self._from_dict({"model_path": "/fake", "disagg_server_addr": "bad"})
+        with self.assertRaisesRegex(ValueError, "disagg_server_addr must be"):
+            args.derive_pool_result_endpoint()
+
+        args = self._from_dict(
+            {"model_path": "/fake", "disagg_server_addr": "127.0.0.1:30000"}
+        )
+        with self.assertRaisesRegex(ValueError, "only defined for encoder"):
+            args.derive_pool_result_endpoint()
 
     def test_cli_args_parsed(self):
         """Per-role parallelism args are parsed from CLI."""
@@ -1401,6 +1564,8 @@ class TestPerRoleParallelism(unittest.TestCase):
             "2",
             "--encoder-tp",
             "1",
+            "--decoder-sp",
+            "8",
         ]
         args, unknown = parser.parse_known_args(argv)
         self.assertEqual(args.denoiser_tp, 2)
@@ -1408,6 +1573,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.denoiser_ulysses, 2)
         self.assertEqual(args.denoiser_ring, 2)
         self.assertEqual(args.encoder_tp, 1)
+        self.assertEqual(args.decoder_sp, 8)
         self.assertIsNone(args.decoder_tp)
 
 
@@ -1425,7 +1591,10 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "768",
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            _mock_cuda_platform(),
+        ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
@@ -1441,12 +1610,81 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "true",
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            _mock_cuda_platform(),
+        ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+
+class TestDisaggTimeoutArgs(unittest.TestCase):
+    def test_disagg_defaults_match_reviewed_values(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_max_slots_per_instance, 8)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 1800)
+        self.assertEqual(args.disagg_timeout, 3600)
+
+    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-downstream-wait-timeout",
+            "45",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
+
+    def test_disagg_timeout_help_uses_current_defaults(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+
+        self.assertIn("Default: 3600.", help_text)
+        self.assertIn("Default: 1800.", help_text)
+
+    def test_disagg_role_alias_cli_arg_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            ["--model-path", "/fake", "--disagg-role", "denoising"]
+        )
+
+        self.assertEqual(args.disagg_role, "denoising")
+
+    def test_disagg_role_alias_normalizes_to_denoiser(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "disagg_role": "denoising"}
+        )
+
+        self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestDisaggTransferBackendArgs(unittest.TestCase):
+    def test_transfer_backend_defaults_to_auto(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_transfer_backend, "auto")
+
+    def test_transfer_backend_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-transfer-backend",
+            "mock",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 if __name__ == "__main__":

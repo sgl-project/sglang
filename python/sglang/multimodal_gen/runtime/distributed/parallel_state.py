@@ -122,6 +122,10 @@ def get_world_group() -> GroupCoordinator:
     return _WORLD
 
 
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
+
+
 def init_world_group(
     ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:
@@ -806,6 +810,22 @@ def get_vae_parallel_world_size() -> int:
 def get_vae_parallel_rank() -> int:
     """Return my rank for the VAE parallel group."""
     return torch.distributed.get_rank(group=get_vae_parallel_group())
+
+
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    sp_group = get_sp_group()
+    cfg_group = get_cfg_group()
+    if sp_group.world_size == 1 and cfg_group.world_size > 1:
+        return cfg_group
+    return sp_group
+
+
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
+
+
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
 
 
 def init_dit_group(

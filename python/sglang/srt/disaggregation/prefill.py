@@ -26,6 +26,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
@@ -378,6 +379,15 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def release_memory_occupation(self):
+        self.queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
+
 
 class SchedulerDisaggregationPrefillMixin:
     """
@@ -721,11 +731,17 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                is_propagated = False
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.warning(error_message)
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
@@ -802,11 +818,17 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
+        is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             error_message += f" with exception {e}"
-        logger.warning(error_message)
+            is_propagated = getattr(e, "is_from_another_rank", False)
+        # Mute error message for propagated exceptions to avoid duplicate logging
+        if is_propagated:
+            logger.debug(error_message)
+        else:
+            logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache)
@@ -870,7 +892,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
+                    self.chunked_req.fill_len,
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
@@ -906,7 +928,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(req.fill_len, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -937,7 +959,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
+            seq_len = min(req.fill_len, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
@@ -970,6 +992,19 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _swa_ring_payload():
+                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
+                # for the last `window` positions, in ascending position order so
+                # decode (its own req_pool_idx) matches positionally.
+                _pool = self.token_to_kv_pool_allocator.get_kvcache()
+                ring_stride = _pool.unified_swa_ring_size
+                window_size = _pool.unified_swa_window
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
+                state_slot = int(req.req_pool_idx)
+                ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                return ring_rows.astype(np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -981,6 +1016,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
                 else:
                     state_indices.append(None)
 

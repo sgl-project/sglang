@@ -46,6 +46,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
@@ -227,7 +228,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
       - name: Collect performance metrics
         if: always()
