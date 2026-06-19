@@ -227,17 +227,18 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
-        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
-        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
+        # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
+        # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend == "tilelang"
-            or self.server_args.dsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
+            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
         ):
             return kv_cache_dim
 
         quant_block_size = DSATokenToKVPool.quant_block_size
         rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
-        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
+        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
+        # (excluding TRTLLM and HIP raw-layout kernels).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
