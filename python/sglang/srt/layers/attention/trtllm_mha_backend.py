@@ -144,18 +144,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Eager/replay seam, resolved by backend STATE (no argument).
-
-        Returns True when this ``(bs, forward_mode)`` has a pre-bound
-        cuda-graph metadata object: i.e. at cuda-graph replay (the runner always
-        pads to a captured bucket) and harmlessly at an eager forward that lands
-        on a captured bs+mode in a graph-enabled server -- there is one forward
-        stream per backend, and the bound metadata is always refilled by
-        ``out_graph`` before the next ``graph.replay()``, so a transient eager
-        plan cannot leak into a later replay. Returns False for pure-eager runs
-        (no metadata was ever captured for this bs/mode) and for plain EXTEND
-        (never captured) -> build a fresh per-iter metadata.
+    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Whether `(bs, forward_mode)` has a captured cuda-graph metadata
+        object — only True when a cuda-graph runner previously captured this
+        bucket. Internal to `_compute_forward_metadata` (not part of the
+        backend API; see that method for the seam semantics).
         """
         if forward_mode.is_decode_or_idle():
             return bs in self.decode_cuda_graph_metadata
@@ -507,30 +500,36 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
             )
 
-        # Single eager == replay == capture metadata path; `use_bound` selects
-        # the pre-bound per-bs cuda-graph metadata (refilled in place) vs a
-        # fresh per-iter metadata.
-        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
-        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
+        # Single eager == replay == capture metadata path. The seam between
+        # the pre-bound per-bs cuda-graph metadata (refilled in place) and a
+        # freshly-built per-iter object is internal to _compute_forward_metadata;
+        # callers do not need to know which path is taken.
+        self._compute_forward_metadata(forward_batch, in_capture=in_capture)
 
     def _compute_forward_metadata(
-        self, forward_batch: ForwardBatch, *, use_bound: bool
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
     ):
         """Single source of truth for TRTLLM-MHA forward metadata, shared by
         eager, capture, and replay.
 
-        ``use_bound`` selects whether the metadata is the per-bs pre-bound
-        cuda-graph object (refilled in place; capture / replay / eager-at-
-        captured-bs) or a fresh per-iter object. Plain EXTEND (and eager
-        draft_extend_v2) only ever run with use_bound=False. The in_capture-only
-        pre-roll (_build_cuda_graph_metadata) lives in
-        init_forward_metadata_out_graph around this call.
+        Internally selects between the pre-bound per-bs cuda-graph metadata
+        (refilled in place at capture / replay / eager-at-captured-bs) and a
+        fresh per-iter object (pure-eager / non-captured bs; plain EXTEND;
+        eager draft_extend_v2). The captured pre-roll
+        (_build_cuda_graph_metadata) is called by init_forward_metadata_out_graph
+        before this method when ``in_capture`` is True.
         """
         bs = forward_batch.batch_size
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if use_bound:
+        # Internalize the captured-bucket seam — every caller goes through this
+        # function; the public API does not expose it.
+        _has_captured_metadata = in_capture or self._has_captured_metadata(
+            bs, forward_mode
+        )
+
+        if _has_captured_metadata:
             # Bound cuda-graph path (replay / capture / eager-at-captured-bs):
             # refill the pre-bound per-bs metadata in place. Mirrors the old
             # _apply_cuda_graph_metadata body exactly ([:bs] slicing, in-place
@@ -653,9 +652,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
             self.forward_metadata = metadata
         else:
-            # Eager (use_bound=False) path: build a fresh per-iter metadata.
-            # Mirrors the old eager init_forward_metadata body exactly (plain
-            # EXTEND and eager draft_extend_v2 both land in the final `else`).
+            # Fresh per-iter metadata (pure-eager / non-captured bs; plain
+            # EXTEND; eager draft_extend_v2). Mirrors the old eager
+            # init_forward_metadata body exactly.
             metadata = TRTLLMMHAMetadata()
             seqlens_in_batch = forward_batch.seq_lens
             batch_size = forward_batch.batch_size
@@ -783,12 +782,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             self.forward_metadata = metadata
 
-        # Bound-path SWA: refill the captured write-target buffer from the live
-        # out_cache_loc before replay (the per-bs metadata holds a view bound in
-        # _build). The eager (use_bound=False) path instead sets
+        # Captured-bucket SWA: refill the captured write-target buffer from
+        # the live out_cache_loc before replay (the per-bs metadata holds a
+        # view bound in _build_cuda_graph_metadata). The fresh path sets
         # metadata.swa_out_cache_loc directly inside the body above.
         if (
-            use_bound
+            _has_captured_metadata
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
         ):
