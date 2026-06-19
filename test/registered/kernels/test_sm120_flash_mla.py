@@ -144,7 +144,9 @@ def _build_kvcache(
     nope_dequant = (
         nope_fp8.view(num_pages, page_size, _NUM_TILES, _TILE_SIZE)
         * scale_e8m0.view(num_pages, page_size, _NUM_TILES, 1)
-    ).view(num_pages, page_size, _NOPE_DIM)  # float32
+    ).view(
+        num_pages, page_size, _NOPE_DIM
+    )  # float32
     ref_per_token = torch.cat(
         [nope_dequant.to(torch.bfloat16), rope_bf16_vals], dim=-1
     )  # (num_pages, page_size, 512) bf16

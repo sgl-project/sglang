@@ -12,10 +12,11 @@ separate region at the end of each page.
 """
 
 import logging
-import os
+import math
 
 import torch
-import math
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,9 @@ def _gather_and_dequant(k_cache, indices, page_size):
     raw_pages = k_cache.as_strided(
         (num_pages, page_bytes),
         (page_bytes, 1),
-    ).view(torch.uint8)  # (num_pages, page_bytes) uint8
+    ).view(
+        torch.uint8
+    )  # (num_pages, page_bytes) uint8
     # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
 
     # Compute byte offsets within each page
@@ -194,7 +197,7 @@ def _sm120_sparse_decode_fwd(
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
-_sm120_default_backend = os.environ.get("SGLANG_SM120_FLASHMLA_BACKEND", "flashinfer")
+_sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
