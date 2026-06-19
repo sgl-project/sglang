@@ -15,6 +15,8 @@ import logging
 import math
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 
@@ -266,9 +268,6 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     return (out, lse)
 
 
-# Lazily initialized FlashInfer wrapper per device (reused across calls).
-_flashinfer_wrapper = {}  # device -> wrapper
-
 # --- Page-split utilities: pbs=256 → pbs=64 ---
 # SGLang SWA KV cache footer layout per 256-token page:
 #   [data: 256 * 576 bytes] [scale: 256 * 8 bytes] [padding]
@@ -287,9 +286,6 @@ _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
 # Pre-allocated buffer for page-split output per device (lazily sized).
 _split_buf = {}  # device -> tensor
-
-import triton
-import triton.language as tl
 
 
 @triton.jit
@@ -402,25 +398,17 @@ def _flash_mla_flashinfer(
     extra_indices,
     extra_topk_length,
 ):
-    """FlashInfer SM120 sparse MLA via BatchSparseMLAPagedAttentionWrapper.
+    """FlashInfer SM120 sparse MLA via sparse_mla_sm120_decode_dsv4.
 
     SGLang SWA pool uses page_size=256 (footer format: 256*576 bytes data + 256*8 bytes scale).
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
     We split 256-token pages into 4 virtual 64-token pages.
     Token indices are invariant under page-split (identity mapping).
     """
-    from flashinfer.sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
 
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
-
     dev = q.device
-    wrapper = _flashinfer_wrapper.get(dev)
-    if wrapper is None:
-        wrapper = BatchSparseMLAPagedAttentionWrapper(
-            d_v=head_dim_v,
-            device=dev,
-        )
-        _flashinfer_wrapper[dev] = wrapper
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
@@ -432,9 +420,6 @@ def _flash_mla_flashinfer(
         if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
         else extra_k_cache
     )
-    # Extra cache (C4/C128) has its own page_block_size (e.g. 64 for C4, 2 for C128).
-    # FlashInfer decode_dsv4 supports variable extra_page_block_size natively,
-    # so pass extra cache as-is without splitting.
     extra_kv_64 = extra_kv_u8
 
     # Indices: no remapping needed (page-split preserves token addressing).
@@ -445,8 +430,8 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
-    output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=q.device)
-    out_lse = torch.empty(B, H, dtype=torch.float32, device=q.device)
+    output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
+    out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
     # Pre-allocate split-K scratch for decode-dsv4 fast path.
     topk = idx.shape[-1]
@@ -456,24 +441,24 @@ def _flash_mla_flashinfer(
         (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
     )
     mid_out = torch.empty(
-        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=q.device
+        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
     )
-    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=q.device)
+    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
 
-    wrapper.run(
-        q=q,  # (B, 1, H, D) — wrapper handles squeeze
+    sparse_mla_sm120_decode_dsv4(
+        q=q.squeeze(1) if q.ndim == 4 else q,
         kv_cache=kv_64,
         indices=idx,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
         output=output,
+        out_lse=out_lse,
         sm_scale=softmax_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_64,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
-        out_lse=out_lse,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
     )
 
     return (output.unsqueeze(1), None)
