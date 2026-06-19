@@ -630,9 +630,14 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            for dirpath, _dirnames, filenames in os.walk(self.file_path):
+            for dirpath, dirnames, filenames in os.walk(self.file_path, topdown=False):
                 for filename in filenames:
                     os.remove(os.path.join(dirpath, filename))
+                for dirname in dirnames:
+                    try:
+                        os.rmdir(os.path.join(dirpath, dirname))
+                    except OSError:
+                        pass
             self._evictor.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
