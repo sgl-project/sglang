@@ -759,6 +759,10 @@ fn build_outgoing_body(
 /// Not replicated → omit:
 ///   * `tools` / `functions` — the encoder doesn't render tool schemas.
 ///   * multimodal (array) `content` — a text tokenizer can't represent images.
+///   * `chat_template` — an OpenAI-compatible per-request template override
+///     (e.g. vLLM); the router renders with the model's default template, so a
+///     custom one would diverge. (SGLang ignores it today, but block it so the
+///     offload stays correct across engines / future versions.)
 ///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
 ///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
 ///     encoder renders in the engine's default mode only.
@@ -784,6 +788,7 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     // Fields that steer the engine's template tokenization but which the
     // router's encoder does not thread through.
     for key in [
+        "chat_template",
         "chat_template_kwargs",
         "reasoning",
         "reasoning_effort",
@@ -1048,6 +1053,7 @@ mod tests {
         let blockers = [
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
             serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
@@ -1068,6 +1074,7 @@ mod tests {
     fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
+            "chat_template": null,
             "reasoning_effort": null,
             "chat_template_kwargs": null,
             "continue_final_message": false
