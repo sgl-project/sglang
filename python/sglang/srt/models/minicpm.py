@@ -17,11 +17,14 @@ import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -35,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -90,6 +94,8 @@ class MiniCPMAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        attn_use_rope: bool = True,
+        use_output_gate: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -114,6 +120,8 @@ class MiniCPMAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.attn_use_rope = attn_use_rope
+        self.use_output_gate = use_output_gate
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -132,13 +140,14 @@ class MiniCPMAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
+        if self.attn_use_rope:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -149,6 +158,17 @@ class MiniCPMAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+        if self.use_output_gate:
+            self.o_gate = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("o_gate", prefix),
+            )
+
+        self.layer_id = layer_id
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -157,13 +177,195 @@ class MiniCPMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        orig_dtype = q.dtype
-        q, k = q.float(), k.float()
-        q, k = self.rotary_emb(positions, q, k)
-        q, k = q.to(orig_dtype), k.to(orig_dtype)
+
+        if self.attn_use_rope:
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+            q, k = self.rotary_emb(positions, q, k)
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
+
         attn_output = self.attn(q, k, v, forward_batch)
+
+        if self.use_output_gate:
+            o_gate_output, _ = self.o_gate(hidden_states)
+            attn_output = attn_output * F.sigmoid(o_gate_output)
+
         output, _ = self.o_proj(attn_output)
         return output
+
+
+class MiniCPMLightningMixer(nn.Module):
+    """Lightning attention mixer that uses SimpleGLAAttnBackend.
+
+    This is a wrapper that prepares inputs for the backend and handles
+    the QKV projection, normalization, RoPE, and output processing,
+    while delegating the Simple GLA kernel calls to SimpleGLAAttnBackend.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        use_rope: bool = True,
+        use_output_gate: bool = False,
+        attention_bias: bool = False,
+        rms_norm_eps: float = 1e-6,
+        use_output_norm: bool = False,
+        qk_norm: bool = True,
+        rope_head_dim: Optional[int] = None,
+        scale: str = "1/sqrt(d)",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_parallel().tp_size
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = head_dim
+        if scale == "1/sqrt(d)":
+            self.scale = self.head_dim ** (-0.5)
+        elif scale == "1/d":
+            self.scale = self.head_dim ** (-1.0)
+        else:
+            self.scale = 1.0
+        self.use_output_gate = use_output_gate
+        self.attention_bias = attention_bias
+        self.rms_norm_eps = rms_norm_eps
+        self.use_rope = use_rope
+        self.qk_norm = qk_norm
+        self.use_output_norm = use_output_norm
+        self.rope_head_dim = (
+            rope_head_dim if rope_head_dim is not None else self.head_dim
+        )
+        assert self.rope_head_dim <= self.head_dim
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        if self.use_output_norm:
+            self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
+
+        if self.use_output_gate:
+            self.z_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=self.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("z_proj", prefix),
+            )
+
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+
+        if self.use_rope:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
+
+        self.layer_id = layer_id
+        self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if self.qk_norm:
+            q = self.q_norm(q.reshape(-1, self.head_dim))
+            k = self.k_norm(k.reshape(-1, self.head_dim))
+
+        if self.use_rope:
+            q = q.reshape(-1, self.num_heads * self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+            q, k = self.rotary_emb(positions, q, k)
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
+
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        attn_backend = get_attn_backend()
+        if not isinstance(attn_backend, HybridLinearAttnBackend):
+            raise RuntimeError(
+                "SimpleGLAAttnBackend requires HybridLinearAttnBackend but got "
+                f"{type(attn_backend).__name__}. This mixer should only be used for "
+                "MiniCPM hybrid models."
+            )
+
+        linear_attn_backend = attn_backend.linear_attn_backend
+        o = linear_attn_backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            output_attentions=False,
+        )
+
+        o = o.reshape(-1, self.num_heads * self.head_dim)
+
+        if self.use_output_norm:
+            o = self.o_norm(o)
+
+        if self.use_output_gate:
+            z, _ = self.z_proj(hidden_states)
+            o = o * F.sigmoid(z)
+
+        y, _ = self.o_proj(o)
+        return y
 
 
 class MiniCPMDecoderLayer(nn.Module):
@@ -176,20 +378,62 @@ class MiniCPMDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
+        if isinstance(config, MiniCPMHybridConfig):
+            self.mixer_type = (
+                config.mixer_types[layer_id]
+                if config.mixer_types is not None
+                else "minicpm4"
+            )
+            attn_use_rope = config.attn_use_rope
+            attn_use_output_gate = config.attn_use_output_gate
+        else:
+            self.mixer_type = "minicpm4"
+            attn_use_rope = True
+            attn_use_output_gate = False
+
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = MiniCPMAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-        )
+        if self.mixer_type == "minicpm4":
+            self.self_attn = MiniCPMAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                attn_use_rope=attn_use_rope,
+                use_output_gate=attn_use_output_gate,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        elif self.mixer_type in ["lightning", "lightning_attn", "lightning-attn"]:
+            assert (
+                config.head_dim is not False
+            ), "head_dim must be provided for LightningAttention"
+            self.self_attn = MiniCPMLightningMixer(
+                hidden_size=self.hidden_size,
+                num_heads=config.lightning_nh,
+                num_kv_heads=config.lightning_nkv,
+                head_dim=config.lightning_head_dim,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                use_rope=config.lightning_use_rope,
+                use_output_gate=config.use_output_gate,
+                attention_bias=config.attention_bias,
+                rms_norm_eps=config.rms_norm_eps,
+                use_output_norm=config.use_output_norm,
+                qk_norm=config.qk_norm,
+                scale=config.lightning_scale,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            raise ValueError(f"Unsupported mixer type: {self.mixer_type}")
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -287,7 +531,7 @@ class MiniCPMModel(nn.Module):
         return hidden_states
 
 
-class MiniCPMForCausalLM(nn.Module):
+class MiniCPMSALAForCausalLM(nn.Module):
     def __init__(
         self,
         config,
@@ -396,4 +640,8 @@ class MiniCPMForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = MiniCPMForCausalLM
+class MiniCPMForCausalLM(MiniCPMSALAForCausalLM):
+    """Alias for MiniCPM checkpoints whose config uses the HF architecture name."""
+
+
+EntryClass = [MiniCPMSALAForCausalLM, MiniCPMForCausalLM]

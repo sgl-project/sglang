@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    linear_attn_model_spec,
+    mambaish_config,
+)
+from sglang.srt.configs.linear_attn_model_registry import import_backend_class
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
@@ -578,6 +583,16 @@ class KVCacheConfigurator:
                     extra_max_context_len=extra_max_context_len,
                     pre_alloc_size=pre_alloc_size,
                 )
+        elif (
+            spec := linear_attn_model_spec(self.model_config)
+        ) is not None and spec.req_to_token_pool_factory_name is not None:
+            factory = import_backend_class(spec.req_to_token_pool_factory_name)
+            req_to_token_pool = factory(
+                configurator=self,
+                size=max_num_reqs,
+                max_context_len=(self.model_config.context_len + extra_max_context_len),
+                enable_memory_saver=self.server_args.enable_memory_saver,
+            )
         elif self.mambaish_config:
             req_to_token_pool = self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,

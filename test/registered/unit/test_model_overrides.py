@@ -72,6 +72,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "moe_dense_tp_size",
                     "attn_cp_size",
                     "disable_overlap_schedule",
+                    "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "speculative_moe_runner_backend",
@@ -278,6 +279,43 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         "qk_rope_head_dim": 8,
         "v_head_dim": 16,
     }
+
+    @staticmethod
+    def _minicpm_overrides(architecture, *, force_dense=False, attention_backend=None):
+        args = SimpleNamespace(
+            minicpm_force_dense=force_dense,
+            attention_backend=attention_backend,
+        )
+        declarations = collect_model_override_declarations(
+            architecture, args, hf_config=SimpleNamespace()
+        )
+        return {
+            field: value
+            for _, declaration in declarations
+            for field, value in declaration.items()
+        }
+
+    def test_minicpm_requires_radix_cache_disabled(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                self.assertTrue(
+                    self._minicpm_overrides(architecture)["disable_radix_cache"]
+                )
+
+    def test_minicpm_force_dense_uses_stock_attention_backend(self):
+        for backend, expected in (
+            ("minicpm_flashattn", "fa3"),
+            ("minicpm_flashinfer", "flashinfer"),
+        ):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        force_dense=True,
+                        attention_backend=backend,
+                    )["attention_backend"],
+                    expected,
+                )
 
     def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs
