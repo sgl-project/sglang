@@ -44,6 +44,10 @@ _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
+_GRAMMAR_ACCEPT = (
+    "managers/scheduler_components/batch_result_processor.py",
+    "SchedulerBatchResultProcessor._accept_spec_v2_grammar_tokens",
+)
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
@@ -64,6 +68,9 @@ _OWNER_SITES = {
     # pre-claim in prepare_for_decode, unlike the EAGLE mixin).
     (*_RESOLVE, "kv_committed_len"): 3,
     (*_RESOLVE, "spec_verify_ct"): 1,
+    # Spec grammar trim rolls back KV slots for tokens dropped after grammar
+    # completion; resolve already committed the full accepted list.
+    (*_GRAMMAR_ACCEPT, "kv_committed_len"): 1,
     (
         "speculative/dflash_info_v2.py",
         "DFlashDraftInputV2.prepare_for_decode",
@@ -154,7 +161,7 @@ def _scan_srt():
 
 
 def _draft_worker_classes():
-    """All transitive BaseDraftWorker subclasses under speculative/."""
+    """All transitive EagleDraftWorkerBase subclasses under speculative/."""
     by_name = {}
     for path in sorted(_SPECULATIVE_DIR.glob("*.py")):
         rel = path.relative_to(_SRT_DIR).as_posix()
@@ -166,7 +173,7 @@ def _draft_worker_classes():
                 }
                 by_name[node.name] = (rel, node, bases)
 
-    workers = {"BaseDraftWorker"}
+    workers = {"EagleDraftWorkerBase"}
     changed = True
     while changed:
         changed = False
@@ -177,7 +184,7 @@ def _draft_worker_classes():
     return [
         (rel, node)
         for name, (rel, node, _) in sorted(by_name.items())
-        if name in workers and name != "BaseDraftWorker"
+        if name in workers and name != "EagleDraftWorkerBase"
     ]
 
 

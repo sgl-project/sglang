@@ -28,6 +28,7 @@ try:
 except:
     pass
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -72,6 +73,9 @@ if _is_cuda or _is_musa:
 
     from sglang.jit_kernel.per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+    )
+    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+        per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
 
 if _is_hip:
@@ -460,17 +464,29 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_ue8m0: bool,
 ):
     if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
-        # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
-            device=device,
-            dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
+        if column_major_scales and scale_tma_aligned:
+            *x_batch, x_q_mn, x_q_k = x_shape
+            x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+            aligned_mn = ceil_align(x_s_mn, 4)
+            aligned_k = ceil_align(x_s_k, 4)
+            # TODO(FIXME): Fix cuda kernel and recover here to empty.
+            return torch.empty(
+                (*x_batch, aligned_k // 4, aligned_mn),
+                device=device,
+                dtype=torch.int,
+            ).transpose(-1, -2)[..., :x_s_mn, :]
+        else:
+            assert not column_major_scales, (
+                "column_major_scales requires scale_tma_aligned=True "
+                "when scale_ue8m0 is enabled"
+            )
+            # Row-major UE8M0 keeps the scale as float32 power-of-two values,
+            # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
+            return torch.empty(
+                x_shape[:-1] + (x_shape[-1] // group_size,),
+                device=device,
+                dtype=torch.float32,
+            )
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -531,7 +547,10 @@ def sglang_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            if enable_v2:
+            if enable_v2 and _is_musa:
+                # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
+                # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
+                # carries the USE_MUSA vector load/store fallbacks.
                 sgl_per_token_group_quant_8bit(
                     x,
                     x_q,
@@ -544,6 +563,19 @@ def sglang_per_token_group_quant_fp8(
                     fuse_silu_and_mul,
                     masked_m,
                     enable_v2=True,
+                )
+            elif enable_v2:
+                sgl_per_token_group_quant_8bit_jit_v2(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0=scale_ue8m0,
+                    fuse_silu_and_mul=fuse_silu_and_mul,
+                    masked_m=masked_m,
                 )
             else:
                 sgl_per_token_group_quant_8bit_jit(
@@ -748,6 +780,7 @@ def _static_quant_fp8(
     # Meta-parameters
     BLOCK: tl.constexpr,
     REPEAT_SCALE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform quantization using the given scale on a
     tensor
@@ -764,8 +797,15 @@ def _static_quant_fp8(
     cols = tl.arange(0, BLOCK)  # N <= BLOCK
     mask = cols < N
 
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y_s = tl.load(y_s_ptr).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     y_s_inv = 1.0 / y_s
     y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -812,6 +852,7 @@ def static_quant_fp8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _static_quant_fp8[(M,)](
         x,
         x_q,
@@ -825,6 +866,7 @@ def static_quant_fp8(
         REPEAT_SCALE=repeat_scale,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s
@@ -1136,7 +1178,9 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
-            if cfg["BLOCK_SIZE_K"] < block_k:
+            if cfg["BLOCK_SIZE_K"] < block_k and (
+                not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
+            ):
                 clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
                 cfg = {**cfg, "BLOCK_SIZE_K": block_k}
             sanitized[m_key] = cfg

@@ -238,7 +238,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -262,7 +262,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
         # draft KV is materialized from target hidden states, so there is no
-        # BaseDraftWorker draft/draft_extend split to wrap it in.
+        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property
@@ -620,17 +620,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
-        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        if not hasattr(lm_head, "shard_indices"):
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(hs, weight.T)
+                out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+            return out_tokens
+
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
         #   base vocab:  [0, num_org)
@@ -640,14 +650,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
-
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
-
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         def _ensure_local_reduce_buffers(
             chunk_len: int,
@@ -1524,7 +1526,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup

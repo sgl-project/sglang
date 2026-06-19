@@ -687,6 +687,8 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+            self.host_mem_release_queue.queue.clear()
+            self.prefetch_tokens_occupied = 0
 
         self.stop_event.clear()
         self.storage_stop_event.clear()
@@ -724,9 +726,17 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            host_indices, device_indices = op.host_indices, op.device_indices
+        else:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
         self.write_queue.clear()
 
         start_event = device_module.Event()
