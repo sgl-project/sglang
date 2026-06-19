@@ -259,10 +259,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        # Attention backend
+        # Attention backend; the static metadata buffers were already
+        # allocated by ModelRunner.init_backends at the EagerRunner's
+        # union-max sizing (≥ any captured bucket).
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.attn_backend.init_static_metadata_buffers(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -375,8 +376,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
-            for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_static_metadata_buffers(self.max_bs, self.max_num_token)
+            # Static metadata buffers for every backend in the group were
+            # allocated by ModelRunner._init_static_metadata_buffers_from_eager
+            # before this runner was built.
 
     def _cache_loc_dtype(self):
         return torch.int64

@@ -908,6 +908,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch.
         self.eager_runner = EagerRunner(self)
 
+        # Allocate the attention backend's static metadata buffers at the union
+        # max sized by EagerRunner (max_running_requests-aligned, ≥ any captured
+        # cg bucket). Both eager (graph-disabled mode AND eager fallback at
+        # non-captured bs) and the cuda-graph runners then share the same
+        # backend buffers — backends bind into them, and load_metadata refills
+        # per-iter. This is the foundation for collapsing the `use_bound` seam.
+        self._init_static_metadata_buffers_from_eager()
+
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
@@ -934,6 +942,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _init_static_metadata_buffers_from_eager(self) -> None:
+        """Allocate the attention backend's static metadata buffers at the
+        EagerRunner's union-max sizing, so both the eager path and the
+        cuda-graph runners' captured buckets share one bound buffer set.
+
+        Sized at ``(eager_max_bs, eager_max_num_token)`` — EagerRunner sizes
+        these to ``max_running_requests`` (plus MLP-sync padding when
+        applicable), the worker's true ceiling. Every captured cg bucket is
+        ≤ this ceiling, so a single fixed-max allocation covers both paths.
+
+        Also initializes each ``decode_attn_backend_group[i]`` for pdmux (its
+        backends are separate instances from ``attn_backend``).
+        """
+        eager_max_bs = self.eager_runner._eager_max_bs
+        eager_max_num_token = self.eager_runner._eager_max_num_token
+        self.attn_backend.init_static_metadata_buffers(
+            eager_max_bs, eager_max_num_token
+        )
+        for ab in self.decode_attn_backend_group:
+            if ab is not self.attn_backend:
+                ab.init_static_metadata_buffers(eager_max_bs, eager_max_num_token)
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
