@@ -10,6 +10,7 @@
 
 mod common;
 
+mod cache_aware_input_ids;
 mod chat_routing;
 mod failover;
 mod graceful_shutdown;

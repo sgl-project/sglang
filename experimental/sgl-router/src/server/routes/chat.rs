@@ -130,6 +130,32 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+
+    // Parse the body into a JSON value once, here at ingress — but only when
+    // the policy actually consumes tokens (cache-aware). For load-only
+    // policies `parse_probe`'s minimal probe is enough, so they keep avoiding
+    // the full `serde_json::Value` allocation over a (up to 1 MiB) body. When
+    // parsed, this single value is reused for both the routing tokenization and
+    // the outgoing-body injection below (no re-parse inside the policy, and PD
+    // bootstrap injection reuses it too). `parse_probe` already validated the
+    // object shape.
+    let request_value: Option<serde_json::Value> = if policy.needs_request_tokens() {
+        Some(serde_json::from_slice(&body).map_err(|_| {
+            ApiError::BadRequest("invalid request: body must be a JSON object".into())
+        })?)
+    } else {
+        None
+    };
+
+    // Tokenize once at ingress (only the cache-aware policy reaches this; its
+    // `needs_request_tokens()` gated the parse above). The ids feed both the
+    // routing decision (below) and — when engine-equivalent — the engine
+    // itself, forwarded as `input_ids` so it skips re-tokenizing the same
+    // prompt.
+    let request_tokens = request_value
+        .as_ref()
+        .and_then(|v| policy.request_tokens(&model_id, v));
+
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
@@ -142,7 +168,8 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key);
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -222,7 +249,14 @@ pub async fn chat_completions(
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
     let guard = worker.load_guard();
-    let prefill_load = estimate_prefill_tokens(&body);
+    // Use the exact token count from the ingress tokenization when available;
+    // fall back to the byte-count heuristic for load-only policies that don't
+    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
+    // accurate rather than off by the char/token ratio.
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|t| t.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -268,6 +302,38 @@ pub async fn chat_completions(
         start,
     };
 
+    // Forward the router-computed tokens to the engine as `input_ids` so it
+    // skips re-tokenizing the same prompt — but only when they are
+    // engine-equivalent (chat-encoder path) AND the request contains nothing
+    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
+    // Otherwise omit them and the engine tokenizes from `messages` as usual —
+    // a transparent, always-correct fallback (`messages` are always retained
+    // in the forwarded body). `forward_input_ids` is `Some` only when
+    // `request_value` is `Some` (the cache-aware path), so the predicate
+    // always has a parsed body to inspect.
+    let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
+    {
+        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
+            Some(t.ids.as_slice())
+        }
+        _ => None,
+    };
+
+    // PD-disagg bootstrap fields (prefill worker address + a per-request
+    // room). Present only when a decode peer was resolved.
+    let bootstrap = decode_peer.as_ref().map(|_| BootstrapFields {
+        host: worker.bootstrap_host().to_string(),
+        port: worker.bootstrap_port(),
+        room: generate_room_id(),
+    });
+    let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
+
+    // Build the body forwarded to the engine(s) exactly once — injecting the
+    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
+    // untouched when neither applies.
+    let outgoing_body =
+        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
         //
@@ -305,18 +371,12 @@ pub async fn chat_completions(
         // `JoinSet` through `AppContext` for graceful shutdown drain;
         // the current implementation ships without one (matching SMG's
         // shutdown behaviour).
-        let bootstrap_room = generate_room_id();
-        let injected_body = inject_bootstrap_fields(
-            &body,
-            worker.bootstrap_host(),
-            worker.bootstrap_port(),
-            bootstrap_room,
-        )?;
+        let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
         let prefill_headers = headers.clone();
-        let prefill_body = injected_body.clone();
+        let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
         let prefill_holds: (LoadGuard, _) = (guard, active_guard);
         tokio::spawn(async move {
@@ -364,7 +424,7 @@ pub async fn chat_completions(
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
-                injected_body,
+                outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
             );
@@ -380,7 +440,7 @@ pub async fn chat_completions(
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
-                injected_body,
+                outgoing_body,
             );
             tokio::select! {
                 biased;
@@ -399,7 +459,7 @@ pub async fn chat_completions(
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
-            body,
+            outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
         );
@@ -427,7 +487,7 @@ pub async fn chat_completions(
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
-            body,
+            outgoing_body,
         );
         // Same `biased` order as the streaming arm.
         tokio::select! {
@@ -563,54 +623,195 @@ fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
-/// Inject the three flat top-level fields SGLang's HTTP disagg-prefill
-/// validator requires:
+/// PD-disagg bootstrap fields injected into the body forwarded to both the
+/// prefill and decode workers. SGLang's HTTP disagg-prefill validator
+/// requires all three as flat top-level fields:
 ///
-/// * `bootstrap_host` — the prefill worker's hostname; decode connects
-///   to this address for the KV transfer.
-/// * `bootstrap_port` — the prefill worker's bootstrap server port
-///   (may be `null` if the worker is misconfigured; the engine will
-///   reject the request with a clear error).
-/// * `bootstrap_room` — a 63-bit random `u64` identifying this request
-///   on both prefill and decode sides.
+/// * `host` → `bootstrap_host` — the prefill worker's hostname; decode
+///   connects here for the KV transfer.
+/// * `port` → `bootstrap_port` — the prefill worker's bootstrap-server port
+///   (`null` when the worker is misconfigured; the engine rejects with a
+///   clear error). Emitted as JSON `null`, not omitted — SGLang's validator
+///   distinguishes missing from null.
+/// * `room` → `bootstrap_room` — a per-request 63-bit `u64` identifying this
+///   request on both prefill and decode sides.
+struct BootstrapFields {
+    host: String,
+    port: Option<u16>,
+    room: u64,
+}
+
+/// Build the body forwarded to the engine, injecting (when present) the
+/// precomputed `input_ids` and/or the PD `bootstrap_*` fields into the
+/// already-parsed request object and serializing once. When neither is
+/// needed, returns the original bytes unchanged (no re-serialize).
 ///
-/// The body must already be a JSON object (the chat handler's
-/// `parse_probe` guarantees this); we re-parse into a `Map` here to
-/// mutate top-level keys without walking nested values into a full
-/// `serde_json::Value`. A malformed body is mapped to
-/// `ApiError::BadRequest` — the parse_probe layer should already have
-/// caught this, but defending against TOCTOU keeps the error path
-/// honest.
-fn inject_bootstrap_fields(
+/// `input_ids`: the router-computed prompt tokens. When set, the engine skips
+/// its own chat-template tokenization; `messages` are retained in the body so
+/// the engine still derives stop tokens / tool-call constraint and the OpenAI
+/// response shape. The caller sets this only when the tokens are
+/// engine-equivalent and `input_ids_safe_to_forward` held.
+///
+/// `value` is the already-parsed request body when one is on hand (the
+/// cache-aware path parses once at ingress); it is consumed so the mutation
+/// reuses that parse. It is `None` only for a load-only policy in PD mode — a
+/// path that never parses at ingress — so the bootstrap injection re-parses
+/// the bytes here (matching the pre-refactor behavior). The body shape was
+/// validated by `parse_probe`; the non-object arm defends against a TOCTOU
+/// regression rather than panicking.
+fn build_outgoing_body(
     body: &Bytes,
-    bootstrap_host: &str,
-    bootstrap_port: Option<u16>,
-    bootstrap_room: u64,
+    value: Option<serde_json::Value>,
+    input_ids: Option<&[u32]>,
+    bootstrap: Option<&BootstrapFields>,
 ) -> Result<Bytes, ApiError> {
-    let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body)
-        .map_err(|e| {
-            tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
+    if input_ids.is_none() && bootstrap.is_none() {
+        // Nothing to inject — forward the original bytes (cheap Arc clone).
+        return Ok(body.clone());
+    }
+    let parsed = match value {
+        Some(v) => v,
+        // Load-only + PD: the ingress skipped the parse, so re-parse for the
+        // bootstrap injection (input_ids is never set on this path).
+        None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-        })?;
-    obj.insert(
-        "bootstrap_host".to_string(),
-        serde_json::Value::String(bootstrap_host.to_string()),
-    );
-    obj.insert(
-        "bootstrap_port".to_string(),
-        match bootstrap_port {
-            Some(p) => serde_json::Value::Number(p.into()),
-            None => serde_json::Value::Null,
-        },
-    );
-    obj.insert(
-        "bootstrap_room".to_string(),
-        serde_json::Value::Number(bootstrap_room.into()),
-    );
+        })?,
+    };
+    let mut obj = match parsed {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "invalid request: body must be a JSON object".to_string(),
+            ))
+        }
+    };
+    if let Some(ids) = input_ids {
+        obj.insert(
+            "input_ids".to_string(),
+            serde_json::Value::Array(
+                ids.iter()
+                    .map(|&i| serde_json::Value::Number(i.into()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(b) = bootstrap {
+        obj.insert(
+            "bootstrap_host".to_string(),
+            serde_json::Value::String(b.host.clone()),
+        );
+        obj.insert(
+            "bootstrap_port".to_string(),
+            match b.port {
+                Some(p) => serde_json::Value::Number(p.into()),
+                None => serde_json::Value::Null,
+            },
+        );
+        obj.insert(
+            "bootstrap_room".to_string(),
+            serde_json::Value::Number(b.room.into()),
+        );
+    }
     let bytes = serde_json::to_vec(&obj).map_err(|e| {
-        ApiError::Internal(anyhow::Error::new(e).context("re-serialize bootstrap-injected body"))
+        ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
     Ok(Bytes::from(bytes))
+}
+
+/// Whether the router's `input_ids` may be forwarded for this request.
+///
+/// We forward only when the engine, fed `input_ids`, would have produced the
+/// SAME prompt the router tokenized. When `input_ids` is present the engine
+/// uses it verbatim and ignores everything that would otherwise steer its
+/// `messages`-side tokenization (only stop tokens / tool-call constraint are
+/// still taken from `messages`). So any request field that changes that
+/// tokenization but which the router's chat encoder does not replicate makes
+/// the forwarded ids wrong. This predicate is conservative by construction —
+/// any such signal returns `false` and the engine tokenizes from `messages`
+/// (always correct).
+///
+/// Replicated-and-safe: plain text `messages` with a string `content`.
+/// Not replicated → omit:
+///   * `tools` / `functions` — the encoder doesn't render tool schemas.
+///   * multimodal (array) `content` — a text tokenizer can't represent images.
+///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
+///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
+///     encoder renders in the engine's default mode only.
+///   * `continue_final_message: true`, or a trailing `assistant` message — the
+///     engine rewrites/strips the final assistant turn; the encoder renders it
+///     verbatim.
+///
+/// NOTE: the router's chat encoder renders in the engine's default
+/// (non-thinking) mode. Current sglang derives thinking from the request
+/// (`chat_template_kwargs`), which this guard already omits, so a plain request
+/// the router rendered matches the engine. The only way to diverge is an engine
+/// build that applies a non-default thinking mode the router can't observe from
+/// the request — the same router↔engine tokenization-parity assumption that
+/// cache-aware routing already depends on.
+fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
+    if request_has_tools(value) || request_is_multimodal(value) {
+        return false;
+    }
+    // Fields that steer the engine's template tokenization but which the
+    // router's encoder does not thread through.
+    for key in [
+        "chat_template_kwargs",
+        "reasoning",
+        "reasoning_effort",
+        "task",
+    ] {
+        if value.get(key).is_some_and(|v| !v.is_null()) {
+            return false;
+        }
+    }
+    if value
+        .get("continue_final_message")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return false;
+    }
+    !last_message_is_assistant(value)
+}
+
+/// Whether the final chat message has `role: "assistant"` (a prefix /
+/// continuation turn the engine's template path special-cases).
+fn last_message_is_assistant(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| msgs.last())
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("assistant")
+}
+
+/// Whether the request carries tool / function definitions. The router's chat
+/// encoder renders only `messages`, so its `input_ids` would omit the tool
+/// schemas the engine's template injects into the prompt — the caller must let
+/// the engine tokenize these itself.
+fn request_has_tools(value: &serde_json::Value) -> bool {
+    let nonempty = |key: &str| {
+        value.get(key).is_some_and(|v| match v {
+            serde_json::Value::Array(a) => !a.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        })
+    };
+    nonempty("tools") || nonempty("functions")
+}
+
+/// Whether any message carries non-string (array / multimodal) content. A text
+/// tokenizer cannot represent image content, so the router's `input_ids` would
+/// drop it — the caller must let the engine handle these requests.
+fn request_is_multimodal(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
+        })
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
@@ -666,9 +867,15 @@ mod tests {
     /// SGLang's validator distinguishes "missing field" from
     /// "null field" in some code paths.
     #[test]
-    fn inject_bootstrap_fields_emits_null_for_missing_port() {
+    fn build_outgoing_body_emits_null_for_missing_port() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let injected = inject_bootstrap_fields(&body, "host", None, 42).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let bootstrap = BootstrapFields {
+            host: "host".into(),
+            port: None,
+            room: 42,
+        };
+        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -679,6 +886,151 @@ mod tests {
             parsed.get("bootstrap_room"),
             Some(&serde_json::Value::Number(42.into()))
         );
+    }
+
+    /// `input_ids` are injected and `messages` retained (the engine still
+    /// needs them for stop tokens / tool-call constraint / response shape).
+    #[test]
+    fn build_outgoing_body_injects_input_ids_and_keeps_messages() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [1u32, 2, 3];
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
+        assert!(
+            parsed.get("messages").is_some(),
+            "messages must be retained alongside input_ids"
+        );
+    }
+
+    /// With nothing to inject, the original bytes are forwarded unchanged
+    /// (no re-serialize) — the transparent no-op fallback.
+    #[test]
+    fn build_outgoing_body_no_injection_returns_original_bytes() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        assert_eq!(
+            out, body,
+            "no injection must forward the original bytes unchanged"
+        );
+    }
+
+    /// PD + forwarding: both `input_ids` and the bootstrap fields land in one
+    /// serialized body.
+    #[test]
+    fn build_outgoing_body_injects_both_input_ids_and_bootstrap() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [7u32, 8];
+        let bootstrap = BootstrapFields {
+            host: "h".into(),
+            port: Some(9),
+            room: 5,
+        };
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
+        assert_eq!(
+            parsed.get("bootstrap_room"),
+            Some(&serde_json::Value::Number(5.into()))
+        );
+        assert_eq!(
+            parsed.get("bootstrap_port"),
+            Some(&serde_json::Value::Number(9.into()))
+        );
+    }
+
+    /// Tool / function requests are detected so the caller omits `input_ids`
+    /// (the router's encoder doesn't render tools).
+    #[test]
+    fn request_has_tools_detects_tools_and_functions() {
+        assert!(request_has_tools(
+            &serde_json::json!({"tools":[{"type":"function"}]})
+        ));
+        assert!(request_has_tools(
+            &serde_json::json!({"functions":[{"name":"f"}]})
+        ));
+        assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
+        assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+    }
+
+    /// Array (multimodal) message content is detected so the caller omits
+    /// `input_ids` (a text tokenizer can't represent image content).
+    #[test]
+    fn request_is_multimodal_detects_array_content() {
+        assert!(request_is_multimodal(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]
+        })));
+        assert!(!request_is_multimodal(&serde_json::json!({
+            "messages":[{"role":"user","content":"hello"}]
+        })));
+    }
+
+    /// Plain text chat with nothing unreplicated → input_ids may be forwarded.
+    #[test]
+    fn input_ids_safe_to_forward_allows_plain_text_chat() {
+        assert!(input_ids_safe_to_forward(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        })));
+    }
+
+    /// Every field the engine honors on the `messages` path but which the
+    /// router's encoder does not replicate must block forwarding — otherwise
+    /// the engine uses the router's ids verbatim and silently runs a different
+    /// prompt than the request asked for.
+    #[test]
+    fn input_ids_safe_to_forward_blocks_unreplicated_signals() {
+        let blockers = [
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+        ];
+        for b in blockers {
+            assert!(
+                !input_ids_safe_to_forward(&b),
+                "must NOT forward input_ids for: {b}"
+            );
+        }
+    }
+
+    /// Null / false-valued fields do not block (absent ≡ null ≡ default).
+    #[test]
+    fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
+        assert!(input_ids_safe_to_forward(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": null,
+            "chat_template_kwargs": null,
+            "continue_final_message": false
+        })));
+    }
+
+    /// Load-only + PD: `build_outgoing_body` is handed `None` for the value
+    /// (the ingress skipped the parse for a load-only policy) and re-parses the
+    /// bytes to inject the bootstrap fields. `input_ids` is never set here.
+    #[test]
+    fn build_outgoing_body_reparses_when_value_absent() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let bootstrap = BootstrapFields {
+            host: "h".into(),
+            port: Some(1),
+            room: 2,
+        };
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("bootstrap_room"),
+            Some(&serde_json::Value::Number(2.into()))
+        );
+        assert!(parsed.get("input_ids").is_none());
     }
 
     #[test]
