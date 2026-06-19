@@ -240,10 +240,18 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_NVTX"
+    )
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
+    )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -467,10 +475,15 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
+    SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
+    # Number of decode steps between periodic mx.clear_cache() calls.
+    # Set to 0 to disable cache clearing entirely.
+    SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -628,6 +641,15 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
+    # Saves the per-step draft forward, but the draft KV goes stale: an upshift
+    # back to steps>0 starts from a cold draft state (low accept until it recovers).
+    SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
+    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # extend_attention_fwd for unsupported cases or when set false (e.g. for
+    # debugging). Correctness is unaffected; this only changes performance.
+    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -693,9 +715,6 @@ class Envs:
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
 
-    # HTTP/2 Server
-    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
-
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
@@ -721,6 +740,7 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
+    SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
@@ -764,12 +784,15 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
@@ -866,6 +889,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
@@ -1004,7 +1028,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:

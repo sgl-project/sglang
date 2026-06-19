@@ -49,7 +49,7 @@ class DFlashVerifyInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
-    def prepare_for_v2_verify(
+    def prepare_for_verify(
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
@@ -73,12 +73,12 @@ class DFlashVerifyInput(SpecInput):
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
         elif not batch.forward_mode.is_idle():

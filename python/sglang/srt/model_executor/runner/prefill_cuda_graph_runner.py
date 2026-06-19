@@ -19,7 +19,7 @@ Backend selection comes from cuda_graph_config.prefill:
                       torch.compile's internal cache. Multi-batch supported.
   - "breakable" — BreakableCudaGraphBackend: segmented capture (no
                       torch.compile). Captures with bs=1; rejects multi-req
-                      prefill in can_run.
+                      prefill in can_run_graph.
   - "full"      — rejected at config validation; not supported for prefill.
   - "disabled"  — handled at the model_runner level — runner not
                       constructed.
@@ -263,9 +263,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
 
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
     def _is_mamba_track_enabled(self) -> bool:
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -423,10 +420,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    # -----------------------------------------------------------------
-    # can_run
-    # -----------------------------------------------------------------
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -457,7 +451,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: replay_prepare bucket-pads
+        # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
@@ -468,9 +462,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly on top with live multi-req metadata.
         return True
 
-    # -----------------------------------------------------------------
-    # capture_prepare
-    # -----------------------------------------------------------------
     def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
@@ -595,9 +586,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
-    # -----------------------------------------------------------------
-    # capture
-    # -----------------------------------------------------------------
     def capture(self) -> None:
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
@@ -628,9 +616,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.capture_one_shape(num_tokens)
 
-    # -----------------------------------------------------------------
-    # capture_one_shape
-    # -----------------------------------------------------------------
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
@@ -663,10 +648,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    # -----------------------------------------------------------------
-    # replay_prepare
-    # -----------------------------------------------------------------
-    def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
+    def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
@@ -800,14 +782,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    # -----------------------------------------------------------------
-    # replay
-    # -----------------------------------------------------------------
-    def replay(
+    def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 

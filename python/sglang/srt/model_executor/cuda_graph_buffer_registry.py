@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
@@ -786,7 +799,7 @@ def build_prefill_registry(
     carried from the batch (a read input) rather than written in-graph.
 
     Padding policies match the inline copy/zero in
-    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
     / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
     padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
     tokens *are* processed by the graph, so they must be benign), then the head
