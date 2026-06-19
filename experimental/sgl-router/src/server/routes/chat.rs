@@ -39,21 +39,21 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Per-route body-size cap on `/v1/chat/completions`. 1 MiB is comfortable
-/// for normal chat traffic (a 200 k-token context tokenized as JSON is well
-/// under this) while preventing a hostile client from forcing the router to
+/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
+/// long context — a ~1 M-token context tokenized as JSON fits under this —
+/// while preventing a hostile client from forcing the router to
 /// heap-allocate hundreds of MiB before forwarding. The cap is wired in
 /// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
 /// layer; axum's `Bytes` extractor enforces it and returns 413
 /// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 1 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
 /// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
 /// does two things:
 ///
-/// 1. Avoids the per-field heap allocation of `Value` for a 1 MiB body.
+/// 1. Avoids the per-field heap allocation of `Value` for a multi-MiB body.
 /// 2. Pins the contract: the body MUST be a JSON object. Degenerate
 ///    shapes (`null`, `[]`, `"hi"`) fail at this step rather than being
 ///    silently forwarded with `stream=false`.

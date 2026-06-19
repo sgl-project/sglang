@@ -45,13 +45,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Chosen to
-/// span 0 → ~1k blocks: blocks are 32–64 tokens each, and our `MAX_CHAT_BODY_BYTES`
-/// cap (1 MiB ≈ 250 k tokens) implies an upper bound around 4–8 k blocks for
-/// a maximum-length context. The `+Inf` bucket catches everything beyond
-/// 1000.
+/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
+/// 32–64 tokens each, and the `MAX_CHAT_BODY_BYTES` cap bounds context length —
+/// putting the practical ceiling for a maximum-length context in the low tens
+/// of thousands of blocks. The ladder spans 0 → ~8k blocks at the resolution
+/// worth charting; the `+Inf` bucket catches the longer-context tail beyond
+/// 8000.
 const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
-    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0,
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
 ];
 
 /// Histogram bucket upper bounds (seconds) for
@@ -1056,11 +1057,11 @@ mod tests {
     #[test]
     fn histogram_plus_inf_bucket_catches_overflow() {
         let reg = MetricsRegistry::new();
-        // 1001 is just above the last finite bucket (1000); it should land
+        // 8001 is just above the last finite bucket (8000); it should land
         // in +Inf only.
-        reg.observe_overlap_blocks("m", 1001);
+        reg.observe_overlap_blocks("m", 8001);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="1000"} 0"#));
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="8000"} 0"#));
         assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
     }
 }
