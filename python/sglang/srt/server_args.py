@@ -2332,9 +2332,9 @@ class ServerArgs:
                     )
                 elif is_sm120_supported() and is_mxfp4_quant_format:
                     # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "triton_kernel"
+                    self.moe_runner_backend = "marlin"
                     logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
