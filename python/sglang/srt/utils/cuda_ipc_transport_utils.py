@@ -119,9 +119,9 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval, gpu_device_index):
+    def __init__(self, memory_size, recycle_interval, base_gpu_id):
         self.memory_pool = torch.empty(
-            memory_size, dtype=torch.int8, device=f"cuda:{gpu_device_index}"
+            memory_size, dtype=torch.int8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
