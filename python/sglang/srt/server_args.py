@@ -2007,7 +2007,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1

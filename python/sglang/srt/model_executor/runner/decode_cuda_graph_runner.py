@@ -182,6 +182,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk_size: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers as a namespace adopted by
     ``build_decode_registry(source=...)``."""
@@ -219,6 +220,10 @@ def _allocate_decode_buffers(
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (max_bs, hidden_size), dtype=dtype
+                )
+            if pp_proxy_topk_size is not None:
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (max_num_token, pp_proxy_topk_size), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -450,6 +455,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
