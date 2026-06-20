@@ -434,14 +434,44 @@ impl<K: ChildKeyType> TreeNode<K> {
     /// (empty key) trivially returns 0 — making it unrepresentable removes a
     /// degenerate code path and a category of nonsense calls from callers.
     pub fn match_key(&self, key: &[K::Atom], page_size: PageSize) -> usize {
-        let count = self
-            .key
-            .iter()
-            .zip(key.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
         let ps = page_size.get();
-        count / ps * ps
+        let max_pages = self.key.len().min(key.len()) / ps;
+        if max_pages == 0 {
+            return 0;
+        }
+
+        // Compare page-aligned chunks instead of counting token-by-token. Long
+        // context cache hits are usually full-node matches; slice equality lets
+        // LLVM/libcore use the optimized monomorphic comparison path for the
+        // concrete atom type while preserving the same page-rounded result.
+        let mut matched_pages = 0usize;
+        let mut step_pages = 1usize;
+        while matched_pages < max_pages {
+            let hi_pages = matched_pages.saturating_add(step_pages).min(max_pages);
+            let start = matched_pages * ps;
+            let end = hi_pages * ps;
+            if self.key[start..end] == key[start..end] {
+                matched_pages = hi_pages;
+                step_pages = step_pages.saturating_mul(2).max(1);
+                continue;
+            }
+
+            let mut lo_pages = matched_pages;
+            let mut bad_pages = hi_pages;
+            while bad_pages - lo_pages > 1 {
+                let mid_pages = lo_pages + (bad_pages - lo_pages) / 2;
+                let start = lo_pages * ps;
+                let end = mid_pages * ps;
+                if self.key[start..end] == key[start..end] {
+                    lo_pages = mid_pages;
+                } else {
+                    bad_pages = mid_pages;
+                }
+            }
+            return lo_pages * ps;
+        }
+
+        matched_pages * ps
     }
 }
 
