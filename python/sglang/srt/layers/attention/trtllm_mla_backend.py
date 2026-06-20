@@ -424,7 +424,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
-
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -523,10 +522,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             self.forward_prefill_metadata = None
 
+        # Pre-refactor's fresh-build path set max_seq_len_k from the LIVE batch
+        # (seq_lens_cpu.max()); the converged path needs the same for normal
+        # decode so long-context models don't pay max_context_len kernel
+        # scheduling cost on short requests. (Spec branches set their own
+        # max_seq_len_k below — captured replays don't care since max_seq_len_k
+        # is a host-side int, not a graph-captured pointer.)
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            live_max_seq_len_k = int(seq_lens_cpu[:bs].max().item())
+        else:
+            live_max_seq_len_k = int(seq_lens[:bs].max().item())
+        metadata.max_seq_len_k = live_max_seq_len_k
+
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k[:bs].copy_(seq_lens.to(dtype=torch.int32))
-            metadata.max_seq_len_k = self.max_context_len
+            # Spec target verify reserves draft tokens past the live max.
+            metadata.max_seq_len_k = live_max_seq_len_k + self.num_draft_tokens
         elif forward_mode.is_draft_extend_v2():
             if bs in self._draft_extend_v2_captured_bs:
                 # Captured/replay layout: fixed num_draft_tokens per req.
@@ -561,7 +574,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
                 )
             metadata.seq_lens_k[:bs].copy_(seq_lens.to(torch.int32))
-            metadata.max_seq_len_k = self.max_context_len
+            # max_seq_len_k was already set to live max above; keep it as-is.
+            # (Pre-refactor's fresh build did not bump max_seq for draft_extend_v2.)
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[
