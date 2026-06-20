@@ -404,6 +404,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return bs in self.decode_cuda_graph_metadata
         return False
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Eager entry point. FlashInferMLAAttnBackend (our parent) ships its
+        own init_forward_metadata that only handles its own DecodeMetadata /
+        PrefillMetadata wrappers -- it never sets self.forward_decode_metadata
+        / forward_batch.decode_trtllm_mla_metadata, which trtllm_mla's
+        forward_decode / forward_extend read. Bypass the parent's override and
+        route through the base ABC default (out_graph + in_graph) so this
+        backend's init_forward_metadata_out_graph (which calls
+        _compute_decode_metadata for capturable modes and builds the trtllm-MLA
+        prefill metadata for plain extend) runs.
+        """
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
