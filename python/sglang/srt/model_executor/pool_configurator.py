@@ -62,6 +62,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return 4, 4
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return 2, 2
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -103,6 +120,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+
+        # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
+        # Assumes draft and target share the same per-layer KV size (head_dim,
+        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
+        # reuse the target architecture's attention config.
+        if (
+            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        ) and not mr.is_draft_worker:
+            eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
+            if (
+                eagle_draft_num_layers is not None
+                and int(eagle_draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                self._cell_size = int(
+                    self._cell_size
+                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                )
 
         # DFLASH: scale cell_size to account for draft model KV cache
         if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
@@ -330,6 +365,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.online_c128_mtp_max_draft_tokens = (
+            mr.server_args.max_speculative_num_draft_tokens or 0
+        )
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -364,10 +402,30 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # would need rollback / replay across draft and verify, which the
         # online path doesn't support yet.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            assert (
-                mr.spec_algorithm.is_none()
-            ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
-            logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
+            allow_experimental_online_c128_mtp = (
+                envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+                and mr.spec_algorithm.is_eagle()
+            )
+            assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
+                "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
+                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+            )
+            if allow_experimental_online_c128_mtp:
+                assert self.online_c128_mtp_max_draft_tokens > 0, (
+                    "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP requires "
+                    "speculative_num_draft_tokens to be set."
+                )
+                logger.warning(
+                    "DSV4 compressed attention: experimental online c128 + MTP enabled "
+                    f"(EAGLE topk=1 only, "
+                    f"draft_banks={self.online_c128_mtp_max_draft_tokens}). "
+                    "Validate correctness carefully."
+                )
+            else:
+                logger.info(
+                    "DSV4 compressed attention: online c128 enabled (ring_size=1)"
+                )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -378,19 +436,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        state_dtype_size = 4
-        c4_state_bytes = 2 * 2 * attn_head_dim * state_dtype_size
+        c4_state_dtype_size, c128_state_dtype_size = (
+            _get_dsv4_compress_state_dtype_sizes()
+        )
+        c4_state_bytes = 2 * 2 * attn_head_dim * c4_state_dtype_size
         # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
         # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
         # nets a large reduction (~3/256x) but the per-slot bytes go up.
         c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
         c128_state_bytes = (
-            (3 if c128_online else 2 * 1) * attn_head_dim * state_dtype_size
+            (3 if c128_online else 2 * 1) * attn_head_dim * c128_state_dtype_size
         )
-        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * state_dtype_size
+        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         c128_state_ratio = self.c128_ring_size / self.swa_page_size
+        if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (

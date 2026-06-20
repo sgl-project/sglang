@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import copy
 import json
 import logging
 import math
@@ -131,6 +132,29 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
@@ -198,13 +222,18 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-        self.hf_config = get_config(
-            self.model_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            model_override_args=self.model_override_args,
-            model_config_parser=model_config_parser,
-            **kwargs,
+        # get_config() is cached. ModelConfig mutates hf_config for draft-model
+        # remapping and architecture-specific normalization, so each instance
+        # must own an isolated copy.
+        self.hf_config = copy.deepcopy(
+            get_config(
+                self.model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                model_override_args=self.model_override_args,
+                model_config_parser=model_config_parser,
+                **kwargs,
+            )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
@@ -589,27 +618,28 @@ class ModelConfig:
 
     def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
-        self.head_dim = getattr(
-            self.hf_text_config,
-            "head_dim",
-            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
-        )
-        self.v_head_dim = getattr(
-            self.hf_text_config,
-            "v_head_dim",
-            self.head_dim,
-        )
+        self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = (
+                self.hf_text_config.hidden_size
+                // self.hf_text_config.num_attention_heads
+            )
+            setattr(self.hf_text_config, "head_dim", self.head_dim)
 
-        self.swa_head_dim = getattr(
-            self.hf_text_config,
-            "swa_head_dim",
-            self.head_dim,
-        )
-        self.swa_v_head_dim = getattr(
-            self.hf_text_config,
-            "swa_v_head_dim",
-            self.swa_head_dim,
-        )
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        if self.v_head_dim is None:
+            self.v_head_dim = self.head_dim
+            setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
+
+        self.swa_head_dim = getattr(self.hf_text_config, "swa_head_dim", None)
+        if self.swa_head_dim is None:
+            self.swa_head_dim = self.head_dim
+            setattr(self.hf_text_config, "swa_head_dim", self.swa_head_dim)
+
+        self.swa_v_head_dim = getattr(self.hf_text_config, "swa_v_head_dim", None)
+        if self.swa_v_head_dim is None:
+            self.swa_v_head_dim = self.swa_head_dim
+            setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
@@ -674,6 +704,17 @@ class ModelConfig:
                 self.scaling = compute_mla_mscale_scaling(
                     self.hf_config.rope_scaling, self.scaling
                 )
+        elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
+            if self.head_dim is None:
+                self.head_dim = (
+                    self.hf_text_config.hidden_size
+                    // self.hf_text_config.num_attention_heads
+                )
+            if self.swa_head_dim is None:
+                self.swa_head_dim = self.head_dim
+            self.v_head_dim = self.head_dim
+            self.swa_v_head_dim = self.swa_head_dim
+            self.attention_arch = AttentionArch.MHA
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -1109,6 +1150,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "nvfp4_online",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -1153,6 +1195,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "nvfp4_online",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1174,6 +1217,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1534,6 +1578,7 @@ multimodal_model_archs = [
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
+    "MiMoV2ASRForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1665,6 +1710,11 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
     Warns if 'factor' is missing from rope_scaling (common in v5 configs).
     """
+    if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
+        "apply_scale", True
+    ):
+        return base_scaling
+
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(
@@ -1697,6 +1747,13 @@ def is_hybrid_swa_model(
         "LagunaForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
+        # Only treat Laguna as hybrid SWA when it actually has a sliding window.
+        if (
+            "LagunaForCausalLM" in model_architectures
+            and hf_text_config is not None
+            and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
         return True
     # Also recognize models that explicitly opt-in via their HF text config,
     # so custom hybrid-SWA architectures don't need to be added to the allowlist.

@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
@@ -21,7 +22,11 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -48,6 +53,33 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 
 
+class MixedRowParallelLinear(RowParallelLinear):
+    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
+        self.input_sizes = input_sizes
+        super().__init__(sum(input_sizes), output_size, **kwargs)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is not None:
+            shards = []
+            offset = 0
+            for input_size in self.input_sizes:
+                loaded_shard = loaded_weight.narrow(input_dim, offset, input_size)
+                shard_size = input_size // self.tp_size
+                loaded_shard = loaded_shard.narrow(
+                    input_dim, self.tp_rank * shard_size, shard_size
+                )
+                shards.append(loaded_shard)
+                offset += input_size
+            loaded_weight = torch.cat(shards, dim=input_dim)
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        param.data.copy_(loaded_weight)
+
+    def weight_loader_v2(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        self.weight_loader(param, loaded_weight)
+
+
 class MMDoubleStreamBlock(nn.Module):
     """
     A multimodal DiT block with separate modulation for text and image/video,
@@ -68,6 +100,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         self.deterministic = False
         self.num_attention_heads = num_attention_heads
+        tp_size = get_tp_world_size()
+        self.local_num_attention_heads = divide(num_attention_heads, tp_size)
         head_dim = hidden_size // num_attention_heads
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
 
@@ -90,23 +124,24 @@ class MMDoubleStreamBlock(nn.Module):
         self.img_mlp_residual = MulAdd()
 
         # Image attention components
-        self.img_attn_qkv = ReplicatedLinear(
+        self.img_attn_qkv = MergedColumnParallelLinear(
             hidden_size,
-            hidden_size * 3,
+            [hidden_size] * 3,
             bias=True,
+            gather_output=False,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_qkv",
             quant_config=quant_config,
-            output_sizes=[hidden_size] * 3,
         )
 
         self.img_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
         self.img_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
-        self.img_attn_proj = ReplicatedLinear(
+        self.img_attn_proj = RowParallelLinear(
             hidden_size,
             hidden_size,
             bias=True,
+            input_is_parallel=True,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_proj",
             quant_config=quant_config,
@@ -140,24 +175,25 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_mlp_residual = MulAdd()
 
         # Text attention components
-        self.txt_attn_qkv = ReplicatedLinear(
+        self.txt_attn_qkv = MergedColumnParallelLinear(
             hidden_size,
-            hidden_size * 3,
+            [hidden_size] * 3,
             bias=True,
+            gather_output=False,
             params_dtype=dtype,
             prefix=f"{prefix}.txt_attn_qkv",
             quant_config=quant_config,
-            output_sizes=[hidden_size] * 3,
         )
 
         # QK norm layers for text
         self.txt_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
         self.txt_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
-        self.txt_attn_proj = ReplicatedLinear(
+        self.txt_attn_proj = RowParallelLinear(
             hidden_size,
             hidden_size,
             bias=True,
+            input_is_parallel=True,
             params_dtype=dtype,
             prefix=f"{prefix}.txt_attn_proj",
             quant_config=quant_config,
@@ -174,7 +210,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
-            num_heads=num_attention_heads,
+            num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -217,7 +253,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Split QKV
         img_qkv = img_qkv.view(
-            batch_size, image_seq_len, 3, self.num_attention_heads, -1
+            batch_size, image_seq_len, 3, self.local_num_attention_heads, -1
         )
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
@@ -240,7 +276,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Split QKV
         txt_qkv = txt_qkv.view(
-            batch_size, text_seq_len, 3, self.num_attention_heads, -1
+            batch_size, text_seq_len, 3, self.local_num_attention_heads, -1
         )
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
@@ -300,26 +336,31 @@ class MMSingleStreamBlock(nn.Module):
         self.deterministic = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        tp_size = get_tp_world_size()
+        self.local_num_attention_heads = divide(num_attention_heads, tp_size)
         head_dim = hidden_size // num_attention_heads
+        self.head_dim = head_dim
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp_hidden_dim = mlp_hidden_dim
+        self.local_mlp_hidden_dim = divide(mlp_hidden_dim, tp_size)
 
         # Combined QKV and MLP input projection
-        self.linear1 = ReplicatedLinear(
+        self.linear1 = MergedColumnParallelLinear(
             hidden_size,
-            hidden_size * 3 + mlp_hidden_dim,
+            [hidden_size] * 3 + [mlp_hidden_dim],
             bias=True,
+            gather_output=False,
             params_dtype=dtype,
             prefix=f"{prefix}.linear1",
             quant_config=quant_config,
-            output_sizes=[hidden_size] * 3 + [mlp_hidden_dim],
         )
 
         # Combined projection and MLP output
-        self.linear2 = ReplicatedLinear(
-            hidden_size + mlp_hidden_dim,
+        self.linear2 = MixedRowParallelLinear(
+            [hidden_size, mlp_hidden_dim],
             hidden_size,
             bias=True,
+            input_is_parallel=True,
             params_dtype=dtype,
             prefix=f"{prefix}.linear2",
             quant_config=quant_config,
@@ -352,7 +393,7 @@ class MMSingleStreamBlock(nn.Module):
 
         # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
-            num_heads=num_attention_heads,
+            num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -376,13 +417,16 @@ class MMSingleStreamBlock(nn.Module):
         linear1_out, _ = self.linear1(x_mod)
 
         # Split into QKV and MLP parts
+        local_qkv_dim = 3 * self.local_num_attention_heads * self.head_dim
         qkv, mlp = torch.split(
-            linear1_out, [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+            linear1_out,
+            [local_qkv_dim, self.local_mlp_hidden_dim],
+            dim=-1,
         )
 
         # Process QKV
         batch_size, seq_len = qkv.shape[0], qkv.shape[1]
-        qkv = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, -1)
+        qkv = qkv.view(batch_size, seq_len, 3, self.local_num_attention_heads, -1)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         # Apply QK-Norm
@@ -575,6 +619,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        pooled_projections: torch.Tensor | None = None,
         guidance=None,
         **kwargs,
     ):
@@ -604,8 +649,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         # Split text embeddings - first token is global, rest are per-token
         if isinstance(encoder_hidden_states, torch.Tensor):
-            txt = encoder_hidden_states[:, 1:]
-            text_states_2 = encoder_hidden_states[:, 0, : self.text_states_dim_2]
+            if pooled_projections is None:
+                txt = encoder_hidden_states[:, 1:]
+                text_states_2 = encoder_hidden_states[:, 0, : self.text_states_dim_2]
+            else:
+                txt = encoder_hidden_states
+                text_states_2 = pooled_projections
         else:
             txt = encoder_hidden_states[0]
             text_states_2 = encoder_hidden_states[1]
@@ -883,25 +932,30 @@ class IndividualTokenRefinerBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
+        tp_size = get_tp_world_size()
+        self.local_num_attention_heads = divide(num_attention_heads, tp_size)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        head_dim = hidden_size // num_attention_heads
 
         # Normalization and attention
         self.norm1 = nn.LayerNorm(
             hidden_size, eps=1e-6, elementwise_affine=True, dtype=dtype
         )
 
-        self.self_attn_qkv = ReplicatedLinear(
+        self.self_attn_qkv = MergedColumnParallelLinear(
             hidden_size,
-            hidden_size * 3,
+            [hidden_size] * 3,
             bias=qkv_bias,
+            gather_output=False,
             params_dtype=dtype,
             prefix=f"{prefix}.self_attn_qkv",
         )
 
-        self.self_attn_proj = ReplicatedLinear(
+        self.self_attn_proj = RowParallelLinear(
             hidden_size,
             hidden_size,
             bias=qkv_bias,
+            input_is_parallel=True,
             params_dtype=dtype,
             prefix=f"{prefix}.self_attn_proj",
         )
@@ -930,8 +984,8 @@ class IndividualTokenRefinerBlock(nn.Module):
 
         # Scaled dot product attention
         self.attn = LocalAttention(
-            num_heads=num_attention_heads,
-            head_size=hidden_size // num_attention_heads,
+            num_heads=self.local_num_attention_heads,
+            head_size=head_dim,
             # TODO: remove hardcode; remove STA
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
@@ -948,7 +1002,7 @@ class IndividualTokenRefinerBlock(nn.Module):
         qkv, _ = self.self_attn_qkv(norm_x)
 
         batch_size, seq_len = qkv.shape[0], qkv.shape[1]
-        qkv = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, -1)
+        qkv = qkv.view(batch_size, seq_len, 3, self.local_num_attention_heads, -1)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         # Run scaled dot product attention

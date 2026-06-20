@@ -8,6 +8,7 @@ export const Qwen36Deployment = () => {
         { id: 'h100', label: 'H100', default: true },
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: false },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
       ],
     },
@@ -85,6 +86,7 @@ export const Qwen36Deployment = () => {
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
     },
     '27b': {
@@ -92,6 +94,7 @@ export const Qwen36Deployment = () => {
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       xeon: { bf16: { tp: 6 },           fp8: { tp: 6 } },
     },
   };
@@ -191,6 +194,9 @@ export const Qwen36Deployment = () => {
 
     if (hardware === 'b200') {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
+    }
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
     }
     if (hwConfig.mem !== undefined) {
       cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;

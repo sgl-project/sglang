@@ -128,6 +128,15 @@ def apply_flashinfer_rope_qk_inplace(
             cos = cos_sin_cache[positions, :half_size].to(q.dtype)
             sin = cos_sin_cache[positions, half_size:].to(q.dtype)
 
+        if current_platform.is_npu():
+            q_flat = q.reshape(bsz * seqlen, q_heads, d)
+            k_flat = k.reshape(bsz * seqlen, k_heads, d)
+            q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+            k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
+            return q_rot.view(bsz, seqlen, q_heads, d), k_rot.view(
+                bsz, seqlen, k_heads, d
+            )
+
         def apply_rope_prefix(x: torch.Tensor, num_heads: int) -> torch.Tensor:
             x_flat = x.reshape(bsz * seqlen, num_heads, d)
             x_rot = x_flat[..., :rope_dim]

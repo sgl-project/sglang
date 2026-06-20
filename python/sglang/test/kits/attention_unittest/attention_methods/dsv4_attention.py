@@ -19,7 +19,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -27,17 +26,23 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
-_dp_attention.get_attention_cp_size = lambda: 1
-_dp_attention.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    attn_tp_size=1, attn_tp_rank=0, attn_cp_size=1, attn_cp_rank=0
+)
+_parallel_override.__enter__()
 
 # DSV4 hard-coded geometry. Do not change.
 DSV4_PAGE_SIZE = 256
@@ -308,8 +313,9 @@ class MockDSV4ModelRunner:
         # case's per-request input length (target_verify uses the draft count
         # directly; draft_extend uses the accepted-token count). Non-spec cases
         # leave it at 0 so the backend skips the speculative branches.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
             speculative_eagle_topk = 1
@@ -329,8 +335,18 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -374,7 +390,8 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             swa_page_size=DSV4_SWA_WINDOW,
             dtype=torch.float8_e4m3fn,
-            state_dtype=dtype,
+            c4_state_dtype=dtype,
+            c128_state_dtype=dtype,
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             indexer_head_dim=128,
@@ -395,6 +412,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
@@ -1477,8 +1495,8 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(
-        include_v2=True
+    assert (
+        case.forward_mode.is_draft_extend_v2()
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
