@@ -327,11 +327,12 @@ class FlashInferAttnBackend(AttentionBackend):
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        # Persistent prefill wrappers for plain EXTEND (the only mode that
+        # never goes through the cuda-graph wrapper dict). Capturable modes
+        # (decode_or_idle / target_verify / dllm_extend) lazy-populate their
+        # per-bs wrappers in decode_cuda_graph_metadata /
+        # prefill_cuda_graph_metadata; no separate persistent set needed.
         self.prefill_wrappers_paged = []
-        self.prefill_wrappers_verify = []
-        self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -341,21 +342,6 @@ class FlashInferAttnBackend(AttentionBackend):
                         backend=self.prefill_backend,
                     )
                 )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                    )
-                )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                )
-            )
 
         # Create indices updater
         if not skip_prefill:
@@ -1111,7 +1097,9 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
+        # Callers always pass decode_wrappers (from
+        # decode_cuda_graph_metadata[bs]); the legacy `or self.decode_wrappers`
+        # fallback is gone with the persistent wrappers.
         self.call_begin_forward(
             decode_wrappers[0],
             req_pool_indices,
