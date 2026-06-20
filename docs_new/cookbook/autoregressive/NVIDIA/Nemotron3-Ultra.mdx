@@ -1,40 +1,36 @@
 ---
 title: NVIDIA Nemotron3-Ultra
-description: "Deploy NVIDIA Nemotron3-Ultra with SGLang - 550B hybrid MoE model (55B active) with 1M context window, BF16/NVFP4 support, built for long-running autonomous agents."
-tag:
-    NEW
+description: "Deploy NVIDIA Nemotron3-Ultra with SGLang — a 550B hybrid Transformer-Mamba Mixture-of-Experts model (55B active, 1M context) for long-horizon agents, in BF16 (16×H100/H200, 8×B200/B300) and NVFP4 on Blackwell (B200/B300/GB200/GB300)."
 ---
 
-import { Nemotron3UltraDeployment } from '/src/snippets/autoregressive/nemotron3-ultra-deployment.jsx';
+## Deployment
 
-## 1. Model Introduction
+<a id="install" />
 
-`NVIDIA Nemotron3-Ultra` is an open frontier reasoning model in the Nemotron 3 family, built for long-running autonomous agents. It is optimized for complex orchestration across coding, deep research, enterprise workflows, and EDA use cases where agents must sustain reasoning across many steps and large context windows.
+<Accordion title="Install SGLang">
 
-Nemotron 3 Ultra is a 550B parameter hybrid MoE model that activates only 55B parameters per forward pass, delivering frontier reasoning accuracy with high-throughput inference. It supports a 1M token context window so agents can keep conversation history, tool outputs, and plan state in view across persistent workflows.
+Nemotron3-Ultra support has not yet propagated to `lmsysorg/sglang:latest` or any stable release. The two paths below match the **Python / Docker** toggle in the command panel — both pull a runtime that already carries Nemotron3-Ultra support.
 
-Architecture and key features:
+<Tabs>
 
-- **Hybrid Transformer-Mamba Architecture (MoE):** Combines Mixture of Experts with a hybrid Transformer-Mamba architecture, enabling efficient routing and sequence modeling in a single stack.
-- **Long-horizon agentic reasoning:** Tuned for agents that plan, call tools, inspect results, recover from failures, and continue working across long task horizons — coding, deep research, enterprise automation, and EDA.
-- **1M token context window:** Sustains coherent agent state across extended workflows without re-ingestion.
-- **BF16 and NVFP4 quantization:** Deployable from multi-node H100 down to a single Blackwell node with NVFP4.
-- **Multi-environment RL post-training:** Post-trained with reinforcement learning across multiple environments for robust reasoning and reliable agentic behavior.
-- **Open weights, open data, open recipes:** Customizable for domain-specific agents and deployable across your own infrastructure.
+<Tab title="Python (pip / uv)">
 
-**Modalities:** Input: text — Output: text
+The enabling code is on `main` but not in a tagged release yet — install from source until it ships:
 
-**Supported GPUs:**
-- **BF16:** 16×H100, 16×H200, 8×B200/B300
-- **NVFP4:** 4/8×B200/B300, 4×GB200/GB300
+```bash Command
+pip install -U uv
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+uv pip install -e python
+```
 
-Available model variants on HuggingFace:
-- [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
-- [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4)
+Then run the **Python** output of the command panel below in that environment.
 
-## 2. SGLang Installation
+</Tab>
 
-Nemotron3-Ultra support has not yet propagated to `lmsysorg/sglang:latest` or any stable release. Pull one of the two dedicated images below — matching your CUDA version — to get a runtime with Nemotron3-Ultra support.
+<Tab title="Docker">
+
+Pull one of the two dedicated images — matching your CUDA version — to get a runtime with Nemotron3-Ultra support:
 
 ```bash Command
 # CUDA 13
@@ -43,79 +39,100 @@ docker pull lmsysorg/sglang:dev-nemotron3-ultra
 # CUDA 12
 docker pull lmsysorg/sglang:dev-cu12-nemotron3-ultra
 ```
-## 3. Model Deployment
 
-This section provides a progressive guide from quick deployment to performance tuning.
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator below produces.
 
-### 3.1 Basic Configuration
+</Tab>
 
-**Interactive Command Generator**: select model precision, hardware, tensor parallelism, and common knobs to generate a launch command.
+</Tabs>
 
-The generator only emits a runnable command for combinations that NVIDIA / SGLang have validated. Selecting an unverified tuple (e.g. NVFP4 on H100/H200, BF16 with TP=4 on H100, …) is **blocked** — the command pane shows an explicit error and the verified support matrix instead of a launch line, so unvalidated commands can't be copied by accident.
+</Accordion>
 
-<Nemotron3UltraDeployment />
+Pick your hardware + recipe to generate the launch command. The generator covers only the (precision × hardware × parallelism) combinations NVIDIA / SGLang have validated — unverified tiles (e.g. NVFP4 on H100/H200) are greyed out. The two serving strategies cover the common operating points:
 
-### 3.2 Configuration Tips
+- **Low-Latency** — dp-attention off + MTP (EAGLE) on. Fastest reply for a single user; pick for chat.
+- **High-Throughput** — dp-attention on + expert-parallel on, MTP off. Most tokens per second across many users; best for batch jobs.
 
-- **Attention backend**:
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/nvidia/nemotron3-ultra.jsx";
 
-    **H100/H200**: Use flash attention 3 backend by default.
-    **B200/GB200/B300/GB300**: Append `--attention-backend trtllm_mha`. The flashinfer default breaks the overlap scheduler on Blackwell, so `trtllm_mha` is required there.
+<Deployment config={config} />
 
-- **Mamba scheduler strategy**:
+## Playground
 
-    Always launch with `--mamba-scheduler-strategy extra_buffer`. This hybrid Transformer-Mamba model requires the `extra_buffer` strategy for correct scheduling of its Mamba state.
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs — DP-Attention degree, expert parallelism, the reasoning / tool-call parsers, MTP, and the **KV Cache DType** (`None` / `fp8_e4m3` / `bf16`) — on top of whichever cell the Deploy panel is currently showing.
 
-- **TP support**:
+import { Playground } from "/src/snippets/_playground.jsx";
 
-    To set tp size, use `--tp <4|8|16>`. Recommended pairings:
-    - BF16: `--tp 16` on H100/H200, `--tp 8` on B200/B300
-    - NVFP4: `--tp 4` or `--tp 8` on B200/B300, `--tp 4` on GB200/GB300
+<Playground config={config} />
 
-- **Multi-node BF16 on H100**:
+## 1. Model Introduction
 
-    The 16×H100 BF16 setup spans two nodes. Use `--dist-init-addr <head-node-ip>:5000 --nnodes 2 --node-rank <0|1>` on each node and keep `--tp 16`.
+[`NVIDIA Nemotron3-Ultra`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) is an open frontier reasoning model in the Nemotron 3 family, built for long-running autonomous agents. It is a **550B-parameter hybrid Transformer-Mamba Mixture-of-Experts** model that activates only **55B parameters** per forward pass, and supports a **1M-token context window** so agents can keep conversation history, tool outputs, and plan state in view across persistent workflows. It is optimized for complex orchestration across coding, deep research, enterprise automation, and EDA use cases.
 
-- **DP attention**:
+Architecture and key features:
 
-    By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache. `--dp` must divide `--tp`.
+- **Hybrid Transformer-Mamba architecture (MoE):** combines Mixture-of-Experts with a hybrid Transformer-Mamba stack, enabling efficient routing and sequence modeling in a single model.
+- **Long-horizon agentic reasoning:** tuned for agents that plan, call tools, inspect results, recover from failures, and continue working across long task horizons.
+- **1M-token context window:** sustains coherent agent state across extended workflows without re-ingestion.
+- **BF16 and NVFP4 quantization:** deployable from a multi-node H100 cluster down to a single Blackwell node with NVFP4.
+- **Open weights, open data, open recipes:** customizable for domain-specific agents and deployable across your own infrastructure.
 
-- **Expert parallel (EP)**:
+**Modalities:** Input: text — Output: text
 
-    This MoE only supports `ep_size == 1` (off) or `ep_size == tp_size`. To enable expert parallelism, append `--ep <tp>` with the same value as `--tp`.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Validated GPUs</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16">NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16</a></strong></td>
+      <td style={{padding: "9px 12px"}}>BF16</td>
+      <td style={{padding: "9px 12px"}}>16×H100, 16×H200 (2-node), 8×B200/B300</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.03)"}}>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4">NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>NVFP4 <span style={{opacity: 0.7}}>(Blackwell only)</span></td>
+      <td style={{padding: "9px 12px"}}>4/8×B200/B300, 4×GB200/GB300</td>
+    </tr>
+  </tbody>
+</table>
 
-- **Multi-token prediction (MTP)**:
+**Recommended generation:** `temperature` 0.6–1.0 (informational; SGLang applies `generation_config.json` defaults automatically — do not hardcode in sample code).
 
-    Enable MTP speculative decoding (the toggle above) for low latency.
+**Resources:** [HuggingFace (BF16)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) · [HuggingFace (NVFP4)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4)
 
-- **FP8 KV cache**:
+## 2. Configuration Tips
 
-    To enable fp8 kv cache, please append `--kv-cache-dtype fp8_e4m3`.
+- **Mamba scheduler strategy:** always launch with `--mamba-scheduler-strategy extra_buffer` (baked into every recipe above). This hybrid Transformer-Mamba model requires the `extra_buffer` strategy for correct scheduling of its Mamba state.
 
-- **Reasoning parser**:
+- **Attention backend:** on **H100/H200** SGLang uses the FlashAttention-3 backend by default — no flag needed. On **B200/GB200/B300/GB300** the recipes append `--attention-backend trtllm_mha` (also baked above): the FlashInfer default breaks the overlap scheduler on Blackwell, so `trtllm_mha` is required there.
 
-    Append `--reasoning-parser nemotron_3` to enable structured reasoning traces (`reasoning_content` field in the response).
+- **Tensor parallelism:** BF16 runs `--tp 16` on H100/H200 (a 2-node setup — select **Multi-Nodes** in the panel) and `--tp 8` on B200/B300; NVFP4 runs `--tp 4` on all four Blackwell platforms, with `--tp 8` additionally validated on B200/B300 (raise the **TP** knob in the [Playground](#playground)).
 
-- **Tool calling**:
+- **Multi-node BF16 on H100/H200:** the 16-GPU BF16 setup spans two nodes. Selecting **Multi-Nodes** injects `--dist-init-addr <head-node-ip>:20000 --nnodes 2 --node-rank <0|1>` — run the emitted command on each node with the matching `--node-rank`.
 
-    Append `--tool-call-parser qwen3_coder` to enable tool calling support.
+- **DP attention:** by default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the **High-Throughput** strategy, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups, each serving its own slice of requests with its own KV cache. `--dp` must divide `--tp`; DP=2 is validated for BF16 and DP∈{2,4,8} for NVFP4 (capped by TP). Tune the degree with the **DP-Attention** knob in the Playground.
 
-## 4. Model Invocation
+- **Expert parallel (EP):** this MoE supports only `ep_size == 1` (off) or `ep_size == tp_size`. To enable expert parallelism, set `--ep` equal to `--tp` (the **High-Throughput** strategy does this; the **EP** knob in the Playground mirrors it).
 
-```shell Command
-python3 -m sglang.launch_server \
-  --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
-  --trust-remote-code \
-  --tp 8 \
-  --mamba-scheduler-strategy extra_buffer \
-  --attention-backend trtllm_mha \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser nemotron_3
-```
+- **Multi-token prediction (MTP):** the **Low-Latency** strategy enables MTP speculative decoding (EAGLE: `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`). Toggle it independently via the **Speculative Decoding** card in the Playground.
 
-### 4.1 Basic Usage (OpenAI-Compatible API)
+- **KV cache dtype:** the default keeps full-precision KV (no flag). To trade accuracy for memory, pick `fp8_e4m3` (or `bf16`) in the **KV Cache DType** card of the [Playground](#playground), which appends `--kv-cache-dtype <value>`. `fp8_e4m3` is accuracy-degrading, so it is offered there rather than baked into the verified recipes.
+
+- **Reasoning / tool-call parsers:** append `--reasoning-parser nemotron_3` for structured reasoning traces (the `reasoning_content` field) and `--tool-call-parser qwen3_coder` for tool calling. Both are exposed as toggles in the **Parsers** card of the [Playground](#playground) (§3.1, §3.2).
+
+## 3. Advanced Usage
+
+### 3.1 Basic Usage (OpenAI-Compatible API)
 
 SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python client:
+
+<Accordion title="Basic Chat Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -135,10 +152,12 @@ resp = client.chat.completions.create(
     max_tokens=1024,
 )
 print("Reasoning:", resp.choices[0].message.reasoning_content, "\nContent:", resp.choices[0].message.content)
-print("\n")
 ```
 
-Output:
+</Accordion>
+
+<Accordion title="Example Output">
+
 ```text Output
 Reasoning: The user wants 3 bullet points about SGLang. Let me recall what I know about SGLang — it's a high-performance serving framework for large language models with a focus on structured generation and efficient KV cache reuse...(more tokens)
 
@@ -147,7 +166,12 @@ Content: - **Radix Attention** — SGLang reuses KV cache across requests sharin
 - **High-throughput serving on NVIDIA GPUs** — Continuous batching, chunked prefill, FP8/NVFP4 quantization, and optimized CUDA kernels deliver state-of-the-art throughput across H100, H200, B200, and GB200.
 ```
 
+</Accordion>
+
 Streaming chat completion:
+
+<Accordion title="Streaming Example (Python)">
+
 ```python Example
 from openai import OpenAI
 
@@ -172,7 +196,10 @@ for chunk in stream:
         print(delta.content, end="", flush=True)
 ```
 
-Output:
+</Accordion>
+
+<Accordion title="Example Output">
+
 ```text Output
 The first 5 prime numbers are:
 **2, 3, 5, 7, 11**.
@@ -185,9 +212,13 @@ The first 5 prime numbers are:
 - **4, 6, 8, 9, 10** are composite.
 ```
 
-### 4.2 Reasoning
+</Accordion>
 
-The model supports two modes — Reasoning ON (default) vs OFF. This can be toggled by setting `enable_thinking` to `False`, as shown below.
+### 3.2 Reasoning
+
+The model supports two modes — Reasoning ON (default) vs OFF. Launch with `--reasoning-parser nemotron_3` (or toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) so the thinking trace lands in `message.reasoning_content`, separate from the answer in `message.content`. Reasoning can be turned off per request by setting `enable_thinking` to `False`.
+
+<Accordion title="Reasoning Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -225,7 +256,10 @@ resp = client.chat.completions.create(
 print(f"Content: \n{resp.choices[0].message.content[:200]}...")
 ```
 
-Output:
+</Accordion>
+
+<Accordion title="Example Output">
+
 ```text Output
 Reasoning on
 Reasoning:
@@ -242,9 +276,13 @@ Here are 3 facts about SGLang:
 ...
 ```
 
-### 4.3 Tool Calling
+</Accordion>
 
-Call functions using the OpenAI Tools schema and inspect returned `tool_calls`. The server must be launched with `--tool-call-parser qwen3_coder`.
+### 3.3 Tool Calling
+
+Call functions using the OpenAI Tools schema and inspect returned `tool_calls`. Launch with `--tool-call-parser qwen3_coder` (or toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)).
+
+<Accordion title="Tool Calling Example (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -296,18 +334,23 @@ print(completion.choices[0].message.reasoning_content)
 print(completion.choices[0].message.tool_calls)
 ```
 
-Output:
+</Accordion>
+
+<Accordion title="Example Output">
+
 ```text Output
 The user is asking where the RadixCache class is defined. I should search the codebase for the symbol "RadixCache" to find the file and line. I'll call search_codebase with that query.
 
 [ChatCompletionMessageFunctionToolCall(id='call_8a7f2c4e1b9d4a3e8c2f1d6b', function=Function(arguments='{"query": "class RadixCache"}', name='search_codebase'), type='function', index=0)]
 ```
 
-### 4.4 Controlling Reasoning Budget
+</Accordion>
 
-The `reasoning_budget` parameter allows you to limit the length of the model's reasoning trace. When the reasoning output reaches the specified token budget, the model will attempt to gracefully end the reasoning at the next newline character.
+### 3.4 Controlling Reasoning Budget
 
-If no newline is encountered within 500 tokens after reaching the budget threshold, the reasoning trace will be forcibly terminated at `reasoning_budget + 500` tokens.
+The `reasoning_budget` parameter limits the length of the model's reasoning trace. When the reasoning output reaches the specified token budget, the model attempts to gracefully end the reasoning at the next newline. If no newline is encountered within 500 tokens after reaching the budget threshold, the reasoning trace is forcibly terminated at `reasoning_budget + 500` tokens.
+
+<Accordion title="Reasoning Budget Client (Python)">
 
 ```python Example
 from typing import Any, Dict, List
@@ -379,7 +422,11 @@ class ThinkingBudgetClient:
         return response_data
 ```
 
+</Accordion>
+
 Usage example with `reasoning_budget=256`:
+
+<Accordion title="Reasoning Budget Usage (Python)">
 
 ```python Example
 SERVED_MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
@@ -404,7 +451,10 @@ resp = client.chat_completion(
 print("Reasoning:", resp["reasoning_content"], "\nContent:", resp["content"])
 ```
 
-Output:
+</Accordion>
+
+<Accordion title="Example Output">
+
 ```text Output
 Reasoning: The user wants a research plan to compare throughput of two MoE serving strategies. I should outline goals, baselines, datasets, metrics (tokens/s, TTFT, ITL, MFU), variables to sweep (TP, batch size, sequence length, concurrency), and statistical handling. Keep it concise since reasoning_budget is 256...
 Content:
@@ -418,129 +468,4 @@ Content:
 5. **Analysis** — per-config throughput table + roofline overlay; bootstrap CIs over 3 reruns to bound noise.
 ```
 
----
-
-## 5. Benchmark
-
-### 5.1 Speed Benchmark
-
-**Test Environment:**
-- Hardware: GB200 (4x)
-- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
-- Tensor Parallelism: 4
-- SGLang Version: main branch
-
-- Model Deployment Command:
-
-```shell Command
-python3 -m sglang.launch_server \
-  --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --mamba-scheduler-strategy extra_buffer \
-  --attention-backend trtllm_mha \
-  --max-running-requests 1024
-```
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
-  --dataset-name random \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 4096 \
-  --max-concurrency 256
-```
-
-- **Test Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 256
-Successful requests:                     4096
-Benchmark duration (s):                  1184.58
-Total input tokens:                      2081726
-Total input text tokens:                 2081726
-Total generated tokens:                  2087288
-Total generated tokens (retokenized):    1990224
-Request throughput (req/s):              3.46
-Input token throughput (tok/s):          1757.35
-Output token throughput (tok/s):         1762.05
-Peak output token throughput (tok/s):    3150.00
-Peak concurrent requests:                266
-Total token throughput (tok/s):          3519.40
-Concurrency:                             249.55
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   72169.95
-Median E2E Latency (ms):                 71994.47
-P90 E2E Latency (ms):                    99898.56
-P99 E2E Latency (ms):                    107119.61
----------------Time to First Token----------------
-Mean TTFT (ms):                          40057.33
-Median TTFT (ms):                        41375.93
-P99 TTFT (ms):                           46377.89
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          63.15
-Median TPOT (ms):                        63.65
-P99 TPOT (ms):                           78.16
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           63.14
-Median ITL (ms):                         35.92
-P95 ITL (ms):                            178.10
-P99 ITL (ms):                            182.10
-Max ITL (ms):                            2466.36
-==================================================
-```
-
-### 5.2 Accuracy Benchmark
-
-#### 5.2.1 GSM8K Benchmark
-
-**Environment**
-- Hardware: GB200 (4x)
-- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
-- Tensor Parallelism: 4
-- SGLang Version: main branch
-
-**Launch Model**
-```bash Command
-python3 -m sglang.launch_server \
-  --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --mamba-scheduler-strategy extra_buffer \
-  --attention-backend trtllm_mha \
-  --reasoning-parser nemotron_3
-```
-
-**Run Benchmark**
-```bash Command
-python3 benchmark/gsm8k/bench_sglang.py
-```
-
-**Test Results:**
-```text Output
-Accuracy: 0.970
-Invalid: 0.000
-Latency: 29.129 s
-Output throughput: 745.333 token/s
-```
-
-#### 5.2.2 MMLU Benchmark
-
-**Run Benchmark**
-```bash Command
-python3 benchmark/mmlu/bench_sglang.py
-```
-
-**Test Results:**
-```text Output
-TBD
-```
-
----
+</Accordion>
