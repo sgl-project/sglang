@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
+    EVICTION_STRATEGIES,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -18,7 +19,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
-from sglang.srt.mem_cache.utils import _EVICTION_POLICY_FACTORIES, get_eviction_strategy
+from sglang.srt.mem_cache.utils import get_eviction_strategy
 from sglang.srt.server_args import RADIX_EVICTION_POLICY_CHOICES
 
 
@@ -227,7 +228,7 @@ class TestEvictionPolicyWiring(unittest.TestCase):
         # CLI choices (the fifo/mru/filo bug this test was added with).
         self.assertEqual(
             set(RADIX_EVICTION_POLICY_CHOICES),
-            set(_EVICTION_POLICY_FACTORIES),
+            set(EVICTION_STRATEGIES),
             msg="server_args choices and the eviction-policy registry have drifted apart",
         )
 

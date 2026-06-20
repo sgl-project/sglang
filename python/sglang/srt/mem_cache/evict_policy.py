@@ -63,3 +63,14 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+EVICTION_STRATEGIES: dict[str, type[EvictionStrategy]] = {
+    "lru": LRUStrategy,
+    "lfu": LFUStrategy,
+    "slru": SLRUStrategy,
+    "priority": PriorityStrategy,
+    "fifo": FIFOStrategy,
+    "mru": MRUStrategy,
+    "filo": FILOStrategy,
+}

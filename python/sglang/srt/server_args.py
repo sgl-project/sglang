@@ -47,6 +47,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.evict_policy import EVICTION_STRATEGIES
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -258,7 +259,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "fifo", "mru", "filo"]
+RADIX_EVICTION_POLICY_CHOICES = list(EVICTION_STRATEGIES)
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
