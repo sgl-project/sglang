@@ -436,7 +436,12 @@ class SessionController:
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
         )
 
-    def maybe_reap(self, now: float, interval: float = 1.0):
+    def maybe_reap(
+        self,
+        now: float,
+        interval: float = 1.0,
+        session_max_idle_s: Optional[float] = None,
+    ):
         # reap sessions every second
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
@@ -461,6 +466,23 @@ class SessionController:
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
+
+            # Soft-evict KV for sessions that have been idle beyond
+            # session_max_idle_s. The session stays open; the next turn re-prefills.
+            if session_max_idle_s is not None:
+                cutoff = now - session_max_idle_s
+                idle = [
+                    sid
+                    for sid, session in self.sessions.items()
+                    if not session._inflight
+                    and session.last_active_time < cutoff
+                ]
+                for sid in idle:
+                    log_info_on_rank0(
+                        logger,
+                        f"Session {sid} idle beyond {session_max_idle_s}s, soft-evicting KV.",
+                    )
+                    self.tree_cache.soft_evict_session(sid)
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:

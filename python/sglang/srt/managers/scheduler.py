@@ -1591,7 +1591,9 @@ class Scheduler(
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
-        self.session_controller.maybe_reap(now)
+        self.session_controller.maybe_reap(
+            now, session_max_idle_s=self.server_args.session_max_idle_s
+        )
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(

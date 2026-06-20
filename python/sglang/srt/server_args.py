@@ -471,6 +471,7 @@ class ServerArgs:
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
+    session_max_idle_s: Optional[float] = None
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -5320,6 +5321,18 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_streaming_session,
             help="Enable streaming session mode and StreamingSession wrapper.",
+        )
+        parser.add_argument(
+            "--session-max-idle-s",
+            type=float,
+            default=ServerArgs.session_max_idle_s,
+            help=(
+                "Soft-evict streaming session KV after this many seconds of idle time "
+                "(no completed turn). The session stays open; the next turn re-prefills "
+                "from whatever prefix is still in the radix cache. "
+                "Also used as the LRU threshold in the OOM eviction path. "
+                "Default: None (no idle eviction)."
+            ),
         )
         parser.add_argument(
             "--random-seed",

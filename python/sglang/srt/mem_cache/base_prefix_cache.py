@@ -336,6 +336,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_session(self, session_id: str) -> None:
         pass
 
+    def evict_sessions(self, num_tokens: int, active_pool_idxs: set) -> int:
+        return 0
+
+    def soft_evict_session(self, session_id: str) -> int:
+        return 0
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
 

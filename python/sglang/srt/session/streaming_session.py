@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import torch
 
@@ -47,6 +48,10 @@ class SessionSlot:
     kv_committed_len: int = 0
     kv_allocated_len: int = 0
 
+    # Wall-clock time of the last completed turn (time.monotonic()). Used by
+    # evict_lru_sessions to identify the least recently active idle slots.
+    last_active_time: float = 0.0
+
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
     cache_protected_len: int = 0
@@ -73,6 +78,7 @@ class SessionSlot:
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
         self.swa_evicted_seqlen = req.swa_evicted_seqlen
+        self.last_active_time = time.monotonic()
 
         if is_first:
             self.last_node = req.last_node
@@ -431,6 +437,85 @@ class StreamingSession(BasePrefixCache):
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
         self._free_slot_mamba(slot)
+
+    def soft_evict_slot(self, session_id: str) -> int:
+        """Free the KV held by a session slot without closing the session.
+
+        Frees token indices in [cache_protected_len, kv_allocated_len), releases
+        the radix tree lock on last_node, and returns req_pool_idx to the pool.
+        The SessionSlot remains in self.slots with req_pool_idx=None so the session
+        stays open; the next turn falls through to a normal radix tree match_prefix
+        and re-prefills from whatever prefix is still cached.
+
+        Returns the number of tokens freed (0 if the slot held no KV).
+        """
+        slot = self.slots.get(session_id)
+        if slot is None or not slot.is_holding_kv:
+            return 0
+
+        protected_len = slot.cache_protected_len
+        end = slot.kv_allocated_len
+        start = protected_len
+        if self.page_size > 1:
+            from sglang.srt.utils.common import ceil_align
+
+            start = ceil_align(start, self.page_size)
+        if start < end:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                slot.req_pool_idx, start:end
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+        tokens_freed = max(0, end - protected_len)
+
+        if slot.last_node is not None:
+            if slot.swa_uuid_for_lock is not None:
+                self.inner.dec_lock_ref(
+                    slot.last_node,
+                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
+                )
+            else:
+                self.inner.dec_lock_ref(slot.last_node)
+
+        self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+
+        slot.req_pool_idx = None
+        slot.kv_allocated_len = 0
+        slot.kv_committed_len = 0
+        slot.last_node = None
+        slot.cache_protected_len = 0
+        slot.swa_uuid_for_lock = None
+
+        logger.info(
+            "Session KV soft-evicted: %s (%d tokens freed)", session_id, tokens_freed
+        )
+        return tokens_freed
+
+    def evict_lru_sessions(
+        self, num_tokens: int, active_pool_idxs: Optional[Set[int]] = None
+    ) -> int:
+        """Soft-evict idle session slots in LRU order until num_tokens are freed.
+
+        Slots whose req_pool_idx is in active_pool_idxs are skipped (their KV is
+        currently owned by an in-flight request and must not be freed).
+
+        Returns the total number of tokens freed.
+        """
+        if active_pool_idxs is None:
+            active_pool_idxs = set()
+
+        candidates: List[tuple] = [
+            (slot.last_active_time, session_id)
+            for session_id, slot in self.slots.items()
+            if slot.is_holding_kv and slot.req_pool_idx not in active_pool_idxs
+        ]
+        candidates.sort()  # oldest last_active_time first
+
+        freed = 0
+        for _, session_id in candidates:
+            if freed >= num_tokens:
+                break
+            freed += self.soft_evict_slot(session_id)
+        return freed
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
