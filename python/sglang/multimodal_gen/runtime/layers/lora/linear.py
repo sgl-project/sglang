@@ -118,6 +118,14 @@ class BaseLayerWithLoRA(nn.Module):
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
 
+    @staticmethod
+    def _as_mutable_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        # lora can be reconfigured after executor forwards create inference tensors
+        if tensor.is_inference():
+            with torch.inference_mode(False):
+                return tensor.detach().clone()
+        return tensor
+
     def set_lora_weights(
         self,
         A: torch.Tensor,
@@ -238,7 +246,7 @@ class BaseLayerWithLoRA(nn.Module):
         self,
         lora_list: list[LoRAWeightEntry],
     ) -> bool:
-        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "0") != "1":
+        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "1") != "1":
             return False
         for _, _, lora_path, _, _, _ in lora_list:
             if lora_path and "distilled-lora" in lora_path.lower():
@@ -249,6 +257,18 @@ class BaseLayerWithLoRA(nn.Module):
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
             self.strength = strength
+            if self.lora_weights_list:
+                self.lora_weights_list = [
+                    (lora_A, lora_B, lora_path, strength, lora_rank, lora_alpha)
+                    for (
+                        lora_A,
+                        lora_B,
+                        lora_path,
+                        _,
+                        lora_rank,
+                        lora_alpha,
+                    ) in self.lora_weights_list
+                ]
 
         if self.disable_lora:
             return
@@ -291,6 +311,7 @@ class BaseLayerWithLoRA(nn.Module):
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()
             ).full_tensor()
+            data = self._as_mutable_tensor(data)
             target_dtype = data.dtype
             if (
                 merge_in_fp32
@@ -302,13 +323,16 @@ class BaseLayerWithLoRA(nn.Module):
             self._merge_lora_into_data(data, lora_list)
 
             unsharded_base_layer.weight = nn.Parameter(
-                data.to(current_device, dtype=target_dtype)
+                self._as_mutable_tensor(data.to(current_device, dtype=target_dtype))
             )
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
-                unsharded_base_layer.bias = nn.Parameter(
+                bias_data = (
                     self.base_layer.bias.to(get_local_torch_device(), non_blocking=True)
                     .full_tensor()
                     .to(current_device)
+                )
+                unsharded_base_layer.bias = nn.Parameter(
+                    self._as_mutable_tensor(bias_data)
                 )
 
             offload_policy = (
@@ -325,6 +349,7 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
+            data = self._as_mutable_tensor(data)
             target_dtype = data.dtype
             if (
                 merge_in_fp32
@@ -335,8 +360,8 @@ class BaseLayerWithLoRA(nn.Module):
 
             self._merge_lora_into_data(data, lora_list)
 
-            self.base_layer.weight.data = data.to(
-                current_device, dtype=target_dtype, non_blocking=True
+            self.base_layer.weight.data = self._as_mutable_tensor(
+                data.to(current_device, dtype=target_dtype, non_blocking=True)
             )
 
         self.merged = True
@@ -356,13 +381,20 @@ class BaseLayerWithLoRA(nn.Module):
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
             old_weight = self.base_layer.weight
-            new_weight_data = self.cpu_weight.to(device, non_blocking=True)
+            new_weight_data = self._as_mutable_tensor(
+                self.cpu_weight.to(device, non_blocking=True)
+            )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
             current_device = self.base_layer.weight.data.device
             cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            self.base_layer.weight.data.copy_(cpu_weight_on_device)
+            if self.base_layer.weight.data.is_inference():
+                self.base_layer.weight.data = self._as_mutable_tensor(
+                    cpu_weight_on_device
+                )
+            else:
+                self.base_layer.weight.data.copy_(cpu_weight_on_device)
             if (
                 cpu_weight_on_device.data_ptr()
                 != self.base_layer.weight.data.data_ptr()
@@ -370,6 +402,30 @@ class BaseLayerWithLoRA(nn.Module):
                 del cpu_weight_on_device
 
         self.merged = False
+
+    @torch.no_grad()
+    def commit_merged_as_base(self) -> None:
+        """Promote the currently merged weights to the permanent base.
+
+        Re-snapshots ``cpu_weight`` so the merged weights become the restore
+        target and resets adapter bookkeeping (``merged=False``). A later dynamic
+        ``set_lora_weights`` then adds its delta on top of the merged base instead
+        of unmerging it.
+        """
+        if not self.merged:
+            return
+        weight = self.base_layer.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        # clone(): to("cpu") may alias storage; we must not mutate this backup.
+        self.cpu_weight = weight.detach().to("cpu").clone()
+        self.merged = False
+        self.disable_lora = True
+        self.lora_weights_list = []
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_path = None
+        self.strength = 1.0
 
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
@@ -403,6 +459,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.merged or self.disable_lora:
+            return self.base_layer(input_)
+
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):

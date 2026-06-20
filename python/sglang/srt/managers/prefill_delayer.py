@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -32,6 +33,11 @@ class _NegotiateOutput(NamedTuple):
     output_reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
+    # Accumulated wait of the prefill being released on this pass. Carried
+    # explicitly because `next_state` is None on every release path and thus
+    # cannot convey it to the metrics observation.
+    wait_forward_passes: int = 0
+    wait_seconds: float = 0.0
 
 
 class PrefillDelayer:
@@ -45,6 +51,7 @@ class PrefillDelayer:
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
+        device_group=None,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
@@ -68,15 +75,32 @@ class PrefillDelayer:
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
+
+        # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
+        # env flag is on (or overlap scheduling is disabled), ride the NCCL
+        # device group on `device` instead of gloo on CPU.
+        use_nccl = (
+            server_args.disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
+        if use_nccl:
+            assert (
+                device_group is not None
+            ), "device_group is required when using NCCL for PrefillDelayer all-gather"
+            self._gather_group = device_group
+            self._gather_device = device
+        else:
+            self._gather_group = cpu_group
+            self._gather_device = "cpu"
+
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
         # waiting_queue_len.
         self._global_info_buffer = torch.empty(
             (dp_size_dim, attn_tp_size, 5),
             dtype=torch.int64,
-            device=device,
+            device=self._gather_device,
         )
-        self._cpu_group = cpu_group
 
         self._metrics_collector = metrics_collector
 
@@ -156,6 +180,16 @@ class PrefillDelayer:
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
+        # Wait accumulated so far, taken from prev_state. Release paths attach
+        # this so the wait histograms observe the real value; delay paths leave
+        # the defaults (0) since the wait isn't finished and isn't observed.
+        wait_info = dict(
+            wait_forward_passes=prev_state.delayed_count if prev_state else 0,
+            wait_seconds=(
+                (time.perf_counter() - prev_state.start_time) if prev_state else 0.0
+            ),
+        )
+
         # Compute outputs
         if prefillable_status == "all":
             # Safety valve: low KV usage means GPU is underutilized, skip
@@ -166,6 +200,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="token_watermark",
                     **debug_info,
+                    **wait_info,
                 )
 
             if not self.enable_dp_attention:
@@ -223,6 +258,7 @@ class PrefillDelayer:
                 output_allow=True,
                 output_reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
+                **wait_info,
             )
         elif prefillable_status == "none":
             return _NegotiateOutput(
@@ -231,6 +267,7 @@ class PrefillDelayer:
                 output_allow=True,
                 output_reason="",
                 **debug_info,
+                **wait_info,
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
@@ -239,6 +276,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="token_watermark",
                     **debug_info,
+                    **wait_info,
                 )
 
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
@@ -257,6 +295,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="wait_timeout",
                     **debug_info,
+                    **wait_info,
                 )
         else:
             raise NotImplementedError
@@ -277,13 +316,13 @@ class PrefillDelayer:
                 max_prefill_bs,
                 waiting_queue_len,
             ],
-            device="cpu",
+            device=self._gather_device,
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,
-            group=self._cpu_group,
+            group=self._gather_group,
         )
         tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info
@@ -357,14 +396,9 @@ def _record_single_pass_result(
             }
 
     if metrics_collector is not None:
-        if (s := output.next_state) is not None:
-            wait_seconds = time.perf_counter() - s.start_time
-            forward_passes = s.delayed_count
-        else:
-            wait_seconds = forward_passes = 0
         metrics_collector.observe_prefill_delayer_outcome(
-            forward_passes=forward_passes,
-            wait_seconds=wait_seconds,
+            forward_passes=output.wait_forward_passes,
+            wait_seconds=output.wait_seconds,
             input_estimation=output.input_estimation,
             output_allow=output.output_allow,
             output_reason=output.output_reason,

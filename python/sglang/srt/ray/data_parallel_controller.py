@@ -20,15 +20,16 @@ from typing import List, Optional
 
 import ray
 import zmq
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from sglang.srt.entrypoints.engine import (
-    _calculate_rank_ranges,
-    _compute_parallelism_ranks,
-)
+from sglang.srt.entrypoints.engine import _calculate_rank_ranges
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
-from sglang.srt.ray.scheduler_actor import SchedulerActor
+from sglang.srt.ray.engine import (
+    _compute_world_size,
+    _create_scheduler_actor,
+    _get_bundle_node_ip,
+    _resolve_bundle_indices,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import bind_port, get_zmq_socket, get_zmq_socket_on_host
 
@@ -48,7 +49,7 @@ class RayDataParallelController(DataParallelController):
         server_args: ServerArgs,
         port_args: PortArgs,
         placement_group,
-        bundle_for_node: List[int],
+        bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
     ):
         # Set Ray-specific attributes BEFORE super().__init__() because the
@@ -73,6 +74,7 @@ class RayDataParallelController(DataParallelController):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.instance_id = port_args.instance_id
 
             # Hold NCCL port so the next DP rank gets a different one
             sockets.append(bind_port(tmp_port_args.nccl_port))
@@ -126,86 +128,129 @@ class RayDataParallelController(DataParallelController):
     ):
         """Create SchedulerActor Ray actors for one TP group (one DP rank).
 
-        For DP attention, dp_rank=None and worker_ports is provided; the dp_rank
-        is derived from tp_rank via compute_dp_attention_world_info.
-
-        For regular DP, dp_rank is an integer and worker_ports is None.
+        Args:
+            dp_rank: DP rank for regular DP; None for DP attention (derived from tp_rank).
+            worker_ports: Pre-allocated ports for DP attention; None for regular DP.
         """
         nnodes = server_args.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
-        for node_idx in range(nnodes):
-            bundle_idx = self.bundle_for_node[node_idx]
-            pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-                nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
-            )
+        if self.server_args.placement_group is None:
+            for node_idx in range(nnodes):
+                bundle_idx = self.bundle_for_node[node_idx]
+                pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
+                    nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
+                )
+                for pp_rank in pp_range:
+                    for tp_rank in tp_range:
+                        rank_port_args = port_args
+                        actual_dp_rank = dp_rank
 
-            for pp_rank in pp_range:
-                for tp_rank in tp_range:
-                    rank_port_args = port_args
-                    actual_dp_rank = dp_rank
-
-                    if server_args.enable_dp_attention:
-                        # DP attention: derive dp_rank from tp_rank
-                        _, _, actual_dp_rank = compute_dp_attention_world_info(
-                            server_args.enable_dp_attention,
-                            tp_rank,
-                            server_args.tp_size,
-                            server_args.dp_size,
-                            server_args.attn_cp_size,
+                        local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
+                            tp_rank % tp_per_node
                         )
-                        rank_port_args = PortArgs.init_new(
-                            server_args, actual_dp_rank, worker_ports
+
+                        if server_args.enable_dp_attention:
+                            _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
+                                server_args.enable_dp_attention,
+                                tp_rank,
+                                server_args.tp_size,
+                                server_args.dp_size,
+                                server_args.attn_cp_size,
+                            )
+                            rank_port_args = PortArgs.init_new(
+                                server_args, actual_dp_rank, worker_ports
+                            )
+                            # All DP ranks share the same NCCL port (reuse TP group)
+                            rank_port_args.nccl_port = port_args.nccl_port
+                            rank_port_args.instance_id = port_args.instance_id
+                            # The detokenizer and tokenizer bind using the
+                            # original port_args addresses (127.0.0.1 when
+                            # dist_init_addr is unset).  Scheduler actors must
+                            # connect to the same addresses.
+                            rank_port_args.detokenizer_ipc_name = (
+                                port_args.detokenizer_ipc_name
+                            )
+                            rank_port_args.tokenizer_ipc_name = (
+                                port_args.tokenizer_ipc_name
+                            )
+
+                        dist_init_addr = (
+                            f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
                         )
-                        # All DP ranks share the same NCCL port (reuse TP group)
-                        rank_port_args.nccl_port = port_args.nccl_port
-                        # The detokenizer and tokenizer bind using the
-                        # original port_args addresses (127.0.0.1 when
-                        # dist_init_addr is unset).  Scheduler actors must
-                        # connect to the same addresses.
-                        rank_port_args.detokenizer_ipc_name = (
-                            port_args.detokenizer_ipc_name
+
+                        actor = _create_scheduler_actor(
+                            pg=self.pg,
+                            bundle_idx=bundle_idx,
+                            gpu_id=local_gpu_idx,
+                            server_args=server_args,
+                            port_args=rank_port_args,
+                            tp_rank=tp_rank,
+                            pp_rank=pp_rank,
+                            dp_rank=actual_dp_rank,
+                            dist_init_addr=dist_init_addr,
+                            rank0_node_ip=self.rank0_node_ip,
                         )
-                        rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+                        self.scheduler_actors.append(actor)
 
-                    local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
-                        tp_rank % tp_per_node
+        else:
+            world_size = _compute_world_size(server_args)
+            bundle_indices = _resolve_bundle_indices(self.pg, world_size)
+
+            ranks_per_tp_group = server_args.tp_size * server_args.pp_size
+            if dp_rank is not None:
+                start_rank = dp_rank * ranks_per_tp_group
+                end_rank = start_rank + ranks_per_tp_group
+                # Each DP group must use its own local rank-0's node IP for
+                # NCCL rendezvous, not the world rank-0's node IP.
+                local_rank0_bundle_idx = bundle_indices[start_rank]
+                local_rank0_node_ip = _get_bundle_node_ip(
+                    self.pg, local_rank0_bundle_idx
+                )
+            else:
+                start_rank = 0
+                end_rank = world_size
+                local_rank0_node_ip = self.rank0_node_ip
+
+            for global_rank in range(start_rank, end_rank):
+                local_rank = global_rank % ranks_per_tp_group
+                pp_rank = local_rank // server_args.tp_size
+                tp_rank = local_rank % server_args.tp_size
+                rank_port_args = port_args
+                actual_dp_rank = dp_rank
+
+                bundle_idx = bundle_indices[global_rank]
+
+                if server_args.enable_dp_attention:
+                    _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
+                        server_args.enable_dp_attention,
+                        tp_rank,
+                        server_args.tp_size,
+                        server_args.dp_size,
+                        server_args.attn_cp_size,
                     )
-
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
+                    rank_port_args = PortArgs.init_new(
+                        server_args, actual_dp_rank, worker_ports
                     )
+                    rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+                    rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-                    # Each DP group needs a unique dist_init_addr for its own
-                    # torch.distributed process group. Use nccl_port which is
-                    # unique per DP group (regular DP) or shared (DP attention).
-                    dist_init_addr = f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
+                dist_init_addr = f"{local_rank0_node_ip}:{rank_port_args.nccl_port}"
 
-                    actor = SchedulerActor.options(
-                        num_cpus=0,
-                        num_gpus=1,
-                        name=(
-                            f"sglang_scheduler_node{self.rank0_node_ip}"
-                            f"_dp{actual_dp_rank}_pp{pp_rank}_tp{tp_rank}"
-                            f"_pg{self.pg.id.hex()[:8]}_bundle{bundle_idx}"
-                        ),
-                        scheduling_strategy=PlacementGroupSchedulingStrategy(
-                            placement_group=self.pg,
-                            placement_group_bundle_index=bundle_idx,
-                        ),
-                    ).remote(
-                        server_args=server_args,
-                        port_args=rank_port_args,
-                        gpu_id=local_gpu_idx,
-                        tp_rank=tp_rank,
-                        attn_cp_rank=attn_cp_rank,
-                        moe_dp_rank=moe_dp_rank,
-                        moe_ep_rank=moe_ep_rank,
-                        pp_rank=pp_rank,
-                        dp_rank=actual_dp_rank,
-                        dist_init_addr=dist_init_addr,
-                    )
-                    self.scheduler_actors.append(actor)
+                actor = _create_scheduler_actor(
+                    pg=self.pg,
+                    bundle_idx=bundle_idx,
+                    gpu_id=0,  # Each bundle has exactly 1 GPU
+                    server_args=server_args,
+                    port_args=rank_port_args,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    dp_rank=actual_dp_rank,
+                    dist_init_addr=dist_init_addr,
+                    rank0_node_ip=local_rank0_node_ip,
+                )
+                self.scheduler_actors.append(actor)
 
         # Wait for all actors created in this call to initialize
         batch_actors = self.scheduler_actors[batch_start_idx:]

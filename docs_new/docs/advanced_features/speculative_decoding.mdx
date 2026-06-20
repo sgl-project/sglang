@@ -33,7 +33,6 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
-- **Want overlap scheduler (experimental)**: Enable **SpecV2** with `SGLANG_ENABLE_SPEC_V2=True` (requires `--speculative-eagle-topk 1`).
 
 ### Method comparison (mini table)
 
@@ -100,13 +99,6 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm STANDALONE</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Does <strong>not</strong> support <code>--enable-dp-attention</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SpecV2 (experimental)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>V2 workers + overlap scheduler</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>N/A</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>SGLANG_ENABLE_SPEC_V2=True</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Only supports <code>--speculative-eagle-topk 1</code>; applies to <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NGRAM</td>
@@ -401,7 +393,7 @@ print(response.choices[0].message.content)
 
 ## Multi Token Prediction
 
-We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [deepseek_v32 doc](../basic_usage/deepseek_v32#multi-token-prediction)).
+We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -592,19 +584,15 @@ print(response.choices[0].message.content)
 
 ## Speculative Decoding V2 (Overlap Scheduler)
 
-SGLang provides an **experimental Speculative Decoding V2** implementation that enables an overlap scheduler and uses V2 speculative workers (e.g. `StandaloneWorkerV2`, `EAGLEWorkerV2`).
-
-To enable it, set the environment variable:
-- `SGLANG_ENABLE_SPEC_V2=True`
+Speculative decoding runs the V2 speculative workers (e.g. `StandaloneWorkerV2`, `EAGLEWorkerV2`) with the overlap scheduler enabled by default. Pass `--disable-overlap-schedule` to fall back to the synchronous (non-overlap) path.
 
 Notes:
-- SpecV2 currently only supports `--speculative-eagle-topk 1`. When SpecV2 is enabled, **set `--speculative-eagle-topk 1` explicitly**.
+- The overlap scheduler currently only supports `--speculative-eagle-topk 1`; **set `--speculative-eagle-topk 1` explicitly**.
 - If you explicitly set `--speculative-eagle-topk > 1`, the server will error.
-- If you omit `--speculative-eagle-topk`, auto-tuning may pick `topk > 1` for some models (e.g. Llama). This is incompatible with SpecV2 and may not always trigger an immediate config error, so set `--speculative-eagle-topk 1` explicitly.
-- This applies to `EAGLE`, `EAGLE3`, and `STANDALONE`.
+- If you omit `--speculative-eagle-topk`, auto-tuning may pick `topk > 1` for some models (e.g. Llama). This is incompatible with the overlap scheduler and may not always trigger an immediate config error, so set `--speculative-eagle-topk 1` explicitly.
 
 ```bash Command
-SGLANG_ENABLE_SPEC_V2=True python3 -m sglang.launch_server \
+python3 -m sglang.launch_server \
     --model Qwen/Qwen2.5-7B-Instruct \
     --speculative-algorithm STANDALONE \
     --speculative-draft-model-path Qwen/Qwen2.5-1.5B-Instruct \
@@ -926,11 +914,6 @@ Below is a comprehensive list of all speculative decoding parameters available i
     </tr>
   </thead>
   <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_SPEC_V2</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>False</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable Speculative Decoding V2 (overlap scheduler)</td>
-    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NGRAM_FORCE_GREEDY_VERIFY</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>False</code></td>

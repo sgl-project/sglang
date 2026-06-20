@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/cuda_piecewise_backend.py
 
 import dataclasses
@@ -11,13 +13,16 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.piecewise_context_manager import (
+from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
-    is_in_pcg_torch_compile,
+    is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
 
 
 @dataclasses.dataclass
@@ -140,13 +145,31 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        if is_in_pcg_torch_compile():
+        if is_in_torch_compile_warmup():
             return entry.runnable(*args)
 
         if entry.cudagraph is None:
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
+
+            # During normal capture (PiecewiseCudaGraphRunner.capture()),
+            # set_pcg_capture_stream() guarantees a valid stream. However,
+            # Dynamo may silently recompile on HIP/MLA serving batches whose
+            # token count exceeds the captured range. The replacement backend
+            # has no capture stream; fall back there instead of crashing while
+            # preserving the original assertion on other platforms.
+            stream = get_pcg_capture_stream()
+            if _is_hip and stream is None:
+                print_warning_once(
+                    "PCG capture stream is not set; likely a Dynamo runtime "
+                    "recompilation. Falling back to eager execution for this "
+                    "subgraph."
+                )
+                return entry.runnable(*args)
+            assert (
+                stream is not None
+            ), "PCG capture stream is not set, please check if runtime recompilation happened"
 
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
@@ -166,10 +189,6 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                stream = get_pcg_capture_stream()
-                assert (
-                    stream is not None
-                ), "PCG capture stream is not set, please check if runtime recompilation happened"
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)

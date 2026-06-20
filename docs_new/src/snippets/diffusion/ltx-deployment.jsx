@@ -7,7 +7,7 @@ export const LTXDeployment = () => {
         { id: 'h200', label: '1x H200', subtitle: 'resident', default: true },
         { id: 'h200-2gpu', label: '2 GPUs', subtitle: 'CFG parallel', default: false },
         { id: 'h200-4gpu', label: '4 GPUs', subtitle: 'TP2 + CFG', default: false },
-        { id: 'standard', label: 'Standard CUDA', subtitle: 'Snapshot mode', default: false },
+        { id: 'standard', label: 'Standard CUDA', subtitle: 'Original mode', default: false },
         { id: 'official', label: 'Official Match', subtitle: 'Original switching', default: false },
       ],
     },
@@ -121,7 +121,7 @@ export const LTXDeployment = () => {
     if (values.hardware === 'official') {
       return 'original';
     }
-    return 'snapshot';
+    return 'original';
   };
 
   const getParallelFlags = () => {
@@ -141,7 +141,7 @@ export const LTXDeployment = () => {
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --pipeline-class-name ${pipelineClass}`;
     command += getParallelFlags();
-    if (values.pipeline !== 'one-stage') {
+    if (values.model === 'ltx23' && values.pipeline !== 'one-stage') {
       command += ` \\\n  --ltx2-two-stage-device-mode ${getDeviceMode()}`;
     }
 

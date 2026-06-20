@@ -71,20 +71,16 @@ def get_processor(
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""
     )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.utils.hf_transformers_utils import get_processor
 
-        return get_processor(pretrained_model_name_or_path)
-
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
-        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
+    from sglang.srt.utils.hf_transformers_utils import (
+        get_processor as _srt_get_processor,
     )
+
+    if not pretrained_model_name_or_path.endswith(
+        (".json", ".model")
+    ) and not os.path.exists(pretrained_model_name_or_path):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return _srt_get_processor(pretrained_model_name_or_path, trust_remote_code=True)
 
 
 def download_and_cache_hf_file(
@@ -118,13 +114,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))
