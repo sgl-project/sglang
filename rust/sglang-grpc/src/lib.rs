@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod msgpack;
 pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
