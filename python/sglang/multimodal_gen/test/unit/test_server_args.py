@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -793,6 +794,7 @@ class TestOffloadDefaults(unittest.TestCase):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
+        fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
@@ -805,6 +807,15 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
         self.assertTrue(mova_deployment.auto_dit_layerwise_offload)
+
+        self.assertEqual(
+            fast_hunyuan_deployment.auto_disable_component_offload_min_available_memory_gb,
+            150,
+        )
+        self.assertEqual(
+            fast_hunyuan_deployment.auto_disable_component_offload_components,
+            ("vae",),
+        )
 
         self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
@@ -1041,6 +1052,43 @@ class TestOffloadDefaults(unittest.TestCase):
             FastWan2_2_TI2V_5B_Config(),
             kwargs={
                 "model_path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_fast_hunyuan_high_memory_keeps_vae_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            FastHunyuanConfig(),
+            memory_gb=180,
+            available_memory_gb=170,
+            kwargs={
+                "model_path": "FastVideo/FastHunyuan-diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+
+    def test_auto_fast_hunyuan_low_memory_keeps_vae_layerwise(self):
+        args = self._from_dict_with_pipeline_config(
+            FastHunyuanConfig(),
+            memory_gb=140,
+            available_memory_gb=140,
+            kwargs={
+                "model_path": "FastVideo/FastHunyuan-diffusers",
                 "performance_mode": "auto",
             },
         )
