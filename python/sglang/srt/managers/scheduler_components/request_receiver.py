@@ -26,6 +26,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.ring_receiver import RingRequestReceiver
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -44,7 +45,9 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_tokenizer: Union[
+        zmq.Socket, ScriptedTokenizerRecvProxy, RingRequestReceiver
+    ]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -100,14 +103,22 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                # Rust ringbuffer backend: drain the in-process ring fed by the
+                # embedded Rust TokenizerManager instead of a zmq socket. Same
+                # non-blocking, msgpack-decoded contract as the zmq path below.
+                if isinstance(self.recv_from_tokenizer, RingRequestReceiver):
+                    recv_reqs.extend(
+                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                    )
+                else:
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
                 while True:
                     try:

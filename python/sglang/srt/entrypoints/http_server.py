@@ -2525,6 +2525,14 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
+    if envs.SGLANG_RUST_SERVER.get():
+        # The embedded Rust frontend (in the rank-0 scheduler process) serves
+        # HTTP, tokenization, and detokenization. The main process has no
+        # Python HTTP server / tokenizer manager to run — just keep it alive
+        # until the scheduler process exits.
+        scheduler_init_result.wait_for_completion()
+        return
+
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,

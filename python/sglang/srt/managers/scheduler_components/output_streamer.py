@@ -9,6 +9,7 @@ from typing import (
     Optional,
 )
 
+import msgspec
 import torch
 import zmq
 
@@ -43,7 +44,13 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # When SGLANG_RUST_SERVER is on, generation output is pushed into the
+    # embedded Rust egress ring (detokenizer shards) instead of the zmq
+    # detokenizer. None otherwise.
+    rust_server: Optional[Any] = None
     _test_stream_output_count: int = 0
+    # Per-rid chunk sequence counter for the Rust egress path.
+    _seq_id: dict = field(default_factory=dict)
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -160,7 +167,36 @@ class SchedulerOutputStreamer:
             has_reqs=bool(reqs),
         )
         if payload is not None:
-            self.send_to_detokenizer.send_output(payload)
+            if self.rust_server is not None:
+                self._push_generation_to_rust(payload)
+            else:
+                self.send_to_detokenizer.send_output(payload)
+
+    def _push_generation_to_rust(self, payload: BatchTokenIDOutput) -> None:
+        """Egress redirect for SGLANG_RUST_SERVER.
+
+        Fan the batch out into per-request ChunkEvents and push them into the
+        Rust egress ring (-> detokenizer shard -> client stream) instead of the
+        zmq detokenizer. ChunkEvent is encoded as a positional msgpack array
+        ``[rid, seq, token_ids, finish_reason]`` to match the Rust struct (which
+        rmp-serde decodes from an array). ``output_ids[i]`` is the incremental
+        new output tokens for this step; ``finished_reasons[i]`` is the finish
+        dict whose ``type`` becomes the chunk's finish reason.
+        """
+        output_ids = payload.output_ids or []
+        for i, rid in enumerate(payload.rids):
+            ids = output_ids[i] if i < len(output_ids) else None
+            token_ids = list(ids) if ids is not None else []
+            fr = payload.finished_reasons[i]
+            finish = fr.get("type") if isinstance(fr, dict) else None
+
+            seq = self._seq_id.get(rid, 0)
+            self._seq_id[rid] = seq + 1
+            chunk = msgspec.msgpack.encode([rid, seq, token_ids, finish])
+            if not self.rust_server.push_chunk(chunk):
+                logger.warning("Rust egress ring full; dropped chunk for %s", rid)
+            if finish is not None:
+                self._seq_id.pop(rid, None)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
