@@ -113,6 +113,7 @@ class CausalWanSelfAttention(nn.Module):
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
+            num_splits=0,
         )
 
     def forward(
@@ -183,6 +184,9 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
+            if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                return self.attn(roped_query, roped_key, v)
+
             head_slice = None
             if kv_cache.k.shape[2] != roped_key.shape[2]:
                 head_slice = slice(self.head_start, self.head_start + self.num_heads)

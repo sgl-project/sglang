@@ -370,6 +370,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        self.num_splits = int(extra_impl_args.get("num_splits", 1))
 
     def forward(
         self,
@@ -406,6 +407,7 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                num_splits=self.num_splits,
                 return_softmax_lse=return_softmax_lse,
                 ver=fa_ver,
             )
@@ -423,6 +425,7 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seqlen_k=max_seqlen_k,
                     softmax_scale=self.softmax_scale,
                     causal=self.causal,
+                    num_splits=self.num_splits,
                     return_softmax_lse=True,
                     ver=fa_ver,
                 )
@@ -437,6 +440,7 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                num_splits=self.num_splits,
                 return_softmax_lse=False,
                 ver=fa_ver,
             )

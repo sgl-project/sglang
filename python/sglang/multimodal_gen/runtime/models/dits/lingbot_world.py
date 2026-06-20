@@ -206,6 +206,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
+            num_splits=0,
         )
 
     def forward(
@@ -281,6 +282,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
+
+        if (
+            not sequence_shard_enabled
+            and not update_cache_only
+            and kv_cache.can_direct_current_attention(roped_key.shape[1])
+        ):
+            return self.attn(roped_query, roped_key, v)
 
         head_slice = None
         if kv_cache.k.shape[2] != roped_key.shape[2]:
