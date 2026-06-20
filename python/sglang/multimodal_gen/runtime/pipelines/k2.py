@@ -84,9 +84,8 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         """Resolve the K2 MMDiT to a list of safetensors shard paths.
 
         Handles a single ``.safetensors`` file, a local directory, and a Hugging
-        Face repo id (downloaded first). Within a directory it prefers the named
-        ``turbo``/``raw`` checkpoints, then discovers single or sharded weights in
-        a diffusers-style ``transformer/`` subfolder, then at the root.
+        Face repo id (downloaded first). Discovers single or sharded weights in a
+        diffusers-style ``transformer/`` subfolder, then at the root.
         """
         path = self.model_path
         if os.path.isfile(path) and path.endswith(".safetensors"):
@@ -94,21 +93,15 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         if not os.path.isdir(path):
             # HF repo id (or any non-local path): resolve to a local snapshot.
             path = maybe_download_model(path)
-        # Prefer the distilled turbo checkpoint, then the raw one, by name.
-        for name in ("turbo.safetensors", "raw.safetensors"):
-            candidate = os.path.join(path, name)
-            if os.path.isfile(candidate):
-                return [candidate]
-        # Otherwise discover all safetensors (single or sharded, via the index) in
-        # a diffusers-style transformer/ subfolder, then at the root.
+        # Discover all safetensors (single or sharded, via the index) in a
+        # diffusers-style transformer/ subfolder, then at the root.
         for sub in ("transformer", "."):
             files = _list_safetensors_files(os.path.join(path, sub))
             if files:
                 return files
         raise FileNotFoundError(
-            f"No K2 MMDiT safetensors found at {self.model_path} (looked for "
-            "turbo.safetensors / raw.safetensors, a transformer/ subfolder, and "
-            "*.safetensors at the root)."
+            f"No K2 MMDiT safetensors found at {self.model_path} (looked for a "
+            "transformer/ subfolder and *.safetensors at the root)."
         )
 
     def _resolve_repo_dir(self) -> str | None:
@@ -120,35 +113,6 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
         if not os.path.isdir(p):
             p = maybe_download_model(p)
         return p if os.path.isdir(p) else None
-
-    def _dit_load_error_hint(
-        self, dit_weights: list[str], model, exc: Exception
-    ) -> str:
-        """Build an actionable message when the strict DiT load fails.
-
-        Surfaces the checkpoint vs. model parameter naming so a renamed public
-        checkpoint can be fixed with a ``param_names_mapping`` entry.
-        """
-        ckpt_keys: list[str] = []
-        try:
-            from safetensors import safe_open
-
-            for f in dit_weights:
-                with safe_open(f, framework="pt") as sf:
-                    ckpt_keys.extend(sf.keys())
-        except Exception:
-            pass
-        model_keys = list(model.state_dict().keys())
-        only_ckpt = sorted(set(ckpt_keys) - set(model_keys))[:8]
-        only_model = sorted(set(model_keys) - set(ckpt_keys))[:8]
-        return (
-            f"Failed to load the K2 MMDiT from {dit_weights}: {exc}\n"
-            f"Checkpoint has {len(ckpt_keys)} tensors; the model expects "
-            f"{len(model_keys)} params. If the published checkpoint renamed "
-            "parameters, add a param_names_mapping in K2ArchConfig.\n"
-            f"  checkpoint-only keys (sample): {only_ckpt}\n"
-            f"  model-only keys (sample): {only_model}"
-        )
 
     def _load_transformer(self, server_args: ServerArgs):
         dit_weights = self._resolve_dit_weights()
@@ -182,7 +146,9 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         except Exception as exc:
             raise RuntimeError(
-                self._dit_load_error_hint(dit_weights, model, exc)
+                f"Failed to load the K2 MMDiT from {dit_weights}: {exc}. If a "
+                "published checkpoint renamed parameters, add a param_names_mapping "
+                "to K2ArchConfig."
             ) from exc
         for n, p in model.named_parameters():
             p.requires_grad = False
