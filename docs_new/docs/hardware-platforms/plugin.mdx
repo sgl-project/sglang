@@ -8,7 +8,7 @@ metatags:
 
 Allows hardware vendors and developers to extend SGLang **without modifying the main repository code**.
 
-The framework provides two plugin types, both discovered via Python's standard `setuptools` entry_points:
+The framework provides three plugin types, all discovered via Python's standard `setuptools` entry_points:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -30,6 +30,11 @@ The framework provides two plugin types, both discovered via Python's standard `
       <td>Register a custom hardware platform (device operations, KV cache pools, attention backends, graph capture, compilation backends, etc.)</td>
     </tr>
     <tr>
+      <td><strong>Startup Plugin</strong></td>
+      <td><code>sglang.srt.startup_plugins</code></td>
+      <td>Install minimal import-time compatibility shims before heavy worker modules are imported in spawned subprocesses</td>
+    </tr>
+    <tr>
       <td><strong>General Plugin</strong></td>
       <td><code>sglang.srt.plugins</code></td>
       <td>Inject hooks (before/after/around/replace) into any function/method, or replace entire classes</td>
@@ -41,7 +46,7 @@ The framework provides two plugin types, both discovered via Python's standard `
 
 - **Non-intrusive**: Existing CUDA/ROCm/NPU/XPU code remains unchanged. OOT code paths are added alongside existing hardware-specific logic.
 - **Zero configuration**: Plugins are automatically discovered after `pip install`, no sglang code changes required.
-- **Environment variable control**: `SGLANG_PLATFORM` selects or validates the active platform plugin; `SGLANG_PLUGINS` (comma-separated) controls which general plugins to load.
+- **Environment variable control**: `SGLANG_PLATFORM` selects or validates the active platform plugin; `SGLANG_PLUGINS` (comma-separated) controls which startup and general plugins to load.
 
 ### Current Scope & Future Direction
 
@@ -95,7 +100,26 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
 
 ### Plugin Loading Flow
 
-`load_plugins()` discovers and executes general plugins, then applies all registered hooks. It is called at four points:
+SGLang has two plugin loading phases:
+
+1. `load_startup_plugins()` discovers and executes startup plugins. These run before `server_args` pulls in platform-sensitive modules in the main process, and before heavy worker modules are imported in spawned subprocesses, so they are the right place for minimal import-time compatibility shims.
+2. `load_plugins()` first calls `load_startup_plugins()`, then discovers and executes general plugins, then applies all registered hooks. These run before hookable runtime objects are constructed.
+
+Startup plugins are loaded through a lightweight subprocess bootstrap target:
+
+```
+mp.Process(
+    target=run_subprocess_target,
+    args=("sglang.srt.managers.scheduler:run_scheduler_process", ...),
+)
+
+run_subprocess_target()
+  ├── load_startup_plugins()                  → run early import-time shims
+  ├── importlib.import_module(real_module)     → import the heavy worker module
+  └── real_function(*args, **kwargs)
+```
+
+`load_plugins()` is called at these points:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -112,12 +136,12 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
   </thead>
   <tbody>
     <tr>
-      <td><code>cli/serve.py</code> serve()</td>
-      <td>Main</td>
-      <td>Before <code>prepare_server_args()</code></td>
+      <td><code>server_args.py</code> module import</td>
+      <td>Main / worker</td>
+      <td>Before platform-sensitive <code>server_args</code> dependencies are imported</td>
     </tr>
     <tr>
-      <td><code>launch_server.py</code> <code>__main__</code></td>
+      <td><code>cli/serve.py</code> serve()</td>
       <td>Main</td>
       <td>Before <code>prepare_server_args()</code></td>
     </tr>
@@ -131,19 +155,47 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
       <td>Subprocess</td>
       <td>Before <code>Scheduler()</code> construction</td>
     </tr>
+    <tr>
+      <td><code>ray/scheduler_actor.py</code> <code>SchedulerActor.__init__()</code></td>
+      <td>Ray actor</td>
+      <td>Before scheduler module import and <code>Scheduler()</code> construction</td>
+    </tr>
+    <tr>
+      <td><code>data_parallel_controller.py</code> <code>run_data_parallel_controller_process()</code></td>
+      <td>Subprocess</td>
+      <td>Before <code>DataParallelController()</code> construction</td>
+    </tr>
+    <tr>
+      <td><code>detokenizer_manager.py</code> <code>run_detokenizer_process()</code></td>
+      <td>Subprocess</td>
+      <td>Before <code>DetokenizerManager()</code> construction</td>
+    </tr>
+    <tr>
+      <td><code>multi_tokenizer_mixin.py</code> <code>run_multi_detokenizer_router_process()</code></td>
+      <td>Subprocess</td>
+      <td>Before <code>MultiDetokenizerRouter()</code> construction</td>
+    </tr>
   </tbody>
 </table>
 
-> **Note**: `load_plugins()` is idempotent (guarded by `_plugins_loaded` flag). In spawn'd subprocesses the flag resets, so plugins are correctly re-loaded.
+> **Note**: `load_startup_plugins()` and `load_plugins()` are idempotent (guarded by per-process flags). In spawn'd subprocesses and Ray actors the flags reset, so plugins are correctly re-loaded.
+>
+> **Note**: `SGLANG_PLUGINS` filters both startup and general plugin groups. If you set it, include any startup plugin names required by your selected platform, otherwise early import-time shims may be skipped.
 
 ```
+load_startup_plugins()
+  ├── _get_excluded_dists()                             → compute dists to skip (via SGLANG_PLATFORM)
+  └── load_plugins_by_group("sglang.srt.startup_plugins", → discover entry_points, filter by SGLANG_PLUGINS
+        excluded_dists=..., raise_on_load_error=True)      skip plugins from unselected platform packages
+
 load_plugins()
-  ├── _get_excluded_dists()                       → compute dists to skip (via SGLANG_PLATFORM)
-  ├── load_plugins_by_group("sglang.srt.plugins",     → discover entry_points, filter by SGLANG_PLUGINS
-  │     excluded_dists=...)                          skip plugins from unselected platform packages
-  ├── for each plugin:                            → set _current_plugin_source context var
-  │     func()                                      side effects (register hooks with source tracking)
-  └── HookRegistry.apply_hooks()                  → monkey-patch targets
+  ├── load_startup_plugins()                            → ensure import-time shims are installed first
+  ├── _get_excluded_dists()                             → compute dists to skip (via SGLANG_PLATFORM)
+  ├── load_plugins_by_group("sglang.srt.plugins",       → discover entry_points, filter by SGLANG_PLUGINS
+  │     excluded_dists=...)                                skip plugins from unselected platform packages
+  ├── for each plugin:                                  → set _current_plugin_source context var
+  │     func()                                            side effects (register hooks with source tracking)
+  └── HookRegistry.apply_hooks()                        → monkey-patch targets
 ```
 
 ---
@@ -592,18 +644,62 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
   <tbody>
     <tr>
       <td><code>SGLANG_PLATFORM</code></td>
-      <td>Select the platform plugin by entry_point name (e.g. <code>kunlun</code>, <code>demo_cuda</code>). When set, <strong>only</strong> the named plugin's <code>activate()</code> is called (front-loading filter) — other plugins are not touched. Additionally, general plugins (<code>sglang.srt.plugins</code>) from unselected platform packages are automatically skipped to avoid importing their dependencies. Required when multiple plugins would activate. Errors if the name is not found or if the plugin's hardware is unavailable.</td>
+      <td>Select the platform plugin by entry_point name (e.g. <code>kunlun</code>, <code>demo_cuda</code>). When set, <strong>only</strong> the named plugin's <code>activate()</code> is called (front-loading filter) — other platform plugins are not touched. Additionally, startup/general plugins from unselected platform packages are automatically skipped to avoid importing their dependencies. Required when multiple plugins would activate. Errors if the name is not found or if the plugin's hardware is unavailable.</td>
     </tr>
     <tr>
       <td><code>SGLANG_PLUGINS</code></td>
-      <td>Comma-separated whitelist of general plugin names to load (group: <code>sglang.srt.plugins</code>). If unset, all discovered general plugins are loaded.</td>
+      <td>Comma-separated whitelist of startup/general plugin names to load (groups: <code>sglang.srt.startup_plugins</code>, <code>sglang.srt.plugins</code>). If unset, all discovered startup/general plugins are loaded.</td>
     </tr>
   </tbody>
 </table>
 
 ---
 
-## Plugin Type 2: General Plugin
+## Plugin Type 2: Startup Plugin
+
+### Description
+
+Startup plugins install minimal import-time compatibility shims before worker modules are imported. They are intended for cases where importing a scheduler, detokenizer, or other worker module would otherwise fail before a normal runtime hook can run.
+
+Startup plugins should stay small and avoid importing heavyweight runtime modules. They do not apply `HookRegistry` hooks; use general plugins for runtime behavior changes.
+
+### Quick Start
+
+**1. Create a minimal package:**
+
+```
+my_startup_plugin/
+├── pyproject.toml
+└── my_startup_plugin/
+    └── __init__.py    # startup() function
+```
+
+**2. `pyproject.toml`:**
+
+```toml
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-startup-plugin"
+version = "0.1.0"
+
+[project.entry-points."sglang.srt.startup_plugins"]
+my_startup_plugin = "my_startup_plugin:startup"
+```
+
+**3. `__init__.py`** — install import-time shims:
+
+```python
+def startup():
+    """Entry point called by load_startup_plugins()."""
+    install_minimal_import_time_shims()
+```
+
+---
+
+## Plugin Type 3: General Plugin
 
 ### Description
 
@@ -847,7 +943,11 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
     </tr>
     <tr>
       <td><code>sglang/srt/plugins/__init__.py</code></td>
-      <td><code>load_plugins()</code> + <code>load_plugins_by_group()</code></td>
+      <td><code>load_startup_plugins()</code>, <code>load_plugins()</code>, and <code>load_plugins_by_group()</code></td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/utils/subprocess_bootstrap.py</code></td>
+      <td>Lazy subprocess target wrapper that runs startup plugins before importing heavy worker modules</td>
     </tr>
     <tr>
       <td><code>sglang/srt/plugins/hook_registry.py</code></td>

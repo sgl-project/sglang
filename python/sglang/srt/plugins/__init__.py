@@ -1,12 +1,14 @@
 """
 SGLang Unified Plugin Framework.
 
-Supports two types of plugins via setuptools entry_points:
+Supports three types of plugins via setuptools entry_points:
 1. Hardware Platform Plugins (sglang.srt.platforms) - register custom hardware platforms
-2. General Plugins (sglang.srt.plugins) - inject hooks into functions/methods, replace classes, etc.
+2. Startup Plugins (sglang.srt.startup_plugins) - install early import-time shims
+3. General Plugins (sglang.srt.plugins) - inject hooks into functions/methods, replace classes, etc.
 
 Plugins are discovered automatically when installed via pip.
 - Platform plugins: use ``SGLANG_PLATFORM`` to select when multiple are installed.
+- Startup plugins: run before heavy worker imports and are filtered by platform.
 - General plugins: use ``SGLANG_PLUGINS`` (comma-separated) to restrict which are loaded.
 """
 
@@ -26,15 +28,19 @@ logger = logging.getLogger(__name__)
 
 # Entry point group names
 PLATFORM_PLUGINS_GROUP = "sglang.srt.platforms"
+STARTUP_PLUGINS_GROUP = "sglang.srt.startup_plugins"
 GENERAL_PLUGINS_GROUP = "sglang.srt.plugins"
 
 # Guard against multiple loads in the same process
+_startup_plugins_loaded = False
 _plugins_loaded = False
 
 
 def load_plugins_by_group(
     group: str,
     excluded_dists: set[str] | None = None,
+    *,
+    raise_on_load_error: bool = False,
 ) -> dict[str, tuple[Callable[[], Any], str | None]]:
     """
     Discover and load plugins registered under the given entry point group.
@@ -44,6 +50,7 @@ def load_plugins_by_group(
         excluded_dists: Distribution names to skip. Plugins from these
             distributions are never ``ep.load()``-ed (avoids importing
             their modules and pulling hardware-specific dependencies).
+        raise_on_load_error: Whether to propagate ``ep.load()`` failures.
 
     Returns:
         Dictionary mapping plugin name to ``(callable, dist_name)``.
@@ -82,6 +89,8 @@ def load_plugins_by_group(
             logger.info("Loaded plugin %s from group %s", ep.name, group)
         except Exception:
             logger.exception("Failed to load plugin %s from group %s", ep.name, group)
+            if raise_on_load_error:
+                raise
 
     return plugins
 
@@ -100,6 +109,39 @@ def _get_excluded_dists() -> set[str]:
     return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
 
 
+def load_startup_plugins():
+    """
+    Load and execute startup plugins.
+
+    Idempotent - safe to call multiple times. Startup plugins are intended for
+    minimal import-time compatibility shims that must run before heavy SRT
+    worker modules are imported. They do not apply HookRegistry hooks; use
+    general plugins for runtime hook registration.
+
+    When ``SGLANG_PLATFORM`` is set, startup plugins from unselected platform
+    packages are automatically skipped (avoids pulling their dependencies).
+    """
+    global _startup_plugins_loaded
+    if _startup_plugins_loaded:
+        return
+
+    plugins = load_plugins_by_group(
+        STARTUP_PLUGINS_GROUP,
+        excluded_dists=_get_excluded_dists(),
+        raise_on_load_error=True,
+    )
+
+    for name, (func, _) in plugins.items():
+        try:
+            func()
+            logger.info("Executed startup plugin: %s", name)
+        except Exception:
+            logger.exception("Failed to execute startup plugin: %s", name)
+            raise
+
+    _startup_plugins_loaded = True
+
+
 def load_plugins():
     """
     Load and execute all general plugins, then apply registered hooks.
@@ -107,6 +149,9 @@ def load_plugins():
     Idempotent - safe to call multiple times. General plugins are functions
     whose side effects (registering hooks, replacing classes, etc.) are the
     desired behavior. Return values are ignored.
+
+    Startup plugins are loaded first, so callers that only need the general
+    plugin phase still get import-time compatibility shims before runtime hooks.
 
     When ``SGLANG_PLATFORM`` is set, general plugins from unselected platform
     packages are automatically skipped (avoids pulling their dependencies).
@@ -119,6 +164,9 @@ def load_plugins():
     global _plugins_loaded
     if _plugins_loaded:
         return
+
+    load_startup_plugins()
+
     _plugins_loaded = True
 
     plugins = load_plugins_by_group(

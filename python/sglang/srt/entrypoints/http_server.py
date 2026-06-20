@@ -69,10 +69,11 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
+    DEFAULT_DETOKENIZER_TARGET,
+    DEFAULT_SCHEDULER_TARGET,
     Engine,
+    SubprocessTarget,
     init_tokenizer_manager,
-    run_detokenizer_process,
-    run_scheduler_process,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -2459,8 +2460,8 @@ def _setup_and_run_http_server(
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
-    run_scheduler_process_func: Callable = run_scheduler_process,
-    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    run_scheduler_process_func: SubprocessTarget = DEFAULT_SCHEDULER_TARGET,
+    run_detokenizer_process_func: SubprocessTarget = DEFAULT_DETOKENIZER_TARGET,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
