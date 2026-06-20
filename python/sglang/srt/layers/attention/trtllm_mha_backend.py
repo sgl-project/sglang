@@ -412,7 +412,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if (
+        # The shared max-bs buffers (decode_cuda_graph_metadata,
+        # target_verify_metadata, draft_extend_metadata) are sized at
+        # cuda-graph max_bs from init_static_metadata_buffers. If max_running_
+        # requests > cuda_graph_max_bs_decode and the runner dispatches eager,
+        # the [:bs] slicing below truncates and metadata.cache_seqlens_int32.
+        # copy_(seq_lens) size-mismatches. Force oversized eager onto the
+        # fresh per-iter else branch (which already handles plain extend).
+        cache_seqlens_buf = self.decode_cuda_graph_metadata.get("cache_seqlens")
+        bs_fits_buffer = (
+            cache_seqlens_buf is not None and bs <= cache_seqlens_buf.shape[0]
+        )
+        if bs_fits_buffer and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or (
@@ -425,8 +436,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # allocates them once). Storage is stable across iters so cuda
             # graph data_ptrs stay valid — capture, replay, and eager all
             # execute this single body. Eager draft_extend_v2 at a non-
-            # captured bs falls through to the fresh per-iter branch so
-            # the layout follows live extend_seq_lens.
+            # captured bs (or oversized eager bs above the buffer ceiling)
+            # falls through to the fresh per-iter branch so the layout
+            # follows live extend_seq_lens.
             seq_lens = forward_batch.seq_lens[:bs]
             seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
             req_pool_indices = forward_batch.req_pool_indices[:bs]
