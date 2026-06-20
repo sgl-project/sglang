@@ -454,6 +454,13 @@ class DeepseekV4AttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        # Keep a back-reference to model_runner so OnlineC128MTPController and
+        # other helpers can reach `self.backend.model_runner.model.model.layers`
+        # without re-plumbing the runner through every call. The use_bound
+        # seam refactor inadvertently dropped this assignment; reinstating it
+        # is required for SGLANG_EXPERIMENTAL_ONLINE_C128_MTP target verify to
+        # build per-layer compress state.
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
         assert (
