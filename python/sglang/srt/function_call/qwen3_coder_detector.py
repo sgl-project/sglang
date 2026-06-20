@@ -1,6 +1,7 @@
 import ast
 import json
 import logging
+import math
 import re
 from typing import Any, List, Optional
 
@@ -11,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import is_json_finite
 
 logger = logging.getLogger(__name__)
 
@@ -127,19 +129,23 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
+            maybe_convert = (
+                False if "." in param_value or "e" in param_value.lower() else True
+            )
             try:
-                maybe_convert = (
-                    False if "." in param_value or "e" in param_value.lower() else True
-                )
-                param_value: float = float(param_value)
-                if maybe_convert and param_value.is_integer():
-                    param_value = int(param_value)
+                converted = float(param_value)
             except Exception:
+                converted = math.nan
+            # Reject inf/-inf/nan: they serialize to invalid JSON (Infinity/NaN).
+            if not math.isfinite(converted):
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a finite float in tool "
                     f"'{func_name}', degenerating to string."
                 )
-            return param_value
+                return param_value
+            if maybe_convert and converted.is_integer():
+                return int(converted)
+            return converted
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
             if param_value not in ["true", "false"]:
@@ -154,20 +160,36 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 or param_type.startswith("list")
             ):
                 try:
-                    param_value = json.loads(param_value)
-                    return param_value
+                    parsed = json.loads(param_value)
                 except Exception:
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
                     )
+                else:
+                    # Reject e.g. json.loads("[1e999]") -> [inf] (invalid JSON).
+                    if not is_json_finite(parsed):
+                        logger.warning(
+                            f"Parsed value '{param_value}' of parameter '{param_name}' is a non-finite number in tool "
+                            f"'{func_name}', degenerating to string."
+                        )
+                        return param_value
+                    return parsed
             try:
-                param_value = ast.literal_eval(param_value)  # safer
+                parsed = ast.literal_eval(param_value)  # safer
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
                 )
-            return param_value
+                return param_value
+            # ast.literal_eval accepts non-JSON literals (e.g. "(1e999,)") that
+            # can still yield a non-finite number; reject it like json.loads.
+            if not is_json_finite(parsed):
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is a non-finite number in tool '{func_name}', degenerating to string."
+                )
+                return param_value
+            return parsed
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
