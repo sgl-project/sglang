@@ -1733,6 +1733,43 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         # The tool name is still recovered despite the malformed partial value.
         self.assertEqual(names, {0: "run"})
 
+    def test_streaming_increment_error_does_not_leak_dsml_markup(self):
+        """Fail-safe for the outer handler: if anything inside
+        parse_streaming_increment raises while the buffer still holds tool-call
+        markup, the detector must NOT dump the raw DSML buffer into normal_text.
+        Doing so leaks the markers into user content AND -- because _buffer is
+        retained across increments -- re-emits the whole buffer on every
+        subsequent chunk, ballooning the response to the output-token cap
+        (observed downstream with tool_calls empty / finish_reason=stop). It
+        must emit empty normal_text and keep buffering instead.
+        """
+        run_tool = Tool(
+            type="function",
+            function=Function(
+                name="run",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": "object"}},
+                },
+            ),
+        )
+        detector = DeepSeekV32Detector()
+        # Force an unexpected failure inside the try block while the buffer
+        # holds DSML markup, exercising the outer except fail-safe directly
+        # (independent of which specific payload triggers it).
+        detector._parse_parameters_from_xml = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        result = detector.parse_streaming_increment(
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="run">\n'
+            '<｜DSML｜parameter name="code" string="false">{"ops":[',
+            [run_tool],
+        )
+        # No raw markup leaked, and the markup is kept buffered (not dropped)
+        # so a still-arriving invoke can complete on a later chunk.
+        self.assertEqual(result.normal_text, "")
+        self.assertIn("｜DSML｜", detector._buffer)
+
     def test_self_closing_zero_arg_invoke(self):
         """V32 inherits the same regex; verify self-closing parses to empty
         params here too (V32 model rarely emits this shape, but the parser
