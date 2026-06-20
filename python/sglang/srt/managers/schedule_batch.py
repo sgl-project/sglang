@@ -1423,13 +1423,19 @@ class Req(ReqDllmMixin):
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
-
+        # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
+        # A stop string takes precedence over a stop/EOS token matched in the same
+        # step: run it before _check_token_based_finish, otherwise a single decode
+        # that accepts both (e.g. speculative decoding accepting >1 token) finishes
+        # as FINISH_MATCHED_TOKEN and trims only the last token, leaking the stop
+        # string into the output.
         if self._check_str_based_finish(new_accepted_len):
+            return
+
+        if self._check_token_based_finish(new_accepted_tokens):
             return
 
     def reset_for_retract(self):
