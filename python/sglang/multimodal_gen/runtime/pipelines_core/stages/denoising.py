@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Callable
@@ -108,6 +107,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_mode,
+)
 from sglang.multimodal_gen.utils import dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
@@ -329,11 +331,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             except ImportError:
                 pass
             dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                dit_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
-            )
+            mode = resolve_torch_compile_mode(dit_config)
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
 

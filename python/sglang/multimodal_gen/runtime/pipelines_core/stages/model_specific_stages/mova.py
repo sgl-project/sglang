@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 
 import torch
 import torch.nn as nn
@@ -32,6 +31,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_sp_parallel_rank,
     get_sp_world_size,
+)
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_mode,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 
@@ -271,11 +273,7 @@ class MOVADenoisingStage(PipelineStage):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                model_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
-            )
+            mode = resolve_torch_compile_mode(model_config)
             compile_kwargs["mode"] = mode
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 

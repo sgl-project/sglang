@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_mode,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -617,11 +620,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         ).to(self.device)
         if server_args.enable_torch_compile:
             dit_config = getattr(server_args.pipeline_config, "dit_config", None)
-            compile_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                dit_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
-            )
+            compile_mode = resolve_torch_compile_mode(dit_config)
             logger.info("Compiling paint transformer with mode: %s", compile_mode)
             self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)
 
