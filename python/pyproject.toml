@@ -17,7 +17,7 @@ classifiers = [
 dependencies = [
   "IPython",
   "aiohttp",
-  "apache-tvm-ffi==0.1.9",
+  "apache-tvm-ffi>=0.1.9,<0.2",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "build",
