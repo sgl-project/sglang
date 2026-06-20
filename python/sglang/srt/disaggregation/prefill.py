@@ -26,6 +26,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
@@ -60,6 +61,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -404,14 +406,54 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
+        """Resolve bootstrap status for waiting prefill requests before admission.
+
+        Covers the window between leaving the bootstrap queue and being admitted
+        into a running batch: aborts requests whose decode peer died, and
+        finalizes optimistic requests whose bootstrap completed so they skip
+        the post-forward bootstrap check.
+        """
+        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        if not candidates:
+            return
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in candidates],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        failed = set()
+        for req, poll in zip(candidates, polls):
+            if poll == KVPoll.Failed:
+                self.handle_bootstrap_failure(req)
+                failed.add(req)
+            elif (
+                poll == KVPoll.WaitingForInput
+                and req.pending_bootstrap
+                and not should_force_retry(req)
+            ):
+                # Optimistic requests reserved a metadata buffer when popped, so
+                # finalize cannot fail here; if it ever does, the request stays
+                # pending and the post-forward check resolves it.
+                self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+        if failed:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in failed
+            ]
+
+    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         self.running_batch.batch_is_full = False
 
         self.process_prefill_chunk()
+
+        self.resolve_waiting_queue_bootstrap()
 
         batch = self.get_new_batch_prefill()
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -991,6 +1033,19 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _swa_ring_payload():
+                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
+                # for the last `window` positions, in ascending position order so
+                # decode (its own req_pool_idx) matches positionally.
+                _pool = self.token_to_kv_pool_allocator.get_kvcache()
+                ring_stride = _pool.unified_swa_ring_size
+                window_size = _pool.unified_swa_window
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
+                state_slot = int(req.req_pool_idx)
+                ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                return ring_rows.astype(np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1002,6 +1057,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
                 else:
                     state_indices.append(None)
 

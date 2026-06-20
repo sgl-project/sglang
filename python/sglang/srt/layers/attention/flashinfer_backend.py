@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
@@ -24,10 +26,6 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_size,
-    get_attention_tp_size,
-)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -40,7 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -67,9 +65,9 @@ def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
     if require_gathered_buffer(server_args):
-        mul_base *= get_attention_tp_size()
-    if mul_base % get_attention_cp_size() != 0:
-        mul_base *= get_attention_cp_size()
+        mul_base *= get_parallel().attn_tp_size
+    if mul_base % get_parallel().attn_cp_size != 0:
+        mul_base *= get_parallel().attn_cp_size
     return (max_bs + mul_base - 1) // mul_base * mul_base
 
 
@@ -208,9 +206,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_attention_tp_size(),
+            // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
+                get_parallel().attn_tp_size
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
@@ -556,7 +554,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -627,24 +625,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
-            )
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged,
-                False,
-                False,
-                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -812,11 +792,7 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-        elif (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-            or forward_mode.is_dllm_extend()
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
                 forward_mode.is_target_verify()
                 and spec_info is not None
@@ -1027,10 +1003,10 @@ class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
@@ -1295,10 +1271,10 @@ class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
@@ -1328,7 +1304,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1346,7 +1322,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1356,6 +1332,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
+            assert prefix_lens is not None
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
             # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
@@ -1387,7 +1364,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1396,6 +1373,18 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
+        if prefix_lens is None:
+            num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
+            prefix_lens = (
+                seq_lens
+                if num_accept_tokens is None
+                else seq_lens
+                - num_accept_tokens[: seq_lens.shape[0]].to(
+                    device=seq_lens.device, dtype=seq_lens.dtype
+                )
+            )
+        sliding_window_size = self.sliding_window_size
+        assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
             if wrapper_id == 0:
@@ -1404,7 +1393,7 @@ class FlashInferIndicesUpdaterPrefill:
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens
                     # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
                     effective_start = torch.clamp(
-                        prefix_lens - self.sliding_window_size, min=0
+                        prefix_lens - sliding_window_size, min=0
                     )
                     paged_kernel_lens = prefix_lens - effective_start
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -1416,7 +1405,7 @@ class FlashInferIndicesUpdaterPrefill:
                     # window attention use paged only
                     paged_kernel_lens = torch.minimum(
                         seq_lens,
-                        torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                        sliding_window_size + seq_lens - prefix_lens,
                     )
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
@@ -1495,7 +1484,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1544,7 +1533,7 @@ class FlashInferIndicesUpdaterPrefill:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
@@ -1557,6 +1546,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         if spec_info is None:
+            assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1581,14 +1571,25 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                        kv_start_idx=kv_start_idx,
+                    )
                 )
-            )
+            else:
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                    )
+                )
 
         # extend part
         if use_ragged:
