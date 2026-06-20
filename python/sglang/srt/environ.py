@@ -251,6 +251,7 @@ class Envs:
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -474,6 +475,7 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -643,6 +645,11 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
+    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # extend_attention_fwd for unsupported cases or when set false (e.g. for
+    # debugging). Correctness is unaffected; this only changes performance.
+    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -707,9 +714,6 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
-
-    # HTTP/2 Server
-    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)

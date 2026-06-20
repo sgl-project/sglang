@@ -31,6 +31,8 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.runtime_context import get_parallel
+
 try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -81,8 +83,6 @@ except ImportError:
 
 from sglang.jit_kernel.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1165,6 +1165,13 @@ def _mask_topk_ids_padded_region(
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
+    elif _is_npu:
+        # On NPU, bool-indexed scatter `topk_ids[bool_mask, :] = -1` lowers
+        # to aclnnNonzeroV2 and can trigger an aicore timeout under long
+        # workloads; `torch.where` avoids that nonzero scan.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        mask = (indices >= num_token_non_padded).unsqueeze(-1)
+        topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value
@@ -1484,8 +1491,8 @@ def _remap_topk_for_deepep(
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
 
-    ep_size = get_moe_expert_parallel_world_size()
-    ep_rank = get_moe_expert_parallel_rank()
+    ep_size = get_parallel().moe_ep_size
+    ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
     # DeepEP interleaved layout must use the physical routed count.
@@ -1569,17 +1576,18 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
+        # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
+        # (negative indices cause illegal memory access). Always fill the padded
+        # region with 0 so every kernel sees a valid in-range expert id.
+        # Routing weights for padded tokens are zeroed below so their
+        # contribution to the hidden state is still zero regardless of the id.
+        # Regression: skipping this mask when EPLB is disabled caused garbage
+        # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
-        # the map is identity, and indexing it here is both unnecessary and not
-        # well-defined for the dp-attention padded region of topk_ids; skip it.
-        # ``--ep-dispatch-algorithm fake`` is a routing benchmark artifact and
-        # does not by itself require remapping.
+        # the map is identity so the remap can be skipped safely.
         if _eplb_remap_enabled():
-            # Mask the padded region to a valid in-range id (0) before the
-            # gather so it never indexes the dispatch map out of bounds. -1 is
-            # not used here: the aiter MoE kernels do not handle topk_ids=-1.
-            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
