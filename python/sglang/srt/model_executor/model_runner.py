@@ -878,6 +878,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
+            self.kernel_warmup()
+            self._pre_initialize_flashinfer_allreduce_workspace()
+            self.init_device_graphs()
+            self.maybe_init_gdn_recovery_prewarm()
         elif self.device == "cpu":
             self.init_attention_backend()
         elif self.device == "npu":
@@ -2512,6 +2516,104 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     module.init_buffers(
                         self.max_running_requests, chunked_prefill_size, self.device
                     )
+
+    def maybe_init_gdn_recovery_prewarm(self):
+        """Pre-JIT the FlashInfer GDN MTP recovery kernel for all B-padded variants.
+
+        B-padding in _no_cache_mtp_recompute() rounds batch size up to the next
+        power-of-2 (max 10 values: 1,2,4,...,512) so the CuTe DSL JIT sees at most
+        10 × T_max distinct (B, T) keys.  Without this prewarm, the first request
+        at each new padded-B triggers a ~37s compilation stall.
+        """
+        import time
+
+        if self.device != "cuda":
+            return
+        if self.is_draft_worker:
+            return
+        T_max = self.server_args.speculative_num_draft_tokens
+        if T_max is None:
+            return
+
+        try:
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+            )
+
+            if not isinstance(self.attn_backend, HybridLinearAttnBackend):
+                return
+            linear_be = self.attn_backend.linear_attn_backend
+            dispatcher = getattr(linear_be, "kernel_dispatcher", None)
+            decode_kernel = getattr(dispatcher, "decode_kernel", None)
+            if (
+                decode_kernel is None
+                or decode_kernel.__class__.__name__ != "FlashInferGDNKernel"
+                or not getattr(decode_kernel, "use_state_pool", False)
+            ):
+                return
+
+            pool = linear_be.req_to_token_pool
+            mamba_pool = getattr(pool, "mamba_pool", None)
+            if mamba_pool is None or mamba_pool.mamba_cache is None:
+                return
+
+            # state_source shape: [pool_size+1, H, V, K] (CUDA, no transpose)
+            state_source = mamba_pool.mamba_cache.temporal[0]
+            if state_source.numel() == 0:
+                return
+            H = state_source.shape[1]  # num_heads_local
+            V = state_source.shape[2]  # head_v_dim
+            K = state_source.shape[3]  # head_k_dim
+            dev = state_source.device
+            ssm_dtype = state_source.dtype
+
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp,
+            )
+
+            _PAD_BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+            n_variants = len(_PAD_BS) * T_max
+            logger.info(
+                f"Pre-warming GDN recovery JIT: {len(_PAD_BS)} B_pad × {T_max} T "
+                f"= {n_variants} variants (~{n_variants * 37 / 60:.0f} min est.)"
+            )
+            tic = time.perf_counter()
+
+            # Dummy index 0 writes to slot 0 (reserved dummy) and is harmless.
+            for B_pad in _PAD_BS:
+                for T in range(1, T_max + 1):
+                    dummy_idx = torch.zeros(B_pad, dtype=torch.int32, device=dev)
+                    dummy_acc = torch.zeros(B_pad, dtype=torch.int32, device=dev)
+                    dummy_k = torch.zeros(B_pad, T, H, K, dtype=ssm_dtype, device=dev)
+                    dummy_v = torch.zeros(B_pad, T, H, V, dtype=ssm_dtype, device=dev)
+                    dummy_a = torch.zeros(B_pad, T, H, dtype=ssm_dtype, device=dev)
+                    dummy_b = torch.zeros(B_pad, T, H, dtype=ssm_dtype, device=dev)
+                    dummy_A_log = torch.zeros(H, dtype=torch.float32, device=dev)
+                    dummy_dt_bias = torch.zeros(H, dtype=ssm_dtype, device=dev)
+                    gated_delta_rule_mtp(
+                        A_log=dummy_A_log,
+                        a=dummy_a,
+                        dt_bias=dummy_dt_bias,
+                        q=dummy_k,
+                        k=dummy_k,
+                        v=dummy_v,
+                        b=dummy_b,
+                        initial_state_source=state_source,
+                        initial_state_indices=dummy_idx,
+                        output_state_indices=dummy_idx,
+                        accepted_steps=dummy_acc,
+                        disable_state_update=False,
+                        disable_output=True,
+                        use_qk_l2norm_in_kernel=True,
+                        scale=None,
+                        output=None,
+                    )
+
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - tic
+            logger.info(f"GDN recovery JIT pre-warm done in {elapsed:.1f}s")
+        except Exception as e:
+            logger.warning(f"GDN recovery JIT pre-warm skipped: {e}")
 
     def maybe_update_ngram_token_table(
         self,

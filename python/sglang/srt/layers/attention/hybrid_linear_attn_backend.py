@@ -1067,9 +1067,89 @@ class HybridLinearAttnBackend(AttentionBackend):
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
         accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
 
+        # On SM100+ with a bf16 state pool, recover via the FlashInfer MTP kernel
+        # (PR #3502). Otherwise fall back to the Triton recurrence kernel.
+        dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
+        decode_kernel = getattr(dispatcher, "decode_kernel", None)
+        use_fi_recovery = (
+            decode_kernel is not None
+            and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
+            and getattr(decode_kernel, "use_state_pool", False)
+        )
+
         # One launch per GDN layer. Factored into a closure so it can run either
         # inline (CUDA graph capture) or on the side stream (eager overlap).
         def _run_recovery():
+            if use_fi_recovery:
+                import bisect
+
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp,
+                )
+
+                B, T = batch_size, cache_steps
+                # Round B up to the next power-of-2 in [1, 2, 4, ..., 512] so the
+                # CuTe DSL JIT sees at most 10 distinct B values across all batches.
+                # Without padding each unique scheduler batch size triggers a ~37s
+                # recompilation; with padding the prewarm at startup covers all cases.
+                _PAD_BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+                pi = bisect.bisect_left(_PAD_BS, B)
+                B_pad = _PAD_BS[pi] if pi < len(_PAD_BS) else B
+                n_extra = B_pad - B
+                if n_extra > 0:
+                    # Padding rows use accepted_steps=0 and state_idx=0 (slot 0 is the
+                    # reserved dummy slot). With accepted_steps=0 the kernel sets
+                    # loop_limit=0 for those rows — it reads no stash data and writes
+                    # h_0 (= initial dummy state) back to slot 0.  The stash tensors
+                    # are already allocated to max_tokens = pool_size × T_max, so
+                    # viewing B_pad × T elements is always in-bounds and avoids any
+                    # cat / zero-fill kernels on the side stream.
+                    _z = accepted_steps_i32.new_zeros(n_extra)
+                    acc_steps_pad = torch.cat([accepted_steps_i32, _z])
+                    state_idx_pad = torch.cat([state_idx_i32, _z])
+                    actual_seq_len_pad = B_pad * T
+                else:
+                    acc_steps_pad = accepted_steps_i32
+                    state_idx_pad = state_idx_i32
+                    actual_seq_len_pad = actual_seq_len
+                # PR-3502 API: pass accepted_steps [B] int32 directly so the
+                # kernel handles per-sequence step counts on the GPU.  One call
+                # per layer (45 total) instead of 4-groups × 45 layers = 180.
+                # disable_output=True: state-only recovery, output is discarded.
+                for layer_id, stash in stash_per_layer.items():
+                    layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
+                    # Zero-copy views: no cat or zero-fill GPU kernels are launched.
+                    # Rows B..B_pad-1 may contain stale data but are never read by
+                    # the kernel when their accepted_steps entry is 0.
+                    k_bat = stash["k"][0, :actual_seq_len_pad].view(
+                        B_pad, T, stash["k"].shape[2], stash["k"].shape[3]
+                    )
+                    gated_delta_rule_mtp(
+                        A_log=stash["A_log"].detach().float(),
+                        a=stash["a"][:actual_seq_len_pad].view(
+                            B_pad, T, stash["a"].shape[-1]
+                        ),
+                        dt_bias=stash["dt_bias"].detach(),
+                        q=k_bat,
+                        k=k_bat,
+                        v=stash["v"][0, :actual_seq_len_pad].view(
+                            B_pad, T, stash["v"].shape[2], stash["v"].shape[3]
+                        ),
+                        b=stash["b"][:actual_seq_len_pad].view(
+                            B_pad, T, stash["b"].shape[-1]
+                        ),
+                        initial_state_source=layer_ssm_states,
+                        initial_state_indices=state_idx_pad,
+                        output_state_indices=state_idx_pad,
+                        accepted_steps=acc_steps_pad,
+                        disable_state_update=False,
+                        disable_output=True,
+                        use_qk_l2norm_in_kernel=True,
+                        scale=None,
+                        output=None,
+                    )
+                return
+
             for layer_id, stash in stash_per_layer.items():
                 layer_cache = pool.mamba2_layer_cache(layer_id)
                 layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
