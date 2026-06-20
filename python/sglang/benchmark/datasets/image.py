@@ -125,6 +125,13 @@ def create_mm_data_row(
             medias=medias,
             return_tensors="pt",
         )["input_ids"].numel()
+    elif type(processor).__name__ == "DeepseekVLV2Processor":
+        result = processor(
+            conversations=prompt_str,
+            images=images,
+            inference_mode=True,
+        )
+        prompt_len = result.input_ids.numel()
     else:
         prompt_len = processor(
             text=[prompt_str],

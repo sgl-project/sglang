@@ -638,7 +638,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        skip_swa: bool = False,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
@@ -646,11 +649,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params)
 
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
+
+    def dec_swa_lock_only(
+        self,
+        node: UnifiedTreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+    ) -> None:
+        """Early-release the SWA portion of a request's tree lock, plus any
+        strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        """
+        if self.disable:
+            return
+        swa_component = self.components.get(ComponentType.SWA)
+        if swa_component is None:
+            return
+        swa_component.release_window_lock(node, swa_uuid_for_lock)
+
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        swa_priority = swa_component.eviction_priority(is_leaf=False)
+        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+        for comp in self._components_tuple:
+            if comp.eviction_priority(is_leaf=False) < swa_priority:
+                comp.release_component_lock(node, dec_params)
 
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
@@ -741,6 +768,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
         # cleanup
@@ -1248,6 +1276,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
+                    # A comp whose TRUE internal priority outranks the trigger
+                    # is only in this loop because leaf-collapse flattened
+                    # priorities; a lock on it is a legit pin and must be
+                    # spared. A lock on a strictly-lower-priority tier is a
+                    # real strand — fall through to the assert below.
+                    if comp.eviction_priority(
+                        is_leaf=False
+                    ) >= trigger.eviction_priority(is_leaf=False):
+                        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                            continue
+                        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
@@ -2562,9 +2602,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._all_component_values_flatten(ComponentType.MAMBA)
 
-    def all_swa_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentType.SWA)
-
     def available_and_evictable_str(self) -> str:
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
@@ -2882,28 +2919,3 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
-
-    def _rebuild_host_leaf_sets(self) -> None:
-        """Rebuild evictable_host_leaves after L1-only reset."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                self._update_evictable_leaf_sets(node)
-            stack.extend(node.children.values())
-
-    def _rebuild_host_lru_lists(self) -> None:
-        """Rebuild host_lru_lists for extra components after L1-only reset.
-        Walks the tree and adds nodes with host component data to the
-        appropriate host LRU list."""
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                for ct in self.tree_components:
-                    if ct == BASE_COMPONENT_TYPE:
-                        continue  # Full uses evictable_host_leaves, not host LRU
-                    cd = node.component_data[ct]
-                    if cd.host_value is not None:
-                        self.host_lru_lists[ct].insert_mru(node)
-            stack.extend(node.children.values())
