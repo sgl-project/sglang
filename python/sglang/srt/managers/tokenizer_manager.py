@@ -1854,19 +1854,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            # Surface scheduler load info on each response so clients can do
-            # response-based flow control without polling /v1/loads. The
-            # scheduler already piggy-backs the per-DP-rank load on
-            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
-            load = getattr(recv_obj, "load", None)
-            if load is not None:
-                num_running_reqs = getattr(load, "num_running_reqs", None)
-                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
-                if num_running_reqs is not None:
-                    meta_info["num_running_reqs"] = num_running_reqs
-                if num_waiting_reqs is not None:
-                    meta_info["num_waiting_reqs"] = num_waiting_reqs
-
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -2654,7 +2641,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Two scheduler messages can race in handle_loop for the same rid: a
+        # batch output that finishes it normally (deletes rid_to_state[rid])
+        # and this abort echo. If the finish wins, the rid is already gone and
+        # there is nothing left to abort. Common under mass client
+        # disconnects, amplified by prefix / abort_all fan-out.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.info(
+                "Abort request for rid=%s not found in rid_to_state; "
+                "likely already finished/removed.",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -3015,6 +3014,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
+            model_name=server_args.model_path,
         )
     except ValueError as e:
         error_message = str(e)
@@ -3029,6 +3029,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
+                model_name=server_args.model_path,
             )
         else:
             raise e

@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.triton_ops.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -56,6 +58,10 @@ class FlashAttentionMetadata:
     cu_seqlens_q: torch.Tensor = None
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor = None
+    # Dummy-tail varlen metadata for the fa_skip_kv_cache path under a piecewise
+    # CUDA graph (built once per forward, reused across layers). See forward_extend.
+    fa_skip_cu_seqlens_q: torch.Tensor = None
+    fa_skip_max_seqlen_q: int = None
     # Window size (typically used by Gemma)
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
@@ -807,18 +813,26 @@ class FlashAttentionBackend(AttentionBackend):
                 elif is_cp_mode:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
-                    cp_allgather_and_save_kv_cache(
-                        forward_batch,
-                        layer,
-                        k,
-                        v,
-                        self.attn_cp_size,
-                        swa_loc=(
-                            self.forward_metadata.swa_out_cache_loc
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
+                    swa_loc = (
+                        self.forward_metadata.swa_out_cache_loc
+                        if self.use_sliding_window_kv_pool
+                        else None
                     )
+                    if is_cp_v2_active(forward_batch):
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        cp_strategy.materialize_full_kv(
+                            forward_batch, layer, k, v, swa_loc=swa_loc
+                        )
+                    else:
+                        cp_allgather_and_save_kv_cache(
+                            forward_batch,
+                            layer,
+                            k,
+                            v,
+                            self.attn_cp_size,
+                            swa_loc=swa_loc,
+                        )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -963,12 +977,24 @@ class FlashAttentionBackend(AttentionBackend):
                         **kwargs,
                     )
 
-                result = cp_attn_forward_extend(
-                    forward_batch,
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.device,
-                    _fa_cp_attn,
-                )
+                q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                if is_cp_v2_active(forward_batch):
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    result = cp_strategy.run_attention(
+                        q_cp,
+                        forward_batch,
+                        self.device,
+                        _fa_cp_attn,
+                        attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                    )
+                else:
+                    result = cp_attn_forward_extend(
+                        forward_batch,
+                        q_cp,
+                        self.device,
+                        _fa_cp_attn,
+                    )
             elif self.fa_skip_kv_cache:
                 # Embedding mode: skip KV cache read and use raw K/V tensors
                 # directly via flash_attn_varlen_func. The KV cache write is
@@ -979,14 +1005,43 @@ class FlashAttentionBackend(AttentionBackend):
                     "fa_skip_kv_cache uses raw K/V tensors, "
                     "FP8 KV cache descaling is not supported in this mode"
                 )
+                # Piecewise CUDA graph pads the token dimension up to a captured
+                # bucket size, so ``q`` has more rows than ``cu_seqlens_q`` covers.
+                # ``flash_attn_varlen_func`` requires ``q.shape[0] == cu_seqlens_q[-1]``;
+                # otherwise the boundary query block corrupts the last real token's
+                # output, producing a NaN embedding (LAST pooling reads that token).
+                # Append the padded tail as a dummy, self-attending segment so every
+                # row is a valid sequence. Real tokens stay in their own segment and
+                # are unaffected. Built once per forward and cached on the metadata
+                # (reused across layers). ``extend_num_tokens`` is a python int equal
+                # to ``cu_seqlens_q[-1]`` for extend/prefill forwards, so it needs no
+                # device sync. With no padding -- or if the count is unavailable (e.g.
+                # any non-piecewise path) -- cu_seqlens_q already covers q, so fall
+                # through to using it as-is (no dummy segment).
+                if metadata.fa_skip_cu_seqlens_q is None:
+                    num_real_tokens = forward_batch.extend_num_tokens
+                    num_padded_tokens = q.shape[0]
+                    if (
+                        num_real_tokens is not None
+                        and num_real_tokens < num_padded_tokens
+                    ):
+                        metadata.fa_skip_cu_seqlens_q = torch.cat(
+                            [cu_seqlens_q, cu_seqlens_q.new_tensor([num_padded_tokens])]
+                        )
+                        metadata.fa_skip_max_seqlen_q = max(
+                            int(max_seqlen_q), num_padded_tokens - num_real_tokens
+                        )
+                    else:
+                        metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
+                        metadata.fa_skip_max_seqlen_q = max_seqlen_q
                 result = flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_q,
+                    cu_seqlens_q=metadata.fa_skip_cu_seqlens_q,
+                    cu_seqlens_k=metadata.fa_skip_cu_seqlens_q,
+                    max_seqlen_q=metadata.fa_skip_max_seqlen_q,
+                    max_seqlen_k=metadata.fa_skip_max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=causal,
                     window_size=window_size,

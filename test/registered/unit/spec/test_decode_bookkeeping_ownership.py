@@ -62,6 +62,8 @@ _OWNER_SITES = {
     (*_MIXIN, "kv_allocated_len"): 1,
     # 3rd resolve mutation: DFLASH settles its full commit_lens here (no
     # pre-claim in prepare_for_decode, unlike the EAGLE mixin).
+    # Spec grammar truncation commits only the retained (pre-termination) length
+    # here, so the dropped suffix is never over-committed (no later rollback).
     (*_RESOLVE, "kv_committed_len"): 3,
     (*_RESOLVE, "spec_verify_ct"): 1,
     (
