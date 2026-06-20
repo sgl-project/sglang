@@ -13,7 +13,40 @@
 //! are not byte-identical across languages; both decoders coerce numerically and the
 //! effective precision is float32 (the proto's declared width).
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
+
+pub(crate) fn is_default_bool(value: &bool) -> bool {
+    !*value
+}
+
+pub(crate) fn is_default_i32(value: &i32) -> bool {
+    *value == 0
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_default_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_default_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_default_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_default_f32(value: &f32) -> bool {
+    *value == 0.0
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_default_f64(value: &f64) -> bool {
+    *value == 0.0
+}
 
 /// Serialize a generated proto message to msgpack bytes for the ZMQ wire.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
@@ -91,14 +124,19 @@ mod tests {
     }
 
     fn from_hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     // Canonical wire vectors minted from the Python `msgspec` codec generated from
     // the same proto (see test/registered/unit/grpc/test_msgpack_codec.py). These
     // must stay byte-identical so the two codecs can never silently drift apart.
     const GV_GENERATE: &str = "83a9696e7075745f69647393010203af73616d706c696e675f706172616d7383ae6d61785f6e65775f746f6b656e7310ae73746f705f746f6b656e5f6964739102a16e01a3726964a3616263";
-    const GV_OPENAI: &str = "82a96a736f6e5f626f6479c4077b2261223a317dad74726163655f6865616465727381a178a179";
+    const GV_OPENAI: &str =
+        "82a96a736f6e5f626f6479c4077b2261223a317dad74726163655f6865616465727381a178a179";
+    const GV_TOKENIZE_RESPONSE: &str = "84a6746f6b656e7393010203a5636f756e7403ad6d61785f6d6f64656c5f6c656ecc80aa696e7075745f74657874a26869";
 
     #[test]
     fn golden_vector_generate_request() {
@@ -130,5 +168,30 @@ mod tests {
         };
         assert_eq!(encode(&req).unwrap(), expect);
         assert_eq!(decode::<OpenAiRequest>(&expect).unwrap(), req);
+    }
+
+    #[test]
+    fn implicit_scalar_defaults_are_omitted() {
+        // Covers proto3 implicit scalars (string/bool/int/bytes), not just
+        // optionals/repeated/maps. This must match msgspec's omit_defaults=True.
+        assert_eq!(
+            encode(&TextGenerateResponse::default()).unwrap(),
+            vec![0x80]
+        );
+        assert_eq!(encode(&TokenizeResponse::default()).unwrap(), vec![0x80]);
+        assert_eq!(encode(&OpenAiResponse::default()).unwrap(), vec![0x80]);
+    }
+
+    #[test]
+    fn golden_vector_tokenize_response_scalars() {
+        let expect = from_hex(GV_TOKENIZE_RESPONSE);
+        let resp = TokenizeResponse {
+            tokens: vec![1, 2, 3],
+            count: 3,
+            max_model_len: 128,
+            input_text: "hi".to_string(),
+        };
+        assert_eq!(encode(&resp).unwrap(), expect);
+        assert_eq!(decode::<TokenizeResponse>(&expect).unwrap(), resp);
     }
 }

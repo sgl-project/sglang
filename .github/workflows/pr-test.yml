@@ -309,6 +309,13 @@ jobs:
           shared-key: "sglang-grpc-cpu"
           save-if: ${{ matrix.partition == 0 }}
 
+      - name: Run Rust gRPC msgpack tests
+        if: ${{ matrix.partition == 0 }}
+        timeout-minutes: 10
+        run: |
+          cd rust/sglang-grpc
+          cargo test --lib msgpack
+
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
@@ -316,6 +323,12 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Check generated msgpack codec
+        if: ${{ matrix.partition == 0 }}
+        run: |
+          proto/generate_msgspec.sh
+          git diff --exit-code -- python/sglang/srt/grpc/messages.py
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache

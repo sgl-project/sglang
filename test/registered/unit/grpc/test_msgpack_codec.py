@@ -23,6 +23,10 @@ GV_GENERATE = bytes.fromhex(
 GV_OPENAI = bytes.fromhex(
     "82a96a736f6e5f626f6479c4077b2261223a317dad74726163655f68656164" "65727381a178a179"
 )
+GV_TOKENIZE_RESPONSE = bytes.fromhex(
+    "84a6746f6b656e7393010203a5636f756e7403ad6d61785f6d6f64656c5f6c656e"
+    "cc80aa696e7075745f74657874a26869"
+)
 
 
 class TestMsgpackCodec(CustomTestCase):
@@ -46,6 +50,17 @@ class TestMsgpackCodec(CustomTestCase):
         # The bytes field is real msgpack bin (0xc4/0xc5/0xc6), not an int array.
         self.assertTrue(any(b in GV_OPENAI for b in (0xC4, 0xC5, 0xC6)))
 
+    def test_golden_vector_tokenize_response_scalars(self):
+        """Implicit proto3 scalars must be byte-identical to the Rust codec."""
+        resp = M.TokenizeResponse(
+            tokens=[1, 2, 3],
+            count=3,
+            max_model_len=128,
+            input_text="hi",
+        )
+        self.assertEqual(M.encode(resp), GV_TOKENIZE_RESPONSE)
+        self.assertEqual(M.decode(GV_TOKENIZE_RESPONSE, M.TokenizeResponse), resp)
+
     def test_round_trip_all_field_shapes(self):
         """Nested message + map + repeated + optional all survive a round-trip."""
         req = M.TextGenerateRequest(
@@ -62,6 +77,12 @@ class TestMsgpackCodec(CustomTestCase):
     def test_unset_optionals_are_omitted(self):
         """omit_defaults: an all-default struct encodes to an empty msgpack map."""
         self.assertEqual(M.encode(M.SamplingParams()), b"\x80")
+
+    def test_implicit_scalar_defaults_are_omitted(self):
+        """Implicit proto3 scalar defaults are omitted, matching Rust serde attrs."""
+        self.assertEqual(M.encode(M.TextGenerateResponse()), b"\x80")
+        self.assertEqual(M.encode(M.TokenizeResponse()), b"\x80")
+        self.assertEqual(M.encode(M.OpenAIResponse()), b"\x80")
 
     def test_decode_is_tolerant(self):
         """Absent keys take defaults; unknown keys are ignored (proto-evolution safe)."""

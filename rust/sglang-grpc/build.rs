@@ -38,23 +38,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Tolerant decode: any field absent from the msgpack map falls back to its
         // default, so adding fields to the proto never breaks older encoders.
         .type_attribute(".", "#[serde(default)]")
-        .file_descriptor_set_path(
-            std::path::PathBuf::from(&out_dir).join("sglang_descriptor.bin"),
-        );
+        .file_descriptor_set_path(std::path::PathBuf::from(&out_dir).join("sglang_descriptor.bin"));
 
     // Pass 2: omit default-valued fields on the wire, mirroring msgspec's
     // `omit_defaults=True`, so unset optionals / empty collections cost no bytes.
     for file in &fds.file {
         let package = file.package();
         for msg in &file.message_type {
-            if msg.options.as_ref().and_then(|o| o.map_entry).unwrap_or(false) {
+            if msg
+                .options
+                .as_ref()
+                .and_then(|o| o.map_entry)
+                .unwrap_or(false)
+            {
                 continue;
             }
             for field in &msg.field {
                 let path = format!(".{}.{}.{}", package, msg.name(), field.name());
                 let is_map = field.r#type() == Type::Message
                     && msg.nested_type.iter().any(|n| {
-                        n.options.as_ref().and_then(|o| o.map_entry).unwrap_or(false)
+                        n.options
+                            .as_ref()
+                            .and_then(|o| o.map_entry)
+                            .unwrap_or(false)
                             && field.type_name().ends_with(n.name())
                     });
                 let attr = if is_map {
@@ -64,8 +70,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if field.proto3_optional() || field.r#type() == Type::Message {
                     "#[serde(skip_serializing_if = \"Option::is_none\")]"
                 } else {
-                    // Implicit-presence proto3 scalar: always present on the wire.
-                    continue;
+                    match field.r#type() {
+                        Type::Double => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_f64\")]"
+                        }
+                        Type::Float => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_f32\")]"
+                        }
+                        Type::Int64 | Type::Sfixed64 | Type::Sint64 => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_i64\")]"
+                        }
+                        Type::Uint64 | Type::Fixed64 => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_u64\")]"
+                        }
+                        Type::Int32 | Type::Sfixed32 | Type::Sint32 | Type::Enum => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_i32\")]"
+                        }
+                        Type::Uint32 | Type::Fixed32 => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_u32\")]"
+                        }
+                        Type::Bool => {
+                            "#[serde(skip_serializing_if = \"crate::msgpack::is_default_bool\")]"
+                        }
+                        Type::String => "#[serde(skip_serializing_if = \"String::is_empty\")]",
+                        Type::Bytes => "#[serde(skip_serializing_if = \"Vec::is_empty\")]",
+                        Type::Group | Type::Message => continue,
+                    }
                 };
                 builder = builder.field_attribute(&path, attr);
             }
