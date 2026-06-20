@@ -109,6 +109,34 @@ class TestCompletionRequest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
 
+    def test_sampling_seed_uses_the_signed_int64_domain(self):
+        request_types = (
+            (CompletionRequest, {"model": "test-model", "prompt": "hello"}),
+            (
+                ChatCompletionRequest,
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            ),
+        )
+        for request_type, request_args in request_types:
+            for seed, expected in (
+                (-(2**63), -(2**63)),
+                (2**63 - 1, 2**63 - 1),
+                ("7", 7),
+                (7.0, 7),
+            ):
+                with self.subTest(request_type=request_type.__name__, seed=seed):
+                    self.assertEqual(
+                        request_type(**request_args, seed=seed).seed, expected
+                    )
+
+            for seed in (True, -(2**63) - 1, 2**63):
+                with self.subTest(request_type=request_type.__name__, seed=seed):
+                    with self.assertRaises(ValidationError):
+                        request_type(**request_args, seed=seed)
+
 
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""

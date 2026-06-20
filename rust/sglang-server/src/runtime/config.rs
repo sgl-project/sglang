@@ -128,6 +128,10 @@ pub struct ServerArgs {
     /// `TokenizerManager._validate_one_request`).
     #[serde(default)]
     pub allow_auto_truncate: bool,
+    /// Whether omitted sampling seeds use the deterministic default. OpenAI
+    /// fans out `n` in this process, before requests reach the scheduler.
+    #[serde(default)]
+    pub enable_deterministic_inference: bool,
     /// `return_hidden_states` is refused unless the server was launched with it:
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
@@ -296,5 +300,29 @@ impl ServerArgs {
     pub fn api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerArgs;
+
+    #[test]
+    fn deterministic_inference_defaults_to_false() {
+        assert!(
+            !ServerArgs::from_json("{}")
+                .unwrap()
+                .enable_deterministic_inference
+        );
+        assert!(
+            ServerArgs::from_json(r#"{"enable_deterministic_inference":true}"#)
+                .unwrap()
+                .enable_deterministic_inference
+        );
+        assert!(
+            !ServerArgs::from_json(r#"{"enable_deterministic_inference":false}"#)
+                .unwrap()
+                .enable_deterministic_inference
+        );
     }
 }

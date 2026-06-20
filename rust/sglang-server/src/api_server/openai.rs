@@ -26,10 +26,26 @@ use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind};
+use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind, SamplingParams};
 use crate::runtime::ServerArgs;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
+const DETERMINISTIC_DEFAULT_SEED: i64 = 42;
+
+fn sampling_for_choice(
+    sampling: &SamplingParams,
+    choice_index: usize,
+    deterministic: bool,
+) -> SamplingParams {
+    let mut choice = sampling.clone();
+    if let Some(seed) = sampling
+        .sampling_seed
+        .or(deterministic.then_some(DETERMINISTIC_DEFAULT_SEED))
+    {
+        choice.sampling_seed = Some(seed.wrapping_add(choice_index as i64));
+    }
+    choice
+}
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -238,3 +254,31 @@ fn contains_media(value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod test_utils;
+
+#[cfg(test)]
+mod seed_tests {
+    use super::sampling_for_choice;
+    use crate::message::SamplingParams;
+
+    #[test]
+    fn choice_seeds_are_distinct_and_wrap_as_signed_i64() {
+        let cases = [
+            (Some(7), true, 2, Some(9)),
+            (None, true, 2, Some(44)),
+            (Some(i64::MAX), true, 1, Some(i64::MIN)),
+            (Some(i64::MIN), true, 1, Some(i64::MIN + 1)),
+            (None, false, 2, None),
+        ];
+        for (seed, deterministic, index, expected) in cases {
+            let sampling = SamplingParams {
+                sampling_seed: seed,
+                ..Default::default()
+            };
+            assert_eq!(
+                sampling_for_choice(&sampling, index, deterministic).sampling_seed,
+                expected
+            );
+            assert_eq!(sampling.sampling_seed, seed);
+        }
+    }
+}
