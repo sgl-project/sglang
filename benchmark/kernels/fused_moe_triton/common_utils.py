@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_d
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_config
 
 
@@ -176,13 +176,18 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
-    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]) but on
-    # gfx942 the weights are converted to block-fp8 [128,128] at load, so the
-    # serving MoE kernel looks up block_shape=[128,128] configs. Tune for that.
-    if architecture == "MiniMaxM3SparseForConditionalGeneration" and block_shape == [
-        1,
-        32,
-    ]:
+    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]). On gfx942
+    # (MI300X, no MX matmul HW) the weights are converted to block-fp8 [128,128]
+    # at load, so the serving MoE kernel looks up block_shape=[128,128] configs.
+    # NVIDIA (sm100) and gfx95 run MXFP8 natively ([1,32]) and must NOT be
+    # remapped, or the tuned config's filename won't match what serving queries.
+    # Gate mirrors fp8.py's native-MXFP8 check (gfx942 == is_hip and not gfx95).
+    if (
+        architecture == "MiniMaxM3SparseForConditionalGeneration"
+        and is_hip()
+        and not is_gfx95_supported()
+        and block_shape == [1, 32]
+    ):
         block_shape = [128, 128]
 
     # text_config may not carry torch_dtype; fall back to bf16.
