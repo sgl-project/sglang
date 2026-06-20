@@ -1,32 +1,72 @@
 //! TokenizerManager egress thread — drains the egress ring (scheduler output
-//! pushed from Python via `push_chunk`) and routes each `ChunkEvent` to the
-//! detok shard that owns its `RequestId`. Routing is a pure function of the rid,
-//! so it matches the shard the request registered with on ingress — no shared
-//! map, no lock.
+//! pushed from Python) and routes each message to the detok shard that owns its
+//! `RequestId`. Routing is a pure function of the rid, so it matches the shard
+//! the request registered with on ingress — no shared map, no lock.
+//!
+//! The ring carries a 1-byte frame tag: `CHUNK` (a generation `ChunkEvent`) or
+//! `RESULT` (a single control-request JSON payload, e.g. `/server_info`).
+
+use bytes::Bytes;
 
 use crate::ids::RequestId;
-use crate::message::ChunkEvent;
+use crate::message::{ChunkEvent, EGRESS_TAG_CHUNK, EGRESS_TAG_RESULT};
 use crate::runtime::channels::{DetokMsg, Senders};
 use crate::runtime::ring::EgressConsumer;
 
 pub fn run_egress(egress: EgressConsumer, senders: Senders) {
     while let Some(bytes) = egress.recv() {
-        let ev: ChunkEvent = match rmp_serde::from_slice(&bytes) {
-            Ok(ev) => ev,
-            Err(e) => {
-                tracing::warn!(error = %e, "egress: bad chunk msgpack");
+        let Some((&tag, body)) = bytes.split_first() else {
+            continue;
+        };
+        let routed = match tag {
+            EGRESS_TAG_CHUNK => decode_chunk(body),
+            EGRESS_TAG_RESULT => decode_result(body),
+            other => {
+                tracing::warn!(tag = other, "egress: unknown frame tag");
                 continue;
             }
         };
-
-        let Ok(rid) = ev.rid.parse::<u64>() else {
-            tracing::warn!(rid = %ev.rid, "egress: unparsable rid");
+        let Some((rid, msg)) = routed else {
             continue;
         };
-
-        let shard = senders.detok_for(RequestId(rid));
-        if shard.send(DetokMsg::Chunk(ev)).is_err() {
+        if senders.detok_for(rid).send(msg).is_err() {
             tracing::error!("egress: detok shard closed");
+        }
+    }
+}
+
+/// Generation chunk: `[rid, seq, token_ids, finish]` → detok shard.
+fn decode_chunk(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
+    let ev: ChunkEvent = match rmp_serde::from_slice(body) {
+        Ok(ev) => ev,
+        Err(e) => {
+            tracing::warn!(error = %e, "egress: bad chunk msgpack");
+            return None;
+        }
+    };
+    let rid = parse_rid(&ev.rid)?;
+    Some((rid, DetokMsg::Chunk(ev)))
+}
+
+/// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
+fn decode_result(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
+    let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
+    let arr = val.as_array()?;
+    let rid = parse_rid(arr.first()?.as_str()?)?;
+    let payload = match arr.get(1)? {
+        rmpv::Value::Binary(b) => Bytes::copy_from_slice(b),
+        rmpv::Value::String(s) => Bytes::copy_from_slice(s.as_bytes()),
+        _ => return None,
+    };
+    Some((rid, DetokMsg::Result { id: rid, payload }))
+}
+
+fn parse_rid(rid: &str) -> Option<RequestId> {
+    match rid.parse::<u64>() {
+        Ok(v) => Some(RequestId(v)),
+        Err(_) => {
+            tracing::warn!(rid = %rid, "egress: unparsable rid");
+            None
         }
     }
 }

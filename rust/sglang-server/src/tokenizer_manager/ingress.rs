@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, ValidationOutcome};
-use crate::message::{EgressItem, Request, TokenizedReqPayload};
+use crate::message::{EgressItem, Request, RequestKind, TokenizedReqPayload, control_req_msgpack};
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::IngressProducer;
 
@@ -36,10 +36,9 @@ fn on_ingress(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
     // Received → Validating
     let _ = req.state.apply(Event::Validated(ValidationOutcome::NeedsTokenize));
 
-    let outcome = classify(&req);
-
     // Register the egress sink with the owning detok shard *before* the request
-    // leaves Rust, so chunks that come back have a home. Routing is by id only.
+    // leaves Rust, so the response (generate chunks or a control result) has a
+    // home. Routing is by id only.
     let shard = senders.detok_for(req.id);
     if shard
         .send(DetokMsg::Register {
@@ -53,6 +52,15 @@ fn on_ingress(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
         return;
     }
 
+    // Control requests reuse this FSM but skip tokenization entirely: validate
+    // straight to Queued and push the bare `[tag, rid, nil]` control message.
+    if let RequestKind::Control(tag) = req.kind {
+        let _ = req.state.apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
+        push_control_to_ring(req, ingress, tag);
+        return;
+    }
+
+    let outcome = classify(&req);
     match outcome {
         ValidationOutcome::AlreadyTokenized => {
             req.input_ids = req.payload.input_ids.clone();
@@ -74,6 +82,22 @@ fn on_ingress(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
                 tracing::error!("tokenizer pool gone");
             }
         }
+    }
+}
+
+/// Push a bare control request (`[tag, rid, nil]`) onto the ingress ring. The
+/// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
+/// egress ring as a single `Result`.
+fn push_control_to_ring(mut req: Request, ingress: &IngressProducer, tag: &str) {
+    let bytes = match control_req_msgpack(tag, &req.id.0.to_string()) {
+        Ok(b) => b,
+        Err(e) => {
+            fail(&mut req, e);
+            return;
+        }
+    };
+    if !ingress.try_push(bytes) {
+        fail(&mut req, Error::QueueFull);
     }
 }
 

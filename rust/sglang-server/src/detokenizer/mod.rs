@@ -95,6 +95,9 @@ struct DetokState {
     stream: bool,
     /// Cumulative decoded text (SGLang stream frames carry cumulative text).
     text: String,
+    /// Cumulative output token count, reported as `meta_info.completion_tokens`
+    /// (clients like bench_serving diff successive frames to get per-step tokens).
+    completion_tokens: u64,
     decoder: Box<dyn StreamDecoder>,
     /// Egress half of the lifecycle FSM. Lives here because the ingress
     /// `Request` (and its FSM) was handed to the scheduler when queued; the
@@ -115,6 +118,7 @@ pub fn run_shard(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokBack
                         sink,
                         stream,
                         text: String::new(),
+                        completion_tokens: 0,
                         decoder: backend.new_stream(),
                         // Registered == handed to the scheduler == Queued.
                         fsm: RequestState::Queued,
@@ -122,7 +126,19 @@ pub fn run_shard(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokBack
                 );
             }
             DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev),
+            DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
         }
+    }
+}
+
+/// Control-request result: deliver the JSON payload to the sink verbatim as a
+/// single `Done` frame — no detokenization, no streaming.
+fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payload: bytes::Bytes) {
+    if let Some(mut st) = table.remove(&id) {
+        let _ = st.sink.try_send(EgressItem::Done(payload));
+        // Egress FSM: a control request goes straight to Completed (no Streaming
+        // / Finalizing states — single response, never streamed).
+        st.fsm = RequestState::Completed;
     }
 }
 
@@ -145,6 +161,7 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
         let _ = st.fsm.apply(Event::SchedulerPicked);
     }
 
+    st.completion_tokens += ev.token_ids.len() as u64;
     match st.decoder.step(&ev.token_ids) {
         Ok(delta) => st.text.push_str(&delta),
         Err(e) => {
@@ -158,7 +175,12 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     let finished = ev.finish_reason.is_some();
     // Streaming → Streaming (finish:false) or Streaming → Finalizing (finish:true).
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
-    let frame = build_frame(&ev.rid, &st.text, ev.finish_reason.as_deref());
+    let frame = build_frame(
+        &ev.rid,
+        &st.text,
+        st.completion_tokens,
+        ev.finish_reason.as_deref(),
+    );
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
@@ -181,11 +203,17 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
 }
 
 /// Serialize one SGLang-style `/generate` output frame.
-fn build_frame(rid: &str, text: &str, finish_reason: Option<&str>) -> Bytes {
+fn build_frame(
+    rid: &str,
+    text: &str,
+    completion_tokens: u64,
+    finish_reason: Option<&str>,
+) -> Bytes {
     let v = serde_json::json!({
         "text": text,
         "meta_info": {
             "id": rid,
+            "completion_tokens": completion_tokens,
             "finish_reason": finish_reason.map(|r| serde_json::json!({ "type": r })),
         },
     });

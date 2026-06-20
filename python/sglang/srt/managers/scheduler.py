@@ -33,7 +33,6 @@ suppress_noisy_warnings()
 
 import psutil  # isort: skip
 import setproctitle
-import sglang_server
 import torch
 import torch.distributed
 from torch.cuda import Stream as CudaStream
@@ -207,7 +206,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.ring_receiver import RingRequestReceiver
+from sglang.srt.managers.scheduler_components.rust_scheduler import RustServer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -561,7 +560,7 @@ class Scheduler(
 
         # Start the embedded Rust frontend (rank 0) before the request receiver,
         # which reads self.rust_ring_recv to pick its ingress transport.
-        self.maybe_init_rust_frontend()
+        self.maybe_init_rust_server()
 
         self.init_request_receiver()
 
@@ -1612,11 +1611,16 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -1672,106 +1676,27 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
-    def maybe_init_rust_frontend(self) -> None:
-        """Start the embedded multi-threaded Rust frontend on the rank-0
-        scheduler when ``SGLANG_RUST_SERVER`` is set.
+    def maybe_init_rust_server(self) -> None:
+        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
+        set, and point the ingress receiver at it. All the plumbing lives in
+        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
-        The frontend owns the API server, TokenizerManager, Tokenizer, and
-        Detokenizer (all Rust threads in this process) and produces ingress
-        requests into an in-process ring. ``init_request_receiver`` drains that
-        ring instead of the zmq tokenizer socket. Stages 1-5 never touch a
-        ``PyObject``, so they run concurrently with this scheduler without
-        contending for the GIL.
-        """
         is_rank_zero = (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
         )
         if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+            # Always define the attribute: init_output_streamer and the
+            # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
             return
 
-        # Partition this rank's allowed CPU cores (already NUMA-local when
-        # SGLANG_SET_CPU_AFFINITY / NUMA bind is on): reserve a few cores for
-        # this scheduler's CUDA-launch / event-loop thread and hand the rest to
-        # the Rust frontend pools, so tokenize/detok never share cores with the
-        # latency-critical launch thread.
-        frontend_cores = self._partition_cores_for_rust_server()
-
-        # Tokenizer source: a local path, model dir, or HF Hub repo id. The Rust
-        # backend resolves a repo id to its cached local tokenizer.json itself.
-        tokenizer_path = self.server_args.tokenizer_path or self.server_args.model_path
-
-        # Keep HF tokenizers (used by the Rust dynamo-tokenizers backend) off
-        # rayon's unpinned global thread pool. The Rust frontend parallelizes
-        # tokenization *across* requests via its pinned worker pool (one
-        # sequential encode per core), not *within* a call via encode_batch.
-        # Forcing sequential per-call keeps rayon from spawning floating worker
-        # threads that would defeat core pinning / NUMA isolation (and silences
-        # the HF fork warning). setdefault so an explicit user choice still wins.
-        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-        self.rust_server = sglang_server.Server(
-            bind=f"{self.server_args.host}:{self.server_args.port}",
-            pin_cores=frontend_cores is not None,
-            cores=frontend_cores,
-            tokenizer_path=tokenizer_path,
-            tokenizer_revision=self.server_args.revision,
-        )
-        self.recv_from_tokenizer = RingRequestReceiver(self.rust_server)
-        logger.info(
-            "SGLANG_RUST_SERVER enabled: embedded Rust frontend listening on %s:%s",
-            self.server_args.host,
-            self.server_args.port,
-        )
-
-    def _partition_cores_for_rust_server(self) -> Optional[List[int]]:
-        """Reserve launch cores for this scheduler and return the rest for the
-        Rust frontend pools.
-
-        Pins *this* (event-loop / CUDA-launch) thread to the reserved cores and
-        returns the remaining allowed cores for the frontend. Both sets are a
-        subset of this rank's NUMA-local cores (when affinity/NUMA bind is on),
-        so the partition stays NUMA-local. Returns ``None`` (frontend runs
-        unpinned, confined only by the process affinity) when the platform has
-        no affinity API or too few cores to split.
-        """
-        if not hasattr(os, "sched_getaffinity"):
-            return None
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except OSError as e:
-            logger.warning("rust frontend: cannot read cpu affinity: %s", e)
-            return None
-
-        # Need enough cores to reserve launch cores and still pin the pools.
-        if len(allowed) < 4:
-            logger.info(
-                "rust frontend: only %d cores allowed; running pools unpinned",
-                len(allowed),
-            )
-            return None
-
-        # Keep a small slice for the launch loop; cap at 2 (the event loop is
-        # effectively serial) and never take more than a quarter of the cores.
-        reserve = min(2, len(allowed) // 4)
-        launch_cores = allowed[:reserve]
-        frontend_cores = allowed[reserve:]
-
-        try:
-            # pid 0 == this thread (the scheduler event-loop / launch thread).
-            os.sched_setaffinity(0, set(launch_cores))
-        except OSError as e:
-            logger.warning("rust frontend: cannot pin launch thread: %s", e)
-            return None
-
-        logger.info(
-            "rust frontend cores=%s, scheduler launch cores=%s",
-            frontend_cores,
-            launch_cores,
-        )
-        return frontend_cores
+        rust_server = RustServer.maybe_create(self)
+        self.rust_server = rust_server
+        # The rust server *is* the ingress source: the scheduler's request
+        # receiver duck-types on `.drain` (see SchedulerRequestReceiver).
+        self.recv_from_tokenizer = rust_server
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(

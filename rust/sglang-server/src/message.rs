@@ -30,11 +30,27 @@ pub enum EgressItem {
     Error(Error),
 }
 
+/// What kind of request this is — selects the ingress branch and the wire
+/// message pushed to the scheduler. Control requests reuse the same ingress
+/// FSM as generate (validate → queue → ring) but skip tokenization, and their
+/// egress is a single non-streamed JSON result rather than detokenized chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    /// `/generate`: tokenize then push a `TokenizedGenerateReqInput`.
+    Generate,
+    /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization.
+    /// The payload is the scheduler request-struct tag (msgspec class name,
+    /// e.g. `"GetInternalStateReq"`) pushed as a bare `[tag, rid, nil]`; the
+    /// scheduler replies with a single JSON result via the egress ring.
+    Control(&'static str),
+}
+
 /// The owned request as it travels ingress stages. Single owner at all times,
 /// so the embedded `state` FSM is mutated without any lock.
 #[derive(Debug)]
 pub struct Request {
     pub id: RequestId,
+    pub kind: RequestKind,
     pub state: RequestState,
     /// Decoded HTTP body (the `GenerateReqInput` view we need for tokenization).
     pub payload: GeneratePayload,
@@ -47,10 +63,25 @@ pub struct Request {
     pub stream: bool,
 }
 
+/// Encode a bare `BaseReq` control message (just `rid` + `http_worker_ipc`) as
+/// the msgspec tagged array `[tag, rid, nil]`. Used for control requests like
+/// `GetInternalStateReq` that carry no extra fields.
+pub fn control_req_msgpack(tag: &str, rid: &str) -> Result<Bytes, Error> {
+    use rmpv::Value;
+    let arr = Value::Array(vec![
+        Value::from(tag),       // struct tag
+        Value::from(rid),       // rid
+        Value::Nil,             // http_worker_ipc
+    ]);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
+    Ok(Bytes::from(buf))
+}
+
 /// Minimal decoded view of an incoming `/generate` body. Core fields are typed;
 /// everything else round-trips through `extra` so we stay faithful to the full
 /// Python schema (and the in-flight msgpack-migration) without enumerating it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeneratePayload {
     #[serde(default)]
     pub text: Option<String>,
@@ -161,6 +192,31 @@ fn with_stop_defaults(sp: Option<rmpv::Value>) -> rmpv::Value {
         }
     }
     Value::Map(map)
+}
+
+/// Egress-ring frame discriminator (first byte). Internal to the Rust egress
+/// ring: Python pushes raw payloads via `push_chunk` / `push_result` and the
+/// tag is prepended on the Rust side, so the Python wire format is unchanged.
+pub const EGRESS_TAG_CHUNK: u8 = 0;
+pub const EGRESS_TAG_RESULT: u8 = 1;
+
+/// Frame a generation chunk for the egress ring (msgpack already built by
+/// Python's `push_chunk`; just prepend the tag).
+pub fn frame_egress_chunk(chunk: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(1 + chunk.len());
+    buf.push(EGRESS_TAG_CHUNK);
+    buf.extend_from_slice(chunk);
+    Bytes::from(buf)
+}
+
+/// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
+pub fn frame_egress_result(rid: &str, payload: &[u8]) -> Bytes {
+    use rmpv::Value;
+    let arr = Value::Array(vec![Value::from(rid), Value::Binary(payload.to_vec())]);
+    let mut buf = Vec::with_capacity(1 + payload.len() + rid.len() + 8);
+    buf.push(EGRESS_TAG_RESULT);
+    let _ = rmpv::encode::write_value(&mut buf, &arr);
+    Bytes::from(buf)
 }
 
 /// One scheduler output increment for a request, pushed from Python via

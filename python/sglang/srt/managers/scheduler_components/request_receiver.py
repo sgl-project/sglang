@@ -26,7 +26,6 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.managers.scheduler_components.ring_receiver import RingRequestReceiver
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -36,6 +35,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.managers.scheduler_components.rust_scheduler import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -45,9 +45,9 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[
-        zmq.Socket, ScriptedTokenizerRecvProxy, RingRequestReceiver
-    ]
+    # Duck-typed: the rust backend (`RustServer`) is detected by its `.drain`
+    # method, so no runtime import of the rust extension here.
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -106,19 +106,22 @@ class SchedulerRequestReceiver:
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
-                if isinstance(self.recv_from_tokenizer, RingRequestReceiver):
+                # Duck-typed on `.drain` so this stays decoupled from the rust
+                # extension (zmq sockets have no `drain`).
+                if hasattr(self.recv_from_tokenizer, "drain"):
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
-                else:
-                    while True:
-                        try:
-                            if self.recv_limit_reached(len(recv_reqs)):
-                                break
-                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                        except zmq.ZMQError:
+                    return recv_reqs
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_reqs.append(recv_req)
+                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
 
                 while True:
                     try:

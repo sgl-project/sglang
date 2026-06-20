@@ -29,6 +29,13 @@ pub enum DetokMsg {
         stream: bool,
     },
     Chunk(ChunkEvent),
+    /// Control-request result: a single already-serialized JSON payload to
+    /// deliver to the request's sink verbatim (no detokenization, no
+    /// streaming). Used by `/server_info` and other control endpoints.
+    Result {
+        id: RequestId,
+        payload: bytes::Bytes,
+    },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.

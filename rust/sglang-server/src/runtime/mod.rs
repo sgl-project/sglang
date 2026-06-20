@@ -47,6 +47,8 @@ pub struct RuntimeConfig {
     pub tokenizer_path: Option<String>,
     /// HF revision used only when `tokenizer_path` is a repo id. `None` → main.
     pub tokenizer_revision: Option<String>,
+    /// Static server metadata (server_args + model_config) for config endpoints.
+    pub server_args: ServerArgs,
 }
 
 impl Default for RuntimeConfig {
@@ -63,7 +65,71 @@ impl Default for RuntimeConfig {
             cores: None,
             tokenizer_path: None,
             tokenizer_revision: None,
+            server_args: ServerArgs::default(),
         }
+    }
+}
+
+/// Static server metadata for config endpoints (`/v1/models`, …) — the JSON
+/// blob the Python scheduler dumps from `server_args` + `model_config` at
+/// startup, parsed once and read by key. `Arc` so cloning into each `AppState`
+/// is cheap. There is no exposure concern: these threads run inside the
+/// scheduler process, and each endpoint chooses what to return.
+#[derive(Clone, Debug)]
+pub struct ServerArgs {
+    data: Arc<serde_json::Value>,
+}
+
+impl Default for ServerArgs {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(serde_json::Value::Null),
+        }
+    }
+}
+
+impl ServerArgs {
+    /// Parse the JSON blob; errors on malformed JSON.
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        let data: serde_json::Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        Ok(Self {
+            data: Arc::new(data),
+        })
+    }
+
+    /// Fail fast at startup if a field an endpoint depends on can't be resolved.
+    pub fn validate_mandatory(&self) -> Result<(), String> {
+        if self.served_model_name().is_empty() {
+            return Err("no 'served_model_name' or 'model_path' in server_args".into());
+        }
+        if self.context_len().is_none() {
+            return Err("no resolvable context length (model_config.context_len)".into());
+        }
+        Ok(())
+    }
+
+    /// `served_model_name`, falling back to `model_path` (the dump mirrors
+    /// server_args, where `served_model_name` is `None` unless the user set it).
+    pub fn served_model_name(&self) -> &str {
+        self.str_field("served_model_name")
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.str_field("model_path"))
+            .unwrap_or("")
+    }
+
+    /// `max_model_len` for `/v1/models`: the resolved `model_config.context_len`
+    /// (model_config is attached to server_args before the dump), falling back
+    /// to the `context_length` user override.
+    pub fn context_len(&self) -> Option<u64> {
+        self.data
+            .get("model_config")
+            .and_then(|m| m.get("context_len"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| self.data.get("context_length").and_then(|v| v.as_u64()))
+    }
+
+    fn str_field(&self, key: &str) -> Option<&str> {
+        self.data.get(key).and_then(|v| v.as_str())
     }
 }
 
@@ -277,7 +343,13 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::serve(cfg.bind, senders, id_gen, cfg.channel_cap));
+                rt.block_on(api_server::serve(
+                    cfg.bind,
+                    senders,
+                    id_gen,
+                    cfg.channel_cap,
+                    cfg.server_args.clone(),
+                ));
             })
             .expect("spawn api runtime");
         threads.push(handle);

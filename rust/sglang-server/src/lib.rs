@@ -20,7 +20,6 @@ mod tokenizer_manager;
 
 use std::net::SocketAddr;
 
-use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -49,6 +48,7 @@ impl Server {
         cores = None,
         tokenizer_path = None,
         tokenizer_revision = None,
+        server_args_json = "{}",
     ))]
     fn start(
         bind: &str,
@@ -62,10 +62,20 @@ impl Server {
         cores: Option<Vec<usize>>,
         tokenizer_path: Option<String>,
         tokenizer_revision: Option<String>,
+        server_args_json: &str,
     ) -> PyResult<Self> {
         let bind: SocketAddr = bind
             .parse()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad bind: {e}")))?;
+        // Static server metadata (server_args + model_config) dumped by the
+        // scheduler; parse and validate mandatory fields now so a bad/missing
+        // field is a boot error, not a request-time 500.
+        let server_args = runtime::ServerArgs::from_json(server_args_json).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad server_args_json: {e}"))
+        })?;
+        server_args.validate_mandatory().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
+        })?;
         let cfg = RuntimeConfig {
             bind,
             api_threads,
@@ -78,6 +88,7 @@ impl Server {
             cores,
             tokenizer_path,
             tokenizer_revision,
+            server_args,
         };
         Ok(Server {
             rt: runtime::start(cfg),
@@ -97,9 +108,17 @@ impl Server {
     }
 
     /// Push one scheduler-output chunk (already msgpack-encoded `ChunkEvent`)
-    /// into the egress ring. Returns `False` on backpressure (ring full).
+    /// into the egress ring → detok shard. Returns `False` on backpressure.
     fn push_chunk(&self, py: Python<'_>, chunk: &[u8]) -> bool {
-        let bytes = Bytes::copy_from_slice(chunk);
+        let bytes = crate::message::frame_egress_chunk(chunk);
+        py.detach(|| self.rt.egress.try_push(bytes))
+    }
+
+    /// Push a control-request result (e.g. the `/server_info` JSON) into the
+    /// egress ring, routed by `rid` to the waiting request's sink as a single
+    /// non-streamed response. Returns `False` on backpressure.
+    fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
+        let bytes = crate::message::frame_egress_result(rid, payload);
         py.detach(|| self.rt.egress.try_push(bytes))
     }
 
