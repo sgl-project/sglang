@@ -439,83 +439,69 @@ class MlxModelRunner:
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
-        # Phase 1 MVP: detect Qwen3.5 MoE (a.k.a. Qwen3.6-35B-A3B) and
-        # confirm the native model module is importable.  Phase 2 will
-        # replace `mlx_lm.load` with a native loader that uses
-        # `sglang.srt.hardware_backend.mlx.models.qwen3_5_moe.Model`.
         if _is_qwen3_5_moe(self.model_path):
-            from sglang.srt.hardware_backend.mlx.models.qwen3_5_moe import (
-                Model as NativeModel,
-            )
+            from sglang.srt.hardware_backend.mlx.models.qwen3_5_moe import load as qwen3_5_load
 
             logger.info(
-                "Detected Qwen3.5 MoE architecture — native model module "
-                "is available (Phase 1 stub; loading still goes through "
-                "mlx_lm until Phase 2 wires up the native loader)."
+                "Detected Qwen3.5 MoE — using sglang native loader "
+                "(sglang.srt.hardware_backend.mlx.models.qwen3_5_moe)"
             )
-            # Sanity: construct the native Model with TextModelArgs to
-            # confirm the import path + dataclass parsing works.  The
-            # constructed instance is discarded; the actual model comes
-            # from mlx_lm below.
-            from sglang.srt.hardware_backend.mlx.models.qwen3_5_moe import (
-                TextModelArgs,
+            self.model = qwen3_5_load(self.model_path)
+        else:
+            # We need the config dict to pass into quantize_model so it knows tied/embedding
+            # layout. return_config=True is cheap and ignored when no quantization is requested.
+            loaded = mlx_lm_load(
+                self.model_path,
+                tokenizer_config={"trust_remote_code": self.trust_remote_code},
+                return_config=True,
             )
-            _ = NativeModel(TextModelArgs())
+            self.model, _tokenizer, config = loaded
 
-        # We need the config dict to pass into quantize_model so it knows tied/embedding
-        # layout. return_config=True is cheap and ignored when no quantization is requested.
-        loaded = mlx_lm_load(
-            self.model_path,
-            tokenizer_config={"trust_remote_code": self.trust_remote_code},
-            return_config=True,
-        )
-        self.model, _tokenizer, config = loaded
+            if self._quantization in _MLX_QUANTIZATION_PRESETS:
+                bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
+                # Skip if the model was already loaded quantized (pre-quantized HF repo);
+                # mlx_lm.load detects the config and instantiates QuantizedLinear directly,
+                # so applying the preset on top would be redundant.
+                if "quantization" in (config or {}):
+                    logger.info(
+                        "MLX model is already quantized by the HF repo; "
+                        f"ignoring --quantization={self._quantization}"
+                    )
+                else:
+                    # Read weight-tensor totals from MLX array metadata (shape + dtype).
+                    # This is zero-cost — neither materializes the lazy fp16 weights nor
+                    # forces them to be peak-resident in memory at once (which on a 64 GB
+                    # Mac running a 32 B model would put us within a few GB of OOM).
+                    bytes_before = sum(
+                        p.size * p.itemsize
+                        for _, p in tree_flatten(self.model.parameters())
+                    )
+                    q_start = time.time()
+                    logger.info(
+                        f"Quantizing MLX model on-the-fly: bits={bits} "
+                        f"group_size={group_size} (preset={self._quantization})"
+                    )
+                    self.model, _new_config = mlx_lm_quantize_model(
+                        self.model,
+                        config or {},
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    bytes_after = sum(
+                        p.size * p.itemsize
+                        for _, p in tree_flatten(self.model.parameters())
+                    )
+                    q_time = time.time() - q_start
+                    pct_reduction = (1 - bytes_after / max(bytes_before, 1)) * 100
+                    logger.info(
+                        f"Quantization complete in {q_time:.2f}s — "
+                        f"weight bytes: {bytes_before / 1024**3:.2f} GB -> "
+                        f"{bytes_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
+                    )
 
-        if self._quantization in _MLX_QUANTIZATION_PRESETS:
-            bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
-            # Skip if the model was already loaded quantized (pre-quantized HF repo);
-            # mlx_lm.load detects the config and instantiates QuantizedLinear directly,
-            # so applying the preset on top would be redundant.
-            if "quantization" in (config or {}):
-                logger.info(
-                    "MLX model is already quantized by the HF repo; "
-                    f"ignoring --quantization={self._quantization}"
-                )
-            else:
-                # Read weight-tensor totals from MLX array metadata (shape + dtype).
-                # This is zero-cost — neither materializes the lazy fp16 weights nor
-                # forces them to be peak-resident in memory at once (which on a 64 GB
-                # Mac running a 32 B model would put us within a few GB of OOM).
-                bytes_before = sum(
-                    p.size * p.itemsize
-                    for _, p in tree_flatten(self.model.parameters())
-                )
-                q_start = time.time()
-                logger.info(
-                    f"Quantizing MLX model on-the-fly: bits={bits} "
-                    f"group_size={group_size} (preset={self._quantization})"
-                )
-                self.model, _new_config = mlx_lm_quantize_model(
-                    self.model,
-                    config or {},
-                    group_size=group_size,
-                    bits=bits,
-                )
-                bytes_after = sum(
-                    p.size * p.itemsize
-                    for _, p in tree_flatten(self.model.parameters())
-                )
-                q_time = time.time() - q_start
-                pct_reduction = (1 - bytes_after / max(bytes_before, 1)) * 100
-                logger.info(
-                    f"Quantization complete in {q_time:.2f}s — "
-                    f"weight bytes: {bytes_before / 1024**3:.2f} GB -> "
-                    f"{bytes_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
-                )
-
-        # Force-evaluate weights so mx.get_active_memory() reflects
-        # actual usage before attention KV pool sizing.
-        mx.eval(self.model.parameters())
+            # Force-evaluate weights so mx.get_active_memory() reflects
+            # actual usage before attention KV pool sizing.
+            mx.eval(self.model.parameters())
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
