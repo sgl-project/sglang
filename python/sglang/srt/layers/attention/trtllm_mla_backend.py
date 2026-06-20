@@ -369,60 +369,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-    ):
-        """Shared decode / target-verify / draft-extend capture+replay body.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
-        the non-decode-family modes to the FlashInferMLA parent).
-        """
-        metadata = self.decode_cuda_graph_metadata[bs]
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q[: bs + 1].copy_(
-                torch.arange(
-                    0,
-                    bs * num_tokens_per_bs + 1,
-                    step=num_tokens_per_bs,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-            )
-            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
-            # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
-            metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
-
-        # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[
-            (
-                bs,
-                get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
-        )
-
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
@@ -437,12 +383,88 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch, disable_flashinfer_ragged=True
             )
 
+    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Eager/replay seam, resolved by backend STATE (no argument).
+
+        Returns True when this ``(bs, forward_mode)`` has a pre-bound
+        cuda-graph metadata object: all decode-family modes (decode / idle /
+        target-verify / draft-extend-v2) capture into the single
+        ``decode_cuda_graph_metadata`` dict, so at decode-graph replay (the
+        runner always pads to a captured bucket) and harmlessly at an eager
+        forward that lands on a captured bs+mode this picks the pre-bound
+        buffers. Returns False for pure-eager runs (no metadata was ever
+        captured for this bs) and for plain EXTEND (never captured) -> build a
+        fresh metadata object. Mode-aware so it never KeyErrors.
+        """
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        ):
+            return bs in self.decode_cuda_graph_metadata
+        return False
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Eager entry point. FlashInferMLAAttnBackend (our parent) ships its
+        own init_forward_metadata that only handles its own DecodeMetadata /
+        PrefillMetadata wrappers -- it never sets self.forward_decode_metadata
+        / forward_batch.decode_trtllm_mla_metadata, which trtllm_mla's
+        forward_decode / forward_extend read. Bypass the parent's override and
+        route through the base ABC default (out_graph + in_graph) so this
+        backend's init_forward_metadata_out_graph (which calls
+        _compute_decode_metadata for capturable modes and builds the trtllm-MLA
+        prefill metadata for plain extend) runs.
+        """
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         forward_mode = forward_batch.forward_mode
+
+        if (
+            forward_mode.is_extend()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend_v2()
+        ):
+            # Plain extend builds the trtllm-gen TRTLLMMLAPrefillMetadata (and,
+            # when falling back, the base flashinfer ragged/paged prefill
+            # metadata). Eager (now routed through the base wrapper -> here) and
+            # any non-capture caller share this path; plain extend is never
+            # captured into a cuda graph.
+            #
+            # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
+            # when chunked prefix cache is disabled.
+            # Also fallback to flashinfer MLA backend when in piecewise cuda graph, since it only supports MLA forward mode.
+            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+            fallback_to_flashinfer_impl = (
+                self.disable_chunked_prefix_cache and has_prefix
+            ) or is_in_tc_piecewise_cuda_graph()
+            if fallback_to_flashinfer_impl:
+                super().init_forward_metadata_out_graph(
+                    forward_batch, in_capture=in_capture
+                )
+
+            seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
+            cum_seq_lens_q = torch.cat(
+                (
+                    torch.zeros(
+                        1, dtype=torch.int32, device=forward_batch.seq_lens.device
+                    ),
+                    torch.cumsum(seq_lens, dim=0),
+                )
+            ).int()
+            max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
+                max_seq_len,
+                cum_seq_lens_q,
+                seq_lens,
+                fallback_to_flashinfer_impl,
+            )
+            return
 
         if (
             not forward_mode.is_decode_or_idle()
@@ -463,67 +485,80 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens.device,
             )
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
+
+        # Single eager == replay == capture decode-family metadata path;
+        # `use_bound` selects the pre-bound cuda-graph metadata object (capture /
+        # replay / eager-at-captured-bs) vs a freshly allocated one. In out_graph
+        # use_bound is always True (capture sets in_capture; replay pads to a
+        # captured bs), matching the old always-bound path.
+        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
+        self._compute_decode_metadata(forward_batch, use_bound=use_bound)
+
+    def _compute_decode_metadata(self, forward_batch: ForwardBatch, *, use_bound: bool):
+        """Single source of truth for TRTLLM-MLA decode / target-verify /
+        draft-extend-v2 metadata, shared by eager / capture / replay.
+
+        ``use_bound`` selects the pre-bound cuda-graph metadata object (capture /
+        replay / eager-at-captured-bs) vs a freshly allocated one.
+
+        Deliberately NOT named ``_compute_forward_metadata`` -- that is the
+        FlashInferMLA base's full-mode helper, reached via super() for delegated
+        plain-extend / other modes; a same-named override here would shadow it
+        and wrongly dispatch those modes into this decode-only body.
+        """
+        forward_mode = forward_batch.forward_mode
+        bs = forward_batch.batch_size
+
+        if use_bound:
+            metadata = self.decode_cuda_graph_metadata[bs]
+            seq_lens = forward_batch.seq_lens
+
+            if forward_mode.is_target_verify():
+                seq_lens = seq_lens[:bs] + self.num_draft_tokens
+                metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
+            elif forward_mode.is_draft_extend_v2():
+                num_tokens_per_bs = self.num_draft_tokens
+                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+                metadata.cu_seqlens_q[: bs + 1].copy_(
+                    torch.arange(
+                        0,
+                        bs * num_tokens_per_bs + 1,
+                        step=num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
+                )
+                metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
+                # see NOTE(draft_extend seq_len handling)
+                seq_lens = (
+                    seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
+                )
+                metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
+
+            # Update block indices for new sequences.
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        metadata.block_kv_indices.shape[1], self.page_size
+                    ),
+                )
+            ](
+                self.req_to_token,
+                forward_batch.req_pool_indices[:bs],
+                seq_lens,
+                None,
+                metadata.block_kv_indices,
+                self.req_to_token.stride(0),
+                metadata.block_kv_indices.shape[1],
+                PAGED_SIZE=self.page_size,
             )
         else:
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
-            )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize the metadata for a forward pass."""
-        # Delegate to parent for non-decode modes.
-        if (
-            forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
-            # when chunked prefix cache is disabled.
-            # Also fallback to flashinfer MLA backend when in piecewise cuda graph, since it only supports MLA forward mode.
-            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
-            fallback_to_flashinfer_impl = (
-                self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_tc_piecewise_cuda_graph()
-            if fallback_to_flashinfer_impl:
-                super().init_forward_metadata(forward_batch)
-
-            seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
-            cum_seq_lens_q = torch.cat(
-                (
-                    torch.zeros(
-                        1, dtype=torch.int32, device=forward_batch.seq_lens.device
-                    ),
-                    torch.cumsum(seq_lens, dim=0),
-                )
-            ).int()
-            max_seq_len = max(forward_batch.extend_seq_lens_cpu)
-            self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
-                max_seq_len,
-                cum_seq_lens_q,
-                seq_lens,
-                fallback_to_flashinfer_impl,
-            )
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            bs = forward_batch.batch_size
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
             # This is necessary because the backend instance persists across forward passes,
             # and forward_prefill_metadata from a previous regular extend call could still be set.
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
                 self.forward_prefill_metadata = None
             # Get maximum sequence length.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
@@ -533,11 +568,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             seq_lens = forward_batch.seq_lens
 
-            if forward_batch.forward_mode.is_target_verify():
+            if forward_mode.is_target_verify():
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
-            elif forward_batch.forward_mode.is_draft_extend_v2():
+            elif forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = torch.nn.functional.pad(
@@ -569,8 +604,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.batch_size = bs
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
-        else:
-            return super().init_forward_metadata(forward_batch)
 
     def pad_draft_extend_query(
         self,

@@ -352,123 +352,305 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
-    def _update_decode_kv_buffers(
-        self,
-        bs: int,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ):
-        """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
+    def _use_cuda_graph_buffers(self, bs: int) -> bool:
+        """Whether to build metadata into the pre-bound ``cuda_graph_*`` buffers.
 
-        Returns (kv_indptr, window_kv_indptr, window_kv_lens) where
-        window_kv_lens is None when sliding-window is disabled.
+        This is the single eager/replay seam — resolved by backend STATE, not
+        an argument. It is True at decode-graph capture/replay (the bs is a
+        captured bucket) and harmlessly True when an eager forward lands on a
+        captured bs in a graph-enabled server: there is one forward stream per
+        backend (TBO / pdmux use separate instances), and the bound buffers are
+        always refilled by ``out_graph`` before the next ``graph.replay()``, so
+        a transient eager write cannot leak into a later replay. It is False for
+        pure-eager runs (``init_cuda_graph_state`` never ran → no buffers) and
+        for any bs beyond the captured capacity → allocate fresh.
         """
-        seq_lens = seq_lens[:bs]
-        req_pool_indices = req_pool_indices[:bs]
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_lens = None
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
-                self.window_kv_indptr,
-                self.req_to_token,
-                self.sliding_window_size,
-                seq_lens,
-                req_pool_indices,
-                bs,
-                token_to_kv_pool=self.token_to_kv_pool,
-                window_kv_indices=self.cuda_graph_window_kv_indices,
-            )
-        return kv_indptr, window_kv_indptr, window_kv_lens
+        buf = getattr(self, "cuda_graph_attn_logits", None)
+        return buf is not None and bs <= buf.shape[0]
 
-    def _update_target_verify_buffers(
+    def _compute_forward_metadata(
         self,
-        bs: int,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        spec_info,
-    ):
-        """Fill all cuda-graph buffers for target_verify mode.
+        forward_batch: ForwardBatch,
+        *,
+        use_bound: bool,
+    ) -> ForwardMetadata:
+        """Single source of truth for Triton forward metadata, shared by eager,
+        capture, and replay.
 
-        Returns the ForwardMetadata components:
-        ``(qo_indptr, kv_indptr, custom_mask, mask_indptr,
-          window_kv_indptr, window_kv_indices, window_num_kv_splits, window_kv_offsets)``
+        ``use_bound`` selects the per-iter output tensors: the pre-bound
+        ``cuda_graph_*`` buffers (capture / replay / eager-at-captured-bs) vs
+        freshly allocated tensors (pure-eager / bs beyond captured capacity).
+        The index scratch (``self.kv_indptr`` / ``qo_indptr`` / ``mask_indptr``)
+        is shared by both paths. All forward modes are handled here (incl. plain
+        EXTEND, which only ever runs with ``use_bound=False``).
         """
-        qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * self.num_draft_tokens,
-            step=self.num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+        swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            window_kv_indices = self.cuda_graph_window_kv_indices
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_offsets = self.cuda_graph_window_kv_offsets
-            window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
-                update_sliding_window_buffer(
+        swa_attn_logits = None
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if spec_info is None or spec_info.kv_indptr is None:
+                # Plain decode/idle (also draft-extend's idle batch: no tree
+                # indices → build from seq_lens).
+                if use_bound:
+                    kv_indices = self.cuda_graph_kv_indices
+                else:
+                    # gpu_only: seq_lens_sum may be None; ub-allocate is safe.
+                    seq_lens_sum = forward_batch.seq_lens_sum
+                    if seq_lens_sum is None:
+                        seq_lens_sum = bs * self.max_context_len
+                    kv_indices = torch.empty(
+                        seq_lens_sum, dtype=torch.int64, device=self.device
+                    )
+                kv_indptr = self._fill_kv_indptr_and_indices(
+                    bs,
+                    forward_batch.seq_lens[:bs],
+                    forward_batch.req_pool_indices[:bs],
+                    kv_indices,
+                )
+                if swa:
+                    window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
+                        update_sliding_window_buffer(
+                            self.window_kv_indptr,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            forward_batch.seq_lens[:bs],
+                            forward_batch.req_pool_indices[:bs],
+                            bs,
+                            self.device,
+                            self.token_to_kv_pool,
+                            window_kv_indices=(
+                                self.cuda_graph_window_kv_indices if use_bound else None
+                            ),
+                        )
+                    )
+                    if use_bound:
+                        window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                    else:
+                        window_num_kv_splits = torch.empty(
+                            (bs,), dtype=torch.int32, device=self.device
+                        )
+                    self.get_num_kv_splits(
+                        window_num_kv_splits[:bs], window_kv_lens[:bs]
+                    )
+            else:
+                # Multi-step draft decode: tree indices come from spec_info, not
+                # the cuda-graph pool. Eager (and the capture pre-roll) only.
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                bs = kv_indptr.shape[0] - 1
+
+            if use_bound:
+                attn_logits = self.cuda_graph_attn_logits
+                attn_lse = self.cuda_graph_attn_lse
+                num_kv_splits = self.cuda_graph_num_kv_splits
+                swa_attn_logits = self.cuda_graph_swa_attn_logits
+            else:
+                attn_logits = torch.empty(
+                    (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                attn_lse = torch.empty(
+                    (bs, self.num_head, self.max_kv_splits),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                num_kv_splits = torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                )
+                if self.swa_v_head_dim is not None:
+                    swa_attn_logits = torch.empty(
+                        (bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+            self.get_num_kv_splits(num_kv_splits[:bs], forward_batch.seq_lens[:bs])
+
+            qo_indptr = None
+            custom_mask = None
+            mask_indptr = None
+            max_extend_len = None
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = len(forward_batch.req_pool_indices)
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if use_bound:
+                kv_indices = self.cuda_graph_kv_indices
+            else:
+                # gpu_only: seq_lens_sum may be None; ub-allocate is safe.
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                bs,
+                forward_batch.seq_lens[:bs],
+                forward_batch.req_pool_indices[:bs],
+                kv_indices,
+            )
+            if swa:
+                window_kv_indices = (
+                    self.cuda_graph_window_kv_indices if use_bound else None
+                )
+                window_kv_offsets_buf = (
+                    self.cuda_graph_window_kv_offsets if use_bound else None
+                )
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
                     self.window_kv_indptr,
                     self.req_to_token,
                     self.sliding_window_size,
-                    seq_lens[:bs],
-                    req_pool_indices,
+                    forward_batch.seq_lens[:bs],
+                    forward_batch.req_pool_indices[:bs],
                     bs,
-                    token_to_kv_pool=self.token_to_kv_pool,
+                    self.device,
+                    self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
                 )
+                if use_bound:
+                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                    window_kv_offsets_buf[:bs] = window_kv_offsets
+                    window_kv_offsets = window_kv_offsets_buf
+
+            custom_mask = spec_info.custom_mask if spec_info is not None else None
+            if use_bound:
+                if custom_mask is not None:
+                    self.cuda_graph_custom_mask[: custom_mask.shape[0]] = custom_mask
+                    custom_mask = self.cuda_graph_custom_mask
+            seq_mask_len = self.num_draft_tokens * (
+                forward_batch.seq_lens[:bs] + self.num_draft_tokens
             )
-        custom_mask = self.cuda_graph_custom_mask
-        if (
-            spec_info is not None
-            and getattr(spec_info, "custom_mask", None) is not None
-        ):
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-        else:
+            mask_indptr = self.mask_indptr[: bs + 1]
+            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            max_extend_len = self.num_draft_tokens
+            num_kv_splits = None
+            attn_logits = None
+            attn_lse = None
+        elif use_bound and forward_batch.forward_mode.is_draft_extend_v2():
+            # Captured draft-extend (v2 only; EAGLE v1 DRAFT_EXTEND was removed):
+            # constant per-req token layout written into the bound buffers (no
+            # graph-illegal host sync). Eager draft_extend_v2 (rare: warmup /
+            # fallback) falls through to the EXTEND branch below.
+            qo_indptr, kv_indptr, num_tokens_per_bs = self._build_draft_extend_indptrs(
+                bs,
+                forward_batch.seq_lens[:bs],
+                forward_batch.req_pool_indices[:bs],
+                spec_info,
+            )
+            kv_indices = self.cuda_graph_kv_indices
+            max_extend_len = num_tokens_per_bs
             custom_mask = None
-        seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-        mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-        return (
-            qo_indptr,
+            mask_indptr = None
+            num_kv_splits = None
+            attn_logits = None
+            attn_lse = None
+        else:
+            # Plain EXTEND (and eager draft_extend_v2; the decode graph never
+            # captures these).
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
+            else:
+                kv_indices_len = bs * self.max_context_len
+            kv_indices = torch.empty(
+                kv_indices_len, dtype=torch.int64, device=self.device
+            )
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                bs,
+                forward_batch.extend_prefix_lens,
+                forward_batch.req_pool_indices,
+                kv_indices,
+            )
+            if swa:
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool,
+                )
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            custom_mask = None
+            mask_indptr = None
+            attn_logits = None
+            attn_lse = None
+            if forward_batch.extend_seq_lens_cpu is not None:
+                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            else:
+                max_extend_len = int(forward_batch.extend_seq_lens.max())
+            num_kv_splits = None
+
+        swa_out_cache_loc = None
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            translated = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+            if use_bound:
+                n = translated.shape[0]
+                self.cuda_graph_swa_out_cache_loc[n:].zero_()
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(translated)
+                swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:n]
+            else:
+                swa_out_cache_loc = translated
+
+        return ForwardMetadata(
+            attn_logits,
+            attn_lse,
+            max_extend_len,
+            num_kv_splits,
             kv_indptr,
+            kv_indices,
+            qo_indptr,
             custom_mask,
             mask_indptr,
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            swa_attn_logits=swa_attn_logits,
+            swa_out_cache_loc=swa_out_cache_loc,
         )
 
-    def _update_draft_extend_buffers(
+    def _build_draft_extend_indptrs(
         self,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        """Fill QO + KV cuda-graph buffers for draft_extend mode.
+        """Fill the bound qo/kv indptr buffers for captured draft_extend (v2).
 
-        Returns (qo_indptr, kv_indptr, num_tokens_per_bs).
+        Returns (qo_indptr, kv_indptr, num_tokens_per_bs). (EAGLE v1
+        DRAFT_EXTEND was removed; only v2 reaches this path.)
         """
-        seq_lens = seq_lens[:bs]
-        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
-        # token layout); num_steps+1 only equals that when topk == 1.
-        num_tokens_per_bs = (
-            self.num_draft_tokens
-            if forward_mode.is_draft_extend_v2()
-            else self.speculative_num_steps + 1
-        )
+        # v2 fills num_draft_tokens per req.
+        num_tokens_per_bs = self.num_draft_tokens
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -477,17 +659,8 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
-        # Triton extend kernel receives extend K/V as separate tensors, so
-        # kv_indptr/kv_indices must cover only the prefix portion.
-        # extend_seq_lens_tensor is only attached to spec_info at real
-        # replay (eagle_draft_extend_cuda_graph_runner.replay); during the
-        # capture-time warmup it's absent, so fall back to zeros (matches
-        # the pre-unification capture path in #26651). Clamp at 0 because
-        # padded rows (raw_bs..bs) leave seq_lens at the fill value (1)
-        # while extend_seq_lens stays at num_tokens_per_bs, which would
-        # otherwise produce negative kv_lens; padded rows reference
-        # reserved req-pool slot 0 and their output is discarded.
+        # seq_lens = prefix + extend; the Triton extend kernel gets extend K/V
+        # separately, so kv_indptr/kv_indices cover only the prefix.
         if (
             spec_info is not None
             and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
@@ -506,283 +679,16 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-        forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
-
+        # Single eager == replay == capture metadata path. `use_bound` selects
+        # the pre-bound cuda_graph_* buffers vs fresh tensors: always bound at
+        # capture; otherwise decided by backend state (see
+        # _use_cuda_graph_buffers — replay and eager-at-captured-bs use bound,
+        # pure-eager / oversize bs use fresh). No eager/replay argument.
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
-            # Multi-step speculative decode: kv buffers come from spec_info
-            # rather than the cuda-graph pool, so replay is not involved.
-            if forward_mode.is_decode_or_idle() and spec_info is not None:
-                self.forward_metadata = ForwardMetadata(
-                    attn_logits=self.cuda_graph_attn_logits,
-                    attn_lse=self.cuda_graph_attn_lse,
-                    max_extend_len=None,
-                    num_kv_splits=self.cuda_graph_num_kv_splits,
-                    kv_indptr=spec_info.kv_indptr,
-                    kv_indices=spec_info.kv_indices,
-                    qo_indptr=None,
-                    custom_mask=None,
-                    mask_indptr=None,
-                    window_kv_indptr=self.window_kv_indptr,
-                    window_kv_indices=None,
-                    window_num_kv_splits=None,
-                    window_kv_offsets=None,
-                    swa_attn_logits=self.cuda_graph_swa_attn_logits,
-                )
-                return
-
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-            )
-            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
-            self.forward_metadata = self._build_cuda_graph_forward_metadata(
-                bs, forward_mode, spec_info, swa_out_cache_loc
-            )
-        else:
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-            )
-            # Metadata view is reused from capture; just refill the buffer.
-            self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
-
-    def _fill_cuda_graph_swa_out_cache_loc(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from the live out_cache_loc and
-        return the [:n] view (None for non-SWA / multi-step draft), so the
-        captured store reads fresh slots on replay."""
-        if not self.use_sliding_window_kv_pool:
-            return None
-        out_cache_loc = forward_batch.out_cache_loc
-        if (
-            out_cache_loc is None
-            or out_cache_loc.shape[0] > self.cuda_graph_swa_out_cache_loc.shape[0]
-        ):
-            return None
-        n = out_cache_loc.shape[0]
-        self.cuda_graph_swa_out_cache_loc[n:].zero_()
-        self.cuda_graph_swa_out_cache_loc[:n].copy_(
-            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-        )
-        return self.cuda_graph_swa_out_cache_loc[:n]
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
-
-        bs = forward_batch.batch_size
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
-        window_kv_offsets = None
-        swa_attn_logits = None
-        spec_info = forward_batch.spec_info
-
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None or spec_info.kv_indptr is None:
-                # kv_indptr is None for draft-extend's idle batch (no tree
-                # indices); build plain metadata from seq_lens.
-                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
-                seq_lens_sum = forward_batch.seq_lens_sum
-                if seq_lens_sum is None:
-                    seq_lens_sum = bs * self.max_context_len
-                kv_indices = torch.empty(
-                    seq_lens_sum, dtype=torch.int64, device=self.device
-                )
-                kv_indptr = self._fill_kv_indptr_and_indices(
-                    bs,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    kv_indices,
-                )
-                # Sliding window
-                if (
-                    self.sliding_window_size is not None
-                    and self.sliding_window_size > 0
-                ):
-                    window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
-                        update_sliding_window_buffer(
-                            self.window_kv_indptr,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            forward_batch.seq_lens,
-                            forward_batch.req_pool_indices,
-                            bs,
-                            self.device,
-                            self.token_to_kv_pool,
-                        )
-                    )
-                    window_num_kv_splits = torch.empty(
-                        (bs,), dtype=torch.int32, device=self.device
-                    )
-                    self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
-            else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                bs = kv_indptr.shape[0] - 1
-
-            attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            if self.swa_v_head_dim is not None:
-                swa_attn_logits = torch.empty(
-                    (bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-            else:
-                swa_attn_logits = None
-            attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
-
-            qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
-            max_extend_len = None
-        elif forward_batch.forward_mode.is_target_verify():
-            bs = len(forward_batch.req_pool_indices)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            # Different with flashinfer kv_indptr and kv_indices construction.
-            # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
-                bs,
-                forward_batch.seq_lens,
-                forward_batch.req_pool_indices,
-                kv_indices,
-            )
-
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                # window_kv_offsets is used to calculate the start position in custom mask
-                (
-                    window_kv_indptr,
-                    window_kv_indices,
-                    window_kv_lens,
-                    window_kv_offsets,
-                ) = update_sliding_window_buffer(
-                    self.window_kv_indptr,
-                    self.req_to_token,
-                    self.sliding_window_size,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    bs,
-                    self.device,
-                    self.token_to_kv_pool,
-                )
-
-            custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = self.num_draft_tokens
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
-
-        else:
-            # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
-            # from GPU tensor, extra tail unused).
-            if forward_batch.extend_prefix_lens_cpu is not None:
-                kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
-            else:
-                kv_indices_len = bs * self.max_context_len
-            kv_indices = torch.empty(
-                kv_indices_len,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
-                bs,
-                forward_batch.extend_prefix_lens,
-                forward_batch.req_pool_indices,
-                kv_indices,
-            )
-            # Sliding window
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                (
-                    window_kv_indptr,
-                    window_kv_indices,
-                    window_kv_lens,
-                    window_kv_offsets,
-                ) = update_sliding_window_buffer(
-                    self.window_kv_indptr,
-                    self.req_to_token,
-                    self.sliding_window_size,
-                    forward_batch.extend_prefix_lens,
-                    forward_batch.req_pool_indices,
-                    bs,
-                    self.device,
-                    self.token_to_kv_pool,
-                )
-
-            qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-            qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
-            mask_indptr = None
-            attn_logits = None
-            attn_lse = None
-            # Caller usually supplies extend_seq_lens_cpu (eagle_info gpu_only
-            # sets host-constant mirror); defensive GPU-max fallback if not.
-            if forward_batch.extend_seq_lens_cpu is not None:
-                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
-            else:
-                max_extend_len = int(forward_batch.extend_seq_lens.max())
-            num_kv_splits = None
-
-        swa_out_cache_loc = None
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
-
-        self.forward_metadata = ForwardMetadata(
-            attn_logits,
-            attn_lse,
-            max_extend_len,
-            num_kv_splits,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-            window_kv_indptr,
-            window_kv_indices,
-            window_num_kv_splits,
-            window_kv_offsets,
-            swa_attn_logits=swa_attn_logits,
-            swa_out_cache_loc=swa_out_cache_loc,
+        use_bound = in_capture or self._use_cuda_graph_buffers(forward_batch.batch_size)
+        self.forward_metadata = self._compute_forward_metadata(
+            forward_batch, use_bound=use_bound
         )
 
     def init_static_metadata_buffers(
@@ -871,133 +777,6 @@ class TritonAttnBackend(AttentionBackend):
                 (max_num_tokens,),
                 dtype=torch.int64,
                 device=self.device,
-            )
-
-    def _build_cuda_graph_forward_metadata(
-        self,
-        bs: int,
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        swa_out_cache_loc: Optional[torch.Tensor] = None,
-    ) -> ForwardMetadata:
-        """Construct ForwardMetadata from the current cuda-graph buffer state.
-
-        Called by capture after the buffer-update helpers have already run
-        (either via replay or directly).  All fields reference the same
-        self.cuda_graph_* tensors that the captured graph kernels will
-        read — the Python object is rebuilt each capture, but the underlying
-        GPU memory addresses are stable. ``swa_out_cache_loc`` is the
-        pre-allocated SWA write-target buffer view (or None for non-SWA).
-        """
-        swa = self.sliding_window_size is not None and self.sliding_window_size > 0
-        if forward_mode.is_decode_or_idle():
-            return ForwardMetadata(
-                attn_logits=self.cuda_graph_attn_logits,
-                attn_lse=self.cuda_graph_attn_lse,
-                max_extend_len=None,
-                num_kv_splits=self.cuda_graph_num_kv_splits,
-                kv_indptr=self.kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                qo_indptr=None,
-                custom_mask=None,
-                mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
-                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
-                window_num_kv_splits=(
-                    self.cuda_graph_window_num_kv_splits if swa else None
-                ),
-                window_kv_offsets=None,
-                swa_attn_logits=self.cuda_graph_swa_attn_logits,
-                swa_out_cache_loc=swa_out_cache_loc,
-            )
-        elif forward_mode.is_target_verify():
-            custom_mask = (
-                self.cuda_graph_custom_mask
-                if spec_info is not None
-                and getattr(spec_info, "custom_mask", None) is not None
-                else None
-            )
-            return ForwardMetadata(
-                attn_logits=None,
-                attn_lse=None,
-                max_extend_len=self.num_draft_tokens,
-                num_kv_splits=None,
-                kv_indptr=self.kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                qo_indptr=self.qo_indptr[: bs + 1],
-                custom_mask=custom_mask,
-                mask_indptr=self.mask_indptr[: bs + 1],
-                window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
-                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
-                window_num_kv_splits=(
-                    self.cuda_graph_window_num_kv_splits if swa else None
-                ),
-                window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
-                swa_out_cache_loc=swa_out_cache_loc,
-            )
-        elif forward_mode.is_draft_extend_v2():
-            return ForwardMetadata(
-                attn_logits=None,
-                attn_lse=None,
-                # Must match the per-req query count (num_tokens_per_bs) used to
-                # build qo_indptr above, else the extend kernel grid is too small
-                # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
-                # blocks.
-                max_extend_len=(
-                    self.num_draft_tokens
-                    if forward_mode.is_draft_extend_v2()
-                    else self.speculative_num_steps + 1
-                ),
-                num_kv_splits=None,
-                kv_indptr=self.kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                qo_indptr=self.qo_indptr[: bs + 1],
-                custom_mask=None,
-                mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
-                window_num_kv_splits=None,
-                window_kv_offsets=None,
-                swa_out_cache_loc=swa_out_cache_loc,
-            )
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
-
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Shared capture+replay body for the cuda-graph init path.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph`.
-        """
-        # NOTE: encoder_lens expected to be zeros or None
-        if forward_mode.is_decode_or_idle():
-            assert spec_info is None, "Multi-step cuda graph init is not done here."
-            _, _, window_kv_lens = self._update_decode_kv_buffers(
-                bs, seq_lens, req_pool_indices
-            )
-            self.get_num_kv_splits(self.cuda_graph_num_kv_splits[:bs], seq_lens[:bs])
-            if window_kv_lens is not None:
-                self.get_num_kv_splits(
-                    self.cuda_graph_window_num_kv_splits[:bs], window_kv_lens[:bs]
-                )
-        elif forward_mode.is_target_verify():
-            bs = len(req_pool_indices)
-            self._update_target_verify_buffers(
-                bs, seq_lens, req_pool_indices, spec_info
-            )
-        elif forward_mode.is_draft_extend_v2():
-            self._update_draft_extend_buffers(
-                bs, seq_lens, req_pool_indices, forward_mode, spec_info
-            )
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
