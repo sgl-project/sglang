@@ -682,6 +682,43 @@ class TestNgramCorpusIncremental(CustomTestCase):
             f"Expected token 4 after extension, got {inc_ids.tolist()}",
         )
 
+    def test_temporary_lookup_does_not_register_req_state(self):
+        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6], [9, 3, 4, 7, 8]])
+        corpus.synchronize()
+
+        req_id = "real-req"
+        _batch_get_with_state(corpus, req_id, [1, 2, 3], 3)
+        state_map_before = dict(corpus._req_id_to_state_id)
+
+        temp_ids, temp_masks = corpus.batch_get_temporary([[3, 4]], [99])
+        self.assertEqual(corpus._req_id_to_state_id, state_map_before)
+
+        expected_ids, expected_masks = _batch_get(corpus, [[3, 4]])
+
+        np.testing.assert_array_equal(temp_ids, expected_ids)
+        np.testing.assert_array_equal(temp_masks, expected_masks)
+
+        inc_ids, inc_masks = _batch_get_with_state(corpus, req_id, [1, 2, 3, 4], 4)
+        full_ids, full_masks = _batch_get(corpus, [[1, 2, 3, 4]])
+        np.testing.assert_array_equal(inc_ids, full_ids)
+        np.testing.assert_array_equal(inc_masks, full_masks)
+
+    def test_root_candidates_temporary_returns_direct_children(self):
+        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5], [9, 2, 3, 7, 8]])
+        corpus.synchronize()
+
+        req_id = "real-req"
+        _batch_get_with_state(corpus, req_id, [1, 2, 3], 3)
+        state_map_before = dict(corpus._req_id_to_state_id)
+
+        candidates = corpus.batch_get_root_candidates_temporary([[2, 3]], [2], 4)
+
+        self.assertEqual(corpus._req_id_to_state_id, state_map_before)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(set(candidates[0]), {4, 7})
+
     def test_stale_state_rebuilds_after_eviction(self):
         corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)
         corpus.batch_put([list(range(5000, 5030))])

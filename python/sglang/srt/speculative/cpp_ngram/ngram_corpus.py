@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -105,6 +105,67 @@ class NgramCorpus:
     ) -> Tuple[np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+
+    def batch_get_temporary(
+        self,
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run a batch lookup with throwaway match states.
+
+        Precompute probes enumerate hypothetical token paths. They must not
+        advance the per-request incremental match state used by real decode
+        lookups.
+        """
+        state_ids = list(
+            range(self._next_state_id, self._next_state_id + len(batch_tokens))
+        )
+        self._next_state_id += len(batch_tokens)
+        try:
+            return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+        finally:
+            if state_ids:
+                self._obj.erase_states(state_ids)
+
+    @staticmethod
+    def direct_child_tokens(
+        tokens: np.ndarray,
+        tree_mask: np.ndarray,
+        parent: int,
+        max_candidates: Optional[int] = None,
+    ) -> List[int]:
+        child_tokens = []
+        seen_tokens = set()
+        for child in range(parent + 1, len(tokens)):
+            if tree_mask[child, child] == 0 or tree_mask[child, parent] == 0:
+                continue
+            ancestor_cols = np.nonzero(tree_mask[child, :child])[0]
+            if len(ancestor_cols) == 0 or ancestor_cols[-1] != parent:
+                continue
+            token = int(tokens[child])
+            if token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            child_tokens.append(token)
+            if max_candidates is not None and len(child_tokens) >= max_candidates:
+                break
+        return child_tokens
+
+    def batch_get_root_candidates_temporary(
+        self,
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+        max_candidates: int,
+    ) -> List[List[int]]:
+        drafts, masks = self.batch_get_temporary(batch_tokens, total_lens)
+        drafts = drafts.reshape(len(batch_tokens), self.draft_token_num)
+        masks = masks.reshape(
+            len(batch_tokens), self.draft_token_num, self.draft_token_num
+        )
+        return [
+            self.direct_child_tokens(drafts[i], masks[i], 0, max_candidates)
+            for i in range(len(batch_tokens))
+        ]
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
