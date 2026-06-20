@@ -205,6 +205,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        # bs values that the draft-extend cuda-graph runner has captured. Used
+        # to gate the bound fixed-width DRAFT_EXTEND_V2 layout; eager / non-
+        # captured bs uses live extend_seq_lens via the fresh branch.
+        self._draft_extend_v2_captured_bs: set[int] = set()
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -524,21 +528,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k[:bs].copy_(seq_lens.to(dtype=torch.int32))
             metadata.max_seq_len_k = self.max_context_len
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q[: bs + 1].copy_(
-                torch.arange(
-                    0,
-                    bs * num_tokens_per_bs + 1,
-                    step=num_tokens_per_bs,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
+            if bs in self._draft_extend_v2_captured_bs:
+                # Captured/replay layout: fixed num_draft_tokens per req.
+                num_tokens_per_bs = self.num_draft_tokens
+                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+                metadata.cu_seqlens_q[: bs + 1].copy_(
+                    torch.arange(
+                        0,
+                        bs * num_tokens_per_bs + 1,
+                        step=num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
                 )
-            )
-            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
-            # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
+                metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
+                # see NOTE(draft_extend seq_len handling)
+                seq_lens = (
+                    seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
+                )
+            else:
+                # Eager / non-captured: per-req extend_seq_lens drives the layout.
+                extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int32)
+                metadata.seq_lens_q[:bs].copy_(extend_seq_lens)
+                metadata.max_seq_len_q = int(extend_seq_lens.max().item())
+                metadata.sum_seq_lens_q = int(extend_seq_lens.sum().item())
+                metadata.cu_seqlens_q[0] = 0
+                metadata.cu_seqlens_q[1 : bs + 1].copy_(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+                )
+                seq_lens = (
+                    seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
+                )
             metadata.seq_lens_k[:bs].copy_(seq_lens.to(torch.int32))
             metadata.max_seq_len_k = self.max_context_len
 

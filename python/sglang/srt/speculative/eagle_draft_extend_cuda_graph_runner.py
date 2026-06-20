@@ -405,6 +405,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend)
         ):
+            # Register this bs as captured BEFORE init_forward_metadata_out_graph
+            # so the bound fixed-width DRAFT_EXTEND_V2 branch fires during the
+            # capture call itself (the gate also catches eager replays at the
+            # same bs later). Non-captured eager bs falls through to the
+            # per-req live-length branch.
+            captured = getattr(
+                self.draft_extend_attn_backend, "_draft_extend_v2_captured_bs", None
+            )
+            if captured is not None:
+                captured.add(bs)
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )

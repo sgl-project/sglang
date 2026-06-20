@@ -917,6 +917,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # each backend internalizes inside its `_compute_forward_metadata`.
         self._init_static_metadata_buffers_from_eager()
 
+        # Warmup (FlashInfer autotune + PP DeepGEMM) runs init_forward_metadata
+        # via _dummy_run, which reads the static metadata buffers. Must run
+        # AFTER _init_static_metadata_buffers_from_eager.
+        self.eager_runner.warmup()
+
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
