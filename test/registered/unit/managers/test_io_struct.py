@@ -608,6 +608,29 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
 
+    def test_getitem_session_params_per_sample(self):
+        """#27218: a list-valued session_params is indexed per subrequest; a
+        scalar dict is forwarded whole."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params=[{"id": "s1"}, {"id": "s2"}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "s1"})
+        self.assertEqual(req[1].session_params, {"id": "s2"})
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params={"id": "shared"},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "shared"})
+        self.assertEqual(req[1].session_params, {"id": "shared"})
+
     def test_getitem_preserves_return_prompt_token_ids(self):
         """Batch subrequests must keep the prompt-token-id return flag."""
         req = GenerateReqInput(
