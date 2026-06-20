@@ -727,7 +727,11 @@ class GenerateReqInput:
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
-            session_params=self.session_params,
+            session_params=(
+                self.session_params[i]
+                if isinstance(self.session_params, list)
+                else self.session_params
+            ),
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
