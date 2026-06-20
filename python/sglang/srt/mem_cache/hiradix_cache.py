@@ -90,14 +90,31 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            if server_args.enable_shared_mla:
+                from sglang.srt.mem_cache.shared_mla_host_kv_cache import (
+                    SharedMLATokenToKVPoolHost,
+                )
+
+                tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+                tp_size = torch.distributed.get_world_size(group=params.tp_cache_group)
+                self.token_to_kv_pool_host = SharedMLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+            else:
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 

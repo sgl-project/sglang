@@ -277,6 +277,17 @@ class HostKVCache(abc.ABC):
         ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
+        self._check_host_memory()
+
+        self.kv_buffer = self.init_kv_buffer()
+
+        # A lock for synchronized operations on memory allocation and state transitions.
+        self.lock = threading.RLock()
+        self.clear()
+
+    def _check_host_memory(self):
+        # Subclasses that attach to a shared slab instead of allocating per-rank
+        # host memory may override this (e.g. SharedMLA followers).
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
@@ -291,12 +302,6 @@ class HostKVCache(abc.ABC):
             logger.info(
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
-
-        self.kv_buffer = self.init_kv_buffer()
-
-        # A lock for synchronized operations on memory allocation and state transitions.
-        self.lock = threading.RLock()
-        self.clear()
 
     @abc.abstractmethod
     def get_size_per_token(self):

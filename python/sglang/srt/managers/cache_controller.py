@@ -450,6 +450,8 @@ class HiCacheController:
             # todo: load balancing
             and self.storage_config.tp_rank != 0
         )
+        # SharedMLA non-owner ranks reuse rank 0's slab; skip the real L3 IO.
+        self.prefetch_skip = getattr(self.mem_pool_host, "is_owner", True) is False
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -898,6 +900,10 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
+        if self.prefetch_skip:
+            # SharedMLA non-owner: see _generic_page_get for rationale.
+            operation.increment(len(hash_values) * self.page_size)
+            return
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -913,6 +919,12 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        if self.prefetch_skip:
+            # SharedMLA non-owner: advance completed_tokens; MIN converges to rank 0.
+            for _ in range(len(hash_values)):
+                if not operation.increment(self.page_size):
+                    break
+            return
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -1011,7 +1023,13 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if self.prefetch_skip:
+                # SharedMLA non-owner: assume full hit; MIN clamps to rank 0.
+                hit_page_num = len(batch_hashes)
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
