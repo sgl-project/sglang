@@ -400,13 +400,35 @@ class FlashAttentionBackend(AttentionBackend):
         # slices [:bs]; the fresh path reads full tensors.
         seq_lens_cpu = forward_batch.seq_lens_cpu
 
-        # Internalize the captured-bucket seam — every caller goes through
-        # this method; the public API does not expose it.
-        _has_captured = in_capture or self._has_captured_metadata(bs, forward_mode)
+        # Lazy-populate the per-bs metadata view for capturable modes — calls
+        # _bind_metadata_buffers if this (bs, mode) hasn't been seen yet, so
+        # the bound body's dict lookups always succeed (the old `_has_captured`
+        # conditional is unconditional True for capturable modes). The dict
+        # entries hold only [:bs] views into shared max-bs buffers — no new
+        # tensor allocations, just small Python objects (~few KB total).
+        _is_capturable = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+        if _is_capturable and not self._has_captured_metadata(bs, forward_mode):
+            # num_tokens: bs for decode/idle; bs*num_draft_tokens for
+            # target_verify; sum(extend_seq_lens) for draft_extend_v2. The
+            # forward_batch carries this via positions.numel() (set by all
+            # spec-aware callers; falls back to seq_lens for cases that lack
+            # positions).
+            positions = getattr(forward_batch, "positions", None)
+            if positions is not None:
+                num_tokens = positions.numel()
+            else:
+                num_tokens = bs
+            self._bind_metadata_buffers(
+                bs, num_tokens, encoder_lens, forward_mode, spec_info, seq_lens.device
+            )
 
-        if _has_captured:
-            # ---- captured-bucket cuda-graph buffers: in-place fused-kernel
-            # fill (old _apply_cuda_graph_metadata body, verbatim) -----------
+        if _is_capturable:
+            # Bound cuda-graph buffers: in-place fused-kernel fill of the
+            # per-bs metadata views (allocated once, refilled per-iter).
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs]
             req_pool_indices = req_pool_indices[:bs]
