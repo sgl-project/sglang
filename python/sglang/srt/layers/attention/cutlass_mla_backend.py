@@ -124,12 +124,37 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         ``init_static_metadata_buffers``. The Cutlass-MLA read kernel guards on
         ``seq_lens`` so trailing sentinel slots in the block table are never
         accessed.
+
+        Oversized eager fallback: when ``bs`` exceeds the cuda-graph block
+        table's row count (max_running_requests > cuda_graph_max_bs_decode and
+        DecodeCudaGraphRunner rejects -> eager), the Triton kv-indices fill is
+        launched with grid bs > buffer rows. Allocate a fresh per-iter block
+        table + workspace for those iters (mirrors the pre-use_bound fresh
+        path that FlashMLA already has).
         """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
 
-        block_kv_indices = self.cuda_graph_kv_indices
+        if bs <= self.cuda_graph_kv_indices.shape[0]:
+            block_kv_indices = self.cuda_graph_kv_indices
+            workspace = self.cuda_graph_mla_workspace
+            block_table_view = block_kv_indices[:bs, : block_kv_indices.shape[1]]
+        else:
+            max_seqlen_pad = triton.cdiv(
+                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
+            )
+            block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            workspace_size = cutlass_mla_get_workspace_size(
+                max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
+            )
+            workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+            block_table_view = block_kv_indices
         create_flashmla_kv_indices_triton[
             (
                 bs,
@@ -146,8 +171,8 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=PAGE_SIZE,
         )
         self.forward_metadata = CutlassMLADecodeMetadata(
-            self.cuda_graph_mla_workspace,
-            block_kv_indices[:bs, : block_kv_indices.shape[1]],
+            workspace,
+            block_table_view,
         )
 
     def init_static_metadata_buffers(
