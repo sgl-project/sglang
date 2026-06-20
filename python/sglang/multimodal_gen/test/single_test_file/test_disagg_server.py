@@ -16,7 +16,7 @@ Two configurations are covered:
 
 Run directly:
 
-    pytest -v python/sglang/multimodal_gen/test/server/test_disagg_server.py
+    pytest -v python/sglang/multimodal_gen/test/single_test_file/test_disagg_server.py
     pytest -v ... -k ZImage1Rank              # one class
     pytest -v ... -k test_generates_image     # one test
 """

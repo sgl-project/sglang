@@ -296,7 +296,6 @@ def _truncate_safetensor(src_file: str, dst_file: str) -> None:
 
 
 def _perturb_safetensor(src_file: str, dst_file: str) -> None:
-
     tensors = load_file(src_file)
     perturbed = {
         k: (t + 0.01 if t.is_floating_point() else t) for k, t in tensors.items()
@@ -361,7 +360,6 @@ class _UpdateWeightsApiMixin:
 
 
 class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
-
     @pytest.fixture(
         scope="class",
         params=_ACTIVE_MODEL_PAIRS,

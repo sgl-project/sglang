@@ -7,7 +7,7 @@ LLM engine's ModelRunner.update_weights_from_disk.
 
 Detailed usage of higher level API can be found in
 
-/python/sglang/multimodal_gen/test/server/test_update_weights_from_disk.py
+/python/sglang/multimodal_gen/test/single_test_file/test_update_weights_from_disk.py
 
 Key design decisions:
 

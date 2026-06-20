@@ -1,19 +1,21 @@
 import pytest
 
-from sglang.multimodal_gen.test.server.accuracy_config import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.config import (
     ComponentType,
     get_skip_reason,
     should_skip_component,
 )
-from sglang.multimodal_gen.test.server.accuracy_testcase_configs import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.testcase_configs import (
     ACCURACY_ONE_GPU_CASES,
     get_component_duplicate_skip_reason,
 )
-from sglang.multimodal_gen.test.server.accuracy_utils import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     run_native_component_accuracy_case,
     run_text_encoder_accuracy_case,
 )
-from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
+    AccuracyEngine,
+)
 
 VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS = {
     "wan2_1_t2v_1.3b",

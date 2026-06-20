@@ -44,7 +44,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
+from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,

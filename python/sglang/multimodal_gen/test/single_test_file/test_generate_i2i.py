@@ -4,7 +4,10 @@ import unittest
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.test.cli.test_generate_common import CLIBase, run_command
+from sglang.multimodal_gen.test.single_test_file.cli_generate_common import (
+    CLIBase,
+    run_command,
+)
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     check_image_size,

@@ -840,17 +840,17 @@ def _discover_unit_tests() -> list[str]:
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
     "component-accuracy": [
-        "test_component_accuracy_1_gpu.py",
-        "test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
     ],
     "component-accuracy-1-gpu": [
-        "test_component_accuracy_1_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
     ],
     "component-accuracy-2-gpu": [
-        "test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
-        "test_server_b200.py",
+        "../single_test_file/test_server_b200.py",
     ],
 }
 
@@ -865,13 +865,13 @@ PARAMETRIZED_CASE_GROUPS = {
 
 STANDALONE_FILES = {
     "1-gpu": [
-        "../cli/test_generate_t2i_perf.py",
+        "../single_test_file/test_generate_zimage_turbo_cli.py",
         # Temporarily disabled: 24 timeout failures since 2026-04-09 across
         # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
-        # "test_update_weights_from_disk.py",
+        # "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
-        "test_disagg_server.py",
+        "../single_test_file/test_disagg_server.py",
     ],
 }
 
@@ -880,14 +880,13 @@ STANDALONE_FILES = {
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
-        "../cli/test_generate_t2i_perf.py": 240.0,
         # See STANDALONE_FILES note above — temporarily disabled.
-        # "test_update_weights_from_disk.py": 480.0,
+        # "../single_test_file/test_update_weights_from_disk.py": 480.0,
     },
     "2-gpu": {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
         # Raise if CI reports a higher measured time.
-        "test_disagg_server.py": 600.0,
+        "../single_test_file/test_disagg_server.py": 600.0,
     },
 }
 
@@ -916,7 +915,9 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = (
+    "../single_test_file/test_update_weights_from_disk.py"
+)
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
 _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "FLUX.2-klein-base-4B",
