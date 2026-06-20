@@ -230,10 +230,38 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_host_register_npu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+) -> torch.Tensor:
+    """
+    Allocate tensor for NPU devices.
+    """
+    try:
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeHostTensorAllocator,
+        )
+    except ImportError:
+        MooncakeHostTensorAllocator = None
+
+    if MooncakeHostTensorAllocator is not None and isinstance(
+        allocator, MooncakeHostTensorAllocator
+    ):
+        # Mooncake standalone storage requires buffers to remain in Mooncake's
+        # shared-memory pool so register_buffer() can preserve zero-copy access.
+        return allocator.allocate(dims, dtype=dtype, device=device)
+
+    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    return buffer
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_host_register_npu,
         "musa": alloc_with_pin_memory,
     },
 )
