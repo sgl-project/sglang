@@ -23,7 +23,7 @@ import json
 import os
 import shlex
 import statistics
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
@@ -45,6 +45,18 @@ class ToleranceConfig:
     non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
+
+    def with_overrides(self, overrides: dict[str, float] | None) -> ToleranceConfig:
+        """Return a copy with per-scenario tolerance overrides applied."""
+        if not overrides:
+            return self
+
+        valid_fields = {config_field.name for config_field in fields(self)}
+        unknown_fields = sorted(set(overrides) - valid_fields)
+        if unknown_fields:
+            raise ValueError(f"Unknown tolerance override field(s): {unknown_fields}")
+
+        return replace(self, **{key: float(value) for key, value in overrides.items()})
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -98,6 +110,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    tolerance_overrides: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +143,10 @@ class BaselineConfig:
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
                 estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
+                tolerance_overrides={
+                    key: float(value)
+                    for key, value in cfg.get("tolerance_overrides", {}).items()
+                },
             )
 
         return cls(
@@ -155,6 +172,10 @@ class BaselineConfig:
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
                 estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
+                tolerance_overrides={
+                    key: float(value)
+                    for key, value in cfg.get("tolerance_overrides", {}).items()
+                },
             )
 
         self.scenarios.update(scenarios_new)

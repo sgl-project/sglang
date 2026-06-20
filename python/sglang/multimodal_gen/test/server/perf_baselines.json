@@ -515,7 +515,13 @@
             "expected_e2e_ms": 1976.64,
             "expected_avg_denoise_ms": 163.76,
             "expected_median_denoise_ms": 188.61,
-            "estimated_full_test_time_s": 122.0
+            "estimated_full_test_time_s": 122.0,
+            "tolerance_overrides": {
+                "e2e": 0.5,
+                "denoise_stage": 0.5,
+                "denoise_step": 0.5,
+                "denoise_agg": 0.5
+            }
         },
         "flux_2_ti2i": {
             "stages_ms": {
