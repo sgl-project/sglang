@@ -97,8 +97,21 @@ def maybe_register_hicache_draft(
     if isinstance(pool, HybridLinearKVPool):
         pool = pool.full_kv_pool
 
-    # Create host pool for draft with the same slot count as the target host pool,
-    # so that host indices stay 1-to-1 between target and draft KV caches.
+    # UnifiedRadixCache path: use draft strategy dispatch
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            attach_draft_pool_to_unified_cache,
+        )
+
+        attach_draft_pool_to_unified_cache(
+            tree_cache=tree_cache,
+            draft_pool=pool,
+            server_args=server_args,
+            page_size=page_size,
+        )
+        return
+
+    # Legacy path (SWARadixCache / HiRadixCache): single host pool, use MHA/MLA directly
     primary = tree_cache.cache_controller.mem_pool_host
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
