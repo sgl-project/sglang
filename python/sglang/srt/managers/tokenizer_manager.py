@@ -2642,7 +2642,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        kill_process_tree(os.getpid(), include_parent=True)
+        # Enter the shutting-down state: stop the subprocess watchdog first so it
+        # does not misread the intentionally-SIGTERM'd children as crashes (which
+        # would fire a spurious SIGQUIT). Then SIGTERM children before the SIGKILL
+        # so scheduler ranks release pinned-host KV buffers (e.g. hisparse) in
+        # userspace -- otherwise kernel reclaim of large cudaHostRegister'd
+        # buffers stalls teardown in uninterruptible sleep.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        kill_process_tree(os.getpid(), include_parent=True, graceful_timeout=15)
         sys.exit(0)
 
     def force_exit_handler(self):

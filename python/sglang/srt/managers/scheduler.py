@@ -352,6 +352,11 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+        # Set by the SIGTERM handler to break the event loop so the finally
+        # block in run_scheduler_process can release GPU/pinned-host resources
+        # in userspace before the process exits.
+        self.gracefully_stop = False
+
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
@@ -1445,6 +1450,16 @@ class Scheduler(
 
         return result_dict
 
+    def release_host_resources(self) -> None:
+        """Release pinned host buffers in userspace on graceful shutdown.
+
+        Called from run_scheduler_process's finally after the event loop breaks
+        on SIGTERM. Keeps process teardown from stalling while the kernel
+        unpins large cudaHostRegister'd buffers during SIGKILL reclaim.
+        """
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.destroy()
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
@@ -1473,6 +1488,9 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            if self.gracefully_stop:
+                break
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1509,6 +1527,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self.gracefully_stop:
+                break
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -4182,6 +4203,15 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        # Graceful shutdown: SIGTERM breaks the event loop so the finally
+        # block can release pinned-host KV buffers in userspace. SIGKILL
+        # reclaim of large cudaHostRegister'd buffers can otherwise stall the
+        # process in uninterruptible sleep for tens of seconds.
+        def _sigterm_handler(signum, frame):
+            scheduler.gracefully_stop = True
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
@@ -4201,3 +4231,7 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Only on the graceful path -- the exception path may leave the GPU
+            # wedged, where stream.synchronize() in destroy() could itself hang.
+            if scheduler.gracefully_stop:
+                scheduler.release_host_resources()

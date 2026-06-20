@@ -1250,6 +1250,7 @@ def kill_process_tree(
     include_parent: bool = True,
     skip_pid: int = None,
     wait_timeout: Optional[float] = None,
+    graceful_timeout: Optional[float] = None,
 ):
     """Kill the process and all its child processes.
 
@@ -1257,6 +1258,14 @@ def kill_process_tree(
     raises `RuntimeError` on timeout; `None` is fire-and-forget. The
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
+
+    `graceful_timeout` (seconds), when set, SIGTERMs the child processes first
+    and gives them up to that long to exit on their own before the SIGKILL.
+    GPU-holding subprocesses use this window to release pinned-host buffers in
+    userspace; otherwise the kernel unpins them during SIGKILL reclaim, which
+    can stall teardown in uninterruptible sleep for tens of seconds. Children
+    only -- the parent stays alive so PR_SET_PDEATHSIG does not SIGKILL them
+    mid-cleanup.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -1273,6 +1282,21 @@ def kill_process_tree(
         return
 
     children = itself.children(recursive=True)
+
+    if graceful_timeout is not None:
+        to_terminate = [child for child in children if child.pid != skip_pid]
+        for child in to_terminate:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        if to_terminate:
+            deadline = time.monotonic() + graceful_timeout
+            while time.monotonic() < deadline and _still_holding_resources(
+                to_terminate
+            ):
+                time.sleep(0.1)
+
     killed = []
     for child in children:
         if child.pid == skip_pid:

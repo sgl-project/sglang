@@ -199,6 +199,20 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
         )
 
 
+def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    if int(rc) != 0:
+        # Best-effort: this runs on the shutdown path, so warn instead of
+        # raising. A leaked registration is reclaimed by the kernel at exit.
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
+            int(rc),
+            cudart.cudaGetErrorString(rc),
+            buffer.data_ptr(),
+        )
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -297,6 +311,30 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        """Release pinned host buffers in userspace before process exit.
+
+        cudaHostRegister'd buffers are otherwise unpinned by the kernel during
+        SIGKILL reclaim, which can stall the process in uninterruptible sleep
+        for tens of seconds when the buffer is large (many GB per rank).
+        Unregistering here -- while the process is alive and responsive -- keeps
+        the subsequent exit fast. Idempotent and best-effort.
+
+        Only the host_register-backed allocator needs explicit unregister; the
+        npu/musa pin_memory path is freed by torch together with the tensor.
+        """
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        buffers = getattr(self, "kv_buffer", None)
+        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+            if not isinstance(buffers, (list, tuple)):
+                buffers = [buffers]
+            for buf in buffers:
+                if buf is not None:
+                    _cuda_host_unregister(buf)
+        self.kv_buffer = None
 
     @abc.abstractmethod
     def get_size_per_token(self):
