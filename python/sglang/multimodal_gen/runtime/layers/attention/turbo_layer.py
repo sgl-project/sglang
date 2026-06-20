@@ -289,12 +289,10 @@ class MinimalA2AAttnOp(DistributedAttention):
             requested_attention_backend = get_global_server_args().attention_backend
         except ValueError:
             requested_attention_backend = None
-        selected_attention_backend, warning_message = (
-            _resolve_turbo_wan_sparse_backend(
-                attention_type,
-                requested_attention_backend,
-                supported_attention_backends,
-            )
+        selected_attention_backend, warning_message = _resolve_turbo_wan_sparse_backend(
+            attention_type,
+            requested_attention_backend,
+            supported_attention_backends,
         )
         if warning_message is not None:
             logger.warning_once(warning_message)
