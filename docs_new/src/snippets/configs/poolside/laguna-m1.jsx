@@ -118,10 +118,11 @@ sgl-eval run gsm8k \\
 
   playgroundFeatures: {
 
-    // M.1 is global-attention (no SWA); expose TP + DP-Attention here. Context parallelism is
-    // exposed separately and Hopper-only, under `flagSelects` below — it requires the fa3 backend,
-    // which is SM80–90 (rejected on Blackwell SM100), so it cannot run on the B200/B300/GB200/GB300
-    // cells.
+    // M.1 is global-attention (no SWA); expose TP + DP-Attention here. CP is a separate Hopper-only
+    // knob below (it needs the fa3 backend, which is SM80–90, so it can't run on the Blackwell SM100
+    // cells; the default trtllm_mha backend has no CP-aware KV-store). It lives outside this card
+    // rather than as a `cp` knob like MiniMax-M3 because the built-in attention CP knob emits NSA
+    // flags (--enable-nsa-prefill-context-parallel), which are for DeepSeek-family models, not M.1.
     // DP-Attention: VERIFIED functionally correct on 8×B200 BF16 (GSM8K 0.94, identical to the TP
     // baseline) but ~15–28% slower on this GQA model (8 KV heads). Playground experiment only —
     // deliberately NOT in the shipped Balanced recipe.
@@ -173,27 +174,24 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // Context Parallelism (prefill) — HOPPER ONLY. M.1's default trtllm_mha backend has no CP-aware
-    // KV-store (crashes in store_cache / kvcache.cuh); the fa3 backend DOES implement prefill-CP, but
-    // fa3 is SM80–90 only, so the whole select is hidden on Blackwell (SM100) cells. EXPERIMENTAL /
-    // UNVERIFIED: the fa3 prefill-CP path exists but has not been benchmarked on M.1 (the only CP
-    // run attempted on B200 failed on the SM check). Decode-CP is unimplemented upstream
-    // (sgl-project/sglang#21788). attn-cp-size 2 with --tp 8 → effective attention TP 4.
+    // CP — HOPPER ONLY: the whole card materializes only on h200. Splits attention context across
+    // ranks via the fa3 backend; fa3 is SM80–90, so every option is hidden on the Blackwell SM100
+    // cells (b200/b300/gb200/gb300) and the card disappears there. No "prefill" qualifier — decode-
+    // phase CP is unimplemented upstream (sgl-project/sglang#21788), so CP here is unambiguous.
+    // EXPERIMENTAL / UNVERIFIED on M.1 (fa3+CP not yet benchmarked). cp=N → effective attn TP = tp/N.
     flagSelects: [
       {
         id: "cp",
-        title: "Context Parallelism (prefill · Hopper)",
+        title: "CP",
         stripPrefixes: ["--attention-backend", "--enable-prefill-cp", "--cp-strategy", "--attn-cp-size"],
         options: [
           { id: "off", label: "Off", flags: [],
             hide: { hw: ["b200", "b300", "gb200", "gb300"] } },
-          { id: "cp2", label: "CP=2 · fa3",
-            flags: [
-              "--attention-backend fa3",
-              "--enable-prefill-cp",
-              "--cp-strategy zigzag",
-              "--attn-cp-size 2",
-            ],
+          { id: "cp2", label: "2",
+            flags: ["--attention-backend fa3", "--enable-prefill-cp", "--cp-strategy zigzag", "--attn-cp-size 2"],
+            hide: { hw: ["b200", "b300", "gb200", "gb300"] } },
+          { id: "cp4", label: "4",
+            flags: ["--attention-backend fa3", "--enable-prefill-cp", "--cp-strategy zigzag", "--attn-cp-size 4"],
             hide: { hw: ["b200", "b300", "gb200", "gb300"] } },
         ],
       },
