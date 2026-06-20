@@ -1003,10 +1003,6 @@ class ModelRunnerKVCacheMixin:
                 requested_per_worker,
                 max_num_reqs,
             )
-        logger.info(
-            f"Max concurrent requests (per dp worker) from the finalized token capacity: "
-            f"max_num_reqs={max_num_reqs}."
-        )
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
