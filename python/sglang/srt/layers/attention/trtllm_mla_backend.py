@@ -494,6 +494,34 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self._compute_decode_metadata(forward_batch, in_capture=in_capture)
 
+    def _build_fresh_decode_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> TRTLLMMLADecodeMetadata:
+        """Allocate per-iter decode metadata sized to the live ``bs``.
+
+        Used when eager dispatch is forced (e.g. ``max_running_requests >
+        cuda_graph_max_bs_decode``) and the singleton ``eager_decode_metadata``
+        (sized at cuda-graph max_bs) would overflow on the seq_lens[:bs]
+        write. Mirrors the pre-use_bound eager-build path.
+        """
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        metadata = TRTLLMMLADecodeMetadata()
+        metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+        metadata.cu_seqlens_q = torch.zeros(
+            (bs + 1,), dtype=torch.int32, device=device
+        )
+        metadata.seq_lens_q = torch.zeros((bs,), dtype=torch.int32, device=device)
+        metadata.block_kv_indices = torch.full(
+            (bs, max_blocks_per_seq), -1, dtype=torch.int32, device=device
+        )
+        metadata.max_seq_len_k = self.max_context_len
+        # max_seq_len_q is set per-mode by the caller (and overwritten for
+        # spec); seed with a safe default.
+        metadata.max_seq_len_q = 1
+        return metadata
+
     def _compute_decode_metadata(
         self, forward_batch: ForwardBatch, *, in_capture: bool = False
     ):
@@ -516,6 +544,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
 
         metadata = self.decode_cuda_graph_metadata.get(bs, self.eager_decode_metadata)
+        # Oversized eager: eager_decode_metadata buffers are sized at the
+        # cuda-graph max_bs; if max_running_requests > cuda_graph_max_bs_decode
+        # and DecodeCudaGraphRunner rejects (-> eager), the subsequent
+        # [:bs].copy_(seq_lens[:bs]) below would size-mismatch on max-bs-sized
+        # destinations with bs-sized sources. Build a fresh live-sized metadata
+        # for those iters (mirrors the pre-use_bound fresh path).
+        if metadata is self.eager_decode_metadata and bs > metadata.seq_lens_k.shape[0]:
+            metadata = self._build_fresh_decode_metadata(forward_batch)
         seq_lens = forward_batch.seq_lens
 
         # Reset any stale prefill metadata (the backend instance persists across
