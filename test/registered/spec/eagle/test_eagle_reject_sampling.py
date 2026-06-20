@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 
 QWEN35_MODEL = "Qwen/Qwen3.5-9B"
 SERVER_LAUNCH_TIMEOUT = 600
@@ -28,6 +28,8 @@ class TestQwen35EagleRS(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
+            "--tp",
+            "2",
             "--speculative-algorithm",
             "NEXTN",
             "--speculative-num-steps",
