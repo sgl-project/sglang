@@ -338,6 +338,47 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
+    if server_args.speculative_use_rejection_sampling:
+        # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
+        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
+        # the rejection-sampling kernel consumes; everything else (STANDALONE,
+        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
+        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            raise NotImplementedError(
+                "--speculative-use-rejection-sampling is only supported for "
+                "EAGLE / EAGLE3 / NEXTN, not "
+                f"speculative_algorithm={server_args.speculative_algorithm}."
+            )
+        if server_args.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
+            )
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--speculative-accept-threshold-single / "
+                "--speculative-accept-threshold-acc; rejection sampling ignores "
+                "the accept thresholds."
+            )
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--enable-deterministic-inference; the sampling kernel draws "
+                "coins from the global RNG and is not batch-invariant."
+            )
+        if server_args.enable_multi_layer_eagle:
+            raise NotImplementedError(
+                "--speculative-use-rejection-sampling is not supported with "
+                "multi-layer EAGLE (--enable-multi-layer-eagle)."
+            )
+        logger.info(
+            "Rejection sampling is enabled for speculative decoding "
+            "(speculative_use_rejection_sampling=True)."
+        )
+
     if (
         server_args.speculative_eagle_topk == 1
         and server_args.speculative_num_draft_tokens
