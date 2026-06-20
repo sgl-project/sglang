@@ -15,7 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(
+    est_time=82,
+    stage="base-c",
+    runner_config="deepep-4-gpu-h100",
+    disabled="Temporarily disabled until Mooncake EP supports torch 2.12.1",
+)
 
 ib_devices = get_rdma_devices_args()
 
