@@ -8,12 +8,13 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-b-test-cpu")
 
 
-class TestQuantLogString(unittest.TestCase):
+class TestQuantLogString(CustomTestCase):
     def test_qwen_fp8_config(self):
         # Example from Qwen/Qwen3-4B-Thinking-2507-FP8
         quant_config = {
