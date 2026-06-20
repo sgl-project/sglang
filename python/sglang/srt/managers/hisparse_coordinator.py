@@ -57,7 +57,7 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
-        swap_in_block_size: int = 512,
+        swap_in_block_size: int = 960,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
