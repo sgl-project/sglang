@@ -82,6 +82,19 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Eager entry point. FlashInferMLAAttnBackend (our parent) ships its
+        own init_forward_metadata that only handles its own DecodeMetadata /
+        PrefillMetadata wrappers; it never reaches Cutlass-MLA's
+        ``_compute_decode_metadata`` (which fills the cuda_graph_kv_indices
+        block table + workspace). Bypass the parent and route through the
+        base ABC default (out_graph + in_graph) so this backend's
+        init_forward_metadata_out_graph runs and the eager / non-captured-bs
+        path gets correct decode metadata.
+        """
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,

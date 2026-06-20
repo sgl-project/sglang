@@ -1000,6 +1000,22 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
 
+        # Set up the online-C128 MTP controller for this forward iter once,
+        # before any branch reads state_slot_offset(). prepare_forward commits
+        # pending state and calls begin_verify (for target_verify) which
+        # populates _verify_ctx that write_prefix_states reads later; if we
+        # only read state_slot_offset() the offset is correct but _verify_ctx
+        # stays None, so write_prefix_states returns without writing the
+        # per-draft C128 prefix states.
+        logical_forward_mode = getattr(
+            forward_batch, "actual_forward_mode", forward_batch.forward_mode
+        )
+        self.online_c128_mtp.prepare_forward(
+            logical_forward_mode,
+            req_pool_indices,
+            seq_lens,
+        )
+
         if use_bound:
             if in_capture:
                 # Captured graph does no real cache writes, so synthesize a dummy
