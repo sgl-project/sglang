@@ -40,7 +40,7 @@ class TestQwen35EagleRS(CustomTestCase):
             "4",
             "--speculative-use-rejection-sampling",
             "--mem-fraction-static",
-            "0.9",
+            "0.8",
             "--disable-radix-cache",
         ]
         with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
