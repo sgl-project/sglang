@@ -9,7 +9,7 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 
 @dataclass
-class K2ArchConfig(DiTArchConfig):
+class Krea2ArchConfig(DiTArchConfig):
     features: int = 6144  # hidden dim
     tdim: int = 256  # timestep embedding dim
     txtdim: int = 2560  # text-encoder hidden dim (Qwen3-VL-4B hidden_size)
@@ -64,6 +64,6 @@ class K2ArchConfig(DiTArchConfig):
 
 
 @dataclass
-class K2DitConfig(DiTConfig):
-    arch_config: K2ArchConfig = field(default_factory=K2ArchConfig)
+class Krea2DitConfig(DiTConfig):
+    arch_config: Krea2ArchConfig = field(default_factory=Krea2ArchConfig)
     prefix: str = "k2"

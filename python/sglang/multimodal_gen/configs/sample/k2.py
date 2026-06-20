@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclass
-class K2SamplingParams(SamplingParams):
+class Krea2SamplingParams(SamplingParams):
     """Distilled `oss_turbo` defaults: 8 steps, CFG disabled."""
 
     negative_prompt: str = ""
@@ -22,7 +22,7 @@ class K2SamplingParams(SamplingParams):
 
 
 @dataclass
-class K2RawSamplingParams(K2SamplingParams):
+class Krea2RawSamplingParams(Krea2SamplingParams):
     """Base `oss_raw` defaults: full sampler with CFG."""
 
     guidance_scale: float = 4.5

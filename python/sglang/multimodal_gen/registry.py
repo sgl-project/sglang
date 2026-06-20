@@ -63,7 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.k2 import K2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.k2 import Krea2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -117,7 +117,7 @@ from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.k2 import (
-    K2SamplingParams,
+    Krea2SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
@@ -853,8 +853,8 @@ def _register_configs():
     )
     # Krea-2 (K2) — non-diffusers MMDiT safetensors (see KNOWN_NON_DIFFUSERS pattern)
     register_configs(
-        sampling_param_cls=K2SamplingParams,
-        pipeline_config_cls=K2PipelineConfig,
+        sampling_param_cls=Krea2SamplingParams,
+        pipeline_config_cls=Krea2PipelineConfig,
         hf_model_paths=["krea/Krea-2"],
         model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
     )

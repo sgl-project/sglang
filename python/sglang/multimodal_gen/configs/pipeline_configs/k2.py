@@ -5,7 +5,7 @@ import torch
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.k2 import K2DitConfig
+from sglang.multimodal_gen.configs.models.dits.k2 import Krea2DitConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -21,7 +21,7 @@ _MU_Y2 = 1.15
 
 
 @dataclass
-class K2PipelineConfig(ImagePipelineConfig):
+class Krea2PipelineConfig(ImagePipelineConfig):
     """Krea-2 single-stream MMDiT, text-to-image.
 
     Reuses the Qwen-Image VAE (same checkpoint) and its latent pack/unpack +
@@ -37,8 +37,11 @@ class K2PipelineConfig(ImagePipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
     vae_precision: str = "bf16"
+    # The released Qwen3-VL text encoder is bf16 (text_encoder/config.json dtype);
+    # the base loader defaults to fp32, which perturbs the conditioning embeddings.
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
-    dit_config: DiTConfig = field(default_factory=K2DitConfig)
+    dit_config: DiTConfig = field(default_factory=Krea2DitConfig)
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
 
     # Pinned time-shift mu (distilled `oss_turbo`); set None to derive from resolution.

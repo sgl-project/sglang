@@ -6,15 +6,13 @@ latent packing, and the rectified-flow timestep schedule. Produces a batch the
 standard DenoisingStage consumes unchanged.
 """
 
+import numpy as np
 import torch
 from einops import rearrange
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
-)
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_k2_flow import (
-    K2FlowMatchScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -141,12 +139,17 @@ class Krea2BeforeDenoisingStage(PipelineStage):
             noise, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch
         )
 
-        # Rectified-flow timestep schedule with time-shift mu.
+        # Rectified-flow timestep schedule with resolution-dependent time-shift mu.
+        # The repo ships a FlowMatchEulerDiscreteScheduler; drive it with the Flux
+        # sigma grid linspace(1, 1/n, n) so its shifted sigmas match the K2 sampler.
         num_inference_steps = batch.num_inference_steps
         image_seq_len = (lat_h // patch) * (lat_w // patch)
         mu = pipeline_config.compute_mu(image_seq_len)
-        scheduler = K2FlowMatchScheduler()
-        scheduler.set_timesteps(num_inference_steps, device=device, mu=mu)
+        scheduler = self.scheduler
+        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+        scheduler.set_timesteps(
+            num_inference_steps, device=device, mu=mu, sigmas=sigmas
+        )
 
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_embeds_mask = [prompt_mask]
@@ -155,7 +158,9 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
         batch.scheduler = scheduler
-        batch.timesteps = scheduler.timesteps
+        # The DiT's TimeEmbed applies its own 1000x, so feed it the [0,1] sigmas
+        # (the diffusers scheduler reports timesteps on the 0..1000 scale instead).
+        batch.timesteps = scheduler.sigmas[:num_inference_steps]
         batch.num_inference_steps = num_inference_steps
         batch.sigmas = None
         batch.generator = torch.Generator(device=device).manual_seed(seed)

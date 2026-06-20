@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
-from sglang.multimodal_gen.configs.models.dits.k2 import K2DitConfig
+from sglang.multimodal_gen.configs.models.dits.k2 import Krea2DitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
@@ -474,7 +474,7 @@ class SingleStreamBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 # Top-level model
 # --------------------------------------------------------------------------- #
-class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """K2 single-stream MMDiT for the SGLang diffusion runtime.
 
     Attribute names follow the released K2 checkpoint, so weights load with an
@@ -483,12 +483,12 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = []
     _compile_conditions = []
-    param_names_mapping = K2DitConfig().arch_config.param_names_mapping
+    param_names_mapping = Krea2DitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(
         self,
-        config: K2DitConfig,
+        config: Krea2DitConfig,
         hf_config: dict[str, Any],
         quant_config: Optional[Any] = None,
     ) -> None:
@@ -592,4 +592,4 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
 
-EntryClass = [K2Transformer2DModel]
+EntryClass = [Krea2Transformer2DModel]
