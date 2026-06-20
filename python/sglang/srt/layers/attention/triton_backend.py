@@ -380,12 +380,25 @@ class TritonAttnBackend(AttentionBackend):
         pre-use_bound behavior.
         """
         bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+        # Multi-step draft decode rewires bs from spec_info.kv_indptr.shape[0]-1
+        # later in the bound branch — when topk > 1 that expanded bs is what the
+        # decode kernels' grid scales with, and the bound per-token buffers
+        # (cuda_graph_attn_logits, cuda_graph_attn_lse, cuda_graph_num_kv_splits)
+        # are only `max_num_tokens` deep. Detect the spec-expanded oversize here
+        # so the fresh-alloc path catches it too.
+        effective_decode_bs = bs
         if (
             forward_batch.forward_mode.is_decode_or_idle()
-            and bs > self.cuda_graph_num_kv_splits.shape[0]
+            and spec_info is not None
+            and getattr(spec_info, "kv_indptr", None) is not None
+        ):
+            effective_decode_bs = spec_info.kv_indptr.shape[0] - 1
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and effective_decode_bs > self.cuda_graph_num_kv_splits.shape[0]
         ):
             return self._compute_forward_metadata_fresh_decode(forward_batch)
-        spec_info = forward_batch.spec_info
         swa = self.sliding_window_size is not None and self.sliding_window_size > 0
 
         window_kv_indptr = self.window_kv_indptr
