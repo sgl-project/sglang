@@ -162,7 +162,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         else:
             super().init_forward_metadata(forward_batch)
 
-    def init_cuda_graph_state(
+    def init_static_metadata_buffers(
         self,
         max_bs: int,
         max_num_tokens: int,
