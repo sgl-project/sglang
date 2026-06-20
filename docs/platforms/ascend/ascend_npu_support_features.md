@@ -71,7 +71,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--page-size`                                       | `128`    | Type: int                      |      A2, A3      |
 | `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |     Planned      |
 | `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
+| `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`,<br/>`slru`,<br/>`priority`,<br/>`fifo`,<br/>`mru`,<br/>`filo` |      A2, A3      |
 | `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
 | `--prefill-delayer-token-usage-low-watermark`       | `None`   | Type: float                    |      A2, A3      |
