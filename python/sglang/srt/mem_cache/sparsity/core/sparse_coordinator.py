@@ -58,6 +58,7 @@ class SparseConfig:
     top_k: int = 2048
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
+    swap_in_block_size: int = 512
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None
