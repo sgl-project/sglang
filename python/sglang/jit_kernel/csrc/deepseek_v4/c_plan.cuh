@@ -53,7 +53,7 @@ struct Prefill1Params {
   PlanW* plan_w;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4; ignored for c128
+  const F2S_T* f2s_ptr;  // full_loc -> SWA loc for c4; ignored for c128
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -69,7 +69,7 @@ struct DecodeParams {
   PlanD* plan_d;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* state_map_ptr;  // full_loc -> SWA loc for c4; ignored for c128
+  const F2S_T* f2s_ptr;  // full_loc -> SWA loc for c4; ignored for c128
   const IDX_T* seq_ptr;  // [batch_size]
   int64_t stride_r2t;
   uint32_t batch_size;
@@ -297,10 +297,6 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
-  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
-    const auto ring_pos = position % params.ring_size;
-    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
-  };
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
@@ -315,13 +311,13 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       // only used for c4, harmless for c128
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
       if (params.compress_ratio == 128) {
-        plan_c.read_page_0 = compute_c128_page(rid, position_0);
-        plan_c.read_page_1 = compute_c128_page(rid, position_1);
+        plan_c.read_page_0 = compute_c128_loc(rid, position_0) / 128;
+        plan_c.read_page_1 = compute_c128_loc(rid, position_1) / 128;
       } else {
         const auto raw_loc_0 = mapping[position_0];
         const auto raw_loc_1 = mapping[position_1];
-        const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
-        const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+        const auto state_loc_0 = params.f2s_ptr[raw_loc_0];
+        const auto state_loc_1 = params.f2s_ptr[raw_loc_1];
         plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
         plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
       }
@@ -342,7 +338,7 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       plan_w.write_loc = compute_c128_loc(rid, position);
     } else {
       const auto raw_loc = mapping[position];
-      plan_w.write_loc = compute_loc(params.state_map_ptr[raw_loc]);
+      plan_w.write_loc = compute_loc(params.f2s_ptr[raw_loc]);
     }
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
@@ -360,10 +356,6 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
-  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
-    const auto ring_pos = position % params.ring_size;
-    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
-  };
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
@@ -375,13 +367,13 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   int32_t read_page_1;
   if (params.compress_ratio == 128) {
     write_loc = compute_c128_loc(rid, position_1);
-    read_page_0 = compute_c128_page(rid, position_0);
-    read_page_1 = compute_c128_page(rid, position_1);
+    read_page_0 = compute_c128_loc(rid, position_0) / 128;
+    read_page_1 = compute_c128_loc(rid, position_1) / 128;
   } else {
     const auto raw_loc_0 = mapping[position_0];
     const auto raw_loc_1 = mapping[position_1];
-    const auto state_loc_0 = params.state_map_ptr[raw_loc_0];
-    const auto state_loc_1 = params.state_map_ptr[raw_loc_1];
+    const auto state_loc_0 = params.f2s_ptr[raw_loc_0];
+    const auto state_loc_1 = params.f2s_ptr[raw_loc_1];
     write_loc = static_cast<int32_t>(compute_loc(state_loc_1));
     read_page_0 = static_cast<int32_t>(compute_loc(state_loc_0) / params.compress_ratio);
     read_page_1 = static_cast<int32_t>(write_loc / params.compress_ratio);
@@ -533,7 +525,7 @@ inline PrefillPlan plan_compress_prefill(
   const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
   const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
   const auto r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr());
-  const auto state_map_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
+  const auto f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
@@ -574,7 +566,7 @@ inline PrefillPlan plan_compress_prefill(
         .plan_w = static_cast<PlanW*>(W.data_ptr()),
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
-        .state_map_ptr = state_map_ptr,
+        .f2s_ptr = f2s_ptr,
         .stride_r2t = req_to_token.stride(0),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
@@ -650,7 +642,7 @@ inline PrefillPlan plan_compress_prefill(
       .plan_w = static_cast<PlanW*>(W.data_ptr()),
       .rid_ptr = rid_ptr,
       .r2t_ptr = r2t_ptr,
-      .state_map_ptr = state_map_ptr,
+      .f2s_ptr = f2s_ptr,
       .stride_r2t = req_to_token.size(1),
       .num_c = counter_c,
       .num_w = counter_w,
@@ -703,7 +695,7 @@ inline tvm::ffi::Tensor plan_compress_decode(
       .plan_d = static_cast<PlanD*>(D.data_ptr()),
       .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
       .r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr()),
-      .state_map_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr()),
+      .f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr()),
       .seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr()),
       .stride_r2t = req_to_token.size(1),
       .batch_size = batch_size,

@@ -12,8 +12,10 @@ from sglang.srt.environ import envs
 
 
 @cache_once
-def _jit_online_c128_mtp_module(head_dim: int) -> Module:
-    args = make_cpp_args(head_dim)
+def _jit_online_c128_mtp_module(
+    head_dim: int, seq_dtype: torch.dtype, req_dtype: torch.dtype
+) -> Module:
+    args = make_cpp_args(head_dim, seq_dtype, req_dtype)
     return load_jit(
         make_name(f"online_c128_mtp_{head_dim}"),
         *args,
@@ -75,7 +77,9 @@ class OnlineC128MTPController:
         if head_dim is None or self._num_verify_tokens() == 0:
             return
         token_to_kv_pool = self.backend.token_to_kv_pool
-        _jit_online_c128_mtp_module(head_dim).mark_pending(
+        _jit_online_c128_mtp_module(
+            head_dim, seq_lens.dtype, req_pool_indices.dtype
+        ).mark_pending(
             seq_lens,
             req_pool_indices,
             token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
@@ -155,7 +159,9 @@ class OnlineC128MTPController:
         if layer_bs <= 0:
             return
 
-        _jit_online_c128_mtp_module(head_dim).write_prefix_states(
+        _jit_online_c128_mtp_module(
+            head_dim, ctx.seq_lens.dtype, ctx.req_pool_indices.dtype
+        ).write_prefix_states(
             kv_score_input,
             ctx.seq_lens,
             ctx.req_pool_indices,
@@ -191,7 +197,9 @@ class OnlineC128MTPController:
         cur_bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
 
         for runtime in self._iter_layer_runtimes():
-            _jit_online_c128_mtp_module(runtime.head_dim).commit_pending(
+            _jit_online_c128_mtp_module(
+                runtime.head_dim, seq_lens.dtype, req_pool_indices.dtype
+            ).commit_pending(
                 seq_lens,
                 req_pool_indices,
                 backend.req_to_token,

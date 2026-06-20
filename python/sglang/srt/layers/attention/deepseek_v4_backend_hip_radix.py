@@ -18,22 +18,14 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+    CompressorBackendMixin,
+    FusedCompressMetadata,
+    create_paged_compressor_data,
+)
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
-
-if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
-else:
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
 
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (

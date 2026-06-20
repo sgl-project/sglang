@@ -177,9 +177,8 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
   }
 }
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename TSeq, typename TReq>
 struct OnlineC128MTPWritePrefixKernel {
-  template <typename TSeq, typename TReq>
   static void launch(
       tvm::ffi::TensorView kv_score_input,
       tvm::ffi::TensorView seq_lens,
@@ -227,14 +226,12 @@ struct OnlineC128MTPWritePrefixKernel {
       int64_t state_slot_stride) {
     using namespace host;
 
-    auto seq_dtype = SymbolicDType{};
-    auto req_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
     TensorMatcher({-1, kHeadDim * 2}).with_dtype<float>().with_device(device).verify(kv_score_input);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(seq_lens);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
+    TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(seq_lens);
+    TensorMatcher({-1}).with_dtype<TReq>().with_device(device).verify(req_pool_indices);
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
     TensorMatcher({128, kHeadDim}).with_dtype<float>().with_device(device).verify(ape);
     TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
@@ -246,33 +243,14 @@ struct OnlineC128MTPWritePrefixKernel {
     RuntimeCheck(layer_bs <= req_pool_indices.shape()[0], "layer_bs exceeds req_pool_indices rows");
     RuntimeCheck(layer_bs * num_verify_tokens <= kv_score_input.shape()[0], "kv_score_input is too small");
 
-    if (seq_dtype.is_type<int32_t>()) {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int32_t, int32_t>(
-            kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
-            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
-      } else {
-        launch<int32_t, int64_t>(
-            kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
-            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
-      }
-    } else {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int64_t, int32_t>(
-            kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
-            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
-      } else {
-        launch<int64_t, int64_t>(
-            kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
-            layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
-      }
-    }
+    launch(
+        kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
+        layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
   }
 };
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename TSeq, typename TReq>
 struct OnlineC128MTPMarkPendingKernel {
-  template <typename TSeq, typename TReq>
   static void launch(
       tvm::ffi::TensorView seq_lens,
       tvm::ffi::TensorView req_pool_indices,
@@ -306,13 +284,11 @@ struct OnlineC128MTPMarkPendingKernel {
       int64_t max_num_reqs) {
     using namespace host;
 
-    auto seq_dtype = SymbolicDType{};
-    auto req_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(seq_lens);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
+    TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(seq_lens);
+    TensorMatcher({-1}).with_dtype<TReq>().with_device(device).verify(req_pool_indices);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
 
     if (bs <= 0) return;
@@ -320,25 +296,12 @@ struct OnlineC128MTPMarkPendingKernel {
     RuntimeCheck(bs <= req_pool_indices.shape()[0], "bs exceeds req_pool_indices rows");
     RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
 
-    if (seq_dtype.is_type<int32_t>()) {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int32_t, int32_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
-      } else {
-        launch<int32_t, int64_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
-      }
-    } else {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int64_t, int32_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
-      } else {
-        launch<int64_t, int64_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
-      }
-    }
+    launch(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
   }
 };
 
-template <int64_t kHeadDim>
+template <int64_t kHeadDim, typename TSeq, typename TReq>
 struct OnlineC128MTPCommitPendingKernel {
-  template <typename TSeq, typename TReq>
   static void launch(
       tvm::ffi::TensorView cur_seq_lens,
       tvm::ffi::TensorView cur_req_pool_indices,
@@ -383,13 +346,11 @@ struct OnlineC128MTPCommitPendingKernel {
       int64_t max_num_reqs) {
     using namespace host;
 
-    auto seq_dtype = SymbolicDType{};
-    auto req_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(cur_seq_lens);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(cur_req_pool_indices);
+    TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(cur_seq_lens);
+    TensorMatcher({-1}).with_dtype<TReq>().with_device(device).verify(cur_req_pool_indices);
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
     TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
@@ -401,27 +362,10 @@ struct OnlineC128MTPCommitPendingKernel {
     RuntimeCheck(cur_bs <= cur_req_pool_indices.shape()[0], "cur_bs exceeds req rows");
     RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
 
-    if (seq_dtype.is_type<int32_t>()) {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int32_t, int32_t>(
-            cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
-            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
-      } else {
-        launch<int32_t, int64_t>(
-            cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
-            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
-      }
-    } else {
-      if (req_dtype.is_type<int32_t>()) {
-        launch<int64_t, int32_t>(
-            cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
-            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
-      } else {
-        launch<int64_t, int64_t>(
-            cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
-            state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
-      }
-    }
+    launch(
+        cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
+        state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs,
+        device.unwrap());
   }
 };
 

@@ -614,11 +614,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             global_page_size=page_size,
         )
 
-        indexer_size = (
-            self.c4_logical_size
-            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
-            else c4_size
-        )
+        indexer_size = self.c4_logical_size
         self.c4_indexer_kv_pool = self._make_indexer_pool(
             indexer_size,
             c4_page_size,
