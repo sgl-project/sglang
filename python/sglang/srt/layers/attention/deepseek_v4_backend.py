@@ -1017,10 +1017,19 @@ class DeepseekV4AttnBackend(
         logical_forward_mode = getattr(
             forward_batch, "actual_forward_mode", forward_batch.forward_mode
         )
+        # For padded cuda-graph target-verify replays, req_pool_indices has
+        # zero-filled padded rows; pass the real verify_bs derived from
+        # spec_info so the controller only writes state for live requests.
+        verify_bs = None
+        if logical_forward_mode.is_target_verify():
+            spec_info = forward_batch.spec_info
+            if spec_info is not None and getattr(spec_info, "num_tokens_per_req", 0):
+                verify_bs = forward_batch.input_ids.shape[0] // spec_info.num_tokens_per_req
         self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
             seq_lens,
+            verify_bs=verify_bs,
         )
 
         if use_bound:
@@ -1158,7 +1167,18 @@ class DeepseekV4AttnBackend(
             else max_seq_len_override
         )
 
-        if forward_batch.forward_mode.is_decode_or_idle():
+        # When DP max-len padding rewrites the batch (forward_mode -> EXTEND
+        # while saving the original on _original_forward_mode), dispatch on
+        # the LOGICAL mode here so decode/target-verify rows still build the
+        # right metadata rather than falling into the prefill branch with
+        # extend_seq_lens.
+        logical_forward_mode = (
+            forward_batch._original_forward_mode
+            if getattr(forward_batch, "_original_forward_mode", None) is not None
+            else forward_batch.forward_mode
+        )
+
+        if logical_forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
             # so slice the shared multi-step out_cache_loc now, not at forward time.
             out_cache_loc = forward_batch.out_cache_loc
@@ -1175,7 +1195,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
             )
-        elif forward_batch.forward_mode.is_target_verify():
+        elif logical_forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1183,7 +1203,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
-        elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+        elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             extend_seq_lens = forward_batch.extend_seq_lens
             assert (
