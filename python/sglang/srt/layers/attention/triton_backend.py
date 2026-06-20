@@ -708,6 +708,16 @@ class TritonAttnBackend(AttentionBackend):
         num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
         self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
+        # Hybrid-SWA: forward_decode wraps swa_out_cache_loc in KVWriteLoc and
+        # SWAKVPool.set_kv_buffer asserts non-None for SWA layers. Translate
+        # out_cache_loc directly here (the cuda_graph_swa_out_cache_loc buffer
+        # is sized for capture and not safe for oversized eager).
+        swa_out_cache_loc = None
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+
         return ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -723,7 +733,7 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits,
-            None,  # swa_out_cache_loc
+            swa_out_cache_loc,
         )
 
     def init_forward_metadata_out_graph(

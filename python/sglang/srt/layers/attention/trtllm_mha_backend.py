@@ -723,12 +723,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Capturable-mode SWA: refill the shared write-target buffer from the
         # live out_cache_loc before replay. The plain-EXTEND fresh path sets
-        # metadata.swa_out_cache_loc directly inside its body above.
+        # metadata.swa_out_cache_loc directly inside its body above; the same
+        # is true for non-captured DRAFT_EXTEND_V2 (it falls through to the
+        # else branch), so skip the refill there too — copying live tokens
+        # into the cuda_graph_swa_out_cache_loc buffer (sized for the
+        # captured static token count) would slice-mismatch on oversized
+        # fallback batches.
         if (
-            (
+            bs_fits_buffer
+            and (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend_v2()
+                or (
+                    forward_mode.is_draft_extend_v2()
+                    and bs in self._draft_extend_v2_captured_bs
+                )
             )
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
