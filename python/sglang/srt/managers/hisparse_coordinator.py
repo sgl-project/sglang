@@ -190,12 +190,8 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def destroy(self) -> None:
-        """Release the pinned host KV buffer on graceful shutdown.
-
-        Drains in-flight host<->device transfers first so the buffer is idle
-        before it is unregistered. See HostKVCache.destroy for why the explicit
-        unregister keeps process teardown from stalling in D-state.
-        """
+        # Drain in-flight transfers so the buffer is idle, then unregister it.
+        # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
         self.mem_pool_host.destroy()

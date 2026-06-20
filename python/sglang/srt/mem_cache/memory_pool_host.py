@@ -203,8 +203,7 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     rc = cudart.cudaHostUnregister(buffer.data_ptr())
     if int(rc) != 0:
-        # Best-effort: this runs on the shutdown path, so warn instead of
-        # raising. A leaked registration is reclaimed by the kernel at exit.
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
         logger.warning(
             "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
             int(rc),
@@ -313,16 +312,12 @@ class HostKVCache(abc.ABC):
         self.clear()
 
     def destroy(self):
-        """Release pinned host buffers in userspace before process exit.
+        """Unregister pinned host buffers in userspace before process exit.
 
-        cudaHostRegister'd buffers are otherwise unpinned by the kernel during
-        SIGKILL reclaim, which can stall the process in uninterruptible sleep
-        for tens of seconds when the buffer is large (many GB per rank).
-        Unregistering here -- while the process is alive and responsive -- keeps
-        the subsequent exit fast. Idempotent and best-effort.
-
-        Only the host_register-backed allocator needs explicit unregister; the
-        npu/musa pin_memory path is freed by torch together with the tensor.
+        Large cudaHostRegister'd buffers are otherwise unpinned by the kernel
+        during SIGKILL reclaim, which can stall teardown in uninterruptible
+        sleep for tens of seconds. Idempotent. (Only the host_register path
+        needs this; npu/musa pin_memory buffers are freed by torch.)
         """
         if getattr(self, "_destroyed", False):
             return

@@ -1259,13 +1259,10 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
 
-    `graceful_timeout` (seconds), when set, SIGTERMs the child processes first
-    and gives them up to that long to exit on their own before the SIGKILL.
-    GPU-holding subprocesses use this window to release pinned-host buffers in
-    userspace; otherwise the kernel unpins them during SIGKILL reclaim, which
-    can stall teardown in uninterruptible sleep for tens of seconds. Children
-    only -- the parent stays alive so PR_SET_PDEATHSIG does not SIGKILL them
-    mid-cleanup.
+    `graceful_timeout` (seconds), when set, SIGTERMs the children first and lets
+    them exit on their own before the SIGKILL -- a window for GPU subprocesses to
+    release pinned-host buffers in userspace. Children only: the parent stays
+    alive so PR_SET_PDEATHSIG does not SIGKILL them mid-cleanup.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "

@@ -54,12 +54,9 @@ class TestGLM5HiSparse(DefaultServerBase, GSM8KMixin):
 
     @classmethod
     def tearDownClass(cls):
-        # HiSparse allocates a large pinned host KV buffer (cudaHostRegister) per
-        # rank. An external SIGKILL leaves the kernel to unpin it during process
-        # reclaim, which can stall teardown for tens of seconds. Drive the
-        # server's own graceful shutdown (SIGTERM) instead, so each scheduler
-        # rank unregisters the buffer in userspace before exiting; fall back to a
-        # hard kill if the graceful path does not finish in time.
+        # HiSparse's large pinned host buffer stalls an external SIGKILL teardown
+        # (kernel unpin). Drive the server's own graceful shutdown so each rank
+        # unregisters in userspace; hard-kill as a fallback.
         cls.process.terminate()
         try:
             cls.process.wait(timeout=90)
