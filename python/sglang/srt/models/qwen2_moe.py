@@ -50,6 +50,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -897,6 +898,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             is_prefill_context_parallel_enabled()
+            and not is_cp_v2_active(forward_batch)
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
@@ -962,6 +964,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             self.pp_group.is_last_rank
+            and not is_cp_v2_active(forward_batch)
             and is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None

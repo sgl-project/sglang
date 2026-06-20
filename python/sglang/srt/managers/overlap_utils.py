@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Sequence, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
@@ -25,18 +24,16 @@ def decide_needs_cpu_seq_lens(
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO / piecewise CG
-    (they read the CPU mirror outside the backend layer).
+    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
+    CPU mirror outside the backend layer to split the batch) or ngram (its
+    USE_FULL_MASK verify path reads the host mirror regardless of backend).
     """
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    cuda_graph_config = server_args.cuda_graph_config
-    if (
-        cuda_graph_config is not None
-        and cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
-    ):
-        # FIXME: support PCG without seq lens cpu value
+    if SpeculativeAlgorithm.from_string(server_args.speculative_algorithm).is_ngram():
+        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
+        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.

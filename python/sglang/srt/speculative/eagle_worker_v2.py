@@ -444,7 +444,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens = (
-                    self.cuda_graph_runner.replay(forward_batch)
+                    self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
                 if (
@@ -767,7 +767,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
         canary_ctx = (
@@ -783,7 +783,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             if can_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
                 )
             else:
@@ -1379,7 +1379,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
-        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
+        # Metadata init is skipped iff cuda-graph already ran load_batch —
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
