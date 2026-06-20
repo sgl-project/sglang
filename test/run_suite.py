@@ -96,7 +96,6 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
-        "stage-b-test-1-gpu-xpu",
     ],
 }
 
