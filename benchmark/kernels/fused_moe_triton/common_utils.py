@@ -176,12 +176,8 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
-    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]). On gfx942
-    # (MI300X, no MX matmul HW) the weights are converted to block-fp8 [128,128]
-    # at load, so the serving MoE kernel looks up block_shape=[128,128] configs.
-    # NVIDIA (sm100) and gfx95 run MXFP8 natively ([1,32]) and must NOT be
-    # remapped, or the tuned config's filename won't match what serving queries.
-    # Gate mirrors fp8.py's native-MXFP8 check (gfx942 == is_hip and not gfx95).
+    # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
+    # sm100/gfx95 run native [1,32] and must not remap (mirrors fp8.py).
     if (
         architecture == "MiniMaxM3SparseForConditionalGeneration"
         and is_hip()
