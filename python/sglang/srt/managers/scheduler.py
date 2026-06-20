@@ -353,7 +353,7 @@ class Scheduler(
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
         # Set by the SIGTERM handler to break the event loop for graceful shutdown.
-        self.gracefully_stop = False
+        self.gracefully_exit = False
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -1482,7 +1482,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            if self.gracefully_stop:
+            if self.gracefully_exit:
                 break
 
             # Receive requests
@@ -1521,7 +1521,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
-            if self.gracefully_stop:
+            if self.gracefully_exit:
                 break
 
             # Receive requests
@@ -4200,7 +4200,7 @@ def run_scheduler_process(
         # SIGTERM breaks the event loop so the finally block can release
         # pinned-host buffers in userspace (see release_host_resources).
         def _sigterm_handler(signum, frame):
-            scheduler.gracefully_stop = True
+            scheduler.gracefully_exit = True
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
 
@@ -4225,5 +4225,5 @@ def run_scheduler_process(
             scheduler.metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_stop:
+            if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
