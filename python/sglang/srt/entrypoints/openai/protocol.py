@@ -794,6 +794,10 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        # An explicit null parallel_tool_calls means "use the default" (True),
+        # not False — normalize it so downstream consumers never see None.
+        if values.get("parallel_tool_calls") is None:
+            values["parallel_tool_calls"] = True
         return values
 
     @model_validator(mode="before")
