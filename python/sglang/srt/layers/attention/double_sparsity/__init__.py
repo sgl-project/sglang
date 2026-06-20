@@ -7,20 +7,15 @@ require ``--enable-hisparse``, and does NOT require PD-disaggregation.
 
 from sglang.srt.layers.attention.double_sparsity.channel_mask import (
     ChannelMask,
-    SanityProbeResult,
     load_channel_mask,
     save_channel_mask,
     slice_per_rank,
-    startup_sanity_probe,
     validate_against_runtime,
     verify_bind_shapes,
 )
 from sglang.srt.layers.attention.double_sparsity.config import (
     DoubleSparsityConfig,
     parse_double_sparsity_config,
-)
-from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-    retrieve_topk,
 )
 from sglang.srt.layers.attention.double_sparsity.selector import (
     DoubleSparsitySelector,
@@ -33,13 +28,10 @@ __all__ = [
     "ChannelMask",
     "DoubleSparsityConfig",
     "DoubleSparsitySelector",
-    "SanityProbeResult",
     "load_channel_mask",
     "parse_double_sparsity_config",
-    "retrieve_topk",
     "save_channel_mask",
     "slice_per_rank",
-    "startup_sanity_probe",
     "validate_against_runtime",
     "validate_double_sparsity",
     "verify_bind_shapes",

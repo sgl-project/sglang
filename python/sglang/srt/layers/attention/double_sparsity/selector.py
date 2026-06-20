@@ -80,13 +80,7 @@ class DoubleSparsitySelector:
         self.num_local_heads = num_local_heads
         self.head_dim = head_dim
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # The opt-in lifted-budget decode path selects a WIDER fixed budget
-        # (lifted_budget_top_k > top_k) and attends it via flash_mla_sparse_fwd;
-        # the selector must emit that many positions. Default off => top_k.
-        if getattr(config, "enable_lifted_budget_decode", False):
-            self.max_top_k = int(config.lifted_budget_top_k)
-        else:
-            self.max_top_k = int(config.top_k)
+        self.max_top_k = int(config.top_k)
         self.page_size = int(config.page_size)
         if self.max_top_k <= 0:
             raise ValueError(

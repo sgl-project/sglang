@@ -366,12 +366,6 @@ class DeepseekSparseAttnBackend(
             )
         )
         self.ds_max_top_k: int = 2048
-        # Opt-in lifted-budget decode (graph-safe production path): the selector
-        # emits a WIDER fixed budget (lifted_budget_top_k > index_topk) and decode
-        # attends the dequantized selected slots via flash_mla_sparse_fwd instead of the
-        # default flashmla_kv. When off, every lifted code path below is skipped
-        # and the default decode is byte-identical.
-        self.ds_lifted_budget_decode: bool = False
         # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
         # sizes the bf16 scratch in ds_graph_state.
         self.ds_score_reduce_bf16: bool = False
@@ -398,9 +392,6 @@ class DeepseekSparseAttnBackend(
                 ds_cfg = parse_double_sparsity_config(
                     model_runner.server_args.double_sparsity_config
                 )
-                self.ds_lifted_budget_decode = bool(
-                    ds_cfg.enable_lifted_budget_decode
-                )
                 self.ds_score_reduce_bf16 = (
                     getattr(ds_cfg, "score_reduce_dtype", "bf16") == "bf16"
                 )
@@ -412,13 +403,8 @@ class DeepseekSparseAttnBackend(
                         ds_cfg, "selector_width_overflow_policy", "full_fallback"
                     )
                 )
-                # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state, so the
-                # selection/output buffers are lifted-width on the opt-in path.
-                self.ds_max_top_k = (
-                    int(ds_cfg.lifted_budget_top_k)
-                    if ds_cfg.enable_lifted_budget_decode
-                    else int(ds_cfg.top_k)
-                )
+                # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state.
+                self.ds_max_top_k = int(ds_cfg.top_k)
             except Exception:
                 # Fall back to the canonical V3.2 default.
                 self.ds_max_top_k = 2048
@@ -1025,8 +1011,6 @@ class DeepseekSparseAttnBackend(
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=int(self.req_to_token.shape[1]),
                 score_reduce_bf16=self.ds_score_reduce_bf16,
-                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
-                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
                 num_local_heads=self.num_q_heads,
                 label_dim=self.ds_label_dim,
                 kv_lora_rank=self.kv_lora_rank,
@@ -1400,8 +1384,6 @@ class DeepseekSparseAttnBackend(
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=width,
                 score_reduce_bf16=self.ds_score_reduce_bf16,
-                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
-                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
                 num_local_heads=self.num_q_heads,
                 label_dim=self.ds_label_dim,
                 kv_lora_rank=self.kv_lora_rank,
@@ -2165,20 +2147,6 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        # Opt-in lifted-budget decode (eager research path): the physical
-        # page_table_1 here is the wider lifted-width selection; attend it via
-        # the dequantized compact KV + flash_mla_sparse_fwd (no 2048 cap) instead
-        # of the default flashmla_kv. Default off => skipped (byte-identical).
-        if getattr(self, "ds_lifted_budget_decode", False):
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_lifted_budget(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
-                sm_scale=layer.scaling,
-                v_head_dim=layer.v_head_dim,
-            )
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2284,78 +2252,6 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
-    def _forward_lifted_budget(
-        self,
-        q_all: torch.Tensor,
-        kv_cache: torch.Tensor,
-        v_head_dim: int,
-        page_table_1: torch.Tensor,
-        sm_scale: float,
-    ) -> torch.Tensor:
-        """Opt-in lifted-budget decode (graph-safe production path; eager fallback).
-
-        ``page_table_1`` is the wider lifted-width selection of PHYSICAL KV slots
-        (``[bs, lifted_budget_top_k]``, ``-1`` pads). Build the request-local
-        compact KV buffer (dequantizing the selected fp8 slots, or gathering bf16)
-        and attend it with ``flash_mla_sparse_fwd`` (no 2048 cap). The default
-        ``flashmla_kv`` path and its ``dsa_index_topk`` assert are untouched.
-
-        Graph path: when the metadata carries preallocated lifted scratch
-        (``DSGraphState.lifted_compact_kv``), use the FIXED-shape builder + the
-        alloc-free ``out=`` dequant into that scratch so the decode is alloc-free
-        under CUDA-graph capture. Eager fallback (non-graph runs): the dynamic
-        ``build_lifted_compact_kv``.
-        """
-        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
-            build_lifted_compact_kv,
-            build_lifted_compact_kv_fixed,
-        )
-
-        bs, width = page_table_1.shape[0], page_table_1.shape[1]
-        fm = getattr(self, "forward_metadata", None)
-        gs = getattr(fm, "ds_graph_state", None) if fm is not None else None
-        lifted_kv = getattr(gs, "lifted_compact_kv", None) if gs is not None else None
-
-        if lifted_kv is not None:
-            # Graph-safe fixed-shape path into preallocated scratch (sliced to the
-            # captured bs/width — both fixed at capture).
-            out_ptf = gs.lifted_page_table[: bs * width]
-            out_ci = gs.lifted_compact_indices[:bs, :width]
-            out_vc = gs.lifted_valid_counts[:bs]
-            out_kv = gs.lifted_compact_kv[: bs * width]
-            valid_lengths = (page_table_1 >= 0).sum(dim=1)
-            build_lifted_compact_kv_fixed(
-                kv_cache,
-                page_table_1,
-                valid_lengths,
-                out_page_table=out_ptf,
-                out_compact_indices=out_ci,
-                out_compact_kv=out_kv,
-                store_is_fp8=self.dsa_kv_cache_store_fp8,
-                out_valid_counts=out_vc,
-            )
-            return self._forward_flashmla_sparse(
-                q_all=q_all,
-                kv_cache=out_kv,
-                page_table_1=out_ci,
-                sm_scale=sm_scale,
-                v_head_dim=v_head_dim,
-                q_pad_scratch=gs.lifted_q_padded,
-            )
-
-        compact_kv, compact_indices, _ = build_lifted_compact_kv(
-            kv_cache,
-            page_table_1,
-            store_is_fp8=self.dsa_kv_cache_store_fp8,
-        )
-        return self._forward_flashmla_sparse(
-            q_all=q_all,
-            kv_cache=compact_kv,
-            page_table_1=compact_indices,
-            sm_scale=sm_scale,
-            v_head_dim=v_head_dim,
-        )
-
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -2363,7 +2259,6 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-        q_pad_scratch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2382,16 +2277,9 @@ class DeepseekSparseAttnBackend(
                 f"TP size may be too large for this model."
             )
 
-            if q_pad_scratch is not None:
-                # Alloc-free graph path: write real heads into preallocated scratch.
-                # The pad-head tail stays 0 (zero-allocated, never written), so the
-                # padded heads' (trimmed) output cannot perturb the real heads.
-                q_padded = q_pad_scratch[:num_tokens]
-                q_padded[:, :num_heads, :].copy_(q_all)
-            else:
-                # Pad q to required size (eager / non-graph path).
-                q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
-                q_padded[:, :num_heads, :] = q_all
+            # Pad q to required size.
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
             q_input = q_all

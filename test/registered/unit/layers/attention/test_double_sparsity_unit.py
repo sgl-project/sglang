@@ -451,74 +451,6 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         attn.indexer.assert_called_once()
         self.assertTrue(torch.equal(result, torch.tensor([7, 8, 9], dtype=torch.int32)))
 
-    def test_ds_branch_contains_placeholder_failure_per_row(self):
-        """Non-row DS failures (e.g. selector RuntimeError from the
-        placeholder guard) are now contained per instead of
-        raising and crashing the batch, the DS branch publishes a
-        per-row failure record to forward_batch.ds_per_request_summary
-        and returns an all-(-1) topk_indices tensor. The scheduler then
-        aborts each affected request via the standard abort path.
-        """
-        attn = self._make_attn(use_ds=True)
-        # Selector left in default placeholder mode (no bind_runtime_data
-        # called); the per-step guard would raise RuntimeError, but the
-        # DS branch now catches it and converts to per-row failure.
-        forward_batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
-            seq_lens=torch.tensor([100], dtype=torch.int32),
-            sparse_mask=None,
-            batch_size=1,
-        )
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
-        # All-(-1) tensor returned; per-request summary records the failure.
-        self.assertTrue(torch.all(result == -1).item())
-        summary = forward_batch.ds_per_request_summary["double_sparsity"]
-        self.assertEqual(len(summary), 1)
-        self.assertEqual(summary[0]["error_class"], "selector_runtime_error")
-        self.assertEqual(summary[0]["dense_fallback"], 1)
-
-    def test_ds_branch_sanitizes_bad_pool_row_and_records_error(self):
-        """live path: a bad req_pool_index (out of range for
-        req_to_token) causes that row's physical slots to be all -1 via
-        the adapter's error-containment path. The DS branch returns normally
-        and publishes a per-request summary record.
-        """
-        attn = self._make_attn_real()
-        max_top_k = attn.double_sparsity_selector.max_top_k
-        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 0  # valid logical position
-        vl = torch.tensor([1], dtype=torch.int32)
-        attn.double_sparsity_selector.retrieve_topk = MagicMock(
-            return_value=(sel, vl)
-        )
-        forward_batch = SimpleNamespace(
-            # req_pool_indices=99 is out of range for a 1-row req_to_token
-            req_pool_indices=torch.tensor([99], dtype=torch.int32),
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            sparse_mask=None,
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
-            ),
-        )
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
-        # Bad pool index causes the adapter to fill -1 for that row.
-        self.assertTrue(torch.all(result == -1).item())
-        # The per-request summary is still published (one record per request).
-        summary = forward_batch.ds_per_request_summary["double_sparsity"]
-        self.assertEqual(len(summary), 1)
-
 
 class TestPageTableAdapter(unittest.TestCase):
     """Verify ``logical_to_physical`` correctly maps logical token positions to
@@ -811,24 +743,6 @@ class TestChannelMaskLoader(unittest.TestCase):
                 mask, server_kv_cache_dtype="bfloat16",
                 server_page_size=64, server_label_dim=4, model_head_dim=128,
             )
-
-    def test_sanity_probe_placeholder_inconclusive(self):
-        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask, startup_sanity_probe,
-        )
-        mask = ChannelMask(
-            channel_selection=torch.zeros(2, 2, 4, dtype=torch.int32),
-            channel_weights=torch.zeros(2, 2, 4, dtype=torch.float32),
-            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
-            label_dim=4, content_sha256="x",
-        )
-        cfg = parse_double_sparsity_config(_valid_payload())
-        selector = DoubleSparsitySelector(
-            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
-        )
-        r = startup_sanity_probe(mask, selector)
-        self.assertFalse(r.passed)
-        self.assertEqual(r.skipped_reason, "placeholder_selector")
 
 
 class TestChannelMaskSlicePerRank(unittest.TestCase):
@@ -1174,47 +1088,6 @@ class TestDSIndexerCacheGate(unittest.TestCase):
         hi = self._cell_size(ds_on=True, hisparse=True)
         dsa = self._cell_size(ds_on=False)
         self.assertEqual(hi, dsa)
-
-
-class TestDoubleSparsityErrorTaxonomy(unittest.TestCase):
-    """anchor (observability): error counter + structured logs.
-
-    The Prometheus counter is registered at module-import time when
-    prometheus_client is available; the registration is best-effort
-    (silent when the dep is missing). This test verifies the API
-    surface — the counter name and the helper that increments labelled
-    counts — exists on the metrics module.
-    """
-
-    def test_error_counter_helpers_exist(self):
-        from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
-
-        # Required surface for the error taxonomy:
-        self.assertTrue(hasattr(ds_metrics, "record_error"))
-        self.assertTrue(hasattr(ds_metrics, "DS_ERROR_CLASSES"))
-        self.assertEqual(
-            sorted(ds_metrics.DS_ERROR_CLASSES),
-            sorted(
-                [
-                    "bad_mask",
-                    "bad_adapter_input",
-                    "selector_runtime_error",
-                    "rank_mismatch",
-                ]
-            ),
-        )
-
-    def test_record_error_accepts_known_class_and_rejects_unknown(self):
-        from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
-
-        # Known class — no exception.
-        ds_metrics.record_error("bad_mask", message="test", request_id="r1")
-        ds_metrics.record_error(
-            "bad_adapter_input", message="test", request_id="r2"
-        )
-        # Unknown class — raises ValueError so callers can't typo a label.
-        with self.assertRaises(ValueError):
-            ds_metrics.record_error("not_a_class", message="oops")
 
 
 class TestDoubleSparsityRequestSummary(unittest.TestCase):

@@ -398,7 +398,7 @@ def validate_against_runtime(
 
     Per the loader contract: shape correctness, content identity (covered by load_channel_mask
     hash check), and configuration agreement on dtype / head_dim / page_size /
-    label_dim. Behavioural sanity is :func:`startup_sanity_probe`.
+    label_dim.
     """
 
     mismatches = []
@@ -525,68 +525,3 @@ def verify_bind_shapes(
             "rather than a silent fall back to native attention):\n  "
             + "\n  ".join(problems)
         )
-
-
-@dataclass
-class SanityProbeResult:
-    passed: bool
-    score: float
-    needle_position: int
-    selected_indices: Optional[torch.Tensor] = None
-    skipped_reason: Optional[str] = None
-
-
-def startup_sanity_probe(
-    mask: ChannelMask,
-    selector,
-    *,
-    haystack_pages: int = 8,
-    page_size: int = 64,
-    needle_page: int = 4,
-    abort_on_placeholder: bool = False,
-) -> SanityProbeResult:
-    """NIAH-min sanity probe: one needle, one short token haystack.
-
-    With the placeholder selector the probe is inconclusive (returns
-    ``passed=False, skipped_reason=...``) — production serving is independently
-    refused by the placeholder-guard. A bound real selector scores the resident
-    MLA latent directly (no synthetic signature store to plant a needle in), so
-    the probe reports it as not applicable; the load-bearing recall diagnostic is
-    the config-borne recall oracle.
-    """
-
-    if needle_page >= haystack_pages or needle_page < 0:
-        raise ValueError(
-            f"needle_page={needle_page} must be in [0, {haystack_pages})."
-        )
-
-    is_placeholder = bool(getattr(selector, "IS_PLACEHOLDER", False))
-    if is_placeholder:
-        msg = (
-            "channel mask sanity probe is inconclusive with the placeholder "
-            "selector: it returns deterministic ascending page IDs regardless "
-            "of channel weights. Real selection kernels must land for the "
-            "probe to be load-bearing."
-        )
-        if abort_on_placeholder:
-            raise RuntimeError(msg)
-        logger.warning(msg)
-        return SanityProbeResult(
-            passed=False,
-            score=0.0,
-            needle_position=needle_page * page_size,
-            selected_indices=None,
-            skipped_reason="placeholder_selector",
-        )
-
-    # A bound real selector scores the resident MLA latent directly — there is
-    # no synthetic signature store to plant a needle in, so this probe cannot
-    # construct a discriminating fixture. Report not-applicable; the recall
-    # oracle is the load-bearing standalone diagnostic.
-    return SanityProbeResult(
-        passed=False,
-        score=0.0,
-        needle_position=needle_page * page_size,
-        selected_indices=None,
-        skipped_reason="real_selector_scores_resident_latent",
-    )

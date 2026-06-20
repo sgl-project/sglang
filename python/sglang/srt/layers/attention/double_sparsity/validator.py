@@ -100,44 +100,6 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Lifted-budget decode opt-in gate. The backend path is wired
-    # (ds_lifted_budget_decode_available() == True): the selector widens to
-    # lifted_budget_top_k and decode routes the selected slots through the
-    # request-local compact remap -> dequantize_k_cache_paged_out ->
-    # flash_mla_sparse_fwd path. As of the production-graph hardening this path is
-    # CUDA-graph-safe (fixed-shape compact builder + alloc-free `out=` dequant +
-    # preallocated DSGraphState scratch, proven zero-alloc under graph replay), so
-    # it no longer requires --disable-cuda-graph. The only remaining gate here is
-    # fail-closed if a future build ever ships the flag without a wired backend
-    # (the top_k == index_topk / lifted_budget_top_k shape checks live in the
-    # model-topk block below).
-    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-        ds_lifted_budget_decode_available,
-    )
-
-    if getattr(config, "enable_lifted_budget_decode", False):
-        if not ds_lifted_budget_decode_available():
-            raise ValueError(
-                "Double Sparsity enable_lifted_budget_decode is recognized but the "
-                "opt-in lifted-budget decode backend path is not implemented in this "
-                "build, so the flag cannot be honored and the server fails closed "
-                "rather than booting into a silent no-op or the flashmla_kv "
-                "'indices.shape[-1] == dsa_index_topk' assert."
-            )
-        if getattr(server_args, "speculative_algorithm", None) is not None:
-            # The lifted-budget graph scratch (DSGraphState.lifted_compact_kv etc.)
-            # is sized by max_bs, but speculative target-verify expands the decode
-            # rows to bs * num_draft_tokens, which would undersize/overflow the
-            # scratch. The lifted op-point is non-speculative; fail closed
-            # rather than risk a wrong-output / OOB scratch slice.
-            raise ValueError(
-                "Double Sparsity enable_lifted_budget_decode is not supported with "
-                "speculative decoding (--speculative-algorithm="
-                f"{server_args.speculative_algorithm!r}): the lifted-budget CUDA-graph "
-                "scratch is sized by max_bs, but speculative target-verify expands the "
-                "decode rows. Disable one of the two."
-            )
-
     # Production-path selector-variant safety (future-proof guard). All
     # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) and
     # anchor_mode (recency/global/strided) — are graph-safe, so
@@ -215,46 +177,15 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
 
     # top_k vs get_dsa_index_topk(hf_config) boot assert.
     # DS must pick the same number of tokens as the DSA lightning indexer so the
-    # apples-to-apples comparison holds (top_k == index_topk). Two
-    # sanctioned exceptions, each with its OWN mechanism:
-    #   * top_k > index_topk (a WIDER budget) is the lifted-budget path:
-    #     opt in via enable_lifted_budget_decode + lifted_budget_top_k. It is NOT
-    #     unlocked by SGLANG_DS_ALLOW_TOPK_MISMATCH (which is an equality-mismatch
-    #     ablation, not the lifted-budget ABI).
-    #   * any other mismatch (e.g. top_k < index_topk) stays an explicit ablation
-    #     gated by SGLANG_DS_ALLOW_TOPK_MISMATCH=1.
+    # apples-to-apples comparison holds (top_k == index_topk). A mismatch stays an
+    # explicit ablation gated by SGLANG_DS_ALLOW_TOPK_MISMATCH=1.
     if hf_config is not None:
         try:
             from sglang.srt.configs.model_config import get_dsa_index_topk
 
             model_topk = get_dsa_index_topk(hf_config)
-            lifted = config.enable_lifted_budget_decode
             if model_topk > 0:
-                if lifted and config.top_k != model_topk:
-                    raise ValueError(
-                        f"Double Sparsity enable_lifted_budget_decode requires the base "
-                        f"top_k to equal DSA index_topk ({model_topk}); got "
-                        f"top_k={config.top_k}. The base budget stays the DSA budget — "
-                        "lifted_budget_top_k is the SEPARATE, wider lifted selection "
-                        "width (it is what widens the decode, not top_k)."
-                    )
-                if lifted and config.lifted_budget_top_k <= model_topk:
-                    raise ValueError(
-                        f"Double Sparsity lifted_budget_top_k={config.lifted_budget_top_k} "
-                        f"must be > DSA index_topk={model_topk} when "
-                        "enable_lifted_budget_decode is set (the lifted budget widens "
-                        "selection beyond index_topk)."
-                    )
-                if config.top_k > model_topk and not lifted:
-                    raise ValueError(
-                        f"Double Sparsity top_k={config.top_k} > DSA index_topk={model_topk}. "
-                        "A wider-than-index_topk budget is the lifted-budget path: "
-                        "set enable_lifted_budget_decode=true + lifted_budget_top_k in "
-                        "--double-sparsity-config. (Do NOT use SGLANG_DS_ALLOW_TOPK_MISMATCH "
-                        "for this — that is an equality-mismatch ablation, not the "
-                        "lifted-budget ABI.)"
-                    )
-                if config.top_k != model_topk and not (lifted and config.top_k > model_topk):
+                if config.top_k != model_topk:
                     if os.environ.get("SGLANG_DS_ALLOW_TOPK_MISMATCH") != "1":
                         raise ValueError(
                             f"Double Sparsity top_k={config.top_k} does not match the model's "
@@ -270,12 +201,6 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                             config.top_k,
                             model_topk,
                         )
-                elif lifted:
-                    logger.info(
-                        "Double Sparsity lifted-budget decode enabled: top_k=%d, "
-                        "lifted_budget_top_k=%d, DSA index_topk=%d.",
-                        config.top_k, config.lifted_budget_top_k, model_topk,
-                    )
         except ImportError:
             logger.debug(
                 "get_dsa_index_topk not available; skipping top_k assertion."

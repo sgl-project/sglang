@@ -173,8 +173,8 @@ def dequantize_k_cache_paged_out(
 ) -> torch.Tensor:
     """Alloc-free variant of :func:`dequantize_k_cache_paged`: dequantize the
     selected rows into the caller-owned bf16 ``out`` buffer (no internal
-    ``torch.empty``), so the lifted-budget decode path can run under CUDA-graph
-    capture with a preallocated fixed-shape scratch.
+    ``torch.empty``), so callers can run under CUDA-graph capture with a
+    preallocated fixed-shape scratch.
 
     Args:
         quant_k_cache: ``[*, dim_quant=656]`` fp8 paged k-cache.
@@ -251,8 +251,8 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
 
     Thin allocating wrapper around :func:`dequantize_k_cache_paged_out` — kept for
-    the eager research path and existing callers; the graph-safe lifted-budget path
-    passes its own preallocated ``out`` via the ``_out`` variant.
+    existing callers; graph-safe callers pass their own preallocated ``out`` via
+    the ``_out`` variant.
     """
     num_tokens = page_table_1_flattened.shape[0]
     output = torch.empty(

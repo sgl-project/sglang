@@ -38,7 +38,7 @@ IPC at TP=8).
 | Base commit (`<BASE>`) | `105e095e005d02a178fb6c5a23bd22ba644c90e4` |
 | Corpus | Pile-val, 300 documents, one per line (deterministic; `seed 42`) |
 | Recipe | `--dtype fp8_e4m3 --label-dim 32 --page-size 64 --num-samples 256 --block-size 512 --seed 42` |
-| Mask path | `/cluster-storage/models/glm51-fp8-channel-mask-loop12.safetensors` |
+| Mask path | `<calibrated GLM-5.1-FP8 channel mask>.safetensors` (large external artifact, referenced by path) |
 | Mask shape | `channel_selection / channel_weights = [78 layers, 64 heads, 32 label_dim]`, page_size 64, dtype fp8_e4m3 |
 | Mask content SHA-256 | `35155ac46ad79fa82e531138434ff35708e2d8c2932889323a21a455342a9b00` |
 | Mask file SHA-256 | `5c89c516428f379c983461ceb58fb366c0d6cb12733b3f957d98edb5406f7b21` |
@@ -56,7 +56,7 @@ python -m sglang.launch_server \
   --dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv \
   --disable-overlap-schedule --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
-  --double-sparsity-config '{"top_k": 2048, "page_size": 64, "channel_mask_path": "<mask>.safetensors", "device_buffer_size": 4096, "scorer_norm": "off", "head_agg": "max", "anchor_mode": "off", "anchor_budget": 0, "enable_lifted_budget_decode": false, "lifted_budget_top_k": 0}' \
+  --double-sparsity-config '{"top_k": 2048, "page_size": 64, "channel_mask_path": "<mask>.safetensors", "device_buffer_size": 4096, "scorer_norm": "off", "head_agg": "max", "anchor_mode": "off", "anchor_budget": 0}' \
   --random-seed 42 --trust-remote-code
 ```
 
@@ -100,7 +100,8 @@ unless exactly `--num-prompts` requests completed, and passes iff p50 decode TPS
 
 The **accepted** result is the DS column, measured on the corrected single-group
 workload: `actual_completed=256`, `gsp_num_groups=1`, `request_shape_ok=true`,
-`parity=true` — see `development/loop12/perf_evidence/verdict.json`. The
+`parity=true` — the eval writes these fields to `verdict.json` under its
+`--evidence-dir`. The
 native-DSA column is **same-base context only**: it was a separate earlier run
 made *before* the wrapper pinned the GSP grouping, so it is NOT a corrected-shape
 measurement and is not a pass/fail baseline. Its 46.50 s P99 TTFT is shown only

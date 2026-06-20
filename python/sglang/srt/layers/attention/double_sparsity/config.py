@@ -30,8 +30,6 @@ _ALLOWED_FIELDS = {
     "selector_width_buckets",
     "selector_width_overflow_policy",
     "score_reduce_dtype",
-    "enable_lifted_budget_decode",
-    "lifted_budget_top_k",
     "extra",
 }
 
@@ -48,7 +46,6 @@ _ALLOWED_FIELDS = {
 #   selection — "off" (default, none), "recency" (most-recent), "global"
 #   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
 # anchor_budget: how many anchor positions to force-include; 0 disables.
-_DEFAULT_LIFTED_BUDGET_TOP_K = 0  # 0 = unset; required (>top_k) when lifted enabled
 _ALLOWED_SCORER_NORM = ("off",)
 _DEFAULT_SCORER_NORM = "off"
 _ALLOWED_HEAD_AGG = ("max", "mean")
@@ -86,8 +83,6 @@ class DoubleSparsityConfig:
     )
     selector_width_overflow_policy: str = _DEFAULT_OVERFLOW_POLICY
     score_reduce_dtype: str = "bf16"
-    enable_lifted_budget_decode: bool = False
-    lifted_budget_top_k: int = _DEFAULT_LIFTED_BUDGET_TOP_K
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -141,45 +136,6 @@ class DoubleSparsityConfig:
                 f"Double Sparsity 'score_reduce_dtype' must be one of "
                 f"['fp32', 'bf16'], got {self.score_reduce_dtype!r}."
             )
-        if not isinstance(self.enable_lifted_budget_decode, bool):
-            raise ValueError(
-                f"Double Sparsity 'enable_lifted_budget_decode' must be a boolean, "
-                f"got {self.enable_lifted_budget_decode!r}."
-            )
-        if not isinstance(self.lifted_budget_top_k, int) or self.lifted_budget_top_k < 0:
-            raise ValueError(
-                f"Double Sparsity 'lifted_budget_top_k' must be a non-negative "
-                f"integer, got {self.lifted_budget_top_k!r}."
-            )
-        if self.enable_lifted_budget_decode:
-            # The lifted budget must exceed the base budget (otherwise it is a
-            # no-op and should not opt in to the heavier decode path).
-            if self.lifted_budget_top_k <= self.top_k:
-                raise ValueError(
-                    "Double Sparsity 'lifted_budget_top_k' "
-                    f"({self.lifted_budget_top_k}) must be > 'top_k' ({self.top_k}) "
-                    "when enable_lifted_budget_decode is set (a lifted budget must "
-                    "widen selection beyond the base index_topk)."
-                )
-            # flash_mla_sparse_fwd tiles the topk index width by 2*B_TOPK (=128);
-            # a non-multiple width trips an in-kernel `topk % (2*B_TOPK) == 0`
-            # assert. The realistic budgets (4096/8192) satisfy this.
-            if self.lifted_budget_top_k % 128 != 0:
-                raise ValueError(
-                    "Double Sparsity 'lifted_budget_top_k' "
-                    f"({self.lifted_budget_top_k}) must be a multiple of 128 (the "
-                    "flash_mla_sparse_fwd index-width block constraint "
-                    "topk % (2*B_TOPK) == 0)."
-                )
-        elif self.lifted_budget_top_k > 0:
-            # Fail closed: a lifted budget set without the enable flag would
-            # silently no-op (the default path keeps top_k == index_topk).
-            raise ValueError(
-                "Double Sparsity 'lifted_budget_top_k' is set "
-                f"({self.lifted_budget_top_k}) but 'enable_lifted_budget_decode' is "
-                "false — it would be ignored. Set enable_lifted_budget_decode=true "
-                "to use the opt-in lifted-budget decode path."
-            )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
                 f"Double Sparsity 'top_k' must be a positive integer, got {self.top_k!r}."
@@ -201,21 +157,6 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'extra' must be a dict, got {type(self.extra).__name__}."
             )
-
-
-def _coerce_bool(value: Any, field: str = "flag") -> bool:
-    """Accept JSON booleans plus the common string/int spellings the serve
-    script may emit (``true``/``1``/``yes`` etc.) so a config flag never silently
-    no-ops because of a quoting mismatch."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    raise ValueError(
-        f"Double Sparsity {field!r} must be a boolean, got {value!r}."
-    )
 
 
 def _coerce_width_buckets(value: Any) -> List[int]:
@@ -292,11 +233,5 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
             data.get("selector_width_overflow_policy", _DEFAULT_OVERFLOW_POLICY)
         ),
         score_reduce_dtype=str(data.get("score_reduce_dtype", "bf16")),
-        enable_lifted_budget_decode=_coerce_bool(
-            data.get("enable_lifted_budget_decode", False), "enable_lifted_budget_decode"
-        ),
-        lifted_budget_top_k=int(
-            data.get("lifted_budget_top_k", _DEFAULT_LIFTED_BUDGET_TOP_K)
-        ),
         extra=data.get("extra", {}),
     )

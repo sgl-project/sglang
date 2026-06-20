@@ -2175,7 +2175,6 @@ class DeepseekV2AttentionMLA(
         forward_batch: ForwardBatch,
         selected_indices: torch.Tensor,
         valid_lengths: torch.Tensor,
-        error_count: int,
         layer_id: int,
     ) -> None:
         """Publish per-row DS stats onto ``forward_batch.ds_per_request_summary``.
@@ -2185,7 +2184,6 @@ class DeepseekV2AttentionMLA(
         ``meta_info["double_sparsity"]``. Stores the latest layer's
         snapshot (last layer's stats win the per-request summary).
         """
-        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
         from sglang.srt.layers.attention.double_sparsity.metrics import (
             meta_info_for_request,
         )
@@ -2198,14 +2196,6 @@ class DeepseekV2AttentionMLA(
         # not a hot-path tensor; one .tolist() per layer per batch.
         vl_cpu = valid_lengths.detach().to("cpu").tolist()
         sl_cpu = seq_lens.detach().to("cpu").tolist()
-
-        if error_count > 0:
-            _ds_metrics.record_error(
-                "bad_adapter_input",
-                message=f"{error_count} bad req_pool_indices in batch at layer {layer_id}",
-                layer_id=layer_id,
-                selector_id=f"layer{layer_id}",
-            )
 
         # After the token-level rotation the selector emits TOKEN
         # positions, not pages — so the sparsity denominator is the
@@ -2259,9 +2249,6 @@ class DeepseekV2AttentionMLA(
         """
 
         if self.use_double_sparsity:
-            from sglang.srt.layers.attention.double_sparsity.error_containment import (
-                try_run_ds_step,
-            )
             from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
                 logical_to_physical,
             )
@@ -2621,7 +2608,7 @@ class DeepseekV2AttentionMLA(
                         if _ds_graph_state is not None
                         else None
                     )
-                    error_count = logical_to_physical(
+                    logical_to_physical(
                         selected_indices=selected_indices,
                         req_pool_indices=_rpi,
                         req_to_token=req_to_token,
@@ -2630,7 +2617,6 @@ class DeepseekV2AttentionMLA(
                     )
                 else:
                     ds_out.fill_(-1)
-                    error_count = 0
                 # Skip the per-request CPU-side summary while CUDA capture
                 # is recording the stream; the host syncs (.to('cpu') and
                 # .item()) inside _publish_ds_request_summary are illegal
@@ -2643,91 +2629,14 @@ class DeepseekV2AttentionMLA(
                         forward_batch=forward_batch,
                         selected_indices=selected_indices,
                         valid_lengths=valid_lengths,
-                        error_count=error_count,
                         layer_id=layer_id,
                     )
                 return ds_out
 
-            error_state: Dict[str, Any] = {}
-            # `record_error_on_failure=False`: the production
-            # batch-wrapper suppresses the cls-only counter increment
-            # here so the per-row loop below can emit exactly one
-            # record_error per affected row without overcounting.
-            ok, result = try_run_ds_step(
-                _run,
-                request_id="batch",
-                error_state=error_state,
-                layer_id=layer_id,
-                selector_id=f"layer{layer_id}",
-                record_error_on_failure=False,
-            )
-            if not ok:
-                # Non-row-level DS exception (selector RuntimeError /
-                # mask corruption / TP misconfig — anything raised before
-                # row tensors exist). Convert to per-row failure records
-                # so the scheduler aborts each affected request via the
-                # standard abort path rather than crashing the batch.
-                error_cls = error_state.get("ds_error_cls", "selector_runtime_error")
-                error_message = error_state.get("ds_error_message", "")
-                bs = int(forward_batch.batch_size) if hasattr(
-                    forward_batch, "batch_size"
-                ) else 1
-                rids = getattr(forward_batch, "rids", None)
-                if rids is None:
-                    rids = getattr(forward_batch, "req_ids", None)
-                records: List[Optional[Dict[str, Any]]] = []
-                from sglang.srt.layers.attention.double_sparsity import (
-                    metrics as _ds_metrics,
-                )
-
-                for _b in range(bs):
-                    rid_str = (
-                        str(rids[_b])
-                        if rids is not None and _b < len(rids)
-                        else f"row{_b}"
-                    )
-                    records.append(
-                        {
-                            "sparsity_rate": 0.0,
-                            "selected_tokens": 0,
-                            "dense_fallback": 1,
-                            "error_class": error_cls,
-                            "error_message": error_message,
-                        }
-                    )
-                    # Per-row record_error: each affected request gets
-                    # its own counter increment + structured log line.
-                    # The earlier `try_run_ds_step` call already
-                    # incremented the counter once with `request_id="batch"`
-                    # — that's a defensive batch-level signal; the
-                    # per-row calls below give operators the actual
-                    # request IDs.
-                    _ds_metrics.record_error(
-                        error_cls,
-                        message=error_message,
-                        request_id=rid_str,
-                        layer_id=layer_id,
-                        selector_id=f"layer{layer_id}-row{_b}",
-                    )
-                summary = getattr(forward_batch, "ds_per_request_summary", None)
-                if summary is None:
-                    summary = {}
-                    setattr(forward_batch, "ds_per_request_summary", summary)
-                summary["double_sparsity"] = records
-
-                # Return an all-(-1) topk_indices so downstream consumers
-                # treat every row as "no selected pages" (the scheduler
-                # will abort them on the next collector pass).
-                max_top_k = self.double_sparsity_selector.max_top_k
-                return torch.full(
-                    (bs, max_top_k),
-                    -1,
-                    dtype=torch.int32,
-                    device=forward_batch.req_pool_indices.device
-                    if hasattr(forward_batch, "req_pool_indices") and forward_batch.req_pool_indices is not None
-                    else "cpu",
-                )
-            return result
+            # DS selection runs directly: a selector/mask/TP failure surfaces
+            # as a normal exception rather than being caught and converted into
+            # per-row "contained" abort records, which would mask correctness bugs.
+            return _run()
 
         return self.indexer(
             x=x,

@@ -15,9 +15,8 @@ This adapter performs a single ``req_to_token`` gather:
 with ``-1`` preserved for padding slots.
 
 Error tracking: the adapter returns a scalar ``error_count`` alongside
-``physical_slots``.  Callers pass this count to the error-containment
-counter used by the ``error_containment`` check.  Errors occur only
-when ``req_pool_indices`` values are out of range for ``req_to_token``.
+``physical_slots`` — the number of rows whose ``req_pool_indices`` value was
+out of range for ``req_to_token`` (those rows are filled with ``-1``).
 """
 
 from __future__ import annotations

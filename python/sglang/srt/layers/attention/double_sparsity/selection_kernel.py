@@ -84,24 +84,6 @@ def ds_scorer_is_graph_safe(config) -> bool:
     return True
 
 
-def ds_lifted_budget_decode_available() -> bool:
-    """``True`` iff the opt-in adjustable-budget (lifted) decode backend path is
-    implemented and wired into selection/decode, so ``enable_lifted_budget_decode``
-    can actually be honored.
-
-    Returns ``True``: the selector widens its budget to ``lifted_budget_top_k`` and
-    the decode routes the selected slots through the request-local compact remap →
-    ``dequantize_k_cache_paged`` (eager) / the fixed-shape graph-safe
-    ``build_lifted_compact_kv_fixed`` + ``dequantize_k_cache_paged_out`` into a
-    preallocated ``DSGraphState`` scratch (under CUDA-graph capture) →
-    ``flash_mla_sparse_fwd``. The path is **CUDA-graph-safe** (proven zero-alloc
-    replay; the validator no longer requires ``--disable-cuda-graph``). The
-    validator's lifted-budget shape checks govern enablement now that this seam is
-    open (mirroring :func:`ds_scorer_is_graph_safe`).
-    """
-    return True
-
-
 _score_reduce_fallback_logged = False
 
 # Transport evidence: one log line per distinct (shape, dtype, path, algorithm)
@@ -902,11 +884,6 @@ def retrieve_topk_graph_safe(
         and anchor_mode == "off"
     )
     topk_scores = scores_view
-    # scorepath exp-1: snapshot the PRE-reduce per-rank score (scores_view
-    # straight off the absorbed paged kernel, before the cross-TP all-reduce).
-    # The reduce mutates scores_view in place (copy_back) or returns a separate
-    # bf16 view, so the pre-reduce values must be cloned NOW. Eager-only,
-    # capture-guarded, off by default — one bool check on the hot path when off.
     if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.cuda.nvtx.range_push("ds_score_allreduce")
         reduced = reduce_token_scores(
@@ -1022,15 +999,4 @@ def retrieve_topk_graph_safe(
         out_indices[:bs, :max_top_k].copy_(a_idx)
         out_lengths[:bs].copy_(a_len)
 
-    # Flag-gated SCORE capture (instrument instrument): dump the absorbed score row
-    # the top-k just consumed. ``topk_scores`` is the AUTHORITATIVE input to the
-    # selection top-k — the bf16 reduced view when bf16 is authoritative, else the
-    # fp32 ``scores_view``; the dump upcasts to fp32 (bf16->fp32 is exact). Column
-    # t == logical position t (logical-position indexed). Eager decode
-    # only (the host copy is illegal under capture); off by default — one getattr
-    # here when off. Capture-guarded; this Python does not re-run on graph replay.
     return out_indices, out_lengths
-
-
-# Public alias for the end-to-end selector pipeline.
-retrieve_topk = absorbed_topk_select
