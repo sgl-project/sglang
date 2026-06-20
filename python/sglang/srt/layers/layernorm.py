@@ -412,6 +412,14 @@ class RMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
+        # The vLLM/aiter rms_norm kernels are not batch-invariant on ROCm: the
+        # per-row normalization reduction depends on batch shape, so identical
+        # rows can yield different outputs across batches. Route to the native
+        # (deterministic) path when batch-invariant mode is enabled, mirroring
+        # forward_cuda.
+        if is_batch_invariant_mode_enabled():
+            return self.forward_native(x, residual, post_residual_addition)
+
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
