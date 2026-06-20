@@ -29,16 +29,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_pp_indices,
-    get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
-    get_pp_group,
-    get_pp_indices,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
