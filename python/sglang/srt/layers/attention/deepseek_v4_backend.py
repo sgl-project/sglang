@@ -1010,7 +1010,9 @@ class DeepseekV4AttnBackend(
         if logical_forward_mode.is_target_verify():
             spec_info = forward_batch.spec_info
             if spec_info is not None and getattr(spec_info, "num_tokens_per_req", 0):
-                verify_bs = forward_batch.input_ids.shape[0] // spec_info.num_tokens_per_req
+                verify_bs = (
+                    forward_batch.input_ids.shape[0] // spec_info.num_tokens_per_req
+                )
         self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
