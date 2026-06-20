@@ -39,7 +39,8 @@ class K2ArchConfig(DiTArchConfig):
     num_attention_heads: int = 48
     num_channels_latents: int = 16
 
-    # Names follow the checkpoint layout; no remapping needed.
+    # Module/parameter names match the released checkpoint, so weights load with an
+    # identity mapping.
     param_names_mapping: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:

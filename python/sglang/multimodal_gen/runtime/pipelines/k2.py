@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 from transformers import (
+    AutoModel,
     AutoTokenizer,
     Qwen2TokenizerFast,
     Qwen3VLForConditionalGeneration,
@@ -110,6 +111,16 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
             "*.safetensors at the root)."
         )
 
+    def _resolve_repo_dir(self) -> str | None:
+        """Local snapshot directory of the model (for its bundled aux subfolders), or
+        ``None`` for a bare single-file checkpoint."""
+        p = self.model_path
+        if os.path.isfile(p):
+            return None
+        if not os.path.isdir(p):
+            p = maybe_download_model(p)
+        return p if os.path.isdir(p) else None
+
     def _dit_load_error_hint(
         self, dit_weights: list[str], model, exc: Exception
     ) -> str:
@@ -184,32 +195,50 @@ class K2Pipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> dict[str, Any]:
         transformer = self._load_transformer(server_args)
 
-        logger.info("Loading text encoder %s", TEXT_ENCODER_REPO)
         te_dtype = torch.bfloat16
-        # Loaded on CPU; the component residency manager moves it to the GPU only
-        # for text encoding and offloads it during the denoise loop (frees ~8GB)
-        # when --text-encoder-cpu-offload is set. Keeping it off the GPU at load
-        # also avoids co-residence with the DiT exceeding a 32GB card.
-        text_encoder = (
-            Qwen3VLForConditionalGeneration.from_pretrained(
-                TEXT_ENCODER_REPO, torch_dtype=te_dtype
-            )
-            .eval()
-            .requires_grad_(False)
-        )
-        # K2 is text-only: drop the unused vision tower to shrink the encoder and
-        # its CPU<->GPU page. (The LM head stays — the encoder forward needs it.)
-        if getattr(getattr(text_encoder, "model", None), "visual", None) is not None:
-            del text_encoder.model.visual
-        tokenizer = AutoTokenizer.from_pretrained(
-            TEXT_ENCODER_REPO, max_length=_TEXT_MAX_LENGTH
-        )
-        processor = Qwen2TokenizerFast.from_pretrained(
-            TEXT_ENCODER_REPO, max_length=_TEXT_MAX_LENGTH
+        # The released repo bundles text_encoder/ tokenizer/ vae/ subfolders; use them
+        # so the model is self-contained, falling back to the standalone Qwen repos for
+        # a bare single-file checkpoint.
+        repo = self._resolve_repo_dir()
+
+        def _subdir(name: str) -> str | None:
+            d = os.path.join(repo, name) if repo else None
+            return d if d and os.path.isdir(d) else None
+
+        te_dir, tok_dir, vae_dir = (
+            _subdir("text_encoder"),
+            _subdir("tokenizer"),
+            _subdir("vae"),
         )
 
-        logger.info("Loading Qwen-Image VAE from %s", VAE_REPO)
-        vae_path = os.path.join(maybe_download_model(VAE_REPO), "vae")
+        te_src = te_dir or TEXT_ENCODER_REPO
+        logger.info("Loading text encoder from %s", te_src)
+        # Loaded on CPU; the component residency manager moves it to the GPU only for
+        # text encoding and offloads it during the denoise loop (frees ~8GB) when
+        # --text-encoder-cpu-offload is set, also avoiding DiT co-residence on a 32GB card.
+        if te_dir is not None:
+            # Bundled encoder: load the architecture declared in its config (Qwen3VLModel).
+            text_encoder = AutoModel.from_pretrained(te_dir, torch_dtype=te_dtype)
+        else:
+            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                TEXT_ENCODER_REPO, torch_dtype=te_dtype
+            )
+        text_encoder = text_encoder.eval().requires_grad_(False)
+        # K2 is text-only: drop the unused vision tower to shrink the encoder and its
+        # CPU<->GPU page. (It may sit on the encoder directly or under .model.)
+        for owner in (text_encoder, getattr(text_encoder, "model", None)):
+            if owner is not None and getattr(owner, "visual", None) is not None:
+                del owner.visual
+                break
+
+        tok_src = tok_dir or TEXT_ENCODER_REPO
+        tokenizer = AutoTokenizer.from_pretrained(tok_src, max_length=_TEXT_MAX_LENGTH)
+        processor = Qwen2TokenizerFast.from_pretrained(
+            tok_src, max_length=_TEXT_MAX_LENGTH
+        )
+
+        vae_path = vae_dir or os.path.join(maybe_download_model(VAE_REPO), "vae")
+        logger.info("Loading VAE from %s", vae_path)
         vae = VAELoader().load_customized(vae_path, server_args, "vae")
 
         return {

@@ -133,29 +133,29 @@ def norm_scale_shift(
 # --------------------------------------------------------------------------- #
 # Submodules
 # --------------------------------------------------------------------------- #
-class SimpleModulation(nn.Module):
-    def __init__(self, dim: int):
+class TimeEmbed(nn.Module):
+    """Timestep embedding MLP: linear_1 -> gelu(tanh) -> linear_2."""
+
+    def __init__(self, in_dim: int, dim: int):
         super().__init__()
-        self.lin = nn.Parameter(torch.zeros(2, dim))
-        self.multiplier = 2
+        self.linear_1 = nn.Linear(in_dim, dim)
+        self.linear_2 = nn.Linear(dim, dim)
 
-    def forward(self, vec: Tensor):
-        out = vec + rearrange(self.lin, "two d -> 1 two d")
-        scale, shift = out.chunk(self.multiplier, dim=1)
-        return scale, shift
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear_2(F.gelu(self.linear_1(x), approximate="tanh"))
 
 
-class DoubleSharedModulation(nn.Module):
-    def __init__(self, dim: int):
+class TxtIn(nn.Module):
+    """Text-context projection: rms-norm -> linear_1 -> gelu(tanh) -> linear_2."""
+
+    def __init__(self, txt_dim: int, dim: int):
         super().__init__()
-        self.lin = nn.Parameter(torch.zeros(6 * dim))
+        self.norm = RMSNorm(txt_dim)
+        self.linear_1 = nn.Linear(txt_dim, dim)
+        self.linear_2 = nn.Linear(dim, dim)
 
-    def forward(self, vec: Tensor):
-        out = vec + self.lin
-        prescale, preshift, pregate, postscale, postshift, postgate = out.chunk(
-            6, dim=-1
-        )
-        return prescale, preshift, pregate, postscale, postshift, postgate
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear_2(F.gelu(self.linear_1(self.norm(x)), approximate="tanh"))
 
 
 class PositionalEncoding(nn.Module):
@@ -176,33 +176,24 @@ class PositionalEncoding(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with effective weight ``scale + 1`` (``scale`` initialized to 0),
-    computed in fp32."""
+    """RMSNorm with effective scale ``weight + 1`` (``weight`` initialized to 0),
+    computed in fp32. The parameter is named ``weight`` to match the released
+    checkpoint; the ``+ 1`` is applied in the forward."""
 
     def __init__(self, features: int, eps: float = 1e-05, device: torch.device = None):
         super().__init__()
         self.features = features
         self.eps = eps
-        self.scale = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.zeros(features, device=device, dtype=torch.float32)
         )
 
     def forward(self, x: Tensor) -> Tensor:
         t, dtype = x.float(), x.dtype
         t = F.rms_norm(
-            t, (self.features,), eps=self.eps, weight=(self.scale.float() + 1.0)
+            t, (self.features,), eps=self.eps, weight=(self.weight.float() + 1.0)
         )
         return t.to(dtype)
-
-
-class QKNorm(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.qnorm = RMSNorm(dim)
-        self.knorm = RMSNorm(dim)
-
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        return self.qnorm(q), self.knorm(k), v
 
 
 class SwiGLU(nn.Module):
@@ -235,9 +226,9 @@ class Attention(nn.Module):
         self.kvheads = kvheads if kvheads is not None else heads
         self.headdim = dim // self.heads
 
-        # Tensor-parallel: q/k/v/gate shard heads by column, wo all-reduces.
-        # Separate (non-fused) parallel linears keep the reference param names, so
-        # the identity checkpoint mapping holds (each shards via its weight_loader).
+        # Tensor-parallel: q/k/v/gate shard heads by column, to_out all-reduces.
+        # Parameter names match the released checkpoint (to_q/to_k/to_v/to_gate,
+        # norm_q/norm_k, to_out.0) so the checkpoint loads with an identity mapping.
         tp = get_tp_world_size()
         assert (
             self.heads % tp == 0 and self.kvheads % tp == 0
@@ -245,18 +236,23 @@ class Attention(nn.Module):
         self.local_heads = self.heads // tp
         self.local_kvheads = self.kvheads // tp
 
-        self.wq = ColumnParallelLinear(
+        self.to_q = ColumnParallelLinear(
             dim, self.headdim * self.heads, bias=bias, gather_output=False
         )
-        self.wk = ColumnParallelLinear(
+        self.to_k = ColumnParallelLinear(
             dim, self.headdim * self.kvheads, bias=bias, gather_output=False
         )
-        self.wv = ColumnParallelLinear(
+        self.to_v = ColumnParallelLinear(
             dim, self.headdim * self.kvheads, bias=bias, gather_output=False
         )
-        self.gate = ColumnParallelLinear(dim, dim, bias=bias, gather_output=False)
-        self.qknorm = QKNorm(self.headdim)
-        self.wo = RowParallelLinear(dim, dim, bias=bias, input_is_parallel=True)
+        self.to_gate = ColumnParallelLinear(dim, dim, bias=bias, gather_output=False)
+        self.norm_q = RMSNorm(self.headdim)
+        self.norm_k = RMSNorm(self.headdim)
+        # to_out is a ModuleList ([linear]) so the param is to_out.0.weight, matching
+        # the diffusers Attention layout in the released checkpoint.
+        self.to_out = nn.ModuleList(
+            [RowParallelLinear(dim, dim, bias=bias, input_is_parallel=True)]
+        )
         # Native GQA flash via the platform backend; parameterless.
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -274,10 +270,10 @@ class Attention(nn.Module):
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
     ) -> Tensor:
-        q, _ = self.wq(qkv)
-        k, _ = self.wk(qkv)
-        v, _ = self.wv(qkv)
-        gate, _ = self.gate(qkv)
+        q, _ = self.to_q(qkv)
+        k, _ = self.to_k(qkv)
+        v, _ = self.to_v(qkv)
+        gate, _ = self.to_gate(qkv)
 
         hd = self.headdim
         # Fast path: fuse RMSNorm(q), RMSNorm(k) and RoPE into one in-place kernel on
@@ -305,12 +301,12 @@ class Attention(nn.Module):
             fused_inplace_qknorm_rope(
                 q.reshape(-1, self.local_heads, hd),
                 k.reshape(-1, self.local_kvheads, hd),
-                (self.qknorm.qnorm.scale.float() + 1.0).to(q.dtype),
-                (self.qknorm.knorm.scale.float() + 1.0).to(k.dtype),
+                (self.norm_q.weight.float() + 1.0).to(q.dtype),
+                (self.norm_k.weight.float() + 1.0).to(k.dtype),
                 _qknorm_rope_cos_sin_cache(freqs),
                 positions,
                 is_neox=False,
-                eps=self.qknorm.qnorm.eps,
+                eps=self.norm_q.eps,
                 head_dim=hd,
                 rope_dim=hd,
             )
@@ -323,7 +319,7 @@ class Attention(nn.Module):
                 rearrange(k, "B L (H D) -> B H L D", H=self.local_kvheads),
                 rearrange(v, "B L (H D) -> B H L D", H=self.local_kvheads),
             )
-            q, k, v = self.qknorm(q, k, v)
+            q, k = self.norm_q(q), self.norm_k(k)
             if freqs is not None:
                 q, k = ropeapply(q, k, freqs)
             # USPAttention expects [B, S, H, D]; a [B, S] key mask + varlen metadata
@@ -335,7 +331,7 @@ class Attention(nn.Module):
                 attn_mask=key_mask,
                 attn_mask_meta=mask_meta,
             ).flatten(2)
-        out, _ = self.wo(out * F.sigmoid(gate))
+        out, _ = self.to_out[0](out * F.sigmoid(gate))
         return out
 
 
@@ -344,11 +340,12 @@ class LastLayer(nn.Module):
         super().__init__()
         self.norm = RMSNorm(features)
         self.linear = nn.Linear(features, patch * patch * channels, bias=True)
-        self.modulation = SimpleModulation(features)
+        self.scale_shift_table = nn.Parameter(torch.zeros(2, features))
 
     def forward(self, x: Tensor, tvec: Tensor) -> Tensor:
-        scale, shift = self.modulation(tvec)
-        x = norm_scale_shift(x, self.norm.scale + 1, scale, shift, self.norm.eps)
+        mod = tvec + rearrange(self.scale_shift_table, "two d -> 1 two d")
+        scale, shift = mod.chunk(2, dim=1)
+        x = norm_scale_shift(x, self.norm.weight + 1, scale, shift, self.norm.eps)
         x = self.linear(x)
         return x
 
@@ -363,10 +360,10 @@ class TextFusionBlock(nn.Module):
         kvheads: int = None,
     ):
         super().__init__()
-        self.prenorm = RMSNorm(features)
-        self.postnorm = RMSNorm(features)
+        self.norm1 = RMSNorm(features)
+        self.norm2 = RMSNorm(features)
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
-        self.mlp = SwiGLU(features, multiplier, bias)
+        self.ff = SwiGLU(features, multiplier, bias)
 
     def forward(
         self,
@@ -374,8 +371,8 @@ class TextFusionBlock(nn.Module):
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
     ) -> Tensor:
-        x = x + self.attn(self.prenorm(x), key_mask=key_mask, mask_meta=mask_meta)
-        x = x + self.mlp(self.postnorm(x))
+        x = x + self.attn(self.norm1(x), key_mask=key_mask, mask_meta=mask_meta)
+        x = x + self.ff(self.norm2(x))
         return x
 
 
@@ -438,11 +435,13 @@ class SingleStreamBlock(nn.Module):
         kvheads: int = None,
     ):
         super().__init__()
-        self.mod = DoubleSharedModulation(features)
-        self.prenorm = RMSNorm(features)
-        self.postnorm = RMSNorm(features)
+        # (6, features) modulation table added to the timestep projection (AdaLN-single),
+        # stored directly on the block to match the released checkpoint.
+        self.scale_shift_table = nn.Parameter(torch.zeros(6, features))
+        self.norm1 = RMSNorm(features)
+        self.norm2 = RMSNorm(features)
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
-        self.mlp = SwiGLU(features, multiplier, bias)
+        self.ff = SwiGLU(features, multiplier, bias)
 
     def forward(
         self,
@@ -452,18 +451,21 @@ class SingleStreamBlock(nn.Module):
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
     ) -> Tensor:
-        prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
+        mod = vec + self.scale_shift_table.reshape(-1)
+        prescale, preshift, pregate, postscale, postshift, postgate = mod.chunk(
+            6, dim=-1
+        )
         x = x + pregate * self.attn(
             norm_scale_shift(
-                x, self.prenorm.scale + 1, prescale, preshift, self.prenorm.eps
+                x, self.norm1.weight + 1, prescale, preshift, self.norm1.eps
             ),
             freqs,
             key_mask,
             mask_meta,
         )
-        x = x + postgate * self.mlp(
+        x = x + postgate * self.ff(
             norm_scale_shift(
-                x, self.postnorm.scale + 1, postscale, postshift, self.postnorm.eps
+                x, self.norm2.weight + 1, postscale, postshift, self.norm2.eps
             )
         )
         return x
@@ -507,8 +509,8 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         assert all(a % 2 == 0 for a in axes), f"axes={axes}"
 
         self.posemb = PositionalEncoding(ac.features, axes, theta=ac.theta, ntk=1.0)
-        self.first = nn.Linear(ac.channels * ac.patch**2, ac.features, bias=True)
-        self.blocks = nn.ModuleList(
+        self.img_in = nn.Linear(ac.channels * ac.patch**2, ac.features, bias=True)
+        self.transformer_blocks = nn.ModuleList(
             [
                 SingleStreamBlock(
                     ac.features, ac.heads, ac.multiplier, ac.bias, ac.kvheads
@@ -516,12 +518,8 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for _ in range(ac.layers)
             ]
         )
-        self.tmlp = nn.Sequential(
-            nn.Linear(ac.tdim, ac.features),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(ac.features, ac.features),
-        )
-        self.txtfusion = TextFusionTransformer(
+        self.time_embed = TimeEmbed(ac.tdim, ac.features)
+        self.text_fusion = TextFusionTransformer(
             ac.txtlayers,
             ac.txtdim,
             ac.txtheads,
@@ -529,20 +527,14 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ac.bias,
             ac.txtkvheads,
         )
-        self.txtmlp = nn.Sequential(
-            RMSNorm(ac.txtdim),
-            nn.Linear(ac.txtdim, ac.features),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(ac.features, ac.features),
-        )
-        self.last = LastLayer(ac.features, ac.patch, ac.channels)
-        self.tproj = nn.Sequential(
-            nn.GELU(approximate="tanh"), nn.Linear(ac.features, ac.features * 6)
-        )
+        self.txt_in = TxtIn(ac.txtdim, ac.features)
+        self.final_layer = LastLayer(ac.features, ac.patch, ac.channels)
+        # GELU(tanh) is applied in the forward; the linear matches time_mod_proj.weight.
+        self.time_mod_proj = nn.Linear(ac.features, ac.features * 6)
         self.seq_multiple_of = ac.seq_multiple_of
         # The 28 single-stream blocks (the ~24GB bulk) are streamed layer-by-layer
         # under --dit-layerwise-offload, keeping only a small working set resident.
-        self.layer_names = ["blocks"]
+        self.layer_names = ["transformer_blocks"]
 
     def _forward_impl(
         self,
@@ -552,9 +544,9 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         pos: Tensor,
         mask: Tensor | None = None,
     ) -> Tensor:
-        img = self.first(img)
-        t = self.tmlp(temb(t, self.tdim, device=img.device, dtype=img.dtype))
-        tvec = self.tproj(t)
+        img = self.img_in(img)
+        t = self.time_embed(temb(t, self.tdim, device=img.device, dtype=img.dtype))
+        tvec = self.time_mod_proj(F.gelu(t, approximate="tanh"))
 
         # A single or same-prompt batch has no padding, so attention runs maskless
         # (native-GQA flash). A ragged batch builds varlen metadata from the
@@ -566,17 +558,17 @@ class K2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             joint_key = mask
             joint_meta = build_varlen_mask_meta(mask)
 
-        context = self.txtfusion(context, key_mask=txt_key, mask_meta=txt_meta)
-        context = self.txtmlp(context)
+        context = self.text_fusion(context, key_mask=txt_key, mask_meta=txt_meta)
+        context = self.txt_in(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
+        for block in self.transformer_blocks:
             combined = block(combined, tvec, freqs, joint_key, joint_meta)
 
-        final = self.last(combined, t)
+        final = self.final_layer(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]
         return output
 
