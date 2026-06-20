@@ -35,6 +35,7 @@ else:
         create_paged_compressor_data,
     )
 
+from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
@@ -373,6 +374,17 @@ class DSV4Metadata:
             )
 
 
+def _copy_or_replace(dst, src):
+    """In-place copy when both sides are non-None (stable storage for cuda-graph
+    replay); otherwise return ``src`` (incl. None) so the field reassigns to
+    whatever the caller built. Used for optional c128 compress metadata that
+    only exists under SGLANG_EXPERIMENTAL_ONLINE_C128_MTP."""
+    if dst is not None and src is not None:
+        dst.copy_(src)
+        return dst
+    return src
+
+
 @dataclass
 class DSV4RawVerifyMetadata:
     req_pool_indices: torch.Tensor
@@ -380,6 +392,13 @@ class DSV4RawVerifyMetadata:
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
+    # Host-side seq_lens carried through to make_forward_metadata_from_raw_verify
+    # for the online-C128-MTP plan path (avoids a second D2H sync).
+    seq_lens_cpu: Optional[List[int]] = None
+    # Per-draft C128 compressed plan when SGLANG_EXPERIMENTAL_ONLINE_C128_MTP is
+    # enabled; None otherwise. make_forward_metadata_from_raw_verify uses it to
+    # publish the offset-aware compress metadata into DSV4Metadata.
+    c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -387,6 +406,10 @@ class DSV4RawVerifyMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
         self.extend_seq_lens = other.extend_seq_lens
+        self.seq_lens_cpu = other.seq_lens_cpu
+        self.c128_compress_metadata = _copy_or_replace(
+            self.c128_compress_metadata, other.c128_compress_metadata
+        )
 
 
 @dataclass
@@ -472,10 +495,49 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        # OnlineC128MTPController coordinates the reserved per-draft KV slot for
+        # the C128 compress state under SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.
+        # `state_slot_offset()` returns 0 when MTP is disabled, so this is
+        # safe to always construct. CompressorBackendMixin.forward_unified does
+        # a getattr() fallback so older code paths still work.
+        self.online_c128_mtp = OnlineC128MTPController(self)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _make_target_verify_c128_metadata(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: List[int],
+        extend_seq_lens: torch.Tensor,
+        use_prefill_cuda_graph: bool,
+        online_c128_state_slot_offset: int,
+    ) -> Optional[FusedCompressMetadata]:
+        """Build the C128 compress metadata for target verify with the MTP
+        state-slot offset bound. Returns None when MTP is disabled — callers
+        then fall through to the regular c128 plan in
+        ``init_forward_metadata_prefill``."""
+        if not self.online_c128_mtp.enabled():
+            return None
+
+        num_draft_tokens = self.speculative_num_draft_tokens
+        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
+        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
+        return create_paged_compressor_data(
+            compress_ratio=128,
+            is_prefill=True,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens + self.speculative_num_draft_tokens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_lens=extend_seq_lens,
+            extend_lens_cpu=extend_lens_cpu,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            online_state_slot_offset=online_c128_state_slot_offset,
+        )
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
@@ -542,6 +604,7 @@ class DeepseekV4AttnBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -591,6 +654,7 @@ class DeepseekV4AttnBackend(
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
+                        online_state_slot_offset=online_c128_state_slot_offset,
                     )
                 return create_paged_compressor_data(
                     compress_ratio=compress_ratio,
@@ -603,6 +667,7 @@ class DeepseekV4AttnBackend(
                     extend_lens=extend_seq_lens,
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
+                    online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
         c4_compress_metadata = create(compress_ratio=4)
@@ -621,9 +686,11 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
+            seq_lens_cpu_list = seq_lens.detach().cpu().tolist()
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
                     [self.speculative_num_draft_tokens] * 1025, device=self.device
@@ -635,6 +702,15 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 extend_seq_lens=extend_seq_lens,
+                seq_lens_cpu=seq_lens_cpu_list,
+                c128_compress_metadata=self._make_target_verify_c128_metadata(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu_list,
+                    extend_seq_lens,
+                    use_prefill_cuda_graph,
+                    online_c128_state_slot_offset,
+                ),
             )
         else:
             seq_lens_cpu = seq_lens.tolist()
@@ -645,6 +721,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
 
     def init_forward_metadata_target_verify_old(
@@ -655,6 +732,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         seq_lens = seq_lens + self.speculative_num_draft_tokens
@@ -676,10 +754,13 @@ class DeepseekV4AttnBackend(
             extend_start_loc=None,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
     def make_forward_metadata_from_raw_verify(
-        self, raw_metadata: DSV4RawVerifyMetadata
+        self,
+        raw_metadata: DSV4RawVerifyMetadata,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -715,12 +796,19 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
+            online_state_slot_offset=online_c128_state_slot_offset,
         )
+        # Prefer the raw c128 metadata when init_forward_metadata_target_verify
+        # already built it (with the MTP offset baked in); fall back to the
+        # default c128 plan otherwise.
+        c128_compress_metadata = raw_metadata.c128_compress_metadata
+        if c128_compress_metadata is None:
+            c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c128_compress_metadata=c128_compress_metadata,
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -802,6 +890,7 @@ class DeepseekV4AttnBackend(
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
+                online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
@@ -991,6 +1080,7 @@ class DeepseekV4AttnBackend(
                     seq_lens=seq_lens,
                     out_cache_loc=out_cache_loc_padded,
                     use_prefill_cuda_graph=True,
+                    online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
                 )
             elif bucket == _GraphBucket.DRAFT_EXTEND:
                 num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
@@ -1068,6 +1158,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
+                online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
