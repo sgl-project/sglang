@@ -148,6 +148,46 @@ sgl-eval run gsm8k \\
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
       ],
     },
+
+    // Prefill-Decode disaggregation (§3.3). M.1 is standard-KV (global attention, no sparse
+    // index buffer), so it disaggregates with just the --disaggregation-* flags — no model-specific
+    // backend pinning. Verified on 2×8×H200 (TP8+TP8, BF16) over InfiniBand.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // mooncake (recommended): honors --disaggregation-ib-device, no transfer cold-start.
+        // The NCCL/MNNVL env is only needed on NVLink-multinode Grace-Blackwell (GB200/GB300).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb200", "gb300"] } },
+        // NiXL ignores --disaggregation-ib-device; its UCX backend needs the NIC pinned via
+        // UCX_NET_DEVICES or every KV transfer hangs to the 300s timeout (§3.3). Baked in here
+        // for the IB-based HGX platforms; also expect a ~38s one-time UCX cold-start.
+        { id: "nixl",     label: "NiXL",
+          env: ["UCX_NET_DEVICES=mlx5_0:1"],
+          envWhen: { hw: ["h200", "b200", "b300"] } },
+      ],
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --policy round_robin \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}}`,
+      },
+    },
   },
 
   // One Balanced cell per valid (hw × quant): H200×{BF16,FP8}; each Blackwell×{BF16,FP8,NVFP4}.
