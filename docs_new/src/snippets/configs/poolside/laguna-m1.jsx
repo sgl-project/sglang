@@ -133,20 +133,12 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // 256-expert top-16 MoE. DeepEP all-to-all + EP degree.
+    // 256-expert top-16 MoE — EP degree only.
     // EP: VERIFIED on 8×B200 BF16 (--ep-size 8, GSM8K 0.94, identical to the TP baseline).
-    // DeepEP: WARNING — does NOT work on the BF16 build. M.1 routes top-16, but DeepEP's
-    // low-latency internode kernel caps top-k at 11 (internode_ll.cu kNumMaxTopK=11), so auto/
-    // low_latency asserts at decode CUDA-graph capture; `--deepep-mode normal` is "NotImplemented"
-    // for unquantized weights. Left selectable for the (untested) quantized cells; on BF16 use plain
-    // --ep-size instead. (Consider gating this off bf16 once FP8+normal is checked — see PR notes.)
+    // DeepEP intentionally NOT exposed — it does not work on M.1: top-16 routing exceeds DeepEP's
+    // low-latency internode kernel cap of 11 (internode_ll.cu kNumMaxTopK=11) → assert at decode
+    // CUDA-graph capture, and `--deepep-mode normal` is NotImplemented for unquantized weights. Use EP.
     moe: {
-      backend: {
-        options: [
-          { id: null,     label: "Inherited" },
-          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
-        ],
-      },
       ep: { label: "EP", values: [null, 1, 2, 4, 8] },
     },
 
