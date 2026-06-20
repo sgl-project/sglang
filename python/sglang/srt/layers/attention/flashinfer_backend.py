@@ -632,6 +632,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     fixed_split_size=None,
                     disable_split_kv=self.disable_cuda_graph_kv_split,
                 )
+                # Eager-fallback at a captured bs (can_run_graph False, e.g.
+                # replace_embeds / unsupported encoder_lens) reaches this bound
+                # branch via init_forward_metadata, so install a DecodeMetadata
+                # pointing at the just-refilled bs-bound wrappers; otherwise
+                # self.forward_metadata may still hold a previous PrefillMetadata.
+                # Replay re-assigns forward_metadata in init_forward_metadata_in_graph;
+                # this is the eager-fallback parallel.
+                self.forward_metadata = DecodeMetadata(
+                    self.decode_cuda_graph_metadata[bs]
+                )
             else:
                 self.indices_updater_decode.update(
                     req_pool_indices,
@@ -661,6 +671,12 @@ class FlashInferAttnBackend(AttentionBackend):
                         encoder_lens[:bs] if encoder_lens is not None else None
                     ),
                     spec_info=spec_info,
+                )
+                # Same eager-fallback rationale as the decode bound branch above.
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_cuda_graph_metadata[bs],
+                    False,
+                    False,
                 )
             else:
                 self.indices_updater_prefill.update(
