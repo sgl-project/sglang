@@ -15,6 +15,7 @@ import requests
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import resolve_base_url
 
 DEFAULT_TIMEOUT = 600
 
@@ -47,7 +48,7 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
 
 
 def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
-    base_url = f"http://{server_args.host}:{server_args.port}"
+    base_url = resolve_base_url("", server_args.host, server_args.port)
 
     # Reuse an already-running server instead of forking a second one onto the
     # occupied port, where it would orphan, compete for the GPU, and OOM.

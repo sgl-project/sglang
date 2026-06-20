@@ -14,8 +14,8 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -347,7 +347,7 @@ class VisionTritonAttention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -420,7 +420,7 @@ class VisionFlash3Attention(nn.Module):
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -925,8 +925,8 @@ class VisionAttention(nn.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads

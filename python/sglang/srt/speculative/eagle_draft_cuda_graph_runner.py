@@ -71,7 +71,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     loop (capture()), bucket-padding helper (_pad_to_bucket),
     and the backend-driven capture/replay scaffolding. EAGLE-specific
     bits — buffer dataclass, dummy ForwardBatch construction in
-    capture_one_shape, replay output unwrap, and can_run — are
+    capture_one_shape, replay output unwrap, and can_run_graph — are
     overridden.
 
     EAGLE does not call DecodeCudaGraphRunner.__init__ (that init
@@ -253,9 +253,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
-    # can_run
+    # can_run_graph
     # -----------------------------------------------------------------
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -423,7 +423,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
