@@ -140,12 +140,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        # If returning hidden states is enabled, or if speculative prefill
-        # needs aux hidden states (DFLASH), capture the FULL variant up front.
-        # Ported from main #27468.
         if (
             model_runner.server_args.enable_return_hidden_states
             or model_runner.spec_algorithm.is_dflash()
+            or (
+                model_runner.spec_algorithm.is_eagle()
+                and not model_runner.is_draft_worker
+            )
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
