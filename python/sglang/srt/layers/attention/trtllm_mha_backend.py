@@ -728,6 +728,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     forward_batch.out_cache_loc
                 )
             )
+            # Bind the [:n] view back onto the freshly built metadata so
+            # forward_decode/extend's KV write passes a non-None swa_out_cache_loc
+            # to KVWriteLoc; SWAKVPool.set_kv_buffer asserts non-None for SWA
+            # layers, so without this hybrid-SWA models crash on the first KV
+            # write of every capturable forward.
+            if self.forward_metadata is not None:
+                self.forward_metadata.swa_out_cache_loc = (
+                    self.cuda_graph_swa_out_cache_loc[:n]
+                )
 
     def forward_decode(
         self,

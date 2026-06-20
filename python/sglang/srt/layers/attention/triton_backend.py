@@ -552,9 +552,18 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
             n = translated.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(translated)
-            swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:n]
+            # cuda_graph_swa_out_cache_loc is sized for decode shapes
+            # (max_bs * num_tokens_per_bs); chunked prefill / plain EXTEND can
+            # produce n > buffer length. Capturable modes need to write the
+            # captured buffer (so the cuda graph's data_ptr stays valid);
+            # plain extend never goes through a captured graph, so return the
+            # translated tensor directly to avoid overflowing the buffer.
+            if n <= self.cuda_graph_swa_out_cache_loc.shape[0]:
+                self.cuda_graph_swa_out_cache_loc[n:].zero_()
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(translated)
+                swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:n]
+            else:
+                swa_out_cache_loc = translated
 
         return ForwardMetadata(
             attn_logits,
