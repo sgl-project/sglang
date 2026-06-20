@@ -220,6 +220,19 @@ class TestSanitize(unittest.TestCase):
         self.assertNotIn("mtp.layers.0.weight", sanitized)
         self.assertNotIn("model.visual.blocks.0.weight", sanitized)
 
+    def test_sanitize_strips_language_model_prefix(self):
+        args = TextModelArgs(**SMALL)
+        m = Model(args)
+        weights = {
+            "language_model.model.layers.0.mlp.gate.weight": "x",
+            "language_model.lm_head.weight": "y",
+            "vision_tower.blocks.0.weight": "drop",
+        }
+        sanitized = m.sanitize(weights)
+        self.assertIn("model.layers.0.mlp.gate.weight", sanitized)
+        self.assertIn("lm_head.weight", sanitized)
+        self.assertNotIn("vision_tower.blocks.0.weight", sanitized)
+
     def test_sanitize_transposes_conv1d_when_unsanitised(self):
         import mlx.core as mx
 

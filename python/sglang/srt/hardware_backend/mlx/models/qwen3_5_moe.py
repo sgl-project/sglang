@@ -535,13 +535,29 @@ class Model(nn.Module):
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         """Remap HF weight names to the sglang native module layout.
 
-        * Drop ``mtp.*`` (Phase 3) and ``model.visual.*`` (Phase 4).
+        * Drop ``mtp.*`` (Phase 3) and ``model.visual.*`` / ``vision_tower.*``
+          (Phase 4).
+        * Strip the ``language_model.`` prefix so weights match the flat
+          ``self.model.layers`` layout used by the sglang-native model.
         * Transpose ``conv1d.weight`` from HF's (out, in, k) to MLX's
           (out, k, in) layout.
         * Shift RMSNorm weights by ``+1`` when the file also contains
           ``mtp.*`` or unsanitised conv1d — these signals mark a fresh
           HF export whose RMSNorm weights use the (1 - gamma) convention.
         """
+        sanitized: Dict[str, Any] = {}
+        for key, value in weights.items():
+            if (
+                "mtp." in key
+                or "model.visual" in key
+                or key.startswith("vision_tower")
+            ):
+                continue
+            if key.startswith("language_model."):
+                key = key[len("language_model.") :]
+            sanitized[key] = value
+        weights = sanitized
+
         has_mtp = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k
@@ -551,12 +567,6 @@ class Model(nn.Module):
             for k, v in weights.items()
         )
         shift_norms = has_mtp or has_unsanitized_conv1d
-
-        weights = {
-            k: v
-            for k, v in weights.items()
-            if "mtp." not in k and "model.visual" not in k
-        }
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
