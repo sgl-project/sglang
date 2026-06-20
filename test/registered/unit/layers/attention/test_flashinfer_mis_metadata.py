@@ -1,17 +1,27 @@
+"""Regression coverage for FlashInfer multi-item scoring metadata bounds."""
+
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.layers.attention.flashinfer_backend import (  # noqa: E402
     FLASHINFER_MIS_MAX_ITEM_LEN,
     FlashInferAttnBackend,
     _max_multi_item_scoring_item_len,
 )
 
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-class TestFlashInferMISMetadata(unittest.TestCase):
-    def _make_forward_batch(self, delimiter_indices, seq_len):
+
+class TestFlashInferMISMetadata(CustomTestCase):
+    @staticmethod
+    def _make_forward_batch(delimiter_indices, seq_len):
         return SimpleNamespace(
             forward_mode=None,
             multi_item_delimiter_indices=[torch.tensor(delimiter_indices)],
@@ -21,7 +31,8 @@ class TestFlashInferMISMetadata(unittest.TestCase):
             positions=torch.zeros(seq_len, dtype=torch.int64),
         )
 
-    def test_max_item_len_from_delimiters(self):
+    def test_max_item_len_tracks_largest_delimited_span(self):
+        """The bound must cover the largest item, including a non-final item."""
         self.assertEqual(
             _max_multi_item_scoring_item_len(torch.tensor([4, 65005]), 65006),
             65000,
@@ -32,6 +43,7 @@ class TestFlashInferMISMetadata(unittest.TestCase):
         )
 
     def test_allows_uint16_boundary(self):
+        """An item at the vendor metadata limit must remain representable."""
         backend = SimpleNamespace(enable_mis=True)
         forward_batch = self._make_forward_batch(
             [4, 4 + FLASHINFER_MIS_MAX_ITEM_LEN + 1],
@@ -48,6 +60,7 @@ class TestFlashInferMISMetadata(unittest.TestCase):
         self.assertEqual(params.max_item_len_ptr.item(), FLASHINFER_MIS_MAX_ITEM_LEN)
 
     def test_rejects_item_len_that_overflows_uint16_positions(self):
+        """Reject silent uint16 wrap instead of scoring with corrupted positions."""
         backend = SimpleNamespace(enable_mis=True)
         forward_batch = self._make_forward_batch(
             [4, 4 + FLASHINFER_MIS_MAX_ITEM_LEN + 2],
