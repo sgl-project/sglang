@@ -27,6 +27,7 @@ DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
+DSV4_NIXL_SERVER_LAUNCH_TIMEOUT = 1800
 
 _EAGLE_SPEC_ARGS = [
     "--speculative-algorithm",
@@ -253,8 +254,16 @@ class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseMooncake)
         cls.start_prefill()
         cls.start_decode()
 
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.wait_server_ready(
+            cls.prefill_url + "/health",
+            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
+            process=cls.process_prefill,
+        )
+        cls.wait_server_ready(
+            cls.decode_url + "/health",
+            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
+            process=cls.process_decode,
+        )
 
         cls.launch_lb()
 
