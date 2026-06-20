@@ -717,6 +717,11 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    # Reject audio that decodes to more than this many seconds, so a small
+    # compressed payload cannot expand into a huge PCM buffer (decompression
+    # bomb). 0 or negative disables the cap. Default mirrors vLLM's
+    # VLLM_MAX_AUDIO_DECODE_DURATION_S.
+    SGLANG_MAX_AUDIO_DECODE_DURATION_S = EnvInt(600)
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
