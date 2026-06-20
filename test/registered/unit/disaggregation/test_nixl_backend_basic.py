@@ -608,7 +608,12 @@ class TestNixlStaging(CustomTestCase):
             },
         ):
             handle, deferred = mgr._do_staging_transfer(
-                strategy, kv_chunk, req, SimpleNamespace(), queue
+                strategy,
+                kv_chunk,
+                kv_chunk.prefill_kv_indices,
+                req,
+                SimpleNamespace(),
+                queue,
             )
 
         self.assertIsNone(handle)
@@ -647,6 +652,7 @@ class TestNixlStaging(CustomTestCase):
                 mgr._do_staging_transfer(
                     strategy,
                     kv_chunk,
+                    kv_chunk.prefill_kv_indices,
                     SimpleNamespace(room=3, agent_name="decode_agent"),
                     SimpleNamespace(),
                     FakeQueue(),
@@ -673,6 +679,7 @@ class TestNixlStaging(CustomTestCase):
             agent_name="decode_agent",
             agent_metadata=b"",
             dst_kv_ptrs=[],
+            dst_kv_mem_kinds=[],
             dst_aux_ptrs=[],
             dst_state_data_ptrs=[],
             gpu_id=5,
@@ -690,6 +697,7 @@ class TestNixlStaging(CustomTestCase):
         handle, deferred = mgr._do_staging_transfer(
             strategy,
             kv_chunk,
+            kv_chunk.prefill_kv_indices,
             SimpleNamespace(room=3, agent_name="decode_agent"),
             dst_info,
             FakeQueue(),
