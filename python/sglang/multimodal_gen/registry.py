@@ -63,7 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.k2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -116,7 +116,7 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.k2 import (
+from sglang.multimodal_gen.configs.sample.krea2 import (
     Krea2SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
-from sglang.multimodal_gen.configs.models.dits.k2 import Krea2DitConfig
+from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta

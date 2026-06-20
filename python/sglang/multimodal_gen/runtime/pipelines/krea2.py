@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k2 import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.krea2 import (
     Krea2BeforeDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -35,8 +35,8 @@ _TEXT_MAX_LENGTH = 512
 class Krea2Pipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "Krea2Pipeline"
 
-    from sglang.multimodal_gen.configs.pipeline_configs.k2 import Krea2PipelineConfig
-    from sglang.multimodal_gen.configs.sample.k2 import Krea2SamplingParams
+    from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+    from sglang.multimodal_gen.configs.sample.krea2 import Krea2SamplingParams
 
     pipeline_config_cls = Krea2PipelineConfig
     sampling_params_cls = Krea2SamplingParams

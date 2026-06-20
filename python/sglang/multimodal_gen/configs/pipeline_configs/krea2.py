@@ -5,7 +5,7 @@ import torch
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.k2 import Krea2DitConfig
+from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
