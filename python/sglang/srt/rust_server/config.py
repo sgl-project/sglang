@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_mm,
     get_model,
     get_observability,
@@ -89,6 +90,7 @@ def _build_server_args(
         ),
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
+        enable_deterministic_inference=get_exec().deterministic.enable_deterministic_inference,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.

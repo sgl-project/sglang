@@ -25,7 +25,7 @@ use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    openai_error, sampling_for_choice, submit_generation, unix_seconds_u32,
 };
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
@@ -171,7 +171,11 @@ async fn completions(
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
+                sampling_params: sampling_for_choice(
+                    &sampling,
+                    sample_index,
+                    state.server_args.enable_deterministic_inference,
+                ),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {

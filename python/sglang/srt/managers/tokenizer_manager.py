@@ -410,6 +410,20 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 
+def _seed_for_parallel_sample(
+    sampling_params: SamplingParams, sample_index: int, *, deterministic: bool
+) -> SamplingParams:
+    seed = sampling_params.sampling_seed_for_sample(
+        sample_index, deterministic=deterministic
+    )
+    if seed is None:
+        return sampling_params
+
+    offset = copy.copy(sampling_params)
+    offset.sampling_seed = seed
+    return offset
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -2023,7 +2037,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for j in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2032,6 +2046,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
+                    tokenized_obj.sampling_params = _seed_for_parallel_sample(
+                        tokenized_obj.sampling_params,
+                        j,
+                        deterministic=get_exec().deterministic.enable_deterministic_inference,
+                    )
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)

@@ -310,3 +310,69 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     assert_eq!(frame["error"]["code"], 503);
     assert!(text.contains("[DONE]"));
 }
+
+// Both OpenAI handlers must derive seeds at dispatch, including omitted seeds
+// in deterministic mode; sharing the original seed duplicates random streams.
+#[tokio::test]
+async fn openai_handlers_derive_per_prompt_choice_seeds() {
+    use super::template::{ChatFormatter, LegacyFormatter, builtin_template};
+    use crate::message::request::RequestKind;
+    use crate::tokenizer_manager::wiring::TmEvent;
+
+    for (seed, deterministic, expected) in [
+        (Some(17), true, vec![Some(17), Some(18), Some(19)]),
+        (Some(17), false, vec![Some(17), Some(18), Some(19)]),
+        (None, true, vec![Some(42), Some(43), Some(44)]),
+        (None, false, vec![None, None, None]),
+        (
+            Some(i64::MAX),
+            true,
+            vec![Some(i64::MAX), Some(i64::MIN), Some(i64::MIN + 1)],
+        ),
+    ] {
+        for chat in [false, true] {
+            let (tx, rx) = flume::unbounded();
+            let mut state = app_state(senders());
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            state_mut.senders.tok_manager_tx = tx;
+            Arc::get_mut(&mut state_mut.server_args)
+                .unwrap()
+                .enable_deterministic_inference = deterministic;
+            state_mut.chat_formatter = Some(ChatFormatter::Legacy(Box::new(LegacyFormatter {
+                spec: builtin_template("chatml").unwrap(),
+            })));
+            let (path, mut body, prompts) = if chat {
+                (
+                    "/v1/chat/completions",
+                    json!({"messages": [{"role": "user", "content": "hi"}]}),
+                    1,
+                )
+            } else {
+                ("/v1/completions", json!({"prompt": ["first", "second"]}), 2)
+            };
+            body["model"] = json!("model");
+            body["n"] = json!(3);
+            body["stream"] = json!(true);
+            if let Some(seed) = seed {
+                body["seed"] = json!(seed);
+            }
+            let response = post_json(routes().with_state(state), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut actual = Vec::new();
+            for _ in 0..prompts * 3 {
+                let TmEvent::Intake(request) = rx.try_recv().expect("submitted choice") else {
+                    panic!("expected intake");
+                };
+                let RequestKind::Generate(request) = request.kind else {
+                    panic!("expected generation");
+                };
+                actual.push(request.sampling_params.sampling_seed);
+            }
+            assert_eq!(
+                actual,
+                expected.repeat(prompts),
+                "{path}, seed={seed:?}, deterministic={deterministic}"
+            );
+        }
+    }
+}

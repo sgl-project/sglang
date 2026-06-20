@@ -164,7 +164,17 @@ print(response.json())
 
 #### Generating Multiple Reproducible Responses
 
-To sample different responses from the same prompt while maintaining reproducibility (e.g., for GRPO training), provide different sampling seeds in your requests:
+For an OpenAI request with `n > 1`, SGLang assigns each choice a distinct,
+reproducible seed. An explicit seed produces `seed`, `seed + 1`, and so on; if
+the seed is omitted, deterministic inference starts from the default seed of
+`42`. Derived seeds wrap with signed 64-bit arithmetic. User-provided seeds must
+be signed 64-bit integers.
+
+Distinct seeds select distinct random streams, but they do not guarantee
+distinct text (for example, greedy decoding may still produce identical
+choices).
+
+You can also provide seeds explicitly when issuing separate requests:
 
 ```python Example
 import requests
@@ -187,13 +197,13 @@ for seed in sampling_seeds:
     )
     responses.append(response.json())
 
-# Each seed will produce a different but reproducible response
-# Using the same seed will always produce the same response
+# Each seed selects a distinct, reproducible random stream
+# Using the same seed reproduces that stream across runs
 ```
 
 This approach ensures that:
-- Different seeds produce diverse responses
-- The same seed always produces the same response across different runs
+- Different seeds select distinct random streams
+- The same seed reproduces the same stream across runs
 - Results are reproducible for debugging and evaluation
 
 
