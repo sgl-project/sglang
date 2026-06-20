@@ -191,8 +191,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             self.workspace_buffer = global_zero_init_workspace_buffer
 
-        # CUDA graph state
-        self.decode_cuda_graph_metadata = {}
+        # Singleton TRTLLMMLADecodeMetadata covering decode / target-verify /
+        # draft-extend-v2 (allocated in init_static_metadata_buffers at
+        # union-max). cuda graph captured data_ptrs reference its stable
+        # buffer storage for every replay shape.
+        self._decode_metadata: Optional[TRTLLMMLADecodeMetadata] = None
         self.decode_cuda_graph_kv_indices = None
         self.padded_q_buffer = None
         self.unpad_output_buffer = None
@@ -328,69 +331,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         super().init_static_metadata_buffers(max_bs, max_num_tokens, kv_indices_buf)
 
-        # Pre-allocate an eager metadata holding union-max-sized mode fields,
-        # plus a view over the shared kv-indices buffer. Used as the fallback
-        # when the live bs has no captured bucket entry (eager-only mode, or
-        # graph-enabled mode at non-captured bs). The cuda-graph capture path
-        # still creates per-bucket entries via _init_cuda_graph_metadata.
-        eager_metadata = TRTLLMMLADecodeMetadata()
-        eager_metadata.seq_lens_k = torch.zeros(
+        # Singleton TRTLLMMLADecodeMetadata sized at union-max; reused across
+        # every iter for decode / target-verify / draft-extend-v2. Buffers
+        # are stable so cuda-graph captured data_ptrs stay valid for every
+        # replay shape.
+        self._decode_metadata = TRTLLMMLADecodeMetadata()
+        self._decode_metadata.seq_lens_k = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-        num_tokens_per_bs = max_num_tokens // max_bs
-        eager_metadata.cu_seqlens_q = torch.zeros(
+        self._decode_metadata.cu_seqlens_q = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=self.device
         )
-        eager_metadata.seq_lens_q = torch.zeros(
+        self._decode_metadata.seq_lens_q = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-        eager_metadata.block_kv_indices = self.decode_cuda_graph_kv_indices[
+        self._decode_metadata.block_kv_indices = self.decode_cuda_graph_kv_indices[
             :max_bs, :max_blocks_per_seq
         ]
-        eager_metadata.max_seq_len_k = self.max_context_len
-        eager_metadata.max_seq_len_q = num_tokens_per_bs
-        self.eager_decode_metadata = eager_metadata
+        self._decode_metadata.max_seq_len_k = self.max_context_len
+        self._decode_metadata.max_seq_len_q = max_num_tokens // max_bs
 
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
-
-    def _init_cuda_graph_metadata(
-        self,
-        bs: int,
-        num_tokens: int,
-        forward_mode: ForwardMode,
-        seq_lens: torch.Tensor,
-        device: torch.device,
-    ):
-        """Allocate persistent metadata buffers for CUDA graph capture."""
-        metadata = TRTLLMMLADecodeMetadata()
-
-        if forward_mode.is_target_verify():
-            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = num_tokens // bs
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=device
-            )
-            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
-
-        # Capture with full width so future longer sequences are safe during replay.
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-
-        self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_decode_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -463,29 +425,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch, in_capture=in_capture
             )
 
-        bs = forward_batch.batch_size
-        if in_capture:
-            num_tokens = forward_batch.positions.numel()
-            self._init_cuda_graph_metadata(
-                bs,
-                num_tokens,
-                forward_mode,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens.device,
-            )
-
+        # Single eager == replay == capture path: the singleton decode
+        # metadata's buffers are stable across iters, so capture and replay
+        # share the same data_ptrs; eager / non-captured bs runs the same body.
         self._compute_decode_metadata(forward_batch)
 
     def _compute_decode_metadata(self, forward_batch: ForwardBatch):
         """Single source of truth for TRTLLM-MLA decode / target-verify /
         draft-extend-v2 metadata, shared by eager / capture / replay.
 
-        Looks up the captured per-bs metadata when present (replay /
-        eager-at-captured-bs) and falls back to the union-max
-        ``eager_decode_metadata`` allocated in ``init_static_metadata_buffers``
-        otherwise (pure-eager / non-captured bs). Either way the body is the
-        same in-place mutation of buffers whose storage is stable across
-        iters, so the cuda graph's captured data_ptrs stay valid.
+        Uses the singleton ``_decode_metadata`` allocated in
+        ``init_static_metadata_buffers`` (sized at union-max). All mutations
+        write into the [:bs] / [:bs+1] slices of stable buffers; the cuda
+        graph's captured data_ptrs stay valid across iters and across bs.
 
         Deliberately NOT named ``_compute_forward_metadata`` -- that is the
         FlashInferMLA base's full-mode helper, reached via super() for delegated
@@ -495,7 +447,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode = forward_batch.forward_mode
         bs = forward_batch.batch_size
 
-        metadata = self.decode_cuda_graph_metadata.get(bs, self.eager_decode_metadata)
+        metadata = self._decode_metadata
         seq_lens = forward_batch.seq_lens
 
         # Reset any stale prefill metadata (the backend instance persists across
