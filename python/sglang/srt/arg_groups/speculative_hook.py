@@ -278,10 +278,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
             "speculative decoding."
         )
-    else:
-        logger.warning(
-            "Overlap spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
-        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
