@@ -536,6 +536,13 @@ def _build_eagle_draft_extend_fixture(
         max_num_tokens=settings.capture_batch_size
         * (settings.speculative_num_draft_tokens or settings.speculative_num_steps),
     )
+    # Mirror EAGLEDraftExtendCudaGraphRunner.capture_one_shape: register the
+    # captured bs so the backend's _compute_forward_metadata takes the bound
+    # DRAFT_EXTEND_V2 layout (instead of falling through to the plain-EXTEND
+    # eager branch which the SimpleNamespace fb_view doesn't support).
+    captured = getattr(draft_extend_attn_backend, "_draft_extend_v2_captured_bs", None)
+    if captured is not None:
+        captured.add(settings.capture_batch_size)
     worker_cls = (
         _EagleDraftExtendV2WorkerHarness
         if case.forward_mode.is_draft_extend_v2()

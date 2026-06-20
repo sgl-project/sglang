@@ -492,9 +492,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
 
-        self._compute_decode_metadata(forward_batch)
+        self._compute_decode_metadata(forward_batch, in_capture=in_capture)
 
-    def _compute_decode_metadata(self, forward_batch: ForwardBatch):
+    def _compute_decode_metadata(
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
+    ):
         """Single source of truth for TRTLLM-MLA decode / target-verify /
         draft-extend-v2 metadata, shared by eager / capture / replay.
 
@@ -523,23 +525,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_prefill_metadata = None
 
         # Pre-refactor's fresh-build path set max_seq_len_k from the LIVE batch
-        # (seq_lens_cpu.max()); the converged path needs the same for normal
-        # decode so long-context models don't pay max_context_len kernel
-        # scheduling cost on short requests. (Spec branches set their own
-        # max_seq_len_k below — captured replays don't care since max_seq_len_k
-        # is a host-side int, not a graph-captured pointer.)
+        # (seq_lens_cpu.max()); the converged path needs the same for eager /
+        # replay so long-context models don't pay max_context_len kernel
+        # scheduling cost on short requests.
+        #
+        # During CAPTURE, DecodeCudaGraphRunner seeds seq_lens_cpu with the
+        # backend's fill value (1), and max_seq_len_k is a host int captured
+        # into the trtllm-gen graph. Recording the live max here would freeze
+        # the captured graph at max_seq_len_k=1, breaking replay for any KV
+        # length > 1. Keep max_context_len for capture; use live max only
+        # outside the capture path.
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None:
             live_max_seq_len_k = int(seq_lens_cpu[:bs].max().item())
         else:
             live_max_seq_len_k = int(seq_lens[:bs].max().item())
-        metadata.max_seq_len_k = live_max_seq_len_k
+        if not in_capture:
+            metadata.max_seq_len_k = live_max_seq_len_k
+        else:
+            metadata.max_seq_len_k = self.max_context_len
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k[:bs].copy_(seq_lens.to(dtype=torch.int32))
             # Spec target verify reserves draft tokens past the live max.
-            metadata.max_seq_len_k = live_max_seq_len_k + self.num_draft_tokens
+            if not in_capture:
+                metadata.max_seq_len_k = live_max_seq_len_k + self.num_draft_tokens
+            # In capture, leave max_seq_len_k = max_context_len from above.
         elif forward_mode.is_draft_extend_v2():
             if bs in self._draft_extend_v2_captured_bs:
                 # Captured/replay layout: fixed num_draft_tokens per req.
