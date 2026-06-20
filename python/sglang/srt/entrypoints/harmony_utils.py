@@ -249,7 +249,19 @@ def parse_output_message(message: Message):
         if len(message.content) != 1:
             raise ValueError("Invalid number of contents in browser message")
         content = message.content[0]
-        browser_call = orjson.loads(content.text)
+        # With retry on, call_search_tool already returned a tool error for this
+        # invalid JSON; render a placeholder so output building does not crash.
+        try:
+            browser_call = orjson.loads(content.text)
+        except orjson.JSONDecodeError:
+            json_retry_output_message = (
+                f"Invalid JSON args, caught and retried: {content.text}"
+            )
+            browser_call = {
+                "query": json_retry_output_message,
+                "url": json_retry_output_message,
+                "pattern": json_retry_output_message,
+            }
         # TODO: translate to url properly!
         if recipient == "browser.search":
             action = ActionSearch(

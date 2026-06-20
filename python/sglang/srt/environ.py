@@ -368,6 +368,7 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    SGLANG_TOOL_JSON_ERROR_AUTOMATIC_RETRY = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
