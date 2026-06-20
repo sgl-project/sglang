@@ -217,19 +217,30 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             # execute this same body).
             seq_lens = seq_lens[:bs]
             req_pool_indices = req_pool_indices[:bs]
-            metadata = DualChunkFlashAttentionMetadata()
-            metadata.seq_lens_tensor = self.decode_metadata["seq_lens_tensor"][:bs]
-            metadata.orig_seq_lens_tensor = self.decode_metadata[
-                "orig_seq_lens_tensor"
-            ][:bs]
-            metadata.block_tables = self.decode_metadata["block_tables"]
-            metadata.block_tables_intra = self.decode_metadata["block_tables_intra"]
-            metadata.block_tables_succ = self.decode_metadata["block_tables_succ"]
-            metadata.seq_lens_intra = self.decode_metadata["seq_lens_intra"][:bs]
-            metadata.seq_lens_succ = self.decode_metadata["seq_lens_succ"][:bs]
-            metadata.seq_lens_inter = self.decode_metadata["seq_lens_inter"][:bs]
-            if self.original_max_position_embeddings > 0:
-                metadata.scaling_factor = self.decode_metadata["scaling_factor"][:bs]
+            # Oversized eager fallback: when bs exceeds the captured ceiling
+            # the cuda-graph runner rejects this batch and dispatches eager;
+            # the shared max-bs views are too small for [:bs].copy_ and would
+            # raise on shape mismatch (or scribble past the buffer on the 2D
+            # block_tables fields). Fresh-alloc per-iter for this path.
+            cg_max_bs = getattr(self, "cuda_graph_max_bs", None)
+            if cg_max_bs is not None and bs > cg_max_bs:
+                metadata = self._build_fresh_decode_metadata(bs)
+            else:
+                metadata = DualChunkFlashAttentionMetadata()
+                metadata.seq_lens_tensor = self.decode_metadata["seq_lens_tensor"][:bs]
+                metadata.orig_seq_lens_tensor = self.decode_metadata[
+                    "orig_seq_lens_tensor"
+                ][:bs]
+                metadata.block_tables = self.decode_metadata["block_tables"]
+                metadata.block_tables_intra = self.decode_metadata["block_tables_intra"]
+                metadata.block_tables_succ = self.decode_metadata["block_tables_succ"]
+                metadata.seq_lens_intra = self.decode_metadata["seq_lens_intra"][:bs]
+                metadata.seq_lens_succ = self.decode_metadata["seq_lens_succ"][:bs]
+                metadata.seq_lens_inter = self.decode_metadata["seq_lens_inter"][:bs]
+                if self.original_max_position_embeddings > 0:
+                    metadata.scaling_factor = self.decode_metadata["scaling_factor"][
+                        :bs
+                    ]
 
             metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
             metadata.seq_lens = seq_lens.tolist()
@@ -631,6 +642,37 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         ).squeeze(1)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _build_fresh_decode_metadata(self, bs: int):
+        """Fresh per-iter equivalent of the bound ``self.decode_metadata`` dict,
+        used when the live bs exceeds the captured ceiling and the cuda-graph
+        runner has dispatched this batch through the eager fallback.
+        """
+        metadata = DualChunkFlashAttentionMetadata()
+        block_cols = (self.max_context_len - 1) // self.page_size + 1
+        metadata.seq_lens_tensor = torch.zeros(
+            bs, dtype=torch.int32, device=self.device
+        )
+        metadata.orig_seq_lens_tensor = torch.zeros(
+            bs, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables_intra = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables_succ = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.seq_lens_intra = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        metadata.seq_lens_succ = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        metadata.seq_lens_inter = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        if self.original_max_position_embeddings > 0:
+            metadata.scaling_factor = torch.zeros(
+                bs, dtype=torch.float32, device=self.device
+            )
+        return metadata
+
     def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -640,6 +682,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # Remembered so _compute_forward_metadata can detect oversized eager
+        # decode (bs > captured ceiling) and route through the fresh-alloc
+        # path instead of size-mismatching .copy_ into the max_bs-sized views.
+        self.cuda_graph_max_bs = max_bs
         self.decode_metadata = {
             "seq_lens_tensor": torch.zeros(
                 max_bs, dtype=torch.int32, device=self.device
