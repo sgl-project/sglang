@@ -575,7 +575,10 @@ class NGRAMWorker(BaseSpecWorker):
         6. At next _prepare_for_speculative_decoding, check if predicted_bonus matches
            the actual bonus token from verification.
         """
-        if batch.forward_mode.is_extend() or batch.has_grammar:
+        if (
+            not batch.forward_mode.is_decode()
+            and not batch.forward_mode.is_target_verify()
+        ) or batch.has_grammar:
             # spec v2 currently doesn't support grammar, so directly return.
             self._precomputed_cache = None
             return
