@@ -56,6 +56,52 @@ logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
+def has_xgrammar_unsupported_json_features(schema: dict) -> bool:
+    """Whether the JSON schema uses keywords xgrammar silently ignores.
+
+    These keywords need counting/arithmetic/regex-keyed matching that a
+    context-free grammar cannot express, so xgrammar compiles the schema
+    without error but does not enforce them and generation can violate the
+    schema. Detecting this lets the caller fail loudly instead. (The string
+    ``format`` keyword is deliberately not checked: which formats xgrammar
+    supports is version-dependent, so flagging it risks false positives.)
+    """
+
+    def check(obj) -> bool:
+        if not isinstance(obj, dict):
+            return False
+
+        # "type" may be a single string or a list (e.g. ["integer", "null"] for a
+        # nullable field); normalize to a set before testing membership.
+        raw_type = obj.get("type")
+        types = (
+            {raw_type}
+            if isinstance(raw_type, str)
+            else set(raw_type) if isinstance(raw_type, list) else set()
+        )
+        if types & {"integer", "number"} and "multipleOf" in obj:
+            return True
+        if "array" in types and any(
+            key in obj for key in ("uniqueItems", "contains", "maxContains")
+        ):
+            return True
+        if "object" in types and any(
+            key in obj for key in ("patternProperties", "propertyNames")
+        ):
+            return True
+
+        for value in obj.values():
+            if isinstance(value, dict):
+                if check(value):
+                    return True
+            elif isinstance(value, list):
+                if any(isinstance(item, dict) and check(item) for item in value):
+                    return True
+        return False
+
+    return check(schema)
+
+
 class XGrammarGrammar(BaseGrammarObject):
 
     def __init__(
@@ -320,6 +366,16 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                schema = json.loads(key_string)
+                if isinstance(schema, dict) and has_xgrammar_unsupported_json_features(
+                    schema
+                ):
+                    raise RuntimeError(
+                        "JSON schema uses features unsupported by xgrammar "
+                        "(e.g. multipleOf, uniqueItems, contains, "
+                        "patternProperties, propertyNames); the constraint "
+                        "would otherwise be silently ignored"
+                    )
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
