@@ -450,9 +450,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.disable_chunked_prefix_cache and has_prefix
             ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
-                super().init_forward_metadata_out_graph(
-                    forward_batch, in_capture=in_capture
-                )
+                # Parent's init_forward_metadata_out_graph routes plain EXTEND
+                # into _apply_cuda_graph_metadata which only handles decode /
+                # target_verify and raises on EXTEND. The fallback wants the
+                # parent's *eager* prefill setup (indices_updater_prefill +
+                # PrefillMetadata wrapper) — that lives on
+                # init_forward_metadata, not init_forward_metadata_out_graph.
+                super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
             cum_seq_lens_q = torch.cat(
