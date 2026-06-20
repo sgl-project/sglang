@@ -138,6 +138,11 @@ class TritonAttnBackend(AttentionBackend):
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        # bs values that the draft-extend cuda-graph runner has captured. Eager
+        # draft-extend-v2 (--disable-cuda-graph or non-captured bs) must NOT use
+        # the bound fixed-width layout in _compute_forward_metadata; the runner
+        # adds bs here as it captures each shape.
+        self._draft_extend_v2_captured_bs: set[int] = set()
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         # Split-KV verify matches extend_attention_fwd only when the EAGLE tree
         # reduces to a pure-causal chain, i.e. topk == 1 (the same condition the
@@ -475,10 +480,15 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
-        elif forward_batch.forward_mode.is_draft_extend_v2():
+        elif (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and bs in self._draft_extend_v2_captured_bs
+        ):
             # Captured draft-extend (v2 only; EAGLE v1 DRAFT_EXTEND was removed):
             # constant per-req token layout written into the bound buffers (no
-            # graph-illegal host sync).
+            # graph-illegal host sync). Eager draft_extend_v2 (--disable-cuda-graph
+            # or a live bs that wasn't captured) falls through to the EXTEND
+            # branch below so per-req extend_seq_lens drive the layout.
             qo_indptr, kv_indptr, num_tokens_per_bs = self._build_draft_extend_indptrs(
                 bs,
                 forward_batch.seq_lens[:bs],

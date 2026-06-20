@@ -126,6 +126,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        # bs values that the draft-extend cuda-graph runner has captured. Used
+        # to gate the bound fixed-width DRAFT_EXTEND_V2 layout; eager / non-
+        # captured bs falls through to the fresh per-iter metadata branch.
+        self._draft_extend_v2_captured_bs: set[int] = set()
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
@@ -411,13 +415,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+            or (
+                forward_mode.is_draft_extend_v2()
+                and bs in self._draft_extend_v2_captured_bs
+            )
         ):
             # Capturable modes: rebuild a TRTLLMMHAMetadata view per-iter
             # from the shared max-bs buffers (init_static_metadata_buffers
             # allocates them once). Storage is stable across iters so cuda
             # graph data_ptrs stay valid — capture, replay, and eager all
-            # execute this single body.
+            # execute this single body. Eager draft_extend_v2 at a non-
+            # captured bs falls through to the fresh per-iter branch so
+            # the layout follows live extend_seq_lens.
             seq_lens = forward_batch.seq_lens[:bs]
             seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
             req_pool_indices = forward_batch.req_pool_indices[:bs]
