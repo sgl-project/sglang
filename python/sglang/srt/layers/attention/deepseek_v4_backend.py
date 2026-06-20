@@ -838,20 +838,6 @@ class DeepseekV4AttnBackend(
                 )
             )
 
-    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Whether ``(bs, forward_mode)`` has a captured cuda-graph metadata
-        object in ``cuda_graph_metadata_of_bucket_and_bs[bucket][bs]``. Internal
-        to ``_compute_forward_metadata``; see that method for the seam.
-        """
-        bucket_metadata = getattr(self, "cuda_graph_metadata_of_bucket_and_bs", None)
-        if bucket_metadata is None:
-            return False
-        try:
-            bucket = _GraphBucket.of(forward_mode)
-        except NotImplementedError:
-            return False
-        return bs in bucket_metadata[bucket]
-
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -897,13 +883,17 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
 
-        # Internalize the captured-bucket seam — every caller goes through
-        # this method; the public API does not expose it.
-        _has_captured = in_capture or self._has_captured_metadata(
-            bs, forward_batch.forward_mode
+        # For capturable modes (decode_or_idle / target_verify /
+        # draft_extend_v2), always route through the bound body. Lazy
+        # population: replay_cuda_graph_metadata_from creates the per-bs
+        # dict entry on first call for a new bs (and refills it on subsequent
+        # calls); no separate captured-vs-fresh routing needed.
+        _is_capturable = forward_batch.forward_mode.is_decode_or_idle() or (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
 
-        if _has_captured:
+        if _is_capturable:
             if in_capture:
                 # Captured graph does no real cache writes, so synthesize a dummy
                 # out_cache_loc per bucket (replay supplies the real value).
