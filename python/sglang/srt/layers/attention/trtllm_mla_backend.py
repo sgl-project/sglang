@@ -509,9 +509,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         metadata = TRTLLMMLADecodeMetadata()
         metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
-        metadata.cu_seqlens_q = torch.zeros(
-            (bs + 1,), dtype=torch.int32, device=device
-        )
+        metadata.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         metadata.seq_lens_q = torch.zeros((bs,), dtype=torch.int32, device=device)
         metadata.block_kv_indices = torch.full(
             (bs, max_blocks_per_seq), -1, dtype=torch.int32, device=device
