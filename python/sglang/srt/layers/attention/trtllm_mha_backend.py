@@ -114,14 +114,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         self.workspace_buffer = global_zero_init_workspace_buffer
 
-        # CUDA graph state
-        self.decode_cuda_graph_metadata = {}
+        # Singleton TRTLLMMHAMetadata objects per mode (allocated in
+        # init_static_metadata_buffers); buffer storage is stable across
+        # iters so cuda-graph captured data_ptrs stay valid for every replay.
+        self._decode_metadata: Optional[TRTLLMMHAMetadata] = None
+        self._draft_decode_metadata: Optional[TRTLLMMHAMetadata] = None
+        self._target_verify_metadata: Optional[TRTLLMMHAMetadata] = None
+        self._draft_extend_metadata: Optional[TRTLLMMHAMetadata] = None
 
         # Speculative decoding
         # Only support topk <= 1 for now.
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
-        self.target_verify_metadata = {}
 
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -193,12 +197,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata: TRTLLMMHAMetadata,
         page_indices: torch.Tensor,
         num_pages: int,
+        bs: int,
     ):
-        """Translate and copy SWA page indices into metadata. No-op for non-SWA."""
+        """Translate and copy SWA page indices into the [:bs, :num_pages]
+        slice of the singleton metadata's swa_page_table. No-op for non-SWA."""
         if metadata.swa_page_table is None:
             return
         swa_indices = self._maybe_translate_swa(page_indices)
-        metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
+        metadata.swa_page_table[:bs, :num_pages].copy_(swa_indices // self.page_size)
 
     def _get_layer_cache_loc(
         self,
@@ -213,14 +219,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     forward_batch.out_cache_loc
                 )
         return forward_batch.out_cache_loc
-
-    def _bind_swa_page_table(
-        self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
-    ):
-        """Bind a pre-allocated SWA page_table slice to metadata for CUDA graph."""
-        buf = source.get(key)
-        if buf is not None:
-            metadata.swa_page_table = buf[:bs, :]
 
     def _get_layer_page_table(
         self, layer: RadixAttention, forward_batch: ForwardBatch
@@ -239,34 +237,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        """Initialize CUDA graph state for TRTLLM MHA."""
+        """Initialize CUDA graph state for TRTLLM MHA.
+
+        Allocates one singleton ``TRTLLMMHAMetadata`` per mode (decode /
+        draft-decode / target-verify / draft-extend-v2) sized at union-max
+        (``max_bs``, ``max_num_pages``). ``_compute_forward_metadata`` reuses
+        these objects across iters and mutates only the [:bs] / [:bs+1]
+        slices; the buffer storage is stable so cuda-graph captured
+        data_ptrs stay valid for every replay shape.
+        """
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
-        # cu_seqlens_q is always pre-allocated (was previously gated on
-        # speculative_num_draft_tokens > 0). The per-iter view rebuild in
-        # _compute_forward_metadata slices [:bs+1] for every mode, so the
-        # shared buffer must exist for both spec and non-spec deployments.
-        self.decode_cuda_graph_metadata = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
+        self._strided_indices = torch.arange(
+            0, self.max_context_len, self.page_size, device=self.device
+        )
+
+        # Normal decode (spec_info is None).
+        self._decode_metadata = TRTLLMMHAMetadata(
+            cache_seqlens_int32=torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            cu_seqlens_q=torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            "cu_seqlens_k": torch.zeros(
+            cu_seqlens_k=torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            "page_table": torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            page_table=torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
             ),
-            "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-            "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
-            ),
-        }
+            swa_page_table=self._alloc_swa_page_table(max_bs, max_num_pages),
+        )
 
         # SWA write-target buffer; sliced as a [:num_tokens] view per-iter
-        # by _compute_forward_metadata, and refilled before each replay in
+        # by _compute_forward_metadata, refilled before each replay in
         # init_forward_metadata_out_graph.
         self.cuda_graph_swa_out_cache_loc = (
             torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
@@ -278,65 +281,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
-            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
-                self._alloc_swa_page_table(max_bs, max_num_pages)
+            # Draft decode (decode_or_idle with spec_info) — shares per-bs
+            # scalar fields with normal decode but uses its own page_table.
+            self._draft_decode_metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=self._decode_metadata.cache_seqlens_int32,
+                cu_seqlens_q=self._decode_metadata.cu_seqlens_q,
+                cu_seqlens_k=self._decode_metadata.cu_seqlens_k,
+                page_table=torch.zeros(
+                    max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                ),
+                swa_page_table=self._alloc_swa_page_table(max_bs, max_num_pages),
             )
 
-            self.target_verify_metadata = {
-                "cache_seqlens": torch.zeros(
+            ndt = self.speculative_num_draft_tokens
+            self._target_verify_metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_q": torch.arange(
-                    0,
-                    max_bs * self.speculative_num_draft_tokens + 1,
-                    step=self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
+                cu_seqlens_q=torch.arange(
+                    0, max_bs * ndt + 1, step=ndt, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_k": torch.zeros(
+                cu_seqlens_k=torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                page_table=torch.zeros(
+                    max_bs, max_num_pages, dtype=torch.int32, device=self.device
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
-            }
+                swa_page_table=self._alloc_swa_page_table(max_bs, max_num_pages),
+                max_seq_len_q=ndt,
+            )
 
-            self.draft_extend_metadata = {
-                "cache_seqlens": torch.zeros(
+            self._draft_extend_metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_q": torch.zeros(
-                    max_bs + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "cu_seqlens_k": torch.zeros(
+                cu_seqlens_q=torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                cu_seqlens_k=torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                page_table=torch.zeros(
+                    max_bs, max_num_pages, dtype=torch.int32, device=self.device
                 ),
-            }
+                swa_page_table=self._alloc_swa_page_table(max_bs, max_num_pages),
+            )
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -413,37 +402,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
         ):
-            # Capturable modes: rebuild a TRTLLMMHAMetadata view per-iter
-            # from the shared max-bs buffers (init_static_metadata_buffers
-            # allocates them once). Storage is stable across iters so cuda
-            # graph data_ptrs stay valid — capture, replay, and eager all
-            # execute this single body.
+            # Capturable modes: pick the singleton metadata for this mode
+            # (allocated once in init_static_metadata_buffers) and mutate its
+            # [:bs] / [:bs+1] / [:bs, :max_seq_pages] slices in place. The
+            # underlying buffers are stable across iters so cuda-graph
+            # captured data_ptrs stay valid for every replay shape.
             seq_lens = forward_batch.seq_lens[:bs]
             seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
             req_pool_indices = forward_batch.req_pool_indices[:bs]
-            metadata = TRTLLMMHAMetadata()
             if forward_mode.is_decode_or_idle():
                 if spec_info is not None:
-                    # Draft Decode (topk = 1)
-                    metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
-                        "cache_seqlens"
-                    ][:bs]
-                    metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
-                        "cu_seqlens_q"
-                    ][: bs + 1]
-                    metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
-                        "cu_seqlens_k"
-                    ][: bs + 1]
-                    metadata.page_table = self.decode_cuda_graph_metadata[
-                        "page_table_draft_decode"
-                    ][:bs, :]
-                    self._bind_swa_page_table(
-                        metadata,
-                        self.decode_cuda_graph_metadata,
-                        "swa_page_table_draft_decode",
-                        bs,
-                    )
-                    metadata.cache_seqlens_int32.copy_(
+                    # Draft Decode (topk = 1).
+                    metadata = self._draft_decode_metadata
+                    metadata.cache_seqlens_int32[:bs].copy_(
                         seq_lens + self.speculative_step_id + 1
                     )
                     metadata.max_seq_len_k = seq_lens.max().item() + (
@@ -453,92 +424,60 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
                 else:
-                    # Normal Decode
-                    metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
-                        "cache_seqlens"
-                    ][:bs]
-                    metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
-                        "cu_seqlens_q"
-                    ][: bs + 1]
-                    metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
-                        "cu_seqlens_k"
-                    ][: bs + 1]
-                    metadata.page_table = self.decode_cuda_graph_metadata[
-                        "page_table"
-                    ][:bs, :]
-                    self._bind_swa_page_table(
-                        metadata, self.decode_cuda_graph_metadata, "swa_page_table", bs
-                    )
+                    # Normal Decode.
+                    metadata = self._decode_metadata
                     max_len = seq_lens_cpu.max().item()
                     max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                     metadata.max_seq_len_k = max_len
-                    metadata.cache_seqlens_int32.copy_(seq_lens)
+                    metadata.cache_seqlens_int32[:bs].copy_(seq_lens)
 
-                metadata.cu_seqlens_k[1:].copy_(
-                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                metadata.cu_seqlens_k[1 : bs + 1].copy_(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32[:bs], dim=0, dtype=torch.int32
+                    )
                 )
                 page_indices = self.req_to_token[
                     req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                        None, :
-                    ],
+                    self._strided_indices[:max_seq_pages][None, :],
                 ]
-                metadata.page_table[:, :max_seq_pages].copy_(
+                metadata.page_table[:bs, :max_seq_pages].copy_(
                     page_indices // self.page_size
                 )
-                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages, bs)
             elif forward_mode.is_target_verify():
-                # Target Verify (topk = 1)
-                metadata.cache_seqlens_int32 = self.target_verify_metadata[
-                    "cache_seqlens"
-                ][:bs]
-                metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
-                    : bs + 1
-                ]
-                metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
-                    : bs + 1
-                ]
-                metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                self._bind_swa_page_table(
-                    metadata, self.target_verify_metadata, "swa_page_table", bs
+                # Target Verify (topk = 1). cu_seqlens_q is pre-arange'd at
+                # init; max_seq_len_q is pre-set to speculative_num_draft_tokens.
+                metadata = self._target_verify_metadata
+                metadata.cache_seqlens_int32[:bs].copy_(
+                    seq_lens + metadata.max_seq_len_q
                 )
-                metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
                 metadata.max_seq_len_k = (
                     seq_lens_cpu.max().item() + metadata.max_seq_len_q
                 )
-                metadata.cu_seqlens_k[1:].copy_(
-                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                metadata.cu_seqlens_k[1 : bs + 1].copy_(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32[:bs], dim=0, dtype=torch.int32
+                    )
                 )
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
                 page_indices = self.req_to_token[
                     req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                    self._strided_indices[:max_seq_pages],
                 ]
-                metadata.page_table[:, :max_seq_pages].copy_(
+                metadata.page_table[:bs, :max_seq_pages].copy_(
                     page_indices // self.page_size
                 )
-                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages, bs)
             elif forward_mode.is_draft_extend_v2():
-                metadata.cache_seqlens_int32 = self.draft_extend_metadata[
-                    "cache_seqlens"
-                ][:bs]
-                metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][
-                    : bs + 1
-                ]
-                metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
-                    : bs + 1
-                ]
-                metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
-                self._bind_swa_page_table(
-                    metadata, self.draft_extend_metadata, "swa_page_table", bs
-                )
-                metadata.cache_seqlens_int32.copy_(seq_lens)
+                metadata = self._draft_extend_metadata
+                metadata.cache_seqlens_int32[:bs].copy_(seq_lens)
                 metadata.max_seq_len_k = seq_lens_cpu.max().item()
-                metadata.cu_seqlens_k[1:].copy_(
-                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                metadata.cu_seqlens_k[1 : bs + 1].copy_(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32[:bs], dim=0, dtype=torch.int32
+                    )
                 )
                 num_tokens_per_bs = spec_info.num_tokens_per_req
                 if num_tokens_per_bs <= 0:
@@ -548,7 +487,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         spec_info.num_accept_tokens[:bs].max().item()
                     )
                 metadata.max_seq_len_q = num_tokens_per_bs
-                metadata.cu_seqlens_q[1:].copy_(
+                metadata.cu_seqlens_q[1 : bs + 1].copy_(
                     torch.arange(
                         num_tokens_per_bs,
                         bs * num_tokens_per_bs + 1,
@@ -562,12 +501,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ) // self.page_size
                 page_indices = self.req_to_token[
                     req_pool_indices[:, None],
-                    self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+                    self._strided_indices[:max_seq_pages],
                 ]
-                metadata.page_table[:, :max_seq_pages].copy_(
+                metadata.page_table[:bs, :max_seq_pages].copy_(
                     page_indices // self.page_size
                 )
-                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages, bs)
             self.forward_metadata = metadata
         else:
             # Fresh per-iter metadata (pure-eager / non-captured bs; plain
