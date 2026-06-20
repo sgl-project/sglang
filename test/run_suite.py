@@ -129,6 +129,7 @@ NIGHTLY_SUITES = {
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
