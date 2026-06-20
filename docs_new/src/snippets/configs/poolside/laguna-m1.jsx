@@ -118,9 +118,13 @@ sgl-eval run gsm8k \\
 
   playgroundFeatures: {
 
-    // M.1 is global-attention (no SWA); expose TP + DP-Attention. No CP.
-    // DP-Attention is a Playground experiment only — ~15% slower than plain TP on this GQA
-    // model (8 KV heads), so it is NOT in the shipped Balanced recipe.
+    // M.1 is global-attention (no SWA); expose TP + DP-Attention here. Context parallelism is
+    // exposed separately and Hopper-only, under `flagSelects` below — it requires the fa3 backend,
+    // which is SM80–90 (rejected on Blackwell SM100), so it cannot run on the B200/B300/GB200/GB300
+    // cells.
+    // DP-Attention: VERIFIED functionally correct on 8×B200 BF16 (GSM8K 0.94, identical to the TP
+    // baseline) but ~15–28% slower on this GQA model (8 KV heads). Playground experiment only —
+    // deliberately NOT in the shipped Balanced recipe.
     attention: {
       knobs: [
         { id: "tp",     label: "TP",           values: [null, 1, 2, 4, 8] },
@@ -130,6 +134,12 @@ sgl-eval run gsm8k \\
     },
 
     // 256-expert top-16 MoE. DeepEP all-to-all + EP degree.
+    // EP: VERIFIED on 8×B200 BF16 (--ep-size 8, GSM8K 0.94, identical to the TP baseline).
+    // DeepEP: WARNING — does NOT work on the BF16 build. M.1 routes top-16, but DeepEP's
+    // low-latency internode kernel caps top-k at 11 (internode_ll.cu kNumMaxTopK=11), so auto/
+    // low_latency asserts at decode CUDA-graph capture; `--deepep-mode normal` is "NotImplemented"
+    // for unquantized weights. Left selectable for the (untested) quantized cells; on BF16 use plain
+    // --ep-size instead. (Consider gating this off bf16 once FP8+normal is checked — see PR notes.)
     moe: {
       backend: {
         options: [
@@ -148,6 +158,46 @@ sgl-eval run gsm8k \\
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
       ],
     },
+
+    // HiCache (hierarchical KV cache). VERIFIED on 8×B200 BF16: enabling the host L2 tier on a
+    // zipfian shared-prefix workload cut mean TTFT ~36% (median ~43%) and lifted throughput ~19% vs
+    // GPU-only, with ~1.14M tokens served from the host tier (TPOT unchanged — the win is on prefill
+    // / prefix reuse). Biggest gains on reuse-heavy traffic: shared system prompts, multi-turn
+    // agentic coding, repeated long contexts. "Enable" emits --enable-hierarchical-cache (+host L2);
+    // Write policy is optional. (L3 storage backends exist but were not validated, so none exposed.)
+    hicache: {
+      writePolicies: [
+        { id: "auto",          label: "Auto" },
+        { id: "write_through", label: "write_through" },
+        { id: "write_back",    label: "write_back" },
+      ],
+    },
+
+    // Context Parallelism (prefill) — HOPPER ONLY. M.1's default trtllm_mha backend has no CP-aware
+    // KV-store (crashes in store_cache / kvcache.cuh); the fa3 backend DOES implement prefill-CP, but
+    // fa3 is SM80–90 only, so the whole select is hidden on Blackwell (SM100) cells. EXPERIMENTAL /
+    // UNVERIFIED: the fa3 prefill-CP path exists but has not been benchmarked on M.1 (the only CP
+    // run attempted on B200 failed on the SM check). Decode-CP is unimplemented upstream
+    // (sgl-project/sglang#21788). attn-cp-size 2 with --tp 8 → effective attention TP 4.
+    flagSelects: [
+      {
+        id: "cp",
+        title: "Context Parallelism (prefill · Hopper)",
+        stripPrefixes: ["--attention-backend", "--enable-prefill-cp", "--cp-strategy", "--attn-cp-size"],
+        options: [
+          { id: "off", label: "Off", flags: [],
+            hide: { hw: ["b200", "b300", "gb200", "gb300"] } },
+          { id: "cp2", label: "CP=2 · fa3",
+            flags: [
+              "--attention-backend fa3",
+              "--enable-prefill-cp",
+              "--cp-strategy zigzag",
+              "--attn-cp-size 2",
+            ],
+            hide: { hw: ["b200", "b300", "gb200", "gb300"] } },
+        ],
+      },
+    ],
 
     // Prefill-Decode disaggregation (§3.3). M.1 is standard-KV (global attention, no sparse
     // index buffer), so it disaggregates with just the --disaggregation-* flags — no model-specific
