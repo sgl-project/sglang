@@ -817,8 +817,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
-            # Draft-extend runs a causal paged prefill (no custom mask); kv spans
-            # the full post-extend sequence so extend-self is covered causally.
+            # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
             self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
@@ -1356,8 +1355,7 @@ class FlashInferIndicesUpdaterPrefill:
             assert prefix_lens is not None
             paged_kernel_lens = prefix_lens
             if extend_prefix_lens_cpu is not None:
-                # Host-known prefix lens -> avoid the per-step D2H sync that
-                # paged_kernel_lens.sum().item() would otherwise force.
+                # Host-known prefix lens; avoids a per-step D2H sync.
                 paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
             else:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()

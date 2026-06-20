@@ -398,10 +398,7 @@ class EagleDraftExtendInput(SpecInput):
     ):
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
-        # Fixed num_tokens_per_req qo layout (constant arange, like verify): the
-        # draft-extend forward processes num_tokens_per_req query rows per req
-        # (padded tree width), independent of the GPU-computed num_accept_tokens.
-        # A constant qo is required for cuda-graph capture/replay (fixed layout).
+        # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
         qo_indptr = torch.arange(
             0,
             (bs + 1) * self.num_tokens_per_req,

@@ -340,8 +340,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
-            # Fixed padded tree width per req; drives the constant qo layout in
-            # generate_attn_arg_prefill (cuda-graph requires a fixed qo).
+            # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.num_tokens_per_bs,
         )
 
