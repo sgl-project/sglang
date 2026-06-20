@@ -7815,7 +7815,9 @@ class ServerArgs:
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
             hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            chunk_size = getattr(hf_config, "mamba_chunk_size", None)
+            if chunk_size is None:
+                chunk_size = getattr(hf_config, "chunk_size", FLA_CHUNK_SIZE)
             assert (
                 max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"

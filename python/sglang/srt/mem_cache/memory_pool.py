@@ -784,13 +784,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(self, req: "Req", donated_to_tree: bool = False):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_allocator.free(mamba_index.unsqueeze(0))
-        req.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer and req.mamba_track_slot is not None:
+            self.mamba_allocator.free(mamba_index.unsqueeze(0))
             if not donated_to_tree:
                 self.mamba_allocator.free(req.mamba_track_slot)
             req.mamba_track_slot = None
+        elif not donated_to_tree:
+            self.mamba_allocator.free(mamba_index.unsqueeze(0))
+
+        req.mamba_pool_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

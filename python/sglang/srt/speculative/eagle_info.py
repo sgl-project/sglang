@@ -7,6 +7,7 @@ import torch
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -153,14 +154,7 @@ class EagleVerifyInput(SpecInput):
         )
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            batch.mamba_track_indices = torch.tensor(
-                [
-                    req.mamba_track_slot[0] if req.mamba_track_slot is not None else 0
-                    for req in batch.reqs
-                ],
-                dtype=torch.int64,
-                device=batch.device,
-            )
+            set_mamba_track_indices_from_reqs(batch)
             batch.mamba_track_mask = None
             batch.mamba_track_seqlens = None
 
