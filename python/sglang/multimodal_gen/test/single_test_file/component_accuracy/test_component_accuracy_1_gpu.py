@@ -5,6 +5,9 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.config impor
     get_skip_reason,
     should_skip_component,
 )
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
+    AccuracyEngine,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.testcase_configs import (
     ACCURACY_ONE_GPU_CASES,
     get_component_duplicate_skip_reason,
@@ -12,9 +15,6 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.testcase_con
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     run_native_component_accuracy_case,
     run_text_encoder_accuracy_case,
-)
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
-    AccuracyEngine,
 )
 
 VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS = {
