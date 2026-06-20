@@ -6,7 +6,7 @@
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
-/python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2 @HaiShaw @yichiche
+/python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2 @HaiShaw @yichiche @AgainstEntropy
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
@@ -48,10 +48,12 @@
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1
+/python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988
 /python/sglang/srt/mem_cache/storage/mooncake_store/embedding_cache_controller.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
+/python/sglang/srt/model_loader @b8zhong
 /python/sglang/srt/models/deepseek_common @Fridge003 @ispobock @fzyzcjy @ch-wan
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/models/transformers.py @adarshxs

@@ -85,6 +85,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -237,6 +239,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def clear(self):
@@ -1378,6 +1381,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
+                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(
@@ -1545,6 +1549,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        # Multimodal prompt token counts packed into cached_tokens slots 4-6
+        # by the prefill node (see MetadataBuffers.set_buf).
+        decode_req.req.mm_image_tokens = cached_tokens[4].item()
+        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
+        decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -1824,6 +1833,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
