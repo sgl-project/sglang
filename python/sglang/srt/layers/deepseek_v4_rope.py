@@ -306,7 +306,13 @@ def apply_rotary_emb_triton(
         # 3D (attention-output / q-k rope): contiguous-load kernel (ATOM-style).
         if is_3d:
             RD = max(triton.next_power_of_2(rope_dim), 2)
-            grid = (triton.cdiv(batch_size, BLOCK_M), n_heads)
+            # The contig kernel does a per-program reshape+flip over [BLOCK_M, RD];
+            # a small BLOCK_M (more programs, smaller tile) maximizes CU occupancy
+            # and keeps the flip cheap. Microbench (MI300, rope_dim=64): BLOCK_M=8
+            # + num_warps=4 is ~1.6-1.8x faster than BLOCK_M=32 at 8k/16k tokens
+            # (~3.5 vs ~1.9 TB/s effective BW), numerically identical.
+            CONTIG_BLOCK_M = 8
+            grid = (triton.cdiv(batch_size, CONTIG_BLOCK_M), n_heads)
             apply_rotary_emb_contig_kernel[grid](
                 x,
                 freqs_real,
@@ -320,9 +326,10 @@ def apply_rotary_emb_triton(
                 freqs_real.stride(1),
                 USE_POS=(positions is not None),
                 IS_INVERSE=inverse,
-                BLOCK_M=BLOCK_M,
+                BLOCK_M=CONTIG_BLOCK_M,
                 RD=RD,
                 RDH=RD // 2,
+                num_warps=4,
             )
             return x
         BLOCK_P = max(triton.next_power_of_2(rope_dim // 2), 1)
