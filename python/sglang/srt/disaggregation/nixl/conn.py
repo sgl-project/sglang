@@ -625,6 +625,21 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def _map_src_kv_indices(
+        self, prefill_kv_indices: npt.NDArray[np.int32]
+    ) -> npt.NDArray[np.int32]:
+        mapper = getattr(self.kv_args, "kv_page_index_mapper", None)
+        if mapper is None or prefill_kv_indices.size == 0:
+            return prefill_kv_indices
+
+        mapped = np.asarray(mapper(prefill_kv_indices), dtype=np.int32)
+        if mapped.shape != prefill_kv_indices.shape:
+            raise RuntimeError(
+                "NIXL KV source page mapper changed index shape: "
+                f"{prefill_kv_indices.shape} -> {mapped.shape}"
+            )
+        return mapped
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -1009,6 +1024,10 @@ class NixlKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
+                        src_prefill_kv_indices = self._map_src_kv_indices(
+                            kv_chunk.prefill_kv_indices
+                        )
+
                         notif = (
                             f"{req.room}_kv_{kv_chunk.chunk_id}"
                             f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
@@ -1033,6 +1052,7 @@ class NixlKVManager(CommonKVManager):
                             kv_xfer_handle, deferred = self._do_staging_transfer(
                                 staging_strategy,
                                 kv_chunk,
+                                src_prefill_kv_indices,
                                 req,
                                 dst_info,
                                 queue,
@@ -1059,7 +1079,7 @@ class NixlKVManager(CommonKVManager):
                                         )
                                     kv_xfer_handle = self.send_kvcache(
                                         req.agent_name,
-                                        kv_chunk.prefill_kv_indices,
+                                        src_prefill_kv_indices,
                                         dst_info.dst_kv_ptrs,
                                         chunked_dst_kv_indice,
                                         dst_info.gpu_id,
@@ -1072,7 +1092,7 @@ class NixlKVManager(CommonKVManager):
                                     handles.extend(
                                         self.send_kvcache_mixed(
                                             req.agent_name,
-                                            kv_chunk.prefill_kv_indices,
+                                            src_prefill_kv_indices,
                                             chunked_dst_kv_indice,
                                             notif,
                                         )
@@ -1080,7 +1100,7 @@ class NixlKVManager(CommonKVManager):
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
                                     req.agent_name,
-                                    kv_chunk.prefill_kv_indices,
+                                    src_prefill_kv_indices,
                                     chunked_dst_kv_indice,
                                     notif,
                                 )
@@ -1646,9 +1666,10 @@ class NixlKVManager(CommonKVManager):
     def _do_staging_transfer(
         self,
         staging_strategy,
-        kv_chunk: TransferKVChunk,
-        req: TransferInfo,
-        dst_info: KVArgsRegisterInfo,
+        kv_chunk: "TransferKVChunk",
+        src_prefill_kv_indices: npt.NDArray[np.int32],
+        req: "TransferInfo",
+        dst_info: "KVArgsRegisterInfo",
         queue: FastQueue,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
@@ -1695,7 +1716,7 @@ class NixlKVManager(CommonKVManager):
         )
         handle = self.send_kvcache_staged(
             req.agent_name,
-            kv_chunk.prefill_kv_indices,
+            src_prefill_kv_indices,
             dst_info.staging.base_ptr + c_offset,
             dst_info.staging.total_size - c_offset,
             dst_info.gpu_id,
