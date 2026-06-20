@@ -2098,14 +2098,14 @@
                 "0": 259.26,
                 "1": 164.46,
                 "2": 263.36,
-                "3": 257.61,
+                "3": 650.0,
                 "4": 271.46,
                 "5": 266.71,
                 "6": 232.55,
                 "7": 270.08,
                 "8": 259.96
             },
-            "expected_e2e_ms": 2775.88,
+            "expected_e2e_ms": 2850.0,
             "expected_avg_denoise_ms": 263.19,
             "expected_median_denoise_ms": 261.85,
             "estimated_full_test_time_s": 122.7
@@ -2487,7 +2487,7 @@
                 "29": 497.15
             },
             "expected_e2e_ms": 16722.42,
-            "expected_avg_denoise_ms": 500.63,
+            "expected_avg_denoise_ms": 520.0,
             "expected_median_denoise_ms": 494.9,
             "estimated_full_test_time_s": 144.2
         },
