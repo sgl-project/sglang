@@ -143,12 +143,209 @@ def apply_rotary_emb_triton_kernel(
     tl.store(x_ptr + offs_x_imag, out_imag, mask=mask)
 
 
+@triton.jit
+def apply_rotary_emb_triton_kernel_batched(
+    x_ptr,
+    freqs_ptr,
+    positions_ptr,
+    rope_dim,
+    n_tokens,
+    stride_x_batch,
+    stride_x_head,
+    stride_x_dim,
+    stride_freq_pos,
+    stride_freq_dim,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    IS_3D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    # Batched variant: BLOCK_M tokens per program (mirrors ATOM's inverse_rope_gptj
+    # which batches 32 tokens/program) to cut the per-token launch granularity of
+    # the original (one program per token).
+    pid_m = tl.program_id(0)
+    pid_head = tl.program_id(1)
+
+    tok = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    tok_mask = tok < n_tokens
+    pair = tl.arange(0, BLOCK_P)
+    pair_mask = pair < (rope_dim // 2)
+    m2 = tok_mask[:, None] & pair_mask[None, :]
+
+    if USE_POS:
+        position = tl.load(positions_ptr + tok, mask=tok_mask, other=0)
+    else:
+        position = tok
+
+    if IS_3D:
+        base = tok[:, None] * stride_x_batch + pid_head * stride_x_head
+    else:
+        base = tok[:, None] * stride_x_batch
+
+    off_real = base + (pair[None, :] * 2) * stride_x_dim
+    off_imag = base + (pair[None, :] * 2 + 1) * stride_x_dim
+
+    x_real = tl.load(x_ptr + off_real, mask=m2, other=0.0).to(tl.float32)
+    x_imag = tl.load(x_ptr + off_imag, mask=m2, other=0.0).to(tl.float32)
+
+    off_f_real = (
+        position[:, None] * stride_freq_pos + (pair[None, :] * 2) * stride_freq_dim
+    )
+    off_f_imag = (
+        position[:, None] * stride_freq_pos + (pair[None, :] * 2 + 1) * stride_freq_dim
+    )
+    freq_real = tl.load(freqs_ptr + off_f_real, mask=m2, other=0.0)
+    freq_imag = tl.load(freqs_ptr + off_f_imag, mask=m2, other=0.0)
+
+    if IS_INVERSE:
+        out_real = x_real * freq_real + x_imag * freq_imag
+        out_imag = x_imag * freq_real - x_real * freq_imag
+    else:
+        out_real = x_real * freq_real - x_imag * freq_imag
+        out_imag = x_real * freq_imag + x_imag * freq_real
+
+    tl.store(x_ptr + off_real, out_real, mask=m2)
+    tl.store(x_ptr + off_imag, out_imag, mask=m2)
+
+
+@triton.jit
+def apply_rotary_emb_contig_kernel(
+    x_ptr,
+    fr_ptr,
+    pos_ptr,
+    rope_dim,
+    n_tokens,
+    sx_tok,
+    sx_head,
+    sx_d,
+    sfr_pos,
+    sfr_d,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    RD: tl.constexpr,
+    RDH: tl.constexpr,
+):
+    # CONTIGUOUS-load GPT-J rope (mirrors ATOM's inverse_rope_gptj): load the rope
+    # slice as a contiguous [BLOCK_M, RD] tile (coalesced, vs the strided 2i/2i+1
+    # interleaved loads), and do the pair rotation via reshape+flip. RD tokens of
+    # one head per program, BLOCK_M tokens batched.
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    tok = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    tok_mask = tok < n_tokens
+    d = tl.arange(0, RD)
+    dmask = d < rope_dim
+    m = tok_mask[:, None] & dmask[None, :]
+
+    xo = tok[:, None] * sx_tok + pid_h * sx_head + d[None, :] * sx_d
+    x = tl.load(x_ptr + xo, mask=m, other=0.0).to(tl.float32)
+
+    if USE_POS:
+        pos = tl.load(pos_ptr + tok, mask=tok_mask, other=0)
+    else:
+        pos = tok
+    # element d uses cos/sin of pair (d//2): freqs_real interleaved [cos0,sin0,...]
+    cos_idx = (d // 2) * 2
+    cos = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d, mask=m, other=0.0
+    )
+    sin = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
+        mask=m,
+        other=0.0,
+    )
+
+    x_sin = x * sin
+    even = (d % 2 == 0)[None, :]
+    # inverse: negate evens; forward: negate odds (then flip pairs)
+    if IS_INVERSE:
+        x_neg = tl.where(even, -x_sin, x_sin)
+    else:
+        x_neg = tl.where(even, x_sin, -x_sin)
+    x_neg = tl.reshape(x_neg, (BLOCK_M, RDH, 2))
+    x_neg = tl.flip(x_neg, 2)
+    x_rot = tl.reshape(x_neg, (BLOCK_M, RD))
+
+    out = x * cos + x_rot
+    tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=m)
+
+
+# Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
+# per-token kernel. Default OFF; DeepseekV4 enables it via set_batched_rope(True).
+# The env var SGLANG_ROPE_BATCHED=1 still works as an override.
+_USE_BATCHED_ROPE: bool = False
+
+
+def set_batched_rope(enabled: bool = True) -> None:
+    global _USE_BATCHED_ROPE
+    _USE_BATCHED_ROPE = enabled
+
+
 def apply_rotary_emb_triton(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: Optional[torch.Tensor] = None,
     inverse: bool = False,
 ) -> torch.Tensor:
+
+    if _USE_BATCHED_ROPE:
+        is_3d = x.ndim == 3
+        if is_3d:
+            batch_size, n_heads, rope_dim = x.shape
+        else:
+            batch_size, rope_dim = x.shape
+            n_heads = 1
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+        if positions is not None:
+            assert positions.shape == (batch_size,)
+        else:
+            assert freqs_real.shape[0] == batch_size
+        BLOCK_M = 32
+        # 3D (attention-output / q-k rope): contiguous-load kernel (ATOM-style).
+        if is_3d:
+            RD = max(triton.next_power_of_2(rope_dim), 2)
+            grid = (triton.cdiv(batch_size, BLOCK_M), n_heads)
+            apply_rotary_emb_contig_kernel[grid](
+                x,
+                freqs_real,
+                positions,
+                rope_dim,
+                batch_size,
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                freqs_real.stride(0),
+                freqs_real.stride(1),
+                USE_POS=(positions is not None),
+                IS_INVERSE=inverse,
+                BLOCK_M=BLOCK_M,
+                RD=RD,
+                RDH=RD // 2,
+            )
+            return x
+        BLOCK_P = max(triton.next_power_of_2(rope_dim // 2), 1)
+        grid = (triton.cdiv(batch_size, BLOCK_M), 1)
+        apply_rotary_emb_triton_kernel_batched[grid](
+            x,
+            freqs_real,
+            positions,
+            rope_dim,
+            batch_size,
+            x.stride(0),
+            0,
+            x.stride(-1),
+            freqs_real.stride(0),
+            freqs_real.stride(1),
+            USE_POS=(positions is not None),
+            IS_INVERSE=inverse,
+            IS_3D=False,
+            BLOCK_M=BLOCK_M,
+            BLOCK_P=BLOCK_P,
+        )
+        return x
+
     is_3d = x.ndim == 3
 
     if is_3d:
