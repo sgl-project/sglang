@@ -602,87 +602,61 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        # Internalize the captured-bucket seam — every caller goes through
-        # this method; the public API does not expose it.
-        _has_captured = in_capture or self._has_captured_metadata(bs, forward_mode)
-
-        # Eager-only SWA write-target translation (the bound path refills the
-        # captured cuda_graph_swa_out_cache_loc buffer in the tail below).
-        swa_out_cache_loc = None
-        if (
-            not _has_captured
-            and self.use_sliding_window_kv_pool
-            and forward_batch.out_cache_loc is not None
-        ):
-            assert self._swa_kv_pool is not None
-            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
+        # Lazy-populate the per-bs captured wrapper for capturable modes —
+        # creates the wrapper via _prepare_cuda_graph_metadata on first
+        # encounter of a new bs (which also sets self.forward_metadata), then
+        # subsequent iters at the same bs reuse it. The `_has_captured` /
+        # persistent-eager-wrapper seam goes away: every capturable-mode iter
+        # runs the bound body.
+        _is_capturable = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_dllm_extend()
+        )
+        _first_use_bs_decode = False
+        if _is_capturable and not self._has_captured_metadata(bs, forward_mode):
+            positions = getattr(forward_batch, "positions", None)
+            num_tokens = positions.numel() if positions is not None else bs
+            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+            if forward_mode.is_decode_or_idle():
+                _first_use_bs_decode = True
 
         if forward_mode.is_decode_or_idle():
-            if _has_captured:
-                self.indices_updater_decode.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                    seq_lens_sum,
-                    decode_wrappers=self.decode_cuda_graph_metadata[bs],
-                    encoder_lens=(
-                        encoder_lens[:bs] if encoder_lens is not None else None
-                    ),
-                    spec_info=spec_info,
-                    fixed_split_size=None,
-                    disable_split_kv=self.disable_cuda_graph_kv_split,
-                )
-            else:
-                self.indices_updater_decode.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_cpu,
-                    seq_lens_sum,
-                    decode_wrappers=self.decode_wrappers,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
-                    fixed_split_size=self.decode_split_tile_size,
-                    disable_split_kv=False,
-                )
-                self.forward_metadata = DecodeMetadata(
-                    self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
-                )
+            self.indices_updater_decode.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                encoder_lens=(
+                    encoder_lens[:bs] if encoder_lens is not None else None
+                ),
+                spec_info=spec_info,
+                fixed_split_size=None,
+                disable_split_kv=self.disable_cuda_graph_kv_split,
+            )
+            # First-use post-plan monkey-patch: install replay-safe
+            # fast_decode_plan once the initial plan has populated
+            # _cached_module. Done here (not at init time) so it doesn't
+            # interfere with the very first plan call above.
+            if _first_use_bs_decode:
+                for w in self.decode_cuda_graph_metadata[bs]:
+                    w.begin_forward = partial(fast_decode_plan, w)
         elif forward_mode.is_target_verify():
-            if _has_captured:
-                self.indices_updater_prefill.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                    use_ragged=False,
-                    encoder_lens=(
-                        encoder_lens[:bs] if encoder_lens is not None else None
-                    ),
-                    spec_info=spec_info,
-                )
-            else:
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_cpu,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrappers=self.prefill_wrappers_verify,
-                    use_ragged=False,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
-                )
-                self.forward_metadata = PrefillMetadata(
-                    self.prefill_wrappers_verify,
-                    False,
-                    False,
-                    swa_out_cache_loc=swa_out_cache_loc,
-                )
-        elif forward_mode.is_dllm_extend() and _has_captured:
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=(
+                    encoder_lens[:bs] if encoder_lens is not None else None
+                ),
+                spec_info=spec_info,
+            )
+        elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -695,9 +669,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
             )
         else:
-            # Plain EXTEND (and eager DLLM_EXTEND) -- eager only; the decode
-            # graph never captures plain EXTEND, and eager DLLM_EXTEND lands here
-            # with captured=False (matching the old eager body's `else`).
+            # Plain EXTEND -- never graph-captured; build fresh metadata
+            # per-iter. SWA write-target is translated live (the capturable
+            # modes' shared cuda_graph_swa_out_cache_loc buffer is reserved
+            # for them in the tail below).
+            swa_out_cache_loc = None
+            if (
+                self.use_sliding_window_kv_pool
+                and forward_batch.out_cache_loc is not None
+            ):
+                assert self._swa_kv_pool is not None
+                swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
@@ -746,12 +731,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
             )
 
-        # Captured-bucket SWA: refill the captured write-target buffer from
-        # the live out_cache_loc before replay (bound onto the metadata at
-        # capture by the in_capture tail below). The fresh path instead
-        # threads swa_out_cache_loc through the metadata constructed above.
+        # Capturable-mode SWA: refill the shared write-target buffer from
+        # the live out_cache_loc before replay. Plain EXTEND sets
+        # metadata.swa_out_cache_loc directly inside its body above.
         if (
-            _has_captured
+            _is_capturable
             and self.use_sliding_window_kv_pool
             and forward_batch.out_cache_loc is not None
         ):

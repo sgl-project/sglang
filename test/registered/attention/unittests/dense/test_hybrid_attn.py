@@ -71,6 +71,19 @@ class TestHybridAttnDenseAttentionBackendCorrectness(CustomTestCase):
             decode_backend = ATTENTION_BACKENDS["flashinfer"](fixture.runner)
         except (AssertionError, ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"hybrid_attn child backend unavailable: {exc}")
+        # Mirror production: init the static metadata buffers on each child
+        # backend (flashinfer's lazy-populated cuda-graph metadata requires
+        # cuda_graph_kv_indices to be allocated).
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        for child in (prefill_backend, decode_backend):
+            if (
+                type(child).init_static_metadata_buffers
+                is not AttentionBackend.init_static_metadata_buffers
+            ):
+                child.init_static_metadata_buffers(
+                    max_bs=case.batch_size,
+                    max_num_tokens=case.num_input_tokens,
+                )
         wrapper = HybridAttnBackend(
             fixture.runner,
             prefill_backend=prefill_backend,
