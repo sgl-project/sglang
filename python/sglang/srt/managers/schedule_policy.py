@@ -645,19 +645,33 @@ class PrefillAdder:
             int(self.rem_total_tokens),
         )
         if _rem_tokens <= 0:
+            # rem_total_tokens over-reserves (max_new_tokens per running req),
+            # so let a staged canvas round proceed past it.
             _rem_tokens = self.rem_dllm_tokens
 
+        # But never past the immediate headroom (cur_rem_tokens carries no
+        # such reservations): over-admitting crashes the alloc in
+        # prepare_for_extend.
+        _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
+        if self.is_hybrid_swa:
+            _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens) - self.page_size)
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
         # the diffusion unmask process may have some problems
         # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        if self.dllm_config.is_uniform:
+            # Uniform extends the actual remaining tokens (variable-length encode or
+            # the full canvas), not a forced page-aligned block.
+            available = req.fill_len - prefix_len
+            trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size, available)
+        else:
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
 
         req.extend_input_len = trunc_len
         req.fill_len = prefix_len + trunc_len
@@ -680,6 +694,10 @@ class PrefillAdder:
 
         # Truncate input length to available tokens and update request metadata
         truncated = req.extend_input_len > _rem_tokens
+        if truncated and self.dllm_config.is_uniform and not req.is_dllm_prefill():
+            # A canvas decode round extends the whole block or not at all
+            # (the denoiser writes bs * block_size tokens).
+            return AddReqResult.NO_TOKEN
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
