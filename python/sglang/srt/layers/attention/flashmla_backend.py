@@ -145,7 +145,24 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_seqlen_pad = triton.cdiv(seq_max, PAGE_SIZE)
         q_head_mult = self.num_draft_tokens if forward_mode.is_target_verify() else 1
 
-        block_kv_indices = self.cuda_graph_kv_indices
+        # cuda_graph_kv_indices is sized for the cuda-graph max_bs at init;
+        # eager fallback when ``bs > cuda_graph_config.decode.max_bs`` (i.e.
+        # ``can_run_graph`` rejects so the runner dispatches eager) would
+        # launch the Triton fill with grid bs > buffer rows and then
+        # ``cuda_graph_num_splits[: bs + 1].copy_`` would index past the
+        # preallocated buffer. Fall back to a fresh ``(bs, max_seqlen_pad)``
+        # allocation for over-sized eager batches, matching pre-refactor.
+        if bs <= self.cuda_graph_kv_indices.shape[0]:
+            block_kv_indices = self.cuda_graph_kv_indices
+            use_bound_num_splits = True
+        else:
+            block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=self.cuda_graph_kv_indices.dtype,
+                device=self.cuda_graph_kv_indices.device,
+            )
+            use_bound_num_splits = False
         create_flashmla_kv_indices_triton[
             (
                 bs,
@@ -187,12 +204,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
                 :actual_num_sm_parts
             ]
-        self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+        if use_bound_num_splits:
+            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            num_splits_for_metadata = self.cuda_graph_num_splits_view
+        else:
+            # Fresh allocation when bs exceeds the cuda-graph num_splits buffer
+            # (parallel to the block_kv_indices fallback above).
+            num_splits_for_metadata = num_splits
         self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-        self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
         self.forward_metadata = FlashMLADecodeMetadata(
             self.cuda_graph_mla_metadata_view,
-            self.cuda_graph_num_splits_view,
+            num_splits_for_metadata,
             block_kv_indices[:bs, :max_seqlen_pad],
         )
 
