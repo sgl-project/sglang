@@ -112,6 +112,40 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 
 
+_QWEN3_5_MOE_ARCHS = frozenset(
+    {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"}
+)
+_QWEN3_5_MOE_MODEL_TYPES = frozenset({"qwen3_5_moe", "qwen3_5_moe_text"})
+
+
+def _is_qwen3_5_moe(model_path: str) -> bool:
+    """Detect Qwen3.5 MoE (Qwen3.6-35B-A3B) by reading config.json.
+
+    Returns True when ``architectures`` or ``text_config.model_type`` matches
+    the Qwen3.5 MoE family.  Cheap (one JSON read); safe to call on every load.
+    """
+    import json
+    from pathlib import Path
+
+    config_path = Path(model_path) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    archs = cfg.get("architectures") or []
+    if any(a in _QWEN3_5_MOE_ARCHS for a in archs):
+        return True
+    if cfg.get("model_type") in _QWEN3_5_MOE_MODEL_TYPES:
+        return True
+    text_cfg = cfg.get("text_config") or {}
+    if text_cfg.get("model_type") in _QWEN3_5_MOE_MODEL_TYPES:
+        return True
+    return False
+
+
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
@@ -404,6 +438,29 @@ class MlxModelRunner:
         """
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
+
+        # Phase 1 MVP: detect Qwen3.5 MoE (a.k.a. Qwen3.6-35B-A3B) and
+        # confirm the native model module is importable.  Phase 2 will
+        # replace `mlx_lm.load` with a native loader that uses
+        # `sglang.srt.hardware_backend.mlx.models.qwen3_5_moe.Model`.
+        if _is_qwen3_5_moe(self.model_path):
+            from sglang.srt.hardware_backend.mlx.models.qwen3_5_moe import (
+                Model as NativeModel,
+            )
+
+            logger.info(
+                "Detected Qwen3.5 MoE architecture — native model module "
+                "is available (Phase 1 stub; loading still goes through "
+                "mlx_lm until Phase 2 wires up the native loader)."
+            )
+            # Sanity: construct the native Model with TextModelArgs to
+            # confirm the import path + dataclass parsing works.  The
+            # constructed instance is discarded; the actual model comes
+            # from mlx_lm below.
+            from sglang.srt.hardware_backend.mlx.models.qwen3_5_moe import (
+                TextModelArgs,
+            )
+            _ = NativeModel(TextModelArgs())
 
         # We need the config dict to pass into quantize_model so it knows tied/embedding
         # layout. return_config=True is cheap and ignored when no quantization is requested.
