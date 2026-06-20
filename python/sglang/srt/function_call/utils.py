@@ -1,3 +1,4 @@
+import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -7,6 +8,20 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+
+def is_json_finite(obj: Any) -> bool:
+    """Whether ``obj`` serializes to valid JSON, i.e. has no non-finite floats.
+
+    ``json.dumps(allow_nan=False)`` rejects ``inf``/``-inf``/``nan`` anywhere in
+    the value, including nested ones (``json.loads("[1e999]") -> [inf]``).
+    """
+    try:
+        json.dumps(obj, allow_nan=False)
+        return True
+    except (ValueError, TypeError):
+        return False
+
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
