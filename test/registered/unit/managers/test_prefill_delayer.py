@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -222,6 +223,60 @@ class TestNegotiateShouldAllowPrefillPure(CustomTestCase):
         out = self._call(mock, prev_state=prev)
         self.assertTrue(out.output_allow)
         self.assertEqual(out.output_reason, "wait_timeout")
+
+    def test_all_queue_condition_delays_prefill(self):
+        """prefillable_status=all with queue condition delays prefill."""
+        mock = _make_delayer_mock(
+            queue_trigger_enabled=True,
+            queue_min_ratio=0.5,
+            skip_first_delayer=False,
+        )
+        # col 2: running_batch=10, col 3: max_prefill_bs=4, col 4: waiting_queue_len=2
+        # queue_min_effective = min(int(10 * 0.5), 4) = 4; waiting_queue_len=2 < 4 -> delay.
+        # slot_condition: max_running_requests=100 -> 100 - 10 = 90 < 4 is False, so only
+        # the queue trigger fires.
+        mock._gather_info.side_effect = _gather_side_effect([[1, 0, 10, 4, 2]])
+        out = self._call(mock, max_running_requests=100, max_prefill_bs=4)
+        self.assertFalse(out.output_allow)
+        self.assertEqual(out.output_reason, "delay")
+
+    def test_all_queue_condition_within_timeout_still_delays(self):
+        """prefillable_status=all with queue condition and elapsed < max_delay_ms still delays."""
+        mock = _make_delayer_mock(
+            queue_trigger_enabled=True,
+            queue_min_ratio=0.5,
+            max_delay_ms=5000.0,
+            skip_first_delayer=False,
+        )
+        mock._gather_info.side_effect = _gather_side_effect([[1, 0, 10, 4, 2]])
+        # prev_state started "now", so elapsed is ~0ms << 5000ms: timeout does not fire,
+        # queue_condition stays True and the prefill is delayed.
+        prev = _State()
+        out = self._call(
+            mock, prev_state=prev, max_running_requests=100, max_prefill_bs=4
+        )
+        self.assertFalse(out.output_allow)
+        self.assertEqual(out.output_reason, "delay")
+
+    def test_all_queue_condition_timeout_allows_prefill(self):
+        """prefillable_status=all with queue condition but elapsed >= max_delay_ms allows prefill."""
+        mock = _make_delayer_mock(
+            queue_trigger_enabled=True,
+            queue_min_ratio=0.5,
+            max_delay_ms=100.0,
+            skip_first_delayer=False,
+        )
+        mock._gather_info.side_effect = _gather_side_effect([[1, 0, 10, 4, 2]])
+        # start_time 200ms in the past > 100ms max_delay_ms: the wall-clock timeout
+        # resets queue_condition to False, so the prefill is released. Because a
+        # prev_state exists, the reason is "wait_success" (not "wait_timeout", which
+        # only the "mixed" branch produces).
+        prev = _State(start_time=time.perf_counter() - 0.2)
+        out = self._call(
+            mock, prev_state=prev, max_running_requests=100, max_prefill_bs=4
+        )
+        self.assertTrue(out.output_allow)
+        self.assertEqual(out.output_reason, "wait_success")
 
 
 class TestPrefillDelayerSinglePassExecutor(CustomTestCase):
