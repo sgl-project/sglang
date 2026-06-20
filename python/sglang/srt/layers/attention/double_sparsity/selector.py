@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -71,7 +71,7 @@ class DoubleSparsitySelector:
 
     def __init__(
         self,
-        config: "DoubleSparsityConfig",
+        config: DoubleSparsityConfig,
         num_local_heads: int,
         head_dim: int,
         device: Optional[torch.device] = None,
@@ -79,7 +79,9 @@ class DoubleSparsitySelector:
         self.config = config
         self.num_local_heads = num_local_heads
         self.head_dim = head_dim
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
         self.max_top_k = int(config.top_k)
         self.page_size = int(config.page_size)
         if self.max_top_k <= 0:
@@ -87,7 +89,7 @@ class DoubleSparsitySelector:
                 f"Double Sparsity max_top_k must be positive, got {self.max_top_k}."
             )
 
-        self.channel_mask: Optional["ChannelMask"] = None
+        self.channel_mask: Optional[ChannelMask] = None
         # Bind-time absorbed-latent projection [H, label_dim, kv_lora_rank], built
         # by deepseek_v2's bind path. Selection scores the resident MLA latent
         # through it.
@@ -101,7 +103,7 @@ class DoubleSparsitySelector:
 
     def bind_runtime_data(
         self,
-        channel_mask: "ChannelMask",
+        channel_mask: ChannelMask,
         *,
         process_group=None,
         reduce_ca=None,
@@ -324,7 +326,9 @@ def assert_tp_configured(
         )
 
 
-def assert_real_selector_or_placeholder_allowed(selector: DoubleSparsitySelector) -> None:
+def assert_real_selector_or_placeholder_allowed(
+    selector: DoubleSparsitySelector,
+) -> None:
     """Refuse to serve real traffic when the placeholder selector is live.
 
     ``bind_runtime_data`` is the only sanctioned way to flip a selector

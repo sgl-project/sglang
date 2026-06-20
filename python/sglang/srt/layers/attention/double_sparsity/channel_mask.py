@@ -43,9 +43,7 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.double_sparsity.config import (
-        DoubleSparsityConfig,
-    )
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +142,10 @@ def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
 
     with safe_open(path, framework="pt", device=map_location) as f:
         tensor_keys = list(f.keys())
-        if "channel_selection" not in tensor_keys or "channel_weights" not in tensor_keys:
+        if (
+            "channel_selection" not in tensor_keys
+            or "channel_weights" not in tensor_keys
+        ):
             raise ValueError(
                 f"channel mask file {path!r} is missing required tensors "
                 "'channel_selection' and/or 'channel_weights'."
@@ -361,9 +362,7 @@ def slice_per_rank(
     if not (0 <= rank < tp_size):
         raise ValueError(f"rank={rank} must be in [0, {tp_size}).")
     if num_local_heads <= 0:
-        raise ValueError(
-            f"num_local_heads must be positive, got {num_local_heads}."
-        )
+        raise ValueError(f"num_local_heads must be positive, got {num_local_heads}.")
     h_full = int(mask.channel_selection.shape[1])
     if h_full != num_local_heads * tp_size:
         raise ValueError(
@@ -407,9 +406,7 @@ def validate_against_runtime(
             f"dtype: mask={mask.dtype!r} server={server_kv_cache_dtype!r}"
         )
     if mask.head_dim != int(model_head_dim):
-        mismatches.append(
-            f"head_dim: mask={mask.head_dim} model={int(model_head_dim)}"
-        )
+        mismatches.append(f"head_dim: mask={mask.head_dim} model={int(model_head_dim)}")
     if mask.page_size != int(server_page_size):
         mismatches.append(
             f"page_size: mask={mask.page_size} server={int(server_page_size)}"
@@ -419,9 +416,7 @@ def validate_against_runtime(
             f"label_dim: mask={mask.label_dim} selector={int(server_label_dim)}"
         )
     if mismatches:
-        raise ValueError(
-            "channel mask runtime mismatch:\n  " + "\n  ".join(mismatches)
-        )
+        raise ValueError("channel mask runtime mismatch:\n  " + "\n  ".join(mismatches))
 
 
 def verify_bind_shapes(
@@ -459,9 +454,7 @@ def verify_bind_shapes(
     # Skip the dtype leg only when the server dtype is still unresolved (auto);
     # the startup validator already gates dtype, and head_dim is the new check.
     effective_dtype = (
-        mask.dtype
-        if server_kv_cache_dtype in (None, "auto")
-        else server_kv_cache_dtype
+        mask.dtype if server_kv_cache_dtype in (None, "auto") else server_kv_cache_dtype
     )
     try:
         validate_against_runtime(

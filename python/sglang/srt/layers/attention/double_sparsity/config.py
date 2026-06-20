@@ -17,7 +17,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-
 _ALLOWED_FIELDS = {
     "top_k",
     "page_size",
@@ -55,7 +54,9 @@ _DEFAULT_ANCHOR_MODE = "off"
 _DEFAULT_ANCHOR_BUDGET = 0
 
 
-_DEFAULT_TOP_K = 2048           # matches the model's intrinsic index_topk (max tokens per request)
+_DEFAULT_TOP_K = (
+    2048  # matches the model's intrinsic index_topk (max tokens per request)
+)
 # Default compact selector score width: a prefix window comfortably covering
 # the served decode windows while shrinking the per-call cross-TP score
 # reduce ~40x vs the full req_to_token width. The full width is always
@@ -64,7 +65,7 @@ _DEFAULT_TOP_K = 2048           # matches the model's intrinsic index_topk (max 
 _DEFAULT_SELECTOR_WIDTH_BUCKETS = (5120,)
 _ALLOWED_OVERFLOW_POLICY = ("full_fallback", "fail_closed")
 _DEFAULT_OVERFLOW_POLICY = "full_fallback"
-_DEFAULT_PAGE_SIZE = 64         # FlashMLA KV layout requirement
+_DEFAULT_PAGE_SIZE = 64  # FlashMLA KV layout requirement
 _DEFAULT_DEVICE_BUFFER_SIZE = 4096  # score-scratch buffer cap in tokens
 
 
@@ -163,10 +164,7 @@ def _coerce_width_buckets(value: Any) -> List[int]:
     # Fail closed: this knob drives the CUDA-graph capture ladder, so a
     # silently coerced bool/float/string width would capture an unintended
     # selector variant. Only genuine positive JSON integers are accepted.
-    if (
-        not isinstance(value, list)
-        or any(type(w) is not int or w <= 0 for w in value)
-    ):
+    if not isinstance(value, list) or any(type(w) is not int or w <= 0 for w in value):
         raise ValueError(
             f"Double Sparsity 'selector_width_buckets' must be a JSON array of "
             f"positive integers, got {value!r}."
@@ -219,15 +217,15 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         channel_mask_path=data["channel_mask_path"],
         top_k=int(data.get("top_k", _DEFAULT_TOP_K)),
         page_size=int(data.get("page_size", _DEFAULT_PAGE_SIZE)),
-        device_buffer_size=int(data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)),
+        device_buffer_size=int(
+            data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)
+        ),
         scorer_norm=str(data.get("scorer_norm", _DEFAULT_SCORER_NORM)),
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
         anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
         anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
         selector_width_buckets=_coerce_width_buckets(
-            data.get(
-                "selector_width_buckets", list(_DEFAULT_SELECTOR_WIDTH_BUCKETS)
-            )
+            data.get("selector_width_buckets", list(_DEFAULT_SELECTOR_WIDTH_BUCKETS))
         ),
         selector_width_overflow_policy=str(
             data.get("selector_width_overflow_policy", _DEFAULT_OVERFLOW_POLICY)

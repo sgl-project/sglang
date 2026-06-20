@@ -199,8 +199,7 @@ def dequantize_k_cache_paged_out(
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     assert out.shape == (num_tokens, 1, dim_nope + dim_rope), (
-        f"out shape {tuple(out.shape)} != "
-        f"{(num_tokens, 1, dim_nope + dim_rope)}"
+        f"out shape {tuple(out.shape)} != " f"{(num_tokens, 1, dim_nope + dim_rope)}"
     )
     assert out.dtype == torch.bfloat16
 

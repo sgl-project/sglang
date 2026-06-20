@@ -17,8 +17,6 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from typing import Dict, Tuple
-from unittest import mock
 from unittest.mock import MagicMock
 
 import torch
@@ -32,6 +30,11 @@ from sglang.srt.layers.attention.double_sparsity import (
 from sglang.srt.layers.attention.double_sparsity.selector import (
     assert_real_selector_or_placeholder_allowed,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# CUDA-only: the Double Sparsity feature is validated on the FlashMLA/H200 path;
+# AMD CI is intentionally not registered until the path is verified on ROCm.
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def _valid_payload(path: str = "/tmp/cm.safetensors") -> str:
@@ -70,9 +73,7 @@ class TestDoubleSparsityConfigParser(unittest.TestCase):
         self.assertIn("top_p", str(ctx.exception))
 
     def test_missing_channel_mask_path(self):
-        payload = (
-            '{"top_k": 2048, "page_size": 64, "device_buffer_size": 4096}'
-        )
+        payload = '{"top_k": 2048, "page_size": 64, "device_buffer_size": 4096}'
         with self.assertRaises(ValueError) as ctx:
             parse_double_sparsity_config(payload)
         self.assertIn("channel_mask_path", str(ctx.exception))
@@ -214,9 +215,7 @@ class TestValidator(unittest.TestCase):
         self.assertIn("mutually exclusive", str(ctx.exception).lower())
 
     def test_missing_config(self):
-        args = self._args(
-            enable_double_sparsity=True, double_sparsity_config=None
-        )
+        args = self._args(enable_double_sparsity=True, double_sparsity_config=None)
         os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
         try:
             with self.assertRaises(ValueError) as ctx:
@@ -272,18 +271,27 @@ class TestValidator(unittest.TestCase):
             os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_valid_path(self):
+        import os as _os
+        import tempfile
+
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             save_channel_mask,
         )
-        import tempfile, os as _os
+
         # head_dim=128 below, so channel indices must be in [0, 128).
         sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
         w_t = torch.randn(2, 4, 16, dtype=torch.float32)
         with tempfile.TemporaryDirectory() as tmp:
             path = _os.path.join(tmp, "cm.safetensors")
             save_channel_mask(
-                path, sel_t, w_t, dtype="fp8_e4m3", head_dim=128, page_size=64,
-                label_dim=16, created_at="2026-05-20T00:00:00Z",
+                path,
+                sel_t,
+                w_t,
+                dtype="fp8_e4m3",
+                head_dim=128,
+                page_size=64,
+                label_dim=16,
+                created_at="2026-05-20T00:00:00Z",
             )
             args = self._args(
                 enable_double_sparsity=True,
@@ -333,26 +341,34 @@ class TestValidator(unittest.TestCase):
         )
 
     def test_marks_channel_mask_valid_on_success(self):
-        """a healthy validator pass must set the ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.
-        """
+        """a healthy validator pass must set the ``sglang_double_sparsity_channel_mask_valid`` gauge to 1."""
 
         try:
             import prometheus_client  # noqa: F401
         except ImportError:
             self.skipTest("prometheus_client not installed")
+        import os as _os
+        import tempfile
+
         from sglang.srt.layers.attention.double_sparsity import metrics as m
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             save_channel_mask,
         )
-        import tempfile, os as _os
+
         m.reset_for_testing()
         sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
         w_t = torch.randn(2, 4, 16, dtype=torch.float32)
         with tempfile.TemporaryDirectory() as tmp:
             path = _os.path.join(tmp, "cm.safetensors")
             save_channel_mask(
-                path, sel_t, w_t, dtype="fp8_e4m3", head_dim=128, page_size=64,
-                label_dim=16, created_at="2026-05-20T00:00:00Z",
+                path,
+                sel_t,
+                w_t,
+                dtype="fp8_e4m3",
+                head_dim=128,
+                page_size=64,
+                label_dim=16,
+                created_at="2026-05-20T00:00:00Z",
             )
             args = self._args(
                 enable_double_sparsity=True,
@@ -371,10 +387,10 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
         gauge = m._metric_objs.get("channel_mask_valid")
-        self.assertIsNotNone(gauge,
-                              "channel_mask_valid gauge should be registered")
-        self.assertEqual(gauge._value.get(), 1,
-                          "gauge must read 1 after a successful validation")
+        self.assertIsNotNone(gauge, "channel_mask_valid gauge should be registered")
+        self.assertEqual(
+            gauge._value.get(), 1, "gauge must read 1 after a successful validation"
+        )
         m.reset_for_testing()
 
 
@@ -421,7 +437,9 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         attn = object.__new__(DeepseekV2AttentionMLA)
         attn.use_double_sparsity = use_ds
         attn.double_sparsity_selector = None
-        attn.indexer = MagicMock(return_value=torch.tensor([7, 8, 9], dtype=torch.int32))
+        attn.indexer = MagicMock(
+            return_value=torch.tensor([7, 8, 9], dtype=torch.int32)
+        )
         if use_ds:
             cfg = parse_double_sparsity_config(_valid_payload())
             attn.double_sparsity_selector = DoubleSparsitySelector(
@@ -461,12 +479,15 @@ class TestPageTableAdapter(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
             logical_to_physical,
         )
+
         return logical_to_physical
 
     def test_basic_req_to_token_gather(self):
         """Logical positions are gathered from req_to_token; -1 padding preserved."""
         adapter = self._adapter()
-        req_to_token = torch.tensor([[10, 20, 30, 40, 50, 60, 70, 80]], dtype=torch.int32)
+        req_to_token = torch.tensor(
+            [[10, 20, 30, 40, 50, 60, 70, 80]], dtype=torch.int32
+        )
         selected = torch.tensor([[0, 2, 4, -1, -1, -1]], dtype=torch.int32)
         req_pool_indices = torch.tensor([0], dtype=torch.int32)
         out = torch.full_like(selected, -1)
@@ -554,7 +575,7 @@ class TestPageTableAdapter(unittest.TestCase):
         req_pool_indices = torch.tensor([0, 99], dtype=torch.int32)  # row 1 bad
         out = torch.full((2, 3), -99, dtype=torch.int32)
         error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), 5)   # req_to_token[0, 0]
+        self.assertEqual(out[0, 0].item(), 5)  # req_to_token[0, 0]
         self.assertEqual(out[0, 1].item(), 15)  # req_to_token[0, 2]
         self.assertEqual(out[0, 2].item(), -1)  # padding
         self.assertTrue(torch.all(out[1] == -1).item())  # bad pool → all -1
@@ -584,8 +605,8 @@ class TestPageTableAdapter(unittest.TestCase):
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
         out = torch.full((2, 3), -1, dtype=torch.int32)
         error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), 1)   # req_to_token[0, 0]
-        self.assertEqual(out[0, 1].item(), 4)   # req_to_token[0, 3]
+        self.assertEqual(out[0, 0].item(), 1)  # req_to_token[0, 0]
+        self.assertEqual(out[0, 1].item(), 4)  # req_to_token[0, 3]
         self.assertEqual(out[1, 0].item(), 20)  # req_to_token[1, 1]
         self.assertEqual(out[1, 1].item(), 30)  # req_to_token[1, 2]
         self.assertEqual(error_count, 0)
@@ -630,17 +651,26 @@ class TestChannelMaskLoader(unittest.TestCase):
         return sel, w
 
     def test_roundtrip(self):
+        import os
+        import tempfile
+
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            save_channel_mask,
             load_channel_mask,
+            save_channel_mask,
         )
-        import tempfile, os
+
         sel, w = self._make_payload()
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "cm.safetensors")
             h = save_channel_mask(
-                path, sel, w, dtype="fp8_e4m3", head_dim=128, page_size=64,
-                label_dim=16, created_at="2026-05-20T00:00:00Z",
+                path,
+                sel,
+                w,
+                dtype="fp8_e4m3",
+                head_dim=128,
+                page_size=64,
+                label_dim=16,
+                created_at="2026-05-20T00:00:00Z",
             )
             cm = load_channel_mask(path)
         self.assertEqual(cm.content_sha256, h)
@@ -651,18 +681,30 @@ class TestChannelMaskLoader(unittest.TestCase):
         self.assertTrue(torch.equal(cm.channel_selection, sel))
 
     def test_content_hash_mismatch(self):
-        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            save_channel_mask, load_channel_mask, compute_content_sha256,
-        )
+        import os
+        import tempfile
+
         from safetensors import safe_open
         from safetensors.torch import save_file
-        import tempfile, os
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            compute_content_sha256,
+            load_channel_mask,
+            save_channel_mask,
+        )
+
         sel, w = self._make_payload()
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "cm.safetensors")
             save_channel_mask(
-                path, sel, w, dtype="fp8_e4m3", head_dim=128, page_size=64,
-                label_dim=16, created_at="2026-05-20T00:00:00Z",
+                path,
+                sel,
+                w,
+                dtype="fp8_e4m3",
+                head_dim=128,
+                page_size=64,
+                label_dim=16,
+                created_at="2026-05-20T00:00:00Z",
             )
             # Tamper: rewrite with a metadata content_sha256 from a different payload.
             tampered_sel = sel.clone()
@@ -682,6 +724,7 @@ class TestChannelMaskLoader(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             load_channel_mask,
         )
+
         with self.assertRaises(FileNotFoundError):
             load_channel_mask("/nonexistent/path.safetensors")
 
@@ -690,11 +733,16 @@ class TestChannelMaskLoader(unittest.TestCase):
         channel_selection has values >= head_dim must be rejected at load.
         """
 
-        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            compute_content_sha256, load_channel_mask,
-        )
+        import os
+        import tempfile
+
         from safetensors.torch import save_file
-        import tempfile, os
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            compute_content_sha256,
+            load_channel_mask,
+        )
+
         sel = torch.zeros(1, 2, 4, dtype=torch.int32)
         # Plant an out-of-range index: head_dim=128 in the metadata below.
         sel[0, 0, 0] = 200
@@ -723,13 +771,19 @@ class TestChannelMaskLoader(unittest.TestCase):
 
     def test_validate_runtime_mismatches(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask, validate_against_runtime,
+            ChannelMask,
+            validate_against_runtime,
         )
+
         mask = ChannelMask(
             channel_selection=torch.zeros(2, 2, 4, dtype=torch.int32),
             channel_weights=torch.zeros(2, 2, 4, dtype=torch.float32),
-            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
-            label_dim=4, content_sha256="x",
+            schema_version="1",
+            dtype="fp8_e4m3",
+            head_dim=128,
+            page_size=64,
+            label_dim=4,
+            content_sha256="x",
         )
         validate_against_runtime(
             mask,
@@ -740,8 +794,11 @@ class TestChannelMaskLoader(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_against_runtime(
-                mask, server_kv_cache_dtype="bfloat16",
-                server_page_size=64, server_label_dim=4, model_head_dim=128,
+                mask,
+                server_kv_cache_dtype="bfloat16",
+                server_page_size=64,
+                server_label_dim=4,
+                model_head_dim=128,
             )
 
 
@@ -750,14 +807,21 @@ class TestChannelMaskSlicePerRank(unittest.TestCase):
 
     def test_slice_per_rank_returns_local_block(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask, slice_per_rank,
+            ChannelMask,
+            slice_per_rank,
         )
+
         sel = torch.arange(2 * 16 * 8, dtype=torch.int32).reshape(2, 16, 8)
         wts = torch.arange(2 * 16 * 8, dtype=torch.float32).reshape(2, 16, 8)
         mask = ChannelMask(
-            channel_selection=sel, channel_weights=wts,
-            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
-            label_dim=8, content_sha256="abc",
+            channel_selection=sel,
+            channel_weights=wts,
+            schema_version="1",
+            dtype="fp8_e4m3",
+            head_dim=128,
+            page_size=64,
+            label_dim=8,
+            content_sha256="abc",
         )
         # TP=4 → num_local_heads=4; rank 2 owns heads [8, 12).
         sliced = slice_per_rank(mask, num_local_heads=4, rank=2, tp_size=4)
@@ -771,13 +835,19 @@ class TestChannelMaskSlicePerRank(unittest.TestCase):
 
     def test_slice_per_rank_rejects_uneven_split(self):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask, slice_per_rank,
+            ChannelMask,
+            slice_per_rank,
         )
+
         mask = ChannelMask(
             channel_selection=torch.zeros(1, 10, 4, dtype=torch.int32),
             channel_weights=torch.zeros(1, 10, 4, dtype=torch.float32),
-            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
-            label_dim=4, content_sha256="x",
+            schema_version="1",
+            dtype="fp8_e4m3",
+            head_dim=128,
+            page_size=64,
+            label_dim=4,
+            content_sha256="x",
         )
         with self.assertRaises(ValueError):
             slice_per_rank(mask, num_local_heads=4, rank=0, tp_size=2)
@@ -786,17 +856,25 @@ class TestChannelMaskSlicePerRank(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
+
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
-            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+            config=cfg,
+            num_local_heads=4,
+            head_dim=128,
+            device=torch.device("cpu"),
         )
         sel.absorbed_w_sel = torch.zeros(4, 8, 16)
         # Mask is still at H_full=32 (un-sliced) — must be rejected.
         full_mask = ChannelMask(
             channel_selection=torch.zeros(2, 32, 8, dtype=torch.int32),
             channel_weights=torch.zeros(2, 32, 8, dtype=torch.float32),
-            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
-            label_dim=8, content_sha256="x",
+            schema_version="1",
+            dtype="fp8_e4m3",
+            head_dim=128,
+            page_size=64,
+            label_dim=8,
+            content_sha256="x",
         )
         with self.assertRaises(ValueError) as ctx:
             sel.bind_runtime_data(full_mask)
@@ -878,9 +956,7 @@ class TestVerifyBindShapes(unittest.TestCase):
 
     def test_matching_mask_passes_with_tp_split(self):
         nope, _v, h, L, ld = self.SHAPES["wide_192"]
-        mask = self._make_mask(
-            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
-        )
+        mask = self._make_mask(head_dim=nope, label_dim=ld, num_layers=L, num_heads=h)
         self._verify(
             mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld, tp_size=8
         )
@@ -898,9 +974,7 @@ class TestVerifyBindShapes(unittest.TestCase):
 
     def test_index_out_of_nope_range_hard_errors(self):
         nope, _v, h, L, ld = self.SHAPES["wide_192"]
-        mask = self._make_mask(
-            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
-        )
+        mask = self._make_mask(head_dim=nope, label_dim=ld, num_layers=L, num_heads=h)
         # Force a selection index past the no-PE width.
         mask.channel_selection[0, 0, 0] = nope + 5
         with self.assertRaises(ValueError) as cm:
@@ -918,20 +992,14 @@ class TestVerifyBindShapes(unittest.TestCase):
 
     def test_head_count_mismatch_hard_errors(self):
         nope, _v, h, L, ld = self.SHAPES["wide_192"]
-        mask = self._make_mask(
-            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
-        )
+        mask = self._make_mask(head_dim=nope, label_dim=ld, num_layers=L, num_heads=h)
         with self.assertRaises(ValueError) as cm:
-            self._verify(
-                mask, nope=nope, num_heads=h + 8, num_layers=L, label_dim=ld
-            )
+            self._verify(mask, nope=nope, num_heads=h + 8, num_layers=L, label_dim=ld)
         self.assertIn("num_heads", str(cm.exception))
 
     def test_label_dim_mismatch_hard_errors(self):
         nope, _v, h, L, ld = self.SHAPES["wide_192"]
-        mask = self._make_mask(
-            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
-        )
+        mask = self._make_mask(head_dim=nope, label_dim=ld, num_layers=L, num_heads=h)
         with self.assertRaises(ValueError) as cm:
             self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld + 1)
         self.assertIn("label_dim", str(cm.exception))
@@ -957,9 +1025,7 @@ class TestVerifyBindShapes(unittest.TestCase):
         )
 
         nope, _v, h, L, ld = self.SHAPES["wide_192"]
-        mask = self._make_mask(
-            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
-        )
+        mask = self._make_mask(head_dim=nope, label_dim=ld, num_layers=L, num_heads=h)
         verify_bind_shapes(
             mask,
             model_nope_head_dim=nope,
@@ -1070,10 +1136,15 @@ class TestDSIndexerCacheGate(unittest.TestCase):
             server_args=SimpleNamespace(enable_double_sparsity=ds_on),
             enable_hisparse=hisparse,
         )
-        with mock.patch.object(pc, "get_attention_tp_size", return_value=1), \
-            mock.patch.object(pc, "is_deepseek_dsa", return_value=True), \
-            mock.patch.object(pc, "get_dsa_index_head_dim", return_value=128), \
-            mock.patch.object(pc, "is_float4_e2m1fn_x2", return_value=False):
+        with mock.patch.object(
+            pc, "get_attention_tp_size", return_value=1
+        ), mock.patch.object(
+            pc, "is_deepseek_dsa", return_value=True
+        ), mock.patch.object(
+            pc, "get_dsa_index_head_dim", return_value=128
+        ), mock.patch.object(
+            pc, "is_float4_e2m1fn_x2", return_value=False
+        ):
             return cfg._compute_cell_size(mr, num_layers=2)
 
     def test_cell_size_drops_indexer_term_when_ds_gated(self):
@@ -1165,11 +1236,16 @@ class TestTableFreeConfigAndValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_double_sparsity_config(payload)
 
+
 class TestMetrics(unittest.TestCase):
     def test_meta_info_shape(self):
         from sglang.srt.layers.attention.double_sparsity import metrics as m
+
         stats = m.DoubleSparsityRequestStats(
-            sparsity_rate=0.0625, selected_tokens=128, total_tokens=2048, dense_fallback=0
+            sparsity_rate=0.0625,
+            selected_tokens=128,
+            total_tokens=2048,
+            dense_fallback=0,
         )
         info = m.meta_info_for_request(stats)
         self.assertEqual(
@@ -1180,6 +1256,7 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(info["selected_tokens"], 128)
         self.assertEqual(info["total_tokens"], 2048)
         self.assertEqual(info["dense_fallback"], 0)
+
 
 class TestMlaNopeExtractionDualShape(unittest.TestCase):
     """`_extract_mla_nope_prefix` must pick the per-head no-PE prefix at the real
@@ -1216,7 +1293,8 @@ class TestMlaNopeExtractionDualShape(unittest.TestCase):
                 out = extract(t, H, nope, v)  # suffix_dim = v_head_dim
                 self.assertEqual(tuple(out.shape), (T, H, nope))
                 self.assertLess(
-                    out.max().item(), 10.0,
+                    out.max().item(),
+                    10.0,
                     f"{name}: K extraction leaked V columns (max={out.max():.1f})",
                 )
                 self.assertTrue(torch.allclose(out, torch.ones(T, H, nope)))
@@ -1233,7 +1311,9 @@ class TestMlaNopeExtractionDualShape(unittest.TestCase):
                 blk[:, :, nope:] = 100.0
                 out = extract(t, H, nope, rope)  # suffix_dim = qk_rope_head_dim
                 self.assertEqual(tuple(out.shape), (T, H, nope))
-                self.assertLess(out.max().item(), 10.0, f"{name}: Q leaked RoPE columns")
+                self.assertLess(
+                    out.max().item(), 10.0, f"{name}: Q leaked RoPE columns"
+                )
                 self.assertTrue(torch.allclose(out, torch.ones(T, H, nope)))
 
 
@@ -1241,10 +1321,12 @@ class TestCalibrateCorpusEmpty(unittest.TestCase):
     """empty corpus must raise a clear ValueError."""
 
     def test_empty_file_raises_value_error(self):
+        import tempfile
+
         from sglang.srt.layers.attention.double_sparsity.calibrate import (
             _read_corpus_file,
         )
-        import tempfile
+
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             f.write("\n  \n\t\n")  # whitespace only
             path = f.name
@@ -1263,12 +1345,13 @@ class TestCalibrateHooksFireRequirement(unittest.TestCase):
     """
 
     def test_missing_hooks_raises_runtime_error(self):
-        from unittest.mock import patch, MagicMock
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
         from sglang.srt.layers.attention.double_sparsity.calibrate import (
             _collect_channel_importance,
         )
-        from types import SimpleNamespace
-        import tempfile
 
         # Fake config: 2 layers, 4 heads, head_dim=16, no MLA split.
         cfg = SimpleNamespace(
@@ -1294,17 +1377,21 @@ class TestCalibrateHooksFireRequirement(unittest.TestCase):
             )
         )
 
-        with patch("transformers.AutoConfig") as mock_cfg_cls, \
-             patch("transformers.AutoModelForCausalLM") as mock_model_cls, \
-             patch("transformers.AutoTokenizer") as mock_tok_cls, \
-             tempfile.TemporaryDirectory() as tmp:
+        with patch("transformers.AutoConfig") as mock_cfg_cls, patch(
+            "transformers.AutoModelForCausalLM"
+        ) as mock_model_cls, patch(
+            "transformers.AutoTokenizer"
+        ) as mock_tok_cls, tempfile.TemporaryDirectory() as tmp:
             mock_cfg_cls.from_pretrained.return_value = cfg
             mock_model_cls.from_pretrained.return_value = fake_model
             mock_tok_cls.from_pretrained.return_value = fake_tok
             with self.assertRaises(RuntimeError) as ctx:
                 _collect_channel_importance(
-                    model_path=tmp, dtype="bfloat16", tp=1,
-                    num_layers_hint=None, num_heads_hint=None,
+                    model_path=tmp,
+                    dtype="bfloat16",
+                    tp=1,
+                    num_layers_hint=None,
+                    num_heads_hint=None,
                     head_dim_hint=None,
                     prompts=["hello"],
                     allow_synthetic=False,
@@ -1323,8 +1410,16 @@ class TestCalibrateMethod1(unittest.TestCase):
     128-d model.
     """
 
-    def _make_fake_model(self, *, num_layers=1, num_heads=2, k_head_dim=4,
-                         v_head_dim=4, has_q_proj=True, is_mla=True):
+    def _make_fake_model(
+        self,
+        *,
+        num_layers=1,
+        num_heads=2,
+        k_head_dim=4,
+        v_head_dim=4,
+        has_q_proj=True,
+        is_mla=True,
+    ):
         """Return (config, model, expected_importance, fake_layer) stubs wired for
         _collect_channel_importance.  Uses real nn.Module so PyTorch forward-hooks
         fire when model(**inputs) is called."""
@@ -1354,9 +1449,11 @@ class TestCalibrateMethod1(unittest.TestCase):
 
         class _FixedOutLinear(nn.Module):
             """Returns a fixed tensor (tuple-wrapped) from forward; PyTorch hooks fire."""
+
             def __init__(self, out_tensor):
                 super().__init__()
                 self._out = out_tensor
+
             def forward(self, x):
                 return (self._out,)
 
@@ -1365,6 +1462,7 @@ class TestCalibrateMethod1(unittest.TestCase):
                 super().__init__()
                 for name, mod in named_projs.items():
                     self.add_module(name, mod)
+
             def forward(self, x):
                 for mod in self.children():
                     mod(x)
@@ -1373,6 +1471,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self, attn):
                 super().__init__()
                 self.self_attn = attn
+
             def forward(self, x):
                 self.self_attn(x)
 
@@ -1380,6 +1479,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self, layer_list):
                 super().__init__()
                 self.layers = nn.ModuleList(layer_list)
+
             def forward(self, x):
                 for layer in self.layers:
                     layer(x)
@@ -1388,8 +1488,10 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self, inner):
                 super().__init__()
                 self.model = inner
+
             def forward(self, **_kwargs):
                 self.model(torch.zeros(1))
+
             @property
             def device(self):
                 return torch.device("cpu")
@@ -1403,8 +1505,16 @@ class TestCalibrateMethod1(unittest.TestCase):
             # Correct extraction: reshape per-head first, then slice noPE prefix.
             # head_dim = k_head_dim + 64 (rope), so qk_rope_head_dim = 64.
             qk_rope_head_dim = 64
-            k_nope_ref = k_out_full.float().reshape(T, num_heads, k_head_dim + v_head_dim)[..., :k_head_dim].contiguous()
-            q_nope_ref = q_out_full.float().reshape(T, num_heads, k_head_dim + qk_rope_head_dim)[..., :k_head_dim].contiguous()
+            k_nope_ref = (
+                k_out_full.float()
+                .reshape(T, num_heads, k_head_dim + v_head_dim)[..., :k_head_dim]
+                .contiguous()
+            )
+            q_nope_ref = (
+                q_out_full.float()
+                .reshape(T, num_heads, k_head_dim + qk_rope_head_dim)[..., :k_head_dim]
+                .contiguous()
+            )
         else:
             k_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
             q_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
@@ -1428,6 +1538,7 @@ class TestCalibrateMethod1(unittest.TestCase):
     def _run_calibration(self, cfg, fake_model, tmpdir):
         """Patch transformers and invoke _collect_channel_importance."""
         from unittest.mock import patch
+
         from sglang.srt.layers.attention.double_sparsity.calibrate import (
             _collect_channel_importance,
         )
@@ -1438,9 +1549,9 @@ class TestCalibrateMethod1(unittest.TestCase):
             )
         )
 
-        with patch("transformers.AutoConfig") as mc, \
-             patch("transformers.AutoModelForCausalLM") as mm, \
-             patch("transformers.AutoTokenizer") as mt:
+        with patch("transformers.AutoConfig") as mc, patch(
+            "transformers.AutoModelForCausalLM"
+        ) as mm, patch("transformers.AutoTokenizer") as mt:
             mc.from_pretrained.return_value = cfg
             mm.from_pretrained.return_value = fake_model
             mt.from_pretrained.return_value = fake_tok
@@ -1460,10 +1571,15 @@ class TestCalibrateMethod1(unittest.TestCase):
     def test_qk_pairing_uses_method1_formula(self):
         """Method 1: importance = mean(abs(Q_nope * K_nope)) not sum(K^2)."""
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg, model, expected_imp, _ = self._make_fake_model(
-                num_layers=1, num_heads=2, k_head_dim=4, v_head_dim=4,
-                has_q_proj=True, is_mla=True,
+                num_layers=1,
+                num_heads=2,
+                k_head_dim=4,
+                v_head_dim=4,
+                has_q_proj=True,
+                is_mla=True,
             )
             importance, _ = self._run_calibration(cfg, model, tmpdir)
 
@@ -1479,15 +1595,22 @@ class TestCalibrateMethod1(unittest.TestCase):
 
     def test_k_only_fallback_when_q_missing(self):
         """When no Q projection is found, fall back to K-only L2 with a warning."""
-        import tempfile
         import logging
+        import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg, model, expected_k_only, _ = self._make_fake_model(
-                num_layers=1, num_heads=2, k_head_dim=4, v_head_dim=4,
-                has_q_proj=False, is_mla=True,
+                num_layers=1,
+                num_heads=2,
+                k_head_dim=4,
+                v_head_dim=4,
+                has_q_proj=False,
+                is_mla=True,
             )
-            with self.assertLogs("sglang.srt.layers.attention.double_sparsity.calibrate",
-                                 level=logging.WARNING) as log_ctx:
+            with self.assertLogs(
+                "sglang.srt.layers.attention.double_sparsity.calibrate",
+                level=logging.WARNING,
+            ) as log_ctx:
                 importance, _ = self._run_calibration(cfg, model, tmpdir)
 
         self.assertTrue(
@@ -1503,54 +1626,80 @@ class TestCalibrateMethod1(unittest.TestCase):
     def test_mla_k_extraction_ignores_v_columns(self):
         """K hook must reshape per-head before slicing; V columns must not pollute K_nope."""
         import tempfile
+
         import torch.nn as nn
 
         num_heads, k_head_dim, v_head_dim = 2, 4, 4
         T = 3
         k_full = num_heads * (k_head_dim + v_head_dim)  # 16
-        q_full = num_heads * (k_head_dim + 64)          # 136
+        q_full = num_heads * (k_head_dim + 64)  # 136
 
         # K output: K_nope = 1.0, V = 100.0 (sentinel poison value).
         # Layout per-head: [K_nope_h0(0:4), V_h0(4:8), K_nope_h1(8:12), V_h1(12:16)]
         k_out = torch.ones(T, k_full)
-        k_out[:, 4:8] = 100.0   # V for head 0
-        k_out[:, 12:16] = 100.0 # V for head 1
+        k_out[:, 4:8] = 100.0  # V for head 0
+        k_out[:, 12:16] = 100.0  # V for head 1
 
         # Q output: all 1.0 (isolates K extraction as the variable under test)
         q_out = torch.ones(T, q_full)
 
         cfg = SimpleNamespace(
-            num_hidden_layers=1, num_attention_heads=num_heads,
-            qk_nope_head_dim=k_head_dim, v_head_dim=v_head_dim,
-            head_dim=k_head_dim + 64, hidden_size=num_heads * (k_head_dim + 64),
+            num_hidden_layers=1,
+            num_attention_heads=num_heads,
+            qk_nope_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            head_dim=k_head_dim + 64,
+            hidden_size=num_heads * (k_head_dim + 64),
         )
 
         class _Fixed(nn.Module):
-            def __init__(self, out): super().__init__(); self._out = out
-            def forward(self, x): return (self._out,)
+            def __init__(self, out):
+                super().__init__()
+                self._out = out
+
+            def forward(self, x):
+                return (self._out,)
 
         class _Attn(nn.Module):
             def __init__(self, **p):
                 super().__init__()
-                for n, m in p.items(): self.add_module(n, m)
+                for n, m in p.items():
+                    self.add_module(n, m)
+
             def forward(self, x):
-                for m in self.children(): m(x)
+                for m in self.children():
+                    m(x)
 
         class _Layer(nn.Module):
-            def __init__(self, a): super().__init__(); self.self_attn = a
-            def forward(self, x): self.self_attn(x)
+            def __init__(self, a):
+                super().__init__()
+                self.self_attn = a
+
+            def forward(self, x):
+                self.self_attn(x)
 
         class _Inner(nn.Module):
             def __init__(self, ls):
-                super().__init__(); import torch.nn as nn2; self.layers = nn2.ModuleList(ls)
+                super().__init__()
+                import torch.nn as nn2
+
+                self.layers = nn2.ModuleList(ls)
+
             def forward(self, x):
-                for l in self.layers: l(x)
+                for l in self.layers:
+                    l(x)
 
         class _Top(nn.Module):
-            def __init__(self, i): super().__init__(); self.model = i
-            def forward(self, **_kw): self.model(torch.zeros(1))
+            def __init__(self, i):
+                super().__init__()
+                self.model = i
+
+            def forward(self, **_kw):
+                self.model(torch.zeros(1))
+
             @property
-            def device(self): return torch.device("cpu")
+            def device(self):
+                return torch.device("cpu")
 
         attn = _Attn(kv_b_proj=_Fixed(k_out), q_b_proj=_Fixed(q_out))
         fake_model = _Top(_Inner([_Layer(attn)]))
@@ -1561,7 +1710,8 @@ class TestCalibrateMethod1(unittest.TestCase):
         # Under wrong flat-slice: head 1 sees V_h0 = 100.0 → importance ≈ 100.0
         actual = importance[0].cpu()
         self.assertLess(
-            actual.max().item(), 10.0,
+            actual.max().item(),
+            10.0,
             f"K extraction appears to include V columns (max={actual.max():.1f}). "
             f"Expected all values near 1.0 (K_nope=1.0 × Q=1.0).\nActual:\n{actual}",
         )
@@ -1573,56 +1723,82 @@ class TestCalibrateMethod1(unittest.TestCase):
     def test_mla_q_extraction_ignores_rope_columns(self):
         """Q hook must reshape per-head before slicing; RoPE columns must not pollute Q_nope."""
         import tempfile
+
         import torch.nn as nn
 
         num_heads, k_head_dim, v_head_dim, qk_rope_head_dim = 2, 4, 4, 64
         T = 3
-        k_full = num_heads * (k_head_dim + v_head_dim)   # 16
+        k_full = num_heads * (k_head_dim + v_head_dim)  # 16
         q_full = num_heads * (k_head_dim + qk_rope_head_dim)  # 136
 
         # Q output: Q_nope = 1.0, Q_rope = 100.0 (sentinel poison value).
         # Per-head layout: [Q_nope_h0(0:4), Q_rope_h0(4:68), Q_nope_h1(68:72), Q_rope_h1(72:136)]
         q_out = torch.ones(T, q_full)
-        q_out[:, 4:68] = 100.0    # Q_rope for head 0
+        q_out[:, 4:68] = 100.0  # Q_rope for head 0
         q_out[:, 72:136] = 100.0  # Q_rope for head 1
 
         # K output: K_nope = 1.0, V = 0.0 (V excluded by correct extraction)
         k_out = torch.zeros(T, k_full)
-        k_out[:, 0:4] = 1.0   # K_nope head 0
+        k_out[:, 0:4] = 1.0  # K_nope head 0
         k_out[:, 8:12] = 1.0  # K_nope head 1
 
         cfg = SimpleNamespace(
-            num_hidden_layers=1, num_attention_heads=num_heads,
-            qk_nope_head_dim=k_head_dim, v_head_dim=v_head_dim,
-            head_dim=k_head_dim + qk_rope_head_dim, hidden_size=num_heads * (k_head_dim + qk_rope_head_dim),
+            num_hidden_layers=1,
+            num_attention_heads=num_heads,
+            qk_nope_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            head_dim=k_head_dim + qk_rope_head_dim,
+            hidden_size=num_heads * (k_head_dim + qk_rope_head_dim),
         )
 
         class _Fixed(nn.Module):
-            def __init__(self, out): super().__init__(); self._out = out
-            def forward(self, x): return (self._out,)
+            def __init__(self, out):
+                super().__init__()
+                self._out = out
+
+            def forward(self, x):
+                return (self._out,)
 
         class _Attn(nn.Module):
             def __init__(self, **p):
                 super().__init__()
-                for n, m in p.items(): self.add_module(n, m)
+                for n, m in p.items():
+                    self.add_module(n, m)
+
             def forward(self, x):
-                for m in self.children(): m(x)
+                for m in self.children():
+                    m(x)
 
         class _Layer(nn.Module):
-            def __init__(self, a): super().__init__(); self.self_attn = a
-            def forward(self, x): self.self_attn(x)
+            def __init__(self, a):
+                super().__init__()
+                self.self_attn = a
+
+            def forward(self, x):
+                self.self_attn(x)
 
         class _Inner(nn.Module):
             def __init__(self, ls):
-                super().__init__(); import torch.nn as nn2; self.layers = nn2.ModuleList(ls)
+                super().__init__()
+                import torch.nn as nn2
+
+                self.layers = nn2.ModuleList(ls)
+
             def forward(self, x):
-                for l in self.layers: l(x)
+                for l in self.layers:
+                    l(x)
 
         class _Top(nn.Module):
-            def __init__(self, i): super().__init__(); self.model = i
-            def forward(self, **_kw): self.model(torch.zeros(1))
+            def __init__(self, i):
+                super().__init__()
+                self.model = i
+
+            def forward(self, **_kw):
+                self.model(torch.zeros(1))
+
             @property
-            def device(self): return torch.device("cpu")
+            def device(self):
+                return torch.device("cpu")
 
         attn = _Attn(kv_b_proj=_Fixed(k_out), q_b_proj=_Fixed(q_out))
         fake_model = _Top(_Inner([_Layer(attn)]))
@@ -1633,7 +1809,8 @@ class TestCalibrateMethod1(unittest.TestCase):
         # Under wrong flat-slice: head 1 gets Q_rope_h0 (100.0) → importance ≈ 100.0
         actual = importance[0].cpu()
         self.assertLess(
-            actual.max().item(), 10.0,
+            actual.max().item(),
+            10.0,
             f"Q extraction appears to include RoPE columns (max={actual.max():.1f}). "
             f"Expected all values near 1.0.\nActual:\n{actual}",
         )
@@ -1650,6 +1827,7 @@ class TestCalibrateMethod1(unittest.TestCase):
         so adding a batch dimension must not change the computed values.
         """
         import tempfile
+
         import torch.nn as nn
 
         num_layers, num_heads, k_head_dim, v_head_dim = 1, 2, 4, 4
@@ -1658,9 +1836,12 @@ class TestCalibrateMethod1(unittest.TestCase):
         # 2-D reference: _make_fake_model uses seed=42, T=3
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg_2d, model_2d, _, _ = self._make_fake_model(
-                num_layers=num_layers, num_heads=num_heads,
-                k_head_dim=k_head_dim, v_head_dim=v_head_dim,
-                has_q_proj=True, is_mla=True,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                k_head_dim=k_head_dim,
+                v_head_dim=v_head_dim,
+                has_q_proj=True,
+                is_mla=True,
             )
             importance_2d, _ = self._run_calibration(cfg_2d, model_2d, tmpdir)
 
@@ -1669,13 +1850,14 @@ class TestCalibrateMethod1(unittest.TestCase):
         k_full = num_heads * (k_head_dim + v_head_dim)
         q_full = num_heads * (k_head_dim + 64)
         rng = torch.Generator().manual_seed(42)
-        k_out_3d = torch.rand(T, k_full, generator=rng).unsqueeze(0)   # [1, T, W_k]
-        q_out_3d = torch.rand(T, q_full, generator=rng).unsqueeze(0)   # [1, T, W_q]
+        k_out_3d = torch.rand(T, k_full, generator=rng).unsqueeze(0)  # [1, T, W_k]
+        q_out_3d = torch.rand(T, q_full, generator=rng).unsqueeze(0)  # [1, T, W_q]
 
         class _3DLinear(nn.Module):
             def __init__(self, out_3d):
                 super().__init__()
                 self._out = out_3d
+
             def forward(self, x):
                 return (self._out,)
 
@@ -1684,6 +1866,7 @@ class TestCalibrateMethod1(unittest.TestCase):
                 super().__init__()
                 self.kv_b_proj = _3DLinear(k_out_3d)
                 self.q_b_proj = _3DLinear(q_out_3d)
+
             def forward(self, x):
                 self.kv_b_proj(x)
                 self.q_b_proj(x)
@@ -1692,6 +1875,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.self_attn = _FakeAttn3D()
+
             def forward(self, x):
                 self.self_attn(x)
 
@@ -1699,6 +1883,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.layers = nn.ModuleList([_FakeLayer3D()])
+
             def forward(self, x):
                 for layer in self.layers:
                     layer(x)
@@ -1707,8 +1892,10 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.model = _FakeInner3D()
+
             def forward(self, **_kwargs):
                 self.model(torch.zeros(1))
+
             @property
             def device(self):
                 return torch.device("cpu")
@@ -1776,11 +1963,16 @@ class TestCalibrateMethod1(unittest.TestCase):
 
         with patch.dict(sys.modules, {"datasets": mock_datasets_module}):
             blocks = _build_pile_val_token_blocks(
-                fake_tok, num_blocks=1, block_size=512, seed=42,
+                fake_tok,
+                num_blocks=1,
+                block_size=512,
+                seed=42,
             )
 
         self.assertEqual(len(blocks), 1, "Must return exactly 1 block")
-        self.assertEqual(tuple(blocks[0].shape), (1, 512), "Block shape must be [1, 512]")
+        self.assertEqual(
+            tuple(blocks[0].shape), (1, 512), "Block shape must be [1, 512]"
+        )
 
         block_ids = blocks[0][0].tolist()
         # Doc 0 occupies positions 0..199 → token IDs 0..199
@@ -1791,7 +1983,8 @@ class TestCalibrateMethod1(unittest.TestCase):
         # Position 511 is in doc 2 range (400..599); token ID equals position
         # since each doc's IDs equal their position in the concatenated stream.
         self.assertEqual(
-            block_ids[511], 511,
+            block_ids[511],
+            511,
             f"Token at index 511 must come from doc 2 (cross-document boundary). "
             f"Got {block_ids[511]}; docs were merely truncated if this fails.",
         )
@@ -1806,8 +1999,9 @@ class TestCalibrateMethod1(unittest.TestCase):
         Q/K importance is accumulated correctly for this config shape.
         """
         import tempfile
-        import torch.nn as nn
         from unittest.mock import patch as _patch
+
+        import torch.nn as nn
 
         from sglang.srt.layers.attention.double_sparsity.calibrate import (
             _collect_channel_importance,
@@ -1831,20 +2025,29 @@ class TestCalibrateMethod1(unittest.TestCase):
             # intentionally no head_dim attribute
         )
 
-        k_full = num_heads * (qk_nope + v_head_dim_val)   # 4*(8+4)=48
-        q_full = num_heads * (qk_nope + qk_rope)           # 4*(8+4)=48
+        k_full = num_heads * (qk_nope + v_head_dim_val)  # 4*(8+4)=48
+        q_full = num_heads * (qk_nope + qk_rope)  # 4*(8+4)=48
         rng = torch.Generator().manual_seed(42)
         k_out = torch.rand(T, k_full, generator=rng)
         q_out = torch.rand(T, q_full, generator=rng)
 
-        k_nope_ref = k_out.float().reshape(T, num_heads, qk_nope + v_head_dim_val)[..., :qk_nope].contiguous()
-        q_nope_ref = q_out.float().reshape(T, num_heads, qk_nope + qk_rope)[..., :qk_nope].contiguous()
+        k_nope_ref = (
+            k_out.float()
+            .reshape(T, num_heads, qk_nope + v_head_dim_val)[..., :qk_nope]
+            .contiguous()
+        )
+        q_nope_ref = (
+            q_out.float()
+            .reshape(T, num_heads, qk_nope + qk_rope)[..., :qk_nope]
+            .contiguous()
+        )
         expected_imp = (q_nope_ref * k_nope_ref).abs().mean(dim=0)
 
         class _FixedOut(nn.Module):
             def __init__(self, out):
                 super().__init__()
                 self._out = out
+
             def forward(self, x):
                 return (self._out,)
 
@@ -1853,6 +2056,7 @@ class TestCalibrateMethod1(unittest.TestCase):
                 super().__init__()
                 self.kv_b_proj = _FixedOut(k_out)
                 self.q_b_proj = _FixedOut(q_out)
+
             def forward(self, x):
                 self.kv_b_proj(x)
                 self.q_b_proj(x)
@@ -1861,6 +2065,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.self_attn = _FakeAttn()
+
             def forward(self, x):
                 self.self_attn(x)
 
@@ -1868,6 +2073,7 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.layers = nn.ModuleList([_FakeLayer()])
+
             def forward(self, x):
                 for layer in self.layers:
                     layer(x)
@@ -1876,8 +2082,10 @@ class TestCalibrateMethod1(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.model = _FakeInner()
+
             def forward(self, **_kwargs):
                 self.model(torch.zeros(1))
+
             @property
             def device(self):
                 return torch.device("cpu")
@@ -1889,9 +2097,9 @@ class TestCalibrateMethod1(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with _patch("transformers.AutoConfig") as mc, \
-                 _patch("transformers.AutoModelForCausalLM") as mm, \
-                 _patch("transformers.AutoTokenizer") as mt:
+            with _patch("transformers.AutoConfig") as mc, _patch(
+                "transformers.AutoModelForCausalLM"
+            ) as mm, _patch("transformers.AutoTokenizer") as mt:
                 mc.from_pretrained.return_value = cfg
                 mm.from_pretrained.return_value = _FakeTopModel()
                 mt.from_pretrained.return_value = fake_tok
@@ -1909,7 +2117,8 @@ class TestCalibrateMethod1(unittest.TestCase):
 
         actual = importance[0].cpu()
         self.assertEqual(
-            tuple(actual.shape), (num_heads, qk_nope),
+            tuple(actual.shape),
+            (num_heads, qk_nope),
             "importance shape must be [H, qk_nope_head_dim]",
         )
         self.assertTrue(
@@ -1925,11 +2134,11 @@ class TestCalibrateMethod1(unittest.TestCase):
     def test_512d_channel_index_rejected(self):
         """load_channel_mask must reject channel indices >= head_dim=128."""
         import tempfile
+
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask,
             DoubleSparsityChannelMaskCorrupt,
-            save_channel_mask,
             load_channel_mask,
+            save_channel_mask,
         )
 
         L, H, label_dim = 2, 4, 8
@@ -1951,17 +2160,21 @@ class TestCalibrateMethod1(unittest.TestCase):
                 label_dim=label_dim,
                 created_at="2026-01-01T00:00:00Z",
             )
-            with self.assertRaises((DoubleSparsityChannelMaskCorrupt, ValueError)) as ctx:
+            with self.assertRaises(
+                (DoubleSparsityChannelMaskCorrupt, ValueError)
+            ) as ctx:
                 load_channel_mask(path)
             self.assertIn("out of range", str(ctx.exception))
         finally:
             import os as _os
+
             _os.unlink(path)
 
     def test_label_dim_exceeds_k_head_dim_raises(self):
         """calibrate() must raise ValueError when label_dim > head_dim."""
-        from sglang.srt.layers.attention.double_sparsity.calibrate import calibrate
         import argparse
+
+        from sglang.srt.layers.attention.double_sparsity.calibrate import calibrate
 
         args = argparse.Namespace(
             model="/nonexistent",

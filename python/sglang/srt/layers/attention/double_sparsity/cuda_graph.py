@@ -52,25 +52,29 @@ class DSGraphState:
 
     selected_indices: torch.Tensor  # int32 [max_bs, max_top_k], -1 padded
     valid_lengths: torch.Tensor  # int32 [max_bs]
-    scratch_partial_scores: Optional[torch.Tensor] = None  # [max_bs, num_blocks, partial_k]
-    scratch_partial_indices: Optional[torch.Tensor] = None  # [max_bs, num_blocks, partial_k]
+    scratch_partial_scores: Optional[torch.Tensor] = (
+        None  # [max_bs, num_blocks, partial_k]
+    )
+    scratch_partial_indices: Optional[torch.Tensor] = (
+        None  # [max_bs, num_blocks, partial_k]
+    )
     max_seq_len: int = 0  # static sequence width for graph-safe logical scoring
 
     # Allocation-free graph-safe path scratch (sized at allocate_graph_state time).
     # Populated when num_local_heads > 0, label_dim > 0, max_seq_len > 0.
-    scratch_scores: Optional[torch.Tensor] = None         # fp32 [max_bs, max_seq_len]
-    scratch_topk_values: Optional[torch.Tensor] = None    # fp32 [max_bs, max_top_k]
-    scratch_topk_indices: Optional[torch.Tensor] = None   # int64 [max_bs, max_top_k]
-    scratch_invalid_mask: Optional[torch.Tensor] = None   # bool [max_bs, max_top_k]
-    scratch_sorted_vals: Optional[torch.Tensor] = None    # int64 [max_bs, max_top_k]
-    scratch_boundary: Optional[torch.Tensor] = None       # int64 [max_bs, 1]
-    scratch_valid_i64: Optional[torch.Tensor] = None      # int64 [max_bs, 1]
-    scratch_pv_mask: Optional[torch.Tensor] = None        # bool [max_bs, max_seq_len]
+    scratch_scores: Optional[torch.Tensor] = None  # fp32 [max_bs, max_seq_len]
+    scratch_topk_values: Optional[torch.Tensor] = None  # fp32 [max_bs, max_top_k]
+    scratch_topk_indices: Optional[torch.Tensor] = None  # int64 [max_bs, max_top_k]
+    scratch_invalid_mask: Optional[torch.Tensor] = None  # bool [max_bs, max_top_k]
+    scratch_sorted_vals: Optional[torch.Tensor] = None  # int64 [max_bs, max_top_k]
+    scratch_boundary: Optional[torch.Tensor] = None  # int64 [max_bs, 1]
+    scratch_valid_i64: Optional[torch.Tensor] = None  # int64 [max_bs, 1]
+    scratch_pv_mask: Optional[torch.Tensor] = None  # bool [max_bs, max_seq_len]
     scratch_throwaway_idx: Optional[torch.Tensor] = None  # int64 [max_bs, max_top_k]
     # bf16 transport scratch for the cross-TP score reduce (score_reduce_dtype
     # == "bf16"): the fp32 scores are cast into this view, reduced, and cast
     # back — halving the reduce bytes over the static score width.
-    scratch_scores_bf16: Optional[torch.Tensor] = None    # bf16 [max_bs, max_seq_len]
+    scratch_scores_bf16: Optional[torch.Tensor] = None  # bf16 [max_bs, max_seq_len]
     # Absorbed-latent selection scratch. The query-side latent projection v_h is
     # built into scratch_absorbed_v in place, scored straight into scratch_scores
     # (paged fp8, in place), then the reduce + radix top-k runs.
@@ -90,23 +94,23 @@ class DSGraphState:
     # Scratch bundle for the sequence-aware deterministic radix top-k
     # (topk_kernel.select_topk_sequence_order_triton). When present, the
     # graph-safe selection replaces the two full-width torch.topk passes.
-    scratch_topk_hist: Optional[torch.Tensor] = None        # int32 [max_bs, 256]
+    scratch_topk_hist: Optional[torch.Tensor] = None  # int32 [max_bs, 256]
     scratch_topk_key_prefix: Optional[torch.Tensor] = None  # int64 [max_bs]
-    scratch_topk_quota: Optional[torch.Tensor] = None       # int32 [max_bs]
+    scratch_topk_quota: Optional[torch.Tensor] = None  # int32 [max_bs]
     scratch_topk_block_above: Optional[torch.Tensor] = None  # int32 [max_bs, nblocks]
-    scratch_topk_block_tie: Optional[torch.Tensor] = None    # int32 [max_bs, nblocks]
-    scratch_topk_above_pref: Optional[torch.Tensor] = None   # int32 [max_bs, nblocks]
-    scratch_topk_tie_pref: Optional[torch.Tensor] = None     # int32 [max_bs, nblocks]
+    scratch_topk_block_tie: Optional[torch.Tensor] = None  # int32 [max_bs, nblocks]
+    scratch_topk_above_pref: Optional[torch.Tensor] = None  # int32 [max_bs, nblocks]
+    scratch_topk_tie_pref: Optional[torch.Tensor] = None  # int32 [max_bs, nblocks]
     topk_block: int = 1024
     # Production input scratch — `forward_batch.req_pool_indices` is int64 in
     # production (scheduler + cuda_graph_runner.py:178) but the captured
     # selector region requires int32. `_select_topk_indices` does an in-place
     # copy_() into these views before calling retrieve_topk_graph_safe.
     scratch_req_pool_indices: Optional[torch.Tensor] = None  # int32 [max_bs]
-    scratch_seq_lens: Optional[torch.Tensor] = None          # int32 [max_bs]
+    scratch_seq_lens: Optional[torch.Tensor] = None  # int32 [max_bs]
     # logical_to_physical's Triton kernel atomically accumulates the
     # bad-req_pool count here. Zeroed on every call.
-    lp_error_scratch: Optional[torch.Tensor] = None          # int32 [1]
+    lp_error_scratch: Optional[torch.Tensor] = None  # int32 [1]
 
     # Host-side replay identity for the selection-capture dump. The DSA
     # backend's pre-replay metadata init stamps these (plain Python values,
@@ -162,9 +166,7 @@ def allocate_graph_state(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    selected = torch.full(
-        (max_bs, max_top_k), -1, dtype=torch.int32, device=device
-    )
+    selected = torch.full((max_bs, max_top_k), -1, dtype=torch.int32, device=device)
     valid = torch.zeros((max_bs,), dtype=torch.int32, device=device)
     scratch_scores_partial = None
     scratch_indices = None
@@ -208,42 +210,67 @@ def allocate_graph_state(
     scratch_topk_tie_pref = None
     if max_seq_len > 0:
         scratch_scores = torch.zeros(
-            (max_bs, max_seq_len), dtype=torch.float32, device=device,
+            (max_bs, max_seq_len),
+            dtype=torch.float32,
+            device=device,
         )
         scratch_topk_values = torch.zeros(
-            (max_bs, max_top_k), dtype=torch.float32, device=device,
+            (max_bs, max_top_k),
+            dtype=torch.float32,
+            device=device,
         )
         scratch_topk_indices = torch.zeros(
-            (max_bs, max_top_k), dtype=torch.int64, device=device,
+            (max_bs, max_top_k),
+            dtype=torch.int64,
+            device=device,
         )
         scratch_invalid_mask = torch.zeros(
-            (max_bs, max_top_k), dtype=torch.bool, device=device,
+            (max_bs, max_top_k),
+            dtype=torch.bool,
+            device=device,
         )
         scratch_sorted_vals = torch.zeros(
-            (max_bs, max_top_k), dtype=torch.int64, device=device,
+            (max_bs, max_top_k),
+            dtype=torch.int64,
+            device=device,
         )
         scratch_boundary = torch.full(
-            (max_bs, 1), max_seq_len, dtype=torch.int64, device=device,
+            (max_bs, 1),
+            max_seq_len,
+            dtype=torch.int64,
+            device=device,
         )
         scratch_valid_i64 = torch.zeros(
-            (max_bs, 1), dtype=torch.int64, device=device,
+            (max_bs, 1),
+            dtype=torch.int64,
+            device=device,
         )
         scratch_pv_mask = torch.zeros(
-            (max_bs, max_seq_len), dtype=torch.bool, device=device,
+            (max_bs, max_seq_len),
+            dtype=torch.bool,
+            device=device,
         )
         scratch_throwaway_idx = torch.zeros(
-            (max_bs, max_top_k), dtype=torch.int64, device=device,
+            (max_bs, max_top_k),
+            dtype=torch.int64,
+            device=device,
         )
         scratch_req_pool_indices = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=device,
+            (max_bs,),
+            dtype=torch.int32,
+            device=device,
         )
         scratch_seq_lens = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=device,
+            (max_bs,),
+            dtype=torch.int32,
+            device=device,
         )
         lp_error_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
         if score_reduce_bf16:
             scratch_scores_bf16 = torch.zeros(
-                (max_bs, max_seq_len), dtype=torch.bfloat16, device=device,
+                (max_bs, max_seq_len),
+                dtype=torch.bfloat16,
+                device=device,
             )
         # Absorbed-latent scratch: v_h ([max_bs, H, lora]), the weighted
         # channel-gathered query ([max_bs, H, label_dim]), and the int64 layer
@@ -276,23 +303,35 @@ def allocate_graph_state(
             )
         topk_nblocks = (max_seq_len + topk_block - 1) // topk_block
         scratch_topk_hist = torch.zeros(
-            (max_bs, 256), dtype=torch.int32, device=device,
+            (max_bs, 256),
+            dtype=torch.int32,
+            device=device,
         )
         scratch_topk_key_prefix = torch.zeros(
-            (max_bs,), dtype=torch.int64, device=device,
+            (max_bs,),
+            dtype=torch.int64,
+            device=device,
         )
         scratch_topk_quota = torch.zeros((max_bs,), dtype=torch.int32, device=device)
         scratch_topk_block_above = torch.zeros(
-            (max_bs, topk_nblocks), dtype=torch.int32, device=device,
+            (max_bs, topk_nblocks),
+            dtype=torch.int32,
+            device=device,
         )
         scratch_topk_block_tie = torch.zeros(
-            (max_bs, topk_nblocks), dtype=torch.int32, device=device,
+            (max_bs, topk_nblocks),
+            dtype=torch.int32,
+            device=device,
         )
         scratch_topk_above_pref = torch.zeros(
-            (max_bs, topk_nblocks), dtype=torch.int32, device=device,
+            (max_bs, topk_nblocks),
+            dtype=torch.int32,
+            device=device,
         )
         scratch_topk_tie_pref = torch.zeros(
-            (max_bs, topk_nblocks), dtype=torch.int32, device=device,
+            (max_bs, topk_nblocks),
+            dtype=torch.int32,
+            device=device,
         )
 
     return DSGraphState(
@@ -329,7 +368,7 @@ def allocate_graph_state(
     )
 
 
-def radix_topk_scratch(state: Optional["DSGraphState"]) -> Optional[dict]:
+def radix_topk_scratch(state: Optional[DSGraphState]) -> Optional[dict]:
     """The radix top-k scratch bundle of a graph state, as kwargs for
     ``topk_kernel.select_topk_sequence_order_triton`` — or None when the
     state has no bundle (legacy torch.topk pipeline)."""
@@ -347,7 +386,7 @@ def radix_topk_scratch(state: Optional["DSGraphState"]) -> Optional[dict]:
 
 
 def capture_decode_step(
-    selector: "DoubleSparsitySelector",
+    selector: DoubleSparsitySelector,
     *,
     state: DSGraphState,
     queries: torch.Tensor,
@@ -542,15 +581,11 @@ def assert_no_alloc_in_region(label: str = "DS decode capture"):
     if not torch.cuda.is_available():
         yield
         return
-    before = torch.cuda.memory_stats(device=None).get(
-        "allocation.all.allocated", 0
-    )
+    before = torch.cuda.memory_stats(device=None).get("allocation.all.allocated", 0)
     try:
         yield
     finally:
-        after = torch.cuda.memory_stats(device=None).get(
-            "allocation.all.allocated", 0
-        )
+        after = torch.cuda.memory_stats(device=None).get("allocation.all.allocated", 0)
         delta = after - before
         if delta > 0:
             raise RuntimeError(

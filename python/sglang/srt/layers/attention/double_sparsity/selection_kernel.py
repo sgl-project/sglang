@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 SELECTED_PAD_VALUE = -1
 _TRITON_AVAILABLE = False
 try:
-    import triton
-    import triton.language as tl
+    import triton  # noqa: F401  # availability probe for _TRITON_AVAILABLE
+    import triton.language as tl  # noqa: F401  # availability probe
 
     _TRITON_AVAILABLE = True
 except ImportError:
@@ -278,7 +278,7 @@ def _topk_by_score_then_pos(
     lower position. Returns ``(top_positions [bs, k] int64, top_vals [bs, k])``. Uses
     fresh argsort outputs (no in/out aliasing — BL-20260527-torch-topk-aliasing).
     """
-    pos_order = torch.argsort(pos, dim=-1, stable=True)            # ascending position
+    pos_order = torch.argsort(pos, dim=-1, stable=True)  # ascending position
     pos_a = torch.gather(pos, 1, pos_order)
     vals_a = torch.gather(vals, 1, pos_order)
     val_order = torch.argsort(vals_a, dim=-1, descending=True, stable=True)[:, :k]
@@ -314,8 +314,14 @@ def select_topk_sequence_order(
     # helper's stable score-descending argsort breaks score ties toward the lower
     # position -- the single ordering all DS top-k selectors honor (see
     # _topk_by_score_then_pos / blocked_topk_sequence_order).
-    positions = torch.arange(max_tokens, device=device, dtype=torch.int64).unsqueeze(0).expand(bs, -1)
-    topk_indices, topk_scores = _topk_by_score_then_pos(token_scores, positions, effective_top_k)
+    positions = (
+        torch.arange(max_tokens, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(bs, -1)
+    )
+    topk_indices, topk_scores = _topk_by_score_then_pos(
+        token_scores, positions, effective_top_k
+    )
 
     invalid_entries = torch.isneginf(topk_scores)
     topk_indices = torch.where(
@@ -397,7 +403,9 @@ def blocked_topk_sequence_order(
     # per-block top-kb candidate LOCAL positions by (score desc, local-pos asc) -- the
     # argsort indices ARE the local positions; stable keeps ascending pos on ties.
     blk_order = torch.argsort(blk, dim=-1, descending=True, stable=True)[:, :, :kb]
-    block_base = (torch.arange(nb, device=device, dtype=torch.int64) * bw).view(1, nb, 1)
+    block_base = (torch.arange(nb, device=device, dtype=torch.int64) * bw).view(
+        1, nb, 1
+    )
     cand_pos = (block_base + blk_order).reshape(bs, nb * kb)
     cand_vals = torch.gather(blk, 2, blk_order).reshape(bs, nb * kb)
     # global top-K over the union, by the SHARED (score desc, position asc) contract
@@ -407,12 +415,15 @@ def blocked_topk_sequence_order(
     invalid = torch.isneginf(merge_vals)
     sel_pos = torch.where(invalid, torch.full_like(sel_pos, max_tokens), sel_pos)
     sorted_pos, _ = torch.sort(sel_pos, dim=-1)
-    selected = torch.full((bs, max_top_k), SELECTED_PAD_VALUE, dtype=torch.int32, device=device)
+    selected = torch.full(
+        (bs, max_top_k), SELECTED_PAD_VALUE, dtype=torch.int32, device=device
+    )
     valid_lengths = (sorted_pos < max_tokens).to(torch.int32).sum(dim=-1)
     grid = torch.arange(eff, device=device)
     keep = grid.unsqueeze(0) < valid_lengths.unsqueeze(1)
     real = torch.where(
-        keep, sorted_pos.to(torch.int32),
+        keep,
+        sorted_pos.to(torch.int32),
         torch.full_like(sorted_pos, SELECTED_PAD_VALUE, dtype=torch.int32),
     )
     selected[:, :eff] = real
@@ -530,20 +541,25 @@ def _force_include_anchor(
 
     # max_seq-wide membership masks (an extra sentinel column absorbs -1 pads).
     sel_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
-    sel_mask.scatter_(1, torch.where(real_mask, pos, torch.full_like(pos, max_seq)), True)
+    sel_mask.scatter_(
+        1, torch.where(real_mask, pos, torch.full_like(pos, max_seq)), True
+    )
     sel_mask = sel_mask[:, :max_seq]
     anc_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
-    anc_mask.scatter_(1, torch.where(avalid, apos, torch.full_like(apos, max_seq)), True)
+    anc_mask.scatter_(
+        1, torch.where(avalid, apos, torch.full_like(apos, max_seq)), True
+    )
     anc_mask = anc_mask[:, :max_seq]
 
-    missing = avalid & ~torch.gather(sel_mask, 1, apos.clamp(min=0))   # [bs,A]
-    evictable = real_mask & ~torch.gather(anc_mask, 1, psafe)          # [bs,K]
-    k = torch.minimum(missing.sum(1), evictable.sum(1))               # [bs]
+    missing = avalid & ~torch.gather(sel_mask, 1, apos.clamp(min=0))  # [bs,A]
+    evictable = real_mask & ~torch.gather(anc_mask, 1, psafe)  # [bs,K]
+    k = torch.minimum(missing.sum(1), evictable.sum(1))  # [bs]
 
     # Evict the k lowest-score evictables (score asc, position asc tie-break).
     big_score = torch.finfo(torch.float32).max
     evict_score = torch.where(
-        evictable, torch.gather(scores, 1, psafe),
+        evictable,
+        torch.gather(scores, 1, psafe),
         torch.full((bs, K), big_score, dtype=scores.dtype, device=device),
     )
     order = _stable_argsort_ascending(evict_score, pos)
@@ -559,11 +575,16 @@ def _force_include_anchor(
     # Combine keep + inserted positions, sort ascending, pad to K with -1.
     big = max_seq + 10
     keep_pos = torch.where(keep, psafe, torch.full_like(psafe, big))
-    ins_pos = torch.where(insert, apos.clamp(min=0), torch.full((bs, A), big, dtype=torch.int64, device=device))
+    ins_pos = torch.where(
+        insert,
+        apos.clamp(min=0),
+        torch.full((bs, A), big, dtype=torch.int64, device=device),
+    )
     combined, _ = torch.sort(torch.cat([keep_pos, ins_pos], dim=1), dim=1)
     out = combined[:, :K]
     out = torch.where(out >= big, torch.full_like(out, -1), out).to(torch.int32)
     return out, (out >= 0).to(torch.int32).sum(-1)
+
 
 def absorbed_topk_select(
     *,
@@ -675,17 +696,17 @@ def retrieve_topk_graph_safe(
     out_indices: torch.Tensor,
     out_lengths: torch.Tensor,
     # Pre-allocated scratch tensors (required for CUDA / Triton fast path)
-    scratch_scores: Optional[torch.Tensor] = None,         # fp32 [max_bs, max_seq_len]
-    scratch_topk_values: Optional[torch.Tensor] = None,    # fp32 [max_bs, max_top_k]
-    scratch_topk_indices: Optional[torch.Tensor] = None,   # int64 [max_bs, max_top_k]
-    scratch_invalid_mask: Optional[torch.Tensor] = None,   # bool [max_bs, max_top_k]
-    scratch_sorted_vals: Optional[torch.Tensor] = None,    # int64 [max_bs, max_top_k]
-    scratch_boundary: Optional[torch.Tensor] = None,       # int64 [max_bs, 1] = max_seq_len
-    scratch_valid_i64: Optional[torch.Tensor] = None,      # int64 [max_bs, 1]
-    per_request_valid: Optional[torch.Tensor] = None,      # bool [bs, max_seq_len]
-    scratch_pv_mask: Optional[torch.Tensor] = None,        # bool [max_bs, max_seq_len]
+    scratch_scores: Optional[torch.Tensor] = None,  # fp32 [max_bs, max_seq_len]
+    scratch_topk_values: Optional[torch.Tensor] = None,  # fp32 [max_bs, max_top_k]
+    scratch_topk_indices: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
+    scratch_invalid_mask: Optional[torch.Tensor] = None,  # bool [max_bs, max_top_k]
+    scratch_sorted_vals: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
+    scratch_boundary: Optional[torch.Tensor] = None,  # int64 [max_bs, 1] = max_seq_len
+    scratch_valid_i64: Optional[torch.Tensor] = None,  # int64 [max_bs, 1]
+    per_request_valid: Optional[torch.Tensor] = None,  # bool [bs, max_seq_len]
+    scratch_pv_mask: Optional[torch.Tensor] = None,  # bool [max_bs, max_seq_len]
     scratch_throwaway_idx: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
-    scratch_scores_bf16: Optional[torch.Tensor] = None,    # bf16 [max_bs, max_seq_len]
+    scratch_scores_bf16: Optional[torch.Tensor] = None,  # bf16 [max_bs, max_seq_len]
     radix_topk_scratch: Optional[dict] = None,  # topk_kernel scratch bundle
     topk_block: int = 1024,
     process_group=None,
@@ -793,21 +814,21 @@ def retrieve_topk_graph_safe(
     # fp32 / fp16 / bf16 — the kernel casts via tl.load(...).to(tl.float32).
     sel_layer = channel_selection[layer_id]
     w_layer = channel_weights[layer_id]
-    assert sel_layer.dtype == torch.int32, (
-        f"channel_selection must be int32, got {sel_layer.dtype}"
-    )
-    assert w_layer.dtype == torch.float32, (
-        f"channel_weights must be float32, got {w_layer.dtype}"
-    )
-    assert req_pool_indices.dtype == torch.int32, (
-        f"req_pool_indices must be int32, got {req_pool_indices.dtype}"
-    )
-    assert req_to_token.dtype == torch.int32, (
-        f"req_to_token must be int32, got {req_to_token.dtype}"
-    )
-    assert seq_lens.dtype == torch.int32, (
-        f"seq_lens must be int32, got {seq_lens.dtype}"
-    )
+    assert (
+        sel_layer.dtype == torch.int32
+    ), f"channel_selection must be int32, got {sel_layer.dtype}"
+    assert (
+        w_layer.dtype == torch.float32
+    ), f"channel_weights must be float32, got {w_layer.dtype}"
+    assert (
+        req_pool_indices.dtype == torch.int32
+    ), f"req_pool_indices must be int32, got {req_pool_indices.dtype}"
+    assert (
+        req_to_token.dtype == torch.int32
+    ), f"req_to_token must be int32, got {req_to_token.dtype}"
+    assert (
+        seq_lens.dtype == torch.int32
+    ), f"seq_lens must be int32, got {seq_lens.dtype}"
 
     # NVTX ranges name the three DS-specific cost buckets (logical score /
     # score all-reduce / top-k select) so profiles can attribute them without
@@ -879,12 +900,14 @@ def retrieve_topk_graph_safe(
     # force-include — keep the copy-back.
     bf16_used = score_reduce_bf16 and scratch_scores_bf16 is not None
     bf16_authoritative = (
-        radix_topk_scratch is not None
-        and bf16_used
-        and anchor_mode == "off"
+        radix_topk_scratch is not None and bf16_used and anchor_mode == "off"
     )
     topk_scores = scores_view
-    if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
+    if (
+        process_group is not None
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
         torch.cuda.nvtx.range_push("ds_score_allreduce")
         reduced = reduce_token_scores(
             scores_view,
@@ -899,9 +922,9 @@ def retrieve_topk_graph_safe(
         torch.cuda.nvtx.range_pop()
 
     if per_request_valid is not None:
-        assert scratch_pv_mask is not None, (
-            "per_request_valid requires scratch_pv_mask in graph-safe path"
-        )
+        assert (
+            scratch_pv_mask is not None
+        ), "per_request_valid requires scratch_pv_mask in graph-safe path"
         pv_view = scratch_pv_mask[:bs, :max_seq_len]
         # copy_ handles dtype conversion in-place (no allocation when shapes match).
         pv_view.copy_(per_request_valid)
@@ -959,9 +982,9 @@ def retrieve_topk_graph_safe(
         # PyTorch's topk requires output indices NOT to alias input — aliasing
         # corrupts the read (observed: input [3, 1] → output values [0, 1]).
         # Route throwaway gather indices into a dedicated scratch.
-        assert scratch_throwaway_idx is not None, (
-            "scratch_throwaway_idx is required for the graph-safe topk pipeline"
-        )
+        assert (
+            scratch_throwaway_idx is not None
+        ), "scratch_throwaway_idx is required for the graph-safe topk pipeline"
         throwaway_view = scratch_throwaway_idx[:bs, :effective_k]
         torch.topk(
             topk_idx_view,
@@ -993,8 +1016,11 @@ def retrieve_topk_graph_safe(
     # replay reuses their memory (alloc-free on replay).
     if anchor_mode != "off" and anchor_budget > 0:
         a_idx, a_len = _force_include_anchor(
-            out_indices[:bs, :max_top_k], scores_view, seq_lens,
-            int(anchor_budget), anchor_mode,
+            out_indices[:bs, :max_top_k],
+            scores_view,
+            seq_lens,
+            int(anchor_budget),
+            anchor_mode,
         )
         out_indices[:bs, :max_top_k].copy_(a_idx)
         out_lengths[:bs].copy_(a_len)

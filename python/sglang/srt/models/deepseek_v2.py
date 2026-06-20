@@ -1834,7 +1834,10 @@ class DeepseekV2AttentionMLA(
         # attn_mha — was never given kv_b_proj. Attach it on attn_mqa too so the
         # DS decode layer has the same projection in scope as attn_mha (DS-only;
         # leaves non-DS behavior unchanged).
-        if self.use_double_sparsity and getattr(self.attn_mqa, "kv_b_proj", None) is None:
+        if (
+            self.use_double_sparsity
+            and getattr(self.attn_mqa, "kv_b_proj", None) is None
+        ):
             self.attn_mqa.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
@@ -1979,7 +1982,6 @@ class DeepseekV2AttentionMLA(
         TP-misconfig fail-fast check. After this method returns, the selector
         reports ``IS_PLACEHOLDER == False``.
         """
-        from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             slice_per_rank,
             verify_bind_shapes,
@@ -2055,6 +2057,7 @@ class DeepseekV2AttentionMLA(
         # leave it on by accident.
         if os.getenv("SGLANG_DS_FAULT_INJECT_CORRUPT_MASK") == "1":
             from dataclasses import replace as _replace
+
             sel = local_mask.channel_selection
             # Deterministic per-layer seed: layer_id keeps each layer
             # consistent across restarts but lets layers diverge.
@@ -2068,13 +2071,15 @@ class DeepseekV2AttentionMLA(
                 for _ in range(L * H):
                     perm = torch.randperm(head_dim, generator=gen, device=sel.device)
                     rows.append(perm[:label_dim])
-                corrupted = (
-                    torch.stack(rows, dim=0).view(L, H, label_dim).to(sel.dtype)
-                )
+                corrupted = torch.stack(rows, dim=0).view(L, H, label_dim).to(sel.dtype)
             else:
                 corrupted = torch.randint(
-                    low=0, high=head_dim, size=sel.shape,
-                    generator=gen, device=sel.device, dtype=sel.dtype,
+                    low=0,
+                    high=head_dim,
+                    size=sel.shape,
+                    generator=gen,
+                    device=sel.device,
+                    dtype=sel.dtype,
                 )
             local_mask = _replace(local_mask, channel_selection=corrupted)
             logger.warning(
@@ -2267,8 +2272,11 @@ class DeepseekV2AttentionMLA(
             )
             from sglang.srt.model_executor.forward_context import (
                 get_attn_backend as _get_attn_backend,
+            )
+            from sglang.srt.model_executor.forward_context import (
                 has_forward_context as _has_forward_context,
             )
+
             if _has_forward_context():
                 _fc_backend = _get_attn_backend()
                 if isinstance(_fc_backend, _TboAttnBackend):
@@ -2355,14 +2363,10 @@ class DeepseekV2AttentionMLA(
                     _fc_backend2 = _get_attn_backend()
                     if isinstance(_fc_backend2, _TboAttnBackend):
                         _fc_backend2 = _fc_backend2.primary
-                    _dsa_metadata = getattr(
-                        _fc_backend2, "forward_metadata", None
-                    )
+                    _dsa_metadata = getattr(_fc_backend2, "forward_metadata", None)
                 _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
                 if _ds_graph_state is None and _dsa_metadata is not None:
-                    _ds_graph_state = getattr(
-                        _dsa_metadata, "ds_graph_state", None
-                    )
+                    _ds_graph_state = getattr(_dsa_metadata, "ds_graph_state", None)
                 # All non-learned selector variants ride the graph-safe path —
                 # head_agg (mean) in the absorbed score kernel and anchor_mode
                 # (recency/global/strided) as a tensorized post-topK force-include
@@ -2377,9 +2381,10 @@ class DeepseekV2AttentionMLA(
                 # Selection always rides the production graph-safe path unless a
                 # non-graph-safe scorer variant or the explicit env override forces
                 # eager.
-                _force_eager_select = (
-                    os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
-                    or not _ds_scorer_is_graph_safe(getattr(_selector, "config", None))
+                _force_eager_select = os.environ.get(
+                    "SGLANG_DS_FORCE_EAGER_SELECT", "0"
+                ) == "1" or not _ds_scorer_is_graph_safe(
+                    getattr(_selector, "config", None)
                 )
                 # Graph-safe selection requires BOTH the bind-time absorbed
                 # projection AND the preallocated absorbed scratch (v_h /

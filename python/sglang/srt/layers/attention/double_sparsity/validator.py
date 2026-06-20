@@ -24,8 +24,6 @@ Enforces, at server startup:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -44,7 +42,7 @@ _BACKEND_BY_DTYPE = {
 }
 
 
-def validate_double_sparsity(server_args: "ServerArgs") -> None:
+def validate_double_sparsity(server_args: ServerArgs) -> None:
     """Validate ``--enable-double-sparsity`` constraints.
 
     Called from ``ServerArgs.check_server_args`` after ``validate_hisparse``.
@@ -202,9 +200,7 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                             model_topk,
                         )
         except ImportError:
-            logger.debug(
-                "get_dsa_index_topk not available; skipping top_k assertion."
-            )
+            logger.debug("get_dsa_index_topk not available; skipping top_k assertion.")
 
     # Channel-mask file existence + content-hash verification. The loader
     # raises DoubleSparsityChannelMaskMissing for absent files and

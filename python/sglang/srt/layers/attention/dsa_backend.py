@@ -199,8 +199,7 @@ class DSAMetadata:
     # an allocation-free Triton + topk + searchsorted pipeline. None when
     # DS is not in use (the path falls back to the allocating
     # `DoubleSparsitySelector.retrieve_topk`).
-    ds_graph_state: Optional["DSGraphState"] = None
-
+    ds_graph_state: Optional[DSGraphState] = None
 
 
 @torch.compile
@@ -361,9 +360,7 @@ class DeepseekSparseAttnBackend(
         # the DS adapter's out buffer without re-checking server_args
         # every batch.
         self.enable_double_sparsity: bool = bool(
-            getattr(
-                model_runner.server_args, "enable_double_sparsity", False
-            )
+            getattr(model_runner.server_args, "enable_double_sparsity", False)
         )
         self.ds_max_top_k: int = 2048
         # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
@@ -399,9 +396,7 @@ class DeepseekSparseAttnBackend(
                     getattr(ds_cfg, "selector_width_buckets", []) or []
                 )
                 self.ds_selector_width_overflow_policy = str(
-                    getattr(
-                        ds_cfg, "selector_width_overflow_policy", "full_fallback"
-                    )
+                    getattr(ds_cfg, "selector_width_overflow_policy", "full_fallback")
                 )
                 # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state.
                 self.ds_max_top_k = int(ds_cfg.top_k)
@@ -1368,7 +1363,7 @@ class DeepseekSparseAttnBackend(
             return int(variant_key[1])
         return int(self.req_to_token.shape[1])
 
-    def _ds_shared_graph_state(self, device) -> "DSGraphState":
+    def _ds_shared_graph_state(self, device) -> DSGraphState:
         """The per-WIDTH shared DSGraphState for graph capture/replay.
 
         One state per selector width serves every batch-size variant of that
@@ -1392,7 +1387,6 @@ class DeepseekSparseAttnBackend(
             )
             self._ds_graph_state_by_width[width] = state
         return state
-
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1853,7 +1847,9 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
-                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
+                self._write_token_labels(
+                    layer, cache_loc, k, forward_batch=forward_batch
+                )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -2107,7 +2103,9 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
-                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
+                self._write_token_labels(
+                    layer, cache_loc, k, forward_batch=forward_batch
+                )
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)

@@ -21,7 +21,7 @@ out of range for ``req_to_token`` (those rows are filled with ``-1``).
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -43,11 +43,11 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _logical_to_physical_kernel(
-        selected_ptr,       # [bs, max_top_k] int32 (logical positions, -1 padded)
-        rpi_ptr,            # [bs] int32 OR int64 (Triton casts on load)
-        rtt_ptr,            # [num_pools, max_seqlen] int32
-        out_ptr,            # [bs, max_top_k] int32 — written in place
-        err_ptr,            # [1] int32 — atomically accumulated error count
+        selected_ptr,  # [bs, max_top_k] int32 (logical positions, -1 padded)
+        rpi_ptr,  # [bs] int32 OR int64 (Triton casts on load)
+        rtt_ptr,  # [num_pools, max_seqlen] int32
+        out_ptr,  # [bs, max_top_k] int32 — written in place
+        err_ptr,  # [1] int32 — atomically accumulated error count
         num_pools: tl.constexpr,
         max_seqlen: tl.constexpr,
         bs: tl.constexpr,
@@ -64,7 +64,8 @@ if _TRITON_AVAILABLE:
 
         s = tl.load(
             selected_ptr + b * sel_stride_b + k_offs,
-            mask=k_in_range, other=-1,
+            mask=k_in_range,
+            other=-1,
         ).to(tl.int32)
         is_pad = s < 0
 
@@ -76,12 +77,14 @@ if _TRITON_AVAILABLE:
         safe_s = tl.maximum(s, 0).to(tl.int64)
         phys = tl.load(
             rtt_ptr + safe_pool * rtt_stride_p + safe_s,
-            mask=k_in_range, other=-1,
+            mask=k_in_range,
+            other=-1,
         ).to(tl.int32)
         result = tl.where(is_pad | bad_pool, tl.full(phys.shape, -1, tl.int32), phys)
         tl.store(
             out_ptr + b * out_stride_b + k_offs,
-            result, mask=k_in_range,
+            result,
+            mask=k_in_range,
         )
 
 
@@ -92,12 +95,14 @@ def _next_pow2(n: int) -> int:
 
 
 def logical_to_physical(
-    selected_indices: torch.Tensor,    # int32 [bs, max_top_k] logical positions, -1 padded
-    req_pool_indices: torch.Tensor,    # int32 or int64 [bs]
-    req_to_token: torch.Tensor,        # int32 [num_pools, max_seqlen]
-    out: torch.Tensor,                 # int32 [bs, max_top_k]  pre-allocated output
+    selected_indices: torch.Tensor,  # int32 [bs, max_top_k] logical positions, -1 padded
+    req_pool_indices: torch.Tensor,  # int32 or int64 [bs]
+    req_to_token: torch.Tensor,  # int32 [num_pools, max_seqlen]
+    out: torch.Tensor,  # int32 [bs, max_top_k]  pre-allocated output
     *,
-    error_scratch: Optional[torch.Tensor] = None,  # int32 [1] — required for CUDA fast path
+    error_scratch: Optional[
+        torch.Tensor
+    ] = None,  # int32 [1] — required for CUDA fast path
 ) -> int:
     """Convert logical token positions to physical KV-cache slot indices.
 
