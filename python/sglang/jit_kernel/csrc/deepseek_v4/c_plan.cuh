@@ -53,7 +53,7 @@ struct Prefill1Params {
   PlanW* plan_w;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // full_loc -> SWA loc for c4; ignored for c128
+  const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -69,7 +69,7 @@ struct DecodeParams {
   PlanD* plan_d;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // full_loc -> SWA loc for c4; ignored for c128
+  const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
   const IDX_T* seq_ptr;  // [batch_size]
   int64_t stride_r2t;
   uint32_t batch_size;

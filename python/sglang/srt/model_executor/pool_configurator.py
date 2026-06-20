@@ -523,10 +523,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_last_dim = 2 * attn_head_dim
 
         return (
-            state_rows
-            * state_last_dim
-            * c128_state_dtype_size
-            * self.num_layers_ca128
+            state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
     def _get_c128_state_fixed_bytes_for_token_capacity(

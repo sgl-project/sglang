@@ -244,8 +244,16 @@ struct OnlineC128MTPWritePrefixKernel {
     RuntimeCheck(layer_bs * num_verify_tokens <= kv_score_input.shape()[0], "kv_score_input is too small");
 
     launch(
-        kv_score_input, seq_lens, req_pool_indices, req_to_token, ape, state,
-        layer_bs, num_verify_tokens, state_slot_stride, device.unwrap());
+        kv_score_input,
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        ape,
+        state,
+        layer_bs,
+        num_verify_tokens,
+        state_slot_stride,
+        device.unwrap());
   }
 };
 
@@ -363,8 +371,15 @@ struct OnlineC128MTPCommitPendingKernel {
     RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
 
     launch(
-        cur_seq_lens, cur_req_pool_indices, req_to_token, pending_seq_lens,
-        state, cur_bs, num_verify_tokens, state_slot_stride, max_num_reqs,
+        cur_seq_lens,
+        cur_req_pool_indices,
+        req_to_token,
+        pending_seq_lens,
+        state,
+        cur_bs,
+        num_verify_tokens,
+        state_slot_stride,
+        max_num_reqs,
         device.unwrap());
   }
 };

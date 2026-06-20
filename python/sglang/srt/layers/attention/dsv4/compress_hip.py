@@ -365,8 +365,10 @@ class CompressorHip(_CompressorBase):
         )
         compress_indices.clamp_(min=-1)
         if self.ratio == 128:
-            compress_indices_state = state_pool.translate_from_req_position_to_state_loc(
-                req_pool_indices[:, None], compress_indices
+            compress_indices_state = (
+                state_pool.translate_from_req_position_to_state_loc(
+                    req_pool_indices[:, None], compress_indices
+                )
             )
         else:
             compress_indices_raw = torch.where(
