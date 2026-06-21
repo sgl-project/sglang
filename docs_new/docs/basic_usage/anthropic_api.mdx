@@ -73,10 +73,21 @@ client = Anthropic(
 
 message = client.messages.create(
     model="zai-org/GLM-5.2-FP8",
-    max_tokens=128,
+    max_tokens=512,
     messages=[{"role": "user", "content": "List 3 countries and their capitals."}],
 )
-print(message.content[0].text)
+# A reasoning model may emit a `thinking` block before the `text` block —
+# pick the text block rather than assuming content[0].
+print(next(b.text for b in message.content if b.type == "text"))
+```
+
+**Example Output:**
+```text Output
+Here are 3 countries and their capitals:
+
+1. **France** - Paris
+2. **Japan** - Tokyo
+3. **Brazil** - Brasília
 ```
 
 ### Streaming
@@ -86,11 +97,16 @@ Set `stream=True` to receive Server-Sent Events as they are produced.
 ```python Example
 with client.messages.stream(
     model="zai-org/GLM-5.2-FP8",
-    max_tokens=128,
+    max_tokens=512,
     messages=[{"role": "user", "content": "Say this is a test"}],
 ) as stream:
     for text in stream.text_stream:
         print(text, end="", flush=True)
+```
+
+**Example Output:**
+```text Output
+This is a test.
 ```
 
 ### System Prompt
@@ -101,10 +117,16 @@ API shape:
 ```python Example
 message = client.messages.create(
     model="zai-org/GLM-5.2-FP8",
-    max_tokens=128,
+    max_tokens=512,
     system="You are a helpful assistant that answers concisely.",
     messages=[{"role": "user", "content": "What is the capital of France?"}],
 )
+print(next(b.text for b in message.content if b.type == "text"))
+```
+
+**Example Output:**
+```text Output
+The capital of France is Paris.
 ```
 
 ### Tool Use
@@ -115,7 +137,7 @@ Tool definitions follow the Anthropic `tools` schema. When the server is launche
 ```python Example
 message = client.messages.create(
     model="zai-org/GLM-5.2-FP8",
-    max_tokens=256,
+    max_tokens=512,
     tools=[
         {
             "name": "get_weather",
@@ -129,6 +151,14 @@ message = client.messages.create(
     ],
     messages=[{"role": "user", "content": "What is the weather in Paris?"}],
 )
+print(message.stop_reason)
+print([b for b in message.content if b.type == "tool_use"])
+```
+
+**Example Output:**
+```text Output
+tool_use
+[ToolUseBlock(type='tool_use', id='toolu_01XXXX', name='get_weather', input={'city': 'Paris'})]
 ```
 
 ### Counting Tokens
@@ -143,6 +173,11 @@ resp = client.messages.count_tokens(
     messages=[{"role": "user", "content": "Hello, world"}],
 )
 print(resp.input_tokens)
+```
+
+**Example Output:**
+```text Output
+15
 ```
 
 ## Using Claude Code
