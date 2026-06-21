@@ -732,9 +732,13 @@ class MeshValidator(PerformanceValidator):
     pass
 
 
+# Pinned to a ci-data commit (not main): invalidates the per-URL download cache
+# whenever the reference is regenerated, and keeps the mesh GT reproducible.
+# Bump this SHA when pushing a new hunyuan3d.glb to ci-data.
 HUNYUAN3D_REFERENCE_URL = (
     "https://raw.githubusercontent.com/sgl-project/ci-data/"
-    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+    "395f6e49c37d22a57d79fbcd3653d43984099ae2"
+    "/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
 )
 
 
