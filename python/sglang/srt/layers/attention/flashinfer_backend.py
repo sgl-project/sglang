@@ -84,6 +84,7 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.page import get_seq_lens
 
     from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
 
@@ -173,6 +174,140 @@ global_workspace_buffer = None
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+
+def fast_prefill_plan(
+    self,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    page_size: int,
+    head_dim_vo: Optional[int] = None,
+    custom_mask: Optional[torch.Tensor] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    pos_encoding_mode: str = "NONE",
+    use_fp16_qk_reduction: bool = False,
+    sm_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    q_data_type: Union[str, torch.dtype] = "float16",
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    o_data_type: Optional[Union[str, torch.dtype]] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    prefix_len_ptr: Optional[torch.Tensor] = None,
+    token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+    token_pos_in_items_len: int = 0,
+    max_item_len_ptr: Optional[torch.Tensor] = None,
+    # sglang sync-free overrides: host-known metadata that lets us skip the
+    # per-replay device-to-host copies the upstream plan() always issues.
+    qo_indptr_host: Optional[torch.Tensor] = None,
+    kv_indptr_host: Optional[torch.Tensor] = None,
+    kv_lens_host: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    max_kv_len: Optional[int] = None,
+) -> None:
+    """A sync-free variant of ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the
+    EAGLE draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+
+    The upstream plan() unconditionally does ``qo_indptr.to("cpu")`` /
+    ``paged_kv_indptr.to("cpu")`` / ``paged_kv_last_page_len.to("cpu")`` to build
+    the host scheduling metadata; in graph replay that blocking D2H drains the GPU
+    queue every step. Draft-extend has a constant qo layout and a host-known kv
+    length (``seq_lens_cpu``), so the caller passes those in and we reach the
+    underlying ``_cached_module.plan`` directly without any host readback. The
+    produced ``_plan_info`` is identical to what plan() would build.
+    """
+    assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
+    assert (
+        getattr(self, "_backend", None) == "fa2"
+    ), "fast_prefill_plan supports the fa2 backend only"
+    assert (
+        getattr(self, "_cached_module", None) is not None
+    ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+
+    if head_dim_vo is None:
+        head_dim_vo = head_dim_qk
+    batch_size = len(paged_kv_last_page_len)
+
+    # Host scheduling metadata without any device-to-host copy. Fall back to the
+    # original .cpu() reads only if a host value was not supplied (keeps the
+    # function correct even off the fast path).
+    if qo_indptr_host is None:
+        qo_indptr_host = qo_indptr.to("cpu")
+    if kv_indptr_host is None:
+        kv_indptr_host = paged_kv_indptr.to("cpu")
+    if kv_lens_host is None:
+        last_page_len_host = paged_kv_last_page_len.to("cpu")
+        kv_lens_host = get_seq_lens(kv_indptr_host, last_page_len_host, page_size)
+
+    total_num_rows = int(qo_indptr_host[-1])
+    self._qo_indptr_last = total_num_rows
+    self._max_q_len = (
+        max_q_len
+        if max_q_len is not None
+        else int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max())
+    )
+    self._max_kv_len = max_kv_len if max_kv_len is not None else int(kv_lens_host.max())
+
+    if self._max_total_num_rows is None:
+        self._max_total_num_rows = total_num_rows
+
+    self._batch_size = batch_size
+    self._num_qo_heads = num_qo_heads
+    self._num_kv_heads = num_kv_heads
+    self._prefix_len_ptr = prefix_len_ptr
+    self._token_pos_in_items_ptr = token_pos_in_items_ptr
+    self._token_pos_in_items_len = token_pos_in_items_len
+    self._max_item_len_ptr = max_item_len_ptr
+
+    # Refresh the cuda-graph input buffers (device-to-device, non-blocking).
+    self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+    self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
+    self._paged_kv_last_page_len_buf.copy_(
+        paged_kv_last_page_len, non_blocking=non_blocking
+    )
+    self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+        paged_kv_indices,
+        non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
+    )
+
+    self._cached_q_data_type = q_data_type
+    self._cached_kv_data_type = (
+        kv_data_type if kv_data_type is not None else q_data_type
+    )
+    self._cached_o_data_type = o_data_type
+    self._block_tables = None
+
+    args = [
+        self._float_workspace_buffer,
+        self._int_workspace_buffer,
+        self._pin_memory_int_workspace_buffer,
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_lens_host,
+        self._max_total_num_rows or total_num_rows,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        self.is_cuda_graph_enabled,
+        head_dim_qk,
+        head_dim_vo,
+        causal,
+        window_left,
+        fixed_split_size if fixed_split_size is not None else -1,
+        False,  # disable_split_kv
+        0,  # num_colocated_ctas
+    ]
+    self._plan_info = self._cached_module.plan(*args)
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -592,6 +727,18 @@ class FlashInferAttnBackend(AttentionBackend):
             # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
+
+        if (
+            in_capture
+            and forward_mode.is_draft_extend_v2()
+            and self.prefill_backend == "fa2"
+            and self.indices_updater_prefill.page_size == 1
+        ):
+            # Same idea as decode: swap in the sync-free fast_prefill_plan for replay,
+            # after the initial real plan() above set up _cached_module. The host-known
+            # qo/kv metadata is supplied per-replay in call_begin_forward.
+            for w in self.draft_extend_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
@@ -1297,6 +1444,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
+        self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
@@ -1372,6 +1520,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
     def update_sliding_window(
@@ -1561,6 +1710,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1646,6 +1796,42 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        # Sync-free fast plan for the draft-extend cuda graph: when this paged wrapper
+        # has had begin_forward swapped for fast_prefill_plan, hand plan() the host-known
+        # qo/kv layout so it skips its per-replay device-to-host copies. Draft-extend has
+        # a constant qo (num_tokens_per_req per req) and a host-known kv length
+        # (seq_lens_cpu). Anything else falls back to the plain call (plan() does .cpu()).
+        paged_plan_kwargs = {}
+        num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
+        uses_fast_prefill = (
+            hasattr(wrapper_paged.begin_forward, "func")
+            and wrapper_paged.begin_forward.func is fast_prefill_plan
+        )
+        if (
+            uses_fast_prefill
+            and seq_lens_cpu is not None
+            and num_tokens_per_req is not None
+            and num_tokens_per_req > 0
+            and self.page_size == 1
+        ):
+            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            qo_indptr_host = torch.arange(
+                0,
+                (bs + 1) * num_tokens_per_req,
+                step=num_tokens_per_req,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            paged_plan_kwargs = dict(
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                kv_lens_host=seq_lens_cpu_i32,
+                max_q_len=num_tokens_per_req,
+                max_kv_len=int(seq_lens_cpu_i32.max()),
+            )
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -1664,6 +1850,7 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
+            **paged_plan_kwargs,
         )
 
 
