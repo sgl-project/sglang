@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -108,9 +108,15 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
-                interleaved=self.config.interleaved,
+                gate_up_interleaved=self.config.gate_up_interleaved,
             )
             return TritonRunnerOutput(hidden_states=out)
+
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
 
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
@@ -200,9 +206,14 @@ def fused_experts_none_to_triton(
             gemm1_alpha=runner_config.gemm1_alpha,
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
-            interleaved=runner_config.interleaved,
+            gate_up_interleaved=runner_config.gate_up_interleaved,
         )
     else:
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts,
         )

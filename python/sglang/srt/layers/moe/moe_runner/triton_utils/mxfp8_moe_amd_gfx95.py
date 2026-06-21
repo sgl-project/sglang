@@ -375,7 +375,7 @@ def fused_experts_mxfp8(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
-    interleaved: bool = True,
+    gate_up_interleaved: bool = True,
     expert_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
@@ -396,7 +396,7 @@ def fused_experts_mxfp8(
         raise NotImplementedError(
             "native MXFP8 MoE does not support apply_router_weight_on_input."
         )
-    if interleaved:
+    if gate_up_interleaved:
         raise NotImplementedError(
             "native MXFP8 MoE expects uninterleaved (split) gate/up layout."
         )
