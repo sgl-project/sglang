@@ -356,6 +356,10 @@ def is_tbo_enabled() -> bool:
     return IS_TBO_ENABLED
 
 
+def is_decode_tbo_enabled() -> bool:
+    return not envs.SGLANG_DISABLE_TBO_FOR_DECODE.get()
+
+
 def is_sbo_enabled() -> bool:
     global IS_SBO_ENABLED
     if IS_SBO_ENABLED is None:
