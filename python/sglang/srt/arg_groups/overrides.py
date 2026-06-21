@@ -1701,10 +1701,36 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
+        or view.prefill_attention_backend == "trtllm_mla"
     ):
-        if not is_blackwell_supported():
+        # trtllm_mla prefill (trtllm_ragged_attention_deepseek) has kernels only
+        # for SM100/SM103 (datacenter Blackwell); on SM120/SM121 (workstation/
+        # consumer Blackwell) it crashes inside FlashInfer with "Unsupported
+        # architecture". Decode auto-dispatches to xqa and works on all
+        # Blackwell, so gate prefill and decode separately (as trtllm_mha does
+        # at the legacy slot).
+        prefill_backend = (
+            view.prefill_attention_backend
+            if view.prefill_attention_backend is not None
+            else view.attention_backend
+        )
+        if prefill_backend == "trtllm_mla" and not is_sm100_supported():
             raise ValueError(
-                "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
+                "TRTLLM MLA backend for prefill is only supported on SM100/SM103 "
+                "(datacenter Blackwell, e.g. B200/B300); its kernels are not built "
+                "for SM120/SM121 (workstation/consumer Blackwell, e.g. RTX PRO 6000 "
+                "/ RTX 5090). Please use a different prefill attention backend "
+                "(e.g. --attention-backend flashinfer) on this GPU."
+            )
+        decode_backend = (
+            view.decode_attention_backend
+            if view.decode_attention_backend is not None
+            else view.attention_backend
+        )
+        if decode_backend == "trtllm_mla" and not is_blackwell_supported():
+            raise ValueError(
+                "TRTLLM MLA backend for decode is only supported on Blackwell GPUs "
+                "(SM100/SM103/SM120/SM121). Please use a different decode backend."
             )
         if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
             raise ValueError(
