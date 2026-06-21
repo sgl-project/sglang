@@ -13,23 +13,28 @@
 # ==============================================================================
 """Utilities for auto-deriving argparse CLI arguments from dataclass fields.
 
-Usage:
-    from typing import Annotated
-    from sglang.srt.arg_groups.arg_utils import Arg, add_cli_args_from_dataclass
+Usage::
+
+    from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
 
     @dataclasses.dataclass
     class ServerArgs:
-        model_path: Annotated[str, Arg(help="Path to model weights.")]
-        load_format: Annotated[str, Arg(
-            help="Weight format.", choices=["auto", "pt", "safetensors"],
-        )] = "auto"
-        skip_tokenizer_init: Annotated[bool, Arg(
-            help="Skip tokenizer initialization.",
-        )] = False
+        # Simple fields — bare string is the help text:
+        host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+        port: A[int, "The port of the HTTP server."] = 30000
+        trust_remote_code: A[bool, "Whether to allow custom models."] = False
+        tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
+
+        # Fields with extra metadata — use Arg(...):
+        model_path: A[str, Arg(help="Path to model weights.", aliases=["--model"])]
+        load_format: A[str, Arg(help="Format.", choices=CHOICES)] = "auto"
 
         @staticmethod
         def add_cli_args(parser):
             add_cli_args_from_dataclass(parser, ServerArgs)
+
+``A`` is a short alias for ``typing.Annotated``. A bare ``str`` inside the
+annotation is equivalent to ``Arg(help=that_string)``.
 """
 
 from __future__ import annotations
@@ -48,6 +53,8 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+
+A = Annotated
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,7 +83,11 @@ _MISSING = dataclasses.MISSING
 
 
 def _unwrap_annotated(tp):
-    """Return (inner_type, Arg | None) from ``Annotated[T, Arg(...)]``."""
+    """Return (inner_type, Arg | None) from ``Annotated[T, Arg(...)]``.
+
+    Also accepts a bare string as shorthand: ``Annotated[T, "help text"]``
+    is equivalent to ``Annotated[T, Arg(help="help text")]``.
+    """
     origin = get_origin(tp)
     if origin is Annotated:
         args = get_args(tp)
@@ -84,6 +95,8 @@ def _unwrap_annotated(tp):
         for a in args[1:]:
             if isinstance(a, Arg):
                 return inner, a
+            if isinstance(a, str):
+                return inner, Arg(help=a)
         return inner, None
     return tp, None
 
@@ -141,10 +154,10 @@ def _field_to_cli_name(name: str) -> str:
 
 
 def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = None):
-    """Add argparse arguments for every ``Annotated[T, Arg(...)]`` field on *cls*.
+    """Add argparse arguments for every ``A[T, "help"]`` or ``A[T, Arg(...)]`` field.
 
-    Fields without an ``Arg`` annotation are silently skipped — they must still
-    be registered manually (this allows incremental migration).
+    Fields without an ``Arg`` or bare-string annotation are silently skipped —
+    they must still be registered manually (this allows incremental migration).
 
     Parameters
     ----------
