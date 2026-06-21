@@ -1478,8 +1478,15 @@ def get_generate_fn(
                 if content_resp.status_code != 200:
                     pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
 
-                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
-                temp_path.write_bytes(content_resp.content)
+                content = content_resp.content
+                # Shape-only Hunyuan3D meshes are returned as OBJ, painted meshes
+                # as GLB. Pick the extension from the content magic so trimesh.load
+                # (which dispatches on the file extension) parses it correctly,
+                # instead of raising "incorrect header on GLB file" when an OBJ
+                # body is saved under a .glb name.
+                ext = ".glb" if content[:4] == b"glTF" else ".obj"
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}{ext}"
+                temp_path.write_bytes(content)
                 MESH_OUTPUT_PATHS[case_id] = str(temp_path)
 
                 logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
