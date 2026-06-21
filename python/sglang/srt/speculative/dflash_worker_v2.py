@@ -293,23 +293,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
-    def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
-
-    def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
-        if is_cuda() and capture_decode_cuda_graph:
+    def init_backends(self):
+        disable_cuda_graph = False
+        if is_cuda() and not self.server_args.disable_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            if available_mem < 1.0:
-                capture_decode_cuda_graph = False
+            disable_cuda_graph = available_mem < 1.0
+            if disable_cuda_graph:
                 logger.warning(
                     "Disable DFLASH draft cuda graph because only %.2f GB GPU "
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        self._draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
