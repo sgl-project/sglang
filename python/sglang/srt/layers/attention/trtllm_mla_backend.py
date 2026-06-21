@@ -869,11 +869,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
+        # eager_decode_metadata is sized at the static max_bs; for live bs
+        # below it (eager at a non-captured bs, e.g. bs=63 falling through
+        # the captured set [..., 64]) the bound block_kv_indices keeps
+        # max_bs rows even though only [:bs] is freshly filled. Flashinfer's
+        # `_check_trtllm_gen_mla_shape` asserts that query and block_table
+        # share batch_size, so pass the live-bs slice explicitly.
+        live_bs = query.shape[0]
         raw_out = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
-            block_tables=metadata.block_kv_indices,
-            seq_lens=forward_batch.seq_lens,
+            block_tables=metadata.block_kv_indices[:live_bs],
+            seq_lens=forward_batch.seq_lens[:live_bs],
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
         )
@@ -1036,11 +1043,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
+            # Same eager-bs-vs-static-buffer slicing rationale as plain decode
+            # above: the bound metadata may carry max_bs-sized rows even at
+            # live bs below the captured ceiling. q.shape[0] is the live bs
+            # here after the per-mode .view(bs, …, ...) reshape.
+            live_bs = q.shape[0]
             raw_out = self._run_decode_kernel(
                 query=q,
                 kv_cache=kv_cache,
-                block_tables=metadata.block_kv_indices,
-                seq_lens=metadata.seq_lens_k,
+                block_tables=metadata.block_kv_indices[:live_bs],
+                seq_lens=metadata.seq_lens_k[:live_bs],
                 max_seq_len=max_seq_len,
                 layer=layer,
             )
