@@ -541,6 +541,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        # Fires (on forward_stream) once a forward has finished READING the
+        # schedule-owned shared GPU buffers (req_to_token / seq_lens) during
+        # attention-metadata prep. The overlap-schedule WAR barrier waits on
+        # this instead of the whole forward, so the next iter's schedule writes
+        # overlap this forward's compute tail. Lazily created on first record.
+        self.sched_buffers_read_done = None
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -2857,6 +2863,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
+            self.record_sched_buffers_read_done()
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
@@ -2966,6 +2973,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
         return output
+
+    def record_sched_buffers_read_done(self):
+        """Mark, on forward_stream, that this forward has finished READING the
+        schedule-owned shared GPU buffers (req_to_token / seq_lens) during
+        attention-metadata prep.
+
+        Call right after init_forward_metadata (eager) / load_batch (graph),
+        before the model compute is enqueued: the recorded point must sit between
+        the metadata gather and the bulk forward so the overlap-schedule WAR
+        barrier waits only on the gather, not the whole forward. Must run on
+        forward_stream (the forward path is wrapped in forward_stream_ctx).
+
+        EVERY real forward must call this — a stale event from an earlier forward
+        gives the next iter's schedule writes no protection against this forward's
+        reads. Capture-time metadata init (cuda-graph capture) must NOT call it.
+        """
+        if self.sched_buffers_read_done is None:
+            self.sched_buffers_read_done = torch.get_device_module(self.device).Event()
+        self.sched_buffers_read_done.record(self.forward_stream)
 
     def _forward_raw(
         self,

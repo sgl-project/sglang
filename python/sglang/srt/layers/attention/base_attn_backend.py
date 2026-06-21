@@ -89,6 +89,15 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True if the backend pre-gathers req_to_token / seq_lens into private
+    # metadata buffers during init_forward_metadata (the read of the
+    # schedule-owned shared buffers finishes before the attention kernel runs).
+    # This lets the overlap-schedule WAR barrier wait on a fine-grained
+    # "metadata read done" event instead of the whole forward. Opt out (set
+    # False) for any backend that reads req_to_token live inside its kernel; the
+    # scheduler then falls back to the coarse wait_stream(forward_stream).
+    pregathers_page_table: bool = True
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on

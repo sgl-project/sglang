@@ -790,6 +790,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            # load_batch finished reading the schedule-owned shared buffers
+            # (req_to_token/seq_lens); mark it before the compute so the overlap
+            # WAR barrier overlaps the next schedule with this forward.
+            self.model_runner.record_sched_buffers_read_done()
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 

@@ -1224,6 +1224,24 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        # Fine-grained overlap-schedule WAR barrier: when every active attention
+        # backend pre-gathers req_to_token/seq_lens into private metadata buffers
+        # (read of the schedule-owned buffers finishes during init_forward_metadata),
+        # the barrier can wait on the forward's "metadata read done" event instead
+        # of the whole forward, letting schedule(N) writes overlap forward(N-1)'s
+        # compute tail. Restricted to the non-spec path (the draft worker forwards
+        # on a separate stream/event that this barrier does not track); spec keeps
+        # the coarse wait_stream. getattr default False -> any undeclared backend
+        # stays on the safe coarse path.
+        self._war_fine_grained = (
+            os.environ.get("SGLANG_WAR_FINE_GRAINED", "1") != "0"
+            and self.draft_worker is None
+            and all(
+                getattr(b, "pregathers_page_table", False)
+                for b in attn_backends
+                if b is not None
+            )
+        )
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
@@ -1469,6 +1487,27 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    def apply_war_barrier(self) -> None:
+        """Order this iter's schedule writes to shared GPU buffers after the
+        previous forward's reads of those buffers (write-after-read hazard on
+        req_to_token / new_seq_lens_buf). Shared by the overlap loop and both
+        disaggregation overlap loops.
+
+        Fine-grained path: wait only on the forward's metadata-read-done event,
+        so schedule(N) writes overlap forward(N-1)'s compute tail. Coarse
+        fallback: wait on the whole forward stream.
+        """
+        if not self._war_barrier_enabled:
+            return
+        if self._war_fine_grained:
+            event = self.tp_worker.model_runner.sched_buffers_read_done
+            # event is None only before the first forward records it; there is no
+            # prior forward to race with, so nothing to wait on.
+            if event is not None:
+                self.schedule_stream.wait_event(event)
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1516,8 +1555,7 @@ class Scheduler(
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self.apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()

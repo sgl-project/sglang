@@ -17,6 +17,10 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        # Only fine-grained-WAR-safe if every wrapped backend pre-gathers.
+        self.pregathers_page_table = getattr(
+            primary, "pregathers_page_table", False
+        ) and all(getattr(c, "pregathers_page_table", False) for c in children)
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):

@@ -979,6 +979,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # load_batch gathered req_to_token/seq_lens into the static metadata
+            # buffers; the captured graph reads only those. Mark the
+            # schedule-owned-buffer read as done before firing the graph so the
+            # overlap WAR barrier overlaps the next schedule with this compute.
+            self.model_runner.record_sched_buffers_read_done()
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):

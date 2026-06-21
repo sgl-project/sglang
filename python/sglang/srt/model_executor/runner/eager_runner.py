@@ -285,6 +285,7 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
+            model_runner.record_sched_buffers_read_done()
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
@@ -319,6 +320,7 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            model_runner.record_sched_buffers_read_done()
 
         cp_v2_active = is_cp_v2_active(forward_batch)
         forward_positions = forward_batch.positions
@@ -419,6 +421,7 @@ class EagerRunner(BaseRunner):
             if not model_runner.server_args.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            model_runner.record_sched_buffers_read_done()
         else:
             model_runner.attn_backend.forward_metadata = None
 
