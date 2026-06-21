@@ -45,19 +45,32 @@ def _fake_mooncake_modules(fake_store_cls, replicate_config_cls):
 def _fake_memory_pool_host_module():
     memory_pool_host = types.ModuleType("sglang.srt.mem_cache.memory_pool_host")
 
+    class MLATokenToKVPoolHost:
+        pass
+
+    memory_pool_host.MLATokenToKVPoolHost = MLATokenToKVPoolHost
+    return memory_pool_host
+
+
+def _fake_pool_host_module():
+    pool_host = types.ModuleType("sglang.srt.mem_cache.pool_host")
+
     class HostKVCache:
         pass
 
     class HostTensorAllocator:
         pass
 
-    class MLATokenToKVPoolHost:
-        pass
+    pool_host.HostKVCache = HostKVCache
+    pool_host.HostTensorAllocator = HostTensorAllocator
+    return pool_host
 
-    memory_pool_host.HostKVCache = HostKVCache
-    memory_pool_host.HostTensorAllocator = HostTensorAllocator
-    memory_pool_host.MLATokenToKVPoolHost = MLATokenToKVPoolHost
-    return memory_pool_host
+
+def _fake_host_pool_modules():
+    return {
+        "sglang.srt.mem_cache.memory_pool_host": _fake_memory_pool_host_module(),
+        "sglang.srt.mem_cache.pool_host": _fake_pool_host_module(),
+    }
 
 
 def _fake_store_class():
@@ -245,7 +258,7 @@ def _make_store(
         "sys.modules",
         {
             **_fake_mooncake_modules(fake_store_cls, replicate_config_cls),
-            "sglang.srt.mem_cache.memory_pool_host": _fake_memory_pool_host_module(),
+            **_fake_host_pool_modules(),
         },
     ):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -262,10 +275,13 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         fake_store_cls = _fake_store_class()
         with patch.dict(
             "sys.modules",
-            _fake_mooncake_modules(
-                fake_store_cls,
-                ReplicateConfigWithClassGroupIdsAndRequiredInit,
-            ),
+            {
+                **_fake_mooncake_modules(
+                    fake_store_cls,
+                    ReplicateConfigWithClassGroupIdsAndRequiredInit,
+                ),
+                **_fake_host_pool_modules(),
+            },
         ):
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeBaseStore,
