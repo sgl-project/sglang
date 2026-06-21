@@ -544,46 +544,250 @@ class ServerArgs:
     ] = False
 
     # Quantization and data type
-    dtype: str = "auto"
-    quantization: Optional[str] = None
-    quantization_param_path: Optional[str] = None
-    kv_cache_dtype: str = "auto"
-    enable_fp32_lm_head: bool = False
-    modelopt_quant: Optional[Union[str, Dict]] = None
-    modelopt_checkpoint_restore_path: Optional[str] = None
-    modelopt_checkpoint_save_path: Optional[str] = None
-    modelopt_export_path: Optional[str] = None
-    quantize_and_serve: bool = False
-    rl_quant_profile: Optional[str] = None  # For flash_rl load format
+    dtype: A[
+        str,
+        Arg(
+            help=(
+                "Data type for model weights and activations.\n\n"
+                '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+                "BF16 precision for BF16 models.\n"
+                '* "half" for FP16. Recommended for AWQ quantization.\n'
+                '* "float16" is the same as "half".\n'
+                '* "bfloat16" for a balance between precision and range.\n'
+                '* "float" is shorthand for FP32 precision.\n'
+                '* "float32" for FP32 precision.'
+            ),
+            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+        ),
+    ] = "auto"
+    quantization: A[
+        Optional[str],
+        Arg(help="The quantization method.", choices=QUANTIZATION_CHOICES),
+    ] = None
+    quantization_param_path: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Path to the JSON file containing the KV cache scaling factors. "
+                "This should generally be supplied, when KV cache dtype is FP8. "
+                "Otherwise, KV cache scaling factors default to 1.0, which may "
+                "cause accuracy issues. "
+            ),
+            type_parser=nullable_str,
+        ),
+    ] = None
+    kv_cache_dtype: A[
+        str,
+        Arg(
+            help=(
+                'Data type for kv cache storage. "auto" will use model data type. '
+                '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
+                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
+                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+            ),
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+        ),
+    ] = "auto"
+    enable_fp32_lm_head: A[
+        bool, "If set, the LM head outputs (logits) are in FP32."
+    ] = False
+    modelopt_quant: A[
+        Optional[Union[str, Dict]],
+        (
+            "The ModelOpt quantization configuration. Supported values: 'fp8', "
+            "'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. This requires the "
+            "NVIDIA Model Optimizer library to be installed: pip install "
+            "nvidia-modelopt"
+        ),
+    ] = None
+    modelopt_checkpoint_restore_path: A[
+        Optional[str],
+        (
+            "Path to restore a previously saved ModelOpt quantized checkpoint. "
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint."
+        ),
+    ] = None
+    modelopt_checkpoint_save_path: A[
+        Optional[str],
+        (
+            "Path to save the ModelOpt quantized checkpoint after quantization. "
+            "This allows reusing the quantized model in future runs."
+        ),
+    ] = None
+    modelopt_export_path: A[
+        Optional[str],
+        (
+            "Path to export the quantized model in HuggingFace format after "
+            "ModelOpt quantization. The exported model can then be used directly "
+            "with SGLang for inference. If not provided, the model will not be "
+            "exported."
+        ),
+    ] = None
+    quantize_and_serve: A[
+        bool,
+        (
+            "Quantize the model with ModelOpt and immediately serve it without "
+            "exporting. This is useful for development and prototyping. For "
+            "production, it's recommended to use separate quantization and "
+            "deployment steps."
+        ),
+    ] = False
+    rl_quant_profile: A[
+        Optional[str],
+        "Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
+    ] = None  # For flash_rl load format
 
     # Memory and scheduling
-    mem_fraction_static: Optional[float] = None
-    max_running_requests: Optional[int] = None
-    max_queued_requests: Optional[int] = None
-    max_total_tokens: Optional[int] = None
-    chunked_prefill_size: Optional[int] = None
-    enable_dynamic_chunking: bool = False
-    max_prefill_tokens: int = 16384
-    prefill_max_requests: Optional[int] = None
-    schedule_policy: str = "fcfs"
-    enable_priority_scheduling: bool = False
-    disable_priority_preemption: bool = False
-    default_priority_value: Optional[int] = None
-    abort_on_priority_when_disabled: bool = False
-    schedule_low_priority_values_first: bool = False
-    priority_scheduling_preemption_threshold: int = 10
-    schedule_conservativeness: float = 1.0
-    page_size: Optional[int] = None
-    swa_full_tokens_ratio: float = 0.8
-    disable_hybrid_swa_memory: bool = False
-    radix_eviction_policy: str = "lru"
-    enable_prefill_delayer: bool = False
-    prefill_delayer_max_delay_passes: int = 30
-    prefill_delayer_token_usage_low_watermark: Optional[float] = None
-    prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
-    prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
-    prefill_delayer_queue_min_ratio: Optional[float] = None
-    prefill_delayer_max_delay_ms: Optional[float] = None
+    mem_fraction_static: A[
+        Optional[float],
+        "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+    ] = None
+    max_running_requests: A[
+        Optional[int], "The maximum number of running requests."
+    ] = None
+    max_queued_requests: A[
+        Optional[int],
+        "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+    ] = None
+    max_total_tokens: A[
+        Optional[int],
+        Arg(
+            help=(
+                "The maximum number of tokens in the memory pool. If not "
+                "specified, it will be automatically calculated based on the "
+                "memory usage fraction. This option is typically used for "
+                "development and debugging purposes."
+                + f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    chunked_prefill_size: A[
+        Optional[int],
+        "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+    ] = None
+    enable_dynamic_chunking: A[
+        bool,
+        "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+    ] = False
+    max_prefill_tokens: A[
+        int,
+        Arg(
+            help=(
+                "The maximum number of tokens in a prefill batch. The real bound "
+                "will be the maximum of this value and the model's maximum "
+                "context length." + f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = 16384
+    prefill_max_requests: A[
+        Optional[int],
+        "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+    ] = None
+    schedule_policy: A[
+        str,
+        Arg(
+            help="The scheduling policy of the requests.",
+            choices=[
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+            ],
+        ),
+    ] = "fcfs"
+    enable_priority_scheduling: A[
+        bool,
+        "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+    ] = False
+    disable_priority_preemption: A[bool, "Disable priority scheduling preemption."] = (
+        False
+    )
+    default_priority_value: A[
+        Optional[int], "Default priority for requests without explicit priority."
+    ] = None
+    abort_on_priority_when_disabled: A[
+        bool,
+        "If set, abort requests that specify a priority when priority scheduling is disabled.",
+    ] = False
+    schedule_low_priority_values_first: A[
+        bool,
+        "If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
+    ] = False
+    priority_scheduling_preemption_threshold: A[
+        int,
+        "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+    ] = 10
+    schedule_conservativeness: A[
+        float,
+        "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+    ] = 1.0
+    page_size: A[Optional[int], "The number of tokens in a page."] = None
+    swa_full_tokens_ratio: A[
+        float,
+        (
+            "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
+            "of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
+            "layer has 100 tokens."
+        ),
+    ] = 0.8
+    disable_hybrid_swa_memory: A[bool, "Disable the hybrid SWA memory pool."] = False
+    radix_eviction_policy: A[
+        str,
+        Arg(
+            help=(
+                "The eviction policy of radix trees. 'lru' stands for Least "
+                "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
+                "stands for Segmented Least Recently Used, and 'priority' evicts "
+                "lower-priority requests first."
+            ),
+            choices=RADIX_EVICTION_POLICY_CHOICES,
+        ),
+    ] = "lru"
+
+    # Prefill delayer
+    enable_prefill_delayer: A[
+        bool, "Enable prefill delayer for DP attention to reduce idle time."
+    ] = False
+    prefill_delayer_max_delay_passes: A[
+        int, "Maximum forward passes to delay prefill."
+    ] = 30
+    prefill_delayer_token_usage_low_watermark: A[
+        Optional[float], "Token usage low watermark for prefill delayer."
+    ] = None
+    prefill_delayer_forward_passes_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
+    ] = None
+    prefill_delayer_wait_seconds_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+    ] = None
+    prefill_delayer_queue_min_ratio: A[
+        Optional[float],
+        (
+            "Opt-in to the adaptive queue-based delay trigger (independent of the "
+            "slot-based one). Delays prefill until the waiting queue reaches "
+            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
+            "into a larger prefill. Unset (default) keeps the original slot-only "
+            "behavior. Typical: 0.1 ~ 0.5."
+        ),
+    ] = None
+    prefill_delayer_max_delay_ms: A[
+        Optional[float],
+        (
+            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
+            "prefill is force-released to bound worst-case TTFT. Only consulted "
+            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
+            "5000; defaults to 5000 if unset."
+        ),
+    ] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -678,8 +882,27 @@ class ServerArgs:
     asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
-    dp_size: int = 1
-    load_balance_method: str = "auto"
+    dp_size: A[
+        int,
+        Arg(
+            help="The data parallelism size.",
+            cli_name="--data-parallel-size",
+            aliases=["--dp-size"],
+        ),
+    ] = 1
+    load_balance_method: A[
+        str,
+        Arg(
+            help="The load balancing strategy for data parallelism.",
+            choices=[
+                "auto",
+                "round_robin",
+                "follow_bootstrap_room",
+                "total_requests",
+                "total_tokens",
+            ],
+        ),
+    ] = "auto"
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
@@ -4862,289 +5085,6 @@ class ServerArgs:
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
-        # Quantization and data type
-        parser.add_argument(
-            "--dtype",
-            type=str,
-            default=ServerArgs.dtype,
-            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
-            help="Data type for model weights and activations.\n\n"
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            "BF16 precision for BF16 models.\n"
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.',
-        )
-        parser.add_argument(
-            "--quantization",
-            type=str,
-            default=ServerArgs.quantization,
-            choices=QUANTIZATION_CHOICES,
-            help="The quantization method.",
-        )
-        parser.add_argument(
-            "--quantization-param-path",
-            type=nullable_str,
-            default=None,
-            help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
-        )
-        parser.add_argument(
-            "--kv-cache-dtype",
-            type=str,
-            default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
-        )
-        parser.add_argument(
-            "--enable-fp32-lm-head",
-            action="store_true",
-            help="If set, the LM head outputs (logits) are in FP32.",
-        )
-        parser.add_argument(
-            "--modelopt-quant",
-            type=str,
-            default=ServerArgs.modelopt_quant,
-            help="The ModelOpt quantization configuration. "
-            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
-            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
-        )
-        parser.add_argument(
-            "--modelopt-checkpoint-restore-path",
-            type=str,
-            default=ServerArgs.modelopt_checkpoint_restore_path,
-            help="Path to restore a previously saved ModelOpt quantized checkpoint. "
-            "If provided, the quantization process will be skipped and the model "
-            "will be loaded from this checkpoint.",
-        )
-        parser.add_argument(
-            "--modelopt-checkpoint-save-path",
-            type=str,
-            default=ServerArgs.modelopt_checkpoint_save_path,
-            help="Path to save the ModelOpt quantized checkpoint after quantization. "
-            "This allows reusing the quantized model in future runs.",
-        )
-        parser.add_argument(
-            "--modelopt-export-path",
-            type=str,
-            default=ServerArgs.modelopt_export_path,
-            help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
-            "The exported model can then be used directly with SGLang for inference. "
-            "If not provided, the model will not be exported.",
-        )
-        parser.add_argument(
-            "--quantize-and-serve",
-            action="store_true",
-            default=ServerArgs.quantize_and_serve,
-            help="Quantize the model with ModelOpt and immediately serve it without exporting. "
-            "This is useful for development and prototyping. For production, it's recommended "
-            "to use separate quantization and deployment steps.",
-        )
-        parser.add_argument(
-            "--rl-quant-profile",
-            type=str,
-            default=ServerArgs.rl_quant_profile,
-            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
-        )
-
-        # Memory and scheduling
-        parser.add_argument(
-            "--mem-fraction-static",
-            type=float,
-            default=ServerArgs.mem_fraction_static,
-            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
-        )
-        parser.add_argument(
-            "--max-running-requests",
-            type=int,
-            default=ServerArgs.max_running_requests,
-            help="The maximum number of running requests.",
-        )
-        parser.add_argument(
-            "--max-queued-requests",
-            type=int,
-            default=ServerArgs.max_queued_requests,
-            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
-        )
-        parser.add_argument(
-            "--max-total-tokens",
-            type=human_readable_int,
-            default=ServerArgs.max_total_tokens,
-            help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-            "This option is typically used for development and debugging purposes."
-            + f"\n\n{human_readable_int.__doc__}",
-        )
-        parser.add_argument(
-            "--chunked-prefill-size",
-            type=int,
-            default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
-        )
-        parser.add_argument(
-            "--prefill-max-requests",
-            type=int,
-            default=ServerArgs.prefill_max_requests,
-            help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
-        )
-        parser.add_argument(
-            "--enable-dynamic-chunking",
-            action="store_true",
-            default=ServerArgs.enable_dynamic_chunking,
-            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
-        )
-        parser.add_argument(
-            "--max-prefill-tokens",
-            type=human_readable_int,
-            default=ServerArgs.max_prefill_tokens,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
-            + f"\n\n{human_readable_int.__doc__}",
-        )
-        parser.add_argument(
-            "--schedule-policy",
-            type=str,
-            default=ServerArgs.schedule_policy,
-            choices=[
-                "lpm",
-                "random",
-                "fcfs",
-                "dfs-weight",
-                "lof",
-                "priority",
-                "routing-key",
-            ],
-            help="The scheduling policy of the requests.",
-        )
-        parser.add_argument(
-            "--enable-priority-scheduling",
-            action="store_true",
-            default=ServerArgs.enable_priority_scheduling,
-            help="Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
-        )
-        parser.add_argument(
-            "--disable-priority-preemption",
-            action="store_true",
-            default=ServerArgs.disable_priority_preemption,
-            help="Disable priority scheduling preemption.",
-        )
-        parser.add_argument(
-            "--default-priority-value",
-            type=int,
-            default=ServerArgs.default_priority_value,
-            help="Default priority for requests without explicit priority.",
-        )
-        parser.add_argument(
-            "--abort-on-priority-when-disabled",
-            action="store_true",
-            default=ServerArgs.abort_on_priority_when_disabled,
-            help="If set, abort requests that specify a priority when priority scheduling is disabled.",
-        )
-        parser.add_argument(
-            "--schedule-low-priority-values-first",
-            action="store_true",
-            default=ServerArgs.schedule_low_priority_values_first,
-            help="If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
-        )
-        parser.add_argument(
-            "--priority-scheduling-preemption-threshold",
-            type=int,
-            default=ServerArgs.priority_scheduling_preemption_threshold,
-            help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
-        )
-        parser.add_argument(
-            "--schedule-conservativeness",
-            type=float,
-            default=ServerArgs.schedule_conservativeness,
-            help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
-        )
-        parser.add_argument(
-            "--page-size",
-            type=int,
-            default=ServerArgs.page_size,
-            help="The number of tokens in a page.",
-        )
-        parser.add_argument(
-            "--hybrid-kvcache-ratio",
-            action=DeprecatedAction,
-            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
-        )
-        parser.add_argument(
-            "--swa-full-tokens-ratio",
-            type=float,
-            default=ServerArgs.swa_full_tokens_ratio,
-            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
-            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
-        )
-        parser.add_argument(
-            "--disable-hybrid-swa-memory",
-            action="store_true",
-            help="Disable the hybrid SWA memory pool.",
-        )
-        parser.add_argument(
-            "--radix-eviction-policy",
-            type=str,
-            choices=RADIX_EVICTION_POLICY_CHOICES,
-            default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
-        )
-        parser.add_argument(
-            "--enable-prefill-delayer",
-            action="store_true",
-            help="Enable prefill delayer for DP attention to reduce idle time.",
-        )
-        parser.add_argument(
-            "--prefill-delayer-max-delay-passes",
-            type=int,
-            default=ServerArgs.prefill_delayer_max_delay_passes,
-            help="Maximum forward passes to delay prefill.",
-        )
-        parser.add_argument(
-            "--prefill-delayer-token-usage-low-watermark",
-            type=float,
-            default=None,
-            help="Token usage low watermark for prefill delayer.",
-        )
-        parser.add_argument(
-            "--prefill-delayer-forward-passes-buckets",
-            type=float,
-            nargs="+",
-            default=None,
-            help="Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
-        )
-        parser.add_argument(
-            "--prefill-delayer-wait-seconds-buckets",
-            type=float,
-            nargs="+",
-            default=None,
-            help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
-        )
-        parser.add_argument(
-            "--prefill-delayer-queue-min-ratio",
-            type=float,
-            default=None,
-            help=(
-                "Opt-in to the adaptive queue-based delay trigger (independent of the "
-                "slot-based one). Delays prefill until the waiting queue reaches "
-                "min(running_req * ratio, max_prefill_bs) so small fragments batch into a "
-                "larger prefill. Unset (default) keeps the original slot-only behavior. "
-                "Typical: 0.1 ~ 0.5."
-            ),
-        )
-        parser.add_argument(
-            "--prefill-delayer-max-delay-ms",
-            type=float,
-            default=None,
-            help=(
-                "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill "
-                "is force-released to bound worst-case TTFT. Only consulted when "
-                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000; defaults to "
-                "5000 if unset."
-            ),
-        )
-
         # Runtime options
         parser.add_argument(
             "--device",
@@ -5667,27 +5607,7 @@ class ServerArgs:
             "Default 32.",
         )
 
-        # Data parallelism
-        parser.add_argument(
-            "--data-parallel-size",
-            "--dp-size",
-            type=int,
-            default=ServerArgs.dp_size,
-            help="The data parallelism size.",
-        )
-        parser.add_argument(
-            "--load-balance-method",
-            type=str,
-            default=ServerArgs.load_balance_method,
-            help="The load balancing strategy for data parallelism.",
-            choices=[
-                "auto",
-                "round_robin",
-                "follow_bootstrap_room",
-                "total_requests",
-                "total_tokens",
-            ],
-        )
+        # Data parallelism deprecated aliases
         parser.add_argument(
             "--prefill-round-robin-balance",
             action=DeprecatedAction,
