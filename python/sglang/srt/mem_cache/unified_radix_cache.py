@@ -2361,18 +2361,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
-        if self.pp_rank == 0:
+        has_local_work = len(self.ongoing_write_through) > 0
+        if self.pp_rank == 0 and has_local_work:
             for _, finish_event, ack_list in cc.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
+        elif self.pp_rank == 0:
+            finish_count = 2**30
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        if finish_count == 2**30:
+            finish_count = 0
 
         # Process completed acks
-        while finish_count > 0:
+        while finish_count > 0 and cc.ack_write_queue:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
@@ -2387,16 +2392,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        if self.pp_rank == 0:
+        has_local_work = len(self.ongoing_load_back) > 0
+        if self.pp_rank == 0 and has_local_work:
             for _, finish_event, ack_list in cc.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
+        elif self.pp_rank == 0:
+            finish_count = 2**30
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        if finish_count == 2**30:
+            finish_count = 0
 
-        while finish_count > 0:
+        while finish_count > 0 and cc.ack_load_queue:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:

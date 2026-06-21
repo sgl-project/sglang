@@ -920,18 +920,23 @@ class HiRadixCache(RadixCache):
         # host memory pressure), so a conditional skip desyncs the NCCL op
         # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
-        if self.pp_rank == 0:
+        has_local_work = len(self.ongoing_write_through) > 0
+        if self.pp_rank == 0 and has_local_work:
             for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
+        elif self.pp_rank == 0:
+            finish_count = 2**30
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        if finish_count == 2**30:
+            finish_count = 0
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
-        while finish_count > 0:
+        while finish_count > 0 and self.cache_controller.ack_write_queue:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
@@ -940,18 +945,23 @@ class HiRadixCache(RadixCache):
 
     def loading_check(self):
         finish_count = 0
-        if self.pp_rank == 0:
+        has_local_work = len(self.ongoing_load_back) > 0
+        if self.pp_rank == 0 and has_local_work:
             for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
+        elif self.pp_rank == 0:
+            finish_count = 2**30
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        if finish_count == 2**30:
+            finish_count = 0
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
-        while finish_count > 0:
+        while finish_count > 0 and self.cache_controller.ack_load_queue:
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
