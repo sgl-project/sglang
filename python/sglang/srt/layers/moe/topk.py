@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -136,14 +138,6 @@ _is_musa = is_musa()
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
-
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -1149,31 +1143,29 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
-if _HAS_TRITON:
-
-    @triton.jit
-    def _fill_padded_rows_kernel(
-        out_ptr,
-        num_token_non_padded_ptr,
-        n_cols,
-        fill_value,
-        stride_row,
-        BLOCK_COLS: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        n_valid = tl.load(num_token_non_padded_ptr)
-        if row >= n_valid:
-            cols = tl.arange(0, BLOCK_COLS)
-            mask = cols < n_cols
-            ptrs = out_ptr + row * stride_row + cols
-            fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
-            tl.store(ptrs, fill, mask=mask)
+@triton.jit
+def _fill_padded_rows_kernel(
+    out_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        ptrs = out_ptr + row * stride_row + cols
+        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        tl.store(ptrs, fill, mask=mask)
 
 
 def _can_fuse_padded_region(x: torch.Tensor) -> bool:
     # The fused kernel uses one program per row and assumes a row-major 2D
     # tensor (columns contiguous); fall back to eager for anything else.
-    return _HAS_TRITON and x.dim() == 2 and x.stride(1) == 1
+    return x.dim() == 2 and x.stride(1) == 1
 
 
 def _fill_padded_rows(
