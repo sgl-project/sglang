@@ -78,6 +78,24 @@ class TestFrozenKVMTP(CustomTestCase):
         ] + cls._common_server_args()
 
     @classmethod
+    def _server_args_eager(cls) -> list[str]:
+        # num_steps=1 causes the frozen-KV CUDA-graph runner to skip graph
+        # capture, forcing every draft call through the eager (EagerRunner)
+        # path — which is the path that exposed the stale out_cache_loc bug.
+        return [
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-draft-model-path",
+            "google/gemma-4-E4B-it-assistant",
+            "--speculative-num-steps",
+            "1",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "2",
+        ] + cls._common_server_args()
+
+    @classmethod
     def _gsm8k_args(cls) -> SimpleNamespace:
         return SimpleNamespace(
             base_url=cls.base_url,
@@ -151,6 +169,55 @@ class TestFrozenKVMTP(CustomTestCase):
         for topk in (1, 3):
             with self.subTest(topk=topk):
                 self._run_gsm8k_mtp(topk)
+
+    def test_eager_path_no_crash(self) -> None:
+        """Regression for #28264: eager draft path must not crash with stale out_cache_loc.
+
+        EagleDraftInputV2Mixin.prepare_for_decode() allocates new target KV
+        slots but never assigns them to batch.out_cache_loc, leaving it shaped
+        [prefill_len] from the extend step.  On the first decode call
+        EagerRunner.load_batch computes raw_num_tokens = input_ids.shape[0] = bs
+        and CudaGraphBufferRegistry.fill_from tries to copy out_cache_loc[:bs]
+        <- stale out_cache_loc, causing a shape-mismatch RuntimeError.
+
+        The fix resets forward_batch.out_cache_loc to zeros of shape [batch_size]
+        in FrozenKVMTPDraftWorker.draft() after _expand_for_topk_draft().
+        """
+        process = None
+        data = None
+        avg_accept = None
+        try:
+            process = popen_launch_server(
+                "google/gemma-4-E4B-it",
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+                other_args=self._server_args_eager(),
+            )
+            # Multi-token prompt ensures prefill_len >> 1 so the stale shape
+            # mismatch ([1] vs [prefill_len]) would trigger without the fix.
+            resp = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": (
+                        "Explain how speculative decoding improves LLM inference "
+                        "throughput while preserving the output distribution."
+                    ),
+                    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            avg_accept = get_avg_spec_accept_length(self.base_url)
+        finally:
+            if process is not None:
+                self._stop_process(process)
+
+        self.assertIn("text", data, "Response missing 'text' field")
+        self.assertGreater(len(data.get("text", "")), 0, "Expected non-empty output")
+        # With num_steps=1, topk=1 the bonus token is always accepted: floor is 1.0.
+        if avg_accept is not None:
+            self.assertGreaterEqual(avg_accept, 1.0, "Accept length below minimum")
 
 
 if __name__ == "__main__":

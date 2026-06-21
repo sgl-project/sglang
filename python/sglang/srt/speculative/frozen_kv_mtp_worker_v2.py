@@ -434,6 +434,17 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
+        # batch.out_cache_loc may hold the stale extend-step allocation (e.g.
+        # shape [prefill_len]) because eagle_info_v2.prepare_for_decode allocates
+        # new target slots but does not update batch.out_cache_loc.  The frozen
+        # draft reads target KV via _target_kv_pool_view and never writes new KV
+        # entries, so the values don't matter — only the shape does.  Set it to
+        # batch_size (= bs * topk after expansion) so load_batch's
+        # raw_num_tokens copy succeeds.
+        forward_batch.out_cache_loc = forward_batch.seq_lens.new_zeros(
+            forward_batch.batch_size
+        )
+
         can_run_cuda_graph = (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run_graph(forward_batch)
