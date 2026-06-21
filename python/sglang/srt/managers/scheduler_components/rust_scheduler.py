@@ -80,6 +80,8 @@ class RustServer:
             cores=cores,
             tokenizer_path=tokenizer_path,
             tokenizer_revision=server_args.revision,
+            tokenizer_threads=server_args.tokenizer_worker_num,
+            detok_shards=server_args.detokenizer_worker_num,
             server_args_json=cls._build_server_args(scheduler),
         )
         logger.info(
