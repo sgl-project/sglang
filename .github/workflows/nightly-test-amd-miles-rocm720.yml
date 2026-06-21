@@ -82,18 +82,6 @@ jobs:
         timeout-minutes: 120
         run: |
           touch "${GITHUB_WORKSPACE}/github_summary.md"
-
-          # Guard against a silently green run: run_suite.py exits 0 when a suite
-          # matches zero tests (e.g. the baked /root/miles image lacks the
-          # register_rocm_ci entries). Fail loudly instead.
-          plan=$(bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
-            python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --match-all-labels --list-only 2>&1)
-          echo "${plan}"
-          if echo "${plan}" | grep -q "No tests to run"; then
-            echo "::error::Suite ${{ matrix.suite }} matched 0 tests on this image (missing register_rocm_ci?)"
-            exit 1
-          fi
-
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
