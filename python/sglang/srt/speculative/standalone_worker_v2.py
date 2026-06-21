@@ -131,17 +131,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_token_map()
         self.init_lm_head()
 
-    def init_attention_backends(self):
+    def init_backends(self):
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context():
-            super().init_attention_backends()
-
-    def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
-            super().init_cuda_graphs()
+            super().init_backends()
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""
