@@ -388,15 +388,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
-            self.draft_extend_attn_backend,
-            (
-                TritonAttnBackend,
-                FlashInferAttnBackend,
-                TRTLLMMLABackend,
-                TRTLLMHAAttnBackend,
-                TokenspeedMLABackend,
-            ),
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
+            isinstance(
+                self.draft_extend_attn_backend,
+                (
+                    TritonAttnBackend,
+                    TRTLLMMLABackend,
+                    TRTLLMHAAttnBackend,
+                    TokenspeedMLABackend,
+                ),
+            )
+            # FlashInfer draft-extend graph does not support a reduced draft vocab
+            # (speculative_token_map / FR-Spec); fall back to eager in that case.
+            or (
+                isinstance(self.draft_extend_attn_backend, FlashInferAttnBackend)
+                and self.server_args.speculative_token_map is None
+            )
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
