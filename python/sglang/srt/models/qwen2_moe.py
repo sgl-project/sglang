@@ -942,7 +942,7 @@ class Qwen2MoeModel(nn.Module):
             ):
                 if get_moe_expert_parallel_world_size() > 1:
                     hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                elif get_moe_tensor_parallel_world_size() > 1:
+                if get_moe_tensor_parallel_world_size() > 1:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
