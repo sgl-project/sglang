@@ -15,8 +15,8 @@ name: PR Test Extra (AMD)
 #   - 1-gpu-small: mock-model / kv_canary *unit* tests
 #   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
 #                  sessions streaming-session, spec standalone triton)
-# The canary *e2e* tests still need the canary JIT kernel ported to ROCm
-# first, so they remain CUDA-only for now.
+# kv_canary e2e coverage lives in the stage-b 1-/2-gpu-large AMD suites
+# because it now exercises the ROCm canary kernels end-to-end.
 
 on:
   pull_request:
