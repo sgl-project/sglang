@@ -117,7 +117,6 @@ class TritonAttnBackend(AttentionBackend):
             build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
-            extend_attention_fwd_with_lse,
         )
         from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
             verify_splitkv_fwd,
@@ -129,9 +128,6 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
-        )
-        self.extend_attention_fwd_with_lse = torch.compiler.disable(
-            extend_attention_fwd_with_lse
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel (ROCm/Triton). Registered here; enabled
@@ -1365,12 +1361,11 @@ class TritonAttnBackend(AttentionBackend):
         # use the original extend kernel's current-token stage directly.
         if k.numel() > 0:
             empty_kv_indptr = torch.zeros_like(kv_indptr)
-            self.extend_attention_fwd_with_lse(
+            self.extend_attention_fwd(
                 q_local,
                 k.contiguous(),
                 v.contiguous(),
                 current_out,
-                current_lse,
                 k_buffer,
                 v_buffer,
                 self.forward_metadata.qo_indptr,
@@ -1385,6 +1380,7 @@ class TritonAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 logit_cap=logits_soft_cap,
                 xai_temperature_len=layer.xai_temperature_len,
+                lse_extend=current_lse,
                 skip_prefix=True,
             )
 
@@ -1410,12 +1406,11 @@ class TritonAttnBackend(AttentionBackend):
         )
         empty_k = k[:0].contiguous()
         empty_v = v[:0].contiguous()
-        self.extend_attention_fwd_with_lse(
+        self.extend_attention_fwd(
             q_all,
             empty_k,
             empty_v,
             prefix_out,
-            prefix_lse,
             k_buffer,
             v_buffer,
             self.forward_metadata.qo_indptr,
@@ -1430,6 +1425,7 @@ class TritonAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             xai_temperature_len=layer.xai_temperature_len,
+            lse_extend=prefix_lse,
             skip_extend=True,
         )
 

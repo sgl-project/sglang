@@ -606,11 +606,19 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    lse_extend=None,
+    skip_prefix=False,
+    skip_extend=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+
+    When ``lse_extend`` is provided, the per-query/head natural-log LSE is also
+    written to it (used by DCP to merge partial attention across ranks).
+    ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
+    respectively so DCP can compute those two parts separately.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -632,117 +640,13 @@ def extend_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
+    STORE_LSE = lse_extend is not None
+    stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
+    stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
-    extra_kargs = {}
-    if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-
-    _fwd_kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        None,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        sinks,
-        window_kv_offsets,
-        sm_scale,
-        k_scale,
-        v_scale,
-        kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        0,
-        0,
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        logit_cap=logit_cap,
-        xai_temperature_len=xai_temperature_len,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        IS_CAUSAL=is_causal,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_LSE=False,
-        SKIP_PREFIX=False,
-        SKIP_EXTEND=False,
-        HAS_SINK=HAS_SINK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
-    )
-
-
-def extend_attention_fwd_with_lse(
-    q_extend,
-    k_extend,
-    v_extend,
-    o_extend,
-    lse_extend,
-    k_buffer,
-    v_buffer,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    custom_mask,
-    is_causal,
-    mask_indptr,
-    max_len_extend,
-    k_scale,
-    v_scale,
-    sm_scale=None,
-    logit_cap=0.0,
-    skip_prefix_custom_mask=True,
-    sliding_window_size=-1,
-    sinks=None,
-    window_kv_offsets=None,
-    xai_temperature_len=-1,
-    skip_prefix=False,
-    skip_extend=False,
-):
-    """Triton extend attention that also returns per-query/head natural-log LSE."""
-    Lq, Lk, Lv = (
-        q_extend.shape[-1],
-        k_extend.shape[-1],
-        v_extend.shape[-1],
-    )
-
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
-    )
-
-    sm_scale = sm_scale or 1.0 / (Lq**0.5)
-    batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
-    USE_CUSTOM_MASK = custom_mask is not None
-    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
-    HAS_SINK = sinks is not None
-
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
@@ -774,8 +678,8 @@ def extend_attention_fwd_with_lse(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
-        lse_extend.stride(0),
-        lse_extend.stride(1),
+        stride_lse_bs,
+        stride_lse_h,
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -793,13 +697,13 @@ def extend_attention_fwd_with_lse(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_LSE=True,
+        STORE_LSE=STORE_LSE,
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
         **extra_kargs,
     )
 
