@@ -944,6 +944,17 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertIn("follow-up", result.normal_text)
 
+    def test_json_with_immediate_trailing_text(self):
+        # Regression: when free-form text follows the final tool call without a
+        # separator (or leading whitespace), its first character must not be
+        # truncated. Previously the parser always skipped one separator-width
+        # character, turning "Some follow-up text" into "ome follow-up text".
+        text = '{"name": "get_weather", "parameters": {}}Some follow-up text'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.normal_text, "Some follow-up text")
+
     def test_invalid_then_valid_json(self):
         text = (
             '{"name": "get_weather", "parameters": {'  # malformed
