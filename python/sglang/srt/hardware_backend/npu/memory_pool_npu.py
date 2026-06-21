@@ -348,10 +348,6 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
                     self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
                     for i in range(self.layer_num)
                 ]
-            # K-only index caches use the value side of _npu_reshape_and_cache
-            # only to avoid the scatter writer; keep it aliased to K so the
-            # sparse index cache does not allocate a second full-size buffer.
-            self.v_buffer = self.k_buffer
 
         self._finalize_allocation_log(size)
 
@@ -374,29 +370,15 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
             cache_k = cache_k.view(self.store_dtype)
 
         k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
-            -1, self.head_num * self.head_dim
+            -1, self.head_num, self.head_dim
         )
         maybe_detect_oob(loc, 0, k_buffer_layer.shape[0], "NPU set_index_k_buffer")
         loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
-        cache_k = cache_k.contiguous()
-        if self.use_fia:
-            torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer,
-                loc.view(-1, 1),
-                cache_k.view(-1, self.head_num * self.head_dim),
-            )
-        else:
-            torch_npu._npu_reshape_and_cache(
-                key=cache_k,
-                value=cache_k,
-                key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.head_dim
-                ),
-                value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.head_dim
-                ),
-                slot_indices=loc,
-            )
+        torch_npu.npu_scatter_nd_update_(
+            k_buffer_layer,
+            loc.view(-1, 1),
+            cache_k.contiguous().view(-1, self.head_num, self.head_dim),
+        )
         _minimax_npu_debug_sync(f"NPU set_index_k_buffer layer_id={layer_id}")
 
     def get_contiguous_buf_infos(self):

@@ -70,53 +70,59 @@ def _load_minimax_sparse_backend_module():
     return module
 
 
-def test_npu_block_topk_counts_init_and_local_inside_topk_budget():
+def test_npu_sparse_block_selection_masks_future_blocks_and_dedups_local():
     module = _load_minimax_sparse_backend_module()
     backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
     backend.block_size_k = 2
-    backend.topk_blocks = 2
-    backend.init_blocks = 1
+    backend.topk_blocks = 1
+    backend.init_blocks = 0
     backend.local_blocks = 1
     backend.score_type = "max"
 
-    scores = torch.tensor([[0.0, 0.0, 5.0, 5.0, 9.0, 9.0, 1.0, 1.0]])
+    idx_q = torch.ones((3, 1, 1), dtype=torch.bfloat16)
+    idx_k = torch.tensor([[0.0], [1.0], [100.0], [100.0], [200.0], [200.0]])
+    query_positions = torch.tensor([0, 1, 2], dtype=torch.long)
 
-    topk_idx = backend._block_topk(scores, seq_len=8)
+    blocks = backend._select_sparse_blocks(idx_q, idx_k, query_positions, seq_len=6)
 
-    assert topk_idx.shape == (1, 2)
-    torch.testing.assert_close(topk_idx, torch.tensor([[0, 3]], dtype=torch.int32))
+    assert blocks.shape == (3, 1, 2)
+    expected = torch.tensor([[[0, -1]], [[0, -1]], [[1, -1]]], dtype=torch.int32)
+    torch.testing.assert_close(blocks, expected)
 
 
-def test_npu_cache_slot_gather_preserves_3d_shape_and_values():
+def test_npu_sparse_seq_matches_dense_attention_when_all_blocks_are_selected():
     module = _load_minimax_sparse_backend_module()
     backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
-    backend.is_npu = False
+    backend.block_size_k = 2
+    backend.topk_blocks = 4
+    backend.init_blocks = 0
+    backend.local_blocks = 0
+    backend.score_type = "max"
 
-    slots = torch.arange(5 * 2 * 3).reshape(5, 2, 3)
-    locs = torch.tensor([3, 1], dtype=torch.int64)
+    q_seq = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.bfloat16)
+    k_seq = torch.tensor(
+        [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]], [[2.0, 0.0]]],
+        dtype=torch.bfloat16,
+    )
+    v_seq = torch.tensor(
+        [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]], [[2.0, 2.0]]],
+        dtype=torch.bfloat16,
+    )
+    idx_q = torch.ones((2, 1, 1), dtype=torch.bfloat16)
+    idx_k = torch.ones((4, 1), dtype=torch.bfloat16)
+    query_positions = torch.tensor([0, 1], dtype=torch.long)
 
-    gathered = backend._gather_cache_slots(slots, locs, "unit test")
-
-    assert gathered.shape == (2, 2, 3)
-    torch.testing.assert_close(gathered, slots[locs])
-
-
-def test_npu_cache_slot_gather_uses_direct_row_select_for_index_cache(monkeypatch):
-    module = _load_minimax_sparse_backend_module()
-    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
-    backend.is_npu = False
-
-    def _raise_if_torch_gather_is_used(*args, **kwargs):
-        raise AssertionError("index cache gather should avoid torch.gather")
-
-    monkeypatch.setattr(torch, "gather", _raise_if_torch_gather_is_used)
-
-    slots = torch.arange(5 * 1 * 4).reshape(5, 1, 4)
-    locs = torch.tensor([4, 2, 0], dtype=torch.int32)
-
-    gathered = backend._gather_cache_slots(
-        slots, locs, "unit test", use_direct_row_select=True
+    _, out = backend._npu_sparse_seq(
+        q_seq, k_seq, v_seq, idx_q, idx_k, None, query_positions, seq_len=4
     )
 
-    assert gathered.shape == (3, 1, 4)
-    torch.testing.assert_close(gathered, slots[locs.long()])
+    scores = torch.einsum("qhd,khd->qhk", q_seq.float(), k_seq.float()) * (
+        q_seq.shape[-1] ** -0.5
+    )
+    key_pos = torch.arange(k_seq.shape[0])
+    valid = key_pos[None, :] <= query_positions[:, None]
+    scores = scores.masked_fill(~valid[:, None, :], -1.0e30)
+    probs = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("qhk,khd->qhd", probs.to(v_seq.dtype), v_seq)
+
+    torch.testing.assert_close(out.float(), expected.float(), rtol=1e-3, atol=1e-3)
