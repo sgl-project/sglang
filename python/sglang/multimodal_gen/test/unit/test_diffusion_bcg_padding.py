@@ -9,9 +9,16 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     _CaptureEntry,
     _signature_kwargs,
 )
-from sglang.multimodal_gen.runtime.layers.attention import DynamicVarlenMaskMeta
+from sglang.multimodal_gen.runtime.layers.attention import (
+    DynamicVarlenMaskMeta,
+    build_varlen_mask_meta,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.server_args import (
+    BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+    BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
 )
 
 
@@ -23,10 +30,15 @@ class OtherTransformer2DModel(torch.nn.Module):
     pass
 
 
+class Ideogram4Transformer2DModel(torch.nn.Module):
+    pass
+
+
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
+        self.ideogram_model = Ideogram4Transformer2DModel()
         self.other_model = OtherTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
@@ -127,6 +139,70 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(out["encoder_hidden_states_mask"])
         self.assertEqual(out["encoder_hidden_states"][0].shape[1], 47)
         self.assertEqual(out["txt_seq_lens"], [47])
+
+    def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):
+        total_seq = text_seq + image_seq
+        indicator = torch.zeros(1, total_seq, dtype=torch.long)
+        if text_seq:
+            indicator[:, :text_seq] = 3
+        indicator[:, text_seq:] = 2
+        segment_ids = torch.ones(1, total_seq, dtype=torch.long)
+        if text_seq:
+            segment_ids[:, :text_seq] = 1
+        return {
+            "llm_features": torch.ones(1, total_seq, 8),
+            "x": torch.zeros(1, total_seq, 16),
+            "t": torch.zeros(1),
+            "position_ids": torch.zeros(1, total_seq, 3, dtype=torch.long),
+            "segment_ids": segment_ids,
+            "indicator": indicator,
+            "attn_mask": segment_ids > 0,
+            "attn_mask_meta": build_varlen_mask_meta(segment_ids > 0),
+        }
+
+    def test_ideogram_prompt_lengths_share_bucket_signature(self):
+        with self._patch_buckets(64, 128):
+            short = self.stage._bcg_pad_prompt_kwargs(
+                self._ideogram_kwargs(19), current_model=self.ideogram_model
+            )
+            longer = self.stage._bcg_pad_prompt_kwargs(
+                self._ideogram_kwargs(47), current_model=self.ideogram_model
+            )
+
+        self.assertEqual(short["llm_features"].shape, (1, 68, 8))
+        self.assertEqual(longer["llm_features"].shape, (1, 68, 8))
+        self.assertEqual(short["x"].shape, (1, 68, 16))
+        self.assertEqual(short["position_ids"].shape, (1, 68, 3))
+        self.assertEqual(short["segment_ids"][0, 23:].tolist(), [-1] * 45)
+        self.assertFalse(short["attn_mask"][0, 23:].any())
+        self.assertIsInstance(short["attn_mask_meta"], DynamicVarlenMaskMeta)
+        self.assertIs(short["attn_mask_meta"], longer["attn_mask_meta"])
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+
+    def test_ideogram_image_only_kwargs_are_not_prompt_padded(self):
+        kwargs = self._ideogram_kwargs(0)
+        with self._patch_buckets(64, 128):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.ideogram_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["x"].shape, (1, 4, 16))
+        self.assertIsInstance(out["attn_mask_meta"], dict)
+
+    def test_ideogram_is_registered_as_bcg_supported(self):
+        self.assertIn(
+            "ideogram-ai/ideogram-4-fp8",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "comfy-org/ideogram-4",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "Ideogram4PipelineConfig",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
+        )
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()
