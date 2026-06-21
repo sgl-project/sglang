@@ -154,6 +154,200 @@ def triton_mrope_fused(
 
 
 @triton.jit
+def _triton_qknorm_mrope_forward_fused(
+    q_ptr,
+    k_ptr,
+    qw_ptr,
+    kw_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_stride,
+    k_stride,
+    positions_stride,
+    n_qh: tl.constexpr,
+    n_kh: tl.constexpr,
+    hd: tl.constexpr,
+    rd: tl.constexpr,
+    pad_n_qh: tl.constexpr,
+    pad_n_kh: tl.constexpr,
+    pad_hd: tl.constexpr,
+    mrope_section_t: tl.constexpr,
+    mrope_section_h: tl.constexpr,
+    mrope_section_w: tl.constexpr,
+    is_interleaved: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Fused Gemma QK-RMSNorm + interleaved/sectioned (neox-style) M-RoPE.
+
+    Mirrors ``_triton_mrope_forward_fused`` (neox branch) but additionally
+    applies Gemma RMSNorm (``x * rsqrt(mean(x^2)+eps) * (w + 1)``) to every
+    Q/K head *before* RoPE, in a single launch.  Variance is reduced over the
+    full ``hd`` channels per head; RoPE rotates the first ``rd`` channels; the
+    ``rd:hd`` tail is written back normed (pass-through).  Operates in place.
+    """
+    pid = tl.program_id(0)
+    q_ptr = q_ptr + pid * q_stride
+    k_ptr = k_ptr + pid * k_stride
+    half_rd = rd // 2
+
+    # --- cos/sin row for this token (sectioned across t/h/w) ---
+    t = tl.load(positions_ptr + 0 * positions_stride + pid)
+    h = tl.load(positions_ptr + 1 * positions_stride + pid)
+    w = tl.load(positions_ptr + 2 * positions_stride + pid)
+    t_cos = cos_sin_cache_ptr + t * rd
+    h_cos = cos_sin_cache_ptr + h * rd
+    w_cos = cos_sin_cache_ptr + w * rd
+    t_sin = t_cos + half_rd
+    h_sin = h_cos + half_rd
+    w_sin = w_cos + half_rd
+    cos_offsets = tl.arange(0, pad_hd // 2)
+    if is_interleaved:
+        h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 * mrope_section_h)
+        w_mask = ((cos_offsets % 3) == 2) & (cos_offsets <= 3 * mrope_section_w)
+        t_mask = ~(h_mask | w_mask)
+    else:
+        t_end = mrope_section_t
+        h_end = t_end + mrope_section_h
+        t_mask = cos_offsets < mrope_section_t
+        h_mask = (t_end <= cos_offsets) & (cos_offsets < h_end)
+        w_mask = (h_end <= cos_offsets) & (cos_offsets < half_rd)
+    t_cos_row = tl.load(t_cos + cos_offsets, mask=t_mask, other=0)
+    t_sin_row = tl.load(t_sin + cos_offsets, mask=t_mask, other=0)
+    h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
+    h_sin_row = tl.load(h_sin + cos_offsets, mask=h_mask, other=0)
+    w_cos_row = tl.load(w_cos + cos_offsets, mask=w_mask, other=0)
+    w_sin_row = tl.load(w_sin + cos_offsets, mask=w_mask, other=0)
+    cos_row = (t_cos_row + h_cos_row + w_cos_row).to(tl.float32)
+    sin_row = (t_sin_row + h_sin_row + w_sin_row).to(tl.float32)
+
+    # --- per-head Gemma RMSNorm scale over the full head_dim ---
+    full = tl.arange(0, pad_hd)
+    full_mask_q = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (full[None, :] < hd)
+    full_mask_k = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (full[None, :] < hd)
+    q_full_off = tl.arange(0, pad_n_qh)[:, None] * hd + full[None, :]
+    k_full_off = tl.arange(0, pad_n_kh)[:, None] * hd + full[None, :]
+    q_full = tl.load(q_ptr + q_full_off, mask=full_mask_q, other=0.0).to(tl.float32)
+    k_full = tl.load(k_ptr + k_full_off, mask=full_mask_k, other=0.0).to(tl.float32)
+    q_scale = tl.rsqrt(tl.sum(q_full * q_full, axis=1) / hd + EPS)[:, None]
+    k_scale = tl.rsqrt(tl.sum(k_full * k_full, axis=1) / hd + EPS)[:, None]
+    qw = tl.load(qw_ptr + full, mask=full[:] < hd, other=0.0).to(tl.float32)[None, :]
+    kw = tl.load(kw_ptr + full, mask=full[:] < hd, other=0.0).to(tl.float32)[None, :]
+    q_normed_full = q_full * q_scale * (qw + 1.0)
+    k_normed_full = k_full * k_scale * (kw + 1.0)
+
+    # Write the normed pass-through tail (rd:hd) back first.
+    tail_mask_q = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (
+        (full[None, :] >= rd) & (full[None, :] < hd)
+    )
+    tail_mask_k = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
+        (full[None, :] >= rd) & (full[None, :] < hd)
+    )
+    tl.store(
+        q_ptr + q_full_off, q_normed_full.to(q_ptr.dtype.element_ty), mask=tail_mask_q
+    )
+    tl.store(
+        k_ptr + k_full_off, k_normed_full.to(k_ptr.dtype.element_ty), mask=tail_mask_k
+    )
+
+    # --- neox RoPE on the normed first rd channels ---
+    d = tl.arange(0, pad_hd // 2)[None, :]
+    fhq = tl.arange(0, pad_n_qh)[:, None] * hd + d
+    fhk = tl.arange(0, pad_n_kh)[:, None] * hd + d
+    fqm = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (d < half_rd)
+    fkm = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (d < half_rd)
+    shq = fhq + half_rd
+    shk = fhk + half_rd
+
+    qn_lo = tl.load(q_ptr + fhq, mask=fqm, other=0.0).to(tl.float32)
+    qn_hi = tl.load(q_ptr + shq, mask=fqm, other=0.0).to(tl.float32)
+    kn_lo = tl.load(k_ptr + fhk, mask=fkm, other=0.0).to(tl.float32)
+    kn_hi = tl.load(k_ptr + shk, mask=fkm, other=0.0).to(tl.float32)
+    # Re-derive the norm scale per head (broadcast over the rotary half-width).
+    qsc = q_scale  # [pad_n_qh, 1]
+    ksc = k_scale
+    qwl = tl.load(qw_ptr + d, mask=d < half_rd, other=0.0).to(tl.float32)
+    qwh = tl.load(qw_ptr + (d + half_rd), mask=d < half_rd, other=0.0).to(tl.float32)
+    kwl = tl.load(kw_ptr + d, mask=d < half_rd, other=0.0).to(tl.float32)
+    kwh = tl.load(kw_ptr + (d + half_rd), mask=d < half_rd, other=0.0).to(tl.float32)
+    q_lo = qn_lo * qsc * (qwl + 1.0)
+    q_hi = qn_hi * qsc * (qwh + 1.0)
+    k_lo = kn_lo * ksc * (kwl + 1.0)
+    k_hi = kn_hi * ksc * (kwh + 1.0)
+    tl.store(
+        q_ptr + fhq,
+        (q_lo * cos_row - q_hi * sin_row).to(q_ptr.dtype.element_ty),
+        mask=fqm,
+    )
+    tl.store(
+        q_ptr + shq,
+        (q_hi * cos_row + q_lo * sin_row).to(q_ptr.dtype.element_ty),
+        mask=fqm,
+    )
+    tl.store(
+        k_ptr + fhk,
+        (k_lo * cos_row - k_hi * sin_row).to(k_ptr.dtype.element_ty),
+        mask=fkm,
+    )
+    tl.store(
+        k_ptr + shk,
+        (k_hi * cos_row + k_lo * sin_row).to(k_ptr.dtype.element_ty),
+        mask=fkm,
+    )
+
+
+def triton_qknorm_mrope_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section: List[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    eps: float,
+) -> None:
+    """In-place fused Gemma QK-RMSNorm + sectioned neox M-RoPE.
+
+    Replaces a separate ``fused_qk_gemma_rmsnorm`` launch followed by
+    ``triton_mrope_fused``.  Only the neox-style sectioned M-RoPE used by the
+    Qwen3.5 text decoder is supported; eligibility is checked by the caller.
+    ``q`` / ``k`` are modified in place.
+    """
+    num_tokens, n_q_dim = q.shape
+    n_k_dim = k.shape[1]
+    n_qh = n_q_dim // head_size
+    n_kh = n_k_dim // head_size
+    pad_n_qh = triton.next_power_of_2(n_qh)
+    pad_n_kh = triton.next_power_of_2(n_kh)
+    pad_hd = triton.next_power_of_2(head_size)
+    _triton_qknorm_mrope_forward_fused[(num_tokens,)](
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        q.stride(0),
+        k.stride(0),
+        positions.stride(0),
+        n_qh,
+        n_kh,
+        head_size,
+        rotary_dim,
+        pad_n_qh,
+        pad_n_kh,
+        pad_hd,
+        mrope_section[0],
+        mrope_section[1],
+        mrope_section[2],
+        mrope_interleaved,
+        eps,
+    )
+
+
+@triton.jit
 def _triton_ernie45_rope_qk_fused(
     q_ptr,
     k_ptr,

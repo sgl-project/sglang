@@ -67,6 +67,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.layers.rotary_embedding.triton_kernels import triton_qknorm_mrope_fused
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -712,6 +714,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        # ROCm/aiter fast path: fuse Gemma QK-RMSNorm + sectioned (neox) M-RoPE
+        # into a single in-place Triton kernel.  Eligible only for the
+        # interleaved neox M-RoPE used by the Qwen3.5 text decoder; any other
+        # rotary configuration falls back to the byte-identical separate path.
+        self._use_fused_qknorm_mrope = (
+            _use_aiter
+            and isinstance(self.rotary_emb, MRotaryEmbedding)
+            and getattr(self.rotary_emb, "mrope_interleaved", False)
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and bool(getattr(self.rotary_emb, "mrope_section", None))
+        )
+
         attn_quant_config = (
             None
             if quant_config and quant_config.get_name() == "modelopt_fp4"
@@ -856,8 +870,29 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._use_fused_qknorm_mrope and positions.ndim == 2:
+            # Single in-place Triton kernel: Gemma QK-RMSNorm + sectioned
+            # (neox) M-RoPE, replacing fused_qk_gemma_rmsnorm + the separate
+            # mrope launch.
+            q = q.reshape(-1, self.q_size).contiguous()
+            k = k.reshape(-1, self.kv_size).contiguous()
+            self.rotary_emb._match_cos_sin_cache_dtype(q)
+            triton_qknorm_mrope_fused(
+                q,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.rotary_emb.mrope_section,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.rotary_emb.mrope_interleaved,
+                self.q_norm.variance_epsilon,
+            )
+        else:
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
