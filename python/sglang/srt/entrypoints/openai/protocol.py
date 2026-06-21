@@ -824,15 +824,18 @@ class ChatCompletionRequest(BaseModel):
                 ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
 
-        if values.get("reasoning_effort") == "none":
+        effort = values.get("reasoning_effort")
+        if effort is not None:
+            # Any tier other than "none" enables thinking.
+            thinking = effort != "none"
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
         return values
