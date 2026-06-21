@@ -44,6 +44,11 @@ from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardBatch,
     ForwardMode,
@@ -324,8 +329,9 @@ class MockMamba2ModelRunner(ModelRunner):
         # `intermediate_ssm` / `intermediate_conv_window` buffers when
         # `speculative_num_draft_tokens is not None`, so auto-derive the
         # count from `case.extend_lens` for the speculative modes.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = (
                 max(case.extend_lens) if case.extend_lens else 1
@@ -335,8 +341,18 @@ class MockMamba2ModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -551,7 +567,7 @@ class ProjectedMamba2Attention(nn.Module):
         # state support. The dense-extend path leaves it False.
         use_triton_causal_conv = (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
         self.backend.forward(
             self.mixer,

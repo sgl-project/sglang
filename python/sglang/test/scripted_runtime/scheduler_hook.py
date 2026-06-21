@@ -95,6 +95,9 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
+    if scheduler._engine_paused:
+        ctx.continue_generation()
+
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
@@ -116,8 +119,8 @@ class ScriptedSchedulerHook:
     def __init__(
         self,
         *,
-        scheduler: "Scheduler",
-        tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
+        scheduler: Scheduler,
+        tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
@@ -125,7 +128,7 @@ class ScriptedSchedulerHook:
             and scheduler.ps.tp_rank == 0
             and scheduler.ps.attn_cp_rank == 0
         )
-        self._batch_log: List["ScriptedBatchRecord"] = []
+        self._batch_log: List[ScriptedBatchRecord] = []
 
         if self._is_driver:
             ensure_script_importable(

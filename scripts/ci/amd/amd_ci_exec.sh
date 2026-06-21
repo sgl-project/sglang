@@ -17,7 +17,14 @@ WORKDIR="/sglang-checkout/test/srt"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
-  [SGLANG_ENABLE_ASYNC_ASSERT]=1
+  # Disabled on AMD: the async-assert probes (#27461) fire torch._assert_async in
+  # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
+  # exception.
+  [SGLANG_ENABLE_ASYNC_ASSERT]=0
+  # Disabled on AMD: the per-step NaN-logit probe/sanitize kernels (#27883) in
+  # the sampler hot path lower single-batch decode fwd_occupancy below the
+  # base-a sanity threshold.
+  [SGLANG_SANITIZE_NAN_LOGITS]=0
   [SGLANG_USE_AITER]=1
 )
 

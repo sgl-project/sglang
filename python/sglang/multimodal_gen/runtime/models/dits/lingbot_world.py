@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_rank,
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
@@ -82,7 +83,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -279,19 +282,54 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
+        head_slice = None
+        if kv_cache.k.shape[2] != roped_key.shape[2]:
+            if sequence_shard_enabled:
+                head_start = get_tp_rank() * roped_key.shape[2]
+            else:
+                head_start = self.head_start
+            head_slice = slice(head_start, head_start + roped_key.shape[2])
+            cache_key = roped_key.new_zeros(
+                roped_key.shape[0],
+                roped_key.shape[1],
+                kv_cache.k.shape[2],
+                roped_key.shape[3],
+            )
+            cache_value = v.new_zeros(
+                v.shape[0],
+                v.shape[1],
+                kv_cache.v.shape[2],
+                v.shape[3],
+            )
+            cache_key[:, :, head_slice, :] = roped_key
+            cache_value[:, :, head_slice, :] = v
+        else:
+            cache_key = roped_key
+            cache_value = v
+
         cache_view = kv_cache.update_and_get_attention_kv(
-            key=roped_key,
-            value=v,
+            key=cache_key,
+            value=cache_value,
             current_chunk_start=current_start,
             debug_name="LingBot KV cache",
         )
         if update_cache_only:
             return v
+        key = (
+            cache_view.k[:, :, head_slice, :]
+            if head_slice is not None
+            else cache_view.k
+        )
+        value = (
+            cache_view.v[:, :, head_slice, :]
+            if head_slice is not None
+            else cache_view.v
+        )
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
-            cache_view.k,
-            cache_view.v,
+            key,
+            value,
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
@@ -860,15 +898,20 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
 
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
+    _use_megatron_tp = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        head_start = self.attn1.head_start
         self.attn1 = LingBotWorldCausalSelfAttention(
             dim=self.hidden_dim,
-            num_heads=self.num_attention_heads,
+            num_heads=self.local_num_heads,
             local_attn_size=self.local_attn_size,
             sink_size=self.attn1.sink_size,
             qk_norm=self.attn1.qk_norm,
             eps=self.attn1.eps,
+            head_dim=self.dim_head,
+            head_start=head_start,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
@@ -1040,11 +1083,15 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             .to(orig_dtype)
         )
         query, key, value = self._project_qkv(norm_hidden_states)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        if self.tp_rmsnorm:
+            query = tensor_parallel_rms_norm(query, self.norm_q)
+            key = tensor_parallel_rms_norm(key, self.norm_k)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         attn_output = self.attn1(
             query,
@@ -1216,7 +1263,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             return None
         session = getattr(forward_batch, "session", None)
         if session is not None:
-            state = session.get_or_create_state(RealtimeCausalDiTState)
+            state = get_realtime_causal_dit_state(session)
             return state.runtime_cache.setdefault(name, {})
         extra = getattr(forward_batch, "extra", None)
         if extra is None:
