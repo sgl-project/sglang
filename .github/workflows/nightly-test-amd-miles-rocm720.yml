@@ -1,0 +1,82 @@
+name: Nightly Test Miles (AMD ROCm 7.2)
+
+on:
+  schedule:
+    # Runs after the 12:00 UTC miles image build has pushed the dated image.
+    - cron: "30 17 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-amd-miles-rocm720.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Override miles image tag (e.g. miles-rocm720-mi35x-20260621); empty = newest by date"
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: "Continue on error (do not fail the workflow on test failures)"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-miles-mi35x:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: stage-c-2-gpu-mi350
+            runner: linux-mi35x-gpu-2
+          - suite: stage-c-8-gpu-mi350
+            runner: linux-mi35x-gpu-8
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve newest miles ROCm 7.2 image
+        run: |
+          registry="10.245.143.50:5000"
+          repo="rocm/sgl-dev"
+          base="miles-rocm720-mi35x"
+          tag="${{ inputs.image_tag }}"
+          if [ -z "${tag}" ]; then
+            # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
+            for i in $(seq 0 6); do
+              d=$(date -u -d "-${i} day" +%Y%m%d)
+              candidate="${base}-${d}"
+              if docker pull "${registry}/${repo}:${candidate}" >/dev/null 2>&1; then
+                tag="${candidate}"
+                break
+              fi
+            done
+          fi
+          if [ -z "${tag}" ]; then
+            echo "::error::No ${repo}:${base}-<date> image found in ${registry} for the last 7 days"
+            exit 1
+          fi
+          echo "MILES_IMAGE=${registry}/${repo}:${tag}" >> "$GITHUB_ENV"
+          echo "Using miles image: ${registry}/${repo}:${tag}"
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start container from the miles image
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${MILES_IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run miles CI suite ${{ matrix.suite }}
+        timeout-minutes: 120
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --match-all-labels \
+            ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
