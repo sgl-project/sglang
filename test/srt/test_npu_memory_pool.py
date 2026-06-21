@@ -135,25 +135,22 @@ def _load_npu_memory_pool_module():
     return module
 
 
-def test_npu_minimax_k_only_index_cache_uses_reshape_and_cache_by_default():
+def test_npu_minimax_k_only_index_cache_uses_scatter_writer():
     npu_memory_pool = _load_npu_memory_pool_module()
 
     calls = []
 
     class FakeTorchNpu:
         @staticmethod
-        def npu_scatter_nd_update_(*args, **kwargs):
-            raise AssertionError("K-only index cache should not use scatter by default")
+        def npu_scatter_nd_update_(cache, indices, updates):
+            assert cache.shape == (10, 1, 4)
+            assert indices.shape == (2, 1)
+            assert updates.shape == (2, 1, 4)
+            calls.append((cache, indices, updates))
 
         @staticmethod
         def _npu_reshape_and_cache(*, key, value, key_cache, value_cache, slot_indices):
-            assert key.shape == (2, 1, 4)
-            assert value.shape == (2, 1, 4)
-            assert key_cache.shape == (5, 2, 1, 4)
-            assert value_cache.shape == (5, 2, 1, 4)
-            assert key_cache.data_ptr() == value_cache.data_ptr()
-            assert slot_indices.dtype == torch.int32
-            calls.append((key, value, key_cache, value_cache, slot_indices))
+            raise AssertionError("K-only MiniMax index cache should use scatter")
 
     npu_memory_pool.torch_npu = FakeTorchNpu
 
