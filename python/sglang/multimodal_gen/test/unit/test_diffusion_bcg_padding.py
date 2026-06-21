@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
     _CaptureEntry,
     _signature_kwargs,
@@ -159,8 +159,11 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(third, {"valid": 3})
         self.assertEqual(len(calls), 2)
 
-    def test_missing_bcg_flag_defaults_disabled(self):
-        self.stage.server_args = SimpleNamespace()
+    def test_disabled_bcg_flag_skips_runner(self):
+        self.stage.server_args = SimpleNamespace(
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+        )
         self.stage._bcg_runners = {}
         self.stage._cache_dit_enabled = False
 
@@ -168,6 +171,35 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage._maybe_enable_torch_compile(self.qwen_model)
         self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
+
+    def test_bcg_runner_cache_is_per_model_module(self):
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        self.stage._bcg_runners = {}
+
+        def fake_runner(model, device):
+            return SimpleNamespace(model=model, device=device)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.breakable_cuda_graph.runner."
+                "DiffusionBreakableCudaGraphRunner",
+                side_effect=fake_runner,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+                "get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
+        ):
+            first = self.stage._maybe_get_bcg_runner(self.qwen_model)
+            second = self.stage._maybe_get_bcg_runner(self.other_model)
+            first_again = self.stage._maybe_get_bcg_runner(self.qwen_model)
+
+        self.assertIs(first_again, first)
+        self.assertIsNot(first, second)
+        self.assertIs(first.model, self.qwen_model)
+        self.assertIs(second.model, self.other_model)
+        self.assertEqual(len(self.stage._bcg_runners), 2)
 
     def test_bcg_runner_rejects_too_many_segments(self):
         runner = object.__new__(DiffusionBreakableCudaGraphRunner)
