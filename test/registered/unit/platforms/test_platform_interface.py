@@ -431,6 +431,20 @@ class TestPinMemoryAvailability(CustomTestCase):
         mock_cuda_available.assert_not_called()
 
 
+class TestCommonPlatformHelpers(CustomTestCase):
+    """Tests for common helpers that surface platform registration hints."""
+
+    def test_unsupported_device_points_to_platform_entry_point_group(self):
+        from sglang.srt.utils import common as common_utils
+
+        with patch.object(common_utils, "current_platform", SRTPlatform()):
+            with self.assertRaises(ValueError) as cm:
+                common_utils.get_available_gpu_memory("fake_accel", 0)
+
+        self.assertIn("'sglang.srt.platforms' entry point", str(cm.exception))
+        self.assertNotIn("sglang.platform_plugins", str(cm.exception))
+
+
 # ---------------------------------------------------------------------------
 # Platform Discovery: _resolve_platform
 # ---------------------------------------------------------------------------
