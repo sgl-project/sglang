@@ -324,6 +324,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not torch.compiler.is_compiling()
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states, should_allreduce_fusion, use_reduce_scatter

@@ -608,7 +608,11 @@ class Grok1DecoderLayer(nn.Module):
         return hidden_states, residual, self.post_moe_norm  # defer layernorm
 
     def moe_with_rmoe(self, x):
-        if self.alt_stream is not None and get_is_capture_mode():
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             mlp_result = self.mlp(x)

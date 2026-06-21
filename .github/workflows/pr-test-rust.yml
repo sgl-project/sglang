@@ -6,6 +6,7 @@ on:
     paths:
       - "sgl-model-gateway/**"
       - ".github/workflows/pr-test-rust.yml"
+      - "sgl-kernel/**"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   pull_request:
@@ -14,6 +15,7 @@ on:
     paths:
       - "sgl-model-gateway/**"
       - ".github/workflows/pr-test-rust.yml"
+      - "sgl-kernel/**"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   workflow_dispatch:
@@ -21,6 +23,10 @@ on:
 concurrency:
   group: gateway-tests-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
 
 env:
   SGLANG_IS_IN_CI: true
@@ -90,6 +96,37 @@ jobs:
           python3 -c "import sglang_router; print('Python package: OK')"
           python3 -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python3 -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+
+  check-changes:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect sglang-kernel-affecting changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            sgl_kernel:
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+
+  sgl-kernel-build-wheels:
+    needs: check-changes
+    if: |
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build Wheel
+    secrets: inherit
 
   python-unit-tests:
     needs: build-wheel
@@ -193,11 +230,16 @@ jobs:
 
   gateway-e2e:
     name: ${{ matrix.name }}
-    needs: build-wheel
+    needs: [build-wheel, check-changes, sgl-kernel-build-wheels]
     if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      (
+        github.event_name != 'pull_request' ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      )
     # The `responses` matrix entry is intentionally omitted. It needs
     # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
     # on the runner host, but the 2-/4-gpu-h100 runners are themselves
@@ -282,9 +324,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download sgl-kernel wheel artifact
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+
       - name: Install SGLang dependencies
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{ needs.check-changes.outputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4

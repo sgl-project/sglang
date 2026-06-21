@@ -195,7 +195,7 @@ jobs:
             --output type=image,name=${IMAGE_REF},push=true \
             --target framework_final \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=1 \

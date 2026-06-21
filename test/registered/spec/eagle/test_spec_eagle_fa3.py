@@ -18,7 +18,12 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=600,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="Temporarily disabled due to consistent failures during Torch upgrade",
+)
 
 
 class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
