@@ -373,13 +373,32 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 @dataclasses.dataclass
 class ServerArgs:
-    """
-    The arguments of the server.
+    """The arguments of the server.
 
-    NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the function
-    `ServerArgs.add_cli_args`.
-    Please follow the existing style to group the new arguments into related groups or create new groups.
+    There are two styles for defining arguments. New arguments MUST use the
+    ``Annotated`` style; the legacy style is being migrated and should not be
+    used for new additions.
+
+    **Style 1 — ``Annotated`` (required for all new arguments):**
+
+    Each field carries its own CLI metadata via ``Annotated[T, Arg(...)]``.
+    The CLI argument is auto-derived by ``add_cli_args_from_dataclass`` —
+    no manual ``add_argument`` call is needed::
+
+        load_format: Annotated[str, Arg(
+            help="The format of the model weights to load.",
+            choices=LOAD_FORMAT_CHOICES,
+        )] = "auto"
+
+    **Style 2 — Legacy (existing arguments, to be migrated):**
+
+    The field is a plain type annotation with a default, and a separate
+    ``parser.add_argument(...)`` call in ``add_cli_args`` defines the CLI
+    surface. When modifying these fields, keep the order in this class
+    definition consistent with the order in ``add_cli_args``.
+
+    Group new arguments into the appropriate existing section or create a
+    new section as needed.
     """
 
     # Model and tokenizer
@@ -443,9 +462,6 @@ class ServerArgs:
     )] = None
     is_embedding: Annotated[bool, Arg(
         help="Whether to use a CausalLM as an embedding model.",
-    )] = False
-    prefill_only_disable_kv_cache: Annotated[bool, Arg(
-        help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads.",
     )] = False
     enable_multimodal: Annotated[Optional[bool], Arg(
         help="Enable the multimodal functionality for the served model. "
@@ -856,6 +872,9 @@ class ServerArgs:
     enable_mis: bool = False
 
     # Optimization/debug options
+    prefill_only_disable_kv_cache: Annotated[bool, Arg(
+        help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads.",
+    )] = False
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
