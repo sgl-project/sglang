@@ -32,6 +32,7 @@ from functools import cached_property
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.srt.arg_groups.arg_utils import Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -39,10 +40,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.arg_groups.arg_utils import Arg, add_cli_args_from_dataclass
-from sglang.srt.configs.linear_attn_model_registry import (
-    get_linear_attn_spec_by_arch,
-)
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -402,145 +400,235 @@ class ServerArgs:
     """
 
     # Model and tokenizer
-    model_path: Annotated[str, Arg(
-        help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-        aliases=["--model"],
-    )]
-    tokenizer_path: Annotated[Optional[str], Arg(
-        help="The path of the tokenizer.",
-    )] = None
-    tokenizer_mode: Annotated[str, Arg(
-        help="Tokenizer mode. 'auto' will use the fast tokenizer if available, "
-        "and 'slow' will always use the slow tokenizer.",
-        choices=["auto", "slow"],
-    )] = "auto"
-    tokenizer_backend: Annotated[str, Arg(
-        help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-        "tokenizers library, and 'fastokens' uses the fastokens library "
-        "for faster tokenization. Requires the fastokens package to be installed.",
-        choices=["huggingface", "fastokens"],
-    )] = "huggingface"
-    tokenizer_worker_num: Annotated[int, Arg(
-        help="The worker num of the tokenizer manager.",
-    )] = 1
-    detokenizer_worker_num: Annotated[int, Arg(
-        help="The worker num of the detokenizer manager.",
-    )] = 1
-    skip_tokenizer_init: Annotated[bool, Arg(
-        help="If set, skip init tokenizer and pass input_ids in generate request.",
-    )] = False
-    load_format: Annotated[str, Arg(
-        help="The format of the model weights to load. "
-        '"auto" will try to load the weights in the safetensors format '
-        "and fall back to the pytorch bin format if safetensors format "
-        "is not available. "
-        '"pt" will load the weights in the pytorch bin format. '
-        '"safetensors" will load the weights in the safetensors format. '
-        '"npcache" will load the weights in pytorch format and store '
-        "a numpy cache to speed up the loading. "
-        '"dummy" will initialize the weights with random values, '
-        "which is mainly for profiling."
-        '"gguf" will load the weights in the gguf format. '
-        '"bitsandbytes" will load the weights using bitsandbytes '
-        "quantization."
-        '"layered" loads weights layer by layer so that one can quantize a '
-        "layer before loading another to make the peak memory envelope "
-        "smaller.",
-        choices=LOAD_FORMAT_CHOICES,
-    )] = "auto"
-    model_loader_extra_config: Annotated[str, Arg(
-        help="Extra config for model loader. "
-        "This will be passed to the model loader corresponding to the chosen load_format.",
-    )] = "{}"
-    trust_remote_code: Annotated[bool, Arg(
-        help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
-    )] = False
-    context_length: Annotated[Optional[int], Arg(
-        help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
-        f"\n\n{human_readable_int.__doc__}",
-        type_parser=human_readable_int,
-    )] = None
-    is_embedding: Annotated[bool, Arg(
-        help="Whether to use a CausalLM as an embedding model.",
-    )] = False
-    enable_multimodal: Annotated[Optional[bool], Arg(
-        help="Enable the multimodal functionality for the served model. "
-        "If the model being served is not multimodal, nothing will happen",
-    )] = None
-    revision: Annotated[Optional[str], Arg(
-        help="The specific model version to use. It can be a branch "
-        "name, a tag name, or a commit id. If unspecified, will use "
-        "the default version.",
-    )] = None
-    model_impl: Annotated[str, Arg(
-        help="Which implementation of the model to use.\n\n"
-        '* "auto" will try to use the SGLang implementation if it exists '
-        "and fall back to the Transformers implementation if no SGLang "
-        "implementation is available.\n"
-        '* "sglang" will use the SGLang model implementation.\n'
-        '* "transformers" will use the Transformers model '
-        '* "mindspore" will use the MindSpore model '
-        "implementation.\n",
-    )] = "auto"
-    model_config_parser: Annotated[str, Arg(
-        help='Which model-config parser to use. "auto" picks "mistral" '
-        'via the is_mistral_model name heuristic, else "hf" '
-        "(AutoConfig over config.json). Plugins can register additional "
-        "parsers via @register_model_config_parser.",
-    )] = "auto"
+    model_path: Annotated[
+        str,
+        Arg(
+            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            aliases=["--model"],
+        ),
+    ]
+    tokenizer_path: Annotated[
+        Optional[str],
+        Arg(
+            help="The path of the tokenizer.",
+        ),
+    ] = None
+    tokenizer_mode: Annotated[
+        str,
+        Arg(
+            help="Tokenizer mode. 'auto' will use the fast tokenizer if available, "
+            "and 'slow' will always use the slow tokenizer.",
+            choices=["auto", "slow"],
+        ),
+    ] = "auto"
+    tokenizer_backend: Annotated[
+        str,
+        Arg(
+            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
+            "tokenizers library, and 'fastokens' uses the fastokens library "
+            "for faster tokenization. Requires the fastokens package to be installed.",
+            choices=["huggingface", "fastokens"],
+        ),
+    ] = "huggingface"
+    tokenizer_worker_num: Annotated[
+        int,
+        Arg(
+            help="The worker num of the tokenizer manager.",
+        ),
+    ] = 1
+    detokenizer_worker_num: Annotated[
+        int,
+        Arg(
+            help="The worker num of the detokenizer manager.",
+        ),
+    ] = 1
+    skip_tokenizer_init: Annotated[
+        bool,
+        Arg(
+            help="If set, skip init tokenizer and pass input_ids in generate request.",
+        ),
+    ] = False
+    load_format: Annotated[
+        str,
+        Arg(
+            help="The format of the model weights to load. "
+            '"auto" will try to load the weights in the safetensors format '
+            "and fall back to the pytorch bin format if safetensors format "
+            "is not available. "
+            '"pt" will load the weights in the pytorch bin format. '
+            '"safetensors" will load the weights in the safetensors format. '
+            '"npcache" will load the weights in pytorch format and store '
+            "a numpy cache to speed up the loading. "
+            '"dummy" will initialize the weights with random values, '
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
+            choices=LOAD_FORMAT_CHOICES,
+        ),
+    ] = "auto"
+    model_loader_extra_config: Annotated[
+        str,
+        Arg(
+            help="Extra config for model loader. "
+            "This will be passed to the model loader corresponding to the chosen load_format.",
+        ),
+    ] = "{}"
+    trust_remote_code: Annotated[
+        bool,
+        Arg(
+            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        ),
+    ] = False
+    context_length: Annotated[
+        Optional[int],
+        Arg(
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+            f"\n\n{human_readable_int.__doc__}",
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    is_embedding: Annotated[
+        bool,
+        Arg(
+            help="Whether to use a CausalLM as an embedding model.",
+        ),
+    ] = False
+    enable_multimodal: Annotated[
+        Optional[bool],
+        Arg(
+            help="Enable the multimodal functionality for the served model. "
+            "If the model being served is not multimodal, nothing will happen",
+        ),
+    ] = None
+    revision: Annotated[
+        Optional[str],
+        Arg(
+            help="The specific model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
+        ),
+    ] = None
+    model_impl: Annotated[
+        str,
+        Arg(
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            '* "mindspore" will use the MindSpore model '
+            "implementation.\n",
+        ),
+    ] = "auto"
+    model_config_parser: Annotated[
+        str,
+        Arg(
+            help='Which model-config parser to use. "auto" picks "mistral" '
+            'via the is_mistral_model name heuristic, else "hf" '
+            "(AutoConfig over config.json). Plugins can register additional "
+            "parsers via @register_model_config_parser.",
+        ),
+    ] = "auto"
 
     # HTTP server
-    host: Annotated[str, Arg(
-        help="The host of the HTTP server.",
-    )] = "127.0.0.1"
-    port: Annotated[int, Arg(
-        help="The port of the HTTP server.",
-    )] = 30000
-    fastapi_root_path: Annotated[str, Arg(
-        help="App is behind a path based routing proxy.",
-    )] = ""
-    grpc_mode: Annotated[bool, Arg(
-        help="If set, use gRPC server instead of HTTP server.",
-    )] = False
-    skip_server_warmup: Annotated[bool, Arg(
-        help="If set, skip warmup.",
-    )] = False
-    warmups: Annotated[Optional[str], Arg(
-        help="Specify custom warmup functions (csv) to run before server starts "
-        "eg. --warmups=warmup_name1,warmup_name2 "
-        "will run the functions `warmup_name1` and `warmup_name2` specified in "
-        "warmup.py before the server starts listening for requests",
-    )] = None
-    nccl_port: Annotated[Optional[int], Arg(
-        help="The port for NCCL distributed environment setup. Defaults to a random port.",
-    )] = None
-    checkpoint_engine_wait_weights_before_ready: Annotated[bool, Arg(
-        help="If set, the server will wait for initial weights to be loaded via "
-        "checkpoint-engine or other update methods before serving inference requests.",
-    )] = False
+    host: Annotated[
+        str,
+        Arg(
+            help="The host of the HTTP server.",
+        ),
+    ] = "127.0.0.1"
+    port: Annotated[
+        int,
+        Arg(
+            help="The port of the HTTP server.",
+        ),
+    ] = 30000
+    fastapi_root_path: Annotated[
+        str,
+        Arg(
+            help="App is behind a path based routing proxy.",
+        ),
+    ] = ""
+    grpc_mode: Annotated[
+        bool,
+        Arg(
+            help="If set, use gRPC server instead of HTTP server.",
+        ),
+    ] = False
+    skip_server_warmup: Annotated[
+        bool,
+        Arg(
+            help="If set, skip warmup.",
+        ),
+    ] = False
+    warmups: Annotated[
+        Optional[str],
+        Arg(
+            help="Specify custom warmup functions (csv) to run before server starts "
+            "eg. --warmups=warmup_name1,warmup_name2 "
+            "will run the functions `warmup_name1` and `warmup_name2` specified in "
+            "warmup.py before the server starts listening for requests",
+        ),
+    ] = None
+    nccl_port: Annotated[
+        Optional[int],
+        Arg(
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        ),
+    ] = None
+    checkpoint_engine_wait_weights_before_ready: Annotated[
+        bool,
+        Arg(
+            help="If set, the server will wait for initial weights to be loaded via "
+            "checkpoint-engine or other update methods before serving inference requests.",
+        ),
+    ] = False
 
     # SSL/TLS
-    ssl_keyfile: Annotated[Optional[str], Arg(
-        help="The file path to the SSL key file.",
-    )] = None
-    ssl_certfile: Annotated[Optional[str], Arg(
-        help="The file path to the SSL certificate file.",
-    )] = None
-    ssl_ca_certs: Annotated[Optional[str], Arg(
-        help="The CA certificates file.",
-    )] = None
-    ssl_keyfile_password: Annotated[Optional[str], Arg(
-        help="The password to decrypt the SSL keyfile.",
-    )] = None
-    enable_ssl_refresh: Annotated[bool, Arg(
-        help="Enable automatic SSL certificate hot-reloading when cert/key "
-        "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
-    )] = False
-    enable_http2: Annotated[bool, Arg(
-        help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
-        "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
-        "Requires 'pip install sglang[http2]'.",
-    )] = False
+    ssl_keyfile: Annotated[
+        Optional[str],
+        Arg(
+            help="The file path to the SSL key file.",
+        ),
+    ] = None
+    ssl_certfile: Annotated[
+        Optional[str],
+        Arg(
+            help="The file path to the SSL certificate file.",
+        ),
+    ] = None
+    ssl_ca_certs: Annotated[
+        Optional[str],
+        Arg(
+            help="The CA certificates file.",
+        ),
+    ] = None
+    ssl_keyfile_password: Annotated[
+        Optional[str],
+        Arg(
+            help="The password to decrypt the SSL keyfile.",
+        ),
+    ] = None
+    enable_ssl_refresh: Annotated[
+        bool,
+        Arg(
+            help="Enable automatic SSL certificate hot-reloading when cert/key "
+            "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+        ),
+    ] = False
+    enable_http2: Annotated[
+        bool,
+        Arg(
+            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
+            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
+            "Requires 'pip install sglang[http2]'.",
+        ),
+    ] = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -876,15 +964,18 @@ class ServerArgs:
     enable_mis: bool = False
 
     # Optimization/debug options
-    prefill_only_disable_kv_cache: Annotated[bool, Arg(
-        help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. "
-        "Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, "
-        "an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active "
-        "(no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS "
-        "may benefit from this later once their attention paths stop using paged KV. "
-        "Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to "
-        "(page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
-    )] = False
+    prefill_only_disable_kv_cache: Annotated[
+        bool,
+        Arg(
+            help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. "
+            "Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, "
+            "an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active "
+            "(no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS "
+            "may benefit from this later once their attention paths stop using paged KV. "
+            "Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to "
+            "(page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+        ),
+    ] = False
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False

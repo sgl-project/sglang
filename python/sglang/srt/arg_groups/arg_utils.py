@@ -36,7 +36,18 @@ from __future__ import annotations
 
 import dataclasses
 import types
-from typing import Annotated, Any, Callable, List, Literal, Optional, Union, get_args, get_origin, get_type_hints
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    List,
+    Literal,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,7 +210,9 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             type_func = arg_meta.type_parser or _infer_type_func(elem_type)
             nargs = arg_meta.nargs or "+"
             kwargs = dict(
-                type=type_func, nargs=nargs, help=arg_meta.help,
+                type=type_func,
+                nargs=nargs,
+                help=arg_meta.help,
             )
             if arg_meta.choices:
                 kwargs["choices"] = arg_meta.choices
@@ -225,8 +238,9 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             kwargs["nargs"] = arg_meta.nargs
         if default is not _MISSING:
             kwargs["default"] = default
-        if (arg_meta.required is True or (
-            arg_meta.required is None and default is _MISSING
-        )) and any(name.startswith("-") for name in names):
+        if (
+            arg_meta.required is True
+            or (arg_meta.required is None and default is _MISSING)
+        ) and any(name.startswith("-") for name in names):
             kwargs["required"] = True
         parser.add_argument(*names, **kwargs)
