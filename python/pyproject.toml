@@ -67,7 +67,7 @@ dependencies = [
   "setproctitle",
   "sgl-deep-gemm==0.1.3",
   "sglang-kernel==0.4.4",
-  "smg-grpc-servicer>=0.5.0,<0.5.3",
+  "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.8",
