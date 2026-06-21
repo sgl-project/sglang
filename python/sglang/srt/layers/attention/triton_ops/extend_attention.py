@@ -401,7 +401,6 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -505,9 +504,7 @@ def _fwd_kernel(
                 + offs_d[:, None]
             )
             k = tl.load(
-                K_Extend + offs_k,
-                mask=(mask_n[None, :]) & (mask_d[:, None]),
-                other=0.0,
+                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
             )
 
             qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -548,9 +545,7 @@ def _fwd_kernel(
                 + offs_dv[None, :]
             )
             v = tl.load(
-                V_Extend + offs_v,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
