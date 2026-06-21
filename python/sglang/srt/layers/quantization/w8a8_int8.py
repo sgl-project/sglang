@@ -169,7 +169,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-        if torch.isnan(layer.weight_scale).any():
+        ws = layer.weight_scale
+        # Guard the NaN check against meta-device tensors (model init / tracing
+        # paths), where a boolean reduction on a meta tensor raises (review note).
+        if ws.device.type != "meta" and torch.isnan(ws).any():
             raise ValueError(
                 "W8A8Int8: weight_scale was not loaded from the checkpoint. "
                 "`--quantization w8a8_int8` requires a pre-quantized (e.g. "
