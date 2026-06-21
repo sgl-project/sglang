@@ -138,6 +138,214 @@ def ack_commit(client: HttpClient, worker_url: str) -> JsonDict:
     return set_internal_state(client, worker_url, {"pd_flip_commit_ack": True})
 
 
+def _first_successful_migration_response(response: Any) -> JsonDict:
+    responses = response if isinstance(response, list) else [response]
+    for item in responses:
+        if isinstance(item, dict) and item.get("success"):
+            return item
+    if responses and isinstance(responses[0], dict):
+        return responses[0]
+    return {"success": False, "message": "migration endpoint returned no result"}
+
+
+def start_migration_source(
+    client: HttpClient,
+    source_url: str,
+    target_url: str,
+    session_id: str,
+) -> JsonDict:
+    return _first_successful_migration_response(
+        client.post_json(
+            source_url,
+            "/pd_flip/migration/source/start",
+            {"session_id": session_id, "target_url": target_url},
+        )
+    )
+
+
+def prepare_migration_target(
+    client: HttpClient,
+    target_url: str,
+    source_url: str,
+    session_id: str,
+    manifests: List[JsonDict],
+) -> JsonDict:
+    return _first_successful_migration_response(
+        client.post_json(
+            target_url,
+            "/pd_flip/migration/target/prepare",
+            {
+                "session_id": session_id,
+                "source_url": source_url,
+                "manifests": manifests,
+            },
+        )
+    )
+
+
+def finish_migration_source(
+    client: HttpClient,
+    source_url: str,
+    session_id: str,
+    released_rids: List[str],
+) -> JsonDict:
+    return _first_successful_migration_response(
+        client.post_json(
+            source_url,
+            "/pd_flip/migration/source/finish",
+            {
+                "session_id": session_id,
+                "released_rids": released_rids,
+            },
+        )
+    )
+
+
+def get_migration_status(
+    client: HttpClient,
+    worker_url: str,
+) -> JsonDict:
+    return _first_successful_migration_response(
+        client.get_json(worker_url, "/pd_flip/migration/status")
+    )
+
+
+def _migration_status_done(status: JsonDict) -> bool:
+    inner = status.get("status") or {}
+    return (
+        bool(status.get("success"))
+        and int(inner.get("pending_reqs") or 0) == 0
+        and int(inner.get("failed_reqs") or 0) == 0
+    )
+
+
+def wait_migration_completion(
+    client: HttpClient,
+    source_url: str,
+    target_url: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    sleep_fn: SleepFn = time.sleep,
+    log_fn: LogFn = print,
+) -> JsonDict:
+    deadline = time.monotonic() + timeout_seconds
+    last_source: JsonDict = {}
+    last_target: JsonDict = {}
+
+    while time.monotonic() < deadline:
+        last_source = get_migration_status(client, source_url)
+        last_target = get_migration_status(client, target_url)
+        source_status = last_source.get("status") or {}
+        target_status = last_target.get("status") or {}
+        log_fn(
+            "migration: "
+            f"source={source_status.get('state')} "
+            f"source_pending={source_status.get('pending_reqs')} "
+            f"target={target_status.get('state')} "
+            f"target_pending={target_status.get('pending_reqs')}"
+        )
+
+        if int(source_status.get("failed_reqs") or 0) > 0:
+            return {
+                "status": "migration_failed",
+                "stage": "source_transfer",
+                "source": last_source,
+                "target": last_target,
+            }
+        if int(target_status.get("failed_reqs") or 0) > 0:
+            return {
+                "status": "migration_failed",
+                "stage": "target_transfer",
+                "source": last_source,
+                "target": last_target,
+            }
+        if _migration_status_done(last_source) and _migration_status_done(last_target):
+            return {
+                "status": "migration_transferred",
+                "source": last_source,
+                "target": last_target,
+            }
+
+        sleep_fn(poll_interval_seconds)
+
+    return {
+        "status": "migration_timeout",
+        "source": last_source,
+        "target": last_target,
+    }
+
+
+def drive_migration_once(
+    client: HttpClient,
+    source_url: str,
+    target_url: str,
+    session_id: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    sleep_fn: SleepFn = time.sleep,
+    log_fn: LogFn = print,
+) -> JsonDict:
+    source = start_migration_source(client, source_url, target_url, session_id)
+    if not source.get("success"):
+        return {
+            "status": "migration_failed",
+            "stage": "source_start",
+            "source": source,
+        }
+
+    manifests = source.get("manifests") or []
+    target = prepare_migration_target(
+        client, target_url, source_url, session_id, manifests
+    )
+    if not target.get("success"):
+        return {
+            "status": "migration_failed",
+            "stage": "target_prepare",
+            "source": source,
+            "target": target,
+        }
+
+    transfer = wait_migration_completion(
+        client=client,
+        source_url=source_url,
+        target_url=target_url,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        sleep_fn=sleep_fn,
+        log_fn=log_fn,
+    )
+    if transfer["status"] != "migration_transferred":
+        return transfer
+
+    released_rids = [
+        manifest["rid"]
+        for manifest in manifests
+        if isinstance(manifest, dict) and "rid" in manifest
+    ]
+    finish = finish_migration_source(client, source_url, session_id, released_rids)
+    if not finish.get("success"):
+        return {
+            "status": "migration_failed",
+            "stage": "source_finish",
+            "source": source,
+            "target": target,
+            "transfer": transfer,
+            "finish": finish,
+        }
+
+    log_fn(
+        f"{source_url}: migrated {len(released_rids)} request(s) to {target_url}"
+    )
+    return {
+        "status": "migration_completed",
+        "source": source,
+        "target": target,
+        "transfer": transfer,
+        "finish": finish,
+        "released_rids": released_rids,
+    }
+
+
 def trigger_flip(
     client: HttpClient,
     worker_url: str,
@@ -176,6 +384,8 @@ def run_once(
     timeout_seconds: float,
     poll_interval_seconds: float,
     restart_command: Optional[str],
+    migration_target_url: Optional[str] = None,
+    migration_session_id: str = "pd-flip-migration",
     sleep_fn: SleepFn = time.sleep,
     log_fn: LogFn = print,
 ) -> JsonDict:
@@ -185,6 +395,7 @@ def run_once(
     prepare_acked = False
     restart_done = False
     commit_acked = False
+    migration_done = False
 
     while time.monotonic() < deadline:
         snapshots = fetch_snapshots(client, worker_urls)
@@ -210,6 +421,30 @@ def run_once(
         target_url = current.url
         target_role = target_role or current.pd_flip.get("target_role")
         state = current.pd_flip.get("state")
+
+        if (
+            state == "preparing"
+            and migration_target_url
+            and not migration_done
+            and current.pd_flip.get("direction") == "d_to_p"
+        ):
+            migration_result = drive_migration_once(
+                client=client,
+                source_url=current.url,
+                target_url=migration_target_url,
+                session_id=migration_session_id,
+                timeout_seconds=max(1.0, deadline - time.monotonic()),
+                poll_interval_seconds=poll_interval_seconds,
+                sleep_fn=sleep_fn,
+                log_fn=log_fn,
+            )
+            if migration_result["status"] != "migration_completed":
+                return {
+                    "status": "migration_failed",
+                    "worker_url": current.url,
+                    "migration": migration_result,
+                }
+            migration_done = True
 
         if not is_idle_for_flip(current.pd_flip):
             sleep_fn(poll_interval_seconds)
@@ -291,6 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--timeout", type=float, default=300.0)
     run_parser.add_argument("--poll-interval", type=float, default=1.0)
     run_parser.add_argument("--restart-command", default=None)
+    run_parser.add_argument("--migration-target-url", default=None)
+    run_parser.add_argument("--migration-session-id", default="pd-flip-migration")
 
     return parser
 
@@ -337,6 +574,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout_seconds=args.timeout,
             poll_interval_seconds=args.poll_interval,
             restart_command=args.restart_command,
+            migration_target_url=args.migration_target_url,
+            migration_session_id=args.migration_session_id,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["status"] in ("completed", "completed_by_restart") else 1

@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FAKE_BOOTSTRAP_HOST,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -522,16 +523,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return None
 
     def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
-        backend = (
-            TransferBackend.FAKE
-            if _is_fake_transfer(req, self.scheduler.server_args)
-            else self.transfer_backend
-        )
+        is_fake_transfer = _is_fake_transfer(req, self.scheduler.server_args)
+        backend = TransferBackend.FAKE if is_fake_transfer else self.transfer_backend
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
+        bootstrap_addr = (
+            f"{FAKE_BOOTSTRAP_HOST}:0" if is_fake_transfer else _bootstrap_addr(req)
+        )
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
+            bootstrap_addr=bootstrap_addr,
             bootstrap_room=req.bootstrap_room,
         )
 

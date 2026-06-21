@@ -1736,6 +1736,45 @@ class SetInternalStateReqOutput(BaseReq):
 
 
 @dataclass
+class PDFlipMigrationSourceStartReq(BaseReq):
+    session_id: Optional[str] = None
+    target_url: Optional[str] = None
+    max_reqs: Optional[int] = None
+
+
+@dataclass
+class PDFlipMigrationTargetPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    source_url: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PDFlipMigrationStatusReq(BaseReq):
+    session_id: Optional[str] = None
+
+
+@dataclass
+class PDFlipMigrationSourceFinishReq(BaseReq):
+    session_id: Optional[str] = None
+    released_rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None

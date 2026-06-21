@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import fastapi
 
 from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+    get_kv_class,
+)
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -48,6 +54,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetPrepareReq,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -111,6 +123,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("pd_flip_migration", PDFlipMigrationReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
@@ -133,6 +146,29 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    def _ensure_pd_flip_migration_bootstrap_server(self: TokenizerManager) -> None:
+        if (
+            DisaggregationMode(self.server_args.disaggregation_mode)
+            != DisaggregationMode.DECODE
+        ):
+            return
+        if getattr(self, "pd_flip_migration_bootstrap_server", None) is not None:
+            return
+
+        transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        if transfer_backend == TransferBackend.FAKE:
+            return
+
+        kv_bootstrap_server_class = get_kv_class(
+            transfer_backend, KVClassType.BOOTSTRAP_SERVER
+        )
+        self.pd_flip_migration_bootstrap_server = kv_bootstrap_server_class(
+            host=self.server_args.host,
+            port=self.server_args.disaggregation_bootstrap_port,
+        )
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -802,6 +838,37 @@ class TokenizerControlMixin:
             await self.set_internal_state_communicator(obj)
         )
         return [res.updated for res in responses]
+
+    async def start_pd_flip_migration_source(
+        self: TokenizerManager, obj: PDFlipMigrationSourceStartReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def get_pd_flip_migration_status(
+        self: TokenizerManager, obj: PDFlipMigrationStatusReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def finish_pd_flip_migration_source(
+        self: TokenizerManager, obj: PDFlipMigrationSourceFinishReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def abort_pd_flip_migration(
+        self: TokenizerManager, obj: PDFlipMigrationAbortReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
 
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput

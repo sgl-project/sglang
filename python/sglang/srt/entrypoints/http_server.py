@@ -127,6 +127,11 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetPrepareReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -691,6 +696,44 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+@app.post("/pd_flip/migration/source/start")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def start_pd_flip_migration_source(
+    obj: PDFlipMigrationSourceStartReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source(obj)
+
+
+@app.post("/pd_flip/migration/target/prepare")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target(obj)
+
+
+@app.get("/pd_flip/migration/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_pd_flip_migration_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_flip_migration_status(
+        PDFlipMigrationStatusReq()
+    )
+
+
+@app.post("/pd_flip/migration/source/finish")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def finish_pd_flip_migration_source(
+    obj: PDFlipMigrationSourceFinishReq, request: Request
+):
+    return await _global_state.tokenizer_manager.finish_pd_flip_migration_source(obj)
+
+
+@app.post("/pd_flip/migration/abort")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def abort_pd_flip_migration(obj: PDFlipMigrationAbortReq, request: Request):
+    return await _global_state.tokenizer_manager.abort_pd_flip_migration(obj)
 
 
 # Do not import `dumper.py` to avoid dependency

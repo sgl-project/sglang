@@ -223,6 +223,114 @@ class TestPDFlipInternalStateUpdate(unittest.TestCase):
         self.assertEqual(scheduler.pd_flip_state_machine.evaluator.slo_threshold, 0.8)
         self.assertEqual(scheduler.pd_flip_state_machine.min_window_seconds, 0.0)
 
+    def test_pd_flip_migration_source_start_exports_running_decode_manifest(self):
+        from sglang.srt.managers.io_struct import PDFlipMigrationSourceStartReq
+
+        req = types.SimpleNamespace(
+            rid="rid-1",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4, 5],
+            bootstrap_room=123,
+            priority=7,
+            routing_key="route-a",
+            extra_key="extra-a",
+            return_logprob=False,
+            req_pool_idx=3,
+            kv_committed_len=4,
+            sampling_params=types.SimpleNamespace(to_json=lambda: {"temperature": 0.0}),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.running_batch = types.SimpleNamespace(reqs=[req])
+        scheduler.waiting_queue = []
+        scheduler.ps = types.SimpleNamespace(tp_rank=0)
+
+        output = Scheduler.start_pd_flip_migration_source(
+            scheduler,
+            PDFlipMigrationSourceStartReq(
+                session_id="session-1",
+                target_url="http://decode-target",
+            ),
+        )
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.status["state"], "source_started")
+        self.assertEqual(output.status["pending_reqs"], 1)
+        self.assertEqual(output.manifests[0]["rid"], "rid-1")
+        self.assertEqual(output.manifests[0]["origin_input_ids"], [1, 2, 3])
+        self.assertEqual(output.manifests[0]["output_ids"], [4, 5])
+        self.assertEqual(output.manifests[0]["kv_committed_len"], 4)
+
+    def test_pd_flip_prepare_waits_for_active_migration_before_ack(self):
+        server_args = get_global_server_args()
+        server_args.pd_flip_prepare_ack = True
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = types.SimpleNamespace(pp_size=1, tp_rank=0)
+        scheduler.is_fully_idle = lambda: True
+        scheduler.pd_flip_migration_session = {
+            "role": "source",
+            "state": "source_started",
+            "pending_reqs": 1,
+            "released_reqs": 0,
+            "failed_reqs": 0,
+        }
+        snapshot = ClusterSnapshot(
+            timestamp=1.0,
+            role="decode",
+            running_reqs=1,
+        )
+        decision = FlipDecision(
+            should_flip=True,
+            direction=FlipDirection.D_TO_P,
+            reason="prefill SLO below threshold",
+        )
+
+        self.assertFalse(Scheduler.prepare_pd_flip(scheduler, snapshot, decision))
+        self.assertTrue(server_args.pd_flip_prepare_ack)
+
+        scheduler.pd_flip_migration_session.update(
+            {"state": "source_released", "pending_reqs": 0, "released_reqs": 1}
+        )
+        idle_snapshot = ClusterSnapshot(timestamp=2.0, role="decode")
+        self.assertTrue(Scheduler.prepare_pd_flip(scheduler, idle_snapshot, decision))
+        self.assertFalse(server_args.pd_flip_prepare_ack)
+
+    def test_pd_flip_internal_state_includes_migration_status(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.pd_flip_state_machine = types.SimpleNamespace(
+            status=lambda: {
+                "state": "preparing",
+                "direction": "d_to_p",
+                "active_request_migration_strategy": "drain_to_idle",
+            }
+        )
+        scheduler.pd_flip_should_reject_new_work = lambda: True
+        scheduler.pd_flip_is_idle_for_commit = lambda snapshot: False
+        scheduler.build_pd_flip_snapshot = lambda: ClusterSnapshot(
+            timestamp=1.0, role="decode"
+        )
+        scheduler.pd_flip_migration_session = {
+            "role": "source",
+            "state": "source_started",
+            "pending_reqs": 2,
+            "transferred_reqs": 0,
+            "released_reqs": 0,
+            "failed_reqs": 0,
+            "last_error": "",
+        }
+
+        status = Scheduler.get_pd_flip_internal_state(scheduler)
+
+        self.assertTrue(status["migration_enabled"])
+        self.assertEqual(status["migration_state"], "source_started")
+        self.assertEqual(status["migration_pending_reqs"], 2)
+        self.assertEqual(
+            status["active_request_migration_strategy"],
+            "decode_to_decode_kv_transfer",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

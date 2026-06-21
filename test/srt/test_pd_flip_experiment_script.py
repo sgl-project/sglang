@@ -27,6 +27,19 @@ class FakeClient:
         self.posts = []
 
     def get_json(self, url, path):
+        if path == "/pd_flip/migration/status":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "source_transferred",
+                        "pending_reqs": 0,
+                        "transferred_reqs": 1,
+                        "failed_reqs": 0,
+                    },
+                    "manifests": [{"rid": "rid-1"}],
+                }
+            ]
         self.assert_path(path, "/server_info")
         if not self.server_infos:
             return {
@@ -44,8 +57,40 @@ class FakeClient:
         return self.server_infos.pop(0)
 
     def post_json(self, url, path, payload):
-        self.assert_path(path, "/set_internal_state")
         self.posts.append((url, payload))
+        if path == "/pd_flip/migration/source/start":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "source_started",
+                        "pending_reqs": 1,
+                    },
+                    "manifests": [{"rid": "rid-1"}],
+                }
+            ]
+        if path == "/pd_flip/migration/target/prepare":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "target_prepared",
+                        "transferred_reqs": 1,
+                    },
+                    "manifests": payload["manifests"],
+                }
+            ]
+        if path == "/pd_flip/migration/source/finish":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "source_released",
+                        "released_reqs": 1,
+                    },
+                }
+            ]
+        self.assert_path(path, "/set_internal_state")
         return {"updated": True, "server_args": payload["server_args"]}
 
     def assert_path(self, actual, expected):
@@ -161,6 +206,58 @@ class TestPDFlipExperimentScript(unittest.TestCase):
         self.assertEqual(
             client.posts,
             [(worker_url, {"server_args": {"pd_flip_prepare_ack": True}})],
+        )
+
+    def test_run_once_drives_migration_before_prepare_ack(self):
+        source_url = "http://127.0.0.1:30000"
+        target_url = "http://127.0.0.1:30001"
+        server_infos = [
+            self._server_info("preparing", idle=True),
+            self._server_info("flipping", idle=True),
+            self._server_info("safe", idle=True, direction="none"),
+        ]
+        client = FakeClient(server_infos)
+
+        result = self.script.run_once(
+            client=client,
+            worker_urls=[source_url],
+            timeout_seconds=5.0,
+            poll_interval_seconds=0.0,
+            restart_command=None,
+            migration_target_url=target_url,
+            sleep_fn=lambda _: None,
+            log_fn=lambda _: None,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            client.posts,
+            [
+                (
+                    source_url,
+                    {
+                        "session_id": "pd-flip-migration",
+                        "target_url": target_url,
+                    },
+                ),
+                (
+                    target_url,
+                    {
+                        "session_id": "pd-flip-migration",
+                        "source_url": source_url,
+                        "manifests": [{"rid": "rid-1"}],
+                    },
+                ),
+                (
+                    source_url,
+                    {
+                        "session_id": "pd-flip-migration",
+                        "released_rids": ["rid-1"],
+                    },
+                ),
+                (source_url, {"server_args": {"pd_flip_prepare_ack": True}}),
+                (source_url, {"server_args": {"pd_flip_commit_ack": True}}),
+            ],
         )
 
     def _server_info(self, state, idle, direction="d_to_p", current_role="decode"):

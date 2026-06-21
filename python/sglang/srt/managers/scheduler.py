@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import hashlib
 import logging
 import os
 import signal
@@ -26,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -43,10 +45,12 @@ from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -54,6 +58,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.flip_state_machine import (
     ClusterSnapshot,
     FlipDecision,
+    FlipDirection,
     FlipEvent,
     FlipState,
     FlipStateMachine,
@@ -67,9 +72,12 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_kv_class,
+    is_mla_backend,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -133,6 +141,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetPrepareReq,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -227,7 +241,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -241,6 +259,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import (
@@ -1060,6 +1079,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
         )
+        self.disagg_draft_token_to_kv_pool = draft_token_to_kv_pool
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
         # when this node runs a spec module.
@@ -1291,6 +1311,21 @@ class Scheduler(
         )
         status["external_commit_ack"] = getattr(server_args, "pd_flip_commit_ack", False)
         status["external_abort_requested"] = getattr(server_args, "pd_flip_abort", False)
+        migration_status = self._pd_flip_migration_status_dict()
+        status["migration_enabled"] = migration_status["enabled"]
+        status["migration_role"] = migration_status["role"]
+        status["migration_state"] = migration_status["state"]
+        status["migration_session_id"] = migration_status["session_id"]
+        status["migration_pending_reqs"] = migration_status["pending_reqs"]
+        status["migration_transferred_reqs"] = migration_status["transferred_reqs"]
+        status["migration_released_reqs"] = migration_status["released_reqs"]
+        status["migration_failed_reqs"] = migration_status["failed_reqs"]
+        status["migration_last_error"] = migration_status["last_error"]
+        status["migration_dry_run"] = migration_status["dry_run"]
+        if migration_status["enabled"] and status.get("direction") == "d_to_p":
+            status["active_request_migration_strategy"] = (
+                "decode_to_decode_kv_transfer"
+            )
         return status
 
     def build_pd_flip_snapshot(self) -> ClusterSnapshot:
@@ -1353,6 +1388,13 @@ class Scheduler(
                 snapshot.decode_prealloc_reqs,
                 snapshot.decode_transfer_reqs,
             )
+        if (
+            decision.direction == FlipDirection.D_TO_P
+            and self._pd_flip_migration_is_active()
+            and not self._pd_flip_migration_is_released()
+        ):
+            return False
+
         # The scheduler event loop is selected from disaggregation_mode at
         # startup. Keep the node in PREPARING until an external orchestrator
         # has drained the node, then acks through /set_internal_state.
@@ -1418,6 +1460,891 @@ class Scheduler(
             return len(queue)
         except TypeError:
             return 0
+
+    def start_pd_flip_migration_source(
+        self, recv_req: PDFlipMigrationSourceStartReq
+    ) -> PDFlipMigrationReqOutput:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "decode":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"source migration requires decode role, got {role}",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        running_reqs = list(getattr(getattr(self, "running_batch", None), "reqs", []))
+        if recv_req.max_reqs is not None:
+            running_reqs = running_reqs[: max(0, recv_req.max_reqs)]
+
+        manifests = []
+        for req in running_reqs:
+            manifest = self._pd_flip_build_migration_manifest(req)
+            manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
+                req
+            )
+            manifest["source_bootstrap_port"] = (
+                getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                )
+            )
+            manifests.append(manifest)
+        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
+        real_entries, real_error = self._pd_flip_start_source_entries(
+            running_reqs, manifests
+        )
+        self.pd_flip_migration_session = {
+            "session_id": session_id,
+            "role": "source",
+            "state": "source_started" if not real_error else "source_failed",
+            "target_url": recv_req.target_url,
+            "manifests": manifests,
+            "pending_reqs": len(manifests),
+            "transferred_reqs": 0,
+            "released_reqs": 0,
+            "failed_reqs": len(manifests) if real_error else 0,
+            "last_error": real_error,
+            "dry_run": not bool(real_entries),
+            "source_entries": real_entries,
+        }
+        if real_entries:
+            self._pd_flip_source_pump_transfer(self.pd_flip_migration_session)
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "source migration session started",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+        )
+
+    def prepare_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "decode":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"target migration requires decode role, got {role}",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        session_id = recv_req.session_id or f"pd-flip-target-{int(time.time() * 1000)}"
+        manifests = list(recv_req.manifests or [])
+        target_entries, real_error = self._pd_flip_prepare_target_entries(
+            manifests, recv_req.source_url
+        )
+        self.pd_flip_migration_session = {
+            "session_id": session_id,
+            "role": "target",
+            "state": "target_prepared" if not real_error else "target_failed",
+            "source_url": recv_req.source_url,
+            "manifests": manifests,
+            "pending_reqs": len(manifests),
+            "transferred_reqs": 0,
+            "released_reqs": 0,
+            "failed_reqs": len(manifests) if real_error else 0,
+            "last_error": real_error,
+            "dry_run": not bool(target_entries),
+            "target_entries": target_entries,
+        }
+        if target_entries:
+            self._pd_flip_target_pump_transfer(self.pd_flip_migration_session)
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "target migration session prepared",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+        )
+
+    def get_pd_flip_migration_status(
+        self, recv_req: PDFlipMigrationStatusReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None) or {}
+        if session.get("role") == "source":
+            self._pd_flip_source_pump_transfer(session)
+        elif session.get("role") == "target":
+            self._pd_flip_target_pump_transfer(session)
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def finish_pd_flip_migration_source(
+        self, recv_req: PDFlipMigrationSourceFinishReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no source migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "source":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not source",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_source_pump_transfer(session)
+
+        manifests = list(session.get("manifests", []))
+        released_rids = recv_req.released_rids
+        if released_rids is not None:
+            released = {
+                manifest.get("rid")
+                for manifest in manifests
+                if manifest.get("rid") in set(released_rids)
+            }
+        else:
+            released = {manifest.get("rid") for manifest in manifests}
+        transferred = set(session.get("transferred_rids", set()))
+        not_ready = sorted(rid for rid in released if rid not in transferred)
+        if not_ready and not session.get("dry_run", False):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"migration transfer still pending for rids={not_ready}",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=manifests,
+            )
+
+        self._pd_flip_release_source_requests(session, released)
+        session["state"] = "source_released"
+        session["pending_reqs"] = max(0, len(manifests) - len(released))
+        session["released_reqs"] = len(released)
+        session["transferred_reqs"] = len(released)
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="source migration session released",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+        )
+
+    def abort_pd_flip_migration(
+        self, recv_req: PDFlipMigrationAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if session:
+            session["state"] = "aborted"
+            session["last_error"] = recv_req.reason or "migration aborted"
+            session["pending_reqs"] = 0
+            session["failed_reqs"] = len(session.get("manifests", []))
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="migration aborted",
+            status=self._pd_flip_migration_status_dict(),
+        )
+
+    def _pd_flip_can_use_real_migration(self) -> bool:
+        return (
+            getattr(self, "disaggregation_mode", None) == DisaggregationMode.DECODE
+            and getattr(self, "disagg_decode_prealloc_queue", None) is not None
+            and getattr(self, "disagg_metadata_buffers", None) is not None
+            and getattr(self, "req_to_metadata_buffer_idx_allocator", None) is not None
+            and getattr(self, "req_to_token_pool", None) is not None
+            and getattr(self, "token_to_kv_pool_allocator", None) is not None
+        )
+
+    def _pd_flip_migration_room_for_req(self, req: Req) -> int:
+        server_args = getattr(self, "server_args", None)
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1)))
+        ps = getattr(self, "ps", None)
+        dp_rank = getattr(ps, "attn_dp_rank", None)
+        if dp_rank is None:
+            dp_rank = getattr(ps, "dp_rank", 0) or 0
+        digest = hashlib.sha256(str(getattr(req, "rid", "")).encode()).digest()
+        base = int.from_bytes(digest[:8], "big") % (2**30)
+        return (base // dp_size) * dp_size + int(dp_rank)
+
+    def _pd_flip_start_source_entries(
+        self, running_reqs: List[Req], manifests: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        if not self._pd_flip_can_use_real_migration():
+            return {}, ""
+        if getattr(self, "enable_hisparse", False):
+            return {}, "PD flip migration does not support HiSparse decode yet"
+
+        try:
+            kv_manager = self._pd_flip_get_source_kv_manager()
+            sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+            entries: Dict[str, Dict[str, Any]] = {}
+            for req, manifest in zip(running_reqs, manifests):
+                rid = str(manifest.get("rid") or getattr(req, "rid", ""))
+                committed_len = int(manifest.get("kv_committed_len") or 0)
+                if committed_len <= 0:
+                    return {}, f"request {rid} has no committed KV to migrate"
+                if len(getattr(req, "output_ids", []) or []) == 0:
+                    return {}, f"request {rid} has no decode output token to resume"
+                if getattr(req, "req_pool_idx", None) is None:
+                    return {}, f"request {rid} has no req_pool_idx"
+
+                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                if metadata_index is None:
+                    return {}, "no metadata buffer available for source migration"
+
+                migration_room = int(manifest["migration_bootstrap_room"])
+                sender = sender_class(
+                    mgr=kv_manager,
+                    bootstrap_addr=bootstrap_addr,
+                    bootstrap_room=migration_room,
+                    dest_tp_ranks=[self.ps.tp_rank],
+                    pp_rank=self.ps.pp_rank,
+                )
+                page_indices = self._pd_flip_source_page_indices(req, committed_len)
+                sender.init(len(page_indices), metadata_index)
+                entries[rid] = {
+                    "req": req,
+                    "sender": sender,
+                    "manifest": manifest,
+                    "metadata_index": metadata_index,
+                    "migration_bootstrap_room": migration_room,
+                    "committed_len": committed_len,
+                    "sent": False,
+                    "transferred": False,
+                    "failed": False,
+                }
+            return entries, ""
+        except Exception as exc:
+            return {}, str(exc)
+
+    def _pd_flip_get_source_kv_manager(self):
+        manager = getattr(self, "pd_flip_source_kv_manager", None)
+        if manager is not None:
+            return manager
+
+        base_manager = self.disagg_decode_prealloc_queue.kv_manager
+        kv_args = base_manager.kv_args
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_args.prefill_start_layer = getattr(kv_pool, "start_layer", 0)
+        kv_args.prefill_end_layer = getattr(kv_pool, "end_layer", None)
+        kv_args.page_size = getattr(kv_pool, "page_size", kv_args.page_size)
+        kv_args.ib_device = self.server_args.disaggregation_ib_device
+        kv_args.gpu_id = self.ps.gpu_id
+        if getattr(kv_pool, "compression_ratios", None) is not None:
+            kv_args.mla_compression_ratios = list(kv_pool.compression_ratios)
+        is_mla = is_mla_backend(kv_pool)
+        if not is_mla:
+            if hasattr(kv_pool, "head_num"):
+                kv_args.kv_head_num = kv_pool.head_num
+            kv_args.total_kv_head_num = self.model_config.get_total_num_kv_heads()
+
+        manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        manager = manager_class(
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.server_args,
+            is_mla,
+        )
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and hasattr(manager, "set_kv_buffer_tensors")
+            and not is_mla
+        ):
+            kv_pool_for_tensors = kv_pool.full_kv_pool if hasattr(kv_pool, "full_kv_pool") else kv_pool
+            if hasattr(kv_pool_for_tensors, "k_buffer") and hasattr(
+                kv_pool_for_tensors, "v_buffer"
+            ):
+                manager.set_kv_buffer_tensors(
+                    kv_pool_for_tensors.k_buffer,
+                    kv_pool_for_tensors.v_buffer,
+                    kv_pool_for_tensors.page_size,
+                )
+        self.pd_flip_source_kv_manager = manager
+        return manager
+
+    def _pd_flip_local_bootstrap_addr(self, kv_manager) -> str:
+        host = getattr(self.server_args, "host", "127.0.0.1")
+        if host in ("0.0.0.0", "::"):
+            host = getattr(kv_manager, "local_ip", "127.0.0.1")
+        return f"{host}:{self.server_args.disaggregation_bootstrap_port}"
+
+    def _pd_flip_source_page_indices(self, req: Req, committed_len: int):
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            .cpu()
+            .numpy()
+        )
+        return kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+
+    def _pd_flip_source_state_indices(
+        self, req: Req, committed_len: int, kv_manager
+    ) -> Optional[List]:
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.sliding_window_size
+            window_start = max(0, committed_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:committed_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+        state_indices: Optional[List] = []
+        for st in getattr(kv_manager.kv_args, "state_types", []):
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _pd_flip_set_source_metadata(
+        self, req: Req, metadata_index: int, migration_room: int
+    ) -> None:
+        buffers = self.disagg_metadata_buffers
+        buffers.output_ids[metadata_index].zero_()
+        buffers.cached_tokens[metadata_index].zero_()
+        buffers.output_token_logprobs_val[metadata_index].zero_()
+        buffers.output_token_logprobs_idx[metadata_index].zero_()
+        buffers.output_top_logprobs_val[metadata_index].zero_()
+        buffers.output_top_logprobs_idx[metadata_index].zero_()
+        buffers.output_topk_p[metadata_index].zero_()
+        buffers.output_topk_index[metadata_index].zero_()
+        buffers.output_hidden_states[metadata_index].zero_()
+        buffers.bootstrap_room[metadata_index].zero_()
+
+        output_ids = list(getattr(req, "output_ids", []) or [])
+        buffers.output_ids[metadata_index][0] = output_ids[-1]
+        buffers.cached_tokens[metadata_index][0] = getattr(req, "cached_tokens", 0)
+        buffers.cached_tokens[metadata_index][1] = getattr(
+            req, "cached_tokens_device", 0
+        )
+        buffers.cached_tokens[metadata_index][2] = getattr(req, "cached_tokens_host", 0)
+        buffers.cached_tokens[metadata_index][3] = getattr(
+            req, "cached_tokens_storage", 0
+        )
+        if getattr(req, "return_logprob", False):
+            vals = getattr(req.logprob, "output_token_logprobs_val", None)
+            idxs = getattr(req.logprob, "output_token_logprobs_idx", None)
+            top_vals = getattr(req.logprob, "output_top_logprobs_val", None)
+            top_idxs = getattr(req.logprob, "output_top_logprobs_idx", None)
+            if vals:
+                buffers.output_token_logprobs_val[metadata_index][0] = vals[-1]
+            if idxs:
+                buffers.output_token_logprobs_idx[metadata_index][0] = idxs[-1]
+            if top_vals:
+                buffers.output_top_logprobs_val[metadata_index][
+                    : len(top_vals[-1])
+                ] = torch.tensor(top_vals[-1], dtype=torch.float32, device="cpu")
+            if top_idxs:
+                buffers.output_top_logprobs_idx[metadata_index][
+                    : len(top_idxs[-1])
+                ] = torch.tensor(top_idxs[-1], dtype=torch.int32, device="cpu")
+        if getattr(req, "hidden_states_tensor", None) is not None:
+            topk = req.output_topk_p.size(0)
+            buffers.output_topk_p[metadata_index, :topk].copy_(req.output_topk_p)
+            buffers.output_topk_index[metadata_index, :topk].copy_(
+                req.output_topk_index
+            )
+            buffers.output_hidden_states[metadata_index].copy_(
+                req.hidden_states_tensor
+            )
+        buffers.bootstrap_room[metadata_index, 0] = migration_room
+
+    def _pd_flip_source_pump_transfer(self, session: Dict[str, Any]) -> None:
+        entries = session.get("source_entries") or {}
+        if not entries:
+            return
+
+        transferred = set(session.get("transferred_rids", set()))
+        failed = set(session.get("failed_rids", set()))
+        for rid, entry in entries.items():
+            if entry.get("transferred") or entry.get("failed"):
+                continue
+            sender = entry["sender"]
+            poll = sender.poll()
+            if poll == KVPoll.Failed:
+                entry["failed"] = True
+                failed.add(rid)
+                try:
+                    sender.failure_exception()
+                except Exception as exc:
+                    session["last_error"] = str(exc)
+                continue
+            if poll == KVPoll.WaitingForInput and not entry.get("sent"):
+                req = entry["req"]
+                old_metadata_index = getattr(req, "metadata_buffer_index", -1)
+                old_bootstrap_room = getattr(req, "bootstrap_room", None)
+                old_sender = getattr(req, "disagg_kv_sender", None)
+                try:
+                    req.metadata_buffer_index = entry["metadata_index"]
+                    req.bootstrap_room = entry["migration_bootstrap_room"]
+                    req.disagg_kv_sender = sender
+                    self._pd_flip_set_source_metadata(
+                        req,
+                        entry["metadata_index"],
+                        entry["migration_bootstrap_room"],
+                    )
+                    page_indices = self._pd_flip_source_page_indices(
+                        req, entry["committed_len"]
+                    )
+                    state_indices = self._pd_flip_source_state_indices(
+                        req, entry["committed_len"], sender.kv_mgr
+                    )
+                    sender.send(page_indices, state_indices)
+                    entry["sent"] = True
+                except Exception as exc:
+                    entry["failed"] = True
+                    failed.add(rid)
+                    session["last_error"] = str(exc)
+                    if hasattr(sender, "abort"):
+                        sender.abort()
+                finally:
+                    req.metadata_buffer_index = old_metadata_index
+                    req.bootstrap_room = old_bootstrap_room
+                    req.disagg_kv_sender = old_sender
+            poll = sender.poll()
+            if poll == KVPoll.Success:
+                entry["transferred"] = True
+                transferred.add(rid)
+                self._pd_flip_free_source_metadata(entry)
+
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(session.get("manifests", [])) - len(transferred) - len(failed)
+        )
+        if failed:
+            session["state"] = "source_failed"
+        elif session["pending_reqs"] == 0 and session.get("state") == "source_started":
+            session["state"] = "source_transferred"
+
+    def _pd_flip_free_source_metadata(self, entry: Dict[str, Any]) -> None:
+        if entry.get("metadata_freed"):
+            return
+        metadata_index = entry.get("metadata_index")
+        if metadata_index is not None and metadata_index >= 0:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+        entry["metadata_freed"] = True
+
+    def _pd_flip_release_source_requests(
+        self, session: Dict[str, Any], released_rids: set
+    ) -> None:
+        for rid in released_rids:
+            entry = (session.get("source_entries") or {}).get(rid)
+            if not entry:
+                continue
+            req = entry.get("req")
+            if req is not None and not req.finished():
+                req.to_finish = FINISH_ABORT(
+                    "Request migrated during PD role flip.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            self._pd_flip_free_source_metadata(entry)
+
+    def _pd_flip_prepare_target_entries(
+        self, manifests: List[Dict[str, Any]], source_url: Optional[str]
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        if not self._pd_flip_can_use_real_migration():
+            return {}, ""
+        if getattr(self, "enable_hisparse", False):
+            return {}, "PD flip migration does not support HiSparse decode yet"
+        try:
+            source_host = self._pd_flip_source_host_from_url(source_url)
+            entries: Dict[str, Dict[str, Any]] = {}
+            receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+            for manifest in manifests:
+                req = self._pd_flip_manifest_to_req(manifest, source_host)
+                receiver = receiver_class(
+                    mgr=kv_manager,
+                    bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                    bootstrap_room=req.bootstrap_room,
+                )
+                decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                entries[req.rid] = {
+                    "decode_req": decode_req,
+                    "phase": "new",
+                    "manifest": manifest,
+                    "metadata_index": -1,
+                }
+            return entries, ""
+        except Exception as exc:
+            return {}, str(exc)
+
+    def _pd_flip_source_host_from_url(self, source_url: Optional[str]) -> str:
+        if not source_url:
+            raise ValueError("source_url is required for real migration target prepare")
+        parsed = urlparse(source_url)
+        if parsed.hostname:
+            return parsed.hostname
+        return parsed.path.split(":", 1)[0]
+
+    def _pd_flip_manifest_to_req(
+        self, manifest: Dict[str, Any], source_host: str
+    ) -> Req:
+        sampling_params = self._pd_flip_deserialize_sampling_params(
+            manifest.get("sampling_params") or {}
+        )
+        try:
+            sampling_params.normalize(getattr(self, "tokenizer", None))
+            sampling_params.verify(self.model_config.vocab_size)
+        except Exception:
+            logger.debug("Skipping sampling param normalize/verify for migration", exc_info=True)
+
+        req = Req(
+            str(manifest.get("rid", "")),
+            "",
+            array("q", list(manifest.get("origin_input_ids") or [])),
+            sampling_params,
+            return_logprob=bool(manifest.get("return_logprob", False)),
+            stream=False,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            bootstrap_host=source_host,
+            bootstrap_port=int(
+                manifest.get("source_bootstrap_port")
+                or getattr(self.server_args, "disaggregation_bootstrap_port", 8998)
+            ),
+            bootstrap_room=int(
+                manifest.get("migration_bootstrap_room")
+                or manifest.get("bootstrap_room")
+                or 0
+            ),
+            disagg_mode=self.disaggregation_mode,
+            vocab_size=self.model_config.vocab_size,
+            priority=manifest.get("priority"),
+            metrics_collector=(
+                self.metrics_collector
+                if getattr(self.metrics_reporter, "enable_metrics", False)
+                else None
+            ),
+            routing_key=manifest.get("routing_key"),
+            extra_key=manifest.get("extra_key"),
+        )
+        req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.kv_committed_len = int(
+            manifest.get("kv_committed_len")
+            or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        )
+        return req
+
+    @staticmethod
+    def _pd_flip_deserialize_sampling_params(values: Dict[str, Any]) -> SamplingParams:
+        allowed = set(SamplingParams.__init__.__code__.co_varnames)
+        allowed.discard("self")
+        kwargs = {key: value for key, value in dict(values).items() if key in allowed}
+        return SamplingParams(**kwargs)
+
+    def _pd_flip_target_pump_transfer(self, session: Dict[str, Any]) -> None:
+        entries = session.get("target_entries") or {}
+        if not entries:
+            return
+
+        transferred = set(session.get("transferred_rids", set()))
+        failed = set(session.get("failed_rids", set()))
+        for rid, entry in entries.items():
+            if rid in transferred or rid in failed:
+                continue
+            decode_req = entry["decode_req"]
+            phase = entry.get("phase")
+            try:
+                if phase == "new":
+                    if not self._pd_flip_target_init_receiver(decode_req):
+                        continue
+                    entry["phase"] = "waiting_for_input"
+                    phase = "waiting_for_input"
+
+                if phase == "waiting_for_input":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target bootstrap failed")
+                    if poll != KVPoll.WaitingForInput:
+                        continue
+                    self._pd_flip_target_prealloc_and_send_metadata(entry)
+                    entry["phase"] = "transferring"
+
+                if entry.get("phase") == "transferring":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target transfer failed")
+                    if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
+                        entry
+                    ):
+                        transferred.add(rid)
+                        entry["phase"] = "transferred"
+                        decode_req.kv_receiver.clear()
+                        self._pd_flip_release_target_request(entry)
+                        self._pd_flip_free_target_metadata(entry)
+            except Exception as exc:
+                failed.add(rid)
+                entry["phase"] = "failed"
+                session["last_error"] = str(exc)
+                if getattr(decode_req, "kv_receiver", None) is not None:
+                    decode_req.kv_receiver.abort()
+                self._pd_flip_release_target_request(entry)
+                self._pd_flip_free_target_metadata(entry)
+
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(session.get("manifests", [])) - len(transferred) - len(failed)
+        )
+        if failed:
+            session["state"] = "target_failed"
+        elif session["pending_reqs"] == 0:
+            session["state"] = "target_transferred"
+
+    def _pd_flip_target_init_receiver(self, decode_req: DecodeRequest) -> bool:
+        queue = self.disagg_decode_prealloc_queue
+        if self.transfer_backend == TransferBackend.FAKE:
+            decode_req.kv_receiver.init(0)
+            return True
+
+        addr = f"{decode_req.req.bootstrap_host}:{decode_req.req.bootstrap_port}"
+        if not queue.kv_manager.try_ensure_parallel_info(addr):
+            return False
+        prefill_dp_rank = queue._resolve_prefill_dp_rank(decode_req.req)
+        if prefill_dp_rank is None:
+            room_to_rank = decode_req.kv_receiver.query_prefill_dp_ranks(
+                addr, [decode_req.req.bootstrap_room]
+            )
+            prefill_dp_rank = room_to_rank.get(str(decode_req.req.bootstrap_room))
+        if prefill_dp_rank is None:
+            return False
+        decode_req.kv_receiver.init(int(prefill_dp_rank))
+        return True
+
+    def _pd_flip_target_prealloc_and_send_metadata(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        decode_req: DecodeRequest = entry["decode_req"]
+        req = decode_req.req
+        queue = self.disagg_decode_prealloc_queue
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for target migration")
+        entry["metadata_index"] = metadata_index
+        decode_req.metadata_buffer_index = metadata_index
+
+        dst_kv_indices = queue._pre_alloc(req, prefix_len=0, total_prefix_len=0)
+        committed_len = int(req.kv_committed_len)
+        if self.server_args.disaggregation_decode_enable_radix_cache:
+            kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                :committed_len
+            ].cpu().numpy()
+        else:
+            kv_indices = dst_kv_indices.cpu().numpy()
+        page_indices = kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+        state_indices = self._pd_flip_target_state_indices(req, committed_len)
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            metadata_index,
+            state_indices,
+            decode_prefix_len=0,
+        )
+        if self.transfer_backend == TransferBackend.FAKE:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
+                req.bootstrap_room
+            )
+
+    def _pd_flip_target_state_indices(self, req: Req, committed_len: int) -> List:
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.sliding_window_size
+            window_start = max(0, committed_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:committed_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+        state_indices: List = []
+        for st in getattr(
+            self.disagg_decode_prealloc_queue.kv_manager.kv_args, "state_types", []
+        ):
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _pd_flip_target_metadata_ready(self, entry: Dict[str, Any]) -> bool:
+        metadata_index = entry.get("metadata_index", -1)
+        if metadata_index is None or metadata_index < 0:
+            return True
+        expected_room = entry["decode_req"].req.bootstrap_room
+        actual_room = self.disagg_metadata_buffers.bootstrap_room[
+            metadata_index, 0
+        ].item()
+        if actual_room == 0:
+            return False
+        if actual_room != expected_room:
+            raise RuntimeError(
+                f"migration metadata room mismatch: expected {expected_room}, got {actual_room}"
+            )
+        return True
+
+    def _pd_flip_free_target_metadata(self, entry: Dict[str, Any]) -> None:
+        metadata_index = entry.get("metadata_index", -1)
+        if metadata_index is not None and metadata_index >= 0:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+            entry["metadata_index"] = -1
+
+    def _pd_flip_release_target_request(self, entry: Dict[str, Any]) -> None:
+        if entry.get("request_released"):
+            return
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None or getattr(req, "req_pool_idx", None) is None:
+            entry["request_released"] = True
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        entry["request_released"] = True
+
+    def _pd_flip_build_migration_manifest(self, req: Req) -> Dict[str, Any]:
+        origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
+        output_ids = list(getattr(req, "output_ids", []) or [])
+        kv_committed_len = getattr(req, "kv_committed_len", None)
+        if kv_committed_len is None:
+            kv_committed_len = len(origin_input_ids) + max(0, len(output_ids) - 1)
+        return {
+            "rid": getattr(req, "rid", ""),
+            "origin_input_ids": origin_input_ids,
+            "output_ids": output_ids,
+            "bootstrap_room": getattr(req, "bootstrap_room", None),
+            "priority": getattr(req, "priority", None),
+            "routing_key": getattr(req, "routing_key", None),
+            "extra_key": getattr(req, "extra_key", None),
+            "return_logprob": bool(getattr(req, "return_logprob", False)),
+            "req_pool_idx": getattr(req, "req_pool_idx", None),
+            "kv_committed_len": int(kv_committed_len),
+            "sampling_params": self._pd_flip_serialize_sampling_params(
+                getattr(req, "sampling_params", None)
+            ),
+        }
+
+    @staticmethod
+    def _pd_flip_serialize_sampling_params(sampling_params) -> Dict[str, Any]:
+        if sampling_params is None:
+            return {}
+        for method_name in ("to_json", "to_dict"):
+            method = getattr(sampling_params, method_name, None)
+            if callable(method):
+                value = method()
+                if isinstance(value, dict):
+                    return Scheduler._pd_flip_json_safe_dict(value)
+        return Scheduler._pd_flip_json_safe_dict(
+            getattr(sampling_params, "__dict__", {})
+        )
+
+    @staticmethod
+    def _pd_flip_json_safe_dict(values: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
+        for key, value in dict(values).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[key] = value
+            elif isinstance(value, (list, tuple)):
+                if all(
+                    isinstance(item, (str, int, float, bool)) or item is None
+                    for item in value
+                ):
+                    safe[key] = list(value)
+        return safe
+
+    def _pd_flip_migration_status_dict(self) -> Dict[str, Any]:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return {
+                "enabled": False,
+                "role": "none",
+                "state": "none",
+                "session_id": None,
+                "pending_reqs": 0,
+                "transferred_reqs": 0,
+                "released_reqs": 0,
+                "failed_reqs": 0,
+                "last_error": "",
+                "dry_run": False,
+            }
+        return {
+            "enabled": True,
+            "role": session.get("role", "none"),
+            "state": session.get("state", "none"),
+            "session_id": session.get("session_id"),
+            "pending_reqs": int(session.get("pending_reqs", 0)),
+            "transferred_reqs": int(session.get("transferred_reqs", 0)),
+            "released_reqs": int(session.get("released_reqs", 0)),
+            "failed_reqs": int(session.get("failed_reqs", 0)),
+            "last_error": session.get("last_error", ""),
+            "dry_run": bool(session.get("dry_run", False)),
+        }
+
+    def _pd_flip_migration_is_active(self) -> bool:
+        return self._pd_flip_migration_status_dict()["enabled"]
+
+    def _pd_flip_migration_is_released(self) -> bool:
+        status = self._pd_flip_migration_status_dict()
+        return (
+            status["state"] == "source_released"
+            and status["pending_reqs"] == 0
+            and status["failed_reqs"] == 0
+        )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -1602,6 +2529,20 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (
+                    PDFlipMigrationSourceStartReq,
+                    self.start_pd_flip_migration_source,
+                ),
+                (
+                    PDFlipMigrationTargetPrepareReq,
+                    self.prepare_pd_flip_migration_target,
+                ),
+                (PDFlipMigrationStatusReq, self.get_pd_flip_migration_status),
+                (
+                    PDFlipMigrationSourceFinishReq,
+                    self.finish_pd_flip_migration_source,
+                ),
+                (PDFlipMigrationAbortReq, self.abort_pd_flip_migration),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
