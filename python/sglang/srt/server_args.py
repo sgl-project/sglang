@@ -620,6 +620,7 @@ class ServerArgs:
     speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_use_rejection_sampling: bool = False
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -6126,6 +6127,12 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-use-rejection-sampling",
+            action="store_true",
+            help="Use rejection sampling for speculative decoding (requires topk=1).",
+            default=ServerArgs.speculative_use_rejection_sampling,
         )
         parser.add_argument(
             "--speculative-token-map",
