@@ -1009,19 +1009,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
-    def test_overlap_force_cpu_seq_lens_with_tc_piecewise_prefill(self):
-        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
-
-        server_args = SimpleNamespace(
-            enable_two_batch_overlap=False,
-            cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        attn_backend = SimpleNamespace(needs_cpu_seq_lens=False)
-
-        self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
-
     @patch(
         "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"

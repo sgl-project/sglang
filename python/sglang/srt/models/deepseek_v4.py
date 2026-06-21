@@ -1841,6 +1841,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
+        # batched/contiguous-load rope kernels (faster on gfx95; .
+        # Module-level toggles default OFF; flipped True here for DSV4
+        if _is_hip:
+            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+
+            set_force_ck_w8a8(True)
+            set_batched_rope(True)
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
