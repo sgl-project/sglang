@@ -55,7 +55,7 @@ jobs:
           if [[ -n "${{ inputs.job_filter }}" ]]; then
             echo "workflows=pr-test-amd.yml" >> "$GITHUB_OUTPUT"
           else
-            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
+            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm700.yml,nightly-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch Actions data snapshot
@@ -119,7 +119,7 @@ jobs:
     outputs:
       pr_jobs: ${{ steps.parse.outputs.pr_jobs }}
       nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
-      pr_rocm720_jobs: ${{ steps.parse.outputs.pr_rocm720_jobs }}
+      pr_rocm700_jobs: ${{ steps.parse.outputs.pr_rocm700_jobs }}
       nightly_rocm720_jobs: ${{ steps.parse.outputs.nightly_rocm720_jobs }}
     steps:
       - name: Checkout code
@@ -144,13 +144,13 @@ jobs:
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
           echo "Nightly jobs: $nightly_jobs"
 
-          # Parse pr-test-amd-rocm720.yml (exclude utility jobs)
+          # Parse pr-test-amd-rocm700.yml (exclude utility jobs)
           # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
-          pr_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
+          pr_rocm700_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm700.yml | \
             grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "pr_rocm720_jobs=$pr_rocm720_jobs" >> $GITHUB_OUTPUT
-          echo "PR ROCm 7.2 jobs: $pr_rocm720_jobs"
+          echo "pr_rocm700_jobs=$pr_rocm700_jobs" >> $GITHUB_OUTPUT
+          echo "PR ROCm 7.0 jobs: $pr_rocm700_jobs"
 
           # Parse nightly-test-amd-rocm720.yml (exclude utility jobs)
           # Excluded: check-all-jobs
@@ -238,16 +238,16 @@ jobs:
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
-  # PR ROCm 7.2 CI reports using dynamic matrix
-  pr-rocm720-ci-reports:
-    name: PR ROCm720 - ${{ matrix.job_name }}
+  # PR ROCm 7.0 CI reports using dynamic matrix
+  pr-rocm700-ci-reports:
+    name: PR ROCm700 - ${{ matrix.job_name }}
     needs: [parse-workflows, fetch-actions-data]
     if: ${{ !inputs.job_filter }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_rocm720_jobs) }}
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_rocm700_jobs) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -266,13 +266,13 @@ jobs:
           name: actions-job-snapshot
           path: ci-data
 
-      - name: Generate PR ROCm 7.2 Report
+      - name: Generate PR ROCm 7.0 Report
         timeout-minutes: 15
         run: |
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
-            --workflow "pr-test-amd-rocm720.yml" \
+            --workflow "pr-test-amd-rocm700.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
@@ -346,7 +346,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --runner-report \
-            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" \
+            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm700.yml,nightly-test-amd-rocm720.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary

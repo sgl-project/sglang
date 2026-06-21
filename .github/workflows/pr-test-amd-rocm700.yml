@@ -1,4 +1,4 @@
-name: PR Test ROCm 7.2 (AMD)
+name: PR Test ROCm 7.0 (AMD)
 # Dynamic run-name for /rerun-stage commands to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
@@ -14,7 +14,7 @@ on:
   #     - "scripts/ci/**"
   #     - "test/**"
   #     - "sgl-kernel/**"
-  #     - ".github/workflows/pr-test-amd-rocm720.yml"
+  #     - ".github/workflows/pr-test-amd-rocm700.yml"
   #     - "docker/rocm.Dockerfile"
   pull_request:
     paths:
@@ -22,7 +22,7 @@ on:
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
-      - ".github/workflows/pr-test-amd-rocm720.yml"
+      - ".github/workflows/pr-test-amd-rocm700.yml"
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
@@ -33,23 +33,23 @@ on:
         default: ''
         options:
           - ''
-          - sgl-kernel-unit-test-amd-rocm720
-          - sgl-kernel-unit-test-2-gpu-amd-rocm720
-          - stage-a-test-1-gpu-small-amd-rocm720
-          - jit-kernel-unit-test-amd-rocm720
-          - stage-b-test-1-gpu-small-amd-rocm720
-          - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
-          - stage-b-test-1-gpu-small-amd-mi35x-rocm720
-          - stage-b-test-1-gpu-large-amd-rocm720
-          - stage-b-test-2-gpu-large-amd-rocm720
-          - multimodal-gen-test-1-gpu-amd-rocm720
-          - multimodal-gen-test-2-gpu-amd-rocm720
-          - stage-c-test-large-8-gpu-amd-rocm720
-          - stage-c-test-large-8-gpu-amd-mi35x-rocm720
-          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
-          - stage-c-test-4-gpu-amd-rocm720
-          - dsv4-flash-fp4-fp8-amd-rocm720
-          - dsv4-pro-fp4-amd-rocm720
+          - sgl-kernel-unit-test-amd-rocm700
+          - sgl-kernel-unit-test-2-gpu-amd-rocm700
+          - stage-a-test-1-gpu-small-amd-rocm700
+          - jit-kernel-unit-test-amd-rocm700
+          - stage-b-test-1-gpu-small-amd-rocm700
+          - stage-b-test-1-gpu-small-amd-nondeterministic-rocm700
+          - stage-b-test-1-gpu-small-amd-mi35x-rocm700
+          - stage-b-test-1-gpu-large-amd-rocm700
+          - stage-b-test-2-gpu-large-amd-rocm700
+          - multimodal-gen-test-1-gpu-amd-rocm700
+          - multimodal-gen-test-2-gpu-amd-rocm700
+          - stage-c-test-large-8-gpu-amd-rocm700
+          - stage-c-test-large-8-gpu-amd-mi35x-rocm700
+          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm700
+          - stage-c-test-4-gpu-amd-rocm700
+          - dsv4-flash-fp4-fp8-amd-rocm700
+          - dsv4-pro-fp4-amd-rocm700
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -98,7 +98,7 @@ on:
         type: boolean
         default: true
 
-# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm700
 # -> pr-test-amd-extra.yml) declares actions: write / issues: read /
 # pull-requests: read. A called reusable workflow can only use scopes the
 # caller already holds, so without this block the call fails workflow
@@ -119,7 +119,7 @@ concurrency:
   # avoid collisions with direct schedule/workflow_dispatch triggers. We use run_all_tests
   # (not github.event_name) to detect this, because github.event_name inherits from the caller.
   # Manual dispatch runs also get unique groups so they never cancel each other.
-  group: pr-test-amd-rocm720-${{ (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  group: pr-test-amd-rocm700-${{ (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -195,14 +195,14 @@ jobs:
               - "scripts/ci/amd/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
-              - ".github/workflows/pr-test-amd-rocm720.yml"
+              - ".github/workflows/pr-test-amd-rocm700.yml"
             sgl_kernel:
               - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
-              - ".github/workflows/pr-test-amd-rocm720.yml"
+              - ".github/workflows/pr-test-amd-rocm700.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - "test/registered/jit/**"
-              - ".github/workflows/pr-test-amd-rocm720.yml"
+              - ".github/workflows/pr-test-amd-rocm700.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
@@ -214,32 +214,32 @@ jobs:
               - "python/pyproject_other.toml"
 
   # =============================================== extra (scheduled) ====================================================
-  # ROCm 7.2 mirror of pr-test-amd.yml's `call-pr-test-amd-extra`: chain the
+  # ROCm 7.0 mirror of pr-test-amd.yml's `call-pr-test-amd-extra`: chain the
   # label-gated AMD extra tier into this workflow's daily schedule, but in a
-  # ROCm 7.2 container (`rocm_version: rocm720`). On `schedule` (and
+  # ROCm 7.0 container (`rocm_version: rocm700`). On `schedule` (and
   # run_all_tests dispatch) the extra suite runs on `main` without the
   # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
   # events). Targeted dispatches (target_stage set) are excluded. Not wired
-  # into any finish aggregator so the base rocm720 run never depends on it.
-  call-pr-test-amd-extra-rocm720:
+  # into any finish aggregator so the base rocm700 run never depends on it.
+  call-pr-test-amd-extra-rocm700:
     if: |
       (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
       !(inputs.target_stage || inputs.target_stage_select)
     uses: ./.github/workflows/pr-test-amd-extra.yml
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
-      rocm_version: rocm720
+      rocm_version: rocm700
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
-  sgl-kernel-unit-test-amd-rocm720:
+  sgl-kernel-unit-test-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -260,7 +260,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -280,12 +280,12 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
 
-  sgl-kernel-unit-test-2-gpu-amd-rocm720:
+  sgl-kernel-unit-test-2-gpu-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -306,7 +306,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -320,12 +320,12 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-gpu-small-amd-rocm720:
+  stage-a-test-1-gpu-small-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -347,7 +347,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -359,12 +359,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  jit-kernel-unit-test-amd-rocm720:
+  jit-kernel-unit-test-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.jit_kernel == 'true'
@@ -385,7 +385,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -397,12 +397,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-rocm720:
+  stage-b-test-1-gpu-small-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -425,7 +425,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -436,12 +436,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-nondeterministic-rocm720:
+  stage-b-test-1-gpu-small-amd-nondeterministic-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -463,7 +463,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -474,12 +474,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-mi35x-rocm720:
+  stage-b-test-1-gpu-small-amd-mi35x-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -501,7 +501,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -512,12 +512,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-large-amd-rocm720:
+  stage-b-test-1-gpu-large-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -540,7 +540,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -551,12 +551,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-2-gpu-large-amd-rocm720:
+  stage-b-test-2-gpu-large-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -579,7 +579,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -590,12 +590,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  multimodal-gen-test-1-gpu-amd-rocm720:
+  multimodal-gen-test-1-gpu-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -626,7 +626,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -725,17 +725,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-failures-amd-rocm720-1gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-failures-amd-rocm700-1gpu-${{ matrix.part }}-${{ github.run_attempt }}
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
 
-  multimodal-gen-test-2-gpu-amd-rocm720:
+  multimodal-gen-test-2-gpu-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -766,7 +766,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -863,18 +863,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-failures-amd-rocm720-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-failures-amd-rocm700-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
 
 
-  stage-c-test-4-gpu-amd-rocm720:
-    needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm720, stage-b-test-2-gpu-large-amd-rocm720]
+  stage-c-test-4-gpu-amd-rocm700:
+    needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm700, stage-b-test-2-gpu-large-amd-rocm700]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -897,7 +897,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -925,12 +925,12 @@ jobs:
               --retry-timeout-increase 0 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-rocm720:
+  stage-c-test-large-8-gpu-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -955,7 +955,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -972,12 +972,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-mi35x-rocm720:
+  stage-c-test-large-8-gpu-amd-mi35x-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -1000,7 +1000,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1012,12 +1012,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720:
+  stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm700:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -1078,7 +1078,7 @@ jobs:
           echo "=== Host RDMA Check Complete ==="
 
       - name: Start Special Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1130,12 +1130,12 @@ jobs:
   # they are gated just like every other PR test job. On PR they hard-fail (a failure
   # blocks merge); on any scheduled run they pass --continue-on-error. They stay
   # selectable via workflow_dispatch / run on workflow_call full runs.
-  dsv4-flash-fp4-fp8-amd-rocm720:
+  dsv4-flash-fp4-fp8-amd-rocm700:
     needs: [call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-flash-fp4-fp8-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-flash-fp4-fp8-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
@@ -1155,10 +1155,10 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2)
+      - name: Setup docker (ROCm 7.0)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1168,7 +1168,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP4 + FP8)
+      - name: Accuracy Test MI35x ROCm 7.0 (8-GPU DeepSeek-V4-Flash FP4 + FP8)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1181,12 +1181,12 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  dsv4-pro-fp4-amd-rocm720:
+  dsv4-pro-fp4-amd-rocm700:
     needs: [call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-pro-fp4-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-pro-fp4-amd-rocm700,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
@@ -1206,10 +1206,10 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2)
+      - name: Setup docker (ROCm 7.0)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm700
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1219,7 +1219,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP4)
+      - name: Accuracy Test MI35x ROCm 7.0 (8-GPU DeepSeek-V4-Pro FP4)
         timeout-minutes: 480
         run: |
           > github_summary.md  # Clear summary file
@@ -1235,31 +1235,31 @@ jobs:
           fi
           exit ${TEST_EXIT_CODE:-0}
 
-  pr-test-amd-rocm720-finish:
+  pr-test-amd-rocm700-finish:
     needs:
       [
         call-gate,
         check-changes,
 
-        sgl-kernel-unit-test-amd-rocm720,
-        sgl-kernel-unit-test-2-gpu-amd-rocm720,
-        multimodal-gen-test-1-gpu-amd-rocm720,
-        multimodal-gen-test-2-gpu-amd-rocm720,
+        sgl-kernel-unit-test-amd-rocm700,
+        sgl-kernel-unit-test-2-gpu-amd-rocm700,
+        multimodal-gen-test-1-gpu-amd-rocm700,
+        multimodal-gen-test-2-gpu-amd-rocm700,
 
-        stage-a-test-1-gpu-small-amd-rocm720,
-        jit-kernel-unit-test-amd-rocm720,
-        stage-b-test-1-gpu-small-amd-rocm720,
-        stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
-        stage-b-test-1-gpu-small-amd-mi35x-rocm720,
-        stage-b-test-1-gpu-large-amd-rocm720,
-        stage-b-test-2-gpu-large-amd-rocm720,
-        stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,
-        stage-c-test-4-gpu-amd-rocm720,
-        stage-c-test-large-8-gpu-amd-rocm720,
-        stage-c-test-large-8-gpu-amd-mi35x-rocm720,
+        stage-a-test-1-gpu-small-amd-rocm700,
+        jit-kernel-unit-test-amd-rocm700,
+        stage-b-test-1-gpu-small-amd-rocm700,
+        stage-b-test-1-gpu-small-amd-nondeterministic-rocm700,
+        stage-b-test-1-gpu-small-amd-mi35x-rocm700,
+        stage-b-test-1-gpu-large-amd-rocm700,
+        stage-b-test-2-gpu-large-amd-rocm700,
+        stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm700,
+        stage-c-test-4-gpu-amd-rocm700,
+        stage-c-test-large-8-gpu-amd-rocm700,
+        stage-c-test-large-8-gpu-amd-mi35x-rocm700,
 
-        dsv4-flash-fp4-fp8-amd-rocm720,
-        dsv4-pro-fp4-amd-rocm720,
+        dsv4-flash-fp4-fp8-amd-rocm700,
+        dsv4-pro-fp4-amd-rocm700,
       ]
     if: always()
     runs-on: ubuntu-latest
