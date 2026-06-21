@@ -3,8 +3,15 @@
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferMultiStepDraftBackend,
+)
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnBackend,
+    TRTLLMHAAttnMultiStepDraftBackend,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -36,6 +43,15 @@ def _mock_runner(
 
 
 class TestResolveSwaKvPool(CustomTestCase):
+    def test_trtllm_mha_does_not_inherit_flashinfer_backends(self):
+        self.assertTrue(issubclass(TRTLLMHAAttnBackend, AttentionBackend))
+        self.assertFalse(issubclass(TRTLLMHAAttnBackend, FlashInferAttnBackend))
+        self.assertFalse(
+            issubclass(
+                TRTLLMHAAttnMultiStepDraftBackend, FlashInferMultiStepDraftBackend
+            )
+        )
+
     def test_active_pool_is_swa_returns_it(self):
         for name, resolve, pool_type in _RESOLVERS:
             with self.subTest(backend=name):
