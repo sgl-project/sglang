@@ -1388,6 +1388,12 @@ class DummyModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+
+            _post_load_weights(model)
+
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -1398,12 +1404,6 @@ class DummyModelLoader(BaseModelLoader):
                     ):
                         continue
                     quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-
-            _post_load_weights(model)
 
         return model.eval()
 
