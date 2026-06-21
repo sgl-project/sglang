@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -352,7 +353,7 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
-        # Set by the SIGTERM handler to break the event loop for graceful shutdown.
+        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
 
         # Distributed rank info
@@ -1392,6 +1393,7 @@ class Scheduler(
                     lambda req: self.profiler_manager._profile(req),
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
+                (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -4017,6 +4019,13 @@ class Scheduler(
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def handle_shutdown(self, recv_req: ShutdownReq):
+        # Break the event loop at the next safe point; run_scheduler_process's
+        # finally then releases pinned-host buffers in userspace before exit.
+        # Broadcast across ranks, so every rank stops on the same iteration.
+        self.gracefully_exit = True
+        return None
+
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
@@ -4197,14 +4206,7 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        # SIGTERM breaks the event loop so the finally block can release
-        # pinned-host buffers in userspace (see release_host_resources).
-        def _sigterm_handler(signum, frame):
-            scheduler.gracefully_exit = True
-
-        signal.signal(signal.SIGTERM, _sigterm_handler)
-
-        # Run the event loop (blocks until shutdown)
+        # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
     except Exception:

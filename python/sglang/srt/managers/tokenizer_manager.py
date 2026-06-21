@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
+    ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -2642,12 +2643,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        # Stop the watchdog first so it does not misread the SIGTERM'd children
-        # as crashes (spurious SIGQUIT). graceful_timeout lets scheduler ranks
-        # release pinned-host buffers in userspace before the SIGKILL.
+        # Stop the watchdog: we are intentionally shutting down, so the
+        # schedulers exiting is expected, not a crash.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=True, graceful_timeout=15)
+        # Ask the schedulers to shut down gracefully. The request is broadcast
+        # across TP ranks, so they stop in lockstep and release pinned-host KV
+        # buffers (e.g. hisparse) in userspace. Wait for them to exit before
+        # hard-killing the rest; otherwise a SIGKILL would leave the kernel to
+        # unpin those buffers during reclaim, stalling teardown.
+        self.send_to_scheduler.send_pyobj(ShutdownReq())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
+        kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
     def force_exit_handler(self):
