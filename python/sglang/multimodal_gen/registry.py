@@ -11,7 +11,6 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import sys
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -64,7 +63,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -450,6 +452,7 @@ def _get_diffusers_model_info(
     works correctly even under the diffusers backend.
     """
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DIFFUSERS_TASK_TYPE_TO_CONFIG,
         DiffusersGenericPipelineConfig,
     )
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
@@ -462,36 +465,17 @@ def _get_diffusers_model_info(
     sampling_param_cls = DiffusersGenericSamplingParams
     pipeline_config_cls = DiffusersGenericPipelineConfig
 
-    # If there is a registered native config for this model, inherit its task_type
+    # If there is a registered native config for this model, inherit its task_type.
+    # We use pre-defined static subclasses instead of make_dataclass so the config
+    # class is pickle-safe for multiprocessing spawn (fixes #21453).
     if model_path is not None:
         config_info = _get_config_info(model_path, model_id=model_id)
         if config_info is not None:
             sampling_param_cls = config_info.sampling_param_cls
             native_task_type = config_info.pipeline_config_cls.task_type
             if native_task_type != DiffusersGenericPipelineConfig.task_type:
-                pipeline_config_cls = dataclasses.make_dataclass(
-                    "DiffusersGenericPipelineConfig",
-                    [
-                        (
-                            "task_type",
-                            type(native_task_type),
-                            dataclasses.field(default=native_task_type),
-                        )
-                    ],
-                    bases=(DiffusersGenericPipelineConfig,),
-                )
-                # make_dataclass sets __module__="types"; fix for pickle.
-                pipeline_config_cls.__module__ = (
-                    DiffusersGenericPipelineConfig.__module__
-                )
-                pipeline_config_cls.__qualname__ = (
-                    DiffusersGenericPipelineConfig.__qualname__
-                )
-                parent_module = sys.modules[DiffusersGenericPipelineConfig.__module__]
-                setattr(
-                    parent_module,
-                    DiffusersGenericPipelineConfig.__name__,
-                    pipeline_config_cls,
+                pipeline_config_cls = DIFFUSERS_TASK_TYPE_TO_CONFIG.get(
+                    native_task_type, DiffusersGenericPipelineConfig
                 )
                 logger.debug(
                     "Inherited task_type=%s from native config for diffusers backend",
@@ -647,7 +631,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=LTX23SamplingParams,
-        pipeline_config_cls=LTX2PipelineConfig,
+        pipeline_config_cls=LTX23PipelineConfig,
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
