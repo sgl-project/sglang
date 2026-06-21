@@ -732,7 +732,6 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_draft_extend_v2()
             and self.prefill_backend == "fa2"
-            and self.indices_updater_prefill.page_size == 1
         ):
             # Same idea as decode: swap in the sync-free fast_prefill_plan for replay,
             # after the initial real plan() above set up _cached_module. The host-known
@@ -1812,7 +1811,6 @@ class FlashInferIndicesUpdaterPrefill:
             and seq_lens_cpu is not None
             and num_tokens_per_req is not None
             and num_tokens_per_req > 0
-            and self.page_size == 1
         ):
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
