@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -619,6 +620,7 @@ class ServerArgs:
     speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_use_rejection_sampling: bool = False
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -1529,9 +1531,9 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own __init__; config-time
-        rules can be added here as they're discovered.
+        """Breakable (segmented capture, no torch.compile). Breakable enforces
+        memory-saver rejection in its own __init__; config-time rules can be
+        added here as they're discovered.
         """
         rules = [
             # MLA prefill takes a different attn-forward path under BCG (no
@@ -1946,6 +1948,16 @@ class ServerArgs:
             f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )
 
+    def _validate_hisparse_dsa_backend(self, attr: str, label: str):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
+
+        validate_hisparse_dsa_backend(self, attr, label)
+
+    def _validate_hisparse_kv_cache_dtype(self):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_kv_cache_dtype
+
+        validate_hisparse_kv_cache_dtype(self)
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -2007,7 +2019,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
@@ -3663,6 +3675,21 @@ class ServerArgs:
         decode_tokens = decode_max_bs * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
 
+    def max_prefill_buffer_tokens(self) -> int:
+        """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
+        chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+        chunked = (
+            self.chunked_prefill_size
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0
+            else 0
+        )
+        tokens = chunked
+        if self.enable_dynamic_chunking and self.pp_size > 1 and chunked:
+            tokens = max(
+                tokens, self.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+            )
+        return tokens
+
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
@@ -4351,9 +4378,9 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
-            if not is_cuda():
+            if not (is_cuda() or is_hip()):
                 logger.warning(
-                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                     "Disabling breakable CUDA graph."
                 )
                 self.debug_cuda_graph = False
@@ -6100,6 +6127,12 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-use-rejection-sampling",
+            action="store_true",
+            help="Use rejection sampling for speculative decoding (requires topk=1).",
+            default=ServerArgs.speculative_use_rejection_sampling,
         )
         parser.add_argument(
             "--speculative-token-map",
