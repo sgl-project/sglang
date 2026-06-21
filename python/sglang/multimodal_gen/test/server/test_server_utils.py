@@ -741,51 +741,48 @@ HUNYUAN3D_REFERENCE_URL = (
 def _download_reference_mesh(url: str) -> Path:
     """Download a reference mesh from URL, caching in temp dir.
 
-    Validates GLB *completeness* (magic header + the length the GLB header
-    declares == the actual byte count) on both the cached copy and a fresh
-    download. raw.githubusercontent can briefly return a truncated/stub response
-    for a just-pushed large file, and a prior run's bare ``write_bytes`` may have
-    cached those partial bytes on a persistent runner — whose first 4 bytes are
-    still ``glTF`` so a magic-only check would wrongly trust them. Verifying the
-    declared length rejects such a poisoned cache (forcing a re-download) and
-    turns a fresh partial download into a clear error instead of a cryptic
-    trimesh "incorrect header on GLB file".
+    Validates that the cached/downloaded file actually *loads* as a non-empty
+    mesh — not just that a magic/length header looks right. raw.githubusercontent
+    can briefly serve a truncated or corrupt response for a just-pushed large
+    file, and a prior run may have cached those bytes on a persistent runner; a
+    size/magic check can't catch a blob whose byte count matches the declared
+    length but whose body is corrupt (exactly what poisoned this CI cache and
+    surfaced as a cryptic trimesh "incorrect header on GLB file" deep inside
+    validation). Loading via trimesh rejects any such cache (forcing a
+    re-download) and turns a bad fresh download into a clear error. The ``v2``
+    cache prefix also invalidates blobs written by the earlier, weaker checks.
     """
     import hashlib
-    import struct
 
-    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_name = f"ref_mesh_v2_{hashlib.md5(url.encode()).hexdigest()}.glb"
     cache_path = Path(tempfile.gettempdir()) / cache_name
 
-    def _declared_glb_len(header12: bytes):
-        # GLB 12-byte header: magic "glTF"(0:4) | version(4:8) | total length LE u32(8:12)
-        if len(header12) < 12 or header12[:4] != b"glTF":
-            return None
-        return struct.unpack("<I", header12[8:12])[0]
-
-    def _cached_glb_complete() -> bool:
+    def _loads_as_mesh(path: Path) -> bool:
         try:
-            with open(cache_path, "rb") as f:
-                declared = _declared_glb_len(f.read(12))
-            return declared is not None and declared == cache_path.stat().st_size
-        except OSError:
+            import trimesh
+
+            mesh = trimesh.load(str(path), force="mesh")
+            return (
+                getattr(mesh, "vertices", None) is not None
+                and len(mesh.vertices) > 0
+            )
+        except Exception:
             return False
 
-    if cache_path.exists() and _cached_glb_complete():
+    if cache_path.exists() and _loads_as_mesh(cache_path):
         logger.info(f"Using cached reference mesh: {cache_path}")
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
-    data = _urlopen_with_retry(url, timeout=60)
-    declared = _declared_glb_len(data[:12])
-    if declared is None or declared != len(data):
+    cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
+    if not _loads_as_mesh(cache_path):
+        size = cache_path.stat().st_size if cache_path.exists() else 0
+        cache_path.unlink(missing_ok=True)
         raise RuntimeError(
-            f"Reference mesh from {url} is not a complete GLB "
-            f"(got {len(data)} bytes, header declares {declared}, "
-            f"first bytes={data[:12]!r}). The CDN may not have propagated a "
-            f"recently-pushed file yet; retry shortly."
+            f"Reference mesh from {url} did not load as a valid mesh "
+            f"({size} bytes). The CDN may not have propagated a recently-pushed "
+            f"file yet; retry shortly."
         )
-    cache_path.write_bytes(data)
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
