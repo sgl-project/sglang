@@ -788,18 +788,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        # Snapshot free memory at the end of the weight-load phase. KV-pool
-        # profiling uses this instead of measuring at alloc_memory_pool()
-        # time: draft-model weights load between the two phases and must stay
-        # outside the --mem-fraction-static budget (deployments tune the
-        # fraction assuming draft weights live in the non-static slack).
-        self.post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
         if (
@@ -862,18 +850,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
 
-    def init_backends(self, disable_cuda_graph: bool = False):
-        """Initialize attention backends and capture cuda graphs."""
-        server_args = self.server_args
-
+    def init_attention_backends(self):
+        """Initialize attention backends only (no cuda graph capture)."""
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
-        # Device-specific attention-backend init. cg_supported gates decode
-        # cuda-graph capture (out-of-tree / unknown platforms may not support it).
-        cg_supported = True
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -892,12 +875,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-        elif current_platform.is_out_of_tree():
-            self.init_attention_backend()
-            cg_supported = current_platform.support_cuda_graph()
         else:
             self.init_attention_backend()
-            cg_supported = False
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs. Requires init_attention_backends() to have run.
+
+        Spec draft runners pass capture_decode_cuda_graph=False
+        because they capture their own decode-style graphs separately.
+        """
 
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
@@ -912,23 +898,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
         self.init_prefill_cuda_graph()
-        if not disable_cuda_graph and cg_supported:
-            self.init_decode_cuda_graph()
+
+        self.decode_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+
+        if capture_decode_cuda_graph:
+            if self.device in ("cuda", "musa", "cpu", "npu"):
+                self.init_decode_cuda_graph()
+            elif (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            ):
+                self.init_decode_cuda_graph()
         else:
-            self.decode_cuda_graph_runner = None
-            self.graph_mem_usage = 0
-        if disable_cuda_graph:
-            # Decode cuda graph disabled: route eager decode through the
-            # EagerRunner (the dispatch gate isinstance(..., EagerRunner) keeps
-            # _forward_raw off any replay branch).
             self.decode_cuda_graph_runner = self.eager_runner
 
         # Register forward hooks AFTER cuda-graph capture so their tensor ops are
         # not traced into any captured graph — capture stays hook-free and hooks
         # fire only on the eager forward path (capture replay never runs Python
         # hooks anyway).
-        if server_args.forward_hooks:
-            register_forward_hooks(self.model, server_args.forward_hooks)
+        if self.server_args.forward_hooks:
+            register_forward_hooks(self.model, self.server_args.forward_hooks)
 
         self.prealloc_symmetric_memory_pool()
 
