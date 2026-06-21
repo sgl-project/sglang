@@ -78,16 +78,15 @@ class EagleDraftWorkerBase(ABC):
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def init_attention_backends(self):
-        """Subclasses wrap this with their context managers (draft_tp_context,
-        speculative_moe_backend_context, etc.) rather than reimplementing it."""
-        self.draft_worker.init_attention_backends()
-        self.init_attention_backend()
+    def init_backends(self):
+        """Initialize standard backends (no cuda graphs) then draft-specific backends.
 
-    def init_cuda_graphs(self):
-        """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
-        self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-        self._capture_cuda_graphs()
+        Subclasses should wrap this with their context managers (draft_tp_context,
+        speculative_moe_backend_context, etc.) rather than reimplementing the logic.
+        """
+        self.draft_worker.init_backends(disable_cuda_graph=True)
+        self.init_attention_backend()
+        self.init_cuda_graphs()
 
     def prepare_for_draft_extend(
         self,
@@ -294,10 +293,7 @@ class BaseSpecWorker(ABC):
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def init_attention_backends(self):
-        pass
-
-    def init_cuda_graphs(self):
+    def init_backends(self):
         pass
 
     def on_verify_complete_cpu(
