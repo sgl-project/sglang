@@ -275,7 +275,10 @@ class CustomAllreduce:
 
         if _is_hip:
             if self.use_amd_deterministic_impl:
-                return True
+                # Large tensors (prefill) exceed the pre-allocated buffer and would call
+                # register_buffer() on every forward pass — an expensive IPC exchange.
+                # Fall back to NCCL for those; keep 1-stage kernel for decode-sized tensors.
+                return inp_size <= self.max_size
             if self.full_nvlink:
                 return inp_size <= self.max_size
             return False

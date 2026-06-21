@@ -97,6 +97,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+# HIP keeps this 0 (disabled): enabling indexer dual-stream overlap was tested
+# neutral at TP=4 CONC=32/64 (overlapped Q/K projections are tiny vs the
+# random-KV paged-MQA logits cost that dominates) and risks the TP=8 alt-stream
+# HW-queue-oversubscription regression. CUDA keeps the upstream 1024.
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 

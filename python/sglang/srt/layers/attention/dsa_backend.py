@@ -1683,6 +1683,10 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            # NOTE: sorting page_table_1 to make the KV gather monotonic was
+            # tested (SGLANG_DSA_SORT_TOPK) and is SLOWER (~+8% ITL): the per-layer
+            # sort cost exceeds the locality gain (page=64 preshuffle + L2 already
+            # provide locality). Not used.
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1991,6 +1995,21 @@ class DeepseekSparseAttnBackend(
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
+        # fp8 KV cache: the aiter ASM mla_decode kernel requires q_scale and
+        # kv_scale tensors when q and/or kv are fp8 (asm_mla.cu asserts on this).
+        # With sglang's default uncalibrated fp8_e4m3 KV the scale is 1.0.
+        q_scale = None
+        kv_scale = None
+        if q_kernel.dtype == torch.float8_e4m3fn or kv_cache.dtype == torch.float8_e4m3fn:
+            k_scale_float = getattr(layer, "k_scale_float", None)
+            q_scale = torch.ones(1, dtype=torch.float32, device=q_kernel.device)
+            kv_scale = torch.full(
+                (1,),
+                float(k_scale_float) if k_scale_float is not None else 1.0,
+                dtype=torch.float32,
+                device=q_kernel.device,
+            )
+
         mla_decode_fwd(
             q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
@@ -2002,6 +2021,8 @@ class DeepseekSparseAttnBackend(
             metadata.max_seq_len_q,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
         )
 
         if self.need_pad_heads:
