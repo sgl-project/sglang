@@ -288,6 +288,7 @@ install_sglang_kernel() {
     fi
 
     # Reinstall torch with matching CUDA version if needed
+    # H20 repro note: this path imports torch before any reinstall decision.
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
     TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
     echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
