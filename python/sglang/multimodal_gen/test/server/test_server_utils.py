@@ -733,7 +733,7 @@ class MeshValidator(PerformanceValidator):
 
 
 HUNYUAN3D_REFERENCE_URL = (
-    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
+    "https://raw.githubusercontent.com/sgl-project/ci-data/"
     "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
 )
 
