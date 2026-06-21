@@ -763,8 +763,7 @@ def _download_reference_mesh(url: str) -> Path:
 
             mesh = trimesh.load(str(path), force="mesh")
             return (
-                getattr(mesh, "vertices", None) is not None
-                and len(mesh.vertices) > 0
+                getattr(mesh, "vertices", None) is not None and len(mesh.vertices) > 0
             )
         except Exception:
             return False
