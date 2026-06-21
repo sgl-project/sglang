@@ -32,6 +32,7 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -39,9 +40,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import (
-    get_linear_attn_spec_by_arch,
-)
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -372,51 +371,177 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 @dataclasses.dataclass
 class ServerArgs:
-    """
-    The arguments of the server.
+    """The arguments of the server.
 
-    NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the function
-    `ServerArgs.add_cli_args`.
-    Please follow the existing style to group the new arguments into related groups or create new groups.
+    There are two styles for defining arguments. New arguments MUST use the
+    ``A[T, ...]`` style; the legacy style is being migrated and should not be
+    used for new additions.
+
+    **Style 1 — ``A[T, ...]`` (required for all new arguments):**
+
+    Each field carries its own CLI metadata. ``A`` is an alias for
+    ``typing.Annotated``. For simple fields, use a bare string as the
+    help text. Use ``Arg(...)`` only when extra metadata is needed
+    (choices, aliases, custom type parser, etc.)::
+
+        # Simple — bare string is the help text:
+        host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+        trust_remote_code: A[bool, "Whether to allow custom models."] = False
+
+        # With extra metadata:
+        load_format: A[str, Arg(help="Format.", choices=LOAD_FORMAT_CHOICES)] = "auto"
+        model_path: A[str, Arg(help="Path to model.", aliases=["--model"])]
+
+    **Style 2 — Legacy (existing arguments, to be migrated):**
+
+    The field is a plain type annotation with a default, and a separate
+    ``parser.add_argument(...)`` call in ``add_cli_args`` defines the CLI
+    surface. When modifying these fields, keep the order in this class
+    definition consistent with the order in ``add_cli_args``.
+
+    Group new arguments into the appropriate existing section or create a
+    new section as needed.
     """
 
     # Model and tokenizer
-    model_path: str
-    tokenizer_path: Optional[str] = None
-    tokenizer_mode: str = "auto"
-    tokenizer_backend: str = "huggingface"
-    tokenizer_worker_num: int = 1
-    detokenizer_worker_num: int = 1
-    skip_tokenizer_init: bool = False
-    load_format: str = "auto"
-    model_loader_extra_config: str = "{}"
-    trust_remote_code: bool = False
-    context_length: Optional[int] = None
-    is_embedding: bool = False
-    prefill_only_disable_kv_cache: bool = False
-    enable_multimodal: Optional[bool] = None
-    revision: Optional[str] = None
-    model_impl: str = "auto"
-    model_config_parser: str = "auto"
+    model_path: A[
+        str,
+        Arg(
+            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            aliases=["--model"],
+        ),
+    ]
+    tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
+    tokenizer_mode: A[
+        str,
+        Arg(
+            help="Tokenizer mode. 'auto' will use the fast tokenizer if available, "
+            "and 'slow' will always use the slow tokenizer.",
+            choices=["auto", "slow"],
+        ),
+    ] = "auto"
+    tokenizer_backend: A[
+        str,
+        Arg(
+            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
+            "tokenizers library, and 'fastokens' uses the fastokens library "
+            "for faster tokenization. Requires the fastokens package to be installed.",
+            choices=["huggingface", "fastokens"],
+        ),
+    ] = "huggingface"
+    tokenizer_worker_num: A[int, "The worker num of the tokenizer manager."] = 1
+    detokenizer_worker_num: A[int, "The worker num of the detokenizer manager."] = 1
+    skip_tokenizer_init: A[
+        bool, "If set, skip init tokenizer and pass input_ids in generate request."
+    ] = False
+    load_format: A[
+        str,
+        Arg(
+            help="The format of the model weights to load. "
+            '"auto" will try to load the weights in the safetensors format '
+            "and fall back to the pytorch bin format if safetensors format "
+            "is not available. "
+            '"pt" will load the weights in the pytorch bin format. '
+            '"safetensors" will load the weights in the safetensors format. '
+            '"npcache" will load the weights in pytorch format and store '
+            "a numpy cache to speed up the loading. "
+            '"dummy" will initialize the weights with random values, '
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
+            choices=LOAD_FORMAT_CHOICES,
+        ),
+    ] = "auto"
+    model_loader_extra_config: A[
+        str,
+        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+    ] = "{}"
+    trust_remote_code: A[
+        bool,
+        "Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+    ] = False
+    context_length: A[
+        Optional[int],
+        Arg(
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+            f"\n\n{human_readable_int.__doc__}",
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    is_embedding: A[bool, "Whether to use a CausalLM as an embedding model."] = False
+    enable_multimodal: A[
+        Optional[bool],
+        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+    ] = None
+    revision: A[
+        Optional[str],
+        "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
+    ] = None
+    model_impl: A[
+        str,
+        Arg(
+            help=(
+                "Which implementation of the model to use.\n\n"
+                '* "auto" will try to use the SGLang implementation if it exists '
+                "and fall back to the Transformers implementation if no SGLang "
+                "implementation is available.\n"
+                '* "sglang" will use the SGLang model implementation.\n'
+                '* "transformers" will use the Transformers model '
+                '* "mindspore" will use the MindSpore model '
+                "implementation.\n"
+            )
+        ),
+    ] = "auto"
+    model_config_parser: A[
+        str,
+        Arg(
+            help=(
+                'Which model-config parser to use. "auto" picks "mistral" '
+                'via the is_mistral_model name heuristic, else "hf" '
+                "(AutoConfig over config.json). Plugins can register additional "
+                "parsers via @register_model_config_parser."
+            )
+        ),
+    ] = "auto"
 
     # HTTP server
-    host: str = "127.0.0.1"
-    port: int = 30000
-    fastapi_root_path: str = ""
-    grpc_mode: bool = False
-    skip_server_warmup: bool = False
-    warmups: Optional[str] = None
-    nccl_port: Optional[int] = None
-    checkpoint_engine_wait_weights_before_ready: bool = False
+    host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+    port: A[int, "The port of the HTTP server."] = 30000
+    fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
+    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
+    skip_server_warmup: A[bool, "If set, skip warmup."] = False
+    warmups: A[
+        Optional[str],
+        "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+    ] = None
+    nccl_port: A[
+        Optional[int],
+        "The port for NCCL distributed environment setup. Defaults to a random port.",
+    ] = None
+    checkpoint_engine_wait_weights_before_ready: A[
+        bool,
+        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+    ] = False
 
     # SSL/TLS
-    ssl_keyfile: Optional[str] = None
-    ssl_certfile: Optional[str] = None
-    ssl_ca_certs: Optional[str] = None
-    ssl_keyfile_password: Optional[str] = None
-    enable_ssl_refresh: bool = False
-    enable_http2: bool = False
+    ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
+    ssl_certfile: A[Optional[str], "The file path to the SSL certificate file."] = None
+    ssl_ca_certs: A[Optional[str], "The CA certificates file."] = None
+    ssl_keyfile_password: A[
+        Optional[str], "The password to decrypt the SSL keyfile."
+    ] = None
+    enable_ssl_refresh: A[
+        bool,
+        "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+    ] = False
+    enable_http2: A[
+        bool,
+        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
+    ] = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -752,6 +877,10 @@ class ServerArgs:
     enable_mis: bool = False
 
     # Optimization/debug options
+    prefill_only_disable_kv_cache: A[
+        bool,
+        "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+    ] = False
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -4728,232 +4857,8 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Model and tokenizer
-        parser.add_argument(
-            "--model-path",
-            "--model",
-            type=str,
-            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=True,
-        )
-        parser.add_argument(
-            "--tokenizer-path",
-            type=str,
-            default=ServerArgs.tokenizer_path,
-            help="The path of the tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-mode",
-            type=str,
-            default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-backend",
-            type=str,
-            default=ServerArgs.tokenizer_backend,
-            choices=["huggingface", "fastokens"],
-            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-            "tokenizers library, and 'fastokens' uses the fastokens library "
-            "for faster tokenization. Requires the fastokens package to be installed.",
-        )
-        parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
-        )
-        parser.add_argument(
-            "--detokenizer-worker-num",
-            type=int,
-            default=ServerArgs.detokenizer_worker_num,
-            help="The worker num of the detokenizer manager.",
-        )
-        parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request.",
-        )
-        parser.add_argument(
-            "--load-format",
-            type=str,
-            default=ServerArgs.load_format,
-            choices=LOAD_FORMAT_CHOICES,
-            help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. '
-            '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization."
-            '"layered" loads weights layer by layer so that one can quantize a '
-            "layer before loading another to make the peak memory envelope "
-            "smaller.",
-        )
-        parser.add_argument(
-            "--model-loader-extra-config",
-            type=str,
-            help="Extra config for model loader. "
-            "This will be passed to the model loader corresponding to the chosen load_format.",
-            default=ServerArgs.model_loader_extra_config,
-        )
-        parser.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
-        )
-        parser.add_argument(
-            "--context-length",
-            type=human_readable_int,
-            default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
-            + f"\n\n{human_readable_int.__doc__}",
-        )
-        parser.add_argument(
-            "--is-embedding",
-            action="store_true",
-            help="Whether to use a CausalLM as an embedding model.",
-        )
-        parser.add_argument(
-            "--prefill-only-disable-kv-cache",
-            action="store_true",
-            help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
-        )
-        parser.add_argument(
-            "--enable-multimodal",
-            default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
-        )
-        parser.add_argument(
-            "--revision",
-            type=str,
-            default=None,
-            help="The specific model version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
-        )
-        parser.add_argument(
-            "--model-impl",
-            type=str,
-            default=ServerArgs.model_impl,
-            help="Which implementation of the model to use.\n\n"
-            '* "auto" will try to use the SGLang implementation if it exists '
-            "and fall back to the Transformers implementation if no SGLang "
-            "implementation is available.\n"
-            '* "sglang" will use the SGLang model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            '* "mindspore" will use the MindSpore model '
-            "implementation.\n",
-        )
-        parser.add_argument(
-            "--model-config-parser",
-            type=str,
-            default=ServerArgs.model_config_parser,
-            help='Which model-config parser to use. "auto" picks "mistral" '
-            'via the is_mistral_model name heuristic, else "hf" '
-            "(AutoConfig over config.json). Plugins can register additional "
-            "parsers via @register_model_config_parser.",
-        )
-
-        # HTTP server
-        parser.add_argument(
-            "--host",
-            type=str,
-            default=ServerArgs.host,
-            help="The host of the HTTP server.",
-        )
-        parser.add_argument(
-            "--port",
-            type=int,
-            default=ServerArgs.port,
-            help="The port of the HTTP server.",
-        )
-        parser.add_argument(
-            "--fastapi-root-path",
-            type=str,
-            default=ServerArgs.fastapi_root_path,
-            help="App is behind a path based routing proxy.",
-        )
-        parser.add_argument(
-            "--grpc-mode",
-            action="store_true",
-            help="If set, use gRPC server instead of HTTP server.",
-        )
-        parser.add_argument(
-            "--skip-server-warmup",
-            action="store_true",
-            help="If set, skip warmup.",
-        )
-        parser.add_argument(
-            "--warmups",
-            type=str,
-            required=False,
-            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
-        )
-        parser.add_argument(
-            "--nccl-port",
-            type=int,
-            default=ServerArgs.nccl_port,
-            help="The port for NCCL distributed environment setup. Defaults to a random port.",
-        )
-        parser.add_argument(
-            "--checkpoint-engine-wait-weights-before-ready",
-            action="store_true",
-            help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
-            "before serving inference requests.",
-        )
-
-        # SSL/TLS
-        parser.add_argument(
-            "--ssl-keyfile",
-            type=str,
-            default=ServerArgs.ssl_keyfile,
-            help="The file path to the SSL key file.",
-        )
-        parser.add_argument(
-            "--ssl-certfile",
-            type=str,
-            default=ServerArgs.ssl_certfile,
-            help="The file path to the SSL certificate file.",
-        )
-        parser.add_argument(
-            "--ssl-ca-certs",
-            type=str,
-            default=ServerArgs.ssl_ca_certs,
-            help="The CA certificates file.",
-        )
-        parser.add_argument(
-            "--ssl-keyfile-password",
-            type=str,
-            default=ServerArgs.ssl_keyfile_password,
-            help="The password to decrypt the SSL keyfile.",
-        )
-        parser.add_argument(
-            "--enable-ssl-refresh",
-            action="store_true",
-            default=ServerArgs.enable_ssl_refresh,
-            help="Enable automatic SSL certificate hot-reloading when cert/key "
-            "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
-        )
-        parser.add_argument(
-            "--enable-http2",
-            action="store_true",
-            default=ServerArgs.enable_http2,
-            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
-            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
-            "Requires 'pip install sglang[http2]'.",
-        )
+        # Auto-derived from Annotated[..., Arg(...)] field metadata.
+        add_cli_args_from_dataclass(parser, ServerArgs)
 
         # Quantization and data type
         parser.add_argument(
