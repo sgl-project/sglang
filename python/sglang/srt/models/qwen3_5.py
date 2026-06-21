@@ -835,6 +835,137 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _can_use_fused_qk_norm_rope(
+        self, q: torch.Tensor, positions: torch.Tensor
+    ) -> bool:
+        """Whether the aiter fused QK-Norm + 3-D MRoPE op can replace the
+        separate ``_apply_qk_norm`` + ``rotary_emb`` calls.
+
+        Qwen3.5 uses GemmaRMSNorm Q/K-norm followed by an interleaved 3-D MRoPE
+        with *partial* rotary (``rotary_dim`` < ``head_dim``). The only aiter
+        kernel that can represent this combination is
+        ``fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`` (the plain
+        ``fused_qk_norm_rope_2way`` kernel handles neither MRoPE nor partial
+        rotary, so it could never fire on this model).
+
+        Requires: aiter enabled (HIP), bfloat16 q/k, supported head_dim, an
+        ``MRotaryEmbedding`` with a 3-section ``mrope_section`` and neox style,
+        and 2-D positions ``[3, num_tokens]`` (the standard MRoPE layout).
+        """
+        rotary_emb = self.rotary_emb
+        mrope_section = getattr(rotary_emb, "mrope_section", None)
+        return (
+            _use_aiter
+            and q.dtype == torch.bfloat16
+            and self.head_dim in (64, 128, 256)
+            and positions.dim() == 2
+            and positions.shape[0] == 3
+            and mrope_section is not None
+            and len(mrope_section) == 3
+            and getattr(rotary_emb, "is_neox_style", True)
+        )
+
+    def _fused_qk_norm_rope(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse GemmaRMSNorm(q/k) + interleaved 3-D MRoPE into a single aiter
+        kernel.
+
+        Replaces the two kernels currently launched per attention layer
+        (``fused_qk_gemma_rmsnorm`` for the Q/K norm and
+        ``_triton_mrope_forward_fused`` for the MRoPE) with one
+        ``fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`` launch.
+
+        The kernel always writes K/V into a paged cache; here we feed it a small
+        per-call BF16 scratch cache (``kv_cache_dtype == qkv_dtype`` => direct
+        store, no quant) and request ``return_kv=True`` so the normed+roped Q/K
+        come back in token order. The scratch cache is discarded — the real KV
+        cache is still written by ``self.attn`` downstream, preserving the
+        attention-backend abstraction.
+
+        GemmaRMSNorm scales by ``(1 + weight)``; the precomputed ``gemma_weight``
+        buffer (== weight + 1) is passed as the norm weight so the kernel's
+        standard RMSNorm matches the GemmaRMSNorm semantics.
+        """
+        import aiter
+
+        rotary_emb = self.rotary_emb
+        num_tokens = q.shape[0]
+        head_dim = self.head_dim
+        device = q.device
+        dtype = q.dtype
+
+        rotary_emb._match_cos_sin_cache_dtype(q)
+        # cos_sin_cache is [max_pos, rotary_dim] with cos||sin concatenated.
+        cos_sin = rotary_emb.cos_sin_cache.contiguous()
+        rotary_dim = rotary_emb.rotary_dim
+
+        qkv = torch.cat([q, k, v], dim=-1).contiguous()
+
+        w_q = self.q_norm.gemma_weight.to(dtype).contiguous()
+        w_k = self.k_norm.gemma_weight.to(dtype).contiguous()
+
+        q_out = torch.empty(
+            num_tokens, self.num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_out = torch.empty(
+            num_tokens, self.num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        v_out = torch.empty(
+            num_tokens, self.num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        # BF16 scratch cache (same dtype as qkv => direct store, no quant).
+        k_cache = torch.empty(
+            num_tokens, self.num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        v_cache = torch.empty(
+            num_tokens, self.num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        # Scales must be CPU tensors: the kernel reads them via ``.item()``
+        # unconditionally, which would force a device->host sync (illegal during
+        # CUDA-graph capture) if they lived on the GPU. They are otherwise
+        # unused for the BF16 direct-store path.
+        ones = torch.ones(1, dtype=torch.float32)
+
+        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            qkv,
+            w_q,
+            w_k,
+            cos_sin,
+            positions.contiguous(),
+            num_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,  # num_heads_v
+            head_dim,
+            rotary_emb.is_neox_style,
+            list(rotary_emb.mrope_section),
+            bool(getattr(rotary_emb, "mrope_interleaved", False)),
+            self.q_norm.variance_epsilon,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            ones,  # per_tensor_k_scale (unused for bf16 direct store)
+            ones,  # per_tensor_v_scale (unused for bf16 direct store)
+            k_out,
+            v_out,
+            True,  # return_kv -> populate k_out/v_out in token order
+            False,  # use_shuffle_layout
+            0,  # block_size
+            0,  # x
+            rotary_dim,
+        )
+
+        q = q_out.view(num_tokens, self.num_heads * head_dim)
+        k = k_out.view(num_tokens, self.num_kv_heads * head_dim)
+        return q, k
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -856,8 +987,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._can_use_fused_qk_norm_rope(q, positions):
+            q, k = self._fused_qk_norm_rope(positions, q, k, v)
+        else:
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
