@@ -205,10 +205,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ):  # llama_eagle3
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
             elif hot_token_id is not None:
-                # FR-Spec: an external speculative_token_map slices the draft head to
-                # len(hot_token_id), but hf_config does not carry this size (it is
-                # injected via a late json_model_override_args after hf_config is
-                # built), so size the logits buffer from the worker's reduced head.
+                # FR-Spec: reduced vocab is injected via a late
+                # json_model_override_args, so hf_config lacks it; size from the head.
                 vocab_size = len(hot_token_id)
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
