@@ -3,7 +3,7 @@ export const DeepSeekV32Deployment = () => {
   //
   // Model variants:
   //   DeepSeek-V3.2, V3.2-Exp, V3.2-Speciale    → deepseek-ai/ family, TP=8
-  //   DeepSeek-V3.2-NVFP4                         → nvidia/ family, B200 only, TP=4
+  //   DeepSeek-V3.2-NVFP4                         → nvidia/ family, B200/B300 only, TP=4
   //   DeepSeek-V3.2-MXFP4                         → amd/ family, MI300X/MI355X only, TP=8
   const options = {
     hardware: {
@@ -12,6 +12,7 @@ export const DeepSeekV32Deployment = () => {
       items: [
         { id: 'h200',   label: 'H200',          default: true  },
         { id: 'b200',   label: 'B200',          default: false },
+        { id: 'b300',   label: 'B300',          default: false },
         { id: 'mi300x', label: 'MI300X',        default: false },
         { id: 'mi355x', label: 'MI355X',        default: false }
       ]
@@ -21,13 +22,13 @@ export const DeepSeekV32Deployment = () => {
       title: 'Model Name',
       getDynamicItems: (values) => {
         const hw = values.hardware;
-        const isB200 = hw === 'b200';
+        const isBlackwell = hw === 'b200' || hw === 'b300';
         const isAMD = hw === 'mi300x' || hw === 'mi355x';
         return [
-          { id: 'v32',         label: 'DeepSeek-V3.2',           default: !isB200 && !isAMD },
+          { id: 'v32',         label: 'DeepSeek-V3.2',           default: !isBlackwell && !isAMD },
           { id: 'v32speciale', label: 'DeepSeek-V3.2-Speciale',  default: false },
           { id: 'v32exp',      label: 'DeepSeek-V3.2-Exp',       default: false },
-          { id: 'v32nvfp4',    label: 'DeepSeek-V3.2-NVFP4',     default: isB200,  disabled: !isB200, disabledReason: 'NVFP4 requires B200 (Blackwell)' },
+          { id: 'v32nvfp4',    label: 'DeepSeek-V3.2-NVFP4',     default: isBlackwell, disabled: !isBlackwell, disabledReason: 'NVFP4 requires B200/B300 (Blackwell)' },
           { id: 'v32mxfp4',    label: 'DeepSeek-V3.2-MXFP4',     default: isAMD,   disabled: !isAMD,  disabledReason: 'MXFP4 requires AMD MI300X/MI355X' }
         ];
       }
@@ -101,7 +102,7 @@ export const DeepSeekV32Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  // When hardware changes, re-resolve model name defaults (NVFP4→B200, MXFP4→AMD).
+  // When hardware changes, re-resolve model name defaults (NVFP4→Blackwell, MXFP4→AMD).
   useEffect(() => {
     setValues(prev => {
       const next = { ...prev };
@@ -139,10 +140,12 @@ export const DeepSeekV32Deployment = () => {
     const isNvfp4 = modelname === 'v32nvfp4';
     const isMxfp4 = modelname === 'v32mxfp4';
     const isAMD = hardware === 'mi300x' || hardware === 'mi355x';
+    const isB300 = hardware === 'b300';
+    const isBlackwell = hardware === 'b200' || isB300;
 
-    // Validation: NVFP4 requires B200
-    if (isNvfp4 && hardware !== 'b200') {
-      return `# Error: DeepSeek-V3.2-NVFP4 requires NVIDIA B200 (Blackwell) hardware\n# Please select "B200" for Hardware Platform or choose a different model`;
+    // Validation: NVFP4 requires Blackwell
+    if (isNvfp4 && !isBlackwell) {
+      return `# Error: DeepSeek-V3.2-NVFP4 requires NVIDIA B200/B300 (Blackwell) hardware\n# Please select "B200" or "B300" for Hardware Platform or choose a different model`;
     }
 
     // Validation: MXFP4 requires AMD MI300X/MI355X
@@ -176,8 +179,16 @@ export const DeepSeekV32Deployment = () => {
       let cmd = 'sglang serve \\\n';
       cmd += `  --model-path ${modelName}`;
       cmd += ' \\\n  --tp 4';
-      cmd += ' \\\n  --quantization modelopt_fp4';
-      cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+      if (isB300) {
+        cmd += ' \\\n  --attention-backend flashinfer';
+        cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --cuda-graph-backend-prefill disabled';
+        cmd += ' \\\n  --moe-runner-backend flashinfer_cutlass';
+        cmd += ' \\\n  --disable-flashinfer-autotune';
+      } else {
+        cmd += ' \\\n  --quantization modelopt_fp4';
+        cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+      }
       return cmd;
     }
 
@@ -220,6 +231,14 @@ export const DeepSeekV32Deployment = () => {
       cmd += ' \\\n  --speculative-num-steps 3';
       cmd += ' \\\n  --speculative-eagle-topk 1';
       cmd += ' \\\n  --speculative-num-draft-tokens 4';
+    }
+
+    if (isB300) {
+      cmd += ' \\\n  --attention-backend flashinfer';
+      if (!strategyArray.includes('dp') || strategyArray.includes('ep') || strategyArray.includes('mtp')) {
+        cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --cuda-graph-backend-prefill disabled';
+      }
     }
 
     // Add tool-call-parser if enabled (not supported for Speciale)

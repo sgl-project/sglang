@@ -56,6 +56,14 @@ def _seq_lens_from_optional_mask(
     return [int(x) for x in prompt_embeds_mask.sum(dim=1).tolist()]
 
 
+def _resolve_layered_image_path(image_path: str | list[str]) -> str:
+    if isinstance(image_path, str):
+        return image_path
+    if isinstance(image_path, list) and image_path:
+        return image_path[0]
+    raise ValueError("Qwen-Image-Layered requires a non-empty image_path.")
+
+
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus.calculate_dimensions
 def calculate_dimensions(target_area, ratio):
     width = math.sqrt(target_area * ratio)
@@ -490,7 +498,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         generator = batch.generator
 
         assert batch.image_path is not None
-        image = load_image(batch.image_path[0])
+        image = load_image(_resolve_layered_image_path(batch.image_path))
         image = image.convert("RGBA")
         image_size = image.size
         resolution = server_args.pipeline_config.resolution
