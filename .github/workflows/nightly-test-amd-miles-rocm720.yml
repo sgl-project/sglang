@@ -35,6 +35,10 @@ jobs:
         include:
           - suite: stage-c-2-gpu-mi350
             runner: linux-mi35x-gpu-2
+          # No dedicated 4-GPU mi35x runner upstream; run on the 8-GPU pool, same
+          # as the existing nightly-4-gpu-mi35x-minimax-m25 job.
+          - suite: stage-c-4-gpu-mi350
+            runner: linux-mi35x-gpu-8
           - suite: stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
