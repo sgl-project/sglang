@@ -35,7 +35,8 @@ Usage:
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Callable, List, Optional, get_args, get_origin, get_type_hints
+import types
+from typing import Annotated, Any, Callable, List, Literal, Optional, Union, get_args, get_origin, get_type_hints
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,45 +67,35 @@ _MISSING = dataclasses.MISSING
 def _unwrap_annotated(tp):
     """Return (inner_type, Arg | None) from ``Annotated[T, Arg(...)]``."""
     origin = get_origin(tp)
-    if origin is not None:
-        # typing.Annotated
-        type_name = getattr(origin, "__name__", "") or getattr(
-            origin, "_name", ""
-        )
-        if type_name == "Annotated" or str(origin) == "typing.Annotated":
-            args = get_args(tp)
-            inner = args[0]
-            for a in args[1:]:
-                if isinstance(a, Arg):
-                    return inner, a
-            return inner, None
+    if origin is Annotated:
+        args = get_args(tp)
+        inner = args[0]
+        for a in args[1:]:
+            if isinstance(a, Arg):
+                return inner, a
+        return inner, None
     return tp, None
 
 
 def _unwrap_optional(tp):
     """If tp is Optional[X] (i.e. Union[X, None]), return (X, True). Else (tp, False)."""
     origin = get_origin(tp)
-    if origin is not None:
-        origin_name = getattr(origin, "__name__", "") or getattr(
-            origin, "_name", ""
-        )
-        if origin_name == "Union":
-            args = get_args(tp)
-            non_none = [a for a in args if a is not type(None)]
-            if len(non_none) == 1:
-                return non_none[0], True
+    is_union = origin is Union or (
+        hasattr(types, "UnionType") and origin is types.UnionType
+    )
+    if is_union:
+        args = get_args(tp)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0], True
     return tp, False
 
 
 def _unwrap_literal(tp):
     """If tp is Literal[...], return list of values. Else None."""
     origin = get_origin(tp)
-    if origin is not None:
-        origin_name = getattr(origin, "__name__", "") or getattr(
-            origin, "_name", ""
-        )
-        if origin_name == "Literal":
-            return list(get_args(tp))
+    if origin is Literal:
+        return list(get_args(tp))
     return None
 
 
@@ -234,8 +225,8 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             kwargs["nargs"] = arg_meta.nargs
         if default is not _MISSING:
             kwargs["default"] = default
-        if arg_meta.required is True or (
+        if (arg_meta.required is True or (
             arg_meta.required is None and default is _MISSING
-        ):
+        )) and any(name.startswith("-") for name in names):
             kwargs["required"] = True
         parser.add_argument(*names, **kwargs)

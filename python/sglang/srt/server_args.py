@@ -456,8 +456,8 @@ class ServerArgs:
         help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
     )] = False
     context_length: Annotated[Optional[int], Arg(
-        help="The model's maximum context length. Defaults to None "
-        "(will use the value from the model's config.json instead).",
+        help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+        f"\n\n{human_readable_int.__doc__}",
         type_parser=human_readable_int,
     )] = None
     is_embedding: Annotated[bool, Arg(
@@ -465,7 +465,7 @@ class ServerArgs:
     )] = False
     enable_multimodal: Annotated[Optional[bool], Arg(
         help="Enable the multimodal functionality for the served model. "
-        "If the model being served is not multimodal, nothing will happen.",
+        "If the model being served is not multimodal, nothing will happen",
     )] = None
     revision: Annotated[Optional[str], Arg(
         help="The specific model version to use. It can be a branch "
@@ -473,13 +473,14 @@ class ServerArgs:
         "the default version.",
     )] = None
     model_impl: Annotated[str, Arg(
-        help='Which implementation of the model to use. '
-        '"auto" will try to use the SGLang implementation if it exists '
+        help="Which implementation of the model to use.\n\n"
+        '* "auto" will try to use the SGLang implementation if it exists '
         "and fall back to the Transformers implementation if no SGLang "
-        'implementation is available. '
-        '"sglang" will use the SGLang model implementation. '
-        '"transformers" will use the Transformers model implementation. '
-        '"mindspore" will use the MindSpore model implementation.',
+        "implementation is available.\n"
+        '* "sglang" will use the SGLang model implementation.\n'
+        '* "transformers" will use the Transformers model '
+        '* "mindspore" will use the MindSpore model '
+        "implementation.\n",
     )] = "auto"
     model_config_parser: Annotated[str, Arg(
         help='Which model-config parser to use. "auto" picks "mistral" '
@@ -506,7 +507,9 @@ class ServerArgs:
     )] = False
     warmups: Annotated[Optional[str], Arg(
         help="Specify custom warmup functions (csv) to run before server starts "
-        "eg. --warmups=warmup_name1,warmup_name2.",
+        "eg. --warmups=warmup_name1,warmup_name2 "
+        "will run the functions `warmup_name1` and `warmup_name2` specified in "
+        "warmup.py before the server starts listening for requests",
     )] = None
     nccl_port: Annotated[Optional[int], Arg(
         help="The port for NCCL distributed environment setup. Defaults to a random port.",
@@ -535,7 +538,8 @@ class ServerArgs:
     )] = False
     enable_http2: Annotated[bool, Arg(
         help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
-        "HTTP/2 auto-negotiation. Requires 'pip install sglang[http2]'.",
+        "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
+        "Requires 'pip install sglang[http2]'.",
     )] = False
 
     # Quantization and data type
@@ -873,7 +877,13 @@ class ServerArgs:
 
     # Optimization/debug options
     prefill_only_disable_kv_cache: Annotated[bool, Arg(
-        help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads.",
+        help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. "
+        "Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, "
+        "an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active "
+        "(no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS "
+        "may benefit from this later once their attention paths stop using paged KV. "
+        "Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to "
+        "(page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
     )] = False
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
