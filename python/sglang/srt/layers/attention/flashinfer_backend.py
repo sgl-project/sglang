@@ -214,16 +214,14 @@ def fast_prefill_plan(
     max_q_len: Optional[int] = None,
     max_kv_len: Optional[int] = None,
 ) -> None:
-    """A sync-free variant of ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the
-    EAGLE draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
+    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
 
-    The upstream plan() unconditionally does ``qo_indptr.to("cpu")`` /
-    ``paged_kv_indptr.to("cpu")`` / ``paged_kv_last_page_len.to("cpu")`` to build
-    the host scheduling metadata; in graph replay that blocking D2H drains the GPU
-    queue every step. Draft-extend has a constant qo layout and a host-known kv
-    length (``seq_lens_cpu``), so the caller passes those in and we reach the
-    underlying ``_cached_module.plan`` directly without any host readback. The
-    produced ``_plan_info`` is identical to what plan() would build.
+    Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
+    its host scheduling metadata, a blocking D2H that drains the GPU queue every
+    replay. The caller passes host-known qo/kv layout in, so we call the underlying
+    ``_cached_module.plan`` directly with no readback; the ``_plan_info`` produced
+    is identical to plan()'s.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
     assert (
@@ -733,9 +731,9 @@ class FlashInferAttnBackend(AttentionBackend):
             and forward_mode.is_draft_extend_v2()
             and self.prefill_backend == "fa2"
         ):
-            # Same idea as decode: swap in the sync-free fast_prefill_plan for replay,
-            # after the initial real plan() above set up _cached_module. The host-known
-            # qo/kv metadata is supplied per-replay in call_begin_forward.
+            # Like decode: swap in fast_prefill_plan for replay, after the real
+            # plan() above set up _cached_module (host metadata supplied per-replay
+            # in call_begin_forward).
             for w in self.draft_extend_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
@@ -1795,11 +1793,9 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
-        # Sync-free fast plan for the draft-extend cuda graph: when this paged wrapper
-        # has had begin_forward swapped for fast_prefill_plan, hand plan() the host-known
-        # qo/kv layout so it skips its per-replay device-to-host copies. Draft-extend has
-        # a constant qo (num_tokens_per_req per req) and a host-known kv length
-        # (seq_lens_cpu). Anything else falls back to the plain call (plan() does .cpu()).
+        # When this wrapper uses fast_prefill_plan, hand it the host-known layout:
+        # draft-extend has a constant qo (num_tokens_per_req per req) and a host kv
+        # length (seq_lens_cpu). Otherwise fall through to the plain D2H plan().
         paged_plan_kwargs = {}
         num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
         uses_fast_prefill = (
