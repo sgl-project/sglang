@@ -15,7 +15,7 @@
 
 Usage:
     from typing import Annotated
-    from sglang.srt.arg_utils import Arg, add_cli_args_from_dataclass
+    from sglang.srt.arg_groups.arg_utils import Arg, add_cli_args_from_dataclass
 
     @dataclasses.dataclass
     class ServerArgs:
