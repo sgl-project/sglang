@@ -2524,8 +2524,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def evict_sessions(self, num_tokens: int, active_pool_idxs: set) -> int:
         return self.session.evict_lru_sessions(num_tokens, active_pool_idxs)
 
-    def soft_evict_session(self, session_id: str) -> int:
-        return self.session.soft_evict_slot(session_id)
 
     def evictable_size(self) -> int:
         return self.component_evictable_size_.get(BASE_COMPONENT_TYPE, 0)
