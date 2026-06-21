@@ -378,9 +378,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        swa_reserved = self.num_reserved_decode_tokens
+        if self.scheduler.server_args.disable_radix_cache:
+            swa_reserved = 0
         return (
             full_len + self.num_reserved_decode_tokens,
-            swa_len + self.num_reserved_decode_tokens,
+            swa_len + swa_reserved,
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
