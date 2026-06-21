@@ -288,13 +288,9 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
-    def test_explicit_prefill_fa4_forces_page_size_128(
-        self, _mock_mla, _mock_sm100
-    ):
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
-        args = self._make_args(
-            attention_backend=None, prefill="fa4", page_size=1
-        )
+        args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
 
         args._handle_attention_backend_compatibility()
 
