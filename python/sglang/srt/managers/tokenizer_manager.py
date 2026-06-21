@@ -2643,15 +2643,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        # Stop the watchdog: we are intentionally shutting down, so the
-        # schedulers exiting is expected, not a crash.
+        # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask the schedulers to shut down gracefully. The request is broadcast
-        # across TP ranks, so they stop in lockstep and release pinned-host KV
-        # buffers (e.g. hisparse) in userspace. Wait for them to exit before
-        # hard-killing the rest; otherwise a SIGKILL would leave the kernel to
-        # unpin those buffers during reclaim, stalling teardown.
+        # Ask schedulers to release resources in userspace and exit (see
+        # ShutdownReq), then wait for them before hard-killing the rest.
         self.send_to_scheduler.send_pyobj(ShutdownReq())
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and collect_scheduler_processes():

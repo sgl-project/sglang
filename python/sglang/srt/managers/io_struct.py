@@ -1816,12 +1816,8 @@ class FreezeGCReq(BaseReq):
 
 @dataclass
 class ShutdownReq(BaseReq):
-    """Ask the scheduler to break its event loop and exit gracefully.
-
-    Broadcast across TP ranks via the normal recv path, so all ranks stop on
-    the same iteration and release pinned-host buffers in userspace.
-    """
-
+    # Broadcast across TP ranks via the normal recv path, so all ranks break
+    # the scheduler loop on the same iteration.
     pass
 
 

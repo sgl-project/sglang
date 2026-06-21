@@ -4020,9 +4020,7 @@ class Scheduler(
         return None
 
     def handle_shutdown(self, recv_req: ShutdownReq):
-        # Break the event loop at the next safe point; run_scheduler_process's
-        # finally then releases pinned-host buffers in userspace before exit.
-        # Broadcast across ranks, so every rank stops on the same iteration.
+        # Break the event loop; the finally in run_scheduler_process releases resources.
         self.gracefully_exit = True
         return None
 
