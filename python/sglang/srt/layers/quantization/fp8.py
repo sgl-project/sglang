@@ -576,12 +576,17 @@ class Fp8LinearMethod(LinearMethodBase):
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
-            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) and not getattr(
+                layer.weight, "is_shuffled", False
+            ):
                 # TODO(1am9trash), to deal with case that this branch chance
-                # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
+                # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands.
+                # Guard on is_shuffled so RL rollout's repeated process_weights
+                # calls shuffle exactly once per fresh (plain) load.
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+                layer.weight.is_shuffled = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -660,6 +665,14 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.format_ue8m0 = True
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
+
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        # See Fp8MoEMethod.restore_weights_before_loading: aiter shuffle is
+        # shape-preserving and the RL weight update overwrites the buffer with
+        # fresh plain bytes, so clearing the idempotency flag is enough.
+        w = getattr(layer, "weight", None)
+        if w is not None and getattr(w, "is_shuffled", False):
+            w.is_shuffled = False
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
@@ -1305,13 +1318,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.contiguous(), (16, 16)
                 )
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
+            # Pre-shuffle weights. shuffle_weight((16, 16)) is NOT idempotent and
+            # RL rollout re-runs process_weights after every weight update, so guard
+            # on is_shuffled to shuffle exactly once per fresh (plain) load.
+            if not getattr(layer.w13_weight, "is_shuffled", False):
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -1570,6 +1588,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
+
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        # aiter shuffle_weight((16, 16)) is shape-preserving and the RL weight
+        # update overwrites the weight buffer with fresh plain bytes, so we only
+        # need to clear the idempotency flag here; process_weights_after_loading
+        # re-shuffles the freshly loaded plain weights exactly once.
+        for name in ("w13_weight", "w2_weight"):
+            w = getattr(layer, name, None)
+            if w is not None and getattr(w, "is_shuffled", False):
+                w.is_shuffled = False
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
