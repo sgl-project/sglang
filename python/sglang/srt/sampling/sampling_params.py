@@ -178,6 +178,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
             )
+        if self.n < 1:
+            raise ValueError(f"n must be at least 1, got {self.n}.")
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
@@ -222,6 +224,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.stop_strs is not None:
+            stop_strs = (
+                [self.stop_strs] if isinstance(self.stop_strs, str) else self.stop_strs
+            )
+            if any(s == "" for s in stop_strs):
+                raise ValueError("stop cannot contain an empty string.")
 
         grammars = [
             self.json_schema,

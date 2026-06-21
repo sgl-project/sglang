@@ -289,6 +289,25 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    # --- n ---
+    def test_n_below_one_raises(self):
+        """n=0 expands to a degenerate empty batch; verify() must reject it."""
+        with self.assertRaises(ValueError):
+            self._make(n=0).verify(self.VOCAB_SIZE)
+
+    # --- stop ---
+    def test_empty_stop_string_raises(self):
+        """An empty stop string matches every position and truncates output."""
+        with self.assertRaises(ValueError):
+            self._make(stop="").verify(self.VOCAB_SIZE)
+
+    def test_empty_stop_in_list_raises(self):
+        with self.assertRaises(ValueError):
+            self._make(stop=["ok", ""]).verify(self.VOCAB_SIZE)
+
+    def test_non_empty_stop_is_valid(self):
+        self._make(stop=["</s>"]).verify(self.VOCAB_SIZE)
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
 
