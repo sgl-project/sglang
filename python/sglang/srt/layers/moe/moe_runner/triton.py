@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
-
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -18,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
