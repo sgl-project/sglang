@@ -84,6 +84,7 @@ jobs:
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            -e PYTHONPATH=/root/miles \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --match-all-labels \
             ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
