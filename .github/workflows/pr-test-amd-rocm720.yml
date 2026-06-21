@@ -4,7 +4,14 @@ name: PR Test ROCm 7.2 (AMD)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
-  # Keep ROCm 7.2 manual/callable only; pr-test-amd-rocm700.yml handles automatic PR and scheduled runs.
+  pull_request:
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-amd-rocm720.yml"
+      - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage_select:

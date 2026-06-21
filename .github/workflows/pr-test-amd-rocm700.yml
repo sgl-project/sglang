@@ -6,14 +6,6 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '0 */6 * * *' # Run every 6 hours (UTC)
-  pull_request:
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-amd-rocm700.yml"
-      - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage_select:
