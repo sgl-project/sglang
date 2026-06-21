@@ -8,6 +8,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
@@ -42,6 +43,9 @@ class EagleVerifyInput(SpecInput):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
+    # vocab); only set under rejection sampling. Consumed by the verify kernel.
+    draft_probs: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -159,6 +163,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
+    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
+    # only set under rejection sampling.
+    draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
@@ -209,6 +216,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        vocab_size: int = 0,
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
@@ -219,6 +227,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            draft_probs=(
+                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                if get_global_server_args().speculative_use_rejection_sampling
+                else None
+            ),
             capture_hidden_mode=capture_hidden_mode,
         )
 
@@ -240,6 +253,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[: len(new_indices)]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
@@ -247,6 +262,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[new_indices]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
@@ -267,6 +284,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.draft_probs = spec_info.draft_probs
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -279,6 +297,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.draft_probs is not None and spec_info.draft_probs is not None:
+            self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
 
 @dataclass
