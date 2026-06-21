@@ -587,6 +587,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        # Warm up + autotune kernels once before capture (run-once across the
+        # decode + prefill runners; see BaseRunner.warmup).
+        self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
