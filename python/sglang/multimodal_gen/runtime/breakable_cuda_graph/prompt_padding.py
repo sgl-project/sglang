@@ -15,8 +15,8 @@
 
 These helpers bucket prompt-conditioning inputs by sequence length so diffusion
 DiT forward calls with different prompt lengths can reuse captured CUDA graphs.
-Model-specific padders can register custom handling; Qwen-Image's rules live in
-model_specific_stages/qwen_image_bcg.py.
+Model-specific padders can register custom handling under
+``breakable_cuda_graph.model_padders``.
 """
 
 from __future__ import annotations
@@ -299,7 +299,7 @@ def _ensure_model_padders_registered() -> None:
     if _model_padders_registered:
         return
     _model_padders_registered = True
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (  # noqa: F401
-        qwen_image_bcg,
-        zimage_bcg,
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (  # noqa: F401
+        qwen_image,
+        zimage,
     )

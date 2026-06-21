@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -78,7 +81,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import bcg_utils
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -357,7 +359,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if getattr(self.server_args, "enable_breakable_cuda_graph", False):
+        if self.server_args.enable_breakable_cuda_graph:
             # BCG captures the eager kernel stream itself; compiling first
             # would capture inductor's own cudagraph trees / guards.
             return
@@ -436,7 +438,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
-        if getattr(self.server_args, "enable_breakable_cuda_graph", False):
+        if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
             return
@@ -1997,8 +1999,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ):
         """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
 
-        Generic padding lives in ``bcg_utils``; Qwen Image registers its
-        prompt-specific padder from ``model_specific_stages/qwen_image_bcg.py``.
+        Generic padding lives in ``breakable_cuda_graph.prompt_padding``;
+        model-specific padders register from ``breakable_cuda_graph.model_padders``.
 
         ``force_bucket`` pads to exactly that bucket (used by warmup to capture
         every bucket); a prompt already longer than ``force_bucket`` is left
@@ -2016,17 +2018,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Return (lazily creating) the breakable CUDA graph runner for
         ``current_model``, or ``None`` if BCG is disabled / inapplicable.
         """
-        if not getattr(self.server_args, "enable_breakable_cuda_graph", False):
+        if not self.server_args.enable_breakable_cuda_graph:
             return None
         if not isinstance(current_model, nn.Module):
             return None
         key = id(current_model)
         runner = self._bcg_runners.get(key)
         if runner is None:
-            from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
                 DiffusionBreakableCudaGraphRunner,
             )
 
+            # DenoisingStage can switch between transformer and transformer_2;
+            # each module owns separate graph state and static input buffers.
             runner = DiffusionBreakableCudaGraphRunner(
                 current_model, get_local_torch_device()
             )

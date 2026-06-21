@@ -9,7 +9,9 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages import bcg_utils
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
 
 
 def is_zimage_transformer(current_model: Any, call_kwargs: dict) -> bool:
