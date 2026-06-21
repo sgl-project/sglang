@@ -324,6 +324,14 @@ class Ideogram4DenoisingStage(DenoisingStage):
             return
         super()._manage_dit_use_site(current_model, current_phase, batch)
 
+    def _run_ideogram_transformer(
+        self, current_model: torch.nn.Module, call_kwargs: dict
+    ) -> torch.Tensor:
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            return self._bcg_run(runner, call_kwargs, current_model)
+        return current_model(**call_kwargs)
+
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         batch.did_sp_shard_latents = False
 
@@ -427,6 +435,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
         z = ctx.latents.to(dtype=torch.float32)
         llm_features = batch.prompt_embeds[0]
         max_text_tokens = data["max_text_tokens"]
+        num_image_tokens = data["num_image_tokens"]
         schedule_values = ctx.extra["ideogram4_schedule_values"]
         schedule_deltas = ctx.extra["ideogram4_schedule_deltas"]
         guidance_schedule = ctx.extra["ideogram4_guidance_schedule"]
@@ -443,17 +452,20 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 attn_metadata=step.attn_metadata,
                 forward_batch=batch,
             ):
-                pos_out = step.current_model(
-                    llm_features=llm_features,
-                    x=pos_z,
-                    t=t,
-                    position_ids=data["position_ids"],
-                    segment_ids=data["segment_ids"],
-                    indicator=data["indicator"],
-                    attn_mask=ctx.extra["ideogram4_attn_mask"],
-                    attn_mask_meta=ctx.extra["ideogram4_attn_mask_meta"],
+                pos_out = self._run_ideogram_transformer(
+                    step.current_model,
+                    dict(
+                        llm_features=llm_features,
+                        x=pos_z,
+                        t=t,
+                        position_ids=data["position_ids"],
+                        segment_ids=data["segment_ids"],
+                        indicator=data["indicator"],
+                        attn_mask=ctx.extra["ideogram4_attn_mask"],
+                        attn_mask_meta=ctx.extra["ideogram4_attn_mask_meta"],
+                    ),
                 )
-                pos_v = pos_out[:, max_text_tokens:]
+                pos_v = pos_out[:, max_text_tokens : max_text_tokens + num_image_tokens]
 
             self._manage_unconditional_transformer_use_site(batch)
             with set_forward_context(
@@ -461,15 +473,18 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 attn_metadata=step.attn_metadata,
                 forward_batch=batch,
             ):
-                neg_v = self.unconditional_transformer(
-                    llm_features=ctx.extra["ideogram4_neg_llm_features"],
-                    x=z,
-                    t=t,
-                    position_ids=ctx.extra["ideogram4_neg_position_ids"],
-                    segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
-                    indicator=ctx.extra["ideogram4_neg_indicator"],
-                    attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
-                    attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
+                neg_v = self._run_ideogram_transformer(
+                    self.unconditional_transformer,
+                    dict(
+                        llm_features=ctx.extra["ideogram4_neg_llm_features"],
+                        x=z,
+                        t=t,
+                        position_ids=ctx.extra["ideogram4_neg_position_ids"],
+                        segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
+                        indicator=ctx.extra["ideogram4_neg_indicator"],
+                        attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
+                        attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
+                    ),
                 )
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
