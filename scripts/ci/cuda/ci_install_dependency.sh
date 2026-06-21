@@ -289,11 +289,18 @@ install_sglang_kernel() {
 
     # Reinstall torch with matching CUDA version if needed
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
-    echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    REINSTALL_TORCH=false
+    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
+        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    else
+        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
+        TORCH_CUDA_VER=""
+        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
+        printf '%s\n' "${TORCH_IMPORT_ERROR}"
+        REINSTALL_TORCH=true
+    fi
     TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
     TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    REINSTALL_TORCH=false
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         REINSTALL_TORCH=true
     else
@@ -308,6 +315,11 @@ install_sglang_kernel() {
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
+            echo "ERROR: could not determine installed torch package versions before reinstall."
+            pip show torch torchaudio torchvision || true
+            exit 1
+        fi
         echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
