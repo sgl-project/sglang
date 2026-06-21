@@ -71,6 +71,7 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    drop_page_margin: bool = False,
 ) -> None:
     from sglang.srt.environ import envs
 
@@ -86,7 +87,7 @@ def free_swa_out_of_window_slots(
     # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
     # may become tombstoned, causing SWA memory leak.
     # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
-    if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+    if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
         evict_threshold = pre_len - sliding_window_size
     else:
         evict_threshold = pre_len - sliding_window_size - page_size
