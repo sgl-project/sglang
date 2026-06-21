@@ -195,6 +195,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
 
+            hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
@@ -203,6 +204,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.model_runner.model_config.hf_config, "hot_vocab_size"
             ):  # llama_eagle3
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
+            elif hot_token_id is not None:
+                # FR-Spec: reduced vocab is injected via a late
+                # json_model_override_args, so hf_config lacks it; size from the head.
+                vocab_size = len(hot_token_id)
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
