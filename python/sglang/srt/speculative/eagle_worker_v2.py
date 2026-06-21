@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -407,14 +408,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
-            self.draft_extend_attn_backend,
+        draft_extend_backend = self.draft_extend_attn_backend
+        graph_supported_backend = isinstance(
+            draft_extend_backend,
             (
                 TritonAttnBackend,
                 TRTLLMMLABackend,
                 TRTLLMHAAttnBackend,
                 TokenspeedMLABackend,
             ),
+        )
+        # FlashInfer draft-extend graph does not support a reduced draft vocab
+        # (speculative_token_map / FR-Spec); fall back to eager in that case.
+        flashinfer_graph_supported = (
+            isinstance(draft_extend_backend, FlashInferAttnBackend)
+            and self.server_args.speculative_token_map is None
+        )
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
+            graph_supported_backend or flashinfer_graph_supported
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends

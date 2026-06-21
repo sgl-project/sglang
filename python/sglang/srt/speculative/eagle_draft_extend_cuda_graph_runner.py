@@ -340,6 +340,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            # Padded tree width per req; drives the constant qo layout.
+            num_tokens_per_req=self.num_tokens_per_bs,
         )
 
         forward_batch = ForwardBatch(
