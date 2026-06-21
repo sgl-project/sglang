@@ -43,7 +43,7 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
             "--mem-frac",
-            "0.7",
+            "0.73",
             "--cuda-graph-max-bs",
             "32",
             "--max-running-requests",

@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
+_use_dsa_indexer_fusion = _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -100,6 +101,11 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.jit_kernel.dsv32 import (
+        fused_k_indexer_norm_rope,
+        fused_k_indexer_norm_rope_store,
+    )
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
@@ -140,6 +146,28 @@ if _is_cuda:
             metadata,
             topk_result,
         )
+
+    def _scale_head_gate_pcg_fake_impl(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
+            dtype=torch.float32,
+            device=weights_raw.device,
+        )
+
+    @register_custom_op(fake_impl=_scale_head_gate_pcg_fake_impl)
+    def scale_head_gate_pcg(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weights = weights_raw * n_heads_inv_sqrt
+        return weights.unsqueeze(-1) * q_scale * softmax_scale
 
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
@@ -350,20 +378,29 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("weights_proj", prefix),
-        )
+        if _use_dsa_indexer_fusion:
+            self.wk_weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim + self.n_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("wk_weights_proj", prefix),
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("weights_proj", prefix),
+            )
         self.k_norm = LayerNorm(
             self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
         )
@@ -379,6 +416,15 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
+        self._indexer_freqs_cis: Optional[torch.Tensor] = None
+        if _use_dsa_indexer_fusion:
+            c = self.rotary_emb.cos_sin_cache.to(torch.float32)
+            half = c.shape[-1] // 2
+            self._indexer_freqs_cis = torch.complex(
+                c[:, :half].contiguous(), c[:, half:].contiguous()
+            )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -435,6 +481,20 @@ class Indexer(MultiPlatformOp):
     ):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
+    @torch.compile(dynamic=True)
+    def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
+        weights = weights_raw * self.n_heads**-0.5
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        kw, _ = self.wk_weights_proj(x)
+        return kw.split([self.head_dim, self.n_heads], dim=-1)
+
+    def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        # Fusion drops the (logit-preserving) Hadamard rotation; without it the
+        # index-K cache here matches the fused path that decode reads back.
+        return x if _use_dsa_indexer_fusion else rotate_activation(x)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -443,6 +503,7 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        weights_raw = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -459,7 +520,10 @@ class Indexer(MultiPlatformOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                key, _ = self.wk(x)
+                if _use_dsa_indexer_fusion:
+                    key, weights_raw = self._fused_k_weights(x)
+                else:
+                    key, _ = self.wk(x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -475,7 +539,10 @@ class Indexer(MultiPlatformOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            key, _ = self.wk(x)
+            if _use_dsa_indexer_fusion:
+                key, weights_raw = self._fused_k_weights(x)
+            else:
+                key, _ = self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -489,20 +556,20 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
+                key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
             and forward_batch.attn_cp_metadata is not None
             and self.dsa_enable_prefill_cp
         ):
-            key = rotate_activation(key)
+            key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
@@ -512,10 +579,10 @@ class Indexer(MultiPlatformOp):
                     torch.cuda.current_stream(),
                 )
             current_stream.wait_stream(self.alt_stream)
-            return query, key
+            return query, key, weights_raw
         else:
-            query = rotate_activation(query)
-            key = rotate_activation(key)
+            query = self._maybe_rotate(query)
+            key = self._maybe_rotate(key)
 
         # allgather+rerrange
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
@@ -525,7 +592,7 @@ class Indexer(MultiPlatformOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        return query, key
+        return query, key, weights_raw
 
     def _get_k_bf16(
         self,
@@ -533,7 +600,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         enable_dual_stream: bool,
     ):
-        # Compute only key, skip query
+        # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
@@ -545,6 +612,107 @@ class Indexer(MultiPlatformOp):
         key = rotate_activation(key)
 
         return key
+
+    def _fused_k_prepare_and_store(
+        self,
+        key_raw: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> None:
+        out_cache_loc = forward_batch.out_cache_loc
+        pool = get_token_to_kv_pool()
+        page_size = pool.page_size
+        if (
+            not _is_fp8_fnuz
+            and out_cache_loc is not None
+            and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
+        ):
+            fused_k_indexer_norm_rope_store(
+                key_raw,
+                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                out_cache_loc,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_freqs_cis,
+                positions,
+                page_size,
+            )
+            return
+
+        # Fallback: separate K kernel + store kernel.
+        key = fused_k_indexer_norm_rope(
+            key_raw,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            self._indexer_freqs_cis,
+            positions,
+        )
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+
+    def _fused_q_prepare_and_store(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+
+        if self.alt_stream is None:
+            kw, _ = self.wk_weights_proj(x)
+            key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+            self._fused_k_prepare_and_store(
+                key, positions, forward_batch, layer_id, act_quant
+            )
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+            return fused_q_indexer_rope_first_quant(
+                q.contiguous(),
+                weights_raw,
+                q_scale_gate,
+                self._indexer_freqs_cis,
+                positions,
+            )
+
+        # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
+        # then fused Q kernel (current) || fused K kernel + cache store (alt).
+        # wait_stream calls are ordered by issue position so each side waits only
+        # on the GEMMs it consumes, not on the other side's fused kernel.
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+
+        kw, _ = self.wk_weights_proj(x)
+        key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+
+        current_stream.wait_stream(self.alt_stream)
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            self._fused_k_prepare_and_store(
+                key, positions, forward_batch, layer_id, act_quant
+            )
+
+        q_fp8, weights = fused_q_indexer_rope_first_quant(
+            q.contiguous(),
+            weights_raw,
+            q_scale_gate,
+            self._indexer_freqs_cis,
+            positions,
+        )
+
+        current_stream.wait_stream(self.alt_stream)
+        return q_fp8, weights
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -958,18 +1126,24 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # Fast path: only compute and store k cache, skip all q and weights ops
-        key = self._get_k_bf16(x, positions, enable_dual_stream)
-
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
-        self._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key,
-            act_quant=act_quant,
-        )
+        # Must write the same K representation as the decode path: fused
+        # (no-Hadamard) when fusion is on, else the legacy Hadamard path.
+        if _use_dsa_indexer_fusion:
+            key_raw, _ = self._fused_k_weights(x)
+            self._fused_k_prepare_and_store(
+                key_raw, positions, forward_batch, layer_id, act_quant
+            )
+        else:
+            key = self._get_k_bf16(x, positions, enable_dual_stream)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
 
         # MHA doesn't need topk_indices
         if not return_indices:
@@ -1382,17 +1556,30 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         # When weights_proj is LoRA-wrapped, use an eager module call so the
-        # wrapper owns base+delta and no LoRA kernel runs under torch.compile
-        weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
+        # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
+        # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
+        # absent then; short-circuit before touching it.
+        weights_proj_lora = not _use_dsa_indexer_fusion and getattr(
+            self.weights_proj, "set_lora", False
+        )
 
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            _use_dsa_indexer_fusion
+            and not is_in_tc_piecewise_cuda_graph()
+            and forward_batch.attn_cp_metadata is None
+        ):
+            q_fp8, weights = self._fused_q_prepare_and_store(
+                x, q_lora, positions, forward_batch, layer_id, act_quant
+            )
+        elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if weights_proj_lora:
-                weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
-            else:
-                weights = self._project_and_scale_head_gates(x)
-            query, key = self._get_q_k_bf16(
+            if not _use_dsa_indexer_fusion:
+                if weights_proj_lora:
+                    weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+                else:
+                    weights = self._project_and_scale_head_gates(x)
+            query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
@@ -1404,9 +1591,12 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+            if _use_dsa_indexer_fusion:
+                weights = self._scale_head_gates(weights_raw, q_scale)
+            else:
+                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
-            query, key = self._get_q_k_bf16(
+            query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
 
@@ -1478,18 +1668,28 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if is_in_tc_piecewise_cuda_graph():
-                if weights_proj_lora:
-                    raise RuntimeError(
-                        "DSA indexer weights_proj LoRA is incompatible with TC piecewise CUDA graph; remove the explicit"
-                        " prefill cuda-graph backend override or drop indexer.weights_proj from the LoRA target modules."
+                if _use_dsa_indexer_fusion:
+                    weights = scale_head_gate_pcg(
+                        weights_raw,
+                        self.n_heads**-0.5,
+                        self.softmax_scale,
+                        q_scale,
                     )
-                weights = logits_head_gate_pcg(
-                    x_for_gate,
-                    self.weights_proj.weight,
-                    self.n_heads**-0.5,
-                    self.softmax_scale,
-                    q_scale,
-                )
+                else:
+                    if weights_proj_lora:
+                        raise RuntimeError(
+                            "DSA indexer weights_proj LoRA is incompatible with TC piecewise CUDA graph; remove the explicit"
+                            " prefill cuda-graph backend override or drop indexer.weights_proj from the LoRA target modules."
+                        )
+                    weights = logits_head_gate_pcg(
+                        x_for_gate,
+                        self.weights_proj.weight,
+                        self.n_heads**-0.5,
+                        self.softmax_scale,
+                        q_scale,
+                    )
+            elif _use_dsa_indexer_fusion:
+                weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
