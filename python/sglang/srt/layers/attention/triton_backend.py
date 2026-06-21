@@ -350,43 +350,24 @@ class TritonAttnBackend(AttentionBackend):
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
         return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
 
-    def _create_dcp_kv_indices(
+    def _dcp_kv_indices(
         self,
         req_pool_indices: torch.Tensor,
         lens: torch.Tensor,
         kv_indptr: torch.Tensor,
-        kv_start_idx: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        dcp_lens = self._dcp_lens(lens, kv_start_idx)
-        kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
-        kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
-        kv_indices = torch.empty(
-            int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
-        )
-        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
-            self.req_to_token,
-            req_pool_indices,
-            dcp_lens,
-            kv_indptr,
-            kv_start_idx,
-            kv_indices,
-            self.req_to_token.stride(0),
-            self.dcp_size,
-            self.dcp_rank,
-        )
-        return kv_indptr, kv_indices
-
-    def _fill_dcp_kv_indices(
-        self,
-        req_pool_indices: torch.Tensor,
-        lens: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
+        kv_indices: Optional[torch.Tensor] = None,
         kv_start_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Build per-DCP-rank sharded KV indptr/indices. eager passes
+        # kv_indices=None (allocate a fresh tensor); the cuda-graph path passes
+        # a fixed address-stable buffer to fill in place.
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
+        if kv_indices is None:
+            kv_indices = torch.empty(
+                int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
+            )
         create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
             req_pool_indices,
@@ -441,7 +422,7 @@ class TritonAttnBackend(AttentionBackend):
             # them into the same cuda-graph buffers that
             # _build_cuda_graph_forward_metadata reads back
             # (self.kv_indptr / self.cuda_graph_kv_indices).
-            _, _, dcp_seq_lens = self._fill_dcp_kv_indices(
+            _, _, dcp_seq_lens = self._dcp_kv_indices(
                 req_pool_indices,
                 seq_lens,
                 self.kv_indptr,
@@ -681,15 +662,14 @@ class TritonAttnBackend(AttentionBackend):
                 # kv_indptr is None for draft-extend's idle batch (no tree
                 # indices); build plain metadata from seq_lens.
                 if self.dcp_size > 1:
-                    # DCP: per-rank sharded KV indices (must mirror the
-                    # cuda-graph path's _fill_dcp_kv_indices). Building full
-                    # contiguous indices here would make each rank read the
-                    # whole KV instead of its owner shard.
-                    kv_indptr, kv_indices = self._create_dcp_kv_indices(
+                    # DCP: per-rank sharded KV indices (shares _dcp_kv_indices
+                    # with the cuda-graph path). Building full contiguous
+                    # indices here would make each rank read the whole KV
+                    # instead of its owner shard.
+                    kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         self.kv_indptr,
-                        None,
                     )
                 else:
                     # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
@@ -818,11 +798,10 @@ class TritonAttnBackend(AttentionBackend):
 
         else:
             if self.dcp_size > 1:
-                kv_indptr, kv_indices = self._create_dcp_kv_indices(
+                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                     forward_batch.req_pool_indices,
                     forward_batch.extend_prefix_lens,
                     self.kv_indptr,
-                    None,
                 )
             else:
                 # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
@@ -1132,32 +1111,32 @@ class TritonAttnBackend(AttentionBackend):
     ):
         pass
 
-    def _kv_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        if self.dcp_size == 1:
-            return forward_batch.out_cache_loc
-        return forward_batch.out_cache_loc // self.dcp_size
-
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         k: torch.Tensor,
         v: torch.Tensor,
         k_scale=None,
         v_scale=None,
     ) -> None:
-        kwargs = {}
+        # DCP writes to the local physical shard (loc = out_cache_loc //
+        # dcp_size) through the masked path so each rank only stores the tokens
+        # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
+            loc = forward_batch.out_cache_loc // self.dcp_size
             if (
                 forward_batch.positions is not None
                 and forward_batch.positions.numel() == loc.numel()
             ):
-                kwargs["dcp_kv_mask"] = (
-                    forward_batch.positions % self.dcp_size == self.dcp_rank
-                )
+                dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
             else:
-                kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
+                dcp_kv_mask = forward_batch.dcp_kv_mask
+            kwargs = {"dcp_kv_mask": dcp_kv_mask}
+        else:
+            loc = loc_info
+            kwargs = {}
         if k_scale is None and v_scale is None:
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
         else:
@@ -1202,21 +1181,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.swa_out_cache_loc,
                 )
                 if layer.k_scale is None:
-                    if self.dcp_size > 1:
-                        self._set_kv_buffer(
-                            forward_batch,
-                            layer,
-                            self._kv_cache_loc(forward_batch),
-                            k,
-                            v,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            loc_info,
-                            k,
-                            v,
-                        )
+                    self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
                     # doesn't accept scale parameters. Clone to protect k from mutation
@@ -1229,25 +1194,15 @@ class TritonAttnBackend(AttentionBackend):
                         v,
                     )
                 else:
-                    if self.dcp_size > 1:
-                        self._set_kv_buffer(
-                            forward_batch,
-                            layer,
-                            self._kv_cache_loc(forward_batch),
-                            k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                            v.clone(),
-                            layer.k_scale,
-                            layer.v_scale,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            loc_info,
-                            k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                            v.clone(),
-                            layer.k_scale,
-                            layer.v_scale,
-                        )
+                    self._set_kv_buffer(
+                        forward_batch,
+                        layer,
+                        loc_info,
+                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                        v.clone(),
+                        layer.k_scale,
+                        layer.v_scale,
+                    )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1660,18 +1615,9 @@ class TritonAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
-            elif self.dcp_size > 1:
+            else:
                 self._set_kv_buffer(
                     forward_batch,
-                    layer,
-                    self._kv_cache_loc(forward_batch),
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
