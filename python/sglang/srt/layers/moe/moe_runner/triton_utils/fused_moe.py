@@ -122,7 +122,7 @@ def inplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
-    interleaved: bool = True,
+    gate_up_interleaved: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -154,7 +154,7 @@ def inplace_fused_experts(
         gemm1_limit,
         filter_expert,
         swiglu_limit=swiglu_limit,
-        interleaved=interleaved,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -188,7 +188,7 @@ def outplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
-    interleaved: bool = True,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -220,7 +220,7 @@ def outplace_fused_experts(
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
-        interleaved=interleaved,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -280,7 +280,7 @@ def fused_experts(
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
-            interleaved=moe_runner_config.interleaved,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
         return hidden_states
     else:
@@ -313,7 +313,7 @@ def fused_experts(
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
-            interleaved=moe_runner_config.interleaved,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
 
 
@@ -455,7 +455,7 @@ def _fused_moe_kernel_sequence(
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
-    interleaved: bool = True,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -553,7 +553,7 @@ def _fused_moe_kernel_sequence(
         # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            if interleaved:
+            if gate_up_interleaved:
                 intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
@@ -844,7 +844,7 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
-    interleaved: bool = True,
+    gate_up_interleaved: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -920,7 +920,7 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
-        interleaved=interleaved,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 

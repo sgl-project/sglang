@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -82,7 +84,7 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-        if quant_info.use_mxfp8:
+        if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
             )
@@ -173,7 +175,7 @@ def fused_experts_none_to_triton(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    if quant_info.use_mxfp8:
+    if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
         from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
             fused_experts_mxfp8,
         )
