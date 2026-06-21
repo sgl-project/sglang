@@ -1079,6 +1079,21 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
 
+    def test_scheduler_tensors_move_to_target_device(self) -> None:
+        scheduler = SimpleNamespace(
+            sigmas=torch.tensor([1.0, 0.0]),
+            timesteps=torch.tensor([1000.0, 0.0]),
+            untouched="value",
+        )
+
+        SanaWMDenoisingStage._move_scheduler_tensors_to_device(
+            scheduler, torch.device("cpu")
+        )
+
+        self.assertEqual(scheduler.sigmas.device.type, "cpu")
+        self.assertEqual(scheduler.timesteps.device.type, "cpu")
+        self.assertEqual(scheduler.untouched, "value")
+
 
 class TestSanaWMNativeDiTChunking(unittest.TestCase):
     def test_softmax_chunking_is_disabled_by_default_for_upstream_parity(self) -> None:
