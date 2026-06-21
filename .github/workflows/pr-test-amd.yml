@@ -213,7 +213,7 @@ jobs:
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
       aiter_ref: ${{ inputs.aiter_ref }}
-      rocm_version: rocm720
+      rocm_version: rocm700
       continue_on_error: true
     secrets: inherit
 
