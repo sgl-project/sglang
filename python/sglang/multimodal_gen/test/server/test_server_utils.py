@@ -739,17 +739,39 @@ HUNYUAN3D_REFERENCE_URL = (
 
 
 def _download_reference_mesh(url: str) -> Path:
-    """Download a reference mesh from URL, caching in temp dir."""
+    """Download a reference mesh from URL, caching in temp dir.
+
+    Validates the GLB magic header on both the cached copy and a fresh download.
+    raw.githubusercontent can briefly 404/return a stub for a just-pushed large
+    file; validating the header surfaces a clear error instead of a cryptic
+    trimesh "incorrect header on GLB file", and prevents caching a poisoned
+    reference that would otherwise fail every retry on a persistent runner.
+    """
     import hashlib
 
     cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
     cache_path = Path(tempfile.gettempdir()) / cache_name
-    if cache_path.exists():
+
+    def _has_glb_magic(path: Path) -> bool:
+        try:
+            with open(path, "rb") as f:
+                return f.read(4) == b"glTF"
+        except OSError:
+            return False
+
+    if cache_path.exists() and _has_glb_magic(cache_path):
         logger.info(f"Using cached reference mesh: {cache_path}")
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
-    cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
+    data = _urlopen_with_retry(url, timeout=60)
+    if data[:4] != b"glTF":
+        raise RuntimeError(
+            f"Reference mesh from {url} is not a valid GLB "
+            f"(header={data[:8]!r}, {len(data)} bytes). The CDN may not have "
+            f"propagated a recently-pushed file yet; retry shortly."
+        )
+    cache_path.write_bytes(data)
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
