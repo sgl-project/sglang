@@ -129,13 +129,7 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
-        "comfy-org/ideogram-4",
         "glm-image",
-        "ideogram-4",
-        "ideogram-4-fp8",
-        "ideogram-4-nf4",
-        "ideogram-ai/ideogram-4-fp8",
-        "ideogram-ai/ideogram-4-nf4",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
@@ -151,7 +145,6 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
-        "Ideogram4PipelineConfig",
         "QwenImagePipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -527,7 +520,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Qwen/Qwen-Image, "
+            "[Diffusion BCG] disabled for %s: only Qwen/Qwen-Image, "
             "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
             "and zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
