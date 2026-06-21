@@ -543,6 +543,25 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertEqual(result[0].author.role, "tool")
         self.assertIn("valid JSON", result[0].content[0].text)
 
+    def test_call_search_tool_retry_returns_tool_error_on_non_dict_json(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.entrypoints.context import HarmonyContext
+        from sglang.srt.environ import envs
+
+        msg = SimpleNamespace(
+            recipient="browser.search",
+            channel="commentary",
+            content=[SimpleNamespace(text="[1, 2, 3]")],
+        )
+        with envs.SGLANG_TOOL_JSON_ERROR_AUTOMATIC_RETRY.override(True):
+            result = asyncio.run(
+                HarmonyContext.call_search_tool(SimpleNamespace(), Mock(), msg)
+            )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].author.role, "tool")
+        self.assertIn("valid JSON", result[0].content[0].text)
+
     def test_parse_output_message_tolerates_invalid_browser_json(self):
         from types import SimpleNamespace
 
@@ -552,6 +571,20 @@ class HarmonyResponsesTestCase(unittest.TestCase):
             author=SimpleNamespace(role="assistant"),
             recipient="browser.search",
             content=[SimpleNamespace(text="{bad json")],
+        )
+        items = parse_output_message(msg)
+        self.assertEqual(len(items), 1)
+        self.assertIn("caught and retried", items[0].action.query)
+
+    def test_parse_output_message_tolerates_non_dict_browser_json(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.entrypoints.harmony_utils import parse_output_message
+
+        msg = SimpleNamespace(
+            author=SimpleNamespace(role="assistant"),
+            recipient="browser.search",
+            content=[SimpleNamespace(text="[1, 2, 3]")],
         )
         items = parse_output_message(msg)
         self.assertEqual(len(items), 1)

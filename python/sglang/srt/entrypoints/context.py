@@ -61,9 +61,7 @@ class SimpleContext(ConversationContext):
         raise NotImplementedError("Should not be called.")
 
 
-def _create_json_parse_error_messages(
-    last_msg: Message, e: orjson.JSONDecodeError
-) -> list[Message]:
+def _create_json_parse_error_messages(last_msg: Message, e: Exception) -> list[Message]:
     """Create a tool error message when JSON parsing of tool args failed."""
     error_msg = (
         f"Error parsing tool arguments as JSON: {str(e)}. "
@@ -165,7 +163,9 @@ class HarmonyContext(ConversationContext):
         if envs.SGLANG_TOOL_JSON_ERROR_AUTOMATIC_RETRY.get():
             try:
                 args = orjson.loads(last_msg.content[0].text)
-            except orjson.JSONDecodeError as e:
+                if not isinstance(args, dict):
+                    raise ValueError("Tool arguments must be a JSON object")
+            except (orjson.JSONDecodeError, ValueError) as e:
                 return _create_json_parse_error_messages(last_msg, e)
         else:
             args = orjson.loads(last_msg.content[0].text)

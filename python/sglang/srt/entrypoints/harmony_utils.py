@@ -253,7 +253,9 @@ def parse_output_message(message: Message):
         # invalid JSON; render a placeholder so output building does not crash.
         try:
             browser_call = orjson.loads(content.text)
-        except orjson.JSONDecodeError:
+            if not isinstance(browser_call, dict):
+                raise ValueError("Expected a JSON object")
+        except (orjson.JSONDecodeError, ValueError):
             json_retry_output_message = (
                 f"Invalid JSON args, caught and retried: {content.text}"
             )
