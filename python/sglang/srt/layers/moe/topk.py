@@ -50,7 +50,7 @@ try:
     ):
         if simulated_ep != 1:
             raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels 3.7.0"
+                "simulated_ep routing is not supported with triton_kernels 3.7.1"
             )
 
         if sm_first:
