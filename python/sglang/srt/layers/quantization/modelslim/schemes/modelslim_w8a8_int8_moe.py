@@ -94,7 +94,38 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
         set_weight_attrs(offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Delegate weight processing to the NPU kernel for the fixed weight group.
-        """
-        self.kernel.process_weights_after_loading(layer, self.weight_prefix)
+        self.kernel.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        layer.swiglu_alpha = getattr(moe_runner_config, "gemm1_alpha", None)
+        layer.swiglu_clamp_limit = getattr(
+            moe_runner_config, "gemm1_clamp_limit", None
+        )
+
+    def apply_weights(
+        self,
+        layer,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        return self.kernel.apply(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
