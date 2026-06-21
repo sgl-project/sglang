@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -174,43 +174,19 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
-    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Eager/replay seam, resolved by backend STATE (no argument).
-
-        Returns True when this ``(bs, forward_mode)`` has a pre-bound cuda-graph
-        metadata object: i.e. at decode-graph replay (the runner always pads to a
-        captured bucket) and harmlessly at an eager forward that lands on a
-        captured bs in a graph-enabled server -- there is one forward stream per
-        backend, and the bound metadata buffers are always re-filled by
-        ``out_graph`` before the next ``graph.replay()``, so a transient eager
-        write cannot leak into a later replay. Only decode/idle is ever captured
-        (``_bind_metadata_buffers``). Returns False for pure-eager runs
-        (``init_cuda_graph_state`` never ran -> no ``decode_metadata``) and for
-        prefill -> build a fresh metadata object. Never raises KeyError.
-        """
-        if not forward_mode.is_decode_or_idle():
-            return False
-        return bs in getattr(self, "decode_metadata", {})
-
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        forward_mode = forward_batch.forward_mode
+        # Single eager == replay == capture path. Decode builds a metadata
+        # view over the shared max-bs buffers (allocated once in
+        # init_static_metadata_buffers) and mutates the views in place — the
+        # storage is stable across iters so cuda graph data_ptrs are stable.
+        # Prefill builds fresh metadata (no captured graph).
+        self._compute_forward_metadata(forward_batch)
 
-        if in_capture:
-            self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
-
-        # Single eager == replay == capture metadata path; `use_bound` selects the
-        # pre-bound cuda-graph metadata object vs a freshly built one (see
-        # _use_cuda_graph_buffers). Always bound at capture.
-        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
-        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
-
-        if in_capture and forward_mode.is_decode_or_idle():
+        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
             # Restore max_seq_len scalars — replay sets actual values but CUDA
             # graph needs the safe upper bound baked in at capture time.
             md = self.forward_metadata
@@ -219,28 +195,52 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             md.max_seq_len_succ = self.max_context_len
             md.max_seq_len_inter = self.max_context_len
 
-    def _compute_forward_metadata(
-        self, forward_batch: ForwardBatch, *, use_bound: bool
-    ):
-        """Single source of truth for Dual-Chunk FlashAttention forward metadata,
-        shared by eager, capture, and replay.
+    def _compute_forward_metadata(self, forward_batch: ForwardBatch):
+        """Single source of truth for Dual-Chunk FlashAttention forward
+        metadata, shared by eager, capture, and replay.
 
-        ``use_bound`` selects the metadata destination: the per-bs pre-bound
-        cuda-graph metadata object in ``decode_metadata`` (capture / replay /
-        eager-at-captured-bs; decode-only) vs a freshly built
-        ``DualChunkFlashAttentionMetadata`` (pure-eager prefill or decode).
+        Decode writes into the shared max-bs buffers from
+        ``init_static_metadata_buffers`` (sliced [:bs] per-iter). The storage
+        is stable across iterations so the cuda graph's captured data_ptrs
+        remain valid; capture, replay, and eager all execute the same body.
+        Prefill builds a fresh metadata object — no captured graph for it.
         """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
 
-        if use_bound:
-            # Bound cuda-graph buffers (decode-only).
-            assert forward_mode.is_decode()
+        if forward_mode.is_decode_or_idle():
+            # Decode: rebuild metadata view over shared max-bs buffers; mutate
+            # the views in place. Storage is stable so cuda-graph captured
+            # data_ptrs stay valid across iters (capture / replay / eager all
+            # execute this same body).
             seq_lens = seq_lens[:bs]
             req_pool_indices = req_pool_indices[:bs]
-            metadata = self.decode_metadata[bs]
+            # Oversized eager fallback: when bs exceeds the captured ceiling
+            # the cuda-graph runner rejects this batch and dispatches eager;
+            # the shared max-bs views are too small for [:bs].copy_ and would
+            # raise on shape mismatch (or scribble past the buffer on the 2D
+            # block_tables fields). Fresh-alloc per-iter for this path.
+            cg_max_bs = getattr(self, "cuda_graph_max_bs", None)
+            if cg_max_bs is not None and bs > cg_max_bs:
+                metadata = self._build_fresh_decode_metadata(bs)
+            else:
+                metadata = DualChunkFlashAttentionMetadata()
+                metadata.seq_lens_tensor = self.decode_metadata["seq_lens_tensor"][:bs]
+                metadata.orig_seq_lens_tensor = self.decode_metadata[
+                    "orig_seq_lens_tensor"
+                ][:bs]
+                metadata.block_tables = self.decode_metadata["block_tables"]
+                metadata.block_tables_intra = self.decode_metadata["block_tables_intra"]
+                metadata.block_tables_succ = self.decode_metadata["block_tables_succ"]
+                metadata.seq_lens_intra = self.decode_metadata["seq_lens_intra"][:bs]
+                metadata.seq_lens_succ = self.decode_metadata["seq_lens_succ"][:bs]
+                metadata.seq_lens_inter = self.decode_metadata["seq_lens_inter"][:bs]
+                if self.original_max_position_embeddings > 0:
+                    metadata.scaling_factor = self.decode_metadata["scaling_factor"][
+                        :bs
+                    ]
 
             metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
             metadata.seq_lens = seq_lens.tolist()
@@ -320,8 +320,8 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
             self.forward_metadata = metadata
         else:
-            # Freshly built metadata object (pure-eager prefill or decode).
-            assert forward_mode.is_prefill() or forward_mode.is_decode()
+            # Prefill: fresh-built metadata (no graph capture in this path).
+            assert forward_mode.is_prefill()
             batch_size = forward_batch.batch_size
 
             metadata = DualChunkFlashAttentionMetadata()
@@ -642,6 +642,37 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         ).squeeze(1)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _build_fresh_decode_metadata(self, bs: int):
+        """Fresh per-iter equivalent of the bound ``self.decode_metadata`` dict,
+        used when the live bs exceeds the captured ceiling and the cuda-graph
+        runner has dispatched this batch through the eager fallback.
+        """
+        metadata = DualChunkFlashAttentionMetadata()
+        block_cols = (self.max_context_len - 1) // self.page_size + 1
+        metadata.seq_lens_tensor = torch.zeros(
+            bs, dtype=torch.int32, device=self.device
+        )
+        metadata.orig_seq_lens_tensor = torch.zeros(
+            bs, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables_intra = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.block_tables_succ = torch.zeros(
+            bs, block_cols, dtype=torch.int32, device=self.device
+        )
+        metadata.seq_lens_intra = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        metadata.seq_lens_succ = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        metadata.seq_lens_inter = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        if self.original_max_position_embeddings > 0:
+            metadata.scaling_factor = torch.zeros(
+                bs, dtype=torch.float32, device=self.device
+            )
+        return metadata
+
     def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -651,6 +682,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # Remembered so _compute_forward_metadata can detect oversized eager
+        # decode (bs > captured ceiling) and route through the fresh-alloc
+        # path instead of size-mismatching .copy_ into the max_bs-sized views.
+        self.cuda_graph_max_bs = max_bs
         self.decode_metadata = {
             "seq_lens_tensor": torch.zeros(
                 max_bs, dtype=torch.int32, device=self.device
@@ -687,51 +722,6 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 max_bs, dtype=torch.int32, device=self.device
             ),
         }
-
-    def _bind_metadata_buffers(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        forward_mode: ForwardMode,
-    ):
-        """Allocate persistent metadata buffers for CUDA graph capture."""
-        metadata = DualChunkFlashAttentionMetadata()
-
-        if forward_mode.is_decode_or_idle():
-            if self.original_max_position_embeddings > 0:
-                metadata.scaling_factor = self.decode_metadata["scaling_factor"][:bs]
-
-            metadata.seq_lens_tensor = self.decode_metadata["seq_lens_tensor"][:bs]
-            metadata.orig_seq_lens_tensor = self.decode_metadata[
-                "orig_seq_lens_tensor"
-            ][:bs]
-            metadata.max_seq_len = self.max_context_len
-            metadata.block_tables = self.decode_metadata["block_tables"][
-                req_pool_indices, :
-            ]
-
-            # intra
-            metadata.max_seq_len_intra = self.max_context_len
-            metadata.seq_lens_intra = self.decode_metadata["seq_lens_intra"][:bs]
-
-            metadata.block_tables_intra = self.decode_metadata["block_tables_intra"][
-                :bs, :
-            ]
-
-            # succ
-            metadata.seq_lens_succ = self.decode_metadata["seq_lens_succ"][:bs]
-            metadata.max_seq_len_succ = self.max_context_len
-
-            metadata.block_tables_succ = self.decode_metadata["block_tables_succ"][
-                :bs, :
-            ]
-
-            metadata.seq_lens_inter = self.decode_metadata["seq_lens_inter"][:bs]
-            metadata.max_seq_len_inter = self.max_context_len
-
-            self.decode_metadata[bs] = metadata
-
-        self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
