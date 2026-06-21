@@ -401,6 +401,13 @@ class CompletionRequest(BaseModel):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def normalize_null_max_tokens(cls, value):
+        if value is None:
+            return cls.model_fields["max_tokens"].default
+        return value
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):

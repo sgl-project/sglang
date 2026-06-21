@@ -109,6 +109,14 @@ class TestCompletionRequest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
 
+    def test_null_max_tokens_uses_default(self):
+        request = CompletionRequest(model="test-model", prompt="Hello", max_tokens=None)
+        self.assertEqual(
+            request.max_tokens,
+            CompletionRequest.model_fields["max_tokens"].default,
+        )
+        self.assertIn("max_tokens", request.model_fields_set)
+
 
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
@@ -648,10 +656,16 @@ class TestValidationEdgeCases(unittest.TestCase):
                 model="test-model", messages=messages, tool_choice=123
             )
 
-    def test_negative_token_limits(self):
-        """Test negative token limits"""
-        with self.assertRaises(ValidationError):
-            CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+    def test_non_positive_token_limits(self):
+        """Test non-positive token limits"""
+        for max_tokens in (0, -1):
+            with (
+                self.subTest(max_tokens=max_tokens),
+                self.assertRaises(ValidationError),
+            ):
+                CompletionRequest(
+                    model="test-model", prompt="Hello", max_tokens=max_tokens
+                )
 
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
