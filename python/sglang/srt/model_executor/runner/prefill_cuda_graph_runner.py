@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
@@ -140,15 +141,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        if (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash()
-            or (
-                model_runner.spec_algorithm.is_eagle()
-                and not model_runner.is_draft_worker
-            )
-        ):
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        # Per-backend hidden mode, matching the pre-#23906 runners:
+        #   BREAKABLE    = old BCG (EAGLE target -> FULL, draft -> LAST)
+        #   TC_PIECEWISE = old PCG (EAGLE -> NULL; dflash -> FULL)
+        # self.backend isn't resolved yet, so read the configured name here.
+        _cg_cfg = model_runner.server_args.cuda_graph_config
+        _prefill_backend = (
+            _cg_cfg.prefill.backend if _cg_cfg is not None else Backend.TC_PIECEWISE
+        )
+        if _prefill_backend == Backend.BREAKABLE:
+            if model_runner.server_args.enable_return_hidden_states:
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
+            if model_runner.spec_algorithm.is_eagle():
+                self.capture_hidden_mode = (
+                    CaptureHiddenMode.LAST
+                    if model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                )
+        else:
+            if (
+                model_runner.server_args.enable_return_hidden_states
+                or model_runner.spec_algorithm.is_dflash()
+            ):
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
