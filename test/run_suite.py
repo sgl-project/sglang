@@ -41,7 +41,6 @@ PER_COMMIT_SUITES = {
         "jit-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
-        "stage-c-test-4-gpu-amd-mi35x",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
@@ -130,6 +129,7 @@ NIGHTLY_SUITES = {
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",

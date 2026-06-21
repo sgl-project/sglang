@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
 
 import httpx
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -52,6 +52,23 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+def _bad_request(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=message)
+
+
+def _parse_size_or_raise(size: str) -> tuple[int, int]:
+    width, height = parse_size(size)
+    if width is None or height is None or width <= 0 or height <= 0:
+        raise _bad_request("size must be formatted as positive WIDTHxHEIGHT")
+    return width, height
+
+
+def _validate_positive_int(kwargs: dict[str, Any], name: str) -> None:
+    value = kwargs.get(name)
+    if value is not None and int(value) <= 0:
+        raise _bad_request(f"{name} must be positive")
 
 
 def flatten_extra_params(payload: Any) -> dict[str, Any]:
@@ -124,13 +141,21 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
     if size:
-        w, h = parse_size(size)
-        if w is not None:
-            # treat None dimensions as unset so parsed size can fill them
-            if kwargs.get("width") is None:
-                kwargs["width"] = w
-            if kwargs.get("height") is None:
-                kwargs["height"] = h
+        w, h = _parse_size_or_raise(size)
+        # treat None dimensions as unset so parsed size can fill them
+        if kwargs.get("width") is None:
+            kwargs["width"] = w
+        if kwargs.get("height") is None:
+            kwargs["height"] = h
+
+    for name in (
+        "width",
+        "height",
+        "num_frames",
+        "num_inference_steps",
+        "num_outputs_per_prompt",
+    ):
+        _validate_positive_int(kwargs, name)
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
