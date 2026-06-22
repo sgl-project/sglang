@@ -502,10 +502,12 @@ const getAvailableGpuCounts = (hardware, quantization) => {
   return gpuCounts.length > 0 ? gpuCounts.sort((a, b) => a - b) : [8];
 };
 
-const generateCommandFromConfig = (config) => {
+const generateCommandFromConfig = (config, options = {}) => {
   if (!config) {
     return '# Error: Configuration not found';
   }
+
+  const { enableDpAttention = false } = options;
 
   let command = '';
   if (config.env_vars) {
@@ -517,6 +519,16 @@ const generateCommandFromConfig = (config) => {
 
   for (const [key, value] of Object.entries(config)) {
     if (key === 'model_path' || key === 'env_vars') {
+      continue;
+    }
+
+    if (enableDpAttention && key === 'tensor_parallel_size') {
+      command +=
+        ` \\\n  --tensor-parallel-size ${value}` +
+        ` \\\n  --data-parallel-size ${value}` +
+        ' \\\n  --enable-dp-attention' +
+        ' \\\n  --enable-dp-attention-local-control-broadcast' +
+        ' \\\n  --enable-dp-lm-head';
       continue;
     }
 
@@ -533,6 +545,12 @@ const generateCommandFromConfig = (config) => {
     }
 
     command += ` \\\n  --${flagName} ${value}`;
+  }
+
+  if (enableDpAttention) {
+    command +=
+      ' \\\n  --schedule-conservativeness 3.33' +
+      ' \\\n  --enable-prefill-delayer';
   }
 
   return command;
@@ -716,7 +734,10 @@ const resolveItems = (option, values) =>
 # This combination is not yet supported.`;
     }
 
-    return generateCommandFromConfig(config);
+    const isB200Fp4 = vals.hardware === 'b200' && vals.quantization === 'fp4';
+    return generateCommandFromConfig(config, {
+      enableDpAttention: isB200Fp4,
+    });
   };
 
   const command = generateCommand(values);
