@@ -318,7 +318,7 @@ class DiffGenerator:
                         samples_out: list[Any] = []
                         audios_out: list[Any] = []
                         frames_out: list[Any] = []
-                        save_outputs(
+                        output_paths = save_outputs(
                             output_batch.output,
                             requests[0].data_type,
                             requests[0].fps,
@@ -356,7 +356,7 @@ class DiffGenerator:
                                     frames=frames_out[idx],
                                     audio=audios_out[idx],
                                     prompt_index=global_output_index + idx,
-                                    output_file_path=req.output_file_path(1, 0),
+                                    output_file_path=output_paths[idx],
                                 )
                             )
             except Exception as e:

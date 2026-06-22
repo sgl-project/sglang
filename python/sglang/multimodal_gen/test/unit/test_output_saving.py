@@ -66,3 +66,60 @@ def test_png_output_saving_uses_fast_pillow_path(
     )
 
     assert save_calls == [("PNG", expected_compress_level)]
+
+
+def test_video_output_saving_normalizes_extension(tmp_path, monkeypatch):
+    frame = _rgb_frame()
+    requested_path = tmp_path / "sample.png"
+    saved_paths = []
+
+    def fake_mimsave(path, frames, **kwargs):
+        saved_paths.append((path, kwargs))
+        with open(path, "wb") as f:
+            f.write(b"video")
+
+    monkeypatch.setattr(output_utils.imageio, "mimsave", fake_mimsave)
+    monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", lambda **_: None)
+
+    output_paths = output_utils.save_outputs(
+        [frame],
+        DataType.VIDEO,
+        fps=8,
+        save_output=True,
+        build_output_path=lambda _idx: str(requested_path),
+    )
+
+    expected_path = str(tmp_path / "sample.mp4")
+    assert output_paths == [expected_path]
+    assert saved_paths[0][0] == expected_path
+    assert (tmp_path / "sample.mp4").exists()
+    assert not requested_path.exists()
+
+
+def test_video_output_saving_retries_without_quality(tmp_path, monkeypatch):
+    frame = _rgb_frame()
+    output_path = tmp_path / "sample.mp4"
+    calls = []
+
+    def fake_mimsave(path, frames, **kwargs):
+        calls.append(kwargs.copy())
+        if "quality" in kwargs:
+            raise TypeError("quality is unsupported")
+        with open(path, "wb") as f:
+            f.write(b"video")
+
+    monkeypatch.setattr(output_utils.imageio, "mimsave", fake_mimsave)
+    monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", lambda **_: None)
+
+    post_process_sample(
+        frame,
+        DataType.VIDEO,
+        fps=8,
+        save_file_path=str(output_path),
+        output_compression=50,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["quality"] == 5.0
+    assert "quality" not in calls[1]
+    assert output_path.exists()
