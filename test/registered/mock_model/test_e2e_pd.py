@@ -7,6 +7,7 @@ from typing import ClassVar, Dict, List
 
 import requests
 
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.violation_log_utils import assert_no_violation_in_log
 from sglang.test.mock_model.utils import (
@@ -129,6 +130,13 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
         self.assert_no_canary_violation()
 
 
+@unittest.skipIf(
+    is_hip(),
+    "ROCm: PD full-real-data KV checksum intermittently trips a "
+    "verify_real_kv_hash canary violation on the decode-side transferred prefix "
+    "(see https://github.com/sgl-project/sglang/issues/28971). The baseline PD "
+    "canary test above stays enabled on AMD.",
+)
 class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 
