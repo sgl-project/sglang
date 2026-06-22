@@ -203,6 +203,12 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+# Shared freqs_cis tensors keyed by the RoPE parameters. V4-Flash otherwise
+# builds one large complex tensor per layer, which is avoidable on NPU because
+# layers with the same base can share the same immutable buffer.
+_PRECOMPUTED_FREQS_CIS: dict[tuple, torch.Tensor] = {}
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -305,6 +311,8 @@ class MQALayer(nn.Module):
             else config.compress_ratios[layer_id]
         )
 
+        # V4-Flash modelslim uses ratio=0 for dense edge layers. These layers
+        # do not create Compressor/C4Indexer state.
         assert compress_ratio in (
             0,
             4,
@@ -337,15 +345,26 @@ class MQALayer(nn.Module):
         # YARN-corrected inv_freq); only the rope base differs (rope_theta vs compress_rope_theta).
         original_seq_len = rope_scaling["original_max_position_embeddings"]
 
-        freqs_cis = precompute_freqs_cis(
-            dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
-            original_seq_len=original_seq_len,
-            base=rope_base,
-            factor=rope_scaling["factor"],
-            beta_fast=rope_scaling["beta_fast"],
-            beta_slow=rope_scaling["beta_slow"],
+        freqs_cis_key = (
+            self.qk_rope_head_dim,
+            config.max_position_embeddings,
+            original_seq_len,
+            rope_base,
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"],
         )
+        if freqs_cis_key not in _PRECOMPUTED_FREQS_CIS:
+            _PRECOMPUTED_FREQS_CIS[freqs_cis_key] = precompute_freqs_cis(
+                dim=self.qk_rope_head_dim,
+                seqlen=config.max_position_embeddings,
+                original_seq_len=original_seq_len,
+                base=rope_base,
+                factor=rope_scaling["factor"],
+                beta_fast=rope_scaling["beta_fast"],
+                beta_slow=rope_scaling["beta_slow"],
+            )
+        freqs_cis = _PRECOMPUTED_FREQS_CIS[freqs_cis_key]
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -2028,7 +2047,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        scale_suffix: str = "weight_scale_inv",
     ) -> str:
+        # ModelSlim checkpoints use ".scale"; the in-model parameter name
+        # differs between FP8 ("weight_scale_inv") and int8/W8A8 compressed
+        # tensors ("weight_scale"). The caller selects the suffix from
+        # params_dict before loading.
         if name == "embed.weight":
             return "model.embed_tokens.weight"
         if name == "head.weight":
@@ -2061,9 +2085,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj.weight_scale_inv"
+                        rest = "e_proj." + scale_suffix
                     elif rest == "h_proj.scale":
-                        rest = "h_proj.weight_scale_inv"
+                        rest = "h_proj." + scale_suffix
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -2073,8 +2097,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
+        scale_target = "." + scale_suffix
         if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+            name = name.replace(".scale", scale_target)
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -2082,13 +2107,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+            name = name.replace(".scale", scale_target)
 
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        scale_suffix = "weight_scale_inv"
+        for param_name in params_dict:
+            if param_name.endswith(".weight_scale"):
+                scale_suffix = "weight_scale"
+                break
+            if param_name.endswith(".weight_scale_inv"):
+                break
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2167,6 +2200,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        scale_suffix=scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)

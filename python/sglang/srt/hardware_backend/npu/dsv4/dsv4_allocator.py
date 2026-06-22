@@ -289,10 +289,34 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "DSV4NPUTokenToKVPoolAllocator requires req_pool_indices "
             "(forwarded from batch.req_pool_indices)."
         )
-        assert dsv4_state_lens is not None, (
-            "DSV4NPUTokenToKVPoolAllocator requires dsv4_state_lens "
-            "(ScheduleBatch._compute_dsv4_state_lens_*)."
-        )
+        if dsv4_state_lens is not None:
+            out_c4_state_loc = self._alloc_state_extend(
+                self.c4_state_attn_allocator,
+                prefix_lens,
+                dsv4_state_lens.c4_prefix_lens,
+                dsv4_state_lens.c4_prefix_lens_cpu,
+                dsv4_state_lens.c4_seq_lens,
+                dsv4_state_lens.c4_seq_lens_cpu,
+                req_pool_indices,
+                last_loc_dtype,
+                dsv4_state_lens.c4_extend_num_tokens,
+                ratio=4,
+            )
+            out_c128_state_loc = self._alloc_state_extend(
+                self.c128_state_attn_allocator,
+                prefix_lens,
+                dsv4_state_lens.c128_prefix_lens,
+                dsv4_state_lens.c128_prefix_lens_cpu,
+                dsv4_state_lens.c128_seq_lens,
+                dsv4_state_lens.c128_seq_lens_cpu,
+                req_pool_indices,
+                last_loc_dtype,
+                dsv4_state_lens.c128_extend_num_tokens,
+                ratio=128,
+            )
+        else:
+            out_c4_state_loc = self._empty_loc
+            out_c128_state_loc = self._empty_loc
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
             prefix_lens,
@@ -311,30 +335,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             seq_lens_cpu,
             req_pool_indices,
             last_loc_dtype,
-            ratio=128,
-        )
-        out_c4_state_loc = self._alloc_state_extend(
-            self.c4_state_attn_allocator,
-            prefix_lens,
-            dsv4_state_lens.c4_prefix_lens,
-            dsv4_state_lens.c4_prefix_lens_cpu,
-            dsv4_state_lens.c4_seq_lens,
-            dsv4_state_lens.c4_seq_lens_cpu,
-            req_pool_indices,
-            last_loc_dtype,
-            dsv4_state_lens.c4_extend_num_tokens,
-            ratio=4,
-        )
-        out_c128_state_loc = self._alloc_state_extend(
-            self.c128_state_attn_allocator,
-            prefix_lens,
-            dsv4_state_lens.c128_prefix_lens,
-            dsv4_state_lens.c128_prefix_lens_cpu,
-            dsv4_state_lens.c128_seq_lens,
-            dsv4_state_lens.c128_seq_lens_cpu,
-            req_pool_indices,
-            last_loc_dtype,
-            dsv4_state_lens.c128_extend_num_tokens,
             ratio=128,
         )
         return DSV4OutCacheLoc(
@@ -440,6 +440,38 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_seq,
             c4_extend_num_tokens=bs,
             c128_extend_num_tokens=bs,
+        )
+
+    def compute_dsv4_state_lens_reserve(
+        self, reqs: List[Req], prefix_lens: List[int], seq_lens: List[int]
+    ) -> Optional[DSV4StateLens]:
+        """Allocate state slots for a speculative pre-reserved raw interval."""
+        if self.c4_state_attn_allocator is None:
+            return None
+
+        c4_prefix: List[int] = []
+        c4_seq: List[int] = []
+        c128_prefix: List[int] = []
+        c128_seq: List[int] = []
+        for req, prefix_len, seq_len in zip(reqs, prefix_lens, seq_lens):
+            reserve = max(0, int(seq_len) - int(prefix_len))
+            prev_c4 = getattr(req, "c4_state_kv_len", 0)
+            prev_c128 = getattr(req, "c128_state_kv_len", 0)
+            c4_prefix.append(prev_c4)
+            c4_seq.append(prev_c4 + reserve)
+            c128_prefix.append(prev_c128)
+            c128_seq.append(prev_c128 + reserve)
+            req.c4_state_kv_len = prev_c4 + reserve
+            req.c128_state_kv_len = prev_c128 + reserve
+
+        total = sum(max(0, int(s) - int(p)) for p, s in zip(prefix_lens, seq_lens))
+        return self._pack_state_lens(
+            c4_prefix,
+            c4_seq,
+            c128_prefix,
+            c128_seq,
+            c4_extend_num_tokens=total,
+            c128_extend_num_tokens=total,
         )
 
     def _pack_state_lens(
@@ -609,6 +641,39 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if kv_len > off:
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, off:kv_len]
                 allocator.free(slots.to(torch.int64))
+
+    def backup_state(self):
+        # EAGLE/NEXTN draft preprocess allocates speculative c{4,128} KV via
+        # alloc_extend(backup_state=True) and rolls it back with restore_state.
+        # The base SWATokenToKVPoolAllocator only snapshots the full + SWA pools,
+        # so without this override the draft's c{4,128} (+ state) slots are never
+        # rolled back -> they leak every draft step until the c4 pool exhausts.
+        # Snapshot the sub-allocators alongside the base pools.
+        return (
+            super().backup_state(),
+            self.c4_attn_allocator.backup_state(),
+            self.c128_attn_allocator.backup_state(),
+            (
+                self.c4_state_attn_allocator.backup_state()
+                if self.c4_state_attn_allocator is not None
+                else None
+            ),
+            (
+                self.c128_state_attn_allocator.backup_state()
+                if self.c128_state_attn_allocator is not None
+                else None
+            ),
+        )
+
+    def restore_state(self, state):
+        base, c4, c128, c4_state, c128_state = state
+        super().restore_state(base)
+        self.c4_attn_allocator.restore_state(c4)
+        self.c128_attn_allocator.restore_state(c128)
+        if self.c4_state_attn_allocator is not None and c4_state is not None:
+            self.c4_state_attn_allocator.restore_state(c4_state)
+        if self.c128_state_attn_allocator is not None and c128_state is not None:
+            self.c128_state_attn_allocator.restore_state(c128_state)
 
     def clear(self):
         super().clear()

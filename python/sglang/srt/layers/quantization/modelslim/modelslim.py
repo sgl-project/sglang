@@ -177,6 +177,16 @@ class ModelSlimConfig(QuantizationConfig):
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
+            if layer.scheme is None:
+                # Unclassified linears are non-quant — load them in the original
+                # dtype instead of crashing on a None scheme in create_weights.
+                # Hits the nextn FLOAT layers (e_proj / h_proj): the modelslim
+                # quant_description marks them FLOAT under the checkpoint names
+                # `mtp.0.{e,h}_proj.weight`, which don't match sglang's `model.*`
+                # module prefixes, so neither is_layer_skipped nor get_linear_scheme
+                # resolves them. (The W8A8 mtp decoder layers DO resolve via the
+                # mtp self_attn->attn / mlp->ffn translation above.)
+                return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)

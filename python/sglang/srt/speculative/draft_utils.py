@@ -227,6 +227,17 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if is_deepseek_v4(self.draft_model_runner.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                DeepseekV4AscendMultiStepDraftBackend,
+            )
+
+            return DeepseekV4AscendMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnMultiStepDraftBackend,
         )
@@ -324,11 +335,9 @@ class DraftBackendFactory:
         return TokenspeedMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnBackend,
-        )
+        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
-        return AscendAttnBackend(self.draft_model_runner)
+        return ATTENTION_BACKENDS["ascend"](self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
         logger.warning(

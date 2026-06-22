@@ -91,6 +91,14 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 cur_kv_lens_device,
             )
+            allocator = batch.token_to_kv_pool_allocator
+            dsv4_state_lens = (
+                allocator.compute_dsv4_state_lens_reserve(
+                    batch.reqs, cur_kv_lens, nxt_kv_lens
+                )
+                if hasattr(allocator, "compute_dsv4_state_lens_reserve")
+                else None
+            )
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
                 cur_kv_lens_device,
@@ -99,7 +107,48 @@ class EagleDraftInputV2Mixin:
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
+                req_pool_indices=batch.req_pool_indices,
+                dsv4_state_lens=dsv4_state_lens,
+                batch=batch,
             )
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    maybe_write_dsv4_extend,
+                )
+
+                if dsv4_state_lens is None:
+                    maybe_write_dsv4_extend(
+                        batch,
+                        batch.req_pool_indices_cpu,
+                        cur_kv_lens_cpu,
+                        nxt_kv_lens_cpu,
+                    )
+                else:
+                    old_state_offsets = [
+                        (
+                            getattr(req, "c4_state_alloc_offset", 0),
+                            getattr(req, "c128_state_alloc_offset", 0),
+                        )
+                        for req in batch.reqs
+                    ]
+                    try:
+                        for req, cur in zip(batch.reqs, cur_kv_lens):
+                            req.c4_state_alloc_offset = cur
+                            req.c128_state_alloc_offset = cur
+                        maybe_write_dsv4_extend(
+                            batch,
+                            batch.req_pool_indices_cpu,
+                            cur_kv_lens_cpu,
+                            nxt_kv_lens_cpu,
+                        )
+                    finally:
+                        for req, (c4_offset, c128_offset) in zip(
+                            batch.reqs, old_state_offsets
+                        ):
+                            req.c4_state_alloc_offset = c4_offset
+                            req.c128_state_alloc_offset = c128_offset
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,

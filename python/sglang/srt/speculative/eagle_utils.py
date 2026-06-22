@@ -315,6 +315,15 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
+        if hasattr(req_to_token_pool, "req_to_token_c4"):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                build_dsv4_verify_bundle,
+            )
+
+            batch.out_cache_loc_dsv4 = build_dsv4_verify_bundle(
+                batch, verify_input.draft_token_num
+            )
+
         prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
