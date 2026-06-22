@@ -1,5 +1,7 @@
 import logging
 import math
+import time
+from copy import deepcopy
 from copy import deepcopy
 from typing import List, Optional
 
@@ -254,9 +256,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
-        # DFlash Repetition Penalty: persistent state to survive copy_for_forward clone()
+        # DFlash Repetition Penalty: persistent state (per-request to survive batch changes)
         self._dflash_cumulated: Optional[torch.Tensor] = None
-        self._dflash_fingerprint: Optional[tuple] = None
+        self._dflash_fingerprint: Optional[tuple] = None  # kept for backward compat
+        self._dflash_cumulated_map: dict[str, torch.Tensor] = {}  # rid -> [vocab_size]
+        self._dflash_cumulated_ts: dict[str, float] = {}          # rid -> last access time
+        self._dflash_step_counter: int = 0
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -1518,17 +1523,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampling_info is not None:
             acc_sc_frame = getattr(sampling_info, "acc_scaling_penalties", None)
             if acc_sc_frame is not None:
-                current_fp = tuple(model_worker_batch.req_pool_indices_cpu.tolist())
-                batch_changed = (
-                    self._dflash_cumulated is None or
-                    self._dflash_cumulated.shape != acc_sc_frame.shape or
-                    self._dflash_fingerprint is None or
-                    self._dflash_fingerprint != current_fp
-                )
-                if batch_changed:
-                    self._dflash_cumulated = acc_sc_frame.clone()
-                    self._dflash_fingerprint = current_fp
-                sampling_info.acc_scaling_penalties = self._dflash_cumulated
+                reqs = model_worker_batch.reqs
+                rids = [req.rid for req in reqs]
+                vocab_size = acc_sc_frame.shape[1]
+
+                if len(rids) == 0:
+                    self._dflash_cumulated = None
+                    sampling_info.acc_scaling_penalties = None
+                else:
+                    # --- Per-request state restore (with shape check for rid reuse) ---
+                    for i, rid in enumerate(rids):
+                        if rid not in self._dflash_cumulated_map or \
+                           self._dflash_cumulated_map[rid].shape[0] != vocab_size:
+                            self._dflash_cumulated_map[rid] = acc_sc_frame[i].clone()
+
+                    # --- Build cumulated matrix for current batch ---
+                    cumulated_list = [self._dflash_cumulated_map[rid] for rid in rids]
+                    self._dflash_cumulated = torch.stack(cumulated_list, dim=0)
+
+                    # --- LRU timestamp update + cleanup ---
+                    now = time.time()
+                    for rid in rids:
+                        self._dflash_cumulated_ts[rid] = now
+                    self._dflash_step_counter += 1
+                    if self._dflash_step_counter % 10 == 0:
+                        expired = [r for r, t in self._dflash_cumulated_ts.items() if now - t > 60.0]
+                        for r in expired:
+                            self._dflash_cumulated_map.pop(r, None)
+                            self._dflash_cumulated_ts.pop(r, None)
+
+                    # --- Inject into sampling_info ---
+                    sampling_info.acc_scaling_penalties = self._dflash_cumulated
         # === End DFlash Hijack ===
 
         need_mamba_verify_commit = hasattr(
@@ -1730,6 +1755,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         if bon_safe.any():
                             bon_bids = torch.arange(bs, device=device)[bon_safe]
                             cumulated[bon_bids, bonus[bon_safe]] = pfac.squeeze(-1)[bon_safe]
+                    
+                    # Write back updated penalties to per-request dict
+                    reqs = model_worker_batch.reqs
+                    for i, req in enumerate(reqs):
+                        self._dflash_cumulated_map[req.rid] = cumulated[i].clone()
         # === End DFlash Hard Guard & Accounting ===
 
         if need_mamba_verify_commit:

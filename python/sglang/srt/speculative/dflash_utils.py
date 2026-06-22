@@ -13,7 +13,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -243,13 +242,16 @@ def apply_dflash_verify_logits_adjustments(
             # This preserves accept rate for speculative decoding
             bonus_slice = logits_3d[:, -1:, :]
             # Use V2 compiled function for scaling
+            from sglang.srt.sampling.penaltylib.repetition_penalty import (
+                apply_scaling_penalties,
+            )
             apply_scaling_penalties(bonus_slice, safe_scaling)
 
         except Exception as e:
             import logging
             logging.error(f"[DFlash] Scaling fallback due to: {e}")
             # Fallback: still only bonus position (protect accept rate)
-            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+            logits_3d = next_token_logits.view(bs, draft_token_num, -1)
             ts = acc_scaling.to(next_token_logits.device, non_blocking=True).unsqueeze(1).clamp(min=1.0, max=2.5)
             bonus_slice = logits_3d[:, -1:, :]
             torch.where(bonus_slice < 0, bonus_slice * ts, bonus_slice / ts, out=bonus_slice)
