@@ -39,7 +39,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.rotary_embedding.utils import rotate_half
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -393,11 +393,6 @@ def apply_glm_image_rotary_pos_emb(
     Returns:
         Tuple of (rotated_q, rotated_k) with same shapes as input
     """
-    # cos/sin shape: [num_tokens, rotary_dim]
-    # Need to unsqueeze for broadcasting with heads dimension
-    cos = cos.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-    sin = sin.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-
     rotary_dim = cos.shape[-1]
 
     # Split into rotary and pass-through parts
@@ -405,8 +400,7 @@ def apply_glm_image_rotary_pos_emb(
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
     # Apply rotary embeddings
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed, k_embed = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
     # Concatenate back
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
