@@ -404,7 +404,9 @@ class ServerArgs:
     definition consistent with the order in ``add_cli_args``.
     """
 
+    # -------------------------------------------------------------------------
     # Model and tokenizer
+    # -------------------------------------------------------------------------
     model_path: A[
         str,
         Arg(
@@ -510,7 +512,9 @@ class ServerArgs:
     ] = "auto"
     json_model_override_args: str = "{}"
 
+    # -------------------------------------------------------------------------
     # HTTP server
+    # -------------------------------------------------------------------------
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
@@ -525,7 +529,9 @@ class ServerArgs:
         "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
     ] = False
 
+    # -------------------------------------------------------------------------
     # SSL/TLS
+    # -------------------------------------------------------------------------
     ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
     ssl_certfile: A[Optional[str], "The file path to the SSL certificate file."] = None
     ssl_ca_certs: A[Optional[str], "The CA certificates file."] = None
@@ -537,7 +543,9 @@ class ServerArgs:
         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
     ] = False
 
+    # -------------------------------------------------------------------------
     # Quantization and data type
+    # -------------------------------------------------------------------------
     dtype: A[
         str,
         Arg(
@@ -632,7 +640,9 @@ class ServerArgs:
         "Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
     ] = None  # For flash_rl load format
 
+    # -------------------------------------------------------------------------
     # Memory and scheduling
+    # -------------------------------------------------------------------------
     mem_fraction_static: A[
         Optional[float],
         "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
@@ -755,7 +765,9 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     enable_mixed_chunk: bool = False
 
+    # -------------------------------------------------------------------------
     # Device info and server timeout
+    # -------------------------------------------------------------------------
     device: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
@@ -772,7 +784,9 @@ class ServerArgs:
     numa_node: Optional[List[int]] = None
     gc_threshold: Optional[List[int]] = None
 
+    # -------------------------------------------------------------------------
     # Tensor parallel, pipeline parallel, data parallel, and context parallel
+    # -------------------------------------------------------------------------
     nccl_port: A[
         Optional[int],
         "The port for NCCL distributed environment setup. Defaults to a random port.",
@@ -819,12 +833,16 @@ class ServerArgs:
     disable_attn_tp_gather: bool = False
     enable_p2p_check: bool = False
 
+    # -------------------------------------------------------------------------
     # Multi-node distributed serving
+    # -------------------------------------------------------------------------
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
 
+    # -------------------------------------------------------------------------
     # Streaming
+    # -------------------------------------------------------------------------
     stream_interval: int = 1
     batch_notify_size: int = 16
     stream_response_default_include_usage: bool = False
@@ -832,11 +850,15 @@ class ServerArgs:
     enable_streaming_session: bool = False
     load_snapshot_publish_interval: int = 15
 
+    # -------------------------------------------------------------------------
     # Constrained decoding
+    # -------------------------------------------------------------------------
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
 
+    # -------------------------------------------------------------------------
     # Logging, metrics, and tracing
+    # -------------------------------------------------------------------------
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
@@ -881,7 +903,9 @@ class ServerArgs:
     # class directly. Default None preserves existing behavior.
     stat_loggers: Optional[Dict[str, type]] = None
 
+    # -------------------------------------------------------------------------
     # API related
+    # -------------------------------------------------------------------------
     api_key: Optional[str] = None
     admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -902,7 +926,9 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
     allow_auto_truncate: bool = False
 
+    # -------------------------------------------------------------------------
     # Prefill delayer
+    # -------------------------------------------------------------------------
     enable_prefill_delayer: A[
         bool, "Enable prefill delayer for DP attention to reduce idle time."
     ] = False
@@ -940,7 +966,9 @@ class ServerArgs:
         ),
     ] = None
 
+    # -------------------------------------------------------------------------
     # LoRA
+    # -------------------------------------------------------------------------
     enable_lora: Optional[bool] = None
     enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
@@ -958,7 +986,9 @@ class ServerArgs:
     lora_strict_loading: bool = False
     lora_drain_wait_threshold: float = 0.0
 
+    # -------------------------------------------------------------------------
     # Kernel backend
+    # -------------------------------------------------------------------------
     attention_backend: Optional[str] = None
     decode_attention_backend: Optional[str] = None
     prefill_attention_backend: Optional[str] = None
@@ -981,7 +1011,9 @@ class ServerArgs:
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
+    # -------------------------------------------------------------------------
     # Speculative decoding
+    # -------------------------------------------------------------------------
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
@@ -1003,7 +1035,9 @@ class ServerArgs:
     speculative_skip_dp_mlp_sync: bool = False
     enable_multi_layer_eagle: bool = False
 
+    # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
+    # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
@@ -1013,11 +1047,15 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
 
+    # -------------------------------------------------------------------------
     # Adaptive speculative decoding
+    # -------------------------------------------------------------------------
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Expert parallelism
+    # -------------------------------------------------------------------------
     ep_size: int = 1
     moe_a2a_backend: Literal[
         "none",
@@ -1059,7 +1097,9 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     enforce_shared_experts_fusion: bool = False
 
+    # -------------------------------------------------------------------------
     # Mamba cache and linear attn
+    # -------------------------------------------------------------------------
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
@@ -1075,7 +1115,9 @@ class ServerArgs:
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Hierarchical cache
+    # -------------------------------------------------------------------------
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
@@ -1086,15 +1128,21 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Hierarchical sparse attention
+    # -------------------------------------------------------------------------
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # LMCache
+    # -------------------------------------------------------------------------
     enable_lmcache: bool = False
     lmcache_config_file: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
+    # -------------------------------------------------------------------------
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
@@ -1102,18 +1150,24 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
 
+    # -------------------------------------------------------------------------
     # Diffusion LLM
+    # -------------------------------------------------------------------------
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Offloading
+    # -------------------------------------------------------------------------
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
     offload_num_in_group: int = 1
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
+    # -------------------------------------------------------------------------
     # Cuda graphs
+    # -------------------------------------------------------------------------
     # Accepts dict (CLI JSON / SDK) at construction time; normalized to
     # CudaGraphConfig by _parse_cuda_graph_config.
     cuda_graph_config: Optional[CudaGraphConfig] = None
@@ -1141,7 +1195,9 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
 
+    # -------------------------------------------------------------------------
     # Communication and kernels
+    # -------------------------------------------------------------------------
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1167,18 +1223,24 @@ class ServerArgs:
     ] = None
     enable_aiter_allreduce_fusion: bool = False
 
+    # -------------------------------------------------------------------------
     # Two batch overlap
+    # -------------------------------------------------------------------------
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
 
+    # -------------------------------------------------------------------------
     # Torch compile and torchao
+    # -------------------------------------------------------------------------
     enable_torch_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
 
-    # Other mics server features
+    # -------------------------------------------------------------------------
+    # Other misc server features
+    # -------------------------------------------------------------------------
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
@@ -1194,23 +1256,31 @@ class ServerArgs:
     # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
     enable_mis: bool = False
 
+    # -------------------------------------------------------------------------
     # Deterministic inference
+    # -------------------------------------------------------------------------
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # KV canary
+    # -------------------------------------------------------------------------
     kv_canary: str = "none"
     kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
 
+    # -------------------------------------------------------------------------
     # Dynamic batch tokenizer
+    # -------------------------------------------------------------------------
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
     dynamic_batch_tokenizer_batch_timeout: float = 0.002
     enable_tokenizer_batch_encode: bool = False
     disable_tokenizer_batch_decode: bool = False
 
+    # -------------------------------------------------------------------------
     # Debug tensor dumps
+    # -------------------------------------------------------------------------
     debug_tensor_dump_output_folder: Optional[str] = None
     # None means dump all layers.
     debug_tensor_dump_layers: Optional[List[int]] = None
@@ -1218,7 +1288,11 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
-    # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # -------------------------------------------------------------------------
+    # PD disaggregation
+    # -------------------------------------------------------------------------
+    # Can be "null" (not disaggregated), "prefill" (prefill-only), or "decode"
+    # (decode-only).
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
@@ -1232,7 +1306,9 @@ class ServerArgs:
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
 
+    # -------------------------------------------------------------------------
     # Encode prefill disaggregation
+    # -------------------------------------------------------------------------
     encoder_only: bool = False
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
@@ -1243,12 +1319,16 @@ class ServerArgs:
     encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
-    # For PD-Multiplexing
+    # -------------------------------------------------------------------------
+    # PD-Multiplexing
+    # -------------------------------------------------------------------------
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
 
+    # -------------------------------------------------------------------------
     # Model weight update and weight loading
+    # -------------------------------------------------------------------------
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
@@ -1270,7 +1350,9 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # -------------------------------------------------------------------------
     # Multi-modal optimization configs
+    # -------------------------------------------------------------------------
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
@@ -1280,7 +1362,9 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
 
+    # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
+    # -------------------------------------------------------------------------
     forward_hooks: Optional[List[dict[str, Any]]] = None
     msprobe_dump_config: Optional[str] = None
 
