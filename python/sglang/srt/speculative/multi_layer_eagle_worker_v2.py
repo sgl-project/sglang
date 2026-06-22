@@ -200,11 +200,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             device=self.device,
         )
 
-    def init_backends(self):
+    def init_attention_backends(self):
         with self.draft_tp_context(
             self.draft_runner_list[0].tp_group
         ), speculative_moe_backend_context():
-            super().init_backends()
+            super().init_attention_backends()
+
+    def init_cuda_graphs(self):
+        with self.draft_tp_context(
+            self.draft_runner_list[0].tp_group
+        ), speculative_moe_backend_context():
+            super().init_cuda_graphs()
 
     def mtp_model_runner(self, step: int):
         return self.draft_runner_list[step]
@@ -233,8 +239,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_extend_attn_backend_list[-1]
                 )
 
-    def init_cuda_graphs(self):
-        """Capture cuda graphs."""
+    def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
@@ -541,7 +546,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
         ret_topk_p_list = []
         ret_topk_index_list = []
@@ -574,7 +579,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
             if can_cuda_graph:
                 draft_logits_output = (
-                    self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
+                    self.cuda_graph_runner_for_draft_extend.get_runner(step).execute(
                         forward_batch, init_state=(step == 0)
                     )
                 )
@@ -721,8 +726,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-    def init_backends(self):
-        self._draft_worker.init_backends()
+    def init_attention_backends(self):
+        self._draft_worker.init_attention_backends()
+
+    def init_cuda_graphs(self):
+        self._draft_worker.init_cuda_graphs()
 
     @property
     def target_worker(self):
@@ -840,7 +848,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 ),
             )
         # NOTE: metadata init is skipped here unconditionally, although
-        # eagle_prepare_for_verify only plans when cuda-graph replay_prepare ran.
+        # eagle_prepare_for_verify only plans when cuda-graph load_batch ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init

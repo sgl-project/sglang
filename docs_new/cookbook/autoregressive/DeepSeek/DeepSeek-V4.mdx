@@ -247,6 +247,31 @@ sglang serve \
   --enable-deepseek-v4-fp4-indexer
 ```
 
+**NVFP4 Hybrid Checkpoints**
+
+The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
+[`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
+quantize MoE experts to **NVFP4** while keeping attention and dense layers in
+**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-NVFP4 \
+  --tp 8
+```
+
+or
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-NVFP4 \
+  --tp 8
+```
+
+Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
+MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
+automatically.
+
 <a id="hopper-note" />
 
 **Hopper (H100 / H200) note**
