@@ -601,9 +601,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len :]
-            )
+            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
 
         if mamba_exist:

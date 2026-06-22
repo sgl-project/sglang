@@ -763,9 +763,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len :]
-            )
+            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
         assert (
             req.locked_cache is not None
