@@ -78,6 +78,7 @@ class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmFlashinferCutedsl(FP4GemmBase, unittest.TestCase):
+    # Keep explicit coverage even though Torch 2.12 makes this backend's FP4 GEMM autotune slow.
     backend = "flashinfer_cutedsl"
 
 
