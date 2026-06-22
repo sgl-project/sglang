@@ -4,6 +4,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace ngram {
 
@@ -202,6 +203,76 @@ Result Ngram::batchMatch(
     merged.mask.insert(merged.mask.end(), combined.mask.begin(), combined.mask.end());
   }
   return merged;
+}
+
+std::vector<std::vector<int32_t>> Ngram::batchRootCandidates(
+    const std::vector<int64_t>& state_ids,
+    const std::vector<std::vector<int32_t>>& tokens,
+    const std::vector<size_t>& total_lens,
+    size_t max_candidates) {
+  if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
+    throw std::runtime_error("batchRootCandidates expects state_ids, tokens, and total_lens to match in size");
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  using TrieCandidateBuildFn =
+      std::vector<int32_t> (Trie::*)(const int32_t*, size_t, size_t, const Param&, MatchState&, size_t) const;
+  using SamCandidateBuildFn =
+      std::vector<int32_t> (SuffixAutomaton::*)(const int32_t*, size_t, size_t, const Param&) const;
+  TrieCandidateBuildFn trie_candidate_build_fn;
+  SamCandidateBuildFn sam_candidate_build_fn;
+  if (param_.match_type == "BFS") {
+    trie_candidate_build_fn = &Trie::getRootCandidatesRecency;
+    sam_candidate_build_fn = &SuffixAutomaton::getRootCandidatesRecency;
+  } else if (param_.match_type == "PROB") {
+    trie_candidate_build_fn = &Trie::getRootCandidatesFrequency;
+    sam_candidate_build_fn = &SuffixAutomaton::getRootCandidatesFrequency;
+  } else {
+    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
+  }
+
+  std::vector<std::vector<int32_t>> batch_candidates;
+  batch_candidates.reserve(tokens.size());
+
+  for (size_t i = 0; i < state_ids.size(); ++i) {
+    const auto& suffix = tokens[i];
+    if (suffix.empty()) {
+      throw std::runtime_error("batchRootCandidates received an empty token tail");
+    }
+
+    auto& state = match_state_[state_ids[i]];
+    std::vector<int32_t> merged_candidates;
+    merged_candidates.reserve(max_candidates);
+    std::unordered_set<int32_t> seen_tokens;
+
+    auto append_candidates = [&merged_candidates, &seen_tokens, max_candidates](const std::vector<int32_t>& src) {
+      for (const auto token : src) {
+        if (merged_candidates.size() >= max_candidates) {
+          return;
+        }
+        if (seen_tokens.insert(token).second) {
+          merged_candidates.emplace_back(token);
+        }
+      }
+    };
+
+    auto trie_candidates = (trie_.get()->*trie_candidate_build_fn)(
+        suffix.data(), suffix.size(), max_candidates, param_, state, total_lens[i]);
+    append_candidates(trie_candidates);
+
+    for (const auto& [_, sam] : sams_) {
+      if (merged_candidates.size() >= max_candidates) {
+        break;
+      }
+      auto sam_candidates = (sam.get()->*sam_candidate_build_fn)(suffix.data(), suffix.size(), max_candidates, param_);
+      append_candidates(sam_candidates);
+    }
+
+    batch_candidates.emplace_back(std::move(merged_candidates));
+  }
+
+  return batch_candidates;
 }
 
 void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {

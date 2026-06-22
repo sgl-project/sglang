@@ -713,11 +713,39 @@ class TestNgramCorpusIncremental(CustomTestCase):
         _batch_get_with_state(corpus, req_id, [1, 2, 3], 3)
         state_map_before = dict(corpus._req_id_to_state_id)
 
-        candidates = corpus.batch_get_root_candidates_temporary([[2, 3]], [2], 4)
+        candidates = corpus.batch_get_root_candidates_temporary([[2, 3]], [2], 2)
 
         self.assertEqual(corpus._req_id_to_state_id, state_map_before)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(set(candidates[0]), {4, 7})
+
+    def test_root_candidates_prefer_width_before_depth(self):
+        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
+        corpus.batch_put(
+            [
+                [1, 2, 3, 10, 11, 12],
+                [1, 2, 3, 20],
+                [1, 2, 3, 30],
+            ]
+        )
+        corpus.synchronize()
+
+        candidates = corpus.batch_get_root_candidates_temporary([[1, 2, 3]], [3], 3)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(set(candidates[0]), {10, 20, 30})
+        self.assertNotIn(11, candidates[0])
+
+    def test_root_candidates_fill_from_deep_continuation(self):
+        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 10, 11, 12]])
+        corpus.synchronize()
+
+        candidates = corpus.batch_get_root_candidates_temporary([[1, 2, 3]], [3], 3)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0][0], 10)
+        self.assertEqual(set(candidates[0]), {10, 11, 12})
 
     def test_stale_state_rebuilds_after_eviction(self):
         corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)

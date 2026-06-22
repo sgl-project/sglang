@@ -66,6 +66,12 @@ class Ngram {
       const std::vector<std::vector<int32_t>>& tokens,
       const std::vector<size_t>& total_lens);
 
+  std::vector<std::vector<int32_t>> batchRootCandidates(
+      const std::vector<int64_t>& state_ids,
+      const std::vector<std::vector<int32_t>>& tokens,
+      const std::vector<size_t>& total_lens,
+      size_t max_candidates);
+
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
   // Resets the online trie and match state but preserves external corpora

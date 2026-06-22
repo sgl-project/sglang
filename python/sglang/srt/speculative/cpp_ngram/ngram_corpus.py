@@ -157,15 +157,27 @@ class NgramCorpus:
         total_lens: List[int],
         max_candidates: int,
     ) -> List[List[int]]:
-        drafts, masks = self.batch_get_temporary(batch_tokens, total_lens)
-        drafts = drafts.reshape(len(batch_tokens), self.draft_token_num)
-        masks = masks.reshape(
-            len(batch_tokens), self.draft_token_num, self.draft_token_num
+        """Return width-first bonus candidates with throwaway match states.
+
+        The candidates prioritize root direct children for the given context.
+        If fewer than max_candidates root children exist, the C++ side fills
+        the remaining slots from deeper continuations as low-confidence
+        backoff candidates.
+        """
+        if max_candidates <= 0:
+            return [[] for _ in batch_tokens]
+
+        state_ids = list(
+            range(self._next_state_id, self._next_state_id + len(batch_tokens))
         )
-        return [
-            self.direct_child_tokens(drafts[i], masks[i], 0, max_candidates)
-            for i in range(len(batch_tokens))
-        ]
+        self._next_state_id += len(batch_tokens)
+        try:
+            return self._obj.root_candidates_stateful(
+                state_ids, batch_tokens, total_lens, max_candidates
+            )
+        finally:
+            if state_ids:
+                self._obj.erase_states(state_ids)
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []

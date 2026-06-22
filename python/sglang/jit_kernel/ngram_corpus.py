@@ -97,6 +97,45 @@ def get_ngram_corpus_cls():
                 np.int64
             )
 
+        def root_candidates_stateful(
+            self,
+            state_ids: List[int],
+            batch_tokens: List[List[int]],
+            total_lens: List[int],
+            max_candidates: int,
+        ) -> List[List[int]]:
+            if max_candidates <= 0:
+                return [[] for _ in batch_tokens]
+
+            tokens_flat, offsets = _to_csr(batch_tokens)
+            batch_size = len(batch_tokens)
+
+            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            total_lens_t = torch.tensor(total_lens, dtype=torch.int64)
+            out_tokens = torch.zeros(batch_size * max_candidates, dtype=torch.int32)
+            out_counts = torch.zeros(batch_size, dtype=torch.int64)
+
+            self.batch_root_candidates_stateful(  # type: ignore
+                state_ids_t,
+                tokens_flat,
+                offsets,
+                total_lens_t,
+                max_candidates,
+                out_tokens,
+                out_counts,
+            )
+
+            out_tokens_np = out_tokens.numpy()
+            out_counts_np = out_counts.numpy()
+            return [
+                out_tokens_np[
+                    i * max_candidates : i * max_candidates + int(out_counts_np[i])
+                ]
+                .astype(np.int64)
+                .tolist()
+                for i in range(batch_size)
+            ]
+
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore

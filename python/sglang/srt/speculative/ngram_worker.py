@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -64,7 +65,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.precompute_bonus_topk = max(1, min(4, self.draft_token_num - 1))
+        self.precompute_bonus_topk = max(1, self.draft_token_num)
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
@@ -111,12 +112,23 @@ class NGRAMWorker(BaseSpecWorker):
         # (drafts, mask), populated by precompute_draft_tokens and consumed by
         # _prepare_for_speculative_decoding.
         self._precomputed_cache = None
+        # Maps (req.rid, path_cols) to the predicted bonus candidates used for
+        # bonus_prediction_hit_rate.
+        self._precomputed_bonus_candidates = None
         self._precomputed_draft_tokens_np = (
             None  # the current batch's draft tokens (numpy)
         )
         self._precomputed_tree_mask_np = None  # the current batch's tree mask (numpy)
         self.prev_token_ids = None
         self.prev_accept_lens = None
+        self._ngram_precompute_stats_interval = max(
+            0, envs.SGLANG_LOG_NGRAM_PRECOMPUTE_STATS_INTERVAL.get()
+        )
+        self._ngram_precompute_stats_forward_ct = 0
+        self._bonus_prediction_hit_ct = 0
+        self._bonus_prediction_total_ct = 0
+        self._precomputed_cache_hit_ct = 0
+        self._precomputed_cache_total_ct = 0
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -131,10 +143,19 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
         self._precomputed_cache = None
+        self._precomputed_bonus_candidates = None
         self._precomputed_draft_tokens_np = None
         self._precomputed_tree_mask_np = None
         self.prev_token_ids = None
         self.prev_accept_lens = None
+        self._ngram_precompute_stats_interval = max(
+            0, envs.SGLANG_LOG_NGRAM_PRECOMPUTE_STATS_INTERVAL.get()
+        )
+        self._ngram_precompute_stats_forward_ct = 0
+        self._bonus_prediction_hit_ct = 0
+        self._bonus_prediction_total_ct = 0
+        self._precomputed_cache_hit_ct = 0
+        self._precomputed_cache_total_ct = 0
 
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
@@ -223,6 +244,54 @@ class NGRAMWorker(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    @staticmethod
+    def _hit_rate(hit_ct: int, total_ct: int) -> float:
+        if total_ct == 0:
+            return 0.0
+        return hit_ct / total_ct
+
+    def _record_bonus_prediction_stats(
+        self, bonus_prediction_hits: list[bool], precomputed_cache_hits: list[bool]
+    ) -> None:
+        self._ngram_precompute_stats_forward_ct += 1
+        self._bonus_prediction_hit_ct += sum(1 for hit in bonus_prediction_hits if hit)
+        self._bonus_prediction_total_ct += len(bonus_prediction_hits)
+        self._precomputed_cache_hit_ct += sum(
+            1 for hit in precomputed_cache_hits if hit
+        )
+        self._precomputed_cache_total_ct += len(precomputed_cache_hits)
+
+        if self._ngram_precompute_stats_interval <= 0:
+            return
+
+        if (
+            self._ngram_precompute_stats_forward_ct
+            % self._ngram_precompute_stats_interval
+            != 0
+        ):
+            return
+
+        logger.info(
+            "NGRAM precompute stats over %d forward steps: "
+            "bonus_prediction_hit_rate=%.4f (%d/%d), "
+            "precomputed_cache_hit_rate=%.4f (%d/%d)",
+            self._ngram_precompute_stats_interval,
+            self._hit_rate(
+                self._bonus_prediction_hit_ct, self._bonus_prediction_total_ct
+            ),
+            self._bonus_prediction_hit_ct,
+            self._bonus_prediction_total_ct,
+            self._hit_rate(
+                self._precomputed_cache_hit_ct, self._precomputed_cache_total_ct
+            ),
+            self._precomputed_cache_hit_ct,
+            self._precomputed_cache_total_ct,
+        )
+        self._bonus_prediction_hit_ct = 0
+        self._bonus_prediction_total_ct = 0
+        self._precomputed_cache_hit_ct = 0
+        self._precomputed_cache_total_ct = 0
+
     def _try_use_precomputed_drafts(
         self, batch: ScheduleBatch
     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
@@ -276,13 +345,21 @@ class NGRAMWorker(BaseSpecWorker):
         result_masks = np.empty(bs * d * d, dtype=np.int64)
         hit_flags = [False] * bs
         hit_count = 0
+        bonus_prediction_hits = []
+        precomputed_cache_hits = []
+        bonus_candidates_by_path = self._precomputed_bonus_candidates or {}
 
         for i in range(bs):
             accept_len = prev_accept_lens_list[i]  # includes bonus token
             bonus_token = prev_token_ids_list[i * d + accept_len - 1]
 
-            key = (batch.reqs[i].rid, accepted_path_per_req[i], bonus_token)
+            path_key = (batch.reqs[i].rid, accepted_path_per_req[i])
+            predicted_bonus_tokens = bonus_candidates_by_path.get(path_key, ())
+            bonus_prediction_hits.append(bonus_token in predicted_bonus_tokens)
+
+            key = (*path_key, bonus_token)
             cached = self._precomputed_cache.get(key)
+            precomputed_cache_hits.append(cached is not None)
             if cached is not None:
                 drafts_for_path, mask_for_path = cached
                 result_drafts[i * d : (i + 1) * d] = drafts_for_path
@@ -290,22 +367,26 @@ class NGRAMWorker(BaseSpecWorker):
                 hit_flags[i] = True
                 hit_count += 1
 
+        self._record_bonus_prediction_stats(
+            bonus_prediction_hits, precomputed_cache_hits
+        )
+
         # Store prev token info (needed by precompute_draft_tokens of next batch)
         self.prev_token_ids = prev_token_ids_list
         self.prev_accept_lens = prev_accept_lens_list
 
         if hit_count == bs:
-            logger.debug(f"Precomputed draft cache HIT for all {bs} requests")
+            logger.info(f"Precomputed draft cache HIT for all {bs} requests")
             return result_drafts, result_masks
         elif hit_count == 0:
-            logger.debug(
+            logger.info(
                 f"Precomputed draft cache MISS for all {bs} requests, "
                 "falling back to fresh generation"
             )
             return None
         else:
             # Partial hit: regenerate only the missed requests and merge
-            logger.debug(
+            logger.info(
                 f"Precomputed draft cache partial HIT: {hit_count}/{bs} requests"
             )
             return self._regenerate_missing_drafts(
@@ -442,6 +523,7 @@ class NGRAMWorker(BaseSpecWorker):
         # TARGET_VERIFY below (relevant once DP attention support lands).
         if not batch.forward_mode.is_decode():
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         bs = len(batch.reqs)
@@ -581,6 +663,7 @@ class NGRAMWorker(BaseSpecWorker):
         ) or batch.has_grammar:
             # spec v2 currently doesn't support grammar, so directly return.
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         bs = len(batch.reqs)
@@ -591,10 +674,12 @@ class NGRAMWorker(BaseSpecWorker):
 
         if cur_draft_tokens is None or cur_tree_mask is None:
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         if not hasattr(self, "prev_token_ids") or self.prev_token_ids is None:
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         cur_draft_tokens_2d = cur_draft_tokens.reshape(bs, d)
@@ -657,6 +742,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         if not bonus_check_tokens:
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         self.ngram_corpus.synchronize()
@@ -675,12 +761,20 @@ class NGRAMWorker(BaseSpecWorker):
         draft_total_lens = []
         # (req_id, path_cols, predicted_bonus) for each Phase 2 entry
         phase2_metadata = []
+        precomputed_bonus_candidates = {}
         for idx, bonus_candidates in enumerate(bonus_candidates_per_path):
             req_id, path_cols_tuple, current_child_tokens = path_metadata[idx]
+            path_key = (req_id, path_cols_tuple)
+            path_bonus_candidates = []
+            path_seen_bonus = set()
             num_residual_bonus = 0
             for predicted_bonus in bonus_candidates:
                 if predicted_bonus in current_child_tokens:
                     continue
+                if predicted_bonus in path_seen_bonus:
+                    continue
+                path_seen_bonus.add(predicted_bonus)
+                path_bonus_candidates.append(predicted_bonus)
                 check_token_with_bonus = (bonus_check_tokens[idx] + [predicted_bonus])[
                     -self.max_trie_depth :
                 ]
@@ -690,9 +784,12 @@ class NGRAMWorker(BaseSpecWorker):
                 num_residual_bonus += 1
                 if num_residual_bonus >= self.precompute_bonus_topk:
                     break
+            if path_bonus_candidates:
+                precomputed_bonus_candidates[path_key] = tuple(path_bonus_candidates)
 
         if not draft_check_tokens:
             self._precomputed_cache = None
+            self._precomputed_bonus_candidates = None
             return
 
         all_drafts, all_masks = self.ngram_corpus.batch_get_temporary(
@@ -717,8 +814,9 @@ class NGRAMWorker(BaseSpecWorker):
                 )
 
         self._precomputed_cache = precomputed
+        self._precomputed_bonus_candidates = precomputed_bonus_candidates
 
-        logger.debug(
+        logger.info(
             f"Precomputed {len(precomputed)} draft combos from "
             f"{n_phase2} phase2 contexts (2-phase) for {bs} requests"
         )

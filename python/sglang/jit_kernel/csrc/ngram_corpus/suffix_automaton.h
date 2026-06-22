@@ -49,6 +49,12 @@ class SuffixAutomaton {
   Result buildFrequency(
       const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
+  std::vector<int32_t>
+  getRootCandidatesRecency(const int32_t* context, size_t len, size_t max_candidates, const Param& param) const;
+
+  std::vector<int32_t>
+  getRootCandidatesFrequency(const int32_t* context, size_t len, size_t max_candidates, const Param& param) const;
+
  private:
   void reset_();
   void extend_(int32_t token, int64_t pos);
