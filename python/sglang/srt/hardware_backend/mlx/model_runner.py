@@ -732,8 +732,8 @@ class MlxModelRunner:
         by handing ``lazy_token`` (and cache state) to ``mx.async_eval``.
         """
         prefix_len = len(prefix_slot_ids)
-        if req is not None:
-            req.mamba_last_track_seqlen = None
+        if req is not None and req.mamba is not None:
+            req.mamba.mamba_last_track_seqlen = None
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()
