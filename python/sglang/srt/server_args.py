@@ -1235,6 +1235,7 @@ class ServerArgs:
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
+    language_model_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
     # Port of the standalone EncoderBootstrapServer started by the language-only
@@ -2145,7 +2146,11 @@ class ServerArgs:
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only:
+            if (
+                model_config.is_multimodal
+                and not self.language_only
+                and not self.language_model_only
+            ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -4552,6 +4557,59 @@ class ServerArgs:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
             )
+
+        # --language-model-only is a standalone mode that strips multimodal
+        # components without EPD disaggregation. It is incompatible with
+        # encoder-related flags.
+        if self.language_model_only:
+            if self.encoder_only:
+                raise ValueError(
+                    "--language-model-only cannot be combined with --encoder-only"
+                )
+            if self.language_only:
+                raise ValueError(
+                    "--language-model-only cannot be combined with --language-only"
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--language-model-only is incompatible with "
+                    "--disaggregation-mode prefill/decode"
+                )
+            if self.enable_prefix_mm_cache:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--enable-prefix-mm-cache"
+                )
+            if self.enable_broadcast_mm_inputs_process:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--enable-broadcast-mm-inputs-process"
+                )
+            if self.mm_enable_dp_encoder:
+                raise ValueError(
+                    "--language-model-only cannot be combined with "
+                    "--mm-enable-dp-encoder"
+                )
+            # Validate model architecture. Currently only Qwen2-VL and Qwen3-VL
+            # family models are supported for --language-model-only.
+            hf_config = self.get_model_config().hf_config
+            model_arch = hf_config.architectures[0]
+            if model_arch not in [
+                "Qwen2VLForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            ]:
+                raise ValueError(
+                    f"Model architecture {model_arch} is not currently supported "
+                    f"for --language-model-only. Supported architectures: "
+                    f"Qwen2VL, Qwen2_5_VL, Qwen3VL, Qwen3VLMoe, Qwen3_5, "
+                    f"Qwen3_5Moe."
+                )
+            return
+
         if self.encoder_only and self.language_only:
             raise ValueError("Cannot set --encoder-only and --language-only together")
         if self.encoder_only and not self.disaggregation_mode == "null":
@@ -7300,6 +7358,14 @@ class ServerArgs:
             "--language-only",
             action="store_true",
             help="For VLM, load weights for the language model only.",
+        )
+        parser.add_argument(
+            "--language-model-only",
+            action="store_true",
+            default=False,
+            help="Strip multimodal vision/audio encoders from the model and load "
+            "only the language backbone. Multimodal inputs (images, video, audio) "
+            "are rejected with an error. This frees GPU memory for additional KV cache.",
         )
         parser.add_argument(
             "--encoder-transfer-backend",
