@@ -19,13 +19,16 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_npu = is_npu()
+_is_mps = is_mps()
 if _is_npu:
     import torch_npu
 
@@ -34,12 +37,13 @@ if _is_npu:
         ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
-    torch_npu._apply_patches(patches)
+    apply_torch_npu_patches(torch_npu, patches)
+elif _is_mps:
+    from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+
+    apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
-
-
-from sglang.srt.utils.profile_utils import ProfileManager
 
 
 @dataclass(kw_only=True)
@@ -213,8 +217,27 @@ class SchedulerProfilerManager:
                         str(self.torch_profiler_output_dir)
                     )
                 ),
+                experimental_config=(
+                    None
+                    if not _is_npu
+                    else torch_npu.profiler._ExperimentalConfig(
+                        export_type=torch_npu.profiler.ExportType.Text,
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                        msprof_tx=False,
+                        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                        l2_cache=False,
+                        op_attr=False,
+                        data_simplification=False,
+                        record_op_args=False,
+                        gc_detect_threshold=None,
+                    )
+                ),
             )
-            self.torch_profiler.start()
+            try:
+                self.torch_profiler.start()
+            except RuntimeError as e:
+                self.torch_profiler = None
+                return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
 
         if "MEM" in activities:

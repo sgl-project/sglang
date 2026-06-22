@@ -1,14 +1,14 @@
 ---
 title: GLM-4.7
 metatags:
-    description: "Deploy GLM-4.7 with SGLang on AMD GPUs - state-of-the-art reasoning, enhanced coding, and robust tool calling capabilities."
+    description: "Deploy GLM-4.7 with SGLang on NVIDIA Blackwell (B200, GB200) and AMD GPUs - state-of-the-art reasoning, robust tool calling, and NVFP4 weights for Blackwell."
 ---
 
 ## 1. Model Introduction
 
-[GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) is the latest and most powerful language model in the GLM series developed by Zhipu AI, featuring state-of-the-art capabilities in reasoning, function calling, and multi-modal understanding.
+[GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) is a powerful language model developed by Zhipu AI, featuring advanced capabilities in reasoning, function calling, and agent workflows.
 
-As the newest iteration in the GLM series, GLM-4.7 achieves significant improvements across all domains:
+GLM-4.7 brings improvements across all major domains:
 
 - **Extended Context Window**: Expanded context window supporting even longer documents and complex multi-turn conversations
 - **Enhanced Reasoning**: Improved reasoning capabilities with better chain-of-thought processing
@@ -21,14 +21,15 @@ For more details, please refer to the [official GLM-4.7 documentation](https://d
 **Key Features:**
 
 - **State-of-the-Art Reasoning**: Enhanced reasoning capabilities for the most complex problem-solving tasks
-- **Multiple Quantizations**: BF16 and FP8 variants for different performance/memory trade-offs
-- **Hardware Optimization**: Specifically tuned for AMD MI300X/MI325X/MI355X GPUs
+- **Multiple Quantizations**: BF16, FP8, and NVFP4 variants for different performance/memory trade-offs
+- **Hardware Optimization**: Tuned for NVIDIA Blackwell (B200, GB200) and AMD MI300X/MI325X/MI355X GPUs
 - **High Performance**: Optimized for both throughput and latency scenarios
 
 **Available Models:**
 
-- **BF16 (Full precision)**: [zai-org/GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) - Recommended for MI300X/MI325X/MI355X
-- **FP8 (8-bit quantized)**: [zai-org/GLM-4.7-FP8](https://huggingface.co/zai-org/GLM-4.7-FP8) - Recommended for MI300X/MI325X/MI355X
+- **BF16 (Full precision)**: [zai-org/GLM-4.7](https://huggingface.co/zai-org/GLM-4.7)
+- **FP8 (8-bit quantized)**: [zai-org/GLM-4.7-FP8](https://huggingface.co/zai-org/GLM-4.7-FP8)
+- **NVFP4 (4-bit, NVIDIA Blackwell)**: [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4)
 
 **License:**
 
@@ -39,6 +40,36 @@ Please refer to the [official GLM-4.7 model card](https://huggingface.co/zai-org
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+**Docker Images by Hardware Platform:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware Platform</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H100 / H200 / B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA GB200 / B300 / GB300 (aarch64)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-cu130`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-rocm720-mi30x`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-rocm720-mi35x`</td>
+    </tr>
+  </tbody>
+</table>
+
 
 ## 3. Model Deployment
 
@@ -54,7 +85,49 @@ import { GLM47Deployment } from "/src/snippets/autoregressive/glm-47-deployment.
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [GLM-4.7 Usage](../../../docs/basic_usage/glm45).
+Pick a weight format by hardware: **NVFP4** on NVIDIA Blackwell (B200, GB200), **FP8** on H100/H200/AMD, **BF16** as the full-precision fallback. The recommended tensor-parallel size per platform:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200 (8×, single node)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=2 / 4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB200 (NVL72, 4× per tray)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=2 / 4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200 (8×)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X / MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=2 / 4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4 / 8</td>
+    </tr>
+  </tbody>
+</table>
+
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable. Enable via the interactive command generator above.
+- **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
+
+For general GLM-4.x family launch guidance (AMD ROCm notes and more), see [Launch GLM-4.5 / GLM-4.6 / GLM-4.7 with SGLang](../../../docs/basic_usage/glm45). Per-hardware bench commands and flags are inline in §5.1 below.
 
 ## 4. Model Invocation
 
@@ -73,7 +146,7 @@ GLM-4.7 supports Thinking mode by default. Enable the reasoning parser during de
 ```shell Command
 python -m sglang.launch_server \
   --model zai-org/GLM-4.7 \
-  --reasoning-parser glm47 \
+  --reasoning-parser glm45 \
   --tp 8 \
   --host 0.0.0.0 \
   --port 8000
@@ -145,12 +218,16 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 
 #### 4.2.2 Tool Calling
 
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+</Note>
+
 GLM-4.7 supports tool calling capabilities. Enable the tool call parser:
 
 ```shell Command
 python -m sglang.launch_server \
   --model zai-org/GLM-4.7 \
-  --reasoning-parser glm47 \
+  --reasoning-parser glm45 \
   --tool-call-parser glm47 \
   --tp 8 \
   --host 0.0.0.0 \
@@ -297,6 +374,27 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
+#### 4.2.3 Thinking Budget
+
+Limit the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
+```
+
 ## 5. Benchmark
 
 This section uses **industry-standard configurations** for comparable benchmark results.
@@ -305,10 +403,10 @@ This section uses **industry-standard configurations** for comparable benchmark 
 
 **Test Environment:**
 
-- Hardware: AMD MI300X (8x), AMD MI325X (8x), AMD MI355X (8x)
-- Model: GLM-4.7
-- Tensor Parallelism: 8
-- SGLang Version: 0.5.6.post1
+- Hardware: NVIDIA B200, NVIDIA GB200, AMD MI300X/MI325X/MI355X (8x)
+- Model: GLM-4.7-NVFP4 on NVIDIA Blackwell; GLM-4.7-FP8 or GLM-4.7 (BF16) on AMD
+- SGLang Version: 0.5.12 (NVIDIA Blackwell), 0.5.6.post1 (AMD)
+- Best per-GPU throughput config on B200: **TP=2 NVFP4 bf16-KV** (NVFP4 weights, no EP). Numbers below come from this config.
 
 **Benchmark Methodology:**
 
@@ -316,7 +414,7 @@ We use industry-standard benchmark configurations to ensure results are comparab
 
 #### 5.1.1 Standard Test Scenarios
 
-Three core scenarios reflect real-world usage patterns:
+Four core scenarios reflect real-world usage patterns:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -352,6 +450,12 @@ Three core scenarios reflect real-world usage patterns:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Document summarization, RAG retrieval</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Throughput**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mixed RAG / agent / multi-turn conversation (used for the inline B200 / GB200 results below)</td>
+    </tr>
   </tbody>
 </table>
 
@@ -361,7 +465,7 @@ Test each scenario at three concurrency levels to capture the throughput vs. lat
 
 - **Low Concurrency**: `--max-concurrency 1` (Latency-optimized)
 - **Medium Concurrency**: `--max-concurrency 16` (Balanced)
-- **High Concurrency**: `--max-concurrency 100` (Throughput-optimized)
+- **High Concurrency**: `--max-concurrency 100` (Throughput-optimized) — the Throughput (4K/1K) scenario uses `--max-concurrency 128` to match the inline B200/GB200 results below.
 
 #### 5.1.3 Number of Prompts
 
@@ -508,6 +612,302 @@ python -m sglang.bench_serving \
   --request-rate inf
 ```
 
+**Scenario 4: Throughput (4K/1K) — NVIDIA Blackwell with NVFP4**
+
+The remaining sub-sections (§5.1.4.1 NVIDIA B200, §5.1.4.2 NVIDIA GB200) measure this scenario with `nvidia/GLM-4.7-NVFP4` weights and report the full `bench_serving` output verbatim. The same commands apply to other NVIDIA hardware after substituting the deployment line from §3.1.
+
+> **Note**: These runs use EOS-enabled generation (no `--disable-ignore-eos`), so generated-token counts reflect natural model behavior rather than a strict fixed-OSL pin. Compare against other EOS-enabled runs at the same workload, not against fixed-output-length benchmarks.
+
+#### 5.1.4.1 NVIDIA B200
+
+**Model Deployment (NVIDIA B200, TP=2 NVFP4 — max tok/s/gpu config):**
+
+```bash Command
+python -m sglang.launch_server \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --tp-size 2 \
+  --mem-fraction-static 0.85 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 5 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     5
+Benchmark duration (s):                  25.07
+Total input tokens:                      8105
+Total generated tokens:                  2674
+Request throughput (req/s):              0.20
+Input token throughput (tok/s):          323.25
+Output token throughput (tok/s):         106.65
+Total token throughput (tok/s):          429.90
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5011.93
+Median E2E Latency (ms):                 6441.44
+---------------Time to First Token----------------
+Mean TTFT (ms):                          179.61
+Median TTFT (ms):                        169.05
+P99 TTFT (ms):                           238.01
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.05
+Median TPOT (ms):                        9.03
+P99 TPOT (ms):                           9.16
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.05
+Median ITL (ms):                         9.05
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  60.60
+Total input tokens:                      179772
+Total generated tokens:                  39657
+Request throughput (req/s):              1.32
+Input token throughput (tok/s):          2966.39
+Output token throughput (tok/s):         654.37
+Total token throughput (tok/s):          3620.76
+Concurrency:                             14.01
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   10615.87
+Median E2E Latency (ms):                 9985.45
+---------------Time to First Token----------------
+Mean TTFT (ms):                          267.39
+Median TTFT (ms):                        177.26
+P99 TTFT (ms):                           584.29
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          20.98
+Median TPOT (ms):                        21.06
+P99 TPOT (ms):                           24.88
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           20.92
+Median ITL (ms):                         17.93
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 640 \
+  --max-concurrency 128 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 128
+Successful requests:                     640
+Benchmark duration (s):                  172.95
+Total input tokens:                      1453591
+Total generated tokens:                  308740
+Request throughput (req/s):              3.70
+Input token throughput (tok/s):          8404.67
+Output token throughput (tok/s):         1785.14
+Total token throughput (tok/s):          10189.80
+Concurrency:                             117.85
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   31848.20
+Median E2E Latency (ms):                 28554.42
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1598.40
+Median TTFT (ms):                        298.88
+P99 TTFT (ms):                           11015.96
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          65.94
+Median TPOT (ms):                        65.81
+P99 TPOT (ms):                           137.73
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           62.99
+Median ITL (ms):                         35.44
+==================================================
+```
+
+#### 5.1.4.2 NVIDIA GB200
+
+**Model Deployment (NVIDIA GB200, TP=2 NVFP4 — max tok/s/gpu config):**
+
+```bash Command
+python -m sglang.launch_server \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --tp-size 2 \
+  --mem-fraction-static 0.85 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 5 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     5
+Benchmark duration (s):                  24.74
+Total input tokens:                      8105
+Total generated tokens:                  2674
+Request throughput (req/s):              0.20
+Input token throughput (tok/s):          327.65
+Output token throughput (tok/s):         108.10
+Total token throughput (tok/s):          435.75
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   4944.47
+Median E2E Latency (ms):                 6347.31
+---------------Time to First Token----------------
+Mean TTFT (ms):                          211.41
+Median TTFT (ms):                        207.25
+P99 TTFT (ms):                           226.46
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.86
+Median TPOT (ms):                        8.84
+P99 TPOT (ms):                           8.96
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.87
+Median ITL (ms):                         8.85
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  60.40
+Total input tokens:                      179772
+Total generated tokens:                  39657
+Request throughput (req/s):              1.32
+Input token throughput (tok/s):          2976.52
+Output token throughput (tok/s):         656.61
+Total token throughput (tok/s):          3633.13
+Concurrency:                             13.97
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   10611.51
+Median E2E Latency (ms):                 9956.84
+---------------Time to First Token----------------
+Mean TTFT (ms):                          338.14
+Median TTFT (ms):                        215.25
+P99 TTFT (ms):                           915.40
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          20.87
+Median TPOT (ms):                        21.36
+P99 TPOT (ms):                           27.05
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           20.77
+Median ITL (ms):                         16.53
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 640 \
+  --max-concurrency 128 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 128
+Successful requests:                     640
+Benchmark duration (s):                  181.89
+Total input tokens:                      1453591
+Total generated tokens:                  309221
+Request throughput (req/s):              3.52
+Input token throughput (tok/s):          7991.59
+Output token throughput (tok/s):         1700.04
+Total token throughput (tok/s):          9691.63
+Concurrency:                             118.86
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   33690.47
+Median E2E Latency (ms):                 30421.55
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1353.16
+Median TTFT (ms):                        383.52
+P99 TTFT (ms):                           8940.53
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          69.88
+Median TPOT (ms):                        71.77
+P99 TPOT (ms):                           131.75
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           67.23
+Median ITL (ms):                         33.46
+==================================================
+```
+
 #### 5.1.5 Understanding the Results
 
 **Key Metrics:**
@@ -523,6 +923,7 @@ python -m sglang.bench_serving \
 - **1K/1K (Chat)**: Represents the most common conversational AI workload. This is the highest priority scenario for most deployments.
 - **1K/8K (Reasoning)**: Tests long-form generation capabilities crucial for complex reasoning, code generation, and detailed explanations.
 - **8K/1K (Summarization)**: Evaluates performance with large context inputs, essential for RAG systems, document Q&A, and summarization tasks.
+- **4K/1K (Throughput)**: Realistic mixed workload typical of production deployments (RAG context + medium response). Long enough input that prefill matters, long enough output that decode steady-state dominates. Used for the inline B200 / GB200 results above.
 - **Variable Concurrency**: Captures the Pareto frontier - the optimal tradeoff between throughput and latency at different load levels. Low concurrency shows best-case latency, high concurrency shows maximum throughput.
 
 **Interpreting Results:**
@@ -541,6 +942,21 @@ Document model accuracy on standard benchmarks:
 - Benchmark Command
 ```bash Command
 python -m sglang.test.few_shot_gsm8k \
-  --num-questions 200 \
+  --num-shots 5 \
+  --num-questions 1319 \
   --port 30000
+```
+
+- Test Result (NVIDIA B200, TP=2 NVFP4)
+```text Output
+Accuracy: 0.946
+Latency: 178.284 s
+Output throughput: 769.204 token/s
+```
+
+- Test Result (NVIDIA GB200, TP=2 NVFP4)
+```text Output
+Accuracy: 0.951
+Latency: 175.190 s
+Invalid: 0.000
 ```
