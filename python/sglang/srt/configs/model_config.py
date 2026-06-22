@@ -302,6 +302,28 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+        # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
+        self.nvfp4_moe_meta: Optional[dict] = None
+        hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):
+            hybrid_quant_cfg = hybrid_quant_cfg.to_dict()
+        if (
+            hybrid_quant_cfg is not None
+            and str(hybrid_quant_cfg.get("quant_algo", "")).upper() == "MIXED_PRECISION"
+            and str(hybrid_quant_cfg.get("moe_quant_algo", "")).upper() == "NVFP4"
+            and hybrid_quant_cfg.get("group_size") is not None
+        ):
+            self.nvfp4_moe_meta = {
+                "group_size": int(hybrid_quant_cfg["group_size"]),
+                "exclude_modules": list(hybrid_quant_cfg.get("ignore") or []),
+            }
+            logger.info(
+                "Auto-detected hybrid FP8+NVFP4 checkpoint "
+                "(NVFP4 MoE group_size=%d, %d exclude_modules)",
+                self.nvfp4_moe_meta["group_size"],
+                len(self.nvfp4_moe_meta["exclude_modules"]),
+            )
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -358,6 +380,14 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+        )
+        # Multimodal archs whose language-model prefill is verified safe to capture
+        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
+        # CG for every multimodal model; this opt-in re-enables it for listed archs
+        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
+        # LM forward is captured).
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1629,6 +1659,14 @@ piecewise_cuda_graph_disabled_model_archs = [
     "LLaDAModelLM",
 ]
 
+# Multimodal archs allowed to keep prefill piecewise CUDA graph enabled. The
+# generic "multimodal model" rule in ServerArgs disables prefill piecewise CG for
+# all multimodal models; archs here opt back in because their LM prefill captures
+# cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
+multimodal_piecewise_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1683,6 +1721,14 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
 def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
     return any(
         arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
+    return any(
+        arch in multimodal_piecewise_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 
