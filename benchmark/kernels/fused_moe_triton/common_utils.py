@@ -86,6 +86,7 @@ def get_model_config(
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekOCRForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
         "MistralLarge3ForCausalLM",
