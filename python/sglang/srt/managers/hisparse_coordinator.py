@@ -189,6 +189,13 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def destroy(self) -> None:
+        # Drain in-flight transfers so the buffer is idle, then unregister it.
+        # See HostKVCache.destroy for why the explicit unregister matters.
+        self.write_staging_stream.synchronize()
+        self.decode_backup_stream.synchronize()
+        self.mem_pool_host.destroy()
+
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         device_capacity = device_allocator.size

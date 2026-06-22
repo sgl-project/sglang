@@ -58,7 +58,7 @@ class SpecEagleServerBase(CustomTestCase):
     attention_backend = "flashinfer"
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    mem_fraction_static = 0.85
+    mem_fraction_static = 0.75
     max_running_requests = 8
     chunked_prefill_size = 128
     # bf16 rather than fp16: fp16 activations can overflow (-> Inf -> NaN) on

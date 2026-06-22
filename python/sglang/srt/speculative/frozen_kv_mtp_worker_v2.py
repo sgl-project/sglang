@@ -197,24 +197,16 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             ),
         )
 
-    def init_attention_backends(self):
+    def init_backends(self):
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            TpModelWorker.init_attention_backends(self)
+            TpModelWorker.init_backends(self, disable_cuda_graph=True)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-
-    def init_cuda_graphs(self):
-        with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
-            TpModelWorker.init_cuda_graphs(self, capture_decode_cuda_graph=False)
-            self._capture_cuda_graphs()
+            self.init_cuda_graphs()
 
     @property
     def draft_model_runner(self):
@@ -350,7 +342,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-    def _capture_cuda_graphs(self) -> None:
+    def init_cuda_graphs(self) -> None:
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
