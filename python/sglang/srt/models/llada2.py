@@ -568,7 +568,10 @@ class LLaDA2MoeAttention(nn.Module):
                     head_dim=self.head_dim,
                     alt_stream=self.alt_stream,
                 )
-            can_fuse_set_kv = enable_fused_set_kv_buffer(forward_batch)
+            can_fuse_set_kv = (
+            self.head_dim == self.rotary_emb.rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+            )
             q, k = self.rotary_emb(
                 positions,
                 q,
