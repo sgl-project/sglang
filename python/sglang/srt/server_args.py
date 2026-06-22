@@ -947,6 +947,7 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
+    fp4_quant_algo: str = "absmax"
     dsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
@@ -5878,6 +5879,18 @@ class ServerArgs:
             "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
             "'marlin' (weight-only W4A16 fallback for SM80+). ",
+        )
+        parser.add_argument(
+            "--fp4-quant-algo",
+            type=str,
+            choices=["absmax", "scalesweep"],
+            default=ServerArgs.fp4_quant_algo,
+            dest="fp4_quant_algo",
+            help="Algorithm for NVFP4 activation quantization. "
+            "'absmax' (default; the flashinfer absmax-based path), "
+            "'scalesweep' (ScaleSweep MSE: sweeps FP8 block scales around the "
+            "absmax base to minimize FP4 reconstruction error; requires SM100+ "
+            "for native FP4). See sgl-project/sglang#27246.",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",

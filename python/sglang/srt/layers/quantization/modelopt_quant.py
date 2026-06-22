@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
+    fp4_quantize_activation,
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -1686,7 +1687,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             x_m = x_fp4.shape[0]
             output_dtype = layer.params_dtype
         else:
-            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+            x_fp4, x_scale_interleaved = fp4_quantize_activation(
+                x, layer.input_scale_inv
+            )
             x_m, _ = x.shape
             output_dtype = x.dtype
 
