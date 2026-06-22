@@ -227,7 +227,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
 
         auxiliary_state_indices = []
         for req in reqs:
-            if getattr(req, "mamba_pool_idx", None) is not None:
+            if req.mamba.mamba_pool_idx is not None:
                 mid = req.mamba.mamba_pool_idx
             else:
                 allocated = self.auxiliary_state_pool.alloc(1)
@@ -250,10 +250,10 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         return 0
 
     def free_mamba_cache(self, req, mamba_ping_pong_track_buffer_to_keep=None):
-        if getattr(req, "mamba_pool_idx", None) is not None:
+        if req.mamba.mamba_pool_idx is not None:
             self.auxiliary_state_pool.free(req.mamba.mamba_pool_idx.unsqueeze(0))
             req.mamba.mamba_pool_idx = None
-        track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+        track_buffer = req.mamba.mamba_ping_pong_track_buffer
         if track_buffer is not None:
             if mamba_ping_pong_track_buffer_to_keep is None:
                 self.auxiliary_state_pool.free(track_buffer)
@@ -296,11 +296,11 @@ class MlxAuxiliaryStateComponent(MambaComponent):
 
     @staticmethod
     def _tracked_value(req) -> tuple[object | None, bool]:
-        track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
-        track_len = getattr(req, "mamba_last_track_seqlen", None)
+        track_buffer = req.mamba.mamba_ping_pong_track_buffer
+        track_len = req.mamba.mamba_last_track_seqlen
         if track_buffer is not None and track_len is not None:
             return track_buffer[0].unsqueeze(-1).clone(), True
-        if getattr(req, "mamba_pool_idx", None) is None:
+        if req.mamba.mamba_pool_idx is None:
             return None, False
         return req.mamba.mamba_pool_idx.unsqueeze(-1).clone(), False
 
@@ -311,7 +311,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        cache_len = getattr(req, "mamba_last_track_seqlen", None)
+        cache_len = req.mamba.mamba_last_track_seqlen
         auxiliary_value, uses_track_slot = self._tracked_value(req)
         setattr(insert_params, "mlx_auxiliary_state_uses_track_slot", uses_track_slot)
 
@@ -357,7 +357,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             if bool(
                 getattr(insert_params, "mlx_auxiliary_state_uses_track_slot", False)
             ):
-                track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+                track_buffer = req.mamba.mamba_ping_pong_track_buffer
                 if track_buffer is not None:
                     self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.mamba.mamba_ping_pong_track_buffer = None
@@ -381,7 +381,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             self.cache.req_to_token_pool.free_auxiliary_state_cache(req)
         else:
             # The radix tree now owns the live auxiliary-state slot.
-            track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+            track_buffer = req.mamba.mamba_ping_pong_track_buffer
             if track_buffer is not None:
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.mamba.mamba_ping_pong_track_buffer = None

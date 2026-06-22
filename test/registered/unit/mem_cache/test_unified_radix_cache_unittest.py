@@ -1015,7 +1015,7 @@ class UnifiedRadixCacheSuite:
 
         tree.dec_lock_ref(
             req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 
@@ -1839,7 +1839,7 @@ class UnifiedRadixCacheSuite:
 
         tree.dec_lock_ref(
             req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 
@@ -1878,7 +1878,7 @@ class UnifiedRadixCacheSuite:
 
         tree.dec_lock_ref(
             req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 
