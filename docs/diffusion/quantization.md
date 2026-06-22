@@ -105,16 +105,18 @@ Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the ten diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and validation coverage.
+This section is the canonical support matrix for the nine published diffusion
+ModelOpt checkpoints plus the locally validated Qwen-Image NVFP4 export
+currently wired up in SGLang docs and validation coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Eight of the ten repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
-official `black-forest-labs/FLUX.2-dev-NVFP4` repo, and the Qwen-Image NVFP4
-entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` repo.
+Eight of the nine published repos live under `lmsys/*`. The FLUX.2 NVFP4 entry
+keeps the official `black-forest-labs/FLUX.2-dev-NVFP4` repo, and the
+Qwen-Image NVFP4 entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` layout once
+that repo is published.
 
 | Quant Algo | Base Model | Preferred CLI | HF Repo | Current Scope | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -127,10 +129,12 @@ entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` repo.
 | `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
 | `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint; the default FP4 GEMM backend is `flashinfer_trtllm` |
-| `NVFP4` | `Qwen/Qwen-Image` | `--model-path` | `nvidia/Qwen-Image-NVFP4` | full-model NVFP4 repo load + generation | full diffusers repo loaded directly (like the Wan2.2 NVFP4 repo); export keeps `img_mod`/`txt_mod` (and blocks 0/1/58/59 + `img_in`/`txt_in`/`time_text_embed`/`norm_out`/`proj_out`) in BF16 |
+| `NVFP4` | `Qwen/Qwen-Image` | `--model-path` | `nvidia/Qwen-Image-NVFP4` or a local ModelOpt export | full-model NVFP4 repo load + generation | full diffusers repo loaded directly (like the Wan2.2 NVFP4 repo); export keeps `img_mod`/`txt_mod` (and blocks 0/1/58/59 + `img_in`/`txt_in`/`time_text_embed`/`norm_out`/`proj_out`) in BF16; on B200, `flashinfer_cutlass` is the faster FP4 backend at high resolutions such as 2048x2048 |
 
-These ten checkpoints are also the intended case set for the B200 diffusion
-CI job (`multimodal-gen-test-1-b200`).
+The published NVFP4 checkpoints are used by the B200 diffusion CI job
+(`multimodal-gen-test-1-b200`). The Qwen-Image NVFP4 row was validated on B200
+from a local ModelOpt export and should be added there after the hosted
+checkpoint is visible to CI.
 
 ## ModelOpt FP8
 
@@ -270,11 +274,25 @@ sglang generate \
   --save-output
 ```
 
-For Qwen-Image, the NVFP4 export is a full-model repo loaded directly:
+For Qwen-Image, the NVFP4 export is a full-model repo loaded directly. The same
+command works with a local ModelOpt export directory while the NVIDIA-hosted repo
+is not yet visible:
 
 ```bash
 sglang generate \
   --model-path nvidia/Qwen-Image-NVFP4 \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
+For high-resolution Qwen-Image generations on B200, the FlashInfer CUTLASS FP4
+GEMM backend can be faster than the default TensorRT-LLM backend:
+
+```bash
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass \
+sglang generate \
+  --model-path /path/to/qwen-image-nvfp4-export \
+  --width 2048 --height 2048 \
   --prompt "A tiny astronaut reading a book under a glass greenhouse" \
   --save-output
 ```
@@ -293,6 +311,10 @@ sglang generate \
   TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
 - The `Qwen/Qwen-Image` NVFP4 export keeps the `img_mod`/`txt_mod` modulation
   projections and blocks 0/1/58/59 in BF16.
+- Qwen-Image NVFP4 does not always improve latency at 1024x1024. On B200, the
+  validated local ModelOpt export was faster than BF16 at 2048x2048 with
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass`, while 1024x1024
+  remained BF16-faster.
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence

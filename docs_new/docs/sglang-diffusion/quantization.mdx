@@ -172,16 +172,18 @@ Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the nine diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and validation coverage.
+This section is the canonical support matrix for the nine published diffusion
+ModelOpt checkpoints plus the locally validated Qwen-Image NVFP4 export
+currently wired up in SGLang docs and validation coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Six of the nine repos live under `lmsys/*`. The Wan2.2 entries use NVIDIA's
-official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
-`black-forest-labs/FLUX.2-dev-NVFP4` repo.
+Eight of the nine published repos live under `lmsys/*`. The FLUX.2 NVFP4 entry
+keeps the official `black-forest-labs/FLUX.2-dev-NVFP4` repo, and the
+Qwen-Image NVFP4 entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` layout once
+that repo is published.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -222,10 +224,10 @@ official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
     <tr>
       <td><code>FP8</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
-      <td><code>--model-path</code></td>
-      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-FP8</code></td>
-      <td>full Diffusers repo with ModelOpt FP8 Wan2.2 components</td>
-      <td>validated through direct <code>--model-path</code> loading</td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
+      <td>primary <code>transformer</code> quantized, <code>transformer_2</code> kept BF16</td>
+      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
     </tr>
     <tr>
       <td><code>FP8</code></td>
@@ -270,16 +272,26 @@ official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
     <tr>
       <td><code>NVFP4</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
+      <td>primary <code>transformer</code> quantized with ModelOpt NVFP4, <code>transformer_2</code> kept BF16</td>
+      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint; the default FP4 GEMM backend is <code>flashinfer_trtllm</code></td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>Qwen/Qwen-Image</code></td>
       <td><code>--model-path</code></td>
-      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
-      <td>full Diffusers repo with ModelOpt NVFP4 Wan2.2 components</td>
-      <td>default FP4 GEMM backend is <code>flashinfer_trtllm</code></td>
+      <td><code>nvidia/Qwen-Image-NVFP4</code> or a local ModelOpt export</td>
+      <td>full-model NVFP4 repo load + generation</td>
+      <td>full diffusers repo loaded directly; export keeps <code>img_mod</code>/<code>txt_mod</code> (and blocks 0/1/58/59 plus <code>img_in</code>/<code>txt_in</code>/<code>time_text_embed</code>/<code>norm_out</code>/<code>proj_out</code>) in BF16; on B200, <code>flashinfer_cutlass</code> is the faster FP4 backend at high resolutions such as 2048x2048</td>
     </tr>
   </tbody>
 </table>
 
-The FP8 rows run in the regular H100 1-GPU diffusion CI shard; the NVFP4 rows
-run in the B200 diffusion CI shard (`multimodal-gen-test-1-b200`).
+The published NVFP4 checkpoints are used by the B200 diffusion CI job
+(`multimodal-gen-test-1-b200`). The Qwen-Image NVFP4 row was validated on B200
+from a local ModelOpt export and should be added there after the hosted
+checkpoint is visible to CI.
 
 ## ModelOpt FP8
 
@@ -300,7 +312,8 @@ sglang generate \
 
 ```bash
 sglang generate \
-  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-FP8 \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -387,12 +400,37 @@ sglang generate \
   --save-output
 ```
 
-For Wan2.2 NVFP4:
+For a dual-transformer Wan2.2 export where only the primary `transformer`
+was quantized:
 
 ```bash
 sglang generate \
-  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
   --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+For Qwen-Image, the NVFP4 export is a full-model repo loaded directly. The same
+command works with a local ModelOpt export directory while the NVIDIA-hosted repo
+is not yet visible:
+
+```bash
+sglang generate \
+  --model-path nvidia/Qwen-Image-NVFP4 \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
+For high-resolution Qwen-Image generations on B200, the FlashInfer CUTLASS FP4
+GEMM backend can be faster than the default TensorRT-LLM backend:
+
+```bash
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass \
+sglang generate \
+  --model-path /path/to/qwen-image-nvfp4-export \
+  --width 2048 --height 2048 \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
   --save-output
 ```
 
@@ -408,6 +446,12 @@ sglang generate \
   intentionally want a non-default `transformer_2`.
 - On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
   TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
+- The `Qwen/Qwen-Image` NVFP4 export keeps the `img_mod`/`txt_mod` modulation
+  projections and blocks 0/1/58/59 in BF16.
+- Qwen-Image NVFP4 does not always improve latency at 1024x1024. On B200, the
+  validated local ModelOpt export was faster than BF16 at 2048x2048 with
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass`, while 1024x1024
+  remained BF16-faster.
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence

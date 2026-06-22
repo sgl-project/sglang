@@ -12,7 +12,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_MODEL,
-    MODELOPT_QWEN_IMAGE_NVFP4_MODEL,
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
@@ -558,15 +557,6 @@ else:
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=[],
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
-            run_consistency_check=True,
-        ),
-        _make_modelopt_ci_case(
-            "qwen_image_modelopt_nvfp4_t2i",
-            model_path=MODELOPT_QWEN_IMAGE_NVFP4_MODEL,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=[],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
         ),
     ]
