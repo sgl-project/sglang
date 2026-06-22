@@ -777,21 +777,20 @@ class ServerArgs:
     sleep_on_idle: bool = False
     use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
-    checkpoint_engine_wait_weights_before_ready: A[
-        bool,
-        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
-    ] = False
     numa_node: Optional[List[int]] = None
     gc_threshold: Optional[List[int]] = None
 
     # -------------------------------------------------------------------------
-    # Tensor parallel, pipeline parallel, data parallel, and context parallel
+    # Distributed topology and parallelism (TP, PP, DP, CP)
     # -------------------------------------------------------------------------
     nccl_port: A[
         Optional[int],
         "The port for NCCL distributed environment setup. Defaults to a random port.",
     ] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    dist_init_addr: Optional[str] = None
+    nnodes: int = 1
+    node_rank: int = 0
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
@@ -834,13 +833,6 @@ class ServerArgs:
     enable_p2p_check: bool = False
 
     # -------------------------------------------------------------------------
-    # Multi-node distributed serving
-    # -------------------------------------------------------------------------
-    dist_init_addr: Optional[str] = None
-    nnodes: int = 1
-    node_rank: int = 0
-
-    # -------------------------------------------------------------------------
     # Streaming
     # -------------------------------------------------------------------------
     stream_interval: int = 1
@@ -848,7 +840,6 @@ class ServerArgs:
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
-    load_snapshot_publish_interval: int = 15
 
     # -------------------------------------------------------------------------
     # Constrained decoding
@@ -874,6 +865,7 @@ class ServerArgs:
     grpc_http_sidecar_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    load_snapshot_publish_interval: int = 15
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
     extra_metric_labels: Optional[Dict[str, str]] = None
@@ -1034,6 +1026,8 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
     enable_multi_layer_eagle: bool = False
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
@@ -1046,12 +1040,6 @@ class ServerArgs:
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
-
-    # -------------------------------------------------------------------------
-    # Adaptive speculative decoding
-    # -------------------------------------------------------------------------
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
 
     # -------------------------------------------------------------------------
     # Expert parallelism
@@ -1239,7 +1227,7 @@ class ServerArgs:
     torchao_config: str = ""
 
     # -------------------------------------------------------------------------
-    # Other misc server features
+    # Misc runtime features
     # -------------------------------------------------------------------------
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
@@ -1349,6 +1337,10 @@ class ServerArgs:
     # Checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
+    checkpoint_engine_wait_weights_before_ready: A[
+        bool,
+        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
