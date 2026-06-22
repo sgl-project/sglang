@@ -28,14 +28,17 @@ from sglang.srt.utils.weight_checker import (
     ChecksumInfo,
     ParallelismInfo,
     WeightChecker,
-    _block_size_of,
     _check_tensors,
-    _compare_quant_pair,
     _hash_tensor,
     _is_non_persistent_buffer_name,
     _postprocess_tensors,
-    _quant_ulp,
     _random_like,
+)
+from sglang.srt.utils.weight_checker_quant import (
+    Fp8BlockReference,
+    _block_size_of,
+    _compare_references,
+    _quant_ulp,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -53,7 +56,7 @@ Entry = Tuple[str, bool, Tuple]
 
 def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:
     """Compare two streams of (name, should_compare, entry) where entry is
-    ("raw", tensor) or ("quant", w_q, w_s)."""
+    ("raw", tensor) or ("quant", Fp8BlockReference)."""
     actual_list: List[Entry] = list(actual)
     expected_list: List[Entry] = list(expected)
     assert len(actual_list) == len(
@@ -65,10 +68,25 @@ def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) ->
         assert a_name == e_name, f"[{i}] name: {a_name!r} != {e_name!r}"
         assert a_flag == e_flag, f"[{i}] should_compare: {a_flag} != {e_flag}"
         assert a_entry[0] == e_entry[0], f"[{i}] entry kind mismatch for {a_name!r}"
-        for a_t, e_t in zip(a_entry[1:], e_entry[1:], strict=True):
+        if a_entry[0] == "quant":
+            a_ref, e_ref = a_entry[1], e_entry[1]
             torch.testing.assert_close(
-                a_t, e_t, msg=f"[{i}] tensor mismatch for {a_name!r}"
+                a_ref.w_q, e_ref.w_q, msg=f"[{i}] w_q mismatch for {a_name!r}"
             )
+            torch.testing.assert_close(
+                a_ref.w_s, e_ref.w_s, msg=f"[{i}] w_s mismatch for {a_name!r}"
+            )
+        else:
+            torch.testing.assert_close(
+                a_entry[1], e_entry[1], msg=f"[{i}] tensor mismatch for {a_name!r}"
+            )
+
+
+def _compare_quant_pair(expect_q, expect_s, actual_q, actual_s):
+    """Test shim: wrap fp8 (q, s) pairs as references and compare them."""
+    return _compare_references(
+        Fp8BlockReference(expect_q, expect_s), Fp8BlockReference(actual_q, actual_s)
+    )
 
 
 def _build_fp8_quant_pair(device: str = "cuda"):
@@ -259,10 +277,11 @@ class TestPostprocessTensors(CustomTestCase):
         qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
 
+        ref = Fp8BlockReference(qweight, sf_packed_int32)
         _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("x.weight", True, ("quant", qweight, sf_packed_int32)),
+                ("x.weight", True, ("quant", ref)),
                 ("x.weight", False, ("raw", qweight)),
                 ("x.weight_scale_inv", False, ("raw", sf_packed_int32)),
             ],
@@ -277,10 +296,11 @@ class TestPostprocessTensors(CustomTestCase):
             "y.bias": bias,
         }
         # All quant entries come first, then a raw pass over every key.
+        ref = Fp8BlockReference(qweight, sf_fp32)
         _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("x.weight", True, ("quant", qweight, sf_fp32)),
+                ("x.weight", True, ("quant", ref)),
                 ("x.weight", False, ("raw", qweight)),
                 ("x.weight_scale_inv", False, ("raw", sf_fp32)),
                 ("y.bias", True, ("raw", bias)),
@@ -424,7 +444,7 @@ class TestCompareQuantPair(CustomTestCase):
 
     def test_chunked_result_matches_unchunked(self):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 128 * 128):
+        with patch("sglang.srt.utils.weight_checker_quant._CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         self.assertEqual(chunked, reference)
 
