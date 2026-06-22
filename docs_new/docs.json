@@ -877,6 +877,24 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
+                  {
+                    "group": "Model Tutorials",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3-8b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_32b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_27b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct"
+                    ]
+                  },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
                   "docs/hardware-platforms/ascend-npus/ascend_npu",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",

@@ -24,8 +24,9 @@ This guide describes the best practice data for MiniMax-M2.5 on the Ascend NPU.
 | MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-50ms) |
 | MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
 
-
 ## Optimal Configuration
+
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
 ### MiniMax-M2.5 W8A8 1P1D 16P IN128K OUT1K PREFIX90 50ms
 
@@ -440,6 +441,8 @@ python -m sglang.bench_serving \
     --num-prompts 640 \
     --request-rate inf
 ```
+
+<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### MiniMax-M2.5 W8A8 4P IN32K OUT1K 50ms
 
