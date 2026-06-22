@@ -635,7 +635,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba is not None and req.mamba.mamba_pool_idx is not None:
+        if req.mamba is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.mamba.mamba_pool_idx.unsqueeze(-1)
             )

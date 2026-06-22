@@ -768,7 +768,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            if req.mamba is not None and req.mamba.mamba_pool_idx is not None:
+            if req.mamba is not None:
                 pass
             else:
                 # TODO(th4): owned-mamba ownership (req.mamba) belongs in the
@@ -778,16 +778,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
-                if req.mamba is None:
-                    req.mamba = ReqMambaInfo(
-                        mamba_pool_idx=mid[0],
-                        mamba_ping_pong_track_buffer=None,
-                        mamba_next_track_idx=None,
-                        mamba_last_track_seqlen=None,
-                        mamba_branching_seqlen=None,
-                    )
-                else:
-                    req.mamba.mamba_pool_idx = mid[0]
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=mid[0],
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
                 req.mamba_needs_clear = True
             mamba_indices.append(req.mamba.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
