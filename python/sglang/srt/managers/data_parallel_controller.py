@@ -669,20 +669,11 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     def sigterm_handler(signum, frame):
-        """Propagate graceful shutdown from the DP controller to its schedulers.
+        """SIGTERM → gracefully stop schedulers before exiting.
 
-        In DP mode the schedulers are children of this controller, which sets
-        PR_SET_PDEATHSIG=SIGKILL on them. If this controller exited immediately
-        on SIGTERM, the kernel would SIGKILL the schedulers mid-cleanup. Instead
-        we SIGTERM the schedulers, wait for them to finish their own cleanup
-        (Mooncake/hicache RDMA teardown), SIGKILL stragglers, then exit normally.
-
-        Exit code 0 keeps the parent's SubprocessWatchdog from treating this as a
-        crash; SystemExit is not an ``Exception``, so the ``except Exception``
-        below does not catch it and we do not send SIGQUIT to the parent.
+        Exits with code 0 to avoid SubprocessWatchdog treating it as a crash.
         """
-        # Ignore further SIGTERM so re-propagation cannot re-enter this handler.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
         logger.info(
             "SIGTERM received in data_parallel_controller; propagating graceful "
             "shutdown to scheduler children..."

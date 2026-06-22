@@ -1302,9 +1302,6 @@ def kill_process_tree(
         _wait_for_reap_or_raise(killed, wait_timeout)
 
 
-# Graceful shutdown: how long to wait for child processes (scheduler, hicache,
-# detokenizer, dp controller, ...) to finish their SIGTERM cleanup before
-# escalating to SIGKILL. Configurable via env var.
 CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV = "SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT"
 DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT = 10.0
 
@@ -1325,27 +1322,13 @@ def graceful_kill_process_tree(
     skip_pid: int = None,
     timeout: float = 10.0,
 ):
-    """Gracefully terminate a process tree: SIGTERM first, then SIGKILL.
-
-    Unlike ``kill_process_tree`` (which sends SIGKILL immediately), this gives
-    children time to run their cleanup hooks (``atexit``, ``__del__`` and C++
-    destructors -- e.g. Mooncake / hicache RDMA teardown) before forcing them
-    down. It sends SIGTERM to every child, waits up to ``timeout`` seconds for
-    them to exit, then SIGKILLs any stragglers.
+    """Gracefully terminate a process tree: SIGTERM first, wait, then SIGKILL stragglers.
 
     Args:
-        parent_pid: Parent PID. ``None`` uses the current process.
-        include_parent: SIGKILL the parent at the end (not recommended for the
-            graceful path; the caller usually exits itself afterwards).
+        parent_pid: Target PID, defaults to current process.
+        include_parent: Also kill the parent after children are done.
         skip_pid: A child PID to leave untouched.
-        timeout: Seconds to wait for graceful exit before SIGKILL.
-
-    Note:
-        Reaping is detected by polling ``/proc`` via ``_still_holding_resources``
-        rather than ``psutil.wait_procs``: the latter's ``os.pidfd_open`` path
-        (taken for non-child processes, i.e. recursively-collected grandchildren)
-        can raise ``OSError(EINVAL)`` against a just-signalled process on some
-        kernels and abort the whole wait.
+        timeout: Seconds to wait before escalating to SIGKILL.
     """
     if parent_pid is None:
         parent_pid = os.getpid()

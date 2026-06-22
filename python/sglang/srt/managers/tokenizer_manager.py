@@ -2627,8 +2627,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
-                # Force path: skip the graceful per-child SIGTERM wait and kill
-                # the whole tree immediately (the server is already unhealthy).
                 kill_process_tree(os.getpid(), include_parent=True)
                 sys.exit(0)
 
@@ -2638,8 +2636,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
-                # Force path: skip the graceful per-child SIGTERM wait and kill
-                # the whole tree immediately.
                 kill_process_tree(os.getpid(), include_parent=True)
                 sys.exit(0)
 
@@ -2655,9 +2651,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
 
-        # Ask schedulers to release resources in userspace before SIGTERM.
+        # Ask schedulers to release resources in userspace and exit via ShutdownReq.
+        # Wait for them to exit before sending SIGTERM to remaining children,
+        # otherwise the SIGTERM would race with ShutdownReq processing.
         self.send_to_scheduler.send_pyobj(ShutdownReq())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
 
+        # SIGTERM remaining children (detokenizer, hicache sidecar, etc.),
+        # then SIGKILL stragglers after timeout.
         graceful_kill_process_tree(
             os.getpid(),
             include_parent=False,
