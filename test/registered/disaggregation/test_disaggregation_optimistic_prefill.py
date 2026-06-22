@@ -97,6 +97,7 @@ class OptimisticPrefillRetryCounterMixin:
         return result
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOptimisticPrefill(
     OptimisticPrefillRetryCounterMixin, PDDisaggregationServerBase
 ):
@@ -178,6 +179,7 @@ class TestOptimisticPrefill(
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

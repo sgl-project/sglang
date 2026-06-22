@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -26,6 +27,7 @@ register_cuda_ci(
 ib_devices = get_rdma_devices_args()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTP(CustomTestCase):
     extra_args = []
 
@@ -89,6 +91,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPureDP(TestTP):
     extra_args = [
         "--attn-dp-size",
