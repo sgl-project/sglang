@@ -5,6 +5,7 @@ from sgl_kernel import sgl_per_token_group_quant_8bit  # AOT v2 reference op
 from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
+from sglang.srt.layers.quantization import fp8_kernel as fp8_kernel_module
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -114,22 +115,41 @@ def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hid
 @pytest.mark.parametrize("num_groups", [8])
 @pytest.mark.parametrize("hidden", [256, 4096])
 def test_sglang_per_token_group_quant_fp8_ue8m0_outer_major_scale_layout(
-    dtype, num_tokens, num_groups, hidden
+    dtype, num_tokens, num_groups, hidden, monkeypatch
 ):
     torch.manual_seed(num_tokens * 1000 + num_groups * 100 + hidden)
     x = torch.randn(num_tokens, num_groups, hidden, device="cuda", dtype=dtype)
 
-    x_q, x_s = sglang_per_token_group_quant_fp8(
+    jit_v2_call_count = 0
+    original_jit_v2 = fp8_kernel_module.sgl_per_token_group_quant_8bit_jit_v2
+
+    def wrapped_jit_v2(*args, **kwargs):
+        nonlocal jit_v2_call_count
+        jit_v2_call_count += 1
+        return original_jit_v2(*args, **kwargs)
+
+    def fail_aot(*args, **kwargs):
+        raise AssertionError("scale_outer_major must not call the AOT quant path")
+
+    monkeypatch.setattr(
+        fp8_kernel_module, "sgl_per_token_group_quant_8bit_jit_v2", wrapped_jit_v2
+    )
+    monkeypatch.setattr(fp8_kernel_module, "sgl_per_token_group_quant_8bit", fail_aot)
+
+    x_q, x_s = fp8_kernel_module.sglang_per_token_group_quant_fp8(
         x.contiguous(),
         G,
         scale_ue8m0=True,
         scale_outer_major=True,
     )
-    q_ref, s_ref = sglang_per_token_group_quant_fp8(
+    assert jit_v2_call_count == 1
+
+    q_ref, s_ref = fp8_kernel_module.sglang_per_token_group_quant_fp8(
         x.reshape(num_tokens * num_groups, hidden).contiguous(),
         G,
         scale_ue8m0=True,
     )
+    assert jit_v2_call_count == 2
     torch.cuda.synchronize()
 
     num_scale_groups = hidden // G
