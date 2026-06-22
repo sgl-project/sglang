@@ -118,9 +118,13 @@ sgl-eval run gsm8k \\
 
   playgroundFeatures: {
 
-    // M.1 is global-attention (no SWA); expose TP + DP-Attention. No CP.
-    // DP-Attention is a Playground experiment only — ~15% slower than plain TP on this GQA
-    // model (8 KV heads), so it is NOT in the shipped Balanced recipe.
+    // M.1 is global-attention (no SWA); expose TP + DP-Attention here. No CP: the default
+    // trtllm_mha backend has no CP-aware KV-store (crashes), and the engine's built-in attention CP
+    // knob emits NSA flags (--enable-nsa-prefill-context-parallel) that apply to DeepSeek-family
+    // models, not M.1. (CP works only via the fa3 backend, which is Hopper SM90 — left out here.)
+    // DP-Attention: VERIFIED functionally correct on 8×B200 BF16 (GSM8K 0.94, identical to the TP
+    // baseline) but ~15–28% slower on this GQA model (8 KV heads). Playground experiment only —
+    // deliberately NOT in the shipped Balanced recipe.
     attention: {
       knobs: [
         { id: "tp",     label: "TP",           values: [null, 1, 2, 4, 8] },
@@ -129,14 +133,12 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // 256-expert top-16 MoE. DeepEP all-to-all + EP degree.
+    // 256-expert top-16 MoE — EP degree only.
+    // EP: VERIFIED on 8×B200 BF16 (--ep-size 8, GSM8K 0.94, identical to the TP baseline).
+    // DeepEP intentionally NOT exposed — it does not work on M.1: top-16 routing exceeds DeepEP's
+    // low-latency internode kernel cap of 11 (internode_ll.cu kNumMaxTopK=11) → assert at decode
+    // CUDA-graph capture, and `--deepep-mode normal` is NotImplemented for unquantized weights. Use EP.
     moe: {
-      backend: {
-        options: [
-          { id: null,     label: "Inherited" },
-          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
-        ],
-      },
       ep: { label: "EP", values: [null, 1, 2, 4, 8] },
     },
 
@@ -147,6 +149,60 @@ sgl-eval run gsm8k \\
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser poolside_v1" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
       ],
+    },
+
+    // HiCache (hierarchical KV cache). VERIFIED on 8×B200 BF16: enabling the host L2 tier on a
+    // zipfian shared-prefix workload cut mean TTFT ~36% (median ~43%) and lifted throughput ~19% vs
+    // GPU-only, with ~1.14M tokens served from the host tier (TPOT unchanged — the win is on prefill
+    // / prefix reuse). Biggest gains on reuse-heavy traffic: shared system prompts, multi-turn
+    // agentic coding, repeated long contexts. "Enable" emits --enable-hierarchical-cache (+host L2);
+    // Write policy is optional. (L3 storage backends exist but were not validated, so none exposed.)
+    hicache: {
+      writePolicies: [
+        { id: "auto",          label: "Auto" },
+        { id: "write_through", label: "Write-through" },
+        { id: "write_back",    label: "Write-back" },
+      ],
+    },
+
+    // Prefill-Decode disaggregation (§3.3). M.1 is standard-KV (global attention, no sparse
+    // index buffer), so it disaggregates with just the --disaggregation-* flags — no model-specific
+    // backend pinning. Verified on 2×8×H200 (TP8+TP8, BF16) over InfiniBand.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // mooncake (recommended): honors --disaggregation-ib-device, no transfer cold-start.
+        // The NCCL/MNNVL env is only needed on NVLink-multinode Grace-Blackwell (GB200/GB300).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb200", "gb300"] } },
+        // NiXL ignores --disaggregation-ib-device; its UCX backend needs the NIC pinned via
+        // UCX_NET_DEVICES or every KV transfer hangs to the 300s timeout (§3.3). Baked in here
+        // for the IB-based HGX platforms; also expect a ~38s one-time UCX cold-start.
+        { id: "nixl",     label: "NiXL",
+          env: ["UCX_NET_DEVICES=mlx5_0:1"],
+          envWhen: { hw: ["h200", "b200", "b300"] } },
+      ],
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --policy round_robin \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}}`,
+      },
     },
   },
 

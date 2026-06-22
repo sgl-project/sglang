@@ -116,6 +116,34 @@ GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
+  
+
+def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
+    attn_backend = get_attn_backend()
+    server_args = get_global_server_args()
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    prefill_backend = (
+        getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
+    )
+    decode_backend = (
+        getattr(attn_backend, "decode_attention_backend_str", None) or decode_backend
+    )
+
+    if forward_batch.forward_mode.is_decode_or_idle():
+        backend_name = decode_backend
+    elif (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    ):
+        backend_name = (
+            decode_backend
+            if server_args.speculative_attention_mode == "decode"
+            else prefill_backend
+        )
+    else:
+        backend_name = prefill_backend
+
+    return backend_name in ("dsa", "nsa")
 
 
 if _is_cuda:

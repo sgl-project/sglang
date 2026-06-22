@@ -78,8 +78,12 @@ class SchedulerClient:
             f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
 
-    def forward(self, batch: Any) -> Any:
+    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
+        previous_timeout_ms = None
+        if timeout_ms is not None:
+            previous_timeout_ms = self.scheduler_socket.getsockopt(zmq.RCVTIMEO)
+            self.scheduler_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         try:
             self.scheduler_socket.send_pyobj(batch)
             output_batch = self.scheduler_socket.recv_pyobj()
@@ -88,6 +92,9 @@ class SchedulerClient:
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
+        finally:
+            if previous_timeout_ms is not None and self.scheduler_socket is not None:
+                self.scheduler_socket.setsockopt(zmq.RCVTIMEO, previous_timeout_ms)
 
     def ping(self) -> bool:
         """
