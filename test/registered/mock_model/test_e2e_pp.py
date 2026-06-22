@@ -7,7 +7,7 @@ from sglang.test.mock_model.utils import run_mock_model_bench_serving
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=600, suite="extra-a-test-2-gpu-large-amd")
+register_amd_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestE2EPipelineParallel(CustomTestCase):
