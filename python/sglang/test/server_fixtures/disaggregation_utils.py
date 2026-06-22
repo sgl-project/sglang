@@ -15,5 +15,8 @@ def assert_process_healthy(test_case, name, process, url, health_path="/health")
         process.poll(),
         f"{name} exited unexpectedly with code {process.returncode}",
     )
-    response = requests.get(f"{url}{health_path}", timeout=10)
+    try:
+        response = requests.get(f"{url}{health_path}", timeout=10)
+    except requests.RequestException as e:
+        test_case.fail(f"Failed to connect to {name} health endpoint: {e}")
     test_case.assertEqual(response.status_code, 200, response.text)
