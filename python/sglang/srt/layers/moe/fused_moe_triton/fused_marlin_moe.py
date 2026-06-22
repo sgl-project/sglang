@@ -55,14 +55,29 @@ def swiglu_limit_func(
 
 def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
+    input: torch.Tensor,  # first half is gate, second half is up (split layout)
     gemm1_alpha: float,
-    gemm1_limit: float,
+    gemm1_limit: Optional[float],
 ) -> None:
+    """SwiGLU-OAI on a split-layout ``[*, 2I]`` tensor:
+    ``gate * sigmoid(alpha * gate) * (up + 1)`` with optional clamp on both
+    halves. Shared by the GPT-OSS marlin path and the MiniMax-M3
+    compressed-tensor W4 marlin path (matches MiniMax-M3
+    ``swiglu_no_interleaved_with_alpha_and_limit`` so the marlin MoE path
+    produces the same activation as the BF16 dense MLP / shared-expert MLP)."""
     d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+    gate = input[:, :d]
+    up = input[:, d:]
+    if gemm1_limit is not None and gemm1_limit > 0:
+        gate = torch.clamp(gate, max=gemm1_limit)
+        up = torch.clamp(up, min=-gemm1_limit, max=gemm1_limit)
+    out_dtype = output.dtype
+    activated = (
+        gate.to(torch.float32)
+        * torch.sigmoid(gemm1_alpha * gate.to(torch.float32))
+        * (up.to(torch.float32) + 1.0)
+    )
+    output.copy_(activated.to(out_dtype))
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -249,12 +264,13 @@ def fused_marlin_moe(
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
-        if clamp_limit is None:
-            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        # SwiGLU-OAI path (GPT-OSS ``swiglu`` variant / MiniMax-M3
+        # ``swigluoai``): single elementwise op in fp32 with `alpha` and
+        # optional clamp so the marlin MoE path matches the BF16 dense MLP.
         swiglu_gpt_oss_sigmoid_alpha_contiguous(
             intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
-            gemm1_alpha,
+            float(gemm1_alpha),
             clamp_limit,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:

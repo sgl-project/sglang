@@ -1468,6 +1468,24 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        elif self.quant_config is not None and any(
+            "shared_experts" in pat
+            for pat in (getattr(self.quant_config, "ignore", []) or [])
+        ):
+            # Mixed-precision ckpt (e.g. W4A16 with bf16 shared_experts):
+            # routed experts are quantized into the fused-MoE packed grid,
+            # but shared_experts are stored as unquantized bf16 raw weight.
+            # Fusing them into the quantized expert-128 slot would silently
+            # drop the bf16 weight (no matching `experts.w*_weight` param
+            # exists; only `_weight_packed/_scale/_shape` do), leaving
+            # expert 128 at its torch.ones() init and corrupting every
+            # token. Force-disable fusion so shared_experts goes through the
+            # independent MiniMaxM3MLP path (UnquantizedLinearMethod + bf16).
+            disable_reason = (
+                "Quant config ignores shared_experts (ckpt stores them as "
+                "unquantized bf16), which cannot be fused into the quantized "
+                "expert grid."
+            )
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override
