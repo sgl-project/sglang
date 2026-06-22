@@ -164,7 +164,7 @@ class DDIMSolver:
         self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
         self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
 
-    def to(self, device: torch.device) -> "DDIMSolver":
+    def to(self, device: torch.device) -> DDIMSolver:
         self.ddim_timesteps = self.ddim_timesteps.to(device)
         self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
         self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
@@ -616,8 +616,11 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             ddim_timesteps=30,
         ).to(self.device)
         if server_args.enable_torch_compile:
-            compile_mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            dit_config = getattr(server_args.pipeline_config, "dit_config", None)
+            compile_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                dit_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             logger.info("Compiling paint transformer with mode: %s", compile_mode)
             self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)

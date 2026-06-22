@@ -2,11 +2,15 @@
 """Mistral3 text encoder configuration for SGLang diffusion models."""
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
+)
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_embed_tokens,
+    is_final_norm,
+    is_layer,
 )
 
 
@@ -34,12 +38,6 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
     head_dim: int = 128
     hidden_state_skip_layer: int = 2  # Use second-to-last hidden state
     text_len: int = 0
-    # Mistral 3.x uses rope_theta=1e9 (yarn-free).
-    rope_parameters: dict[str, Any] = field(
-        default_factory=lambda: {"rope_theta": 1_000_000_000.0}
-    )
-    attention_bias: bool = False
-    mlp_bias: bool = False
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
@@ -51,8 +49,9 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
         ]
     )
 
-    # TP-parallel runtime shards weights along TP dim; no FSDP needed.
-    _fsdp_shard_conditions: list = field(default_factory=list)
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_layer, is_embed_tokens, is_final_norm]
+    )
 
     def __post_init__(self):
         # Let the parent populate tokenizer_kwargs["max_length"] = self.text_len
