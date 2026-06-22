@@ -241,6 +241,9 @@ def _normalize_tp_style(style: str) -> Style:
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",
         "moe_tp_experts": "replicate",
+        # MLA kv_a_proj: replicate (HF MlaKvAProjParallel replicates the weight;
+        # its rope-segment all_reduce_backward is backward-only).
+        "mla_kv_a_proj": "replicate",
     }.get(style, style)
     if style not in {"colwise", "colwise_rep", "rowwise", "rowwise_rep", "replicate"}:
         raise ValueError(f"Unsupported TP style '{style}' for Transformers backend.")
