@@ -255,7 +255,7 @@ template <
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     bool FUSE_SILU_AND_MUL = false,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>>
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -265,13 +265,10 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int hidden_dim_num_groups,
     // TODO can this be removed?
     const int scale_expert_stride,
-    const int scale_token_stride,
     const int scale_hidden_stride,
-    const int scale_outer_dim_size,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-  // When row-major + SCALE_UE8M0, scale is still stored as float (value is power-of-2)
-  using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
+  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -321,27 +318,17 @@ __global__ void per_token_group_quant_8bit_kernel(
         constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int column_major_scale_token_stride = 1;
+          constexpr int scale_token_stride = 1;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                          (expert_idx * scale_expert_stride * num_elems_per_pack +
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                          token_idx * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
+                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
-          static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
-          int64_t scale_offset;
-          if (scale_outer_dim_size > 0) {
-            const int outer_idx = token_idx / scale_outer_dim_size;
-            const int token_idx_in_outer = token_idx % scale_outer_dim_size;
-            scale_offset = outer_idx * scale_expert_stride + token_idx_in_outer * scale_token_stride +
-                           hidden_dim_group_idx * scale_hidden_stride;
-          } else {
-            scale_offset = expert_idx * scale_expert_stride + token_idx * scale_token_stride +
-                           hidden_dim_group_idx * scale_hidden_stride;
-          }
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) + scale_offset;
+          static_assert(!SCALE_UE8M0);
+          scale_output = output_s + offset_num_groups;
         }
 
         // can speed up if too slow
@@ -375,25 +362,12 @@ __global__ void per_token_group_quant_8bit_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
         float y_scale, y_scale_inv;
-        // For row-major + UE8M0: quantize with exact scale, but output rounded scale_inv
-        // This is equivalent to the original two-step approach (quant then ceil_to_ue8m0)
-        if constexpr (SCALE_UE8M0 && !IS_COLUMN_MAJOR) {
-          // Exact scale for quantization
-          constexpr float MAX_8BIT_INV = 1.0f / dst_dtype_info::MAX;
-          y_scale_inv = local_absmax * MAX_8BIT_INV;
-          y_scale = dst_dtype_info::MAX / local_absmax;
-          // Rounded scale_inv for output
-          float rounded_scale_inv = fast_pow2(fast_log2_ceil(y_scale_inv));
-          if (lane_id == 0) {
-            *scale_output = rounded_scale_inv;
-          }
-        } else {
-          calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-          if (lane_id == 0) {
-            *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
-          }
-        }
+        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
         float2 y_scale_repeated = {y_scale, y_scale};
+
+        if (lane_id == 0) {
+          *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+        }
 
         int4 output_buf;
         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
@@ -450,7 +424,6 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
-  CHECK_CUDA(output_s);
   TORCH_CHECK(input.numel() > 0);
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
@@ -459,8 +432,7 @@ void sgl_per_token_group_quant_8bit_v2(
   const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
-  TORCH_CHECK(output_s.dim() == 2 || output_s.dim() == 3);
-  TORCH_CHECK(!masked_layout || output_s.dim() == 3);
+  TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
 
   const int num_local_experts = masked_layout ? input.size(0) : 1;
 
@@ -471,12 +443,8 @@ void sgl_per_token_group_quant_8bit_v2(
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size;
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
-  const int scale_expert_stride =
-      (masked_layout || output_s.dim() == 3) ? static_cast<int>(output_s.stride(-3)) : 0;
-  const int scale_token_stride = static_cast<int>(output_s.stride(-2));
+  const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
-  const int scale_outer_dim_size =
-      (!masked_layout && output_s.dim() == 3) ? static_cast<int>(output_s.size(-2)) : 0;
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
   do {                                                                                                               \
@@ -505,9 +473,7 @@ void sgl_per_token_group_quant_8bit_v2(
         subwarps_per_block,                                                                                          \
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
-        scale_token_stride,                                                                                          \
         scale_hidden_stride,                                                                                         \
-        scale_outer_dim_size,                                                                                        \
         num_tokens_per_expert);                                                                                      \
   } while (0)
 
@@ -537,11 +503,7 @@ void sgl_per_token_group_quant_8bit_v2(
         LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
       }                                                                                                             \
     } else {                                                                                                        \
-      if (scale_ue8m0) {                                                                                            \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, true);     \
-      } else {                                                                                                      \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);           \
-      }                                                                                                             \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);             \
     }                                                                                                               \
   } while (0)
 
