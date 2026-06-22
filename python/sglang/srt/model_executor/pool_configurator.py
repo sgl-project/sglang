@@ -30,8 +30,8 @@ from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import (
-    ceil_div,
     ceil_align,
+    ceil_div,
     is_float4_e2m1fn_x2,
     spec_decode_alloc_len_per_request,
 )
@@ -486,6 +486,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             else None
         )
         self.disaggregation_mode = mr.server_args.disaggregation_mode
+        self.disaggregation_decode_extra_slots = (
+            mr.server_args.disaggregation_decode_extra_slots or 0
+        )
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -601,13 +604,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_num_req_slots(self, max_running_requests: int) -> int:
         if self.disaggregation_mode == "decode":
-            pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-            pre_alloc_size = (
-                max_running_requests * 2
-                if max_running_requests <= 32
-                else pre_alloc_size
-            )
-            return max_running_requests + pre_alloc_size + 1
+            return max_running_requests + self.disaggregation_decode_extra_slots + 1
         return max_running_requests + 1
 
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
