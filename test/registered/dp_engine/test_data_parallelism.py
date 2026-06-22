@@ -2,6 +2,7 @@ import time
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -18,6 +19,7 @@ register_cuda_ci(est_time=91, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDataParallelism(CustomTestCase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.7
 
