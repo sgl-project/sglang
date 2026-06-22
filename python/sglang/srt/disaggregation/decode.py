@@ -378,9 +378,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        swa_reserved = self.num_reserved_decode_tokens
+        if self.scheduler.server_args.disable_radix_cache:
+            swa_reserved = 0
         return (
             full_len + self.num_reserved_decode_tokens,
-            swa_len + self.num_reserved_decode_tokens,
+            swa_len + swa_reserved,
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -1788,9 +1791,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()

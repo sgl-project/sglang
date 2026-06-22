@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
@@ -108,9 +108,9 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--max-total-tokens",
                 "12000",
                 "--max-mamba-cache-size",
@@ -169,9 +169,9 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
                 "--max-mamba-cache-size",
