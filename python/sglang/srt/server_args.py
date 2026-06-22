@@ -6042,15 +6042,20 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
+        # FP8 W_o GEMM is supported on Blackwell by the existing ue8m0 path
+        # and on sm90 by an opt-in fp32-scale grouped DeepGEMM path.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
-            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
-                    "detected sm%d.",
-                    get_device_sm(),
-                )
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            if is_sm90_supported():
+                if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            else:
+                if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                    logger.warning(
+                        "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm90 or "
+                        "sm100+ (Blackwell), detected sm%d.",
+                        get_device_sm(),
+                    )
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
