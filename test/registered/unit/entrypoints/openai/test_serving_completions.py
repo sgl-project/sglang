@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from sglang.srt.entrypoints.openai.protocol import CompletionRequest, StreamOptions
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils import get_or_create_event_loop
@@ -50,7 +50,11 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.tokenizer.bos_token_id = 1
 
         tm.model_config = Mock(is_multimodal=False)
-        tm.server_args = Mock(enable_cache_report=False)
+        tm.server_args = Mock(
+            enable_cache_report=False,
+            enable_spec_decode_usage=False,
+            stream_response_default_include_usage=False,
+        )
 
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()
@@ -366,6 +370,107 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    # ---------- spec-decode usage (completion_tokens_details) ----------
+    def _spec_ret(self):
+        """A single response item with spec-decode counters in meta_info."""
+        return [
+            {
+                "text": "Spec response",
+                "meta_info": {
+                    "id": "cmpl-spec-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 6,
+                    "spec_num_proposed_drafts": 15,
+                    "spec_num_correct_drafts": 4,
+                    "spec_verify_ct": 3,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+    def test_non_streaming_spec_decode_usage_populates_when_flag_on(self):
+        """With --enable-spec-decode-usage, completion_tokens_details carries
+        accepted/rejected prediction tokens aggregated from meta_info."""
+        self.sc.tokenizer_manager.server_args.enable_spec_decode_usage = True
+
+        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
+        response = self.sc._build_completion_response(req, self._spec_ret(), 1234567890)
+
+        details = response.usage.completion_tokens_details
+        self.assertIsNotNone(details)
+        self.assertEqual(details.accepted_prediction_tokens, 4)
+        self.assertEqual(details.rejected_prediction_tokens, 11)
+
+    def test_non_streaming_spec_decode_usage_omits_when_flag_off(self):
+        """Without --enable-spec-decode-usage, completion_tokens_details is
+        omitted even when meta_info carries spec counters."""
+        self.sc.tokenizer_manager.server_args.enable_spec_decode_usage = False
+
+        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
+        response = self.sc._build_completion_response(req, self._spec_ret(), 1234567890)
+
+        self.assertIsNone(response.usage.completion_tokens_details)
+
+    def test_streaming_spec_decode_usage_populates_final_usage_chunk(self):
+        """In streaming, spec counters land on the final chunk (state.finished
+        in TokenizerManager) and surface in the final usage chunk that the
+        client receives when include_usage=True."""
+        self.sc.tokenizer_manager.server_args.enable_spec_decode_usage = True
+
+        async def _mock_generate_with_spec(*args, **kwargs):
+            yield {
+                "text": "Spec response",
+                "meta_info": {
+                    "id": "cmpl-spec-stream",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 6,
+                    "spec_num_proposed_drafts": 15,
+                    "spec_num_correct_drafts": 4,
+                    "spec_verify_ct": 3,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_with_spec
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+            stream_options=StreamOptions(include_usage=True),
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            chunks = []
+            async for chunk in self.sc._generate_completion_stream(
+                adapted_request, req, self.fastapi_request
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        usage_chunks = []
+        for chunk in chunks:
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            data = json.loads(chunk[len("data: ") :])
+            if data.get("usage"):
+                usage_chunks.append(data)
+
+        # The final usage chunk has empty choices and usage populated.
+        final = next(c for c in usage_chunks if c["choices"] == [])
+        details = final["usage"]["completion_tokens_details"]
+        self.assertEqual(details["accepted_prediction_tokens"], 4)
+        self.assertEqual(details["rejected_prediction_tokens"], 11)
 
 
 if __name__ == "__main__":
