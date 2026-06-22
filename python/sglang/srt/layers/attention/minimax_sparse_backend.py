@@ -25,6 +25,14 @@ if not is_npu():
         minimax_sparse_prefill,
     )
 
+def _npu_use_triton_sparse() -> bool:
+    """Whether the NPU sparse path should use the fused triton kernels."""
+    import os
+
+    return is_npu() and bool(
+        int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "0"))
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -677,6 +685,182 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_out[batch_id : batch_id + 1] = idx_o_seq
         return idx_out, out
 
+    def _forward_npu_triton_decode(
+        self,
+        q: torch.Tensor,                       # [B, num_q_heads, head_dim]
+        k_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim] (NHD)
+        v_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim]
+        idx_q: torch.Tensor,                   # [B, num_idx_heads, idx_dim]
+        idx_k_cache: torch.Tensor,             # [num_slots, idx_kv_heads, idx_dim]
+        idx_v_cache: Optional[torch.Tensor],   # [num_slots, idx_kv_heads, idx_dim] or None
+        forward_batch: ForwardBatch,
+    ):
+        """NPU decode via the ported vLLM-ascend triton kernels (BNSD paged).
+
+        sglang's NHD paged KV ([slots,H,D], page_size==block_size) reshapes
+        directly to the kernels' [pages,block_size,H,D] layout; the block table
+        is derived from req_to_token.
+        """
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
+            flash_decode_bnsd_with_topk_idx,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+            flash_decode_bnsd_with_gqa_share_sparse,
+        )
+
+        page_size = self.page_size  # == block_size_k
+        num_q_heads = q.shape[1]
+        head_dim = q.shape[2]
+        num_idx_heads = idx_q.shape[1]
+        idx_dim = idx_q.shape[2]
+        import os as _os
+
+        # k_cache layout: NHD slot-major [slots, head_num, head_dim] OR already
+        # paged 4D [pages, page_size, head_num, head_dim]. Handle both.
+        if k_cache.dim() == 4:
+            num_pages, _ps, num_kv_heads, head_dim = k_cache.shape
+            k_bnsd = k_cache
+            v_bnsd = v_cache
+        else:
+            num_kv_heads = k_cache.shape[1]
+            head_dim = k_cache.shape[2]
+            num_pages = k_cache.shape[0] // page_size
+            k_bnsd = k_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+            v_bnsd = v_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+        if _os.environ.get("MINIMAX_NPU_TRITON_DEBUG"):
+            print(
+                f"[DEBUG triton-decode] q={tuple(q.shape)} k_cache={tuple(k_cache.shape)} "
+                f"dim={k_cache.dim()} -> k_bnsd={tuple(k_bnsd.shape)} "
+                f"idx_q={tuple(idx_q.shape)} idx_k={tuple(idx_k_cache.shape)} dim={idx_k_cache.dim()} "
+                f"idx_v={None if idx_v_cache is None else tuple(idx_v_cache.shape)} "
+                f"page_size={page_size} num_kv_heads={num_kv_heads} head_dim={head_dim} "
+                f"req_to_token={tuple(self.req_to_token.shape)} "
+                f"seq_lens={forward_batch.seq_lens.tolist()}",
+                flush=True,
+            )
+
+        # index cache -> BNSD
+        if idx_k_cache.dim() == 4:
+            idx_k_bnsd = idx_k_cache
+            idx_v_bnsd = idx_v_cache
+        else:
+            idx_kv_heads = idx_k_cache.shape[1]
+            idx_k_bnsd = idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            idx_v_bnsd = (
+                None
+                if idx_v_cache is None
+                else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            )
+
+        # block_table[b, blk] = page holding logical block blk of request b.
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        max_seqlen = int(self._max_seqlen_k) if self._max_seqlen_k else int(seq_lens.max().item())
+        max_blocks = (max_seqlen + page_size - 1) // page_size
+        req_idx = forward_batch.req_pool_indices.long()
+        max_cols = self.req_to_token.shape[1]
+        blk_cols = torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
+        blk_cols = blk_cols.clamp(max=max_cols - 1)
+        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
+        block_table = (token_slots // page_size).to(torch.int32)
+
+        disable_index_value = idx_v_cache is None
+
+        # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
+        # Pass init_blocks=0, local_blocks=0 on purpose: the ported triton score
+        # kernel would otherwise *boost* the forced init/local blocks to 1e30/1e29
+        # and let them take slots INSIDE the top-k budget (sentinel injection), so
+        # the local block displaces the k-th real block -> only `topk` blocks
+        # attended. The validated pure-PyTorch path instead selects top-k purely by
+        # score and APPENDS init/local on top (concat + dedup, see
+        # _merge_sparse_blocks), attending to topk+init+local blocks. We select the
+        # pure top-k here and re-append the forced blocks below so the triton path
+        # attends to the identical block set as the PyTorch path. Mismatched, this
+        # diverges ~7% per sparse layer (one dropped 128-token block) and produces
+        # different/garbled decode output under greedy decoding.
+        idx_o, topk_idx = flash_decode_bnsd_with_topk_idx(
+            q=idx_q,
+            sink=None,
+            k_cache_bnsd=idx_k_bnsd,
+            v_cache_bnsd=idx_v_bnsd,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            block_size=page_size,
+            topk=self.topk_blocks,
+            init_blocks=0,
+            local_blocks=0,
+            sm_scale=idx_dim ** -0.5,
+            score_type=self.score_type,
+            disable_index_value=disable_index_value,
+        )
+
+        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
+        if num_idx_heads > num_kv_heads:
+            idx_group_size = num_idx_heads // num_kv_heads
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
+                dim=1,
+            )
+
+        # 3) Append the forced init/local blocks on top of the pure top-k, using the
+        # SAME concat+dedup semantics as the pure-PyTorch path (_merge_sparse_blocks)
+        # so triton decode attends to the identical block set. `max_blocks` (batch
+        # max) is a safe upper bound here: the indexer already emitted only valid,
+        # causal block ids per request, and _merge_sparse_blocks only uses num_blocks
+        # for clamping/validity masking. The main sparse kernel accepts the wider
+        # topk_idx (max_topk = topk+init+local) and skips the -1 dedup sentinels.
+        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [B, num_kv_heads, topk]
+        # Decode: each query sits at the last token of its sequence.
+        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
+        topk_idx = topk_merged.permute(1, 0, 2).contiguous()  # [num_kv_heads, B, topk+init+local]
+
+        # 4) main sparse attention over the selected blocks
+        o = flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_bnsd,
+            v_cache_bnsd=v_bnsd,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            block_size=page_size,
+            topk_idx=topk_idx,
+            sm_scale=head_dim ** -0.5,
+        )
+
+        # DEBUG (opt-in, MINIMAX_NPU_TRITON_DEBUG_DIFF=1): also run the validated
+        # pure-PyTorch path on the identical inputs and log the per-call output
+        # difference on REAL model data. Settles whether the triton-vs-pytorch gap
+        # is ~bf16 noise (~0.3%/layer) or a larger systematic divergence. Logs only
+        # the first few sparse decode calls to avoid spam.
+        import os as _os_dbg
+
+        if _os_dbg.environ.get("MINIMAX_NPU_TRITON_DEBUG_DIFF"):
+            if not hasattr(self, "_dbg_diff_count"):
+                self._dbg_diff_count = 0
+            if self._dbg_diff_count < 5:
+                self._dbg_diff_count += 1
+                try:
+                    _idx_o_ref, _o_ref = self._forward_npu_sparse_decode(
+                        q, k_cache, v_cache, idx_q, idx_k_cache, idx_v_cache, forward_batch
+                    )
+                    _d = (o.float() - _o_ref.float()).abs().max().item()
+                    _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
+                    logger.warning(
+                        "[MiniMax/NPU triton-vs-pytorch] call #%d: "
+                        "max_abs_diff=%.6f rel=%.5f (q=%s seq_lens=%s)",
+                        self._dbg_diff_count,
+                        _d,
+                        _r,
+                        tuple(q.shape),
+                        forward_batch.seq_lens.tolist(),
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning(
+                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s", _e
+                    )
+        return idx_o, o
+
     @staticmethod
     def _is_sparse_kv_cached_by_fusion(
         forward_batch: ForwardBatch, layer_id: int
@@ -933,15 +1117,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_decode(
-                q,
-                k_cache,
-                v_cache,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                forward_batch,
-            )
+            if _npu_use_triton_sparse():
+                idx_o, o = self._forward_npu_triton_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                )
+            else:
+                idx_o, o = self._forward_npu_sparse_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                )
         else:
             idx_o, o = minimax_sparse_decode(
                 q,
