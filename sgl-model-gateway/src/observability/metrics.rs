@@ -931,13 +931,7 @@ impl Metrics {
         .set(count as f64);
     }
 
-    /// Record cache-aware policy execution branch for routing decisions.
-    ///
-    /// This answers "why did cache-aware route this request the way it did" at the
-    /// decision level. Branches: cache_hit / cache_miss_min_load / load_balance /
-    /// stale_tenant_fallback / no_tree_random / no_healthy_workers. A high share of
-    /// `load_balance` or `cache_miss_min_load` while match rates are high indicates
-    /// the affinity-vs-load-balance tension is actively hurting cache hit rate.
+    /// Record cache-aware policy execution branch.
     pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
         counter!(
             "smg_cache_aware_policy_branch_total",
@@ -946,17 +940,12 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record the global best-prefix match rate observed at a cache-aware decision.
-    ///
-    /// The distribution (p50/p90) distinguishes "traffic genuinely has little shared
-    /// prefix" (low match rate) from "routing is breaking affinity" (high match rate
-    /// but low realized cache hit rate downstream).
+    /// Record best-prefix match rate at a cache-aware decision.
     pub fn record_cache_aware_match_rate(rate: f64) {
         histogram!("smg_cache_aware_match_rate").record(rate);
     }
 
-    /// Set the approximate cache footprint (in characters) a model's tree attributes
-    /// to a specific worker (tenant). Exposes per-worker cache skew across the pool.
+    /// Set per-worker cache footprint (characters) for a model.
     pub fn set_cache_aware_tree_chars(model_id: &str, worker: &str, chars: usize) {
         let model = intern_string(model_id);
         let worker_interned = intern_string(worker);

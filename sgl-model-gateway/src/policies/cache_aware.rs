@@ -76,24 +76,14 @@ use crate::{
     observability::metrics::Metrics,
 };
 
-/// Execution branch for cache-aware routing decisions (decision-level observability).
-///
-/// Recorded as a Prometheus counter so operators can answer "why is the cache hit
-/// rate low right now": a high share of `LoadBalance`/`CacheMissMinLoad` while match
-/// rates are high means the affinity-vs-load-balance tension is breaking affinity.
+/// Execution branch for cache-aware routing decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Branch {
-    /// Balanced load + match_rate > threshold: routed to the highest-match worker.
     CacheHit,
-    /// Balanced load + match_rate <= threshold: routed to the least-loaded worker.
     CacheMissMinLoad,
-    /// Load imbalanced: routed to the least-loaded worker (shortest queue).
     LoadBalance,
-    /// Best-match worker was gone/unhealthy: removed stale tenant, used fallback.
     StaleTenantFallback,
-    /// No tree for this model yet: random healthy worker.
     NoTreeRandom,
-    /// No healthy workers available.
     NoHealthyWorkers,
 }
 
@@ -175,10 +165,6 @@ impl CacheAwarePolicy {
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
 
-                        // Emit per-worker cache footprint gauge so operators can see
-                        // cache skew across the pool (a cold worker explains low hits).
-                        // Done in the periodic task to avoid per-request overhead. The
-                        // tree key is "pool::model"; expose the model portion as label.
                         let model_label =
                             tree_key.split_once("::").map(|x| x.1).unwrap_or(tree_key);
                         for (tenant_url, chars) in tree.get_tenant_char_count() {
@@ -418,16 +404,7 @@ impl CacheAwarePolicy {
         Some(min_load_idx)
     }
 
-    /// Emit a per-worker decision snapshot for cache-aware routing.
-    ///
-    /// This is the "decision-level trace" that answers, for a given moment, *which
-    /// candidate worker matched how many prefix characters, what its current load was,
-    /// and which one (and why) was finally selected*. It calls the read-only
-    /// `prefix_match_tenant_len` once per healthy worker, which is O(prefix_len) per
-    /// worker, so it is gated behind DEBUG to avoid per-request overhead on the hot
-    /// path. When a tracing OpenTelemetry layer is active, this structured event is
-    /// captured as a span event with attributes, giving end-to-end per-request
-    /// routing visibility.
+    /// Emit per-worker decision snapshot (DEBUG-gated).
     #[allow(clippy::too_many_arguments)]
     fn emit_decision_snapshot(
         &self,
@@ -444,21 +421,12 @@ impl CacheAwarePolicy {
             return;
         }
 
-        // Tie the snapshot to a request id (best-effort) so it can be correlated
-        // with this request elsewhere in the gateway logs/traces. Note: the engine
-        // does not adopt x-request-id as its rid, so this does NOT by itself join
-        // gateway and engine logs; cross-process correlation still relies on the
-        // W3C trace context (trace_id). Extracted after the DEBUG gate to avoid
-        // any work on the hot path.
         let request_id = headers
             .and_then(|h| h.get("x-request-id"))
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
         let input_chars = text.chars().count();
-        // (worker_url, matched_chars, matched_rate, load) for each candidate.
-        // Use the read-only matcher so observing per-worker scores does not perturb
-        // the approximate tree's LRU eviction order.
         let candidates: Vec<(String, usize, f32, usize)> = healthy_indices
             .iter()
             .map(|&idx| {
@@ -545,7 +513,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            // Cheap, always-on: record the global best-prefix match rate distribution.
             Metrics::record_cache_aware_match_rate(match_rate as f64);
 
             let is_cache_hit = match_rate > self.config.cache_threshold;
@@ -573,8 +540,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     Branch::CacheMissMinLoad
                 };
 
-                // Per-worker decision snapshot (gated behind DEBUG, expensive). Answers
-                // "at this moment, which node matched how much, and why was this picked".
                 self.emit_decision_snapshot(
                     workers,
                     &healthy_indices,
