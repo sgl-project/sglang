@@ -81,12 +81,10 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             stop=stop,
         )
     else:
-        chat_stop = getattr(args, "stop", None)
         sampler = ChatCompletionSampler(
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
-            stop=chat_stop,
         )
 
     # Run eval
@@ -98,8 +96,8 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
 
 def _run_sgl_eval(eval_name, args) -> dict:
-    # Black-box subprocess wrapper around `sgl-eval`. Returns a metrics dict
-    # shaped like run_eval_once's so the existing threshold gate is unchanged.
+    # Returns a metrics dict (score, latency, output_throughput) so the
+    # existing write_results_to_json + threshold gate keep working.
     from sglang.test.test_utils import dump_metric
 
     base_url = (

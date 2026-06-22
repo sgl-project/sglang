@@ -142,7 +142,6 @@ class TestRunSglEval(CustomTestCase):
 
     def test_raises_when_metrics_json_missing(self):
         def fake_run(cmd, **kwargs):
-            # Don't write metrics.json
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as td:
