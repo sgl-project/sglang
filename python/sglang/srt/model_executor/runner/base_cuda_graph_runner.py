@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
@@ -90,6 +91,13 @@ def get_batch_sizes_to_capture(
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
+
+    # DeepEP low_latency caps per-rank dispatch tokens; a decode capture bs above
+    # that cap trips the deep_ep dispatch assertion, so clamp the list to it.
+    if server_args.moe_a2a_backend == "deepep" and server_args.deepep_mode != "normal":
+        deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if max(capture_bs) > deepep_cap:
+            capture_bs = [bs for bs in capture_bs if bs <= deepep_cap]
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
