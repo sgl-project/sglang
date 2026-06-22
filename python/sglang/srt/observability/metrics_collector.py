@@ -1941,6 +1941,24 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
 
+class LogitProcessorCollector(_StatLoggerDIMixin):
+    def __init__(self) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter as _PromCounter
+
+        Counter = self._counter_cls or _PromCounter
+
+        self.repetition_truncation_detected_count = Counter(
+            name="sglang:repetition_truncation_detected_count",
+            documentation="The number of requests the repetition-truncation processor inspected.",
+        )
+
+        self.repetition_truncation_truncated_count = Counter(
+            name="sglang:repetition_truncation_truncated_count",
+            documentation="The number of requests truncated due to detected repetition.",
+        )
+
+
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     """
     Get the histogram configuration from the environment variable.
