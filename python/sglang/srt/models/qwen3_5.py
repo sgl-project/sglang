@@ -401,6 +401,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     @staticmethod
     def _make_conv1d_weight_loader(loader):
+        """Adapt GDN conv1d checkpoints with or without the singleton channel dim.
+
+        Some checkpoints store the depthwise-conv weight as [N, 1, K], while
+        the TP-sharded runtime parameter may be [N, K]. Keep this wrapper
+        limited to that single representation difference before delegating to
+        the real loader, so other shape mismatches still fail normally.
+        """
+
         def weight_loader(param, loaded_weight):
             param_data = param.data
             if (
