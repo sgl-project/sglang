@@ -1269,9 +1269,9 @@ def biased_grouped_topk_gpu(
         _is_cuda 
         and ((
                 _use_fused_moe_gate
-                and gating_output.shape[1] // num_expert_group  <= 32) or (gating_output.shape[1] == 256
+                and experts_per_group  <= 32) or (num_experts == 256
                 and num_expert_group == 1
-            ))  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+            )) 
         and is_power_of_two(num_experts)
     ):
         topk_weights, topk_ids = moe_fused_gate(
