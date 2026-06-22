@@ -880,6 +880,8 @@ class ServerArgs:
     pd_flip_prepare_ack: bool = False
     pd_flip_commit_ack: bool = False
     pd_flip_abort: bool = False
+    enable_pd_runtime_role_switch: bool = False
+    pd_runtime_initial_role: Optional[Literal["prefill", "decode"]] = None
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -940,6 +942,7 @@ class ServerArgs:
         """
 
         self._maybe_download_model_for_runai()
+        self._handle_pd_runtime_role_switch()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
@@ -1124,6 +1127,18 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_pd_runtime_role_switch(self):
+        if not self.enable_pd_runtime_role_switch:
+            return
+
+        initial_role = self.pd_runtime_initial_role or self.disaggregation_mode
+        if initial_role not in ("prefill", "decode"):
+            raise ValueError(
+                "--enable-pd-runtime-role-switch requires --disaggregation-mode "
+                "prefill/decode or --pd-runtime-initial-role"
+            )
+        self.disaggregation_mode = initial_role
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -7433,6 +7448,20 @@ class ServerArgs:
             "The first implementation observes local scheduler state and emits "
             "safe/preparing/flipping transitions; real request/KV migration is "
             "provided by the flip callbacks.",
+        )
+        parser.add_argument(
+            "--enable-pd-runtime-role-switch",
+            action="store_true",
+            default=ServerArgs.enable_pd_runtime_role_switch,
+            help="Enable in-process PD role switching. The initial role is taken "
+            "from --disaggregation-mode unless --pd-runtime-initial-role is set.",
+        )
+        parser.add_argument(
+            "--pd-runtime-initial-role",
+            type=str,
+            choices=["prefill", "decode"],
+            default=ServerArgs.pd_runtime_initial_role,
+            help="Initial active PD role for runtime role switch workers.",
         )
         parser.add_argument(
             "--pd-flip-window-seconds",

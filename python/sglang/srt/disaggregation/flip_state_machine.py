@@ -208,7 +208,8 @@ class FlipStateMachine:
             if needs_migration
             else "none",
             "requires_external_orchestrator": self.direction != FlipDirection.NONE,
-            "can_hot_switch_in_process": False,
+            "can_hot_switch_in_process": True,
+            "requires_process_restart": False,
             "router_action": self._router_action(),
             "last_completed_direction": self.last_completed_direction.value,
             "last_completed_target_role": self._target_role(
