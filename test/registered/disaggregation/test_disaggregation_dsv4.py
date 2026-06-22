@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -46,6 +47,7 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 1.8
