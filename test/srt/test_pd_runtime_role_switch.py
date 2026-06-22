@@ -102,10 +102,32 @@ class TestPDRuntimeRoleSwitch(unittest.TestCase):
         )
         self.assertIn("def set_pd_runtime_role", scheduler)
         self.assertIn("def get_pd_runtime_role_status", scheduler)
+        self.assertIn('"event_loop_dynamic": True', scheduler)
 
         self.assertIn("/pd_flip/runtime_role/status", http_server)
         self.assertIn("/pd_flip/runtime_role/set", http_server)
         self.assertIn("/pd_flip/runtime_role/admission", http_server)
+
+    def test_pd_flip_commit_mutates_runtime_role_when_hot_switch_enabled(self):
+        scheduler = (REPO_ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
+
+        self.assertIn(
+            "if self.pd_runtime_role_switch_enabled():\n            return True",
+            scheduler,
+        )
+        self.assertIn(
+            "if self.pd_runtime_role_switch_enabled():\n            target = (",
+            scheduler,
+        )
+        self.assertIn(
+            '"prefill"\n                if decision.direction == FlipDirection.D_TO_P',
+            scheduler,
+        )
+        self.assertIn(
+            "out = self.set_pd_runtime_role(PDRuntimeRoleSetReq(role=target))",
+            scheduler,
+        )
+        self.assertIn("return out.success", scheduler)
 
 
 if __name__ == "__main__":

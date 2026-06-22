@@ -1259,7 +1259,7 @@ class Scheduler(
                 and hasattr(self, "disagg_decode_transfer_queue")
                 and hasattr(self, "disagg_prefill_bootstrap_queue")
             ),
-            "event_loop_dynamic": False,
+            "event_loop_dynamic": True,
         }
 
     def get_pd_runtime_role_status(
@@ -1533,11 +1533,11 @@ class Scheduler(
         ):
             return False
 
-        # The scheduler event loop is selected from disaggregation_mode at
-        # startup. Keep the node in PREPARING until an external orchestrator
-        # has drained the node, then acks through /set_internal_state.
         if not self.pd_flip_is_idle_for_commit(snapshot):
             return False
+
+        if self.pd_runtime_role_switch_enabled():
+            return True
 
         server_args = get_global_server_args()
         ready = bool(getattr(server_args, "pd_flip_prepare_ack", False))
@@ -1556,6 +1556,15 @@ class Scheduler(
             )
         if not self.pd_flip_is_idle_for_commit(snapshot):
             return False
+
+        if self.pd_runtime_role_switch_enabled():
+            target = (
+                "prefill"
+                if decision.direction == FlipDirection.D_TO_P
+                else "decode"
+            )
+            out = self.set_pd_runtime_role(PDRuntimeRoleSetReq(role=target))
+            return out.success
 
         server_args = get_global_server_args()
         ready = bool(getattr(server_args, "pd_flip_commit_ack", False))
