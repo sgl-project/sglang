@@ -27,15 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,7 +42,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -57,7 +51,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -80,7 +74,6 @@ class GlmImageVisionMLP(nn.Module):
         bias: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.fc1 = ColumnParallelLinear(
@@ -233,7 +226,6 @@ class GlmImageVisionBlock(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -420,42 +412,6 @@ class GlmImageVQVAE(nn.Module):
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    # Keep half or full tensor for later concatenation
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    # Apply rotary embeddings on the first half or full tensor
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    # Concatenate back to full shape
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-    return q_embed, k_embed
 
 
 def apply_glm_image_rotary_pos_emb(
@@ -773,7 +729,6 @@ class GlmImageTextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1009,9 +964,7 @@ class GlmImageTextMLP(nn.Module):
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
         gate_up, _ = self.gate_up_proj(x)
-
         x = self.activation_fn(gate_up)
-
         x, _ = self.down_proj(x)
         return x
 
@@ -1097,26 +1050,19 @@ class GlmImageTextModel(nn.Module):
         config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = GlmImageTextDecoderLayer,
-        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
         self.quant_config = None
 
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
-
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
-                prefix=add_prefix("embed_tokens", prefix),
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            use_attn_tp_group=is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -1136,12 +1082,9 @@ class GlmImageTextModel(nn.Module):
         self,
         input_ids: torch.Tensor | None,
         forward_batch: ForwardBatch,
-        position_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         output_hidden_states = (
             output_hidden_states
@@ -1183,7 +1126,6 @@ class GlmImageForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
         self.config = config
         self.vision_config = config.vision_config
         self.vq_config = config.vq_config
@@ -1230,15 +1172,12 @@ class GlmImageForConditionalGeneration(nn.Module):
             logits_config = self.text_config
 
         # lm_head: maps hidden_size -> vision_vocab_size
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                logits_config.vocab_size,
-                self.text_config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
+        self.lm_head = ParallelLMHead(
+            logits_config.vocab_size,
+            self.text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+        )
 
         self.is_mrope_enabled = (
             hasattr(self.text_config, "rope_scaling")
@@ -1293,50 +1232,12 @@ class GlmImageForConditionalGeneration(nn.Module):
 
         return torch.cat(all_embeds, dim=0)
 
-    def _get_decode_mrope_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Look up pre-computed 2D spatial MRoPE positions during decode.
-
-        Instead of using the default delta-based positions (which are sequential
-        and identical across all 3 dims), this looks up the pre-computed 2D
-        spatial positions stored in each request's MultimodalInputs.mrope_positions.
-        This gives each generated image token the correct (temporal, height, width)
-        coordinates based on its position in the target image grid.
-        """
-        batch_size = forward_batch.batch_size
-        positions_list = []
-        seq_lens = forward_batch.seq_lens_cpu
-
-        for i in range(batch_size):
-            mm_input = forward_batch.mm_inputs[i] if forward_batch.mm_inputs else None
-            seq_len = int(seq_lens[i])
-
-            if mm_input is not None and mm_input.mrope_positions is not None:
-                stored = mm_input.mrope_positions
-                idx = seq_len - 1
-                if idx < stored.shape[1]:
-                    # Look up the pre-computed 2D spatial position
-                    pos = stored[:, idx : idx + 1]
-                else:
-                    # Beyond stored positions: fall back to sequential from last
-                    last_max = stored[:, -1:].max().item()
-                    overflow = idx - stored.shape[1] + 1
-                    pos = torch.full((3, 1), last_max + overflow, dtype=torch.int64)
-            else:
-                pos = torch.full((3, 1), seq_len - 1, dtype=torch.int64)
-            positions_list.append(pos)
-
-        return torch.cat(positions_list, dim=1).to(
-            device=forward_batch.input_ids.device, dtype=torch.int64
-        )
-
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
@@ -1357,18 +1258,14 @@ class GlmImageForConditionalGeneration(nn.Module):
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
-            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-            )
-        else:
-            return hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

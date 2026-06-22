@@ -1026,8 +1026,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len: int,
     ) -> torch.Tensor:
         # Some generation models precompute decode positions for future tokens.
-# For example, GLM-Image needs 2D spatial MRoPE positions instead of
-# sequential delta-based positions.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
         # This is needed for image generation models (e.g. GlmImage) where
         # decode tokens require 2D spatial MRoPE positions, not sequential.
         if (
