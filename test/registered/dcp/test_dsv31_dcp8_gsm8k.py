@@ -60,7 +60,7 @@ register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 _COMMON_SERVER_ARGS = [
-    "--tp",
+    "--tp-size",
     "8",
     "--enable-cache-report",
     "--enable-metrics",
@@ -83,6 +83,15 @@ _COMMON_SERVER_ARGS = [
     "--log-requests",
     "--log-requests-level",
     "3",
+]
+
+_DCP8_ARGS = [
+    "--dcp-size",
+    "8",
+]
+_DCP4_ARGS = [
+    "--dcp-size",
+    "4",
 ]
 
 # Prompts used for logprob parity verification between DCP and non-DCP.
@@ -140,14 +149,11 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
 
     @classmethod
     def setUpClass(cls):
-        env = os.environ.copy()
-        env["SGLANG_DCP_WORLD_SIZE"] = "8"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=_COMMON_SERVER_ARGS,
-            env=env,
+            other_args=_DCP8_ARGS + _COMMON_SERVER_ARGS,
         )
         # Store max_total_num_tokens so we can verify DCP is active.
         # With DCP=8, this value should be ~8x the non-DCP value for the
@@ -217,7 +223,6 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
     def setUpClass(cls):
         # Launch non-DCP baseline server first
         env = os.environ.copy()
-        env["SGLANG_DCP_WORLD_SIZE"] = "1"
         env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         cls._baseline_process = popen_launch_server(
             DEEPSEEK_V31_MODEL_PATH,
@@ -292,13 +297,12 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
         time.sleep(5)
 
         env = os.environ.copy()
-        env["SGLANG_DCP_WORLD_SIZE"] = "8"
         env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         dcp_process = popen_launch_server(
             DEEPSEEK_V31_MODEL_PATH,
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=_COMMON_SERVER_ARGS,
+            other_args=_DCP8_ARGS + _COMMON_SERVER_ARGS,
             env=env,
         )
         self._processes.append(dcp_process)
@@ -389,12 +393,11 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
     @classmethod
     def setUpClass(cls):
         env = os.environ.copy()
-        env["SGLANG_DCP_WORLD_SIZE"] = "4"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=_COMMON_SERVER_ARGS,
+            other_args=_DCP4_ARGS + _COMMON_SERVER_ARGS,
             env=env,
         )
         # Store max_total_num_tokens for DCP activation verification.
