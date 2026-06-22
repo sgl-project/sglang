@@ -2919,7 +2919,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.locked_cache.last_node, req.locked_cache.swa_uuid_for_lock
+                            req.locked_cache.last_node,
+                            req.locked_cache.swa_uuid_for_lock,
                         )
                         req.locked_cache.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
