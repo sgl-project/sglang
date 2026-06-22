@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1152,6 +1153,72 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestGrpcServerArgs(CustomTestCase):
+    """Native gRPC is env-gated (SGLANG_ENABLE_GRPC) and runs alongside HTTP;
+    --smg-grpc (and the deprecated --grpc-mode) select the legacy SMG server.
+
+    The gRPC setup lives in ServerArgs._handle_deprecated_args, which
+    __post_init__ skips for dummy models, so these tests build a dummy
+    ServerArgs and invoke that handler directly (mirroring the real flow for a
+    concrete model path).
+    """
+
+    @staticmethod
+    def _args(**kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_defaults_native_grpc_off_legacy_off(self):
+        sa = self._args()
+        sa._handle_deprecated_args()
+        self.assertFalse(sa.enable_grpc)
+        self.assertFalse(sa.smg_grpc)
+
+    def test_grpc_port_derived_from_http_port(self):
+        sa = self._args(port=30000)
+        sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 40000)
+
+    def test_grpc_mode_is_deprecated_alias_for_smg(self):
+        sa = self._args(grpc_mode=True)
+        with self.assertWarns(DeprecationWarning):
+            sa._handle_deprecated_args()
+        self.assertTrue(sa.smg_grpc)
+
+    def test_env_enables_native_grpc_and_knobs(self):
+        sa = self._args(port=30000)
+        with envs.SGLANG_ENABLE_GRPC.override(True):
+            with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+                sa._handle_deprecated_args()
+        self.assertTrue(sa.enable_grpc)
+        self.assertEqual(sa.grpc_worker_threads, 8)
+        self.assertEqual(sa.grpc_port, 40000)
+
+    def test_native_grpc_rejects_legacy_smg(self):
+        sa = self._args(smg_grpc=True)
+        with envs.SGLANG_ENABLE_GRPC.override(True):
+            with self.assertRaises(ValueError):
+                sa._handle_deprecated_args()
+
+    def test_native_grpc_rejects_multi_tokenizer(self):
+        sa = self._args(tokenizer_worker_num=2)
+        with envs.SGLANG_ENABLE_GRPC.override(True):
+            with self.assertRaises(ValueError):
+                sa._handle_deprecated_args()
+
+    def test_native_grpc_rejects_http_auth(self):
+        sa = self._args(api_key="secret")
+        with envs.SGLANG_ENABLE_GRPC.override(True):
+            with self.assertRaises(ValueError):
+                sa._handle_deprecated_args()
+
+    def test_invalid_grpc_worker_threads_rejected(self):
+        sa = self._args()
+        with envs.SGLANG_ENABLE_GRPC.override(True):
+            with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
+                with self.assertRaises(ValueError):
+                    sa._handle_deprecated_args()
 
 
 if __name__ == "__main__":

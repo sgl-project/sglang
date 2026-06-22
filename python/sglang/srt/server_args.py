@@ -513,6 +513,12 @@ class ServerArgs:
     port: A[int, "The port of the HTTP server."] = 30000
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
     grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
+    smg_grpc: A[
+        bool,
+        "Use the legacy SMG gRPC server. Replaces the deprecated --grpc-mode. "
+        "Distinct from the native gRPC server, which is env-gated via "
+        "SGLANG_ENABLE_GRPC and runs alongside HTTP.",
+    ] = False
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -1585,10 +1591,27 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
+        # --grpc-mode is the legacy SMG gRPC server. It still works but is
+        # deprecated in favor of --smg-grpc; the native gRPC server is a
+        # separate, env-gated path (SGLANG_ENABLE_GRPC) handled below.
+        if self.grpc_mode and not self.smg_grpc:
+            import warnings
+
+            warnings.warn(
+                "--grpc-mode is deprecated and will be removed in a future "
+                "version. Use --smg-grpc for the legacy SMG gRPC server. The "
+                "native gRPC server now starts automatically alongside HTTP.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.smg_grpc = True
+
         # Native gRPC flags — env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
         self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
+        self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
+        self.grpc_max_prefill_tokens = envs.SGLANG_GRPC_MAX_PREFILL_TOKENS.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         self.grpc_port = (
@@ -1599,6 +1622,40 @@ class ServerArgs:
             raise ValueError(
                 f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
             )
+        if self.grpc_worker_threads < 1:
+            raise ValueError(
+                f"SGLANG_GRPC_WORKER_THREADS ({self.grpc_worker_threads}) must be >= 1"
+            )
+
+        # The native gRPC server is incompatible with the legacy SMG server and
+        # with launch paths it does not wire into.
+        if self.enable_grpc:
+            if self.smg_grpc or self.grpc_mode:
+                raise ValueError(
+                    "SGLANG_ENABLE_GRPC (native gRPC) is incompatible with the "
+                    "legacy --smg-grpc/--grpc-mode gRPC server. Pick one."
+                )
+            if self.use_ray:
+                raise ValueError(
+                    "SGLANG_ENABLE_GRPC is not supported with --use-ray: the Ray "
+                    "serve launch path does not start the native gRPC server."
+                )
+            if self.encoder_only:
+                raise ValueError(
+                    "SGLANG_ENABLE_GRPC is not supported with --encoder-only: "
+                    "encoder disaggregation uses its own server."
+                )
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "Native gRPC does not yet support --tokenizer-worker-num > 1. "
+                    "Unset SGLANG_ENABLE_GRPC or set --tokenizer-worker-num 1."
+                )
+            if self.api_key or self.admin_api_key:
+                raise ValueError(
+                    "SGLANG_ENABLE_GRPC is incompatible with --api-key/"
+                    "--admin-api-key: the native gRPC listener bypasses HTTP auth "
+                    "middleware."
+                )
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
