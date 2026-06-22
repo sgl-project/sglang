@@ -29,7 +29,7 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
@@ -209,6 +209,19 @@ impl PDRouter {
             }
         }
         None
+    }
+
+    fn build_chat_cache_request_text(req: &ChatCompletionRequest) -> Option<String> {
+        if req.messages.is_empty() {
+            return None;
+        }
+
+        let mut text = String::new();
+        for message in &req.messages {
+            text.push_str(&serde_json::to_string(message).ok()?);
+            text.push('\n');
+        }
+        Some(text)
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
@@ -1421,22 +1434,10 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
-        } else {
-            None
-        };
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| Self::build_chat_cache_request_text(body))
+            .flatten();
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
@@ -1550,7 +1551,10 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        core::{BasicWorkerBuilder, WorkerType},
+        protocols::chat::{ChatMessage, MessageContent},
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1573,6 +1577,79 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_chat_cache_request_text_includes_all_messages() {
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: MessageContent::Text("system prompt".to_string()),
+                    name: None,
+                },
+                ChatMessage::User {
+                    content: MessageContent::Text("first user turn".to_string()),
+                    name: None,
+                },
+                ChatMessage::Assistant {
+                    content: Some(MessageContent::Text("assistant answer".to_string())),
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: Some("hidden reasoning".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let text = PDRouter::build_chat_cache_request_text(&req).unwrap();
+
+        assert!(text.contains("system prompt"));
+        assert!(text.contains("first user turn"));
+        assert!(text.contains("assistant answer"));
+        assert!(text.contains("hidden reasoning"));
+        assert_eq!(text.lines().count(), 3);
+    }
+
+    #[test]
+    fn test_chat_cache_request_text_preserves_expanding_prefix() {
+        let first_turn = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: MessageContent::Text("system prompt".to_string()),
+                    name: None,
+                },
+                ChatMessage::User {
+                    content: MessageContent::Text("first user turn".to_string()),
+                    name: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut second_turn = first_turn.clone();
+        second_turn.messages.push(ChatMessage::Assistant {
+            content: Some(MessageContent::Text("assistant answer".to_string())),
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        });
+
+        let first_text = PDRouter::build_chat_cache_request_text(&first_turn).unwrap();
+        let second_text = PDRouter::build_chat_cache_request_text(&second_turn).unwrap();
+
+        assert!(second_text.starts_with(&first_text));
+    }
+
+    #[test]
+    fn test_chat_cache_request_text_empty_messages() {
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            ..Default::default()
+        };
+
+        assert!(PDRouter::build_chat_cache_request_text(&req).is_none());
     }
 
     #[tokio::test]
