@@ -455,10 +455,14 @@ class MQALayer(nn.Module):
             **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
+            from sglang.srt.layers import deep_gemm_wrapper
+
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
-            self.wo_a.weight_scale_inv.format_ue8m0 = True
+            self.wo_a.weight_scale_inv.format_ue8m0 = (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1082,12 +1086,16 @@ class MQALayer(nn.Module):
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
+            from sglang.srt.layers import deep_gemm_wrapper
+
             T, G, D = o.shape
             R = self.o_lora_rank
+            scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            recipe = (1, 1, 128) if scale_ue8m0 else (1, 128, 128)
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
-                scale_ue8m0=True,
+                scale_ue8m0=scale_ue8m0,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
@@ -1095,7 +1103,7 @@ class MQALayer(nn.Module):
                 (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
-                recipe=(1, 1, 128),
+                recipe=recipe,
             )
             o = output
         else:
@@ -2049,7 +2057,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
-        from deep_gemm import transform_sf_into_required_layout
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
             layers = [self.model.decoder]
@@ -2065,14 +2076,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
-                raw_scale,
-                mn=R,
-                k=D,
-                recipe=(1, 128, 128),
-                num_groups=G,
-                is_sfa=False,
-            )
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
+                    raw_scale,
+                    mn=R,
+                    k=D,
+                    recipe=(1, 128, 128),
+                    num_groups=G,
+                    is_sfa=False,
+                )
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+            else:
+                attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
+                attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if _FP8_WO_A_GEMM:
