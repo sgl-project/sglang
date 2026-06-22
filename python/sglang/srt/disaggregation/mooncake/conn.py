@@ -1772,7 +1772,12 @@ class MooncakeKVSender(CommonKVSender):
                 + self.kv_mgr.pp_rank * self.kv_mgr.attn_cp_size
                 + self.kv_mgr.attn_cp_rank
             )
-            for transfer_info in list(transfer_infos.values()):
+            try:
+                target_infos = list(transfer_infos.values())
+            except RuntimeError:
+                target_infos = []
+
+            for transfer_info in target_infos:
                 if transfer_info.is_dummy:
                     continue
                 try:
