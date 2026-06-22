@@ -1088,10 +1088,6 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        if self._use_ascend_fuseep:
-            from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
-
-            return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
