@@ -183,46 +183,17 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            head_slice = None
-            if kv_cache.k.shape[2] != roped_key.shape[2]:
-                head_slice = slice(self.head_start, self.head_start + self.num_heads)
-                cache_key = roped_key.new_zeros(
-                    roped_key.shape[0],
-                    roped_key.shape[1],
-                    kv_cache.k.shape[2],
-                    roped_key.shape[3],
-                )
-                cache_value = v.new_zeros(
-                    v.shape[0],
-                    v.shape[1],
-                    kv_cache.v.shape[2],
-                    v.shape[3],
-                )
-                cache_key[:, :, head_slice, :] = roped_key
-                cache_value[:, :, head_slice, :] = v
-            else:
-                cache_key = roped_key
-                cache_value = v
-            cache_view = kv_cache.update_and_get_attention_kv(
-                key=cache_key,
-                value=cache_value,
+            cache_view = kv_cache.update_and_get_attention_kv_for_local_heads(
+                key=roped_key,
+                value=v,
                 current_chunk_start=current_start,
+                local_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
-            )
-            key = (
-                cache_view.k[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.k
-            )
-            value = (
-                cache_view.v[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.v
             )
             x = self.attn(
                 roped_query,
-                key,
-                value,
+                cache_view.k,
+                cache_view.v,
             )
 
         return x

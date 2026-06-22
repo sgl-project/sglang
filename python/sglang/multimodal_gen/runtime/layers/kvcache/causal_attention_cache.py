@@ -220,6 +220,61 @@ class CausalSelfAttentionKVCache:
             visible_global_end=updated_global_end,
         )
 
+    def update_and_get_attention_kv_for_local_heads(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        current_chunk_start: int,
+        local_head_start: int | None = None,
+        debug_name: str = "causal KV cache",
+    ) -> CausalAttentionKVView:
+        """write local-head kv into a full-head cache and return the local-head view"""
+        if self.k.shape[2] == key.shape[2]:
+            return self.update_and_get_attention_kv(
+                key=key,
+                value=value,
+                current_chunk_start=current_chunk_start,
+                debug_name=debug_name,
+            )
+
+        if local_head_start is None:
+            raise ValueError(
+                f"{debug_name} requires local_head_start when cache heads "
+                f"({self.k.shape[2]}) differ from input heads ({key.shape[2]})."
+            )
+
+        local_head_slice = slice(local_head_start, local_head_start + key.shape[2])
+        cache_key = key.new_zeros(
+            key.shape[0],
+            key.shape[1],
+            self.k.shape[2],
+            key.shape[3],
+        )
+        cache_value = value.new_zeros(
+            value.shape[0],
+            value.shape[1],
+            self.v.shape[2],
+            value.shape[3],
+        )
+        cache_key[:, :, local_head_slice, :] = key
+        cache_value[:, :, local_head_slice, :] = value
+
+        cache_view = self.update_and_get_attention_kv(
+            key=cache_key,
+            value=cache_value,
+            current_chunk_start=current_chunk_start,
+            debug_name=debug_name,
+        )
+        return CausalAttentionKVView(
+            k=cache_view.k[:, :, local_head_slice, :],
+            v=cache_view.v[:, :, local_head_slice, :],
+            local_start_index=cache_view.local_start_index,
+            local_end_index=cache_view.local_end_index,
+            visible_local_end=cache_view.visible_local_end,
+            visible_global_end=cache_view.visible_global_end,
+        )
+
 
 @dataclass(slots=True)
 class CrossAttentionKVCache:
