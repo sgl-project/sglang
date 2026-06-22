@@ -28,7 +28,8 @@ class TorchNpuDispatchOutput(NamedTuple):
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
-    topk_output: TopKOutput
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
     expanded_row_idx: torch.Tensor
     expert_tokens: torch.Tensor
     group_list_type: int
@@ -99,6 +100,9 @@ class TorchNpuDispatcher(BaseDispatcher):
         No longer needs to distinguish prefill vs decode because the same
         routing kernels are used for both phases.
         """
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        topk_weights = topk_weights.to(hidden_states.dtype)
+        topk_ids = topk_ids.to(torch.int32)
         (
             permuted_hidden_states,
             expanded_row_idx,
@@ -106,14 +110,15 @@ class TorchNpuDispatcher(BaseDispatcher):
             hidden_states_scale,
         ) = self.init._init_routing(
             hidden_states,
-            topk_output.topk_ids.to(torch.int32),
+            topk_ids,
             self.num_experts,
         )
 
         self._dispatch_output = TorchNpuDispatchOutput(
             hidden_states=permuted_hidden_states,
             hidden_states_scale=hidden_states_scale,
-            topk_output=topk_output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
@@ -131,9 +136,9 @@ class TorchNpuDispatcher(BaseDispatcher):
         dispatch_out = self._dispatch_output
         final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
-            topk_weights=dispatch_out.topk_output.topk_weights.to(combine_input.hidden_states.dtype),
+            topk_weights=dispatch_out.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
-            topk_ids=dispatch_out.topk_output.topk_ids.to(torch.int32),
+            topk_ids=dispatch_out.topk_ids,
         )
 
         self._dispatch_output = None
