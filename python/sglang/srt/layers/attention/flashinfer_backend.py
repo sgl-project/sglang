@@ -730,6 +730,9 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_draft_extend_v2()
             and self.prefill_backend == "fa2"
+            # Host-rebuilt layout only matches full attention (single wrapper);
+            # SWA/cross-attn keep the plain plan().
+            and self.dispatch_reason is None
         ):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
