@@ -184,7 +184,11 @@ Eight of the nine published repos live under `lmsys/*`. The FLUX.2 NVFP4 entry
 keeps the official `black-forest-labs/FLUX.2-dev-NVFP4` repo, and the
 Qwen-Image NVFP4 entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` layout once
 that repo is published. Qwen-Image-2512 has been validated from a local
-ModelOpt export with the same loader path.
+ModelOpt export with the same loader path. Qwen-Image-Edit,
+Qwen-Image-Edit-2509, and Qwen-Image-Edit-2511 were also validated from local
+ModelOpt exports, but the active ModelOpt PR currently exposes them through a
+local wrapper over the `qwen-image` model type rather than a separate public
+CLI model type.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -280,19 +284,19 @@ ModelOpt export with the same loader path.
     </tr>
     <tr>
       <td><code>NVFP4</code></td>
-      <td><code>Qwen/Qwen-Image</code>, <code>Qwen/Qwen-Image-2512</code></td>
+      <td><code>Qwen/Qwen-Image</code>, <code>Qwen/Qwen-Image-2512</code>, and local <code>Qwen-Image-Edit*</code> exports</td>
       <td><code>--model-path</code></td>
       <td><code>nvidia/Qwen-Image-NVFP4</code> for the base model once published, or a local ModelOpt export</td>
-      <td>full-model NVFP4 local repo load + generation</td>
-      <td>full diffusers repo loaded directly; export keeps <code>img_mod</code>/<code>txt_mod</code> (and blocks 0/1/58/59 plus <code>img_in</code>/<code>txt_in</code>/<code>time_text_embed</code>/<code>norm_out</code>/<code>proj_out</code>) in BF16; on B200, <code>flashinfer_cutlass</code> is the faster FP4 backend at high resolutions such as 2048x2048</td>
+      <td>full-model NVFP4 local repo load + T2I/TI2I generation</td>
+      <td>full diffusers repo loaded directly; export keeps <code>img_mod</code>/<code>txt_mod</code> (and blocks 0/1/58/59 plus <code>img_in</code>/<code>txt_in</code>/<code>time_text_embed</code>/<code>norm_out</code>/<code>proj_out</code>) in BF16; on B200, <code>flashinfer_cutlass</code> is the faster FP4 backend at high resolutions such as 2048x2048. Qwen-Image-Edit-2509 required a BFloat16 ModelOpt export to avoid FP16 multi-image calibration NaNs. Qwen-Image-Layered is not included in this row because its CLI smoke currently fails output-count/grouped-request validation after denoising.</td>
     </tr>
   </tbody>
 </table>
 
 The published NVFP4 checkpoints are used by the B200 diffusion CI job
 (`multimodal-gen-test-1-b200`). The Qwen-Image NVFP4 row was validated on B200
-from local ModelOpt exports and should be added there after a hosted checkpoint
-is visible to CI.
+from local ModelOpt exports and should be added there after hosted checkpoints
+are visible to CI.
 
 ## ModelOpt FP8
 
