@@ -23,13 +23,17 @@ from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
 
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _tgemm = None
 if _use_aiter:
@@ -341,7 +345,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(nn.Module):
+class Compressor(MultiPlatformOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -369,6 +373,7 @@ class Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
         )
+        set_weight_attrs(self.ape, {"weight_loader": self.load_ape_weight})
         wkv_gate_dtype = torch.bfloat16
         self.wkv_gate = ReplicatedLinear(
             self.dim,
@@ -386,18 +391,26 @@ class Compressor(nn.Module):
 
         self.ape_converted = False
 
-    def apply_ape_hotfix(self):
-        assert not self.ape_converted
+    def _apply_ape_hotfix(self):
         self.ape_converted = True
+
+        if _is_npu:
+            return
 
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-        if _use_aiter:
-            self.ape.data = self.ape.data.to(torch.bfloat16)
-            self.norm.weight.data = self.norm.weight.data.to(torch.bfloat16)
+    def apply_ape_hotfix(self):
+        assert not self.ape_converted
+        self._apply_ape_hotfix()
+
+    def load_ape_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param is self.ape
+        assert loaded_weight.shape == param.shape
+        param.data.copy_(loaded_weight)
+        self._apply_ape_hotfix()
 
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
@@ -421,17 +434,17 @@ class Compressor(nn.Module):
         if dsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
-                get_attention_cp_size(),
+                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
         return kv_score
 
-    def forward(
+    def forward_native(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: AttentionBackend,
+        attn_backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
@@ -454,6 +467,26 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        if dsa_use_prefill_cp(forward_batch):
+            x = cp_all_gather_rerange_output(
+                x,
+                get_attention_cp_size(),
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        return get_attn_backend().forward_compress(self, x, forward_batch)
 
 
 if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():

@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import uuid
 from typing import Any, List, Optional
@@ -12,8 +13,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -28,6 +29,26 @@ except ImportError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
+    """Split NIXL FILE storage directory config into ordered unique paths."""
+    if not raw:
+        return []
+    candidates = [path.strip() for path in raw.split(",")]
+    candidates = [path for path in candidates if path]
+    seen: dict[str, str] = {}
+    ordered: List[str] = []
+    for path in candidates:
+        real_path = os.path.realpath(path)
+        if real_path in seen:
+            raise ValueError(
+                "SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR contains duplicate "
+                f"path {path!r} (same mount as {seen[real_path]!r})."
+            )
+        seen[real_path] = path
+        ordered.append(path)
+    return ordered
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -49,9 +70,11 @@ class HiCacheNixl(HiCacheStorage):
         use_direct_io = nixlconfig.get_use_direct_io()
 
         # Might be better to be unified across HiCache backends and moved to HiCacheController
-        file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        storage_dirs = _parse_storage_dirs(
+            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        )
         self.file_manager = (
-            NixlFileManager(file_path, use_direct_io=use_direct_io)
+            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )

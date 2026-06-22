@@ -39,20 +39,18 @@ if TYPE_CHECKING:
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp8MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp8MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp8_block_scale_moe_lora_finalize,
         trtllm_fp8_block_scale_routed_moe_lora,
     )
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-    )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -160,7 +158,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = fused_pack_topk(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -302,11 +300,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp4MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     """NVFP4 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
     Decomposed (unfused-activation) MoE-LoRA: routing -> gather -> gate_up grouped
@@ -318,8 +316,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
         fused_experts_none_to_flashinfer_trtllm_fp4,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
@@ -397,7 +395,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+    packed_topk_ids = fused_pack_topk(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )

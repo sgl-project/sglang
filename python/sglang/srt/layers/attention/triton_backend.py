@@ -7,17 +7,18 @@ import torch
 import triton
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -28,6 +29,7 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
+    is_gfx95_supported,
     is_gfx942_supported,
     next_power_of_2,
 )
@@ -107,6 +109,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+            verify_splitkv_fwd,
+        )
 
         super().__init__()
 
@@ -116,6 +121,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
+        # Split-KV EAGLE-verify kernel (ROCm/Triton). Registered here; enabled
+        # below once topk is known (the path is only valid at topk == 1).
+        self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -130,12 +138,27 @@ class TritonAttnBackend(AttentionBackend):
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # Split-KV verify matches extend_attention_fwd only when the EAGLE tree
+        # reduces to a pure-causal chain, i.e. topk == 1 (the same condition the
+        # aiter backend's unified-verify uses). For topk > 1 the tree custom_mask
+        # is not causal, so leave the path off and fall back to the baseline.
+        # gfx95-only (MI350X/CDNA4): the kernel uses ROCm/CDNA Triton launch hints
+        # (waves_per_eu, matrix_instr_nonkdim) and its block config is tuned and
+        # validated only on gfx950. NVIDIA's Triton rejects those kwargs, and the
+        # path is unvalidated on NV and on other AMD archs, so restrict it to gfx95
+        # and fall back to extend_attention_fwd everywhere else.
+        self.use_verify_splitkv = (
+            is_gfx95_supported()
+            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
+            and self.topk == 1
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
         # The decode triton kernel derives attn_lse offsets from attn_logits
         # strides via integer division by v_head_dim (the "// Lv" trick in
@@ -454,31 +477,25 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        if forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
-            # Triton extend kernel receives extend K/V as separate tensors, so
-            # kv_indptr/kv_indices must cover only the prefix portion.
-            # extend_seq_lens_tensor is only attached to spec_info at real
-            # replay (eagle_draft_extend_cuda_graph_runner.replay); during the
-            # capture-time warmup it's absent, so fall back to zeros (matches
-            # the pre-unification capture path in #26651). Clamp at 0 because
-            # padded rows (raw_bs..bs) leave seq_lens at the fill value (1)
-            # while extend_seq_lens stays at num_tokens_per_bs, which would
-            # otherwise produce negative kv_lens; padded rows reference
-            # reserved req-pool slot 0 and their output is discarded.
-            if (
-                spec_info is not None
-                and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
-            ):
-                extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
-            else:
-                extend_seq_lens = torch.zeros(
-                    bs, dtype=torch.int32, device=seq_lens.device
-                )
-            kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(torch.int32)
+        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+        # Triton extend kernel receives extend K/V as separate tensors, so
+        # kv_indptr/kv_indices must cover only the prefix portion.
+        # extend_seq_lens_tensor is only attached to spec_info at real
+        # replay (eagle_draft_extend_cuda_graph_runner.replay); during the
+        # capture-time warmup it's absent, so fall back to zeros (matches
+        # the pre-unification capture path in #26651). Clamp at 0 because
+        # padded rows (raw_bs..bs) leave seq_lens at the fill value (1)
+        # while extend_seq_lens stays at num_tokens_per_bs, which would
+        # otherwise produce negative kv_lens; padded rows reference
+        # reserved req-pool slot 0 and their output is discarded.
+        if (
+            spec_info is not None
+            and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
+        ):
+            extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
         else:
-            # DRAFT_EXTEND_V1: seq_lens = prefix only.
-            kv_lens = seq_lens
+            extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=seq_lens.device)
+        kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(torch.int32)
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
@@ -693,32 +710,6 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
 
-        elif forward_batch.forward_mode.is_draft_extend():
-            # Eager only (CG replay bypasses init); explicit D2H here instead of
-            # letting torch.empty inside generate_attn_arg_prefill .item() on a
-            # GPU cumsum tensor.
-            seq_lens_sum = (
-                forward_batch.seq_lens_sum
-                if forward_batch.seq_lens_sum is not None
-                else int(forward_batch.seq_lens.sum())
-            )
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    seq_lens_sum,
-                    self.req_to_token,
-                )
-            )
-            kv_indices = kv_indices.to(torch.int64)
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accept_tokens_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
         else:
             # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
             # from GPU tensor, extra tail unused).
@@ -944,7 +935,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1000,7 +991,7 @@ class TritonAttnBackend(AttentionBackend):
             self._update_target_verify_buffers(
                 bs, seq_lens, req_pool_indices, spec_info
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(
                 bs, seq_lens, req_pool_indices, forward_mode, spec_info
             )
@@ -1036,7 +1027,10 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
     ):
         # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
+        attn_out = getattr(forward_batch, "_attn_output", None)
+        if attn_out is not None:
+            o = attn_out
+        elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
@@ -1125,6 +1119,43 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
+        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
+        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
+        # returns True if it ran (o written), or False for any case it cannot
+        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
+        # sliding-window / ragged / topk>1), so we fall through to
+        # extend_attention_fwd below. Correctness is never at risk.
+        if (
+            self.use_verify_splitkv
+            and forward_batch.forward_mode.is_target_verify()
+            and self.verify_splitkv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+                max_bs=self.req_to_token_pool.size,
+            )
+        ):
+            return o
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1418,7 +1449,7 @@ class TritonMultiStepDraftBackend:
             )
         self.max_context_len = self.attn_backends[0].max_context_len
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices

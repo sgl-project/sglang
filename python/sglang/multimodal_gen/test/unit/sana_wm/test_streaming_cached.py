@@ -241,7 +241,9 @@ HFFN, WFFN = S, 1  # S spatial tokens per frame
 
 def _ffn():
     m = GLUMBConvTemp(C_FFN, HID, t_kernel_size=3).double().eval()
-    with torch.no_grad():  # zero-init t_conv -> randomize for a non-trivial temporal filter
+    with (
+        torch.no_grad()
+    ):  # zero-init t_conv -> randomize for a non-trivial temporal filter
         m.t_conv.weight.copy_(torch.randn_like(m.t_conv.weight))
     return m
 

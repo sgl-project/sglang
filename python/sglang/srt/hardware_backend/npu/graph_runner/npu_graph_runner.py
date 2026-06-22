@@ -35,7 +35,11 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import numpy as np
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
@@ -108,7 +112,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
-            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            arch
+            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
 
@@ -201,13 +206,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if forward_batch.needs_forward_metadata_init():
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
@@ -230,7 +235,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
+        if not (
+            is_deepseek_dsa(self.model_runner.model_config.hf_config)
+            or is_deepseek_v4(self.model_runner.model_config.hf_config)
+        ):
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
@@ -241,8 +249,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
-                attr_name=self.attr_name[AttentionArch.MLA],
-                attr_type=self.attr_type[AttentionArch.MLA],
+                attr_name=self._get_update_attr_name(),
+                attr_type=self._get_update_attr_type(),
             )
         else:
             output = self.backend.replay(graph_key, forward_batch)
