@@ -273,13 +273,9 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if (
         get_moe_a2a_backend().is_mori()
         or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_ascend_fuseep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
     ):
         return DeepEPMoE
-    if get_moe_a2a_backend().is_ascend_fuseep():
-        # ascend_fuseep bypasses dispatch/combine inside FusedMoE.forward
-        # (see forward_fuseep in hardware_backend/npu/moe/fuseep.py).
-        return FusedMoE
-
     return FusedMoE
