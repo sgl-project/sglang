@@ -116,18 +116,18 @@ class SessionSlot:
         # (is_first) `req.cache = None`, instead of the copy.copy above and the
         # field-level nulling below. Kept as-is to preserve original behavior.
         req.req_pool_idx = None
-        req.mamba_pool_idx = None
-        req.mamba_ping_pong_track_buffer = None
-        req.mamba_next_track_idx = None
-        req.mamba_last_track_seqlen = None
-        req.mamba_branching_seqlen = None
+        req.mamba.mamba_pool_idx = None
+        req.mamba.mamba_ping_pong_track_buffer = None
+        req.mamba.mamba_next_track_idx = None
+        req.mamba.mamba_last_track_seqlen = None
+        req.mamba.mamba_branching_seqlen = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.req_pool_idx = self.req_pool_idx
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
-        req.swa_uuid_for_lock = self.cache.swa_uuid_for_lock
+        req.cache.swa_uuid_for_lock = self.cache.swa_uuid_for_lock
         req.mamba = copy.copy(self.mamba)
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
@@ -321,10 +321,10 @@ class StreamingSession(BasePrefixCache):
                 self.slots[session_id] = slot
                 # the abort fall-through doesn't double-free.
                 # TODO: with real move semantics this would be `req.mamba = None`.
-                req.mamba_pool_idx = None
-                req.mamba_ping_pong_track_buffer = None
+                req.mamba.mamba_pool_idx = None
+                req.mamba.mamba_ping_pong_track_buffer = None
             slot.kv.kv_allocated_len = max(
-                slot.kv.kv_allocated_len, req.kv_allocated_len
+                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
             )
             self.release_session(session_id)
             req.req_pool_idx = None
@@ -532,9 +532,9 @@ class StreamingSession(BasePrefixCache):
         slot.kv.kv_allocated_len = prefix_len
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv_allocated_len = prefix_len
+        req.kv.kv_allocated_len = prefix_len
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Trim slot KV to finished_len boundary. Spec v2 may overshoot
@@ -543,10 +543,10 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
-        req.kv_allocated_len = min(req.kv_allocated_len, target)
+        self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
+        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:

@@ -455,7 +455,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.cache.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -465,7 +465,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=radix_key,
                     value=values,
                     prev_prefix_len=old_prefix_len,
-                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                    swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
                 )
             )
         else:
@@ -478,11 +478,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.cache.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            skip_swa=req.cache.swa_prefix_lock_released,
         )
-        req.swa_prefix_lock_released = False
+        req.cache.swa_prefix_lock_released = False
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -504,7 +504,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.cache.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -531,14 +531,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        req.cache_protected_len = len(new_indices)
+        req.cache.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.cache.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            skip_swa=req.cache.swa_prefix_lock_released,
         )
-        req.swa_prefix_lock_released = False
+        req.cache.swa_prefix_lock_released = False
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -549,8 +549,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
-        req.last_node = new_last_node
-        req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.cache.last_node = new_last_node
+        req.cache.swa_uuid_for_lock = swa_uuid_for_lock
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
