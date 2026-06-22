@@ -35,7 +35,7 @@ concurrency:
 jobs:
   nightly-xpu-1-gpu:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: intel-bmg
+    runs-on: intel-bmg-nightly
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
