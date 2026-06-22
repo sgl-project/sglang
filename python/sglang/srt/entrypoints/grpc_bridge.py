@@ -18,13 +18,11 @@ from pydantic import ValidationError
 logger = logging.getLogger(__name__)
 
 
+class _BadOpenAIRequest(ValueError):
+    pass
+
+
 class _CaseInsensitiveHeaders:
-    """Minimal read-only header view with case-insensitive lookup.
-
-    Mirrors the only Starlette ``Headers`` surface the OpenAI serving classes
-    use (``.get(name)``), without importing Starlette or FastAPI.
-    """
-
     __slots__ = ("_data",)
 
     def __init__(self, headers: Optional[Dict[str, str]] = None):
@@ -34,18 +32,8 @@ class _CaseInsensitiveHeaders:
         return self._data.get(name.lower(), default)
 
 
-class MockRequest:
-    """Stand-in for ``fastapi.Request`` when serving classes are called from gRPC.
-
-    Implements the three surfaces the OpenAI serving classes actually touch:
-      * ``headers.get(name)`` — case-insensitive, matches HTTP semantics
-      * ``state.<attr>`` — attribute namespace for downstream mutations
-      * ``await is_disconnected()`` — client-cancellation probe
-
-    ``is_disconnected_fn`` is an optional sync callable the Rust side can pass
-    that reads its Tonic ``CancellationToken``. When omitted, the request is
-    treated as always-connected (current Rust behaviour).
-    """
+class _GrpcRequest:
+    """Small FastAPI Request shim used by OpenAIServing* and TokenizerManager."""
 
     def __init__(
         self,
@@ -85,98 +73,84 @@ class RuntimeHandle:
 
         self._openai_serving_classes = None
 
-        # Ensure the handle_loop task exists before any gRPC RPC is dispatched.
-        # auto_create_handle_loop is idempotent (no-op if the loop is already
-        # running) and uses get_or_create_event_loop on the calling thread, so
-        # constructing RuntimeHandle from the launcher's main thread pins the
-        # loop where handle_loop's signal handlers expect it.
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
 
     @property
     def _tm_loop(self):
-        """Return the tokenizer_manager's event loop.
-
-        Communicator-based async methods (flush_cache, get_load, etc.) use
-        asyncio.Event internally, which only works within a single event
-        loop. These must run on the same loop as handle_loop(), i.e. the
-        tokenizer_manager's event_loop. Cached at construction time so RPCs
-        never race the loop's creation.
-        """
+        """Return the TokenizerManager loop used by communicator RPCs."""
         return self._event_loop
 
     def _safe_callback(self, chunk_callback, payload, **kwargs):
-        """Invoke chunk_callback swallowing exceptions; returns the status it returned, or None on failure.
-
-        The Rust callbacks return ``ChunkSendStatus`` (Ready/Pending/Closed);
-        callers that care about backpressure should use
-        ``_send_with_backpressure`` instead, which awaits on Pending.
-        """
+        """Invoke a Rust callback and return its ChunkSendStatus, if any."""
         try:
             return chunk_callback(payload, **kwargs)
         except Exception as e:
-            # Most often: Rust receiver dropped (client disconnect, channel
-            # closed). Log at warning so it's visible without spamming on
-            # every normal cancellation.
             logger.warning("gRPC chunk_callback failed: %s", e)
             return None
 
-    # Generous ceiling so a Rust-side close that fails to fire on_ready
-    # (only possible when the channel closes during a parked send) doesn't
-    # deadlock the stream coroutine forever. Legitimate slow clients can
-    # easily take seconds per chunk, so this is a stuck-stream backstop, not
-    # a normal pacing knob.
+    def _send_native_error(self, chunk_callback, message: str):
+        # ChunkCallback extracts the PyDict arg before reading error=.
+        return self._safe_callback(chunk_callback, {}, finished=True, error=message)
+
     _BACKPRESSURE_TIMEOUT_S = 300.0
 
     @staticmethod
     def _is_pending_status(status) -> bool:
-        # ChunkSendStatus is a Rust pyclass enum with eq_int, so name-based
-        # comparison via the variant on the value's type works regardless of
-        # discriminant values.
         return status is not None and status == type(status).Pending
 
     @staticmethod
     def _is_closed_status(status) -> bool:
         return status is not None and status == type(status).Closed
 
+    def _abort_request_id(self, rid) -> None:
+        if isinstance(rid, list):
+            for single_rid in rid:
+                self.tokenizer_manager.abort_request(rid=single_rid)
+        else:
+            self.tokenizer_manager.abort_request(rid=rid)
+
     async def _send_with_backpressure(
         self,
         chunk_callback,
         ready_event: Optional[asyncio.Event],
         payload,
+        *,
+        timeout_abort_rid=None,
         **kwargs,
     ) -> bool:
-        """Send one chunk and honor ChunkSendStatus backpressure.
-
-        Returns True if the caller should keep producing, False if the Rust
-        side reported the channel closed (or the call itself failed).
-        ``ready_event`` may be None if the callback doesn't support
-        set_on_ready (test stubs); in that case Pending is treated as
-        Ready — best-effort, not crash.
-        """
         status = self._safe_callback(chunk_callback, payload, **kwargs)
         if status is None or self._is_closed_status(status):
             return False
-        if self._is_pending_status(status) and ready_event is not None:
-            try:
-                await asyncio.wait_for(
-                    ready_event.wait(), timeout=self._BACKPRESSURE_TIMEOUT_S
-                )
-            except asyncio.TimeoutError:
+        if not self._is_pending_status(status):
+            return True
+
+        if kwargs.get("finished"):
+            return True
+        if ready_event is None:
+            return True
+
+        try:
+            await asyncio.wait_for(
+                ready_event.wait(), timeout=self._BACKPRESSURE_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            if timeout_abort_rid is not None:
+                self._abort_request_id(timeout_abort_rid)
                 logger.warning(
-                    "gRPC chunk backpressure wait timed out after %ss; aborting stream",
+                    "gRPC chunk backpressure wait timed out after %ss; aborted request",
                     self._BACKPRESSURE_TIMEOUT_S,
                 )
-                return False
-            ready_event.clear()
+            else:
+                logger.warning(
+                    "gRPC chunk backpressure wait timed out after %ss; closing stream",
+                    self._BACKPRESSURE_TIMEOUT_S,
+                )
+            return False
+        ready_event.clear()
         return True
 
     def _install_on_ready(self, chunk_callback) -> Optional[asyncio.Event]:
-        """Register an on_ready hook on ``chunk_callback`` that wakes a TM-loop Event.
-
-        Returns the event, or None if the callback doesn't expose
-        set_on_ready (e.g. unit-test stub) so callers can no-op gracefully.
-        """
         set_on_ready = getattr(chunk_callback, "set_on_ready", None)
         if set_on_ready is None:
             return None
@@ -184,15 +158,13 @@ class RuntimeHandle:
         loop = self._tm_loop
 
         def _on_ready() -> None:
-            # Fired from a Tokio thread under the GIL; bounce onto the TM
-            # loop so the awaiting coroutine wakes safely.
             loop.call_soon_threadsafe(ready_event.set)
 
         try:
             set_on_ready(_on_ready)
         except Exception as e:
             logger.warning("gRPC set_on_ready failed: %s", e)
-            return None
+            raise
         return ready_event
 
     @staticmethod
@@ -211,10 +183,6 @@ class RuntimeHandle:
 
     @staticmethod
     def _log_unhandled_future_exception(future) -> None:
-        # All RuntimeHandle coroutines wrap their bodies in try/except and
-        # route errors through chunk_callback, so this is a defence in depth:
-        # if anything ever escapes (or a new caller forgets the wrap), we
-        # surface it instead of silently hanging the gRPC stream.
         try:
             future.result()
         except Exception as e:
@@ -232,14 +200,6 @@ class RuntimeHandle:
         *,
         error_payload_fn: Optional[Callable[[Exception], Any]] = None,
     ) -> None:
-        """Schedule a unary op whose result is JSON-encoded and sent via chunk_callback.
-
-        ``payload_coro_factory`` is a zero-arg callable returning a coroutine
-        that awaits the operation and returns the success payload (dict/list).
-        ``error_payload_fn`` maps a caught exception to the payload sent on
-        the error path; defaults to ``{"error": {"message": str(e)}}``,
-        matching the OpenAI passthrough error shape.
-        """
         error_fn = error_payload_fn or (lambda e: {"error": {"message": str(e)}})
 
         async def _run() -> None:
@@ -305,22 +265,8 @@ class RuntimeHandle:
         chunk_callback,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
-        """Submit a generate or embed request from a pre-built dict.
-
-        The Rust gRPC server builds ``req_dict`` directly from proto fields,
-        mapping them to GenerateReqInput / EmbeddingReqInput field names.
-        Python just does ``**dict`` unpacking - no JSON parsing needed.
-
-        Args:
-            req_type: "generate" or "embed" (classify uses "embed").
-            req_dict: Dict matching the dataclass constructor kwargs.
-            chunk_callback: Rust-side PyO3 callback object.
-            is_disconnected_fn: Optional sync callable wrapping the Rust
-                cancellation token; lets TokenizerManager abort the request
-                when the gRPC client drops.
-        """
         mock_request = (
-            MockRequest(is_disconnected_fn=is_disconnected_fn)
+            _GrpcRequest(is_disconnected_fn=is_disconnected_fn)
             if is_disconnected_fn is not None
             else None
         )
@@ -343,11 +289,9 @@ class RuntimeHandle:
             )
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
-        # ChunkCallback expects a PyDict positional arg; even error chunks
-        # send {} (the body is ignored when error= is set, but pyo3 still
-        # extracts the dict before dispatching).
-        ready_event = self._install_on_ready(chunk_callback) if stream else None
+        ready_event = None
         try:
+            ready_event = self._install_on_ready(chunk_callback) if stream else None
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 async for chunk in gen:
@@ -355,7 +299,11 @@ class RuntimeHandle:
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
                     keep_going = await self._send_with_backpressure(
-                        chunk_callback, ready_event, chunk, finished=finished
+                        chunk_callback,
+                        ready_event,
+                        chunk,
+                        finished=finished,
+                        timeout_abort_rid=obj.rid,
                     )
                     if finished or not keep_going:
                         return
@@ -368,7 +316,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
+            self._send_native_error(chunk_callback, str(e))
         finally:
             if stream:
                 self._uninstall_on_ready(chunk_callback)
@@ -382,7 +330,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
+            self._send_native_error(chunk_callback, str(e))
 
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
@@ -423,7 +371,6 @@ class RuntimeHandle:
         self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def get_model_info(self) -> str:
-        """Return model info as a JSON string."""
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
@@ -436,16 +383,11 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        """Return server info as a JSON string."""
-        # dataclasses.asdict only walks declared fields, so dynamic attrs like
-        # ServerArgs.model_config (set lazily by get_model_config) are
-        # excluded automatically.
         result: Dict[str, Any] = dict(dataclasses.asdict(self.server_args))
         result.update(self.scheduler_info)
         return json.dumps(result, default=str)
 
     def health_check(self) -> bool:
-        """Return True if the server is healthy."""
         from sglang.srt.managers.tokenizer_manager import ServerStatus
 
         if self.tokenizer_manager.gracefully_exit:
@@ -456,7 +398,6 @@ class RuntimeHandle:
         )
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
-        """Tokenize text and return result as JSON string."""
         tokenizer = self.tokenizer_manager.tokenizer
         tokens = tokenizer.encode(text, add_special_tokens=add_special_tokens)
         result = {
@@ -468,13 +409,11 @@ class RuntimeHandle:
         return json.dumps(result)
 
     def detokenize(self, tokens: List[int]) -> str:
-        """Detokenize token IDs and return result as JSON string."""
         tokenizer = self.tokenizer_manager.tokenizer
         text = tokenizer.decode(tokens)
         return json.dumps({"text": text})
 
     def list_models(self) -> str:
-        """Return the list of served models as JSON string."""
         served_model_name = self.tokenizer_manager.served_model_name
         models = [
             {
@@ -498,17 +437,13 @@ class RuntimeHandle:
         return json.dumps(models)
 
     def get_load(self, chunk_callback, dp_rank: Optional[int] = None) -> None:
-        """Return load info via chunk_callback."""
-
         async def _payload():
             result = await self.tokenizer_manager.get_loads(dp_rank=dp_rank)
-            return [dataclasses.asdict(r) for r in result]
+            return [r.to_dict() for r in result]
 
         self._submit_json_unary("get_load", _payload, chunk_callback)
 
     def flush_cache(self, chunk_callback) -> None:
-        """Flush the radix cache. Sends result through chunk_callback."""
-
         async def _payload():
             ret = await self.tokenizer_manager.flush_cache()
             return {"success": ret.success, "message": "Cache flushed."}
@@ -521,8 +456,6 @@ class RuntimeHandle:
         )
 
     def pause_generation(self, mode: str, chunk_callback) -> None:
-        """Pause generation. Sends result through chunk_callback."""
-
         async def _payload():
             from sglang.srt.managers.io_struct import PauseGenerationReqInput
 
@@ -534,8 +467,6 @@ class RuntimeHandle:
         self._submit_json_unary("pause_generation", _payload, chunk_callback)
 
     def continue_generation(self, chunk_callback) -> None:
-        """Continue generation. Sends result through chunk_callback."""
-
         async def _payload():
             from sglang.srt.managers.io_struct import ContinueGenerationReqInput
 
@@ -547,8 +478,6 @@ class RuntimeHandle:
         self._submit_json_unary("continue_generation", _payload, chunk_callback)
 
     def start_profile(self, output_dir: Optional[str], chunk_callback) -> None:
-        """Start profiling. Sends result through chunk_callback."""
-
         async def _payload():
             kwargs = {"output_dir": output_dir} if output_dir else {}
             await self.tokenizer_manager.start_profile(**kwargs)
@@ -557,8 +486,6 @@ class RuntimeHandle:
         self._submit_json_unary("start_profile", _payload, chunk_callback)
 
     def stop_profile(self, chunk_callback) -> None:
-        """Stop profiling. Sends result through chunk_callback."""
-
         async def _payload():
             await self.tokenizer_manager.stop_profile()
             return {"message": "Profiling stopped."}
@@ -568,8 +495,6 @@ class RuntimeHandle:
     def update_weights_from_disk(
         self, model_path: str, load_format: Optional[str], chunk_callback
     ) -> None:
-        """Update weights from disk. Sends result through chunk_callback."""
-
         async def _payload():
             from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqInput
 
@@ -601,7 +526,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]],
         is_disconnected_fn: Optional[Callable[[], bool]],
     ) -> None:
-        """Schedule an OpenAI pass-through request on the tokenizer_manager loop."""
         self._submit_on_tm_loop(
             self._run_openai_request(
                 serving_key,
@@ -621,7 +545,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI chat completion (JSON pass-through, streaming)."""
         self._submit_openai(
             "chat", True, json_body, chunk_callback, trace_headers, is_disconnected_fn
         )
@@ -634,7 +557,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI completion (JSON pass-through, streaming)."""
         self._submit_openai(
             "completion",
             True,
@@ -652,7 +574,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI embedding (JSON pass-through, unary)."""
         self._submit_openai(
             "embedding",
             False,
@@ -670,7 +591,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI classify (JSON pass-through, unary)."""
         self._submit_openai(
             "classify",
             False,
@@ -688,7 +608,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI score (JSON pass-through, unary)."""
         self._submit_openai(
             "score", False, json_body, chunk_callback, trace_headers, is_disconnected_fn
         )
@@ -701,7 +620,6 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Submit OpenAI rerank (JSON pass-through, unary)."""
         self._submit_openai(
             "rerank",
             False,
@@ -740,32 +658,18 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]] = None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
-        """Generic OpenAI pass-through handler.
-
-        Delegates to the appropriate OpenAIServing* class, sending response
-        data back through the Rust chunk_callback.
-        """
         try:
             serving = self._get_openai_serving()[serving_key]
 
-            # JSON parse + Pydantic validation are client errors. Surface
-            # them with status_code=400 so the Rust side maps them to
-            # INVALID_ARGUMENT instead of INTERNAL. They always happen
-            # before any stream chunks are emitted, so it is safe to send a
-            # single status-bearing chunk even on streaming endpoints.
             try:
                 request_dict = json.loads(json_body)
-                # `[]`, `null`, `"…"`, numbers etc. parse as JSON but can't be
-                # **-unpacked into the request model; that raises TypeError
-                # outside our handler and ends up as an internal 500. Reject
-                # non-object bodies up front as a client error.
                 if not isinstance(request_dict, dict):
-                    raise TypeError(
+                    raise _BadOpenAIRequest(
                         f"Request body must be a JSON object, got {type(request_dict).__name__}"
                     )
                 request_cls = self._get_openai_request_class(serving_key)
                 request_obj = request_cls(**request_dict)
-            except (json.JSONDecodeError, ValidationError, TypeError) as e:
+            except (json.JSONDecodeError, ValidationError, _BadOpenAIRequest) as e:
                 error_body = json.dumps(
                     {"error": {"message": str(e), "type": "BadRequest"}}
                 ).encode("utf-8")
@@ -774,7 +678,7 @@ class RuntimeHandle:
                 )
                 return
 
-            mock_request = MockRequest(
+            mock_request = _GrpcRequest(
                 headers=trace_headers,
                 is_disconnected_fn=is_disconnected_fn,
             )
@@ -782,13 +686,6 @@ class RuntimeHandle:
             result = await serving.handle_request(request_obj, mock_request)
 
             if hasattr(result, "body_iterator"):
-                # Parse SSE events per WHATWG spec (data:/event:/id: fields,
-                # `:` comments, blank-line event boundaries). OpenAIServing*
-                # currently emits one `data: <json>\n\n` per yield, but a
-                # naive `startswith("data: ")` filter silently drops anything
-                # else — multi-line data, comments, future event/id usage.
-                # See follow-up: replace SSE round-trip with a (dict,
-                # finished) hook on OpenAIServing*.
                 ready_event = self._install_on_ready(chunk_callback)
                 data_buf: List[str] = []
                 stream_closed = False
@@ -830,8 +727,6 @@ class RuntimeHandle:
                             break
 
                     if not stream_closed:
-                        # Defensive: emit a trailing event if the stream ended
-                        # without a final blank line.
                         await _flush_event()
                         self._safe_callback(chunk_callback, b"", finished=True)
                 finally:
@@ -845,15 +740,17 @@ class RuntimeHandle:
                     resp_bytes = json.dumps(result).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
-                # ErrorResponse uses ``code``; Starlette/FastAPI Response
-                # uses ``status_code``. Honour whichever is present so error
-                # responses don't ship as HTTP 200 with an error body.
                 status_code = int(
                     getattr(result, "status_code", None)
                     or getattr(result, "code", None)
                     or 200
                 )
-                chunk_callback(resp_bytes, finished=True, status_code=status_code)
+                self._safe_callback(
+                    chunk_callback,
+                    resp_bytes,
+                    finished=True,
+                    status_code=status_code,
+                )
 
         except Exception as e:
             logger.error("gRPC OpenAI %s error: %s", serving_key, e)
