@@ -211,8 +211,8 @@ class HiRadixCache(RadixCache):
         """
         Block until all outstanding async sends are consumed, then clear.
 
-        Called at the start of each event round, so work_list holds exactly
-        the previous round's sends. This bounds it to one round and applies
+        Called at the start of each event round, so work_list holds the sends
+        accumulated since the last round. This bounds it and applies
         backpressure when a downstream PP rank lags. Scheduler thread only.
         """
         for work in self.work_list:

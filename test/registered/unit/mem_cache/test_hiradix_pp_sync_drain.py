@@ -3,6 +3,7 @@
 import unittest
 
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -21,23 +22,28 @@ class _Holder:
 
 
 class TestPPSyncDrain(unittest.TestCase):
+    def _drain_fns(self):
+        return (HiRadixCache._drain_async_work, UnifiedRadixCache._drain_async_work)
+
     def test_drain_waits_all_and_clears(self):
-        holder = _Holder()
-        works = [_FakeWork(), _FakeWork(), _FakeWork()]
-        holder.work_list = list(works)
+        for drain in self._drain_fns():
+            holder = _Holder()
+            works = [_FakeWork(), _FakeWork(), _FakeWork()]
+            holder.work_list = list(works)
 
-        HiRadixCache._drain_async_work(holder)
+            drain(holder)
 
-        self.assertTrue(all(w.waited for w in works))
-        self.assertEqual(holder.work_list, [])
+            self.assertTrue(all(w.waited for w in works))
+            self.assertEqual(holder.work_list, [])
 
     def test_drain_empty_is_noop(self):
-        holder = _Holder()
-        holder.work_list = []
+        for drain in self._drain_fns():
+            holder = _Holder()
+            holder.work_list = []
 
-        HiRadixCache._drain_async_work(holder)
+            drain(holder)
 
-        self.assertEqual(holder.work_list, [])
+            self.assertEqual(holder.work_list, [])
 
 
 if __name__ == "__main__":
