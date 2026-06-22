@@ -267,16 +267,8 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        # NIXL's nixlAgent is not thread-safe by default. We drive a single
-        # agent from several of our own threads -- the transfer_worker pool
-        # calls agent.check_xfer_state()/get_xfer_status() (reads the internal
-        # remote-agent map) while the bootstrap thread calls
-        # agent.add_remote_agent() (writes that map).
-        #
-        # NIXL only auto-enables locking when it starts its
-        # own communication thread, i.e. when its etcd metadata transport
-        # (NIXL_ETCD_ENDPOINTS) or TCP listener is in use, not when we handle
-        # our own communication.
+        # self.transfer_worker and self._start_bootstrap_thread runs concurrently
+        # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
             backends=[],
             num_threads=num_threads,
