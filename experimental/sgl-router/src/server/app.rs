@@ -57,5 +57,17 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
         )
+        .route(
+            "/pd_flip/router/workers",
+            get(crate::server::routes::pd_runtime::list_workers),
+        )
+        .route(
+            "/pd_flip/router/worker/drain",
+            post(crate::server::routes::pd_runtime::set_worker_drain),
+        )
+        .route(
+            "/pd_flip/router/worker/role",
+            post(crate::server::routes::pd_runtime::set_worker_role),
+        )
         .with_state(ctx)
 }

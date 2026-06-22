@@ -174,7 +174,7 @@ impl WorkerRegistry {
         // [`crate::proxy`].
         self.workers_for(model)
             .into_iter()
-            .filter(|w| w.breaker.would_allow())
+            .filter(|w| w.breaker.would_allow() && !w.is_draining())
             .collect()
     }
 
@@ -334,6 +334,27 @@ mod tests {
             "only the worker with a non-Open breaker should survive",
         );
         assert_eq!(healthy[0].id, WorkerId("ok".into()));
+    }
+
+    #[test]
+    fn healthy_subset_filters_draining_workers_without_removing_them() {
+        let r = WorkerRegistry::default();
+        let _ = r.add(spec("active", WorkerMode::Prefill, &["m"]));
+        let _ = r.add(spec("draining", WorkerMode::Prefill, &["m"]));
+        let draining = r
+            .get(&WorkerId("draining".into()))
+            .expect("draining worker present");
+        draining.set_draining(true);
+
+        let healthy = r.healthy_workers_for(&ModelId("m".into()));
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].id, WorkerId("active".into()));
+        assert_eq!(
+            r.workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .len(),
+            2,
+            "draining must not unregister the worker or drop its in-flight state",
+        );
     }
 
     /// PD prefill/decode workers and plain workers cannot coexist on the

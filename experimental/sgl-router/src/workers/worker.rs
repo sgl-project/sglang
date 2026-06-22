@@ -3,8 +3,22 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+const NO_BOOTSTRAP_PORT: u32 = 0;
+
+fn encode_bootstrap_port(port: Option<u16>) -> u32 {
+    port.map(u32::from).unwrap_or(NO_BOOTSTRAP_PORT)
+}
+
+fn decode_bootstrap_port(port: u32) -> Option<u16> {
+    if port == NO_BOOTSTRAP_PORT {
+        None
+    } else {
+        Some(port as u16)
+    }
+}
 
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
@@ -85,6 +99,9 @@ pub struct Worker {
     /// Interior-mutable mode so `ModeChanged` can update in place without
     /// dropping the Worker (which would reset `active_requests` + breaker).
     mode: AtomicU8,
+    /// True while the router should stop admitting new requests to this worker.
+    /// In-flight requests keep their LoadGuards and are allowed to drain.
+    draining: AtomicBool,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -98,7 +115,7 @@ pub struct Worker {
     /// SGLang bootstrap server port for prefill workers (`None` for
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
-    bootstrap_port: Option<u16>,
+    bootstrap_port: AtomicU32,
 }
 
 impl Worker {
@@ -121,11 +138,12 @@ impl Worker {
             id: spec.id,
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
+            draining: AtomicBool::new(false),
             model_ids: spec.model_ids,
             breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
-            bootstrap_port: spec.bootstrap_port,
+            bootstrap_port: AtomicU32::new(encode_bootstrap_port(spec.bootstrap_port)),
         }
     }
 
@@ -136,7 +154,13 @@ impl Worker {
 
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
+        decode_bootstrap_port(self.bootstrap_port.load(Ordering::Relaxed))
+    }
+
+    /// Update the port used when this worker is routed as prefill.
+    pub fn set_bootstrap_port(&self, port: Option<u16>) {
         self.bootstrap_port
+            .store(encode_bootstrap_port(port), Ordering::Relaxed);
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -153,6 +177,28 @@ impl Worker {
     /// identity survives the mode transition.
     pub fn set_mode(&self, m: WorkerMode) {
         self.mode.store(m.as_u8(), Ordering::Relaxed);
+    }
+
+    /// Update runtime PD routing state in one place.
+    ///
+    /// A worker that becomes `Prefill` needs a bootstrap port so the
+    /// router can inject `bootstrap_port` into PD request bodies. The
+    /// caller may pass `None` for `Decode` / `Plain`.
+    pub fn set_runtime_role(&self, m: WorkerMode, bootstrap_port: Option<u16>) {
+        self.set_mode(m);
+        self.set_bootstrap_port(if m == WorkerMode::Prefill {
+            bootstrap_port
+        } else {
+            None
+        });
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Relaxed);
     }
 
     pub fn active_load(&self) -> usize {
@@ -172,6 +218,7 @@ impl std::fmt::Debug for Worker {
             .field("id", &self.id)
             .field("url", &self.url)
             .field("mode", &self.mode())
+            .field("draining", &self.is_draining())
             .field("active_load", &self.active_load())
             .finish()
     }
@@ -253,6 +300,41 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: None,
         });
+        assert_eq!(w.bootstrap_port(), None);
+    }
+
+    #[test]
+    fn draining_flag_updates_in_place() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
+        });
+        assert!(!w.is_draining());
+        w.set_draining(true);
+        assert!(w.is_draining());
+        w.set_draining(false);
+        assert!(!w.is_draining());
+    }
+
+    #[test]
+    fn set_runtime_role_updates_mode_and_bootstrap_port() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
+        });
+
+        w.set_runtime_role(WorkerMode::Prefill, Some(8997));
+        assert_eq!(w.mode(), WorkerMode::Prefill);
+        assert_eq!(w.bootstrap_port(), Some(8997));
+
+        w.set_runtime_role(WorkerMode::Decode, None);
+        assert_eq!(w.mode(), WorkerMode::Decode);
         assert_eq!(w.bootstrap_port(), None);
     }
 
