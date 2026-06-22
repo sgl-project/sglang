@@ -102,15 +102,30 @@ class CausalSelfAttentionKVCache:
         key: torch.Tensor,
         value: torch.Tensor,
         current_chunk_start: int,
+        cache_head_start: int | None = None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
         """write fresh kv into the cache, returns the part of view visible to the current chunk
 
         Args:
             current_chunk_start: the global position of the start of the chunk
+            cache_head_start: first cache head for key/value when they only
+                carry a slice of the cache heads; other heads are left untouched
 
         """
         num_new_tokens = key.shape[1]
+        num_input_heads = key.shape[2]
+        num_cache_heads = self.k.shape[2]
+        cache_head_slice = None
+        if num_cache_heads != num_input_heads:
+            if cache_head_start is None:
+                raise ValueError(
+                    f"{debug_name} requires cache_head_start when cache heads "
+                    f"({num_cache_heads}) differ from input heads ({num_input_heads})."
+                )
+            cache_head_slice = slice(
+                cache_head_start, cache_head_start + num_input_heads
+            )
         current_chunk_end = current_chunk_start + num_new_tokens
         kv_cache_size = self.cache_size
         sink_tokens = self.sink_tokens
@@ -159,20 +174,54 @@ class CausalSelfAttentionKVCache:
                     local_end_index_prev - num_evicted_tokens - sink_tokens,
                 )
                 if num_rolled_tokens > 0:
-                    self.k[:, sink_tokens: sink_tokens + num_rolled_tokens] = self.k[
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens: sink_tokens
-                                              + num_evicted_tokens
-                                              + num_rolled_tokens,
-                    ].clone()
-                    self.v[:, sink_tokens: sink_tokens + num_rolled_tokens] = self.v[
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens: sink_tokens
-                                              + num_evicted_tokens
-                                              + num_rolled_tokens,
-                    ].clone()
+                    if cache_head_slice is None:
+                        self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                            self.k[
+                                :,
+                                sink_tokens
+                                + num_evicted_tokens : sink_tokens
+                                + num_evicted_tokens
+                                + num_rolled_tokens,
+                            ].clone()
+                        )
+                        self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                            self.v[
+                                :,
+                                sink_tokens
+                                + num_evicted_tokens : sink_tokens
+                                + num_evicted_tokens
+                                + num_rolled_tokens,
+                            ].clone()
+                        )
+                    else:
+                        self.k[
+                            :,
+                            sink_tokens : sink_tokens + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ] = self.k[
+                            :,
+                            sink_tokens
+                            + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ].clone()
+                        self.v[
+                            :,
+                            sink_tokens : sink_tokens + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ] = self.v[
+                            :,
+                            sink_tokens
+                            + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ].clone()
 
                 # if we move the minimum number of tokens, the right bound of the append token would be aligned with end of the buffer
                 local_end_index = kv_cache_size
@@ -203,84 +252,33 @@ class CausalSelfAttentionKVCache:
             self.k = self.k.detach()
         if self.v.requires_grad:
             self.v = self.v.detach()
-        self.k[:, local_start_index:local_end_index] = key
-        self.v[:, local_start_index:local_end_index] = value
-
         attn_start_index = max(0, updated_local_end - self.attention_window_size)
+        if cache_head_slice is None:
+            self.k[:, local_start_index:local_end_index] = key
+            self.v[:, local_start_index:local_end_index] = value
+            visible_k = self.k[:, attn_start_index:updated_local_end]
+            visible_v = self.v[:, attn_start_index:updated_local_end]
+        else:
+            self.k[:, local_start_index:local_end_index, cache_head_slice, :] = key
+            self.v[:, local_start_index:local_end_index, cache_head_slice, :] = value
+            visible_k = self.k[
+                :, attn_start_index:updated_local_end, cache_head_slice, :
+            ]
+            visible_v = self.v[
+                :, attn_start_index:updated_local_end, cache_head_slice, :
+            ]
+
         self._write_indices(
             global_end_index=updated_global_end,
             local_end_index=updated_local_end,
         )
         return CausalAttentionKVView(
-            k=self.k[:, attn_start_index:updated_local_end],
-            v=self.v[:, attn_start_index:updated_local_end],
+            k=visible_k,
+            v=visible_v,
             local_start_index=local_start_index,
             local_end_index=local_end_index,
             visible_local_end=updated_local_end,
             visible_global_end=updated_global_end,
-        )
-
-    def update_and_get_attention_kv_for_local_heads(
-        self,
-        *,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        current_chunk_start: int,
-        local_head_start: int | None = None,
-        debug_name: str = "causal KV cache",
-    ) -> CausalAttentionKVView:
-        """write local-head kv into a full-head cache and return the local-head view
-
-          Args:
-            local_head_start: the start index attention heads the current rank takes charge of
-
-        """
-        num_input_heads = key.shape[2]
-
-        if self.k.shape[2] == num_input_heads:
-            # head is not splitted: the global head num equals to input head num. no adjustment needed
-            return self.update_and_get_attention_kv(
-                key=key,
-                value=value,
-                current_chunk_start=current_chunk_start,
-                debug_name=debug_name,
-            )
-
-        if local_head_start is None:
-            raise ValueError(
-                f"{debug_name} requires local_head_start when cache heads "
-                f"({self.k.shape[2]}) differ from input heads ({num_input_heads})."
-            )
-
-        local_head_slice = slice(local_head_start, local_head_start + num_input_heads)
-        cache_key = key.new_zeros(
-            key.shape[0],
-            key.shape[1],
-            self.k.shape[2],
-            key.shape[3],
-        )
-        cache_value = value.new_zeros(
-            value.shape[0],
-            value.shape[1],
-            self.v.shape[2],
-            value.shape[3],
-        )
-        cache_key[:, :, local_head_slice, :] = key
-        cache_value[:, :, local_head_slice, :] = value
-
-        cache_view = self.update_and_get_attention_kv(
-            key=cache_key,
-            value=cache_value,
-            current_chunk_start=current_chunk_start,
-            debug_name=debug_name,
-        )
-        return CausalAttentionKVView(
-            k=cache_view.k[:, :, local_head_slice, :],
-            v=cache_view.v[:, :, local_head_slice, :],
-            local_start_index=cache_view.local_start_index,
-            local_end_index=cache_view.local_end_index,
-            visible_local_end=cache_view.visible_local_end,
-            visible_global_end=cache_view.visible_global_end,
         )
 
 
