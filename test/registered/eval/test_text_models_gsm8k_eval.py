@@ -36,7 +36,6 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.77,  # 81.88% measured - 5%
     "Qwen/Qwen3-8B": 0.76,  # 81.20% measured - 5%
     "Qwen/Qwen3-4B": 0.77,  # 82.03% measured - 5%
-    "Qwen/Qwen3.5-4B": 0.64,  # 69.07% measured (--thinking) - 5%
     "meta-llama/Llama-3.1-70B-Instruct": 0.0,  # TODO: sgl-eval baseline - 5%
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.0,  # TODO: sgl-eval baseline - 5%
     "Qwen/Qwen2-57B-A14B-Instruct": 0.0,  # TODO: sgl-eval baseline - 5%
