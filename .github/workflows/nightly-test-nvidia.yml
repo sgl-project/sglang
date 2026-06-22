@@ -549,8 +549,10 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
+        env:
+          GRACE_BLACKWELL: "1"
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 600
