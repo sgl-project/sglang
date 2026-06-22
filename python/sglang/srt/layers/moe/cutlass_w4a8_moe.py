@@ -64,6 +64,8 @@ def cutlass_w4a8_moe(
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
     routed_scaling_factor: float = 1.0,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -198,7 +200,30 @@ def cutlass_w4a8_moe(
         (m * topk, n), dtype=torch.float8_e4m3fn, device=device
     )
 
-    if a2_scale is None:
+    use_swiglu_oai = gemm1_alpha is not None or gemm1_clamp_limit is not None
+    if use_swiglu_oai:
+        # SwiGLU-OAI (e.g. MiniMax-M3): clamp + alpha-scaled sigmoid + (up+1).
+        # The fused silu_mul_*_tensorwise_quant_for_cutlass_moe kernels are
+        # plain SiLU, which would silently corrupt outputs. Do the activation
+        # in bf16 here, then per-tensor FP8 quantize.
+        alpha = 1.702 if gemm1_alpha is None else float(gemm1_alpha)
+        gate, up = c1.chunk(2, dim=-1)
+        if gemm1_clamp_limit is not None:
+            limit = float(gemm1_clamp_limit)
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        intermediate = gate * torch.sigmoid(gate * alpha) * (up + 1)
+        intermediate = intermediate.contiguous()
+        if a2_scale is None:
+            a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+            # is_static=False: kernel computes absmax-based scale itself.
+            per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale, False)
+        else:
+            # is_static=True: caller-provided scale is reused as-is.
+            per_tensor_quant_fp8(
+                intermediate, intermediate_q, a2_scale.float(), True
+            )
+    elif a2_scale is None:
         a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
         silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
             c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
