@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_shrink_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -60,6 +61,11 @@ def _chunked_lora_shrink_kernel(
 
     pid_n = tl.program_id(0)
 
+    seg_start = tl.load(seg_indptr + pid_s)
+    seg_end = tl.load(seg_indptr + pid_s + 1)
+    if seg_start == seg_end:
+        return
+
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
     w_index = tl.load(weight_indices + pid_s)
@@ -69,16 +75,13 @@ def _chunked_lora_shrink_kernel(
     if rank == 0:
         return
 
-    seg_start = tl.load(seg_indptr + pid_s)
-    seg_end = tl.load(seg_indptr + pid_s + 1)
-
     # Adjust N dim according to the specific LoRA adapter
     cur_n = tl.minimum(N, rank * NUM_SLICES)
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
+        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
     )
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
@@ -137,11 +140,15 @@ def chunked_sgmv_lora_shrink_forward(
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
 
-    # Block shapes
-    # TODO (lifuhuang): experiment with split-k
+    # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
-    BLOCK_N = 16
-    BLOCK_K = 256
+    # weights shape is (num_lora, num_slices * rank, input_dim)
+    MAX_RANK = weights.shape[1] // num_slices
+    config = get_lora_shrink_config(
+        K=weights.shape[2], R=MAX_RANK, num_slices=num_slices, chunk_size=BLOCK_M
+    )
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
 
     S = x.shape[0]
     N = weights.shape[1]
@@ -149,10 +156,22 @@ def chunked_sgmv_lora_shrink_forward(
     assert x.shape[-1] == K
 
     num_segments = batch_info.num_segments
+    segment_grid = (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else num_segments
+    )
     grid = (
         triton.cdiv(N, BLOCK_N),
-        batch_info.bs if batch_info.use_cuda_graph else num_segments,
+        segment_grid,
     )
+
+    # Optional launch params from tuned config
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
     _chunked_lora_shrink_kernel[grid](
@@ -163,7 +182,7 @@ def chunked_sgmv_lora_shrink_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=num_segments,
+        num_segs=segment_grid,
         # constants
         N=N,
         K=K,
@@ -171,6 +190,7 @@ def chunked_sgmv_lora_shrink_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **extra_kwargs,
     )
 
     return output

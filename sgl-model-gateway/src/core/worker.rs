@@ -39,6 +39,75 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+pub struct WorkerRoutingKeyLoad {
+    url: String,
+    active_routing_keys: dashmap::DashMap<String, usize>,
+}
+
+impl WorkerRoutingKeyLoad {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            active_routing_keys: dashmap::DashMap::new(),
+        }
+    }
+
+    pub fn value(&self) -> usize {
+        self.active_routing_keys.len()
+    }
+
+    pub fn increment(&self, routing_key: &str) {
+        *self
+            .active_routing_keys
+            .entry(routing_key.to_string())
+            .or_insert(0) += 1;
+        self.update_metrics();
+    }
+
+    pub fn decrement(&self, routing_key: &str) {
+        use dashmap::mapref::entry::Entry;
+
+        match self.active_routing_keys.entry(routing_key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let counter = entry.get_mut();
+                if *counter > 0 {
+                    *counter -= 1;
+                    if *counter == 0 {
+                        entry.remove();
+                    }
+                } else {
+                    tracing::warn!(
+                        worker_url = %self.url,
+                        routing_key = %routing_key,
+                        "Attempted to decrement routing key counter that is already at 0"
+                    );
+                }
+            }
+            Entry::Vacant(_) => {
+                tracing::warn!(
+                    worker_url = %self.url,
+                    routing_key = %routing_key,
+                    "Attempted to decrement non-existent routing key"
+                );
+            }
+        }
+        self.update_metrics();
+    }
+
+    fn update_metrics(&self) {
+        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+    }
+}
+
+impl fmt::Debug for WorkerRoutingKeyLoad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerRoutingKeyLoad")
+            .field("url", &self.url)
+            .field("active_routing_keys", &self.value())
+            .finish()
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -110,6 +179,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
+
+    /// Get the worker routing key load tracker
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -459,6 +531,8 @@ pub struct HealthConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking healthy
     pub success_threshold: u32,
+    /// Whether to disable health checks for this worker
+    pub disable_health_check: bool,
 }
 
 impl Default for HealthConfig {
@@ -469,6 +543,7 @@ impl Default for HealthConfig {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         }
     }
 }
@@ -545,6 +620,7 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
@@ -625,6 +701,13 @@ impl Worker for BasicWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
+        if self.metadata.health_config.disable_health_check {
+            if !self.is_healthy() {
+                self.set_healthy(true);
+            }
+            return Ok(());
+        }
+
         let health_result = match &self.metadata.connection_mode {
             ConnectionMode::Http => self.http_health_check().await?,
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
@@ -696,6 +779,10 @@ impl Worker for BasicWorker {
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
         self.update_running_requests_metrics();
+    }
+
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
+        &self.worker_routing_key_load
     }
 
     fn processed_requests(&self) -> usize {
@@ -838,18 +925,27 @@ impl Worker for BasicWorker {
         let url = self.normalised_url()?;
         let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
 
-        let mut req = WORKER_CLIENT.get(health_url).timeout(timeout);
+        let mut req = WORKER_CLIENT.get(&health_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.api_key {
             req = req.bearer_auth(api_key);
         }
 
         match req.send().await {
-            Ok(resp) => Ok(resp.status().is_success()),
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        "HTTP health check returned non-success status for {}: {}",
+                        health_url,
+                        status
+                    );
+                    Ok(false)
+                }
+            }
             Err(err) => {
-                tracing::warn!(
-                    "HTTP health check failed for {}: {err:?}",
-                    self.metadata.url
-                );
+                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
                 Ok(false)
             }
         }
@@ -933,6 +1029,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.reset_load();
     }
 
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
+        self.base_worker.worker_routing_key_load()
+    }
+
     fn processed_requests(&self) -> usize {
         self.base_worker.processed_requests()
     }
@@ -1008,102 +1108,76 @@ impl Worker for DPAwareWorker {
 /// immediately but the stream continues in the background.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
+    routing_key: Option<String>,
 }
 
 impl WorkerLoadGuard {
-    pub fn new(worker: Arc<dyn Worker>) -> Self {
+    pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        use crate::routers::header_utils::extract_routing_key;
+
         worker.increment_load();
-        Self { worker }
-    }
 
-    /// Attach this guard to a Response, tying the guard's lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guard is dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses where the handler
-    /// returns immediately but the stream continues in a background task.
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        let (parts, body) = response.into_parts();
+        let routing_key = extract_routing_key(headers).map(String::from);
 
-        // Wrap body with guard - guard drops when body drops
-        let guarded_body = GuardedBody {
-            inner: body,
-            _guard: self,
-        };
+        if let Some(ref key) = routing_key {
+            worker.worker_routing_key_load().increment(key);
+        }
 
-        axum::response::Response::from_parts(parts, Body::new(guarded_body))
+        Self {
+            worker,
+            routing_key,
+        }
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.decrement_load();
+        if let Some(ref key) = self.routing_key {
+            self.worker.worker_routing_key_load().decrement(key);
+        }
     }
 }
 
-/// Attach multiple guards to a Response (for dual prefill/decode workers)
-pub fn attach_guards_to_response(
-    guards: Vec<WorkerLoadGuard>,
-    response: axum::response::Response,
-) -> axum::response::Response {
-    let (parts, body) = response.into_parts();
-
-    let guarded_body = MultiGuardedBody {
-        inner: body,
-        _guards: guards,
-    };
-
-    axum::response::Response::from_parts(parts, Body::new(guarded_body))
-}
-
-/// Body wrapper that holds a WorkerLoadGuard
+/// Body wrapper that holds an attached value.
 ///
 /// When this body is dropped (stream ends or client disconnects),
-/// the guard is dropped, decrementing worker load.
-struct GuardedBody {
+/// the attached value is dropped automatically. This is useful for RAII guards
+/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
+pub struct AttachedBody<T> {
     inner: Body,
-    _guard: WorkerLoadGuard,
+    _attached: T,
 }
 
-/// Body wrapper that holds multiple WorkerLoadGuards (for dual prefill/decode)
-struct MultiGuardedBody {
-    inner: Body,
-    _guards: Vec<WorkerLoadGuard>,
+impl<T> AttachedBody<T> {
+    pub fn new(inner: Body, attached: T) -> Self {
+        Self {
+            inner,
+            _attached: attached,
+        }
+    }
 }
 
-impl http_body::Body for GuardedBody {
+impl<T: Send + Unpin + 'static> AttachedBody<T> {
+    pub fn wrap_response(
+        response: axum::response::Response,
+        attached: T,
+    ) -> axum::response::Response {
+        let (parts, body) = response.into_parts();
+        axum::response::Response::from_parts(parts, Body::new(Self::new(body, attached)))
+    }
+}
+
+impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
     type Data = bytes::Bytes;
     type Error = axum::Error;
 
     fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl http_body::Body for MultiGuardedBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1185,6 +1259,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         chat_template: worker.chat_template(model_id).map(String::from),
         bootstrap_port,
         metadata: worker.metadata().labels.clone(),
+        disable_health_check: worker.metadata().health_config.disable_health_check,
         job_status: None,
     }
 }
@@ -1258,6 +1333,7 @@ mod tests {
         assert_eq!(config.endpoint, "/health");
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
+        assert!(!config.disable_health_check);
     }
 
     #[test]
@@ -1268,12 +1344,14 @@ mod tests {
             endpoint: "/healthz".to_string(),
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: true,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
         assert_eq!(config.endpoint, "/healthz");
         assert_eq!(config.failure_threshold, 5);
         assert_eq!(config.success_threshold, 3);
+        assert!(config.disable_health_check);
     }
 
     #[test]
@@ -1312,6 +1390,7 @@ mod tests {
             endpoint: "/custom-health".to_string(),
             failure_threshold: 4,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         use crate::core::BasicWorkerBuilder;
@@ -1918,5 +1997,154 @@ mod tests {
 
         // Not found
         assert!(metadata.find_model("unknown-model").is_none());
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_increment_decrement() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        assert_eq!(load.value(), 0);
+
+        load.increment("key1");
+        assert_eq!(load.value(), 1);
+
+        load.increment("key2");
+        assert_eq!(load.value(), 2);
+
+        load.increment("key1");
+        assert_eq!(load.value(), 2);
+
+        load.decrement("key1");
+        assert_eq!(load.value(), 2);
+
+        load.decrement("key1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("key2");
+        assert_eq!(load.value(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_cleanup_on_zero() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+
+        load.increment("key1");
+        load.increment("key2");
+        load.increment("key3");
+        assert_eq!(load.active_routing_keys.len(), 3);
+
+        load.decrement("key1");
+        assert_eq!(load.active_routing_keys.len(), 2);
+
+        load.decrement("key2");
+        assert_eq!(load.active_routing_keys.len(), 1);
+
+        load.decrement("key3");
+        assert_eq!(load.active_routing_keys.len(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_multiple_requests_same_key() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+
+        load.increment("key-1");
+        load.increment("key-1");
+        load.increment("key-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("key-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("key-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("key-1");
+        assert_eq!(load.value(), 0);
+        assert_eq!(load.active_routing_keys.len(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_decrement_nonexistent() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        load.decrement("nonexistent");
+        assert_eq!(load.value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_with_routing_key() {
+        use crate::core::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
+
+        {
+            let _guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+            assert_eq!(worker.load(), 1);
+            assert_eq!(worker.worker_routing_key_load().value(), 1);
+        }
+
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_without_routing_key() {
+        use crate::core::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+
+        {
+            let _guard = WorkerLoadGuard::new(worker.clone(), None);
+            assert_eq!(worker.load(), 1);
+            assert_eq!(worker.worker_routing_key_load().value(), 0);
+        }
+
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_multiple_same_routing_key() {
+        use crate::core::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
+
+        let guard1 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+        assert_eq!(worker.load(), 1);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        let guard2 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+        assert_eq!(worker.load(), 2);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        drop(guard1);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        drop(guard2);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
     }
 }

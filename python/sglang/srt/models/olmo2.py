@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +17,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/olmo2.py
 """Inference-only OLMo2 model compatible with HuggingFace weights."""
+
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -23,8 +26,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
@@ -44,8 +45,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+_is_cuda = is_cuda()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -57,7 +62,7 @@ def get_attention_sliding_window_size(config):
 class Olmo2Attention(nn.Module):
     """
     This is the attention block where the output is computed as
-    ``Attention(LN(x))`` in ``MLP(LN(x + Attention(LN(x))))``
+    Attention(LN(x)) in MLP(LN(x + Attention(LN(x))))
     (plus another skip connection).
     """
 
@@ -67,11 +72,12 @@ class Olmo2Attention(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
 
         assert self.hidden_size % self.total_num_heads == 0
@@ -94,7 +100,7 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters["rope_theta"]
 
         # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(
@@ -106,7 +112,8 @@ class Olmo2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
+        self.alt_stream = alt_stream
 
         self.k_norm = RMSNorm(
             self.total_num_kv_heads * self.head_dim,
@@ -161,8 +168,29 @@ class Olmo2Attention(nn.Module):
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm.forward_native(q)
-        k = self.k_norm.forward_native(k)
+
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+
+            q_shape = q.shape
+            k_shape = k.shape
+
+            q_by_last = q.reshape(-1, q_shape[-1])
+            q_by_last = self.q_norm(q_by_last)
+
+            with torch.cuda.stream(self.alt_stream):
+                k_by_last = k.reshape(-1, k_shape[-1])
+                k_by_last = self.k_norm(k_by_last)
+
+            current_stream.wait_stream(self.alt_stream)
+
+            q = q_by_last.view(q_shape)
+            k = k_by_last.view(k_shape)
+        else:
+            q = self.q_norm.forward_native(q)
+            k = self.k_norm.forward_native(k)
+
         if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
             q = splitter(q)[self.tp_rank]
@@ -187,7 +215,7 @@ class Olmo2Attention(nn.Module):
 class Olmo2MLP(nn.Module):
     """
     This is the MLP block where the output is computed as
-    ``MLP(x)`` in ``LN(MLP(x + LN(Attention(x))))``
+    MLP(x) in LN(MLP(x + LN(Attention(x))))
     (plus another skip connection).
     """
 
@@ -236,7 +264,7 @@ class Olmo2MLP(nn.Module):
 class Olmo2DecoderLayer(nn.Module):
     """
     This is a typical transformer block where the output is
-    computed as ``MLP(LN(x + Attention(LN(x))))``
+    computed as MLP(LN(x + Attention(LN(x))))
     (plus another skip connection).
     """
 
@@ -246,12 +274,18 @@ class Olmo2DecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.alt_stream = alt_stream
         # Attention block.
         self.self_attn = Olmo2Attention(
-            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+            config,
+            layer_id,
+            quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         # MLP block.
@@ -293,9 +327,13 @@ class Olmo2Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
+        if alt_stream is None and _is_cuda:
+            alt_stream = torch.cuda.Stream()
+        self.alt_stream = alt_stream
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -309,6 +347,7 @@ class Olmo2Model(nn.Module):
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -357,11 +396,15 @@ class Olmo2ForCausalLM(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
         self.model = Olmo2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            alt_stream=alt_stream,
         )
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 # Constrained decoding with EAGLE3 speculative reasoning (tp=2)
-register_cuda_ci(est_time=60, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=137, stage="base-b", runner_config="2-gpu-large")
 
 
 class ServerWithGrammar(CustomTestCase):

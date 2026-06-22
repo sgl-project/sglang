@@ -17,11 +17,8 @@ import unittest
 
 import openai
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
-
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,6 +26,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
+register_amd_ci(est_time=150, suite="nightly-amd-1-gpu", nightly=True)
 
 
 def get_real_lora_adapter() -> str:

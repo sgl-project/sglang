@@ -10,8 +10,8 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 class PerformanceTestParams:
     """Parameters for performance testing."""
 
-    batch_sizes: List[int] = field(default_factory=lambda: [1, 8, 16, 64])
-    input_lens: Tuple[int, ...] = (4096,)
+    batch_sizes: List[int] = field(default_factory=lambda: [1, 8, 16])
+    input_lens: Tuple[int, ...] = (8192,)
     output_lens: Tuple[int, ...] = (512,)
     profile_dir: Optional[str] = None  # None = auto-generate based on is_vlm
     dataset_name: str = "mmmu"  # For VLM perf test
@@ -77,7 +77,9 @@ def run_performance_test(
             input_lens=input_lens,
             output_lens=output_lens,
             other_args=model.extra_args,
+            variant=model.variant or "",
             extra_bench_args=extra_bench_args,
+            env=model.env,
         )
 
         if success and results:

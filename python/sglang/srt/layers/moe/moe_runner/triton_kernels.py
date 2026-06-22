@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -19,8 +19,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
-    from triton_kernels.matmul_ogs import PrecisionConfig
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
+    from triton_kernels.matmul_ogs import (
+        GatherIndx,
+        PrecisionConfig,
+        RoutingData,
+        ScatterIndx,
+    )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -38,9 +42,9 @@ class TritonKernelsRunnerInput(RunnerInput):
     """Input bundle passed to the triton-kernels runner core."""
 
     hidden_states: torch.Tensor
-    routing_data: "RoutingData"
-    gather_indx: "GatherIndx"
-    scatter_indx: "ScatterIndx"
+    routing_data: RoutingData
+    gather_indx: GatherIndx
+    scatter_indx: ScatterIndx
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -84,6 +88,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         runner_input: TritonKernelsRunnerInput,
         quant_info: TritonKernelsQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> TritonKernelsRunnerOutput:
         from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
             triton_kernel_fused_experts,
@@ -153,7 +158,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
 @register_pre_permute("standard", "triton_kernel")
 def pre_permute_standard_to_triton_kernels(
-    dispatch_output: "StandardDispatchOutput",
+    dispatch_output: StandardDispatchOutput,
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,

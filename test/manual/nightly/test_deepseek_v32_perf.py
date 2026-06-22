@@ -1,10 +1,9 @@
 import unittest
 
-from nightly_utils import NightlyBenchmarkRunner
-
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 PROFILE_DIR = "performance_profiles_deepseek_v32"
 
 
@@ -56,7 +55,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                 ],
             },
             {
-                "name": "nsa",
+                "name": "dsa",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -65,10 +64,10 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "8",
                     "--enable-dp-attention",
                     "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
+                    "dsa",
+                    "--dsa-prefill-backend",
                     "flashmla_sparse",
-                    "--nsa-decode-backend",
+                    "--dsa-decode-backend",
                     "flashmla_kv",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
@@ -81,10 +80,10 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "--tp",
                     "8",
                     "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
+                    "dsa",
+                    "--dsa-prefill-backend",
                     "flashmla_sparse",
-                    "--nsa-decode-backend",
+                    "--dsa-decode-backend",
                     "flashmla_kv",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',

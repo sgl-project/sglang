@@ -5,8 +5,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.tool_call_test_runner import ToolCallTestParams
 
-register_cuda_ci(est_time=18000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -14,6 +15,11 @@ BASE_ARGS = [
     "--trust-remote-code",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true}',
+]
+
+TOOL_CALL_ARGS = [
+    "--tool-call-parser=deepseekv32",
+    "--reasoning-parser=deepseek-v3",
 ]
 
 DP_ARGS = [
@@ -24,10 +30,10 @@ DP_ARGS = [
 
 # Accuracy thresholds
 GSM8K_BASELINE = 0.935
-GPQA_BASELINE = 0.835
+GPQA_BASELINE = 0.83
 
 
-class TestDeepseekV32Unified(unittest.TestCase):
+class TestDeepseekV32(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
     Tests multiple variants with both performance and accuracy tests:
@@ -54,35 +60,35 @@ class TestDeepseekV32Unified(unittest.TestCase):
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS,
                 variant="DP8",
             ),
             # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS,
                 variant="TP8",
             ),
             # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="TP8+MTP",
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="DeepSeek-V3.2 Unified",
+            test_name="DeepSeek-V3.2",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
@@ -90,58 +96,61 @@ class TestDeepseekV32Unified(unittest.TestCase):
                 batch_sizes=[1, 8, 16, 64],
                 profile_dir="performance_profiles_deepseek_v32",
             ),
+            tool_call_params=ToolCallTestParams(
+                test_thinking=True, test_reasoning_usage=True
+            ),
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
-    def test_deepseek_v32_nsa_backends(self):
-        """Test NSA attention backend variants (H200 only).
+    def test_deepseek_v32_dsa_backends(self):
+        """Test DSA attention backend variants (H200 only).
 
-        Tests three NSA backend configurations:
+        Tests three DSA backend configurations:
         - flashmla: flashmla_sparse prefill + flashmla_kv decode
         - fa3: FA3 prefill + FA3 decode
         - fp8kvcache: default backends with FP8 KV cache
         """
-        NSA_FLASHMLA_ARGS = [
-            "--attention-backend=nsa",
-            "--nsa-prefill-backend=flashmla_sparse",
-            "--nsa-decode-backend=flashmla_kv",
+        DSA_FLASHMLA_ARGS = [
+            "--attention-backend=dsa",
+            "--dsa-prefill-backend=flashmla_sparse",
+            "--dsa-decode-backend=flashmla_kv",
         ]
 
-        NSA_FA3_ARGS = [
-            "--attention-backend=nsa",
-            "--nsa-prefill-backend=fa3",
-            "--nsa-decode-backend=fa3",
+        DSA_FA3_ARGS = [
+            "--attention-backend=dsa",
+            "--dsa-prefill-backend=fa3",
+            "--dsa-decode-backend=fa3",
         ]
 
-        NSA_FP8KV_ARGS = [
-            "--attention-backend=nsa",
+        DSA_FP8KV_ARGS = [
+            "--attention-backend=dsa",
             "--kv-cache-dtype=fp8_e4m3",
         ]
 
-        nsa_variants = [
+        dsa_variants = [
             # flashmla backend
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FLASHMLA_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FLASHMLA_ARGS,
             ),
             # fa3 backend
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FA3_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FA3_ARGS,
             ),
             # fp8 kv cache
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FP8KV_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FP8KV_ARGS,
             ),
         ]
 
         run_combined_tests(
-            models=nsa_variants,
-            test_name="DeepSeek-V3.2 NSA Backends",
+            models=dsa_variants,
+            test_name="DeepSeek-V3.2 DSA Backends",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),

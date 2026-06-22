@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from packaging import version
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
+
 PAD_SLOT_ID = -1
 
 TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
@@ -56,6 +58,14 @@ else:
         is not None
     }
 )
+@triton.heuristics(
+    {
+        "HAS_INTERMEDIATE_STATE_INDICES": lambda args: args[
+            "intermediate_state_indices_ptr"
+        ]
+        is not None
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def _selective_scan_update_kernel(
     # Pointers to matrices
@@ -74,6 +84,7 @@ def _selective_scan_update_kernel(
     intermediate_states_buffer,
     cache_steps,
     retrieve_parent_token_ptr,
+    intermediate_state_indices_ptr,
     # Matrix dimensions
     batch,
     T,
@@ -130,8 +141,13 @@ def _selective_scan_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -177,7 +193,12 @@ def _selective_scan_update_kernel(
 
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        if HAS_STATE_BATCH_INDICES:
+        if HAS_INTERMEDIATE_STATE_INDICES:
+            intermediate_state_idx = tl.load(intermediate_state_indices_ptr + pid_b).to(
+                tl.int64
+            )
+            cache_idx = intermediate_state_idx
+        elif HAS_STATE_BATCH_INDICES:
             cache_idx = state_batch_idx
         else:
             cache_idx = pid_b
@@ -250,7 +271,7 @@ def _selective_scan_update_kernel(
                 if state_batch_idx != pad_slot_id:
                     cache_ptr_base = (
                         intermediate_states_buffer
-                        + state_batch_idx * cache_steps * nheads * dim * dstate
+                        + cache_idx * cache_steps * nheads * dim * dstate
                         + current_step_idx * nheads * dim * dstate
                         + pid_h * dim * dstate
                     )
@@ -281,6 +302,9 @@ def _selective_scan_update_kernel(
     if not DISABLE_STATE_UPDATE:
         tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def selective_state_update(
     state,
@@ -300,6 +324,7 @@ def selective_state_update(
     intermediate_states_buffer=None,
     cache_steps=None,
     retrieve_parent_token=None,
+    intermediate_state_indices=None,
 ):
     """
     Argument:
@@ -324,6 +349,8 @@ def selective_state_update(
         intermediate_states_buffer: Buffer to cache intermediate states
         cache_steps: Total number of steps in the buffer
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
+        intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
+            If provided, uses these indices instead of state_batch_indices for the buffer.
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -409,7 +436,9 @@ def selective_state_update(
         else (0, 0)
     )
 
-    with torch.cuda.device(x.device.index):
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
+    with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             x,
@@ -426,6 +455,7 @@ def selective_state_update(
             intermediate_states_buffer,
             cache_steps if cache_steps is not None else 0,
             retrieve_parent_token,
+            intermediate_state_indices,
             batch,
             T,
             nheads,
@@ -472,4 +502,5 @@ def selective_state_update(
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
+            **pdl_kwargs,
         )

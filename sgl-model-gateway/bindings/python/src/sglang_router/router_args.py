@@ -4,9 +4,34 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+try:
+    from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+except ModuleNotFoundError:
+    logging.warning(
+        "sglang_router_rs is not available, get_available_tool_call_parsers will return empty list"
+    )
+
+    def get_available_tool_call_parsers() -> List[str]:
+        return []
+
 
 logger = logging.getLogger(__name__)
+
+# Single source of truth for routing-policy CLI choices. Keep this in sync with
+# `policy_from_str` in router.py and the `PolicyType` enum exposed by the Rust
+# binding (sglang_router_rs). The Rust standalone binary (src/main.rs) accepts a
+# subset of these — extending its `value_parser` and `parse_policy` to match is
+# tracked separately.
+_POLICY_CHOICES = (
+    "random",
+    "round_robin",
+    "cache_aware",
+    "power_of_two",
+    "bucket",
+    "manual",
+    "consistent_hashing",
+    "prefix_hash",
+)
 
 
 @dataclasses.dataclass
@@ -18,6 +43,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -36,6 +62,7 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
+    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -43,6 +70,7 @@ class RouterArgs:
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
+    json_log: bool = False
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -85,6 +113,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    disable_health_check: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -117,6 +146,9 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: Optional[str] = None
     postgres_pool_max: int = 16
+    redis_url: Optional[str] = None
+    redis_pool_max: int = 16
+    redis_retention_days: int = 30
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -135,7 +167,15 @@ class RouterArgs:
     jwt_issuer: Optional[str] = None
     jwt_audience: Optional[str] = None
     jwt_jwks_uri: Optional[str] = None
+    jwt_role_claim: str = "roles"
     jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # HTTP client connection pool tuning for upstream worker requests
+    pool_idle_timeout_secs: int = 50
+    connect_timeout_secs: int = 10
+    pool_max_idle_per_host: int = 500
+    tcp_keepalive_secs: int = 30
+    # Enable WebAssembly support
+    enable_wasm: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -173,6 +213,9 @@ class RouterArgs:
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
         )
+        http_client_group = parser.add_argument_group(
+            "HTTP Client", "Tuning for upstream HTTP client connection pooling"
+        )
         rate_limit_group = parser.add_argument_group(
             "Rate Limiting", "Concurrent request and queue limits"
         )
@@ -199,6 +242,9 @@ class RouterArgs:
         )
         postgres_group = parser.add_argument_group(
             "PostgreSQL Database", "PostgreSQL database backend configuration"
+        )
+        redis_group = parser.add_argument_group(
+            "Redis Database", "Redis database backend configuration"
         )
         tls_group = parser.add_argument_group(
             "TLS/mTLS Security", "TLS certificates for server and worker communication"
@@ -238,28 +284,21 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=_POLICY_CHOICES,
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "bucket",
-            ],
+            choices=_POLICY_CHOICES,
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=_POLICY_CHOICES,
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -305,6 +344,13 @@ class RouterArgs:
             help="Maximum idle time in seconds before eviction (for manual policy)",
         )
         routing_group.add_argument(
+            f"--{prefix}assignment-mode",
+            type=str,
+            default=RouterArgs.assignment_mode,
+            choices=["random", "min_load", "min_group"],
+            help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
+        )
+        routing_group.add_argument(
             f"--{prefix}max-payload-size",
             type=int,
             default=RouterArgs.max_payload_size,
@@ -326,6 +372,11 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}test-external-dp-routing",
+            action="store_true",
+            help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
@@ -374,6 +425,11 @@ class RouterArgs:
             choices=["debug", "info", "warn", "error"],
             help="Set the logging level. If not specified, defaults to INFO.",
         )
+        logging_group.add_argument(
+            f"--{prefix}json-log",
+            action="store_true",
+            help="Enable structured JSON log output instead of plain text.",
+        )
 
         # Service discovery configuration
         k8s_group.add_argument(
@@ -412,6 +468,12 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}bootstrap-port-annotation",
+            type=str,
+            default=RouterArgs.bootstrap_port_annotation,
+            help="Kubernetes annotation key for bootstrap port (PD mode)",
         )
         # Prometheus configuration
         prometheus_group.add_argument(
@@ -458,6 +520,32 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
+
+        # HTTP client connection pool tuning
+        http_client_group.add_argument(
+            f"--{prefix}pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.pool_idle_timeout_secs,
+            help="Idle timeout in seconds for pooled upstream HTTP connections",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}connect-timeout-secs",
+            type=int,
+            default=RouterArgs.connect_timeout_secs,
+            help="Timeout in seconds for new upstream HTTP connections",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}pool-max-idle-per-host",
+            type=int,
+            default=RouterArgs.pool_max_idle_per_host,
+            help="Maximum idle upstream HTTP connections to keep per host",
+        )
+        http_client_group.add_argument(
+            f"--{prefix}tcp-keepalive-secs",
+            type=int,
+            default=RouterArgs.tcp_keepalive_secs,
+            help="TCP keepalive idle time in seconds for upstream HTTP connections",
         )
 
         # Rate limiting configuration
@@ -585,6 +673,12 @@ class RouterArgs:
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
         )
+        health_group.add_argument(
+            f"--{prefix}disable-health-check",
+            action="store_true",
+            default=RouterArgs.disable_health_check,
+            help="Disable all worker health checks at startup",
+        )
         # Tokenizer configuration
         tokenizer_group.add_argument(
             f"--{prefix}model-path",
@@ -663,8 +757,14 @@ class RouterArgs:
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
-            choices=["memory", "none", "oracle", "postgres"],
+            choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
+        )
+        backend_group.add_argument(
+            f"--{prefix}enable-wasm",
+            action="store_true",
+            default=RouterArgs.enable_wasm,
+            help="Enable WebAssembly support",
         )
 
         # Oracle configuration
@@ -731,6 +831,28 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
+
+        # Redis configuration
+        redis_group.add_argument(
+            f"--{prefix}redis-url",
+            type=str,
+            default=os.getenv("REDIS_URL"),
+            help="Redis connection URL (env: REDIS_URL)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-pool-max",
+            type=int,
+            default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
+            help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-retention-days",
+            type=int,
+            default=int(
+                os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)
+            ),
+            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
         # TLS/mTLS configuration
@@ -819,6 +941,12 @@ class RouterArgs:
             help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
         )
         auth_group.add_argument(
+            f"--{prefix}jwt-role-claim",
+            type=str,
+            default=RouterArgs.jwt_role_claim,
+            help="JWT claim name containing the role (default: 'roles')",
+        )
+        auth_group.add_argument(
             f"--{prefix}jwt-role-mapping",
             type=str,
             nargs="*",
@@ -877,9 +1005,6 @@ class RouterArgs:
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
         )
-
-        # Mooncake-specific annotation
-        args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
 
         # Parse control plane API keys
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(

@@ -1,6 +1,9 @@
+import logging
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
+
+logger = logging.getLogger(__name__)
 from sglang_router.sglang_router_rs import (
     BackendType,
     HistoryBackendType,
@@ -10,6 +13,7 @@ from sglang_router.sglang_router_rs import (
     PyJwtConfig,
     PyOracleConfig,
     PyPostgresConfig,
+    PyRedisConfig,
     PyRole,
 )
 from sglang_router.sglang_router_rs import Router as _Router
@@ -63,6 +67,8 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
         return HistoryBackendType.Oracle
     elif backend_lower == "postgres":
         return HistoryBackendType.Postgres
+    elif backend_lower == "redis":
+        return HistoryBackendType.Redis
     else:
         raise ValueError(f"Unknown history backend: {backend_str}")
 
@@ -86,6 +92,22 @@ def build_control_plane_auth_config(
     # Check if any auth is configured
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
+
+    # Warn when JWT-related fields are set but the required pair is missing —
+    # otherwise the silent drop here disables JWT auth without explanation.
+    jwt_partial = bool(
+        args_dict.get("jwt_jwks_uri")
+        or args_dict.get("jwt_role_mapping")
+        or (
+            args_dict.get("jwt_role_claim") is not None
+            and args_dict.get("jwt_role_claim") != "roles"
+        )
+    )
+    if jwt_partial and not has_jwt:
+        logger.warning(
+            "JWT-related fields set but jwt_issuer/jwt_audience missing; "
+            "JWT auth will NOT be enabled."
+        )
 
     if not has_api_keys and not has_jwt:
         return None
@@ -111,6 +133,7 @@ def build_control_plane_auth_config(
             issuer=jwt_issuer,
             audience=jwt_audience,
             jwks_uri=args_dict.get("jwt_jwks_uri"),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
             role_mapping=args_dict.get("jwt_role_mapping", {}),
         )
 
@@ -262,12 +285,27 @@ class Router:
             )
         args_dict["postgres_config"] = postgres_config
 
+        # Convert Redis config if needed
+        redis_config = None
+        if history_backend == HistoryBackendType.Redis:
+            retention_days = args_dict.get("redis_retention_days", 30)
+            # If retention_days is negative, it means persistent storage (None in Rust)
+            retention_arg = None if retention_days < 0 else retention_days
+
+            redis_config = PyRedisConfig(
+                url=args_dict.get("redis_url"),
+                pool_max=args_dict.get("redis_pool_max", 16),
+                retention_days=retention_arg,
+            )
+        args_dict["redis_config"] = redis_config
+
         # Build control plane auth config
         args_dict["control_plane_auth"] = build_control_plane_auth_config(args_dict)
 
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
+            "test_external_dp_routing",
             "oracle_wallet_path",
             "oracle_tns_alias",
             "oracle_connect_descriptor",
@@ -278,12 +316,16 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            "redis_url",
+            "redis_pool_max",
+            "redis_retention_days",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",
             "jwt_issuer",
             "jwt_audience",
             "jwt_jwks_uri",
+            "jwt_role_claim",
             "jwt_role_mapping",
         ]
         for field in fields_to_remove:

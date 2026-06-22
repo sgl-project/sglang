@@ -5,17 +5,18 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=66, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=66, suite="stage-b-test-small-1-gpu")
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=66, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestPyTorchSamplingBackend(CustomTestCase):
@@ -47,6 +48,12 @@ class TestPyTorchSamplingBackend(CustomTestCase):
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
+    @unittest.skipIf(
+        is_in_amd_ci(),
+        "Skip on MI300x: greedy decode is not bit-exact across runs on MI300x "
+        "(kernel-level numerical jitter), so the assertEqual on identical "
+        "regenerated text is flaky on this runner pool.",
+    )
     def test_greedy(self):
 
         first_text = None
