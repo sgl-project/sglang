@@ -69,18 +69,15 @@ void pack_vnni2(scalar_t* __restrict__ dst, float* __restrict__ src, const float
 #endif
 }
 
-template <typename scalar_t>
-inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
+template <typename scalar_t, int SIZE>
+inline void fill_stub(scalar_t* __restrict__ out, float val) {
   using Vec = at::vec::Vectorized<scalar_t>;
   constexpr int kVecSize = Vec::size();
+  static_assert(SIZE % kVecSize == 0);
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
-  int d = 0;
-#pragma GCC unroll 4
-  for (; d <= size - kVecSize; d += kVecSize) {
+#pragma GCC unroll 8
+  for (int d = 0; d < SIZE; d += kVecSize) {
     data_vec.store(out + d);
-  }
-  if (size - d > 0) {
-    data_vec.store(out + d, size - d);
   }
 }
 
@@ -740,11 +737,11 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
     alignas(64) float tmp3[CHUNK_SIZE * D];
 
     // init temp buffer just once for each thread to prevent NaN
-    fill_stub(tmp, 0.f, CHUNK_SIZE * D);
-    fill_stub(tmp2, 0.f, CHUNK_SIZE * D);
-    fill_stub(attn, 0.f, CHUNK_SIZE * CHUNK_SIZE);
-    fill_stub(attn2, 0.f, CHUNK_SIZE * CHUNK_SIZE);
-    fill_stub(tmp3, 0.f, CHUNK_SIZE * D);
+    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp, 0.f);
+    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp2, 0.f);
+    fill_stub<float, CHUNK_SIZE * CHUNK_SIZE>(attn, 0.f);
+    fill_stub<scalar_t, CHUNK_SIZE * CHUNK_SIZE>(attn2, 0.f);
+    fill_stub<float, CHUNK_SIZE * D>(tmp3, 0.f);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
@@ -936,12 +933,12 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
     alignas(64) scalar_t attn2[CHUNK_SIZE * CHUNK_SIZE];
 
     // init temp buffer just once for each thread to prevent NaN
-    fill_stub(tmp, 0.f, CHUNK_SIZE * D);
-    fill_stub(tmp2, 0.f, D * D);
-    fill_stub(tmp3, 0.f, CHUNK_SIZE * D);
-    fill_stub(tmp4, 0.f, CHUNK_SIZE * D);
-    fill_stub(attn, 0.f, CHUNK_SIZE * CHUNK_SIZE);
-    fill_stub(attn2, 0.f, CHUNK_SIZE * CHUNK_SIZE);
+    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp, 0.f);
+    fill_stub<scalar_t, D * D>(tmp2, 0.f);
+    fill_stub<float, CHUNK_SIZE * D>(tmp3, 0.f);
+    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp4, 0.f);
+    fill_stub<float, CHUNK_SIZE * CHUNK_SIZE>(attn, 0.f);
+    fill_stub<scalar_t, CHUNK_SIZE * CHUNK_SIZE>(attn2, 0.f);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
