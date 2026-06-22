@@ -653,7 +653,7 @@ class Envs:
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
-    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(True)
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
