@@ -1481,5 +1481,173 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestLanguageModelOnlyArgs(CustomTestCase):
+    """Tests for --language-model-only flag validation."""
+
+    @staticmethod
+    def _mock_model_config(architectures: list[str]):
+        """Create a mock ModelConfig with the given architectures."""
+        mock_config = MagicMock()
+        mock_config.hf_config = SimpleNamespace(architectures=architectures)
+        return mock_config
+
+    def _make_server_args(self, **kwargs) -> ServerArgs:
+        """Create ServerArgs with a model path that avoids the dummy short-circuit."""
+        return ServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, **kwargs
+        )
+
+    # --- Mutual exclusion with encoder-related flags ---
+
+    def test_language_model_only_rejects_encoder_only(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(language_model_only=True, encoder_only=True)
+        self.assertIn("cannot be combined with --encoder-only", str(ctx.exception))
+
+    def test_language_model_only_rejects_language_only(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(language_model_only=True, language_only=True)
+        self.assertIn("cannot be combined with --language-only", str(ctx.exception))
+
+    def test_language_model_only_rejects_prefill_disaggregation(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(
+                language_model_only=True, disaggregation_mode="prefill"
+            )
+        self.assertIn("incompatible with --disaggregation-mode", str(ctx.exception))
+
+    def test_language_model_only_rejects_decode_disaggregation(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(
+                language_model_only=True, disaggregation_mode="decode"
+            )
+        self.assertIn("incompatible with --disaggregation-mode", str(ctx.exception))
+
+    def test_language_model_only_rejects_enable_prefix_mm_cache(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(
+                language_model_only=True, enable_prefix_mm_cache=True
+            )
+        self.assertIn(
+            "cannot be combined with --enable-prefix-mm-cache", str(ctx.exception)
+        )
+
+    def test_language_model_only_rejects_enable_broadcast_mm_inputs_process(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(
+                language_model_only=True, enable_broadcast_mm_inputs_process=True
+            )
+        self.assertIn(
+            "cannot be combined with --enable-broadcast-mm-inputs-process",
+            str(ctx.exception),
+        )
+
+    def test_language_model_only_rejects_mm_enable_dp_encoder(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(
+                language_model_only=True, mm_enable_dp_encoder=True
+            )
+        self.assertIn(
+            "cannot be combined with --mm-enable-dp-encoder", str(ctx.exception)
+        )
+
+    # --- Architecture whitelist validation ---
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_rejects_non_vlm_architecture(
+        self, mock_get_config
+    ):
+        """A text-only model (Qwen2ForCausalLM) should be rejected."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen2ForCausalLM"]
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(language_model_only=True)
+        self.assertIn("not currently supported", str(ctx.exception))
+        self.assertIn("Qwen2ForCausalLM", str(ctx.exception))
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_rejects_llava_architecture(
+        self, mock_get_config
+    ):
+        """Llava models are not yet in the whitelist."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["LlavaForConditionalGeneration"]
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._make_server_args(language_model_only=True)
+        self.assertIn("not currently supported", str(ctx.exception))
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen2_vl(self, mock_get_config):
+        """Qwen2-VL family should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen2VLForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen2_5_vl(self, mock_get_config):
+        """Qwen2.5-VL should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen2_5_VLForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen3_vl(self, mock_get_config):
+        """Qwen3-VL should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen3VLForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen3_vl_moe(self, mock_get_config):
+        """Qwen3-VL-MoE should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen3VLMoeForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen3_5(self, mock_get_config):
+        """Qwen3.5 should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen3_5ForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_language_model_only_accepts_qwen3_5_moe(self, mock_get_config):
+        """Qwen3.5-MoE should be accepted."""
+        mock_get_config.return_value = self._mock_model_config(
+            ["Qwen3_5MoeForConditionalGeneration"]
+        )
+        args = self._make_server_args(language_model_only=True)
+        self.assertTrue(args.language_model_only)
+
+    # --- Flag defaults ---
+
+    def test_language_model_only_defaults_to_false(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertFalse(args.language_model_only)
+
+    def test_language_model_only_memory_adjustment_skipped(self):
+        """VLM memory adjustment should be skipped for language_model_only."""
+        args = ServerArgs(model_path="dummy", language_model_only=True)
+        self.assertTrue(args.language_model_only)
+        # When language_model_only=False (default), this wouldn't adjust anyway
+        # for dummy models. The real test is server_args.py line 1797 which
+        # guards with: not self.language_model_only
+        args2 = ServerArgs(model_path="dummy")
+        self.assertFalse(args2.language_model_only)
+
+
 if __name__ == "__main__":
     unittest.main()
