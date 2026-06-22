@@ -33,12 +33,12 @@ from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
@@ -149,9 +149,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         config = model_runner.model_config
 
         # Model parameters
-        self.num_q_heads = config.num_attention_heads // get_attention_tp_size()
-        self.num_kv_heads = config.get_num_kv_heads(get_attention_tp_size())
-        self.num_local_heads = config.num_attention_heads // get_attention_tp_size()
+        self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
+        self.num_kv_heads = config.get_num_kv_heads(get_parallel().attn_tp_size)
+        self.num_local_heads = config.num_attention_heads // get_parallel().attn_tp_size
 
         # MLA-specific dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -344,7 +344,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
@@ -386,7 +386,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
@@ -447,7 +447,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
+            and not forward_mode.is_draft_extend_v2()
         ):
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -483,7 +483,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
@@ -514,7 +514,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             bs = forward_batch.batch_size
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
@@ -522,7 +522,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # and forward_prefill_metadata from a previous regular extend call could still be set.
             if (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
             # Get maximum sequence length.
@@ -537,7 +537,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
-            elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = torch.nn.functional.pad(
@@ -879,7 +879,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             metadata = (
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)

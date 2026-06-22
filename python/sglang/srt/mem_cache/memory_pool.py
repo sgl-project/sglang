@@ -90,6 +90,26 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
+def conv_window_dedup_enabled(
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+) -> bool:
+    """Whether the deduplicated sliding-window conv-intermediate layout is safe.
+
+    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
+    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
+    the overlapping physical columns hold identical values. Under EAGLE *tree*
+    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
+    columns can need different values from different parent chains -> fall back to
+    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
+    contiguous per-step windows). See ``MambaPool.__init__``.
+    """
+    return (
+        not is_npu
+        and not is_cpu
+        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+    )
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -316,6 +336,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -393,22 +414,86 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            conv_shape[0],
-                            conv_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device="cuda",
-                    )
-                    for conv_shape in conv_state_shape
-                ]
+                # Cache intermediate conv windows (last K-1 inputs) per draft token
+                # during target verify.
+                #
+                # On CUDA (Triton conv kernel + Triton scatter) we use a
+                # *deduplicated sliding-window* layout: consecutive draft tokens'
+                # (K-1)-wide windows overlap by (K-2), so instead of D separate
+                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
+                # (layer, slot) and expose an overlapping `as_strided` view of
+                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
+                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
+                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
+                # with no numerical change: both the conv kernel write (idempotent
+                # overlapping stores) and `fused_conv_window_scatter_with_mask`
+                # consume the view through its strides.
+                #
+                # Dedup the sliding-window conv-intermediate only when it is safe:
+                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
+                # verify (topk > 1) keep the dense layout -- see
+                # `conv_window_dedup_enabled` for the full rationale. The
+                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
+                # so the dense fallback reads correctly through the same code path.
+                dedup_conv_window = conv_window_dedup_enabled(
+                    _is_npu, _is_cpu, speculative_eagle_topk
+                )
+                self._intermediate_conv_window_phys = []
+                if dedup_conv_window:
+                    intermediate_conv_window_cache = []
+                    for conv_shape in conv_state_shape:
+                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
+                        shared_win = (
+                            speculative_num_draft_tokens + win - 1
+                        )  # D + (K-1) - 1
+                        phys = torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                conv_dim,
+                                shared_win,
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
+                        view = phys.as_strided(
+                            (
+                                phys.shape[0],
+                                phys.shape[1],
+                                speculative_num_draft_tokens,
+                                conv_dim,
+                                win,
+                            ),
+                            (
+                                phys.stride(0),
+                                phys.stride(1),
+                                phys.stride(3),  # step -> shared-win axis (stride 1)
+                                phys.stride(2),  # dim
+                                phys.stride(3),  # win -> shared-win axis (stride 1)
+                            ),
+                        )
+                        self._intermediate_conv_window_phys.append(phys)
+                        intermediate_conv_window_cache.append(view)
+                else:
+                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                    # [dim, K-1] window per draft token.
+                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    intermediate_conv_window_cache = [
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                speculative_num_draft_tokens,
+                                conv_shape[0],
+                                conv_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -421,7 +506,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    # Report the deduplicated PHYSICAL conv-window buffers (the view
+                    # over-reports its logical, un-deduplicated size).
+                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -431,7 +518,19 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
+            mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
+            if isinstance(self.mamba_cache, self.SpeculativeState):
+                # `intermediate_conv_window` is an as_strided view whose logical
+                # shape over-reports its real footprint; charge the physical buffers
+                # instead. No-op for the dense layout, where the view and the
+                # physical tensors coincide.
+                mem_usage_bytes -= get_tensor_size_bytes(
+                    self.mamba_cache.intermediate_conv_window
+                )
+                mem_usage_bytes += get_tensor_size_bytes(
+                    self._intermediate_conv_window_phys
+                )
+            self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
@@ -561,6 +660,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -585,6 +685,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def _init_mamba_pool(
@@ -596,6 +697,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -605,12 +707,27 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
             device=device,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+
+        # Optional int8 checkpoint pool: the radix caches states here (int8) instead
+        # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
+        # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_int8_mamba_checkpoint_pool,
+        )
+
+        self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
+            mamba_size=mamba_size,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=device,
+        )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
@@ -821,6 +938,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        # The int8 checkpoint pool holds radix-cached states in its own slots; a
+        # flush/reset drops the radix tree, so its slots must be released too,
+        # otherwise the (now unreferenced) slots leak and break the int8-pool
+        # invariant (int8_available + radix_cached != int8_total).
+        if self.mamba_ckpt_pool is not None:
+            self.mamba_ckpt_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
@@ -863,7 +986,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1663,9 +1786,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -1679,9 +1804,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_v_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
@@ -1711,10 +1838,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
+            cache_v, cache_v_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -2268,9 +2397,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -2290,9 +2421,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            cache_k_fp4, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+                cache_k
+            )
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -2326,14 +2461,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
-                    KVFP4QuantizeUtil,
+                    BlockFP4KVQuantizeUtil,
                 )
 
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
                 )
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_rope)
                 )
 
             if self.store_dtype != self.dtype:
