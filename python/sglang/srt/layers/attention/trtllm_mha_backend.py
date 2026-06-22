@@ -238,7 +238,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.draft_branch_page_tables: Optional[torch.Tensor] = None
         self.draft_branch_page_table_buf: Optional[torch.Tensor] = None
         # SWA hybrid + topk > 1: tree verify on SWA layers folds the sliding
-        # window into the packed custom mask (the trtllm-gen custom-mask
+        # window into the packed custom mask (the trtllm custom-mask
         # cubins have no SlidingWindow+Custom mask type), presenting only the
         # in-window KV via a page-trimmed SWA table so the mask region stays
         # ~window-sized. See _swa_verify_views.
