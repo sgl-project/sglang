@@ -66,6 +66,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     set_tc_piecewise_forward_context,
 )
@@ -77,7 +80,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -134,10 +136,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
         self.max_bs = model_runner.req_to_token_pool.size
-
-        log_info_on_rank0(
-            logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
-        )
 
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -222,7 +220,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
-        self.backend = resolve_prefill_backend(self)
+        try:
+            self.backend = resolve_prefill_backend(self)
+        except RuntimeError as e:
+            if _prefill_backend_name == Backend.TC_PIECEWISE:
+                raise Exception(
+                    f"Capture prefill CUDA graph failed: {e}\n"
+                    f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
+            raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
@@ -304,7 +310,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture prefill CUDA graph failed: {e}\n"
+                f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
 
         self.raw_num_tokens = 0
 

@@ -2626,6 +2626,18 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            elif is_hip():
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -3119,10 +3131,11 @@ class ServerArgs:
 
         # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families). SM90 is not auto-enabled because
-        # auto resolves to mnnvl, which requires a working NVLink multicast fabric
-        # that SM90 nodes do not reliably have; SM90 users can opt in explicitly
-        # via --flashinfer-allreduce-fusion-backend.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). SM90 is not
+        # auto-enabled because auto resolves to mnnvl, which requires a working
+        # NVLink multicast fabric that SM90 nodes do not reliably have; SM90
+        # users can opt in explicitly via
+        # --flashinfer-allreduce-fusion-backend.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -3135,6 +3148,7 @@ class ServerArgs:
                 "Glm4MoeLiteForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Qwen3VLMoeForConditionalGeneration",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
