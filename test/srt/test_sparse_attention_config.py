@@ -60,10 +60,28 @@ class TestSparseAttentionConfig(unittest.TestCase):
         algo = _create_sparse_algorithm(config, torch.device("cpu"))
         self.assertIsInstance(algo, QuestAlgorithm)
 
-    def test_factory_unknown_algorithm_raises(self):
-        config = parse_sparse_attention_config(_server_args('{"algorithm":"does_not_exist"}'))
+    def test_unknown_algorithm_rejected_at_parse(self):
         with self.assertRaises(ValueError):
-            _create_sparse_algorithm(config, torch.device("cpu"))
+            parse_sparse_attention_config(_server_args('{"algorithm":"does_not_exist"}'))
+
+    def test_unsupported_backend_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_sparse_attention_config(
+                _server_args('{"algorithm":"quest","backend":"triton"}')
+            )
+
+    def test_bad_sparsity_ratio_rejected(self):
+        for bad in ("1.0", "1.5", "-0.1"):
+            with self.assertRaises(ValueError):
+                parse_sparse_attention_config(
+                    _server_args('{"algorithm":"quest","sparsity_ratio":%s}' % bad)
+                )
+
+    def test_negative_min_sparse_prompt_len_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_sparse_attention_config(
+                _server_args('{"algorithm":"quest","min_sparse_prompt_len":-1}')
+            )
 
 
 if __name__ == "__main__":

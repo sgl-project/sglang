@@ -27,6 +27,9 @@ _ALGORITHM_REGISTRY = {
     ),
 }
 
+# Attention backends the experimental --enable-sparse-attention path supports.
+_SUPPORTED_SPARSE_BACKENDS = {"fa3", "flashattention"}
+
 
 def _create_sparse_algorithm(
     config: SparseConfig,
@@ -125,16 +128,33 @@ def parse_sparse_attention_config(server_args) -> SparseConfig:
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse sparse_attention_config: {e}") from e
 
-    algorithm = cfg.pop("algorithm", "quest")
+    algorithm = str(cfg.pop("algorithm", "quest")).lower()
+    if algorithm not in _ALGORITHM_REGISTRY:
+        raise ValueError(
+            f"Unknown sparse-attention algorithm '{algorithm}'. "
+            f"Available: {sorted(_ALGORITHM_REGISTRY)}"
+        )
+
     backend = (
         cfg.pop("backend", None)
         or getattr(server_args, "attention_backend", None)
         or "fa3"
     )
+    if backend not in _SUPPORTED_SPARSE_BACKENDS:
+        raise ValueError(
+            f"Sparse attention does not support attention backend '{backend}'. "
+            f"Supported: {sorted(_SUPPORTED_SPARSE_BACKENDS)} "
+            f"(run with --attention-backend fa3)."
+        )
+
     page_size = (
         cfg.pop("page_size", None) or getattr(server_args, "page_size", None) or 1
     )
-    min_sparse_prompt_len = cfg.pop("min_sparse_prompt_len", 0)
+    min_sparse_prompt_len = int(cfg.pop("min_sparse_prompt_len", 0))
+    if min_sparse_prompt_len < 0:
+        raise ValueError(
+            f"min_sparse_prompt_len must be >= 0, got {min_sparse_prompt_len}"
+        )
     top_k = cfg.pop("top_k", 2048)
     device_buffer_size = cfg.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = cfg.pop("host_to_device_ratio", 2)
@@ -142,6 +162,12 @@ def parse_sparse_attention_config(server_args) -> SparseConfig:
     extra = dict(cfg.pop("algorithm_config", {}) or {})
     # remaining flat keys (e.g. sparsity_ratio, num_recent_pages) -> extra config
     extra.update(cfg)
+
+    sparsity_ratio = extra.get("sparsity_ratio")
+    if sparsity_ratio is not None and not 0.0 <= float(sparsity_ratio) < 1.0:
+        raise ValueError(
+            f"sparsity_ratio must be in [0, 1), got {sparsity_ratio}"
+        )
 
     return SparseConfig(
         top_k=top_k,

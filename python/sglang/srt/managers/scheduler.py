@@ -356,6 +356,10 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
 
+        # Experimental query-aware sparse attention (e.g. Quest), runner-owned.
+        self.enable_sparse_attention = server_args.enable_sparse_attention
+        self.sparse_coordinator = None
+
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
@@ -476,6 +480,12 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if self.enable_sparse_attention:
+            # Created inside ModelRunner.initialize(); bind the runner-owned instance.
+            self.sparse_coordinator = getattr(
+                self.tp_worker.model_runner, "sparse_coordinator", None
+            )
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -1822,6 +1832,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            sparse_coordinator=self.sparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
@@ -2914,15 +2925,11 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        if self.server_args.enable_sparse_attention:
+        if self.sparse_coordinator is not None:
             # Register newly admitted requests with the sparse-attention coordinator
             # (records prompt length + resets per-request representation state).
-            from sglang.srt.mem_cache.sparsity.factory import get_sparse_coordinator
-
-            _sc = get_sparse_coordinator()
-            if _sc is not None:
-                for req in new_batch.reqs:
-                    _sc.on_request_begin(req)
+            for req in new_batch.reqs:
+                self.sparse_coordinator.on_request_begin(req)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
