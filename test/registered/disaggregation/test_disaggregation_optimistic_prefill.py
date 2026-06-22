@@ -64,6 +64,7 @@ class OptimisticPrefillRetryCounterMixin:
         (pending_bootstrap=True). A single idle request completes bootstrap
         instantly, so we need concurrent load to keep decode busy.
         """
+
         def submit_contention(executor):
             return [
                 executor.submit(
@@ -81,6 +82,7 @@ class OptimisticPrefillRetryCounterMixin:
                 )
                 for _ in range(BOOTSTRAP_CONTENTION_REQUESTS)
             ]
+
         with ThreadPoolExecutor(max_workers=BOOTSTRAP_CONTENTION_WORKERS) as executor:
             contention_futures = submit_contention(executor)
             # Let contention requests reach decode bootstrap first.
