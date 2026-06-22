@@ -8361,7 +8361,7 @@ class PortArgs:
     metrics_ipc_name: str
 
     # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
-    tokenizer_router_input_ipc_name: Optional[str]
+    tokenizer_worker_ipc_name: Optional[str]
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -8383,9 +8383,9 @@ class PortArgs:
             nccl_port = server_args.nccl_port
 
         if server_args.tokenizer_worker_num == 1:
-            tokenizer_router_input_ipc_name = None
+            tokenizer_worker_ipc_name = None
         else:
-            tokenizer_router_input_ipc_name = (
+            tokenizer_worker_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
@@ -8400,7 +8400,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                tokenizer_router_input_ipc_name=tokenizer_router_input_ipc_name,
+                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 instance_id=instance_id,
             )
         else:
@@ -8470,7 +8470,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
-                tokenizer_router_input_ipc_name=tokenizer_router_input_ipc_name,
+                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 load_collector_ipc_name=NetworkAddress(
                     dist_init_host, load_collector_port
                 ).to_tcp(),

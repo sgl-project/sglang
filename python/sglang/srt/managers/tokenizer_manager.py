@@ -385,9 +385,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
 
-            # Use tokenizer_router_input_ipc_name in multi-tokenizer mode
+            # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_router_input_ipc_name, False
+                context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
