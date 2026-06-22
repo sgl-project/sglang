@@ -2626,6 +2626,18 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            elif is_hip():
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
