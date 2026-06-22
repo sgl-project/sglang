@@ -30,6 +30,7 @@ register_cuda_ci(est_time=164, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakableCUDAGraphBasic(CustomTestCase):
     """Test basic breakable CUDA graph capture and replay."""
 
@@ -340,6 +341,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             bcg._copy_into_output((target, None), (target,))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakGraphHelper(CustomTestCase):
     """Test the break_graph() convenience function."""
 
@@ -378,6 +380,7 @@ class TestBreakGraphHelper(CustomTestCase):
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakableCudaGraph(CustomTestCase):
     """Integration: Qwen3-8B with --cuda-graph-backend-prefill=breakable on mgsm_en."""
 
