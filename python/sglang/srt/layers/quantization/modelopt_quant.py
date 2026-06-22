@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -1354,6 +1355,45 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
 
+class HybridFp8NvFp4Config(Fp8Config):
+    """FP8 (linear/attention/MTP MoE) + NVFP4 (FusedMoE) hybrid quantization.
+
+    For checkpoints like nvidia/DeepSeek-V4-Pro-NVFP4 where
+    config.json:quantization_config declares quant_method=fp8 and
+    moe_quant_algo=NVFP4. FusedMoE layers route through
+    ModelOptNvFp4FusedMoEMethod; linear / attention layers
+    delegate to the inherited Fp8Config dispatch.
+    """
+
+    def __init__(self, fp8_config: Fp8Config, nvfp4_config: ModelOptFp4Config):
+        # Inherit all of fp8_config's state without re-running its
+        # validation / logging (already happened at fp8_config build time).
+        self.__dict__.update(fp8_config.__dict__)
+        self.nvfp4_config = nvfp4_config
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            if not self.nvfp4_config.is_layer_excluded(prefix):
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            # Fall back to MXFP4 for MTP MoE layers
+            if self.is_fp4_experts:
+                from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                )
+
+                return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
+        return super().get_quant_method(layer, prefix)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+
+
 class ModelOptFp4LinearMethod(LinearMethodBase):
     """Linear method for NVFP4.
     Supports loading NVFP4 checkpoints with the following structure:
@@ -2053,6 +2093,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        swiglu_limit = layer.moe_runner_config.swiglu_limit
+        if (
+            swiglu_limit is not None
+            and layer.moe_runner_config.is_gated
+            and self.enable_flashinfer_trtllm_moe
+        ):
+            copy_or_rebind_param(
+                layer,
+                "gemm1_clamp_limit",
+                (swiglu_limit / layer.g1_alphas).to(torch.float32),
+            )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
@@ -2338,6 +2390,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "routing_method_type", RoutingMethodType.Default
             )
 
+            gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
@@ -2353,6 +2406,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
+                gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
             )
 
             return self.runner.run(dispatch_output, quant_info)
