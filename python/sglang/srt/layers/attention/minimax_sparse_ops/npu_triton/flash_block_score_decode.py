@@ -7,26 +7,24 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    # Optional. This exists in vllm-ascend, but keeping a fallback makes this
-    # file easier to import in lightweight/unit-test environments.
-    from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-except Exception:  # pragma: no cover
-    get_vectorcore_num = None
-
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
 
 def _get_vectorcore_num_safe() -> int:
-    """Return Ascend vector core count with a conservative fallback."""
-    if get_vectorcore_num is None:
-        return 32
+    """Return the Ascend NPU vector-core count (sglang-native).
+
+    Read ``num_vectorcore`` from triton's active-driver device properties for the
+    current NPU. Falls back to 32 off-NPU or if the property is unavailable.
+    """
     try:
-        vc_num = int(get_vectorcore_num())
+        props = triton.runtime.driver.active.utils.get_device_properties(
+            torch.npu.current_device()
+        )
+        vc_num = int(props.get("num_vectorcore", -1))
     except Exception:
         return 32
-    return max(1, vc_num)
+    return max(1, vc_num) if vc_num > 0 else 32
 
 
 def _choose_num_kv_chunks(

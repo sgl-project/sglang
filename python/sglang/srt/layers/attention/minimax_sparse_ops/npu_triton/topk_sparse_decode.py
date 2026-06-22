@@ -20,14 +20,20 @@ def _floor_power_of_2(x: int) -> int:
 
 
 def _get_vectorcore_num_safe() -> int:
-    try:
-        from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+    """Return the Ascend NPU vector-core count (sglang-native).
 
-        n = int(get_vectorcore_num())
-        return max(1, n)
+    Read ``num_vectorcore`` from triton's active-driver device properties for the
+    current NPU. Falls back to 32 off-NPU or if the property is unavailable.
+    """
+    try:
+        props = triton.runtime.driver.active.utils.get_device_properties(
+            torch.npu.current_device()
+        )
+        n = int(props.get("num_vectorcore", -1))
     except Exception:
         # Conservative fallback.
         return 32
+    return max(1, n) if n > 0 else 32
 
 
 def _choose_num_topk_chunks(
