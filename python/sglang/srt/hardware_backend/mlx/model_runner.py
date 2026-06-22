@@ -320,15 +320,15 @@ class MlxModelRunner:
                     "falling back to leaf-only auxiliary-state radix caching."
                 )
                 return
-            req.mamba_ping_pong_track_buffer = track_buffer
-            req.mamba_next_track_idx = 0
+            req.mamba.mamba_ping_pong_track_buffer = track_buffer
+            req.mamba.mamba_next_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
             cache,
             self._cache_layout.auxiliary_layer_indices,
         )
-        req.mamba_last_track_seqlen = track_len
+        req.mamba.mamba_last_track_seqlen = track_len
 
     def _cache_with_pool_backed_attention(
         self, prefix_slot_ids: list[int], prefix_len: int
@@ -733,7 +733,7 @@ class MlxModelRunner:
         """
         prefix_len = len(prefix_slot_ids)
         if req is not None:
-            req.mamba_last_track_seqlen = None
+            req.mamba.mamba_last_track_seqlen = None
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()

@@ -565,7 +565,7 @@ class SWAComponent(TreeComponent):
         is_finished: bool,
     ) -> Optional[int]:
         if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+            insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
@@ -580,7 +580,7 @@ class SWAComponent(TreeComponent):
                 req_to_token_pool=self.cache.req_to_token_pool,
                 token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             )
-        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
 
