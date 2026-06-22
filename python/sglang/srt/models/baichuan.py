@@ -49,6 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, is_xpu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 _is_xpu = is_xpu()
