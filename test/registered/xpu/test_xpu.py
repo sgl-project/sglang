@@ -97,6 +97,7 @@ class TestLMCacheXPUConnector(unittest.TestCase):
             rank=0,
             k_pool=cls.k_buffer,
             v_pool=cls.v_buffer,
+            config_file=os.environ["LMCACHE_CONFIG_FILE"],
         )
 
     @classmethod
