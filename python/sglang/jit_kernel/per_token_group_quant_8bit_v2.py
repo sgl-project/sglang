@@ -72,7 +72,7 @@ def _per_token_group_quant_8bit_v2_custom_op(
         return
     num_local_experts = input.shape[0] if masked_layout else 1
     last = output_q.dim() - 1
-    is_column_major = output_s.stride(-2) < output_s.stride(-1)
+    is_column_major = output_s.stride(last - 1) < output_s.stride(last)
     hidden_dim_num_groups = output_q.shape[last] // group_size
     num_tokens_per_expert = output_q.shape[last - 1]
     if is_column_major:
