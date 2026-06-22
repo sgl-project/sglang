@@ -11,11 +11,12 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestDisaggregationWire(unittest.TestCase):
+class TestDisaggregationWire(CustomTestCase):
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
@@ -47,7 +48,7 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
-class TestGroupConcurrentContiguous(unittest.TestCase):
+class TestGroupConcurrentContiguous(CustomTestCase):
     @staticmethod
     def _arr(values):
         return np.array(values, dtype=np.int32)
@@ -91,7 +92,7 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
 
 
-class TestDSV4C128StateIndices(unittest.TestCase):
+class TestDSV4C128StateIndices(CustomTestCase):
     def test_online_uses_request_slot(self):
         np.testing.assert_array_equal(
             get_dsv4_c128_state_indices(7, 256, online=True, ring_size=1),

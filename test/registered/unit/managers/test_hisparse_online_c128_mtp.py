@@ -5,6 +5,10 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _make_server_args(**overrides):
@@ -25,7 +29,7 @@ def _make_server_args(**overrides):
     return args
 
 
-class TestHiSparseOnlineC128MTPValidation(unittest.TestCase):
+class TestHiSparseOnlineC128MTPValidation(CustomTestCase):
     def _validate(self, args, *, online=True, experimental=True, compressor_v2=True):
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(online))

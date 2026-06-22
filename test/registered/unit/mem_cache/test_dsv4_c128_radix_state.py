@@ -10,8 +10,9 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import RadixKey, SWARadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class FakeDSV4KVPool(BaseSWAKVPool):
@@ -57,7 +58,7 @@ class FakeReq:
         self.last_node = None
 
 
-class TestDSV4C128RadixState(unittest.TestCase):
+class TestDSV4C128RadixState(CustomTestCase):
     def _make_cache(self):
         kv_pool = FakeDSV4KVPool()
         allocator = SWATokenToKVPoolAllocator(
