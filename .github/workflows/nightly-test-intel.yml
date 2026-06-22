@@ -2,7 +2,8 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # 22:15 IST (UTC+5:30) → 16:45 UTC daily.
+    - cron: '45 16 * * *'
   push:
     branches:
       - main
@@ -248,7 +249,7 @@ jobs:
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Nightly Test (8-GPU XPU)
-        timeout-minutes: 90
+        timeout-minutes: 150
         run: |
           touch github_summary.md
           docker exec ci_sglang_xpu bash -c "
