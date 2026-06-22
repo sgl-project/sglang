@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
 
 register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=True)
 
-DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.1-FP8"
+DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
 # Fallback when the layer count can't be resolved: never silently shrink coverage.
 DUMPER_FILTER_ALL_LAYERS = (
