@@ -1352,11 +1352,7 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
-        # Handle data parallelism before memory settings: dp-attention divides
-        # chunked_prefill_size by dp_size, and _handle_gpu_memory_settings uses
-        # chunked_prefill_size to reserve prefill activation memory — running it
-        # before the division over-reserves activation by dp_size and drives the
-        # auto mem_fraction_static too low on smaller GPUs (KV pool <= 0 OOM).
+        # Handle data parallelism.
         self._handle_data_parallelism()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
