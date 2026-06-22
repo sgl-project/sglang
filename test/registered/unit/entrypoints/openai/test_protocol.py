@@ -485,6 +485,34 @@ class TestValidationEdgeCases(unittest.TestCase):
                 model="test-model", messages=messages, tool_choice=123
             )
 
+    def test_named_tool_choice_mismatch_rejected(self):
+        """A named tool_choice that matches no tool is rejected."""
+        messages = [{"role": "user", "content": "Hello"}]
+        tools = [
+            {"type": "function", "function": {"name": "a"}},
+        ]
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                tools=tools,
+                tool_choice={"type": "function", "function": {"name": "b"}},
+            )
+
+    def test_named_tool_choice_match_accepted(self):
+        """A named tool_choice that matches a declared tool is accepted."""
+        messages = [{"role": "user", "content": "Hello"}]
+        tools = [
+            {"type": "function", "function": {"name": "a"}},
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "a"}},
+        )
+        self.assertEqual(request.tool_choice.function.name, "a")
+
     def test_negative_token_limits(self):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
