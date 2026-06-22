@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+device_print_registered = False
 
 
 class NPUACLFormat(IntEnum):
@@ -349,12 +350,16 @@ def _mark_op_side_effectful(op: Any) -> None:
 
 
 def _ensure_device_print_registered() -> None:
+    global device_print_registered
+    if device_print_registered:
+        return
     try:
         # Mark device_print ops side-effectful so FX/Inductor does not DCE or reorder these debug callbacks.
         import sgl_kernel_npu  # noqa: F401
 
         _mark_op_side_effectful(torch.ops.npu.device_print)
         _mark_op_side_effectful(torch.ops.npu.device_print_tensor)
+        device_print_registered = True
     except AttributeError as exc:
         raise RuntimeError(
             "device_print ops are available in sgl_kernel_npu. "
