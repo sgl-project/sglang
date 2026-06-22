@@ -536,4 +536,150 @@ struct PerTokenGroupQuant8bitV2Kernel {
   }
 };
 
+template <int GROUP_SIZE, int THREADS_PER_SUBWARP, typename T, typename DST_DTYPE, bool kUsePDL>
+__global__ void per_token_group_quant_fp8_dsv4_kernel(
+    const T* __restrict__ input,
+    DST_DTYPE* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int subwarps_per_block,
+    const int hidden_dim_num_groups,
+    const int num_dsv4_groups,
+    const int scale_token_stride,
+    const int scale_group_stride) {
+  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
+  static_assert(std::is_same_v<DST_DTYPE, fp8_e4m3_t>);
+
+  device::PDLWaitPrimary<kUsePDL>();
+
+  NaiveScheduler::template execute<false, GROUP_SIZE, THREADS_PER_SUBWARP>(
+      subwarps_per_block,
+      hidden_dim_num_groups,
+      nullptr,
+      0,
+      [&](const int,
+          const int token_idx,
+          const int hidden_dim_group_idx,
+          const int lane_id,
+          const int64_t input_group_start_offset) {
+        constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
+        constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
+
+        const int row_idx = token_idx;
+        const int dsv4_token_idx = row_idx / num_dsv4_groups;
+        const int dsv4_group_idx = row_idx - dsv4_token_idx * num_dsv4_groups;
+        const int64_t output_s_offset = static_cast<int64_t>(dsv4_token_idx) * scale_token_stride +
+                                        static_cast<int64_t>(dsv4_group_idx) * scale_group_stride +
+                                        hidden_dim_group_idx;
+        const int offset_num_groups = row_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+
+        int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
+        T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
+
+#pragma unroll
+        for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+          input_primary_int4[j] =
+              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE)[j];
+        }
+
+        float local_absmax = LOCAL_ABSMAX_ABS;
+#pragma unroll
+        for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+          const float val = static_cast<float>(input_primary_vec[j]);
+          local_absmax = fmaxf(local_absmax, fabsf(val));
+        }
+
+        local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax);
+
+        float y_scale, y_scale_inv;
+        calculate_fp8_scales<true, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        if (lane_id == 0) {
+          output_s[output_s_offset] = y_scale_inv;
+        }
+        float2 y_scale_repeated = {y_scale, y_scale};
+
+        int4 output_buf;
+        const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+#pragma unroll
+        for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+          float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+          float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
+          outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
+          outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
+          output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+        }
+
+        *reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE) =
+            output_buf;
+      });
+
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <typename T, typename DST_DTYPE, bool kUsePDL>
+struct PerTokenGroupQuantFp8Dsv4Kernel {
+  template <int GROUP_SIZE>
+  static void launch(
+      const DLDevice& device,
+      int num_groups,
+      int hidden_dim_num_groups,
+      int num_dsv4_groups,
+      int scale_token_stride,
+      int scale_group_stride,
+      const void* input,
+      void* output_q,
+      void* output_s) {
+    constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;
+    static_assert((GROUP_SIZE / 16) * INPUT_PRIMARY_VEC_NUM_BYTES == GROUP_SIZE * static_cast<int>(sizeof(T)));
+    int subwarps_per_block;
+    dim3 grid, block;
+    NaiveScheduler::compute_exec_config(
+        THREADS_PER_SUBWARP, 1, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);
+    auto kernel = per_token_group_quant_fp8_dsv4_kernel<GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, kUsePDL>;
+    host::LaunchKernel(grid, block, device)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            static_cast<const T*>(input),
+            static_cast<DST_DTYPE*>(output_q),
+            static_cast<float*>(output_s),
+            subwarps_per_block,
+            hidden_dim_num_groups,
+            num_dsv4_groups,
+            scale_token_stride,
+            scale_group_stride);
+  }
+
+  static void
+  run(tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      int64_t group_size,
+      int64_t num_groups,
+      int64_t hidden_dim_num_groups,
+      int64_t num_dsv4_groups,
+      int64_t scale_token_stride,
+      int64_t scale_group_stride) {
+    const DLDevice dev = input.device();
+    const void* in = input.data_ptr();
+    void* oq = output_q.data_ptr();
+    void* os = output_s.data_ptr();
+
+    switch (group_size) {
+      case 128:
+        launch<128>(
+            dev,
+            static_cast<int>(num_groups),
+            static_cast<int>(hidden_dim_num_groups),
+            static_cast<int>(num_dsv4_groups),
+            static_cast<int>(scale_token_stride),
+            static_cast<int>(scale_group_stride),
+            in,
+            oq,
+            os);
+        break;
+      default:
+        host::Panic("Unsupported DSV4 group_size ", group_size);
+    }
+  }
+};
+
 }  // namespace

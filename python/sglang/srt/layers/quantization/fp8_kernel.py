@@ -77,6 +77,9 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
         per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
+    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+        per_token_group_quant_fp8_dsv4 as sgl_per_token_group_quant_fp8_dsv4_jit,
+    )
 
 if _is_hip:
     _has_vllm = False
@@ -690,6 +693,54 @@ def sglang_per_token_group_quant_fp8_ue8m0(
             False,  # fuse_silu_and_mul
             None,  # masked_m
             enable_v2=True,
+        )
+
+    return x_q, x_s
+
+
+def sglang_per_token_group_quant_fp8_dsv4_ue8m0(
+    x: torch.Tensor,
+    num_dsv4_groups: int,
+    group_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert group_size == 128, "DSV4 deep_gemm fp8_einsum expects group_size=128"
+    assert x.dim() == 2, "x must be flattened as (num_tokens * num_dsv4_groups, hidden)"
+    assert (
+        x.shape[-1] % group_size == 0
+    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    assert (
+        x.shape[0] % num_dsv4_groups == 0
+    ), f"rows ({x.shape[0]}) must be divisible by num_dsv4_groups ({num_dsv4_groups})"
+    assert x.is_contiguous(), "x must be contiguous"
+    assert (
+        enable_sgl_per_token_group_quant_8bit
+    ), "DSV4 quant requires the v2 group quant kernel"
+
+    num_tokens = x.shape[0] // num_dsv4_groups
+    hidden_dim_num_groups = x.shape[-1] // group_size
+    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    if num_tokens <= 1:
+        x_s = torch.empty_strided(
+            (num_tokens, num_dsv4_groups, hidden_dim_num_groups),
+            (num_dsv4_groups * hidden_dim_num_groups, hidden_dim_num_groups, 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+    else:
+        x_s = torch.empty_strided(
+            (num_tokens, num_dsv4_groups, hidden_dim_num_groups),
+            (hidden_dim_num_groups, num_tokens * hidden_dim_num_groups, 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_fp8_dsv4_jit(
+            x,
+            x_q,
+            x_s,
+            group_size=group_size,
+            num_dsv4_groups=num_dsv4_groups,
         )
 
     return x_q, x_s
