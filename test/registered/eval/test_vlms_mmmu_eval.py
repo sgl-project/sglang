@@ -3,6 +3,8 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -64,6 +66,7 @@ MODEL_THRESHOLDS = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyVLMMmmuEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
