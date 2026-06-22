@@ -293,18 +293,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
-    def init_backends(self):
-        disable_cuda_graph = False
-        if is_cuda() and not self.server_args.disable_cuda_graph:
+    def init_attention_backends(self):
+        self._draft_worker.init_attention_backends()
+
+    def init_cuda_graphs(self):
+        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            disable_cuda_graph = available_mem < 1.0
-            if disable_cuda_graph:
+            if available_mem < 1.0:
+                capture_decode_cuda_graph = False
                 logger.warning(
                     "Disable DFLASH draft cuda graph because only %.2f GB GPU "
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
+        self._draft_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -620,17 +625,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
-        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        if not hasattr(lm_head, "shard_indices"):
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(hs, weight.T)
+                out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+            return out_tokens
+
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
         #   base vocab:  [0, num_org)
@@ -640,14 +655,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
-
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
-
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         def _ensure_local_reduce_buffers(
             chunk_len: int,

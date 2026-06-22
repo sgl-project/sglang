@@ -26,7 +26,6 @@ This guide describes the best practice data for Qwen3.5-397B on the Ascend NPU.
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
-
 ## Optimal Configuration
 
 ### Qwen3.5-397B W4A8 8P IN128K OUT1K 20ms
@@ -698,6 +697,8 @@ python -m sglang.bench_serving \
     --request-rate inf \
     --warmup-requests 64
 ```
+
+<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 50ms
 

@@ -9,7 +9,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    align_tensor_to_module_dtype,
+    autocast_enabled,
+    resolve_precision,
+    temporary_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -32,9 +37,15 @@ class LTX2AVDecodingStage(DecodingStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
+        audio_vae_dtype = resolve_precision(
+            server_args, "audio_vae", precision_attr="audio_vae_precision"
+        )
         return [
-            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
-            ComponentUse(stage_name, "audio_vae"),
+            ComponentUse(stage_name, "vae", target_dtype=vae_dtype),
+            ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
             ComponentUse(stage_name, "vocoder"),
         ]
 
@@ -46,17 +57,18 @@ class LTX2AVDecodingStage(DecodingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        vae_dtype = resolve_precision(
+            server_args,
+            "vae",
+            precision_attr="vae_precision",
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
-        original_dtype = vae_dtype
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None
             self.vae = vae
             self.vae.eval()
-            latents = batch.latents.to(get_local_torch_device(), dtype=torch.bfloat16)
+            latents = batch.latents.to(get_local_torch_device())
             if self._ltx2_should_externally_denorm_video_latents(server_args):
                 std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
                 mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
@@ -75,15 +87,19 @@ class LTX2AVDecodingStage(DecodingStage):
                         self.vae.enable_tiling()
                 except Exception:
                     pass
-                decode_output = self.vae.decode(latents)
+                should_cast_vae = not vae_autocast_enabled
+                if not vae_autocast_enabled:
+                    latents = latents.to(vae_dtype)
+                with temporary_module_dtype(
+                    self.vae, vae_dtype, enabled=should_cast_vae
+                ) as vae:
+                    decode_output = vae.decode(latents)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):
                     video = decode_output.sample
                 else:
                     video = decode_output
-
-            self.vae.to(original_dtype)
         video = self.video_processor.postprocess_video(video, output_type="np")
 
         output_batch = OutputBatch(
@@ -109,15 +125,12 @@ class LTX2AVDecodingStage(DecodingStage):
                 assert audio_vae is not None
                 self.audio_vae = audio_vae
                 self.audio_vae.eval()
-                try:
-                    dtype = self.audio_vae.dtype
-                except AttributeError:
-                    dtype = None
-                if dtype is None:
-                    try:
-                        dtype = next(self.audio_vae.parameters()).dtype
-                    except StopIteration:
-                        dtype = torch.float32
+                audio_vae_dtype = resolve_precision(
+                    server_args,
+                    "audio_vae",
+                    precision_attr="audio_vae_precision",
+                )
+                dtype = audio_vae_dtype
                 audio_latents = audio_latents.to(device, dtype=dtype)
                 try:
                     latents_std = self.audio_vae.latents_std
@@ -147,11 +160,24 @@ class LTX2AVDecodingStage(DecodingStage):
                         )
                     audio_latents = audio_latents * latents_std + latents_mean
 
-                with torch.no_grad():
+                audio_vae_autocast_enabled = autocast_enabled(
+                    audio_vae_dtype, server_args.disable_autocast
+                )
+                should_cast_audio_vae = not audio_vae_autocast_enabled
+                with torch.no_grad(), torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=audio_vae_dtype,
+                    enabled=audio_vae_autocast_enabled,
+                ):
                     # Decode latents to spectrogram
-                    spectrogram = self.audio_vae.decode(
-                        audio_latents, return_dict=False
-                    )[0]
+                    with temporary_module_dtype(
+                        self.audio_vae,
+                        audio_vae_dtype,
+                        enabled=should_cast_audio_vae,
+                    ) as audio_vae:
+                        spectrogram = audio_vae.decode(
+                            audio_latents, return_dict=False
+                        )[0]
 
             with self.use_declared_component(
                 component_name="vocoder",
@@ -170,6 +196,7 @@ class LTX2AVDecodingStage(DecodingStage):
                             f"Vocoder expects channels*mel_bins={expected_in}, got {actual_in} from spectrogram shape {tuple(spectrogram.shape)}"
                         )
                 # Decode spectrogram to waveform
+                spectrogram = align_tensor_to_module_dtype(spectrogram, self.vocoder)
                 with torch.no_grad():
                     waveform = self.vocoder(spectrogram)
             output_batch.audio = waveform.cpu().float()

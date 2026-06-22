@@ -25,8 +25,9 @@ This guide describes the best practice data for GLM-5.1 on the Ascend NPU.
 | GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
 | GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
-
 ## Optimal Configuration
+
+<a id="multi-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### GLM-5.1 W4A8 16P IN3K5 OUT1K5 50ms
 
@@ -123,6 +124,8 @@ python -m sglang.bench_serving \
     --num-prompts 512 \
     --random-range-ratio 1
 ```
+
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
 ### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K
 
