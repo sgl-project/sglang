@@ -63,11 +63,11 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend_utils import (
-    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
-)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
+)
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     set_tc_piecewise_forward_context,
