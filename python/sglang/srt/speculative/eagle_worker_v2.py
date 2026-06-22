@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -407,15 +408,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
+        graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
             (
                 TritonAttnBackend,
                 TRTLLMMLABackend,
                 TRTLLMHAAttnBackend,
                 TokenspeedMLABackend,
+                FlashInferAttnBackend,
             ),
         )
+        supports_cuda_draft_extend_graph = (
+            _is_cuda or _is_musa
+        ) and graph_supported_backend
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
@@ -801,12 +806,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             - 1
         )
 
+        # Cast to int64 before entering plan stream to avoid cross-stream
+        # synchronization issues with .to() inside the plan stream context.
+        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                batch_result.next_token_ids,
+                next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
