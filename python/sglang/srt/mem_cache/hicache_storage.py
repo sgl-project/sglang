@@ -70,8 +70,9 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
-    # Draft KV pool
+    # Draft KV pools
     DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
 
     def __str__(self) -> str:
         return self.value
