@@ -8,7 +8,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import _handle_output_by_index
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_batch_str_output() -> BatchStrOutput:

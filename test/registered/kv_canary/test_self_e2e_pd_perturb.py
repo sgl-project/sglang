@@ -7,7 +7,7 @@ from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.pd_fixture import CanaryPDFixture
 
-register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=174, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PDPerturbBase(CanaryPDFixture):

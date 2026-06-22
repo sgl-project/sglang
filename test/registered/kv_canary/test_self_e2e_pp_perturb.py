@@ -8,7 +8,7 @@ from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.pp_fixture import CanaryPPFixture
 
-register_cuda_ci(est_time=220, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=333, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPPPerturbSwaSwa(CanaryPPFixture):

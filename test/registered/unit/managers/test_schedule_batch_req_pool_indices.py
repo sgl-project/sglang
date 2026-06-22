@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req(req_pool_idx, origin_input_ids, output_ids):

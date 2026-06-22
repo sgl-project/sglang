@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model.utils import MOCK_MODEL_PATH, run_mock_model_bench_serving
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=109, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestE2ESpeculativeEagle(CustomTestCase):

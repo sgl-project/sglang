@@ -19,7 +19,7 @@ from sglang.test.observability.fake_ray import (
     load_ray_wrappers_without_ray,
 )
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
