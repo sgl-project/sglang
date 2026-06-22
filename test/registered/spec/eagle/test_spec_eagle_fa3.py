@@ -22,7 +22,6 @@ register_cuda_ci(
     est_time=600,
     stage="base-b",
     runner_config="1-gpu-large",
-    disabled="Temporarily disabled due to consistent failures during Torch upgrade",
 )
 
 
