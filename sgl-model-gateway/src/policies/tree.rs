@@ -692,14 +692,7 @@ impl Tree {
         take_chars(text, matched_chars)
     }
 
-    /// Read-only prefix match length for a specific tenant.
-    ///
-    /// Returns how many leading characters of `text` are present in this tenant's
-    /// approximate cache, **without** mutating the LRU access epoch and without
-    /// allocating a result String. This is intended for observability (e.g. the
-    /// cache-aware decision snapshot), so that recording per-worker match scores
-    /// does not perturb the tree's eviction order the way `prefix_match_tenant`
-    /// would.
+    /// Read-only prefix match length (no LRU mutation, no allocation).
     pub fn prefix_match_tenant_len(&self, text: &str, tenant: &str) -> usize {
         let tenant_id = intern_tenant(tenant);
 
