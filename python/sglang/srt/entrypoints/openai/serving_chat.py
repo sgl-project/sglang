@@ -435,15 +435,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Flush logprobs unattached this step (e.g. the tool-call parser
-        # consumed the delta, so the content branch never ran).
+        # Flush logprobs still unattached this step: tool-call parser consumed
+        # the delta (its chunks take no logprobs param), or delta was empty.
         if remaining_logprobs is not None:
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens.get(index, 0),
+                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                    completion_tokens=completion_tokens.get(index, 0),
+                ).model_dump()
+
             yield build_sse_content(
                 chunk_id=content["meta_info"]["id"],
                 created=int(time.time()),
                 model=request.model,
                 index=index,
                 logprobs=remaining_logprobs,
+                usage=usage,
             )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
