@@ -1352,9 +1352,6 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
-        # Handle data parallelism.
-        self._handle_data_parallelism()
-
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -1395,6 +1392,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Handle data parallelism.
+        self._handle_data_parallelism()
 
         # Re-apply after model-specific defaults resolve attention_backend so
         # canonical CP mirrors to the right legacy runtime aliases.
@@ -2104,9 +2104,12 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
+            effective_chunked_prefill_size = self.chunked_prefill_size // (
+                self.dp_size if self.enable_dp_attention and self.dp_size > 1 else 1
+            )
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
-                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+                reserved_mem += max(effective_chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
