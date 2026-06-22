@@ -324,7 +324,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     else:
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
-        model_runner.init_backends()
+        model_runner.init_attention_backends()
+        model_runner.init_cuda_graphs()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
@@ -393,7 +394,7 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req: Req = reqs[i]
-        req.full_untruncated_fill_ids += input_ids[i][bench_args.cut_len :]
+        req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly

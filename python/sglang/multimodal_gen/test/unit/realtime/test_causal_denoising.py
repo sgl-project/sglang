@@ -445,6 +445,63 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     assert recompute_view.k.flatten().tolist() == [50.0, 6.0]
 
 
+def test_causal_kv_cache_update_for_cache_head_slice_returns_local_view():
+    cache = CausalSelfAttentionKVCache(
+        k=torch.full((1, 4, 4, 1), 99.0),
+        v=torch.full((1, 4, 4, 1), 999.0),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        global_end_index_int=0,
+        local_end_index_int=0,
+    )
+
+    view = cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[1.0], [2.0]], [[3.0], [4.0]]]]),
+        value=torch.tensor([[[[10.0], [20.0]], [[30.0], [40.0]]]]),
+        current_chunk_start=0,
+        cache_head_start=1,
+    )
+
+    assert view.k.shape == (1, 2, 2, 1)
+    assert view.v.shape == (1, 2, 2, 1)
+    assert view.k.flatten().tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert view.v.flatten().tolist() == [10.0, 20.0, 30.0, 40.0]
+    assert cache.k[0, :2, :, 0].tolist() == [
+        [99.0, 1.0, 2.0, 99.0],
+        [99.0, 3.0, 4.0, 99.0],
+    ]
+
+    cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[5.0], [6.0]], [[7.0], [8.0]]]]),
+        value=torch.tensor([[[[50.0], [60.0]], [[70.0], [80.0]]]]),
+        current_chunk_start=2,
+        cache_head_start=1,
+    )
+    rolled_view = cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[9.0], [10.0]], [[11.0], [12.0]]]]),
+        value=torch.tensor([[[[90.0], [100.0]], [[110.0], [120.0]]]]),
+        current_chunk_start=4,
+        cache_head_start=1,
+    )
+
+    assert rolled_view.k.flatten().tolist() == [
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        11.0,
+        12.0,
+    ]
+    assert cache.k[0, :, :, 0].tolist() == [
+        [99.0, 5.0, 6.0, 99.0],
+        [99.0, 7.0, 8.0, 99.0],
+        [99.0, 9.0, 10.0, 99.0],
+        [99.0, 11.0, 12.0, 99.0],
+    ]
+
+
 def test_causal_kv_cache_update_grows_without_rolling_when_enabled():
     cache = CausalSelfAttentionKVCache(
         k=torch.zeros(1, 2, 1, 1),
