@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -107,7 +109,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         dt_bias: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -124,6 +126,58 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+        )
+
+    def state_update(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        input_token_indices: Optional[torch.Tensor] = None,
+        input_sequence_indices: Optional[torch.Tensor] = None,
+        input_sequence_lengths: Optional[torch.Tensor] = None,
+        initial_state_indices: Optional[torch.Tensor] = None,
+        input_token_start: int = 0,
+        input_token_stride: int = 0,
+        **kwargs,
+    ) -> None:
+        if is_cpu() or is_npu():
+            raise NotImplementedError(
+                "State-only GDN replay is only implemented for the Triton CUDA kernel."
+            )
+
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=k,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=(
+                cache_indices
+                if initial_state_indices is None
+                else initial_state_indices
+            ),
+            output_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            disable_output_calculation=True,
+            input_token_indices=input_token_indices,
+            input_sequence_indices=input_sequence_indices,
+            input_sequence_lengths=input_sequence_lengths,
+            input_token_start=input_token_start,
+            input_token_stride=input_token_stride,
         )
 
     def extend(

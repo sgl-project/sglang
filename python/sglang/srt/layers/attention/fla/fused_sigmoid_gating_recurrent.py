@@ -19,12 +19,18 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    h0_output_indices,
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
     intermediate_state_indices,
     cache_steps,
     retrieve_parent_token_ptr,
+    input_token_indices,
+    input_sequence_indices,
+    input_sequence_lengths,
+    input_token_start: tl.constexpr,
+    input_token_stride: tl.constexpr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
     # ================================================
@@ -49,8 +55,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_KDA: tl.constexpr,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
+    DISABLE_OUTPUT_CALCULATION: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    HAS_INPUT_TOKEN_INDICES: tl.constexpr = False,
+    HAS_INPUT_SEQUENCE_INDICES: tl.constexpr = False,
+    HAS_INPUT_SEQUENCE_LENGTHS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -59,7 +69,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
-    if IS_VARLEN:
+    if HAS_INPUT_SEQUENCE_LENGTHS:
+        bos = 0
+        all = T
+        T = tl.load(input_sequence_lengths + i_n).to(tl.int64)
+    elif IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
@@ -73,24 +87,66 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + bos * stride_q + i_h * K + o_k
-    p_k = k + bos * stride_k + i_h * K + o_k
-    p_v = v + bos * stride_v + i_hv * V + o_v
-    p_b = b + bos * stride_b + i_hv
-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+    if not HAS_INPUT_TOKEN_INDICES and not HAS_INPUT_SEQUENCE_INDICES:
+        p_k = k + bos * stride_k + i_h * K + o_k
+        p_v = v + bos * stride_v + i_hv * V + o_v
+        p_b = b + bos * stride_b + i_hv
+    else:
+        p_k = k + i_h * K + o_k
+        p_v = v + i_hv * V + o_v
+        p_b = b + i_hv
+
+    if not DISABLE_OUTPUT_CALCULATION:
+        p_q = q + bos * stride_q + i_h * K + o_k
+        p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
+        if not HAS_INPUT_TOKEN_INDICES and not HAS_INPUT_SEQUENCE_INDICES:
+            p_a = a + bos * stride_a + i_hv * K + o_k
+        else:
+            p_a = a + i_hv * K + o_k
     else:
-        p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
+        if not HAS_INPUT_TOKEN_INDICES and not HAS_INPUT_SEQUENCE_INDICES:
+            p_a = a + bos * stride_a + i_hv
+        else:
+            p_a = a + i_hv
 
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if T == 0:
+        return
+
+    if HAS_INPUT_SEQUENCE_INDICES:
+        physical_t = (
+            tl.load(input_sequence_indices + i_n).to(tl.int64) * input_token_stride
+            + input_token_start
+        )
+        p_k = k + physical_t * stride_k + i_h * K + o_k
+        p_v = v + physical_t * stride_v + i_hv * V + o_v
+        p_b = b + physical_t * stride_b + i_hv
+        if not DISABLE_OUTPUT_CALCULATION:
+            p_q = q + physical_t * stride_q + i_h * K + o_k
+        if IS_KDA:
+            p_a = a + physical_t * stride_a + i_hv * K + o_k
+        else:
+            p_a = a + physical_t * stride_a + i_hv
+    elif HAS_INPUT_SEQUENCE_LENGTHS:
+        physical_t = i_n * input_token_stride + input_token_start
+        p_k = k + physical_t * stride_k + i_h * K + o_k
+        p_v = v + physical_t * stride_v + i_hv * V + o_v
+        p_b = b + physical_t * stride_b + i_hv
+        if not DISABLE_OUTPUT_CALCULATION:
+            p_q = q + physical_t * stride_q + i_h * K + o_k
+        if IS_KDA:
+            p_a = a + physical_t * stride_a + i_hv * K + o_k
+        else:
+            p_a = a + physical_t * stride_a + i_hv
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -125,6 +181,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     step_idx = 0
     for _ in range(0, T):
+        if HAS_INPUT_TOKEN_INDICES:
+            physical_t = tl.load(input_token_indices + bos + step_idx).to(tl.int64)
+            p_q = q + physical_t * stride_q + i_h * K + o_k
+            p_k = k + physical_t * stride_k + i_h * K + o_k
+            p_v = v + physical_t * stride_v + i_hv * V + o_v
+            p_b = b + physical_t * stride_b + i_hv
+            if IS_KDA:
+                p_a = a + physical_t * stride_a + i_hv * K + o_k
+            else:
+                p_a = a + physical_t * stride_a + i_hv
+
         # Tree attention: load parent's cached state
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
@@ -144,7 +211,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
         # Load inputs
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
@@ -175,10 +241,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-
-        b_q = b_q * scale
 
         # Apply gating to hidden state: h *= exp(g)
         if IS_KDA:
@@ -196,12 +259,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_h += b_k[:, None] * b_v[None, :]
 
         # Compute output: o = sum(h * q, dim=0)
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        if not DISABLE_OUTPUT_CALCULATION:
+            b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+            b_q = b_q * scale
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
-            if cache_idx >= 0:
+            if cache_idx >= 0 and step_idx < cache_steps:
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
@@ -216,18 +284,21 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         step_idx += 1
 
         # Update pointers for next timestep
-        p_q += stride_q
-        p_k += stride_k
-        p_v += stride_v
-        p_b += stride_b
-        p_o += HV * V
-        p_a += stride_a
+        if not HAS_INPUT_TOKEN_INDICES:
+            if not DISABLE_OUTPUT_CALCULATION:
+                p_q += stride_q
+            p_k += stride_k
+            p_v += stride_v
+            p_b += stride_b
+            p_a += stride_a
+        if not DISABLE_OUTPUT_CALCULATION:
+            p_o += HV * V
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
-            if idx >= 0:
+            idx = tl.load(h0_output_indices + i_n)
+            if (idx >= 0) & (T > 0):
                 p_h0 = (
                     h0_source
                     + idx * HV * K * V
@@ -250,18 +321,25 @@ def fused_sigmoid_gating_delta_rule_update(
     b: torch.Tensor,
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
+    output_state_indices: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
+    disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    input_token_indices: Optional[torch.Tensor] = None,
+    input_sequence_indices: Optional[torch.Tensor] = None,
+    input_sequence_lengths: Optional[torch.Tensor] = None,
+    input_token_start: int = 0,
+    input_token_stride: int = 0,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -274,6 +352,31 @@ def fused_sigmoid_gating_delta_rule_update(
                      and optional state update disable
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
+    if input_token_indices is not None:
+        assert cu_seqlens is not None, "input_token_indices requires cu_seqlens"
+        assert (
+            disable_output_calculation
+        ), "input_token_indices is only supported for state-only replay"
+    if input_sequence_indices is not None:
+        assert (
+            cu_seqlens is not None or input_sequence_lengths is not None
+        ), "input_sequence_indices requires cu_seqlens or input_sequence_lengths"
+        assert (
+            input_token_indices is None
+        ), "input_sequence_indices and input_token_indices are mutually exclusive"
+        assert (
+            disable_output_calculation
+        ), "input_sequence_indices is only supported for state-only replay"
+    if input_sequence_lengths is not None:
+        assert input_sequence_indices is not None or input_token_stride > 0, (
+            "input_sequence_lengths requires input_sequence_indices or "
+            "a positive input_token_stride"
+        )
+        assert (
+            disable_output_calculation
+        ), "input_sequence_lengths is only supported for state-only replay"
+    if output_state_indices is None:
+        output_state_indices = initial_state_indices
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
     stride_v = v.stride()[1]
@@ -283,7 +386,10 @@ def fused_sigmoid_gating_delta_rule_update(
     # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
     stride_a = a.stride()[-2]
     HV = v.shape[2]
-    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    if input_sequence_lengths is not None:
+        N = input_sequence_lengths.shape[0]
+    else:
+        N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -295,7 +401,13 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    if disable_output_calculation:
+        # State-only replay does not read or write the output pointer in the
+        # Triton kernel. Reuse an existing tensor to avoid a tiny allocation for
+        # every replay layer.
+        o = q
+    else:
+        o = q.new_empty(NK, *v.shape)
 
     # Prepare retrieve_parent_token strides
     if retrieve_parent_token is not None:
@@ -330,11 +442,17 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        h0_output_indices=output_state_indices,
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
+        input_token_indices=input_token_indices,
+        input_sequence_indices=input_sequence_indices,
+        input_sequence_lengths=input_sequence_lengths,
+        input_token_start=input_token_start,
+        input_token_stride=input_token_stride,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
@@ -357,10 +475,16 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
         DISABLE_STATE_UPDATE=disable_state_update,
+        DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        HAS_INPUT_TOKEN_INDICES=input_token_indices is not None,
+        HAS_INPUT_SEQUENCE_INDICES=input_sequence_indices is not None,
+        HAS_INPUT_SEQUENCE_LENGTHS=input_sequence_lengths is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if disable_output_calculation:
+        return None
     o = o.squeeze(0)
     return o

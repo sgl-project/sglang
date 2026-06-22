@@ -268,7 +268,7 @@ def _selective_scan_update_kernel(
 
         if CACHE_INTERMEDIATE_STATES:
             if HAS_STATE_BATCH_INDICES:
-                if state_batch_idx != pad_slot_id:
+                if state_batch_idx != pad_slot_id and current_step_idx < cache_steps:
                     cache_ptr_base = (
                         intermediate_states_buffer
                         + cache_idx * cache_steps * nheads * dim * dstate

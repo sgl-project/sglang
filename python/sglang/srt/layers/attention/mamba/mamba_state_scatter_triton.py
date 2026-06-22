@@ -254,9 +254,16 @@ def fused_mamba_state_scatter_with_mask(
     dst_layer_stride = dst.stride(0)
     dst_req_stride = dst.stride(1)
 
-    # Ensure indices are int32 and contiguous
-    dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
-    step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    # The verify hot path already supplies int32 contiguous indices. Avoid
+    # paying Python dispatch for no-op conversions on every scatter call.
+    if dst_indices_raw.dtype != torch.int32:
+        dst_indices_raw = dst_indices_raw.to(torch.int32)
+    if not dst_indices_raw.is_contiguous():
+        dst_indices_raw = dst_indices_raw.contiguous()
+    if step_indices_raw.dtype != torch.int32:
+        step_indices_raw = step_indices_raw.to(torch.int32)
+    if not step_indices_raw.is_contiguous():
+        step_indices_raw = step_indices_raw.contiguous()
 
     # Ensure tensors are contiguous
     if not dst.is_contiguous():
