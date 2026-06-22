@@ -325,7 +325,7 @@ class EagerRunner(BaseRunner):
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
-                    self.model.prepare_context_parallel_metadata_for_dcp(
+                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,
                         forward_batch.extend_prefix_lens,
                         forward_batch.extend_prefix_lens_cpu,
