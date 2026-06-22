@@ -12,9 +12,6 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-import jinja2
-import jinja2.ext
-import jinja2.sandbox
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -55,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.managers.template_detection import detect_inline_system_support
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -192,13 +190,11 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = self._detect_merge_inline_system(
+        self._merge_inline_system = not detect_inline_system_support(
             self._chat_template()
         )
 
     def _chat_template(self) -> Optional[str]:
-        """Best-effort fetch of the chat template; ``None`` when the tokenizer
-        isn't reachable (e.g. unit-test fakes), treated as "merge"."""
         tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
         if tokenizer_manager is None:
             return None
@@ -206,34 +202,6 @@ class AnthropicServing:
         if tokenizer is None:
             return None
         return getattr(tokenizer, "chat_template", None)
-
-    @staticmethod
-    def _detect_merge_inline_system(chat_template: Optional[str]) -> bool:
-        """Render a ``[system, user, system, user]`` probe; merge when it
-        raises (e.g. a system-first guard), otherwise pass through inline."""
-        if not chat_template:
-            return True
-        try:
-            env = jinja2.sandbox.ImmutableSandboxedEnvironment(
-                trim_blocks=True,
-                lstrip_blocks=True,
-                extensions=[jinja2.ext.loopcontrols],
-            )
-            env.from_string(chat_template).render(
-                messages=[
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                    {"role": "system", "content": "t"},
-                    {"role": "user", "content": "t"},
-                ],
-                add_generation_prompt=False,
-            )
-            return False
-        except jinja2.TemplateError:
-            return True
-        except Exception:
-            # Pathological template — fall back to merging, don't break startup.
-            return True
 
     async def handle_messages(
         self,

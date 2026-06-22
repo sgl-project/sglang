@@ -23,6 +23,10 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
+import jinja2
+import jinja2.ext
+import jinja2.sandbox
+
 logger = logging.getLogger(__name__)
 
 
@@ -400,6 +404,35 @@ def detect_tool_call_parser(
     if ctx is None:
         return None
     return match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser")
+
+
+def detect_inline_system_support(chat_template: Optional[str]) -> bool:
+    """Whether the chat template renders mid-conversation ``role: "system"``
+    turns inline (True) or rejects them and needs merging into the leading
+    system block (False). Probed by rendering a ``[system, user, system,
+    user]`` conversation; a raise (e.g. a system-first guard) means merge."""
+    if not chat_template:
+        return False
+    try:
+        env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+            trim_blocks=True,
+            lstrip_blocks=True,
+            extensions=[jinja2.ext.loopcontrols],
+        )
+        env.from_string(chat_template).render(
+            messages=[
+                {"role": "system", "content": "t"},
+                {"role": "user", "content": "t"},
+                {"role": "system", "content": "t"},
+                {"role": "user", "content": "t"},
+            ],
+            add_generation_prompt=False,
+        )
+        return True
+    except jinja2.TemplateError:
+        return False
+    except Exception:
+        return False
 
 
 def _resolve_auto_parser(

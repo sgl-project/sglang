@@ -18,6 +18,9 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.managers.template_detection import (  # noqa: E402
+    detect_inline_system_support,
+)
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -1476,14 +1479,11 @@ class TestAnthropicServing(unittest.TestCase):
         )
 
 
-class TestDetectMergeInlineSystem(unittest.TestCase):
-    """Verify the chat-template auto-detection that decides whether
-    mid-conversation ``role: "system"`` turns are merged into the leading
-    system block or passed through inline (see sgl-project/sglang#28883)."""
+class TestDetectInlineSystemSupport(unittest.TestCase):
+    """Chat-template detection for mid-conversation system messages (#28883)."""
 
-    def test_guarded_template_requires_merge(self):
-        """A template with a system-first guard (e.g. Qwen) rejects a
-        mid-conversation system turn, so detection returns ``True``."""
+    def test_guarded_template_not_supported(self):
+        # A system-first guard that raise_exceptions on non-first system.
         guarded = (
             "{%- for message in messages %}"
             "{%- if message.role == 'system' and not loop.first %}"
@@ -1491,23 +1491,21 @@ class TestDetectMergeInlineSystem(unittest.TestCase):
             "{%- endif %}"
             "{%- endfor %}"
         )
-        self.assertTrue(AnthropicServing._detect_merge_inline_system(guarded))
+        self.assertFalse(detect_inline_system_support(guarded))
 
-    def test_inline_template_does_not_merge(self):
-        """A template that renders system at any position returns ``False`` —
-        inline system can pass through, preserving the prefix cache."""
+    def test_inline_template_supported(self):
+        # Renders system at any position (GLM/Kimi/Qwen3).
         inline = (
             "{%- for message in messages %}"
             "{{- message.role }}: {{ message.content }}\n"
             "{%- endfor %}"
         )
-        self.assertFalse(AnthropicServing._detect_merge_inline_system(inline))
+        self.assertTrue(detect_inline_system_support(inline))
 
-    def test_no_template_defaults_to_merge(self):
-        """No chat_template → conservative default: merge, matching production
-        servers whose tokenizer exposes no template (e.g. programmatic use)."""
-        self.assertTrue(AnthropicServing._detect_merge_inline_system(None))
-        self.assertTrue(AnthropicServing._detect_merge_inline_system(""))
+    def test_no_template_not_supported(self):
+        # No chat_template → conservative default: not supported (merge).
+        self.assertFalse(detect_inline_system_support(None))
+        self.assertFalse(detect_inline_system_support(""))
 
 
 if __name__ == "__main__":
