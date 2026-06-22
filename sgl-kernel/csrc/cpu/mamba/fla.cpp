@@ -220,7 +220,7 @@ struct decay_mask_kernel<float, CHUNK_SIZE> {
 };
 #endif
 
-template <typename scalar_t, int CHUNK_SIZE>
+template <typename scalar_t, int CHUNK_SIZE, bool has_beta>
 struct apply_mask_kernel {
   static inline void apply(
       scalar_t* __restrict__ attn2,
@@ -228,25 +228,21 @@ struct apply_mask_kernel {
       const scalar_t* __restrict__ beta,
       const float* __restrict__ d,
       int size,
-      int b_stride) {
-    TORCH_CHECK(false, "apply_mask_kernel: scalar path not implemented!");
-  }
-  static inline void
-  apply2(scalar_t* __restrict__ attn2, const float* __restrict__ attn, const float* __restrict__ d, int size) {
+      int b_stride = 0) {
     TORCH_CHECK(false, "apply_mask_kernel: scalar path not implemented!");
   }
 };
 
 #if defined(CPU_CAPABILITY_AVX512)
-template <int CHUNK_SIZE>
-struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE> {
+template <int CHUNK_SIZE, bool has_beta>
+struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE, has_beta> {
   static inline void apply(
       at::BFloat16* __restrict__ attn2,
       const float* __restrict__ attn,
       const at::BFloat16* __restrict__ beta,
       const float* __restrict__ d,
       int size,
-      int b_stride) {
+      int b_stride = 0) {
     static_assert(CHUNK_SIZE % 16 == 0);
 
     constexpr int ROWS = CHUNK_SIZE;
@@ -254,15 +250,19 @@ struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE> {
 
     __m512 vbeta;
 
-    // attn2 = -attn * beta * d
+    // has_beta: attn2 = -attn * beta * d  (strict lower)
+    // !has_beta: attn2 = attn * d         (lower incl. diagonal)
     auto compute = [&](auto i) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
 
-      constexpr int len = std::max(0, std::min(row - col * 16, 16));
+      constexpr int len =
+          has_beta ? std::max(0, std::min(row - col * 16, 16)) : std::max(0, std::min(row + 1 - col * 16, 16));
       if (row < size) {
-        if constexpr (col == 0) {
-          vbeta = _mm512_set1_ps(-static_cast<float>(beta[row * b_stride]));
+        if constexpr (has_beta) {
+          if constexpr (col == 0) {
+            vbeta = _mm512_set1_ps(-static_cast<float>(beta[row * b_stride]));
+          }
         }
 
         __m512 vc;
@@ -272,37 +272,11 @@ struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE> {
           constexpr __mmask16 vmask = (1 << len) - 1;
           __m512 va = _mm512_maskz_loadu_ps(vmask, attn + row * CHUNK_SIZE + col * 16);
           __m512 vd = _mm512_maskz_loadu_ps(vmask, d + row * CHUNK_SIZE + col * 16);
-          vc = _mm512_mul_ps(_mm512_mul_ps(va, vbeta), vd);
-        }
-        _mm256_storeu_si256(
-            reinterpret_cast<__m256i*>(attn2 + row * CHUNK_SIZE + col * 16), (__m256i)(_mm512_cvtneps_pbh(vc)));
-      }
-    };
-    Unroll<ROWS * COLS>{}(compute);
-  }
-
-  static inline void
-  apply2(at::BFloat16* __restrict__ attn2, const float* __restrict__ attn, const float* __restrict__ d, int size) {
-    static_assert(CHUNK_SIZE % 16 == 0);
-
-    constexpr int ROWS = CHUNK_SIZE;
-    constexpr int COLS = CHUNK_SIZE / 16;
-
-    // attn2 = attn * d
-    auto compute = [&](auto i) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-
-      constexpr int len = std::max(0, std::min(row + 1 - col * 16, 16));
-      if (row < size) {
-        __m512 vc;
-        if constexpr (len == 0) {
-          vc = _mm512_setzero_ps();
-        } else {
-          constexpr __mmask16 vmask = (1 << len) - 1;
-          __m512 va = _mm512_maskz_loadu_ps(vmask, attn + row * CHUNK_SIZE + col * 16);
-          __m512 vd = _mm512_maskz_loadu_ps(vmask, d + row * CHUNK_SIZE + col * 16);
-          vc = _mm512_mul_ps(va, vd);
+          if constexpr (has_beta) {
+            vc = _mm512_mul_ps(_mm512_mul_ps(va, vbeta), vd);
+          } else {
+            vc = _mm512_mul_ps(va, vd);
+          }
         }
         _mm256_storeu_si256(
             reinterpret_cast<__m256i*>(attn2 + row * CHUNK_SIZE + col * 16), (__m256i)(_mm512_cvtneps_pbh(vc)));
@@ -795,7 +769,7 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
         // step 3: attn2 = -attn * beta * d
         const scalar_t* __restrict__ beta_ptr = beta + (batch_offset + mb_start) * Hv + hv;
         const float* __restrict__ d_ptr = d + nt * (Hv * CHUNK_SIZE * CHUNK_SIZE) + hv * (CHUNK_SIZE * CHUNK_SIZE);
-        apply_mask_kernel<scalar_t, CHUNK_SIZE>::apply(attn2, attn, beta_ptr, d_ptr, mb_size, Hv);
+        apply_mask_kernel<scalar_t, CHUNK_SIZE, true>::apply(attn2, attn, beta_ptr, d_ptr, mb_size, Hv);
 
         // step 4: solve_tril(attn2) -> (I + L)^{-1}, L = strict-lower from step 3
         //   for i in 1..C-1: attn2[i, :i] += (attn2[i, :i] * attn2[:i, :i]).sum(-1)
@@ -988,7 +962,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
 
         // step 1.b: attn = attn * decay_mask.masked_fill_(mask, 0)
         const float* __restrict__ d_ptr = d + nt * (Hv * CHUNK_SIZE * CHUNK_SIZE) + hv * (CHUNK_SIZE * CHUNK_SIZE);
-        apply_mask_kernel<scalar_t, CHUNK_SIZE>::apply2(attn2, attn, d_ptr, mb_size);
+        apply_mask_kernel<scalar_t, CHUNK_SIZE, false>::apply(attn2, attn, nullptr, d_ptr, mb_size);
 
         // step 2.a: v' = w @ state (fuse state *= exp(g_last) with packing)
         float* __restrict__ s_ptr = state + bs * (Hv * D * D) + hv * (D * D);
