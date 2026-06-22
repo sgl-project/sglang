@@ -1002,75 +1002,96 @@ class MMEncoder:
 
         # Step 7: Rank 0 waits for D2H, then assembles final embedding.
         if self.rank == 0:
-            self.mm_global_cache.wait_store_to_pool(
-                miss_d2h_handles + fallback_d2h_handles
+            # Map item indices to their computed embedding slices.
+            miss_slice_pos = {
+                missing_indices[i]: i for i in range(len(missing_indices))
+            }
+            fallback_slice_pos = {
+                fallback_indices[i]: i for i in range(len(fallback_indices))
+            }
+
+            token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
+            dim = self.mm_global_cache.get_embedding_dim(modality)
+
+            # Allocate the final CPU buffer used by the ZMQ sender.
+            mm_embedding = torch.empty(
+                (sum(token_counts), dim),
+                dtype=self._embedding_dtype,
+                pin_memory=True,
             )
 
-            # Collect slices: pool views for hits, GPU tensors for miss/fallback.
-            # Each slot holds a list of tensor slices (usually one, but may be
-            # multiple page-run slices for fragmented pool entries).
-            item_slices = [None] * num_items
-            hit_view_hashes = []
-
-            # Fill miss/fallback slices (already on GPU from ViT)
-            for i, idx in enumerate(missing_indices):
-                src = new_slices[i]
-                if src.ndim != 2:
-                    src = src.reshape(-1, src.shape[-1])
-                item_slices[idx] = [src.cpu()]
-            for i, idx in enumerate(fallback_indices):
-                src = fallback_slices[i]
-                if src.ndim != 2:
-                    src = src.reshape(-1, src.shape[-1])
-                item_slices[idx] = [src.cpu()]
-
-            # Fill hit slices with zero-copy pool views (slice lists)
-            if hit_indices:
-                hit_hashes_for_view = [
-                    str_mm_hashes[idx]
-                    for idx in hit_indices
-                    if fallback_mask[idx].item() == 0
-                ]
+            # Pin local cache entries while copying their pool views.
+            hit_view_hashes = [
+                str_mm_hashes[idx]
+                for idx in hit_indices
+                if fallback_mask[idx].item() == 0
+            ]
+            hit_views = {}
+            if hit_view_hashes:
                 cached_slice_lists = self.mm_global_cache.get_pool_views(
-                    hit_hashes_for_view
+                    hit_view_hashes
                 )
-                view_idx = 0
-                for idx in hit_indices:
-                    if fallback_mask[idx].item() == 0:
-                        slices = cached_slice_lists[view_idx]
-                        view_idx += 1
-                        if slices is not None:
-                            item_slices[idx] = slices
-                        else:
-                            raise InternalError(
-                                f"Cached embedding {str_mm_hashes[idx]} "
-                                f"not available for req {req_id}"
-                            )
-                hit_view_hashes = hit_hashes_for_view
+                for h, slices in zip(hit_view_hashes, cached_slice_lists):
+                    if slices is None:
+                        self.mm_global_cache.release_pool_views(hit_view_hashes)
+                        raise InternalError(
+                            f"Cached embedding {h} not available for req {req_id}"
+                        )
+                    hit_views[h] = slices
 
-            # Flatten and concat in one shot — no intermediate copies.
-            flat_slices = [s for parts in item_slices for s in parts]
-            mm_embedding = torch.cat(flat_slices, dim=0)
+            # Fill the output buffer in request order.
+            offset = 0
+            for idx, num_tokens in enumerate(token_counts):
+                if idx in miss_slice_pos:
+                    src = new_slices[miss_slice_pos[idx]]
+                    if src.ndim != 2:
+                        src = src.reshape(-1, src.shape[-1])
+                    mm_embedding[offset : offset + num_tokens].copy_(
+                        src, non_blocking=True
+                    )
+                elif idx in fallback_slice_pos:
+                    src = fallback_slices[fallback_slice_pos[idx]]
+                    if src.ndim != 2:
+                        src = src.reshape(-1, src.shape[-1])
+                    mm_embedding[offset : offset + num_tokens].copy_(
+                        src, non_blocking=True
+                    )
+                else:
+                    # Cache hits are copied from host pool views.
+                    copied = 0
+                    for view in hit_views[str_mm_hashes[idx]]:
+                        n = view.shape[0]
+                        mm_embedding[offset + copied : offset + copied + n].copy_(view)
+                        copied += n
+                offset += num_tokens
 
-            # Release pool views now that torch.cat has copied the data.
+            # Ensure pending device copies are visible to the host sender.
+            torch.cuda.current_stream(self.device).synchronize()
+
+            # Release cache pins after the output buffer is complete.
             if hit_view_hashes:
                 self.mm_global_cache.release_pool_views(hit_view_hashes)
 
-            # Background: push pool-resident embeddings to storage.
+            # Publish newly cached embeddings after their pool copies finish.
             all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             if fallback_indices:
                 all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
 
             if all_new_hashes:
+                captured_handles = miss_d2h_handles + fallback_d2h_handles
 
-                async def _background_insert():
+                async def _background_store_and_insert():
+                    await asyncio.to_thread(
+                        self.mm_global_cache.wait_store_to_pool,
+                        captured_handles,
+                    )
                     await asyncio.to_thread(
                         self.mm_global_cache.insert_batch,
                         all_new_hashes,
                         modality,
                     )
 
-                task = asyncio.create_task(_background_insert())
+                task = asyncio.create_task(_background_store_and_insert())
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
 
