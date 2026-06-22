@@ -7,18 +7,13 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
     get_moe_ep_group,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_moe_tp_group,
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -637,17 +632,17 @@ def ensure_workspace_initialized(
         return False
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
-        rank = get_attn_tensor_model_parallel_rank()
+        world_size = get_parallel().attn_tp_size
+        rank = get_parallel().attn_tp_rank
         coordinator = get_attn_tp_group()
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
-            rank = get_moe_expert_parallel_rank()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+            rank = get_parallel().moe_ep_rank
             coordinator = get_moe_ep_group()
         else:
-            world_size = get_moe_tensor_parallel_world_size()
-            rank = get_moe_tensor_parallel_rank()
+            world_size = get_parallel().moe_tp_size
+            rank = get_parallel().moe_tp_rank
             coordinator = get_moe_tp_group()
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
@@ -757,12 +752,12 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
+        world_size = get_parallel().attn_tp_size
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
         else:
-            world_size = get_moe_tensor_parallel_world_size()
+            world_size = get_parallel().moe_tp_size
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
