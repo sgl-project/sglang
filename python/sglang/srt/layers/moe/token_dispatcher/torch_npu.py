@@ -106,7 +106,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             hidden_states_scale,
         ) = self.init._init_routing(
             hidden_states,
-            topk_output.topk_ids,
+            topk_output.topk_ids.to(torch.int32),
             self.num_experts,
         )
 
@@ -131,9 +131,9 @@ class TorchNpuDispatcher(BaseDispatcher):
         dispatch_out = self._dispatch_output
         final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
-            topk_weights=dispatch_out.topk_output.topk_weights,
+            topk_weights=dispatch_out.topk_output.topk_weights.to(combine_input.hidden_states.dtype),
             expanded_row_idx=dispatch_out.expanded_row_idx,
-            topk_ids=dispatch_out.topk_output.topk_ids,
+            topk_ids=dispatch_out.topk_output.topk_ids.to(torch.int32),
         )
 
         self._dispatch_output = None
