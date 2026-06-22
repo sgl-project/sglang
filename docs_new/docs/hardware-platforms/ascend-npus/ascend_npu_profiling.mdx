@@ -16,7 +16,7 @@ and analysis to visualization — helping you get started with performance
 profiling quickly.
 
 For more profiling scenarios (e.g., Nsight Systems, PD disaggregation, etc.),
-see [SGLang Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx).
+see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
 
 ## Ascend PyTorch Profiler
 
@@ -482,7 +482,7 @@ In a multi-node deployment, each node generates its own trace files.
 To merge them into a single unified trace, set `"merge_profiles": true` in the `/start_profile` request.
 However, on Ascend NPU, the merge feature does **not** fully support the `*_ascend_pt` format — merged results may be incomplete or incorrect.
 It is recommended to view `trace_view.json` on each node individually instead.
-For more details, see [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx#profiler-trace-merger-for-distributed-traces).
+For more details, see [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces).
 </Note>
 
 ### 6. Re-parsing Raw Data (Optional)
@@ -529,17 +529,17 @@ If the original data is still needed, back it up before running `analyse()`.
   limited support — check `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json`
   on each node individually. In PD disaggregation mode, prefill and decode
   workers must be profiled separately — see
-  [Profile In PD Disaggregation Mode](../../developer_guide/benchmark_and_profiling.mdx#profile-in-pd-disaggregation-mode).
+  [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
 
 ## See Also
 
-- [SGLang Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx)
+- [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
   — General SGLang profiling guide
-- [Ascend NPU Quickstart](../../hardware-platforms/ascend-npus/ascend_npu_quick_start.mdx)
+- [Ascend NPU Quickstart](/docs//hardware-platforms/ascend-npus/ascend_npu_quick_start)
   — Ascend NPU environment setup
-- [Ascend NPU Optimization](../../hardware-platforms/ascend-npus/ascend_npu_optimization.mdx)
+- [Ascend NPU Optimization](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization)
   — Ascend NPU optimization parameters
-- [Ascend NPU Performance Testing](../../hardware-platforms/ascend-npus/ascend_npu_performance_testing.mdx)
+- [Ascend NPU Performance Testing](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing)
   — Ascend NPU performance benchmarking
-- [Ascend NPU Environment Variables](../../hardware-platforms/ascend-npus/ascend_npu_environment_variables.mdx)
+- [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables)
   — Environment variable reference

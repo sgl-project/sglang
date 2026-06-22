@@ -15,6 +15,7 @@ Kimi K2.5 is an open-source, native multimodal agentic model built through conti
 - `Kimi-K2.5-w4a8`: Download Kimi-K2.5-w4a8 from [modelers](https://modelers.cn/models/Eco-Tech/Kimi-K2.5-w4a8), [modelscope](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.5-w4a8).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize `Kimi-K2.5-w4a8` from `Kimi-K2.5`.
 
+
 ### Installation
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
@@ -53,10 +54,8 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} --net=host \
 ```
 
 ### Best Practices
-
 Note: Using this image for **best practices**, switch to the more stable version 4.57.1 of transformers.
-
-```text
+```
 # reinstall transformers
 
 # Install transformers version 4.57.1 from PyPI
@@ -306,6 +305,7 @@ python -m sglang_router.launch_router \
     --port 6688 \
 ```
 
+
 ### Using Benchmark
 
-Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.mdx) for details.
+Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling) for details.

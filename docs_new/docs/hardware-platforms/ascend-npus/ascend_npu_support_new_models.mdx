@@ -133,7 +133,7 @@ launch_server(server_args)
 
 ## Example: Implementing and Serving a Llama Wrapper Model
 
-Below is an introductory, step-by-step walkthrough on how to implement a new model end-to-end in SGLang and then run it via the [Offline Engine](../../basic_usage/offline_engine_api.mdx).
+Below is an introductory, step-by-step walkthrough on how to implement a new model end-to-end in SGLang and then run it via the [Offline Engine](/docs/basic_usage/offline_engine_api).
 
 ### Implementing Our Model
 
@@ -404,8 +404,8 @@ Using the same Llama wrapper from the previous section, here is how to package a
 
     ```json Config
     {
-    "architectures": ["LlamaWrapper"],
-    ...
+        "architectures": ["LlamaWrapper"],
+        ...
     }
     ```
 
@@ -513,11 +513,11 @@ python -m sglang.launch_server \
 
 ## Documentation
 
-Add to table of supported models in [generative_models.mdx](../../supported-models/generative_models.mdx) or [multimodal_language_models.mdx](../../supported-models/multimodal_language_models.mdx)
+Add to table of supported models in [generative_models.mdx](/docs/supported-models/generative_models) or [multimodal_language_models.mdx](/docs/supported-models/multimodal_language_models)
 
 <Tip>
 For NPU-adapted models, also add entries to the NPU support models table in
-[ascend_npu_support_models.mdx](./ascend_npu_support_models.mdx).
+[ascend_npu_support_models.mdx](./ascend_npu_support_models).
 </Tip>
 
 ---
