@@ -952,6 +952,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
 
+        # TODO(th4): clearing owned-mamba ownership (req.mamba) belongs in the
+        # mamba subsystem, not in the low-level ReqToTokenPool; kept here in the
+        # presence op to preserve equivalence.
         req.mamba = None
 
     def clear(self):
