@@ -7,7 +7,7 @@ import tilelang.language as T
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
@@ -46,6 +46,13 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+# Opt-in (default off): route the fp8 sparse-MLA *prefill* path through the
+# Triton per-query flash kernel (~1.6x faster than the TileLang partial+combine
+# on gfx950 for the tiny M=16 attention tile; ~8-12% lower TTFT e2e, GSM8K
+# unchanged). Decode is left on TileLang. Validated on gfx950; enable with
+# SGLANG_DSA_TRITON_PREFILL=1.
+_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
@@ -1349,6 +1356,23 @@ def tilelang_sparse_fwd(
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
+            # Prefill (many query rows) -> Triton flash kernel. Detect prefill
+            # by a large query-row count; decode stays on TileLang.
+            #
+            # Restricted to the *validated* attention shape (GLM-5.1 @ TP4 and
+            # any DSA model presenting the same per-rank tile): 16 heads,
+            # d_v=512, tail=64 (topk==2048 asserted above). Other shapes — e.g.
+            # DeepSeek-V3.2 at TP4 (32 heads/rank), or any non-power-of-2 head
+            # count that would break tl.arange — fall back to TileLang.
+            triton_shape_ok = num_heads == 16 and d_v == 512 and tail_dim == 64
+            if _DSA_TRITON_PREFILL and triton_shape_ok and q.shape[0] >= 512:
+                from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+                    triton_sparse_mla_fwd,
+                )
+
+                return triton_sparse_mla_fwd(
+                    q=q, kv=kv, indices=indices, sm_scale=sm_scale, d_v=d_v
+                )
             if _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
