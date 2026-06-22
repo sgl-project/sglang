@@ -114,12 +114,12 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_HighThroughput(
         self.run_throughput()
 
 
-class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_aime25(TestNpuAccuracyTestCaseBase):
+class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_GPQA(TestNpuAccuracyTestCaseBase):
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     envs = MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS
     other_args = MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS
-    accuracy = 0.863
-    datasets = ["aime25"]
+    accuracy = 0.852
+    datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
     max_concurrency = 64
