@@ -39,6 +39,7 @@ from sglang.srt.utils.weight_checker_quant import (
     _block_size_of,
     _compare_references,
     _quant_ulp,
+    select_quantization_method,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -531,6 +532,27 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
             _check_tensors(
                 expect_tensors=expect, actual_tensors=actual, allow_quant_error=True
             )
+
+
+# ---------------------------------------------------------------------------
+# select_quantization_method
+# ---------------------------------------------------------------------------
+
+
+class TestSelectQuantizationMethod(CustomTestCase):
+
+    def test_returns_none_when_not_a_quant_method(self):
+        self.assertIsNone(select_quantization_method(None))
+
+    def test_raises_on_unsupported_quant_method(self):
+        from sglang.srt.layers.quantization.base_config import LinearMethodBase
+
+        class _Unsupported(LinearMethodBase):
+            def apply(self, *args, **kwargs):
+                return None
+
+        with self.assertRaises(NotImplementedError):
+            select_quantization_method(_Unsupported())
 
 
 # ---------------------------------------------------------------------------

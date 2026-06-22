@@ -12,6 +12,7 @@ from sglang.srt.utils.weight_checker_quant import (
     _CHUNK_NUMEL,
     Fp8BlockReference,
     _compare_references,
+    select_quantization_method,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class WeightChecker:
 
     def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
+        self._assert_quant_supported()
 
         skip_compare_names = {
             name
@@ -106,6 +108,7 @@ class WeightChecker:
     def _compute_checksum(self) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
+        self._assert_quant_supported()
 
         skip_compare_names = {
             name
@@ -163,6 +166,10 @@ class WeightChecker:
     def _model_state(self):
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
+
+    def _assert_quant_supported(self):
+        for _, module in self._model_runner.model.named_modules():
+            select_quantization_method(getattr(module, "quant_method", None))
 
 
 def _hash_tensor(t: torch.Tensor) -> str:

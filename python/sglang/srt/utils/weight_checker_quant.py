@@ -1,18 +1,22 @@
-"""Quantization-aware reference weights for the weight checker.
-
-A ReferenceWeight presents a logical weight in encoding-invariant (dequantized)
-form. weight_checker compares and checksums only through this seam, so a new
-precision is a new ReferenceWeight subclass — _check_tensors / _compute_checksum
-never change. Each subclass reuses sglang's per-format dequant logic.
-"""
+"""Reference weights for the weight checker: a quantized weight in dequantized,
+encoding-invariant form. A new precision is a new ReferenceWeight subclass."""
 
 from typing import Iterable, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
+)
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
 )
 
 # Bound GPU memory: a full-size fp32 intermediate won't fit beside the KV-cache pool.
@@ -132,3 +136,25 @@ def _compare_references(
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
         num_exceed += int((~(abs_diff <= tol)).sum())
     return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+
+
+def select_quantization_method(quant_method) -> Optional[type]:
+    """Select the ReferenceWeight subclass for a module's quant_method: None if the
+    module is not a quantized weight layer, the subclass for a supported format,
+    else raise. Dispatching on quant_method (not param names) is robust to
+    swizzled scales and per-format naming."""
+    if not isinstance(quant_method, (LinearMethodBase, FusedMoEMethodBase)):
+        return None
+    if isinstance(quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)):
+        return None
+    # fp8 block quant has square blocks; mxfp8 ([1, 32]) is non-square and
+    # per-tensor fp8 has no block scale, so neither is supported.
+    if (
+        isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
+        and quant_method.block_quant
+        and not quant_method.use_mxfp8
+    ):
+        return Fp8BlockReference
+    raise NotImplementedError(
+        f"weight checker has no ReferenceWeight for {type(quant_method).__name__}"
+    )
