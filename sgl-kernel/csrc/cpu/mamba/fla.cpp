@@ -491,6 +491,7 @@ struct update_value_kernel {
       const scalar_t* __restrict__ v,
       const float* __restrict__ v_prime,
       int size,
+      int padded_size,
       int v_strideT) {
     TORCH_CHECK(false, "update_kernel: scalar path not implemented!");
   }
@@ -504,6 +505,7 @@ struct update_value_kernel<at::BFloat16, D> {
       const at::BFloat16* __restrict__ v,
       const float* __restrict__ v_prime,
       int size,
+      int padded_size,
       int v_strideT) {
     static_assert(D % 32 == 0);
     constexpr int COLS = D / 16;
@@ -523,6 +525,16 @@ struct update_value_kernel<at::BFloat16, D> {
           va1 = _mm512_sub_ps(va1, v_prime1);
           __m512i o16 = (__m512i)(_mm512_cvtne2ps_pbh(va1, va0));
           _mm512_storeu_si512(v_prime2 + i * D + col * 16, o16);
+        }
+      });
+    }
+
+    // pad the last chunk
+    for (int i = size; i < padded_size; ++i) {
+      Unroll<COLS>{}([&](auto col) {
+        if constexpr (col % 2 == 0) {
+          __m512i v16 = _mm512_setzero_si512();
+          _mm512_storeu_si512(v_prime2 + i * D + col * 16, v16);
         }
       });
     }
@@ -868,7 +880,7 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
 
 //
 // out           : [B, T, Hv, Dv]
-// state         : [num_seqs, Hv, D, Dv]
+// state         : [num_seqs, Hv, Dv, D]
 // q             : [B, T, H, D]
 // k             : [B, T, H, D]
 // w             : [B, T, Hv, D]
@@ -1006,7 +1018,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
 
         // step 2.b: v2' = u - v'
         const scalar_t* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
-        update_value_kernel<scalar_t, D>::apply(v_prime2, u_ptr, v_prime, mb_size, u_strideT);
+        update_value_kernel<scalar_t, D>::apply(v_prime2, u_ptr, v_prime, mb_size, padded_mb_size, u_strideT);
 
         // step 3.a: qg_exp = q * exp(g)
         apply_beta_kernel<scalar_t, CHUNK_SIZE, D, false, true>::apply(
@@ -1029,7 +1041,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
         pack_vnni2<scalar_t>(
             /*    dst */ v_packed,
             /*    src */ v_prime2,
-            /*     K  */ mb_size,
+            /*     K  */ padded_mb_size,
             /*     N  */ D,
             /* ld_src */ D,
             /* ld_dst */ D);
@@ -2224,8 +2236,6 @@ at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens,
   int64_t Hv = g.size(2);
   int64_t NT = chunk_indices.size(0);
 
-  std::cout << "### chunk_local_cumsum" << std::endl;
-
   at::Tensor g_ = at::empty({B, NT, Hv, CHUNK_SIZE}, g.options());
   AT_DISPATCH_FLOATING_TYPES(g.scalar_type(), "chunk_local_cumsum", [&] {
     chunk_local_cumsum_kernel_impl<scalar_t, CHUNK_SIZE>(
@@ -2406,8 +2416,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   // TODO: now only optimized for qwen3.5 D == Dv
   CHECK_EQ(D, Dv);
 
-  std::cout << "\n### chunk_gated_delta_rule_fwd_intra ..." << std::endl;
-
   at::Tensor w = at::empty({B, T, Hv, D}, k.options());                                 // BFloat16
   at::Tensor u = at::empty({B, T, Hv, Dv}, k.options());                                // BFloat16
   at::Tensor decay_mask = at::empty({B, NT, Hv, CHUNK_SIZE, CHUNK_SIZE}, g.options());  // Float
@@ -2467,8 +2475,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
   const int64_t Dv = u.size(3);
   const int64_t num_seqs = initial_state.size(0);
 
-  std::cout << "### chunk_gated_delta_rule_fwd_inter ..." << std::endl;
-
   at::Tensor o = at::empty({B, T, Hv, Dv}, q.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "chunk_gated_delta_rule_fwd_inter", [&] {
     switch (D) {
@@ -2493,7 +2499,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
 //   value: [B, T, Hv, Dv]
 //   g: [B, T, Hv] FP32
 //   beta: [B, T, Hv]
-//   initial_state: [num_seqs, Hv, D, Dv] FP32
+//   initial_state: [num_seqs, Hv, Dv, D] FP32
 //   cu_seqlens: [num_seqs + 1] INT32
 //
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -2528,21 +2534,22 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   CHECK_INPUT_SHAPE_DTYPE<false>(g, {B, T, Hv}, at::kFloat);
   CHECK_INPUT_SHAPE_DTYPE<false>(beta, {B, T, Hv}, at::kBFloat16);
   CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, {num_seqs + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, D, Dv}, at::kFloat);
-
-  std::cout << "### chunk_gated_delta_rule_cpu ..." << std::endl;
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, Dv, D}, at::kFloat);
 
   constexpr int CHUNK_SIZE = 64;
+  bool debug = false;
 
   // prepare chunk indices
   auto [chunk_indices, chunk_offsets] = prepare_chunk_indices<CHUNK_SIZE>(cu_seqlens);
-  std::cout << "### cu_seqlens" << cu_seqlens << std::endl;
-  std::cout << "### chunk_indices" << chunk_indices << std::endl;
+  if (debug) {
+    std::cout << "### chunk_gated_delta_rule_cpu ..." << std::endl;
+    std::cout << "### cu_seqlens" << cu_seqlens << std::endl;
+    std::cout << "### chunk_indices" << chunk_indices << std::endl;
+  }
 
   float scale = 1.0 / std::sqrt(D);
   auto [query_, key_] = use_qk_l2norm_in_kernel ? l2norm_fwd(query, key, eps) : std::make_tuple(query.mul(scale), key);
 
-  bool debug = true;
   if (debug && use_qk_l2norm_in_kernel) {
     auto q_ref = l2norm(query, eps, true);
     auto k_ref = l2norm(key, eps, false);
