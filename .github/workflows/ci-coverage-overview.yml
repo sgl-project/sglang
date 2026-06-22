@@ -3,11 +3,6 @@ name: CI Coverage Overview
 on:
   schedule:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC
-  pull_request:
-    paths:
-      - '.github/workflows/ci-coverage-overview.yml'
-      - 'scripts/ci/utils/ci_coverage_report.py'
-      - 'test/registered/**'
   workflow_dispatch:
     inputs:
       output_format:
@@ -70,12 +65,22 @@ jobs:
 
   unit-test-coverage:
     name: Unit Test Code Coverage
-    if: github.event_name != 'pull_request'
     runs-on: 1-gpu-h100
     timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + protoc
+        # Editable install of sglang triggers `build_rust` for the bundled
+        # native gRPC extension (rust/sglang-grpc). The 1-gpu-h100 runner
+        # image has no Rust toolchain by default, which is why this job has
+        # been failing on every scheduled run. Use the same helper that
+        # ci_install_dependency.sh uses so the install path matches the
+        # rest of CI.
+        run: |
+          bash scripts/ci/utils/install_rust_protoc.sh
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
 
       - name: Install dependencies
         timeout-minutes: 10

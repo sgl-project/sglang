@@ -294,7 +294,12 @@ You can enable it in any of the three supported configuration methods:
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
 
 
-Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.
+Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`,
+the regular Mooncake backend path still uses `page_first` or `page_first_direct`.
+When HiSparse provides an MLA host KV pool or DeepSeek V4 C4 side pool with
+layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
+APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
+each logical page across its per-layer buffers.
 
 ### Distributed Deployment
 

@@ -2,7 +2,7 @@
 
 Routes forward passes through the MLX model runner, bypassing PyTorch
 MPS.  A lightweight stub provides scheduler bookkeeping; the actual
-KV data lives in MlxKVPool.
+attention KV data lives in MlxAttentionKVPool.
 
 The worker also exposes an async (lazy-eval) surface used by the MLX
 overlap scheduler: ``async_forward_batch_generation_mlx`` launches a
@@ -87,9 +87,9 @@ class MlxTpModelWorker(TpModelWorker):
         return None
 
     def _ensure_mlx_pool_initialized(self):
-        """Lazily initialize the MlxKVPool after the stub's pools are ready."""
+        """Lazily initialize MLX cache pools after the stub pools are ready."""
         if not self._mlx_pool_initialized:
-            self._mlx_runner.init_kv_pool(self._model_runner.req_to_token_pool)
+            self._mlx_runner.init_cache_pools(self._model_runner.req_to_token_pool)
             self._mlx_pool_initialized = True
 
     def forward_batch_generation(
@@ -98,7 +98,7 @@ class MlxTpModelWorker(TpModelWorker):
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -124,6 +124,14 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             self._mlx_active_rids |= current_rids
 
+    def prepare_for_kv_cache_release(self, req) -> None:
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        if self._mlx_runner.has_request(req.rid):
+            self._mlx_runner.store_auxiliary_state_for_request(req.rid)
+            # Prefer the just-snapshotted live auxiliary state for the final
+            # insert. Any older tracked slot is released during component cleanup.
+            req.mamba_last_track_seqlen = None
+
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -144,7 +152,7 @@ class MlxTpModelWorker(TpModelWorker):
         next_token_ids_list: list[int] = []
 
         if forward_mode.is_extend():
-            # Ensure pool is up-to-date before PoolBackedCache reads it
+            # Ensure pool is up-to-date before pool-backed attention reads it
             # for prefix-cached prefills.  Only runs on extend batches.
             self._mlx_runner.flush_all_decode_kv()
             input_ids_cpu = batch.input_ids.cpu().tolist()
@@ -177,7 +185,7 @@ class MlxTpModelWorker(TpModelWorker):
                 else:
                     # New prefill
                     prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.fill_ids)
+                    full_token_ids = list(req.get_fill_ids())
                     next_token = self._mlx_runner.prefill(
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
@@ -185,6 +193,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                     prefill_rids.append((req.rid, next_token))
 
@@ -270,7 +279,7 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_extend():
             # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before any PoolBackedCache
+            # Ensure the pool is up-to-date before pool-backed attention
             # reads it for prefix-cached prefills. Mirror the sync path.
             self._mlx_runner.flush_all_decode_kv()
             return self._async_extend_batch(batch)
@@ -321,7 +330,7 @@ class MlxTpModelWorker(TpModelWorker):
             else:
                 # New prefill
                 prefix_slot_ids = req.prefix_indices.tolist()
-                full_token_ids = list(req.fill_ids)
+                full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
                         req_id=req.rid,
@@ -330,6 +339,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                 )
 
@@ -377,7 +387,23 @@ class MlxTpModelWorker(TpModelWorker):
     @staticmethod
     def _cache_state(cache_list) -> list[mx.array]:
         """Flatten a per-layer cache list to its ``state`` arrays."""
-        return [s for c in cache_list for s in c.state]
+        arrays: list[mx.array] = []
+
+        def collect(value):
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif value is None:
+                return
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        for cache in cache_list:
+            collect(getattr(cache, "state", ()))
+        return arrays
 
     def async_chained_decode_mlx(
         self,
