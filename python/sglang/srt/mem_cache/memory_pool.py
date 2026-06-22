@@ -286,6 +286,9 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                # TODO(th4): owned-kv ownership (req.kv) belongs in the owned-kv
+                # subsystem, not in the low-level ReqToTokenPool; kept here in
+                # the presence op to preserve equivalence.
                 r.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
                 offset += 1
         return [r.req_pool_idx for r in reqs]
@@ -765,6 +768,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba is not None and req.mamba.mamba_pool_idx is not None:
                 pass
             else:
+                # TODO(th4): owned-mamba ownership (req.mamba) belongs in the
+                # mamba subsystem, not in the low-level ReqToTokenPool; kept
+                # here in the presence op to preserve equivalence.
                 mid = self.mamba_allocator.alloc(1)
                 assert (
                     mid is not None

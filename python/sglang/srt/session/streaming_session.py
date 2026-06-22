@@ -74,6 +74,8 @@ class SessionSlot:
         if req.mamba is not None:
             self.mamba = copy.copy(req.mamba)
 
+        # TODO: to form real move semantics the slot should TAKE these objects
+        # instead of the copy.copy above. Kept as-is to preserve original behavior.
         req.req_pool_idx = None
         req.kv = None
         req.mamba = None
