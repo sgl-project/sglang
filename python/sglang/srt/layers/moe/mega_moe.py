@@ -26,7 +26,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -208,16 +207,17 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        server_args = get_global_server_args()
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-            if server_args.enable_eplb
-            else None
-        )
         topk_output = moe.topk(
             hidden_states,
             router_logits,
-            expert_location_dispatch_info=dispatch_info,
+            num_token_non_padded=(
+                forward_batch.num_token_non_padded
+                if forward_batch is not None
+                else None
+            ),
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=moe.layer_id,
+            ),
             **topk_kwargs,
         )
         topk_ids = topk_output.topk_ids

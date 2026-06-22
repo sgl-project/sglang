@@ -591,8 +591,8 @@ class TopK(MultiPlatformOp):
         ):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
-                topk_ids=topk_output.topk_ids.new_empty(
-                    (0, topk_output.topk_ids.shape[-1] + n)
+                topk_ids=topk_output.topk_ids.new_full(
+                    (0, topk_output.topk_ids.shape[-1] + n), -1
                 ),
                 topk_weights=topk_output.topk_weights.new_empty(
                     (0, topk_output.topk_weights.shape[-1] + n)
@@ -1538,9 +1538,6 @@ def _post_process_topk_ids(
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
         log2phy_prob = None
-        use_per_rank_shared_slots = (
-            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
-        )
         if (
             expert_location_dispatch_info is not None
             and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
@@ -1550,33 +1547,22 @@ def _post_process_topk_ids(
 
             lplb_solver = get_global_lplb_solver(layer_id)
             if lplb_solver is not None:
-                lplb_solver_input = (
-                    topk_ids[:, :-num_fused_shared_experts]
-                    if use_per_rank_shared_slots
-                    else topk_ids
-                )
-                log2phy_prob = lplb_solver.solve(lplb_solver_input)
+                log2phy_prob = lplb_solver.solve(topk_ids)
 
-        if log2phy_prob is not None and not use_per_rank_shared_slots:
+        if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif use_per_rank_shared_slots:
+        elif num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
             # Shared experts appended as extra columns in topk_ids: their value
             # would be out-of-bounds for the logical-to-physical dispatch table,
             # so split, dispatch the routed cols, recombine.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            if log2phy_prob is not None:
-                routed_cols = topk_ids_logical_to_physical(
-                    routed_cols, expert_location_dispatch_info, log2phy_prob
-                )
-                _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
-            else:
-                routed_cols = _biased_grouped_topk_postprocess(
-                    routed_cols, expert_location_dispatch_info, num_token_non_padded
-                )
+            routed_cols = _biased_grouped_topk_postprocess(
+                routed_cols, expert_location_dispatch_info, num_token_non_padded
+            )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             # ExpertDistributionRecorder tracks EPLB physical routed experts.
             # Per-rank shared-slot dispatch later inserts local shared slots into
