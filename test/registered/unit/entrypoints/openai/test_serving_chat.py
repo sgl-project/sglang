@@ -1587,8 +1587,12 @@ class ServingChatTestCase(unittest.TestCase):
             "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
         )
 
-    def test_streaming_logprobs_flushed_on_empty_delta_step(self):
-        """Logprobs for an empty-delta step (no parser) are flushed, not dropped."""
+    def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
+        """With no parser active, an empty-delta step must not emit a standalone
+        empty-delta logprobs chunk — clients expect each chunk to carry real
+        content/reasoning/tool_calls or a finish_reason."""
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = None
 
         async def _mock_generate():
             yield {
@@ -1627,12 +1631,18 @@ class ServingChatTestCase(unittest.TestCase):
             chunks = self._run_chat_stream(adapted_request, req)
 
         parsed = self._parse_chunks(chunks)
-        logprob_chunks = [
-            c for c in parsed if c["choices"][0].get("logprobs") is not None
+        empty_logprob_chunks = [
+            c
+            for c in parsed
+            if c["choices"][0].get("logprobs") is not None
+            and not c["choices"][0]["delta"].get("content")
+            and not c["choices"][0]["delta"].get("reasoning_content")
+            and not c["choices"][0]["delta"].get("tool_calls")
+            and not c["choices"][0].get("finish_reason")
         ]
-        self.assertTrue(
-            logprob_chunks,
-            "logprobs dropped: empty-delta step should flush logprobs on a standalone chunk",
+        self.assertFalse(
+            empty_logprob_chunks,
+            "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):

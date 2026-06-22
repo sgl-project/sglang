@@ -435,9 +435,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Flush logprobs still unattached this step: tool-call parser consumed
-        # the delta (its chunks take no logprobs param), or delta was empty.
-        if remaining_logprobs is not None:
+        # Flush logprobs still unattached this step — only when a parser is
+        # active, since _process_tool_call_stream may consume the delta and emit
+        # no content chunk. On the plain path an empty-delta step has no chunk
+        # to attach to either way, and a standalone empty-delta logprobs chunk
+        # is not a shape clients expect.
+        if remaining_logprobs is not None and (
+            self.reasoning_parser or self.tool_call_parser
+        ):
             usage = None
             if continuous_usage_stats:
                 usage = UsageProcessor.calculate_token_usage(
