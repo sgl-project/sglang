@@ -505,6 +505,10 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    restore_c128_state = getattr(batch.tree_cache, "restore_c128_state_for_reqs", None)
+    if restore_c128_state is not None:
+        restore_c128_state(batch.reqs)
+
     # DSV4-NPU hook: write c4/c128/swa per-req tables from the stashed bundle.
     # No-op on non-DSV4 paths (out_cache_loc_dsv4 stays None there).
     if _is_npu:

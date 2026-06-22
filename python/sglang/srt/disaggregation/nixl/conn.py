@@ -951,6 +951,7 @@ class NixlKVManager(CommonKVManager):
         dst_data_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        state_type: Optional[StateType] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
@@ -1008,7 +1009,7 @@ class NixlKVManager(CommonKVManager):
         # Make descs
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
             layers_params = [
                 (
@@ -1612,7 +1613,12 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+            ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -1631,6 +1637,7 @@ class NixlKVManager(CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    state_type=st,
                 )
             else:
                 raise RuntimeError(
