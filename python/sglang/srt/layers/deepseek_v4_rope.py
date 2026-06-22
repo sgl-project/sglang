@@ -161,7 +161,7 @@ def apply_rotary_emb_triton_kernel_batched(
     BLOCK_M: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
-    # Batched variant: BLOCK_M tokens per program (mirrors ATOM's inverse_rope_gptj
+    # Batched variant: BLOCK_M tokens per program
     # which batches 32 tokens/program) to cut the per-token launch granularity of
     # the original (one program per token).
     pid_m = tl.program_id(0)
@@ -232,7 +232,7 @@ def apply_rotary_emb_flat_kernel(
     # Consecutive rows are sx_head apart in memory (vs sx_tok == n_heads*sx_head
     # for the per-head contig kernel), so the read/write is far less scattered ->
     # ~2x higher achieved HBM bandwidth (cold) on the 128-head attention output
-    # (production rope ~168us -> ~59us, below ATOM's ~83us).
+    # (production rope ~168us -> ~59us).
     pid = tl.program_id(0)
     row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     rmask = row < n_rows
@@ -304,7 +304,7 @@ def apply_rotary_emb_triton(
         else:
             assert freqs_real.shape[0] == batch_size
         BLOCK_M = 32
-        # 3D (attention-output / q-k rope): contiguous-load kernel (ATOM-style).
+        # 3D (attention-output / q-k rope): contiguous-load kernel.
         if is_3d:
             RD = max(triton.next_power_of_2(rope_dim), 2)
             # FLAT-row kernel: process (token, head) pairs flattened as
@@ -312,7 +312,7 @@ def apply_rotary_emb_triton(
             # The per-head contig kernel reads BLOCK_M tokens strided by
             # n_heads*head_dim (very scattered on the 128-head attention output) and
             # only reaches ~2.2 TB/s cold; the flat kernel's rows are head_dim apart
-            # -> ~4.5 TB/s cold (~2x), beating ATOM. Microbench (MI300, 8192x128x64,
+            # -> ~4.5 TB/s cold (~2x). Microbench (MI300, 8192x128x64,
             # cold): BLOCK_ROWS=16 + num_warps=1. Numerically bit-exact vs contig.
             FLAT_BLOCK_ROWS = 16
             n_rows = batch_size * n_heads

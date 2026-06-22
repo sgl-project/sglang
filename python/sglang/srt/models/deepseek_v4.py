@@ -158,7 +158,7 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
-# gather (like ATOM) instead of on the gathered global buffer. Requires
+# gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
