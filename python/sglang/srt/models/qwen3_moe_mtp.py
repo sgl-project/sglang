@@ -60,7 +60,6 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

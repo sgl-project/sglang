@@ -243,26 +243,47 @@ class BypassPathStructuralTest(unittest.TestCase):
         )
 
 
-class Qwen3MoeMTPOptOutStructuralTest(unittest.TestCase):
-    """Regression tripwire for the Qwen3-MoE MTP draft construction chain."""
+class CentralizedDraftOptOutStructuralTest(unittest.TestCase):
+    """Tripwire for the centralized draft opt-out contract.
 
-    def test_qwen3_moe_mtp_path_forwards_is_nextn_to_topk(self):
-        from sglang.srt.models.qwen3_moe import (
-            Qwen3MoeDecoderLayer,
-            Qwen3MoeModel,
-            Qwen3MoeSparseMoeBlock,
+    The draft-side opt-out no longer threads `allow_routed_experts_capture`
+    through each model family's construction chain. Instead the
+    ModelRunner-level pass `disable_routed_experts_capture_for_draft` walks
+    the loaded draft model and flips every TopK. These assertions catch a
+    regression that reintroduces per-family threading or drops the
+    centralized pass."""
+
+    def test_draft_guard_defines_central_optout_pass(self):
+        from sglang.srt.state_capturer import draft_guard
+
+        source = inspect.getsource(draft_guard)
+        self.assertIn(
+            "def disable_routed_experts_capture_for_draft(",
+            source,
+            "draft_guard must define the centralized opt-out pass",
         )
-        from sglang.srt.models.qwen3_moe_mtp import Qwen3MoeForCausalLMMTP
 
-        mtp_source = inspect.getsource(Qwen3MoeForCausalLMMTP.__init__)
-        model_source = inspect.getsource(Qwen3MoeModel.__init__)
-        decoder_source = inspect.getsource(Qwen3MoeDecoderLayer.__init__)
-        moe_source = inspect.getsource(Qwen3MoeSparseMoeBlock.__init__)
+    def test_model_runner_draft_branch_calls_central_optout(self):
+        from sglang.srt.model_executor import model_runner as mr
 
-        self.assertIn("is_nextn=True", mtp_source)
-        self.assertIn("is_nextn=True", model_source)
-        self.assertIn("is_nextn=is_nextn", decoder_source)
-        self.assertIn("allow_routed_experts_capture=not is_nextn", moe_source)
+        source = inspect.getsource(mr.ModelRunner.initialize)
+        self.assertIn(
+            "disable_routed_experts_capture_for_draft(self.model)",
+            source,
+            "ModelRunner.initialize() draft branch must call the centralized "
+            "opt-out pass on the loaded draft model",
+        )
+
+    def test_qwen3_moe_no_longer_threads_flag(self):
+        from sglang.srt.models import qwen3_moe
+
+        source = inspect.getsource(qwen3_moe)
+        self.assertNotIn(
+            "allow_routed_experts_capture",
+            source,
+            "qwen3_moe must not thread allow_routed_experts_capture at "
+            "construction time; the draft opts out via the central walker",
+        )
 
 
 if __name__ == "__main__":

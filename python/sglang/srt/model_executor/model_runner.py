@@ -726,16 +726,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
-        # Fail-closed runtime guard: when a draft worker is configured to
-        # participate in routed-experts capture (R3), every MoE TopK on the
-        # draft model must carry allow_routed_experts_capture=False. An
-        # un-opted-out draft MoE layer raises here rather than silently
-        # polluting the target's R3 buffer at runtime.
+        # R3 routed-experts capture is target-only: opt every draft-side MoE
+        # TopK out (allow_routed_experts_capture=False) so it can never write
+        # the target's capture buffer, then fail-closed assert it. Both run
+        # before backend/graph init; disable runs regardless of whether
+        # capture is enabled. HashTopK is intentionally untouched -- no
+        # topk_config, never calls the R3 capturer.
         if self.is_draft_worker:
             from sglang.srt.state_capturer.draft_guard import (
                 check_draft_capture_optout,
+                disable_routed_experts_capture_for_draft,
             )
 
+            disable_routed_experts_capture_for_draft(self.model)
             check_draft_capture_optout(
                 self.model,
                 routed_experts_capture_enabled=bool(

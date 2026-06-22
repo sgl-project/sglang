@@ -96,8 +96,6 @@ class HYV3MoEFused(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        *,
-        allow_routed_experts_capture: bool = True,
     ):
         super().__init__()
         self.tp_size = get_parallel().moe_tp_size
@@ -133,7 +131,6 @@ class HYV3MoEFused(nn.Module):
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=self.router_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
-            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
@@ -345,8 +342,6 @@ class HYV3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        *,
-        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -384,7 +379,6 @@ class HYV3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
-                allow_routed_experts_capture=allow_routed_experts_capture,
             )
             self.block_type = "moe"
 
@@ -418,8 +412,6 @@ class HYV3Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        *,
-        allow_routed_experts_capture: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -441,7 +433,6 @@ class HYV3Model(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers.{i}",
                     alt_stream=self.alt_stream,
-                    allow_routed_experts_capture=allow_routed_experts_capture,
                 )
                 for i in range(config.num_hidden_layers)
             ]

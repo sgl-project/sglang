@@ -258,7 +258,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
-            allow_routed_experts_capture=not is_nextn,
         )
 
         # Disable inplace MoE when fused gate will need hidden_states after experts

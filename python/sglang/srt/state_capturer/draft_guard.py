@@ -1,28 +1,50 @@
-"""Fail-closed runtime guard for draft-worker R3 routed-experts capture.
+"""Draft-worker opt-out + fail-closed guard for R3 routed-experts capture.
 
-Called once per draft `ModelRunner` construction (when the draft worker
-loads its model and before any forward runs). The guard walks the freshly
-constructed draft model and asserts the single safety invariant that the
-R3 routed-experts capture relies on:
+Role invariant: R3 capture is target-only, so a draft model's MoE `TopK`
+must never write the target's routed-experts capture buffer. The only
+thing the runtime chokepoint (`capture_routed_experts_if_allowed`)
+consults is `topk_config.allow_routed_experts_capture`, so enforcement is
+purely a matter of that flag on each draft-side `TopK`.
 
-    every `TopK` on a draft model must carry
-    `topk_config.allow_routed_experts_capture == False`.
+`ModelRunner.initialize()` runs both passes here on every draft worker
+(unconditionally, before backend/graph init):
 
-That flag is the only thing the runtime capture chokepoint
-(`capture_routed_experts_if_allowed`) consults, so checking it directly on
-the real model instance is both necessary and sufficient: an un-opted-out
-draft MoE layer (flag left at the default `True`) would silently pollute
-the target's R3 capture buffer, and the walk turns that into a loud
-startup failure instead. Dense drafts simply have zero `TopK` and pass.
+  - `disable_routed_experts_capture_for_draft(model)` walks the freshly
+    loaded draft model and sets the flag False on every `TopK`. This is
+    where the opt-out happens -- not at block construction.
+  - `check_draft_capture_optout(model, ...)` re-walks and asserts the
+    invariant, turning any un-opted-out draft `TopK` (flag left at the
+    default `True`) into a loud startup failure instead of silent buffer
+    pollution. It runs only when capture is actually enabled
+    (`--enable-return-routed-experts`); otherwise it is a no-op.
 
-The guard runs only when routed-experts capture is actually enabled (i.e.
-`--enable-return-routed-experts`); otherwise no capture can happen and the
-guard is a no-op.
+Dense drafts have zero `TopK` and both passes are no-ops. `HashTopK` is
+intentionally NOT covered: it has no `topk_config` and never calls the R3
+capturer (it only writes the EPLB expert-distribution recorder).
 """
 
 from __future__ import annotations
 
 from typing import Any, List
+
+
+def disable_routed_experts_capture_for_draft(model: Any) -> None:
+    """Opt every draft-side MoE `TopK` out of R3 routed-experts capture.
+
+    Role invariant: a draft model's MoE `TopK` must never write the
+    target's R3 capture buffer. Walks `model` and sets
+    `topk_config.allow_routed_experts_capture = False` on every `TopK`.
+    Runs before the guard and before any graph recording. Dense-safe
+    (zero `TopK` -> no-op) and idempotent. `HashTopK` is intentionally
+    NOT covered: no `topk_config`, never calls the R3 capturer.
+    """
+    # Imported lazily to avoid an import-time cycle between
+    # `state_capturer.*` and `layers.moe.topk` during module initialization.
+    from sglang.srt.layers.moe.topk import TopK
+
+    for m in model.modules():
+        if isinstance(m, TopK):
+            m.topk_config.allow_routed_experts_capture = False
 
 
 def check_draft_capture_optout(

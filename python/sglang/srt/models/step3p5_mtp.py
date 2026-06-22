@@ -84,7 +84,6 @@ class Step3p5AMultiTokenPredictor(nn.Module):
             config=config,
             layer_id=layer_id,
             prefix=f"{prefix}.mtp_block",
-            allow_routed_experts_capture=False,
         )
         self.lm_head = self.shared_head.head
 

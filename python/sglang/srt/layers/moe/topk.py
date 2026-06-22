@@ -214,8 +214,8 @@ class TopKConfig:
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
     # When False, RoutedExpertsCapturer.capture() is skipped at this layer's
-    # MoE topk site. Default True keeps target-model behavior; draft-side MoE
-    # blocks (NextN / MTP / EAGLE-MoE) set this to False at construction.
+    # MoE topk site. Default True keeps target-model behavior; on draft
+    # workers a ModelRunner-level pass sets this False on every TopK.
     allow_routed_experts_capture: bool = True
 
 
@@ -1534,8 +1534,8 @@ def capture_routed_experts_if_allowed(
     Reads `topk_config.allow_routed_experts_capture` and the process-global
     `RoutedExpertsCapturer`; calls `capture(...)` only when both consent.
     Centralizing the gate means a future capture-aware backend cannot
-    accidentally bypass the per-`TopKConfig` opt-out used by draft MoE
-    layers (NextN / MTP / EAGLE-MoE).
+    accidentally bypass the opt-out, which a ModelRunner-level pass sets
+    False on every draft-worker TopK (R3 capture is target-only).
     """
     if not topk_config.allow_routed_experts_capture:
         return

@@ -3,10 +3,12 @@ target's R3 routed-experts (`--enable-return-routed-experts`) capture buffer.
 
 Both servers run the same Qwen3-30B-A3B target with
 `--enable-return-routed-experts`; the reference additionally attaches the
-Qwen3-MoE EAGLE3 draft. The draft's MoE `TopK` modules opt out of capture
-(`allow_routed_experts_capture=False`); if one still wrote through the
-process-global capturer, the per-output-token experts captured with the
-draft attached would diverge from the target-only baseline.
+Qwen3-MoE EAGLE3 draft. Draft workers opt out of capture via the
+ModelRunner-level pass `disable_routed_experts_capture_for_draft`, which
+flips `allow_routed_experts_capture=False` on every draft-side MoE `TopK`;
+if one still wrote through the process-global capturer, the
+per-output-token experts captured with the draft attached would diverge
+from the target-only baseline.
 
 The target + MoE-draft pair mirrors
 `test/registered/spec/eagle/test_eagle_dp_attention.py`

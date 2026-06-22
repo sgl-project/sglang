@@ -60,7 +60,6 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            allow_routed_experts_capture=False,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

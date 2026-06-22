@@ -452,7 +452,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            allow_routed_experts_capture=not is_nextn,
             apply_routed_scaling_factor_on_output=getattr(
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
