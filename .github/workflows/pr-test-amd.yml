@@ -1130,6 +1130,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          DISAGG_IMAGE_OVERRIDE: rocm/sgl-dev:v0.5.13.post1-rocm720-mi35x-nixl-pr28348-20260616
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
