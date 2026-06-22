@@ -256,6 +256,48 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestFa4PageSizeAutoForce(CustomTestCase):
+    """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
+    must trigger for `--attention-backend fa4` (combined) too, not only for the
+    explicit `--prefill-attention-backend fa4` path."""
+
+    def _make_args(self, attention_backend, prefill=None, decode=None, page_size=1):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend = prefill
+        args.decode_attention_backend = decode
+        args.page_size = page_size
+        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
+        # real model_config. Pre-set the attribute so get_model_config returns
+        # early without touching ModelConfig.from_server_args.
+        args.model_config = MagicMock()
+        args.model_config.hf_config.dual_chunk_attention_config = None
+        return args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_combined_attention_backend_fa4_forces_page_size_128(
+        self, _mock_mla, _mock_sm100
+    ):
+        # `--attention-backend fa4` (combined): prefill/decode fields stay None.
+        args = self._make_args(attention_backend="fa4")
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
+        # `--prefill-attention-backend fa4`: the previously-covered path.
+        args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()
