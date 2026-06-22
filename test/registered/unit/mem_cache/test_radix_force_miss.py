@@ -91,14 +91,14 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
             match_prefix_for_req(tree, baseline_req)
         self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
-        self.assertIsNot(baseline_req.cache.last_node, tree.root_node)
+        self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
             match_prefix_for_req(tree, forced_req)
         self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
-        self.assertIs(forced_req.cache.last_node, tree.root_node)
+        self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
 

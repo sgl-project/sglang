@@ -52,7 +52,7 @@ class ScriptedReqHandle:
         req = self.req
         if req is None:
             return 0
-        node = req.cache.last_node
+        node = req.last_node
         if node is None:
             return 0
         return _node_lock_ref(node)

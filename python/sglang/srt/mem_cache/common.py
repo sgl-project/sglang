@@ -77,10 +77,10 @@ def free_swa_out_of_window_slots(
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
-        req.cache.cache_protected_len % page_size == 0
+        req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
     req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.cache.cache_protected_len
+        req.kv.swa_evicted_seqlen, req.cache_protected_len
     )
 
     # Subtract an extra page_size so the eviction frontier never reaches the

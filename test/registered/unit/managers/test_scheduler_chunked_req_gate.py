@@ -38,10 +38,10 @@ def _make_req(
     req.extend_input_len = extend_input_len
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
-    req.cache.cache_protected_len = 0
+    req.cache_protected_len = 0
     req.skip_radix_cache_insert = False
-    req.cache.last_node = None
-    req.cache.swa_uuid_for_lock = None
+    req.last_node = None
+    req.locked_cache.swa_uuid_for_lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1

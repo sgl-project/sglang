@@ -539,7 +539,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache.cache_protected_len)
+                cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
@@ -593,7 +593,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
-                    prev_prefix_len=req.cache.cache_protected_len,
+                    prev_prefix_len=req.cache_protected_len,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -602,7 +602,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.int8_ckpt_pool.free(mamba_value)
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache.cache_protected_len :]
+                kv_indices[req.cache_protected_len :]
             )
             mamba_exist = True
 
@@ -700,7 +700,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
-                prev_prefix_len=req.cache.cache_protected_len,
+                prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
             )
         )
@@ -721,15 +721,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
         assert (
-            req.cache.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache.cache_protected_len, len(new_indices))),
-            new_indices[req.cache.cache_protected_len :],
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
         )
 
         self.dec_lock_ref(req.locked_cache.last_node)
@@ -741,7 +741,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
         req.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
+        req.mamba.mamba_last_track_seqlen = None
         req.last_node = new_last_node
         req.locked_cache.last_node = new_last_node
 

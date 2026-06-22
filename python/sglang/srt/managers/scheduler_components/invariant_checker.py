@@ -215,9 +215,7 @@ class SchedulerInvariantChecker:
                 if req.req_pool_idx is None:
                     continue
 
-                cache_protected_len = (
-                    req.cache.cache_protected_len if req.cache is not None else 0
-                )
+                cache_protected_len = req.cache_protected_len
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)

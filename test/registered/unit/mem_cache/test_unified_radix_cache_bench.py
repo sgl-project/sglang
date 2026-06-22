@@ -640,12 +640,12 @@ def bench_cache_finished(
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
         req.fill_len = len(req.full_untruncated_fill_ids)
-        req.cache.last_node = node
-        req.cache.cache_protected_len = matched_len
+        req.last_node = node
+        req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
         req.kv_committed_freed = False
         if hasattr(lr, "swa_uuid_for_lock"):
-            req.cache.swa_uuid_for_lock = lr.swa_uuid_for_lock
+            req.locked_cache.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 

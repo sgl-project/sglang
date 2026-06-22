@@ -647,7 +647,7 @@ class UnifiedRadixCacheSuite:
 
     def _apply_match_to_req(self, req, match):
         req.prefix_indices = match.device_indices
-        req.cache.last_node = match.last_device_node
+        req.last_node = match.last_device_node
         req.last_host_node = match.last_host_node
         req.best_match_node = match.best_match_node
         req.host_hit_length = match.host_hit_length
@@ -893,9 +893,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
         req.fill_len = len(req.full_untruncated_fill_ids)
@@ -928,9 +928,9 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
         req.kv.kv_allocated_len = kv_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
             req.mamba.mamba_last_track_seqlen = kv_len
@@ -972,9 +972,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
         req.fill_len = len(req.full_untruncated_fill_ids)
@@ -1000,9 +1000,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
             req.mamba.mamba_last_track_seqlen = kv_len
@@ -1010,12 +1010,12 @@ class UnifiedRadixCacheSuite:
         tree.cache_unfinished_req(req)
 
         self.assertGreater(len(req.prefix_indices), 0)
-        self.assertEqual(req.cache.cache_protected_len, len(req.prefix_indices))
-        self.assertIsNotNone(req.cache.last_node)
+        self.assertEqual(req.cache_protected_len, len(req.prefix_indices))
+        self.assertIsNotNone(req.last_node)
 
         tree.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.locked_cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 
@@ -1125,9 +1125,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids)
         req.fill_len = len(req.full_untruncated_fill_ids)
@@ -1809,9 +1809,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         req.kv.swa_evicted_seqlen = 0
 
@@ -1838,8 +1838,8 @@ class UnifiedRadixCacheSuite:
         )
 
         tree.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.locked_cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 
@@ -1861,9 +1861,9 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len
-        req.cache.last_node = tree.root_node
-        req.cache.cache_protected_len = 0
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.locked_cache.swa_uuid_for_lock = None
         req.extra_key = None
         req.kv.swa_evicted_seqlen = 0
 
@@ -1877,8 +1877,8 @@ class UnifiedRadixCacheSuite:
         )
 
         tree.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.locked_cache.swa_uuid_for_lock),
         )
         tree.sanity_check()
 

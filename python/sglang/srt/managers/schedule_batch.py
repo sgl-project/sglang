@@ -1112,78 +1112,6 @@ class Req(ReqDllmMixin):
             else None
         )
 
-    @property
-    def swa_uuid_for_lock(self) -> Optional[int]:
-        return self.locked_cache.swa_uuid_for_lock
-
-    @swa_uuid_for_lock.setter
-    def swa_uuid_for_lock(self, value: Optional[int]) -> None:
-        self.locked_cache.swa_uuid_for_lock = value
-
-    @property
-    def swa_prefix_lock_released(self) -> bool:
-        return self.locked_cache.swa_prefix_lock_released
-
-    @swa_prefix_lock_released.setter
-    def swa_prefix_lock_released(self, value: bool) -> None:
-        self.locked_cache.swa_prefix_lock_released = value
-
-    @property
-    def kv_allocated_len(self) -> int:
-        return self.kv.kv_allocated_len
-
-    @kv_allocated_len.setter
-    def kv_allocated_len(self, value: int) -> None:
-        self.kv.kv_allocated_len = value
-
-    @property
-    def swa_evicted_seqlen(self) -> int:
-        return self.kv.swa_evicted_seqlen
-
-    @swa_evicted_seqlen.setter
-    def swa_evicted_seqlen(self, value: int) -> None:
-        self.kv.swa_evicted_seqlen = value
-
-    @property
-    def mamba_pool_idx(self) -> Optional[torch.Tensor]:
-        return self.mamba.mamba_pool_idx if self.mamba is not None else None
-
-    @mamba_pool_idx.setter
-    def mamba_pool_idx(self, value: Optional[torch.Tensor]) -> None:
-        self.mamba.mamba_pool_idx = value
-
-    @property
-    def mamba_ping_pong_track_buffer(self) -> Optional[torch.Tensor]:
-        return self.mamba.mamba_ping_pong_track_buffer
-
-    @mamba_ping_pong_track_buffer.setter
-    def mamba_ping_pong_track_buffer(self, value: Optional[torch.Tensor]) -> None:
-        self.mamba.mamba_ping_pong_track_buffer = value
-
-    @property
-    def mamba_next_track_idx(self) -> Optional[int]:
-        return self.mamba.mamba_next_track_idx
-
-    @mamba_next_track_idx.setter
-    def mamba_next_track_idx(self, value: Optional[int]) -> None:
-        self.mamba.mamba_next_track_idx = value
-
-    @property
-    def mamba_last_track_seqlen(self) -> Optional[int]:
-        return self.mamba.mamba_last_track_seqlen
-
-    @mamba_last_track_seqlen.setter
-    def mamba_last_track_seqlen(self, value: Optional[int]) -> None:
-        self.mamba.mamba_last_track_seqlen = value
-
-    @property
-    def mamba_branching_seqlen(self) -> Optional[int]:
-        return self.mamba.mamba_branching_seqlen
-
-    @mamba_branching_seqlen.setter
-    def mamba_branching_seqlen(self, value: Optional[int]) -> None:
-        self.mamba.mamba_branching_seqlen = value
-
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
@@ -1309,9 +1237,9 @@ class Req(ReqDllmMixin):
             ):
                 self.mamba.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is not None:
-                self.cache.cache_protected_len = match_result.cache_protected_len
+                self.cache_protected_len = match_result.cache_protected_len
             else:
-                self.cache.cache_protected_len = len(self.prefix_indices)
+                self.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -2985,15 +2913,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and req.locked_cache is not None
-                        and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
+                        and not req.locked_cache.swa_prefix_lock_released
+                        and req.locked_cache.swa_uuid_for_lock is not None
                         and req.locked_cache.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.locked_cache.last_node, req.swa_uuid_for_lock
+                            req.locked_cache.last_node, req.locked_cache.swa_uuid_for_lock
                         )
-                        req.cache.swa_prefix_lock_released = True
+                        req.locked_cache.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:

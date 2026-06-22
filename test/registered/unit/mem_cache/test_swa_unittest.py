@@ -627,10 +627,10 @@ class TestSWA(unittest.TestCase):
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
-        req.cache.last_node = tree.root_node
-        req.cache.swa_uuid_for_lock = None
+        req.last_node = tree.root_node
+        req.locked_cache.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
-        req.cache.cache_protected_len = 1
+        req.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
 
@@ -646,7 +646,7 @@ class TestSWA(unittest.TestCase):
         tree.insert = wrapped_insert
         tree.cache_finished_req(req, is_insert=True)
 
-        self.assertEqual(captured["prev_prefix_len"], req.cache.cache_protected_len)
+        self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
         self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
 
@@ -662,10 +662,10 @@ class TestSWA(unittest.TestCase):
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
-        req2.cache.last_node = tree.root_node
-        req2.cache.swa_uuid_for_lock = None
+        req2.last_node = tree.root_node
+        req2.locked_cache.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0
-        req2.cache.cache_protected_len = 1
+        req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
         freed_lens = []
