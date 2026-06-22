@@ -131,6 +131,20 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--model", args.model]
     if getattr(args, "num_examples", None) is not None:
         cmd += ["--num-examples", str(args.num_examples)]
+    # Bound generation length so long-reasoning models don't stall the eval.
+    if getattr(args, "max_tokens", None) is not None:
+        cmd += ["--max-tokens", str(args.max_tokens)]
+    else:
+        cmd += ["--max-tokens", "2048"]
+    # Reasoning models (e.g. Qwen3.5) emit their answer in the reasoning
+    # channel by default; without --thinking their `message.content` is empty
+    # and sgl-eval scores 0. Pass --thinking for known reasoning families.
+    if getattr(args, "sgl_eval_thinking", None) is None:
+        model_l = (getattr(args, "model", None) or "").lower()
+        if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
+            cmd += ["--thinking"]
+    elif args.sgl_eval_thinking:
+        cmd += ["--thinking"]
 
     try:
         completed = subprocess.run(
