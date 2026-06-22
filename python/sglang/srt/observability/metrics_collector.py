@@ -1930,9 +1930,6 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
-        # --- Capacity / footprint gauges (align with PR #15699) -------------
-        # Together with the eviction-token rate these let operators estimate the
-        # effective cache horizon (capacity / churn) and "how many requests fit".
         self.cache_entry_count = Gauge(
             name="sglang:cache_entry_count",
             documentation="Number of entries (nodes) currently in the radix cache.",

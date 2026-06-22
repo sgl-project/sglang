@@ -929,14 +929,7 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_total_tokens = host_pool.size
 
     def _log_radix_cache_size(self):
-        """Push radix cache footprint gauges (entry count + total tokens).
-
-        Together with the evicted-tokens rate, this lets operators estimate the
-        effective cache horizon (capacity / churn) and roughly how many requests
-        fit. Computed at the throttled metrics cadence because entry counting is
-        an O(n) tree traversal. No-op unless the cache exposes a metrics collector
-        (i.e. --enable-metrics) and get_cache_stats().
-        """
+        """Push radix cache footprint gauges (entry count + total tokens)."""
         tree_cache = getattr(self.scheduler, "tree_cache", None)
         if tree_cache is None:
             return
@@ -946,8 +939,6 @@ class SchedulerMetricsReporter:
         try:
             entry_count, total_tokens = tree_cache.get_cache_stats()
         except Exception as e:
-            # Footprint reporting must never break the scheduler loop, but log so
-            # a broken get_cache_stats() can still be diagnosed.
             logger.warning(f"Failed to get radix cache stats: {e}")
             return
         collector.set_cache_size(entry_count, total_tokens)
