@@ -659,12 +659,44 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=runner_config.num_local_experts,
+            intermediate_buffer=gate_up_lora_intermediate,
         )
 
     # O1-bf16 fork: gate_up shrink/expand on the side stream, concurrent with the
     # bf16 op's routing + permute + gate_up GEMM below. The op waits on lora_event
     # right before its activation kernel (the only consumer of gate_up_delta).
     lora_event = torch.cuda.Event()
+
+    # Hoist every side-chain allocation onto the MAIN stream (cuda-graph allocator
+    # safety -- see the "routing" stage in virtual_experts.py): pre-warm the routing
+    # cache and pre-allocate the shrink intermediate here, so the side-stream block
+    # below launches kernels only. Without this, the routing tensors + shrink
+    # intermediate get allocated inside the side-stream context during cuda-graph
+    # capture, where cross-stream tracking is off -> pool blocks reused with no graph
+    # edge -> '!!!!' decode corruption at max-loras>=2 (matches the fp8/fp4 fix).
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=fused_lora_routing_cache,
+        stage="routing",
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=runner_config.num_local_experts,
+    )
+    gate_up_lora_intermediate = hidden_states.new_empty(
+        (
+            hidden_states.shape[0],
+            topk_ids.shape[1],
+            lora_info.gate_up_lora_a_weights.shape[2],
+        )
+    )
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         _run_gate_up_lora()

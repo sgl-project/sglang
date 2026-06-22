@@ -3565,6 +3565,7 @@ class Bf16LoraLauncher {
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
         /*permuted_idx_to_expanded_idx=*/nullptr,
         static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+        /*expertIds=*/nullptr,
         expert_weights_ptr,
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
