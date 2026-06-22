@@ -84,7 +84,6 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.page import get_seq_lens
 
     from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
 
@@ -188,15 +187,8 @@ def fast_prefill_plan(
     page_size: int,
     head_dim_vo: Optional[int] = None,
     custom_mask: Optional[torch.Tensor] = None,
-    packed_custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
-    pos_encoding_mode: str = "NONE",
-    use_fp16_qk_reduction: bool = False,
-    sm_scale: Optional[float] = None,
     window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
     q_data_type: Union[str, torch.dtype] = "float16",
     kv_data_type: Optional[Union[str, torch.dtype]] = None,
     o_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -206,13 +198,16 @@ def fast_prefill_plan(
     token_pos_in_items_ptr: Optional[torch.Tensor] = None,
     token_pos_in_items_len: int = 0,
     max_item_len_ptr: Optional[torch.Tensor] = None,
-    # sglang sync-free overrides: host-known metadata that lets us skip the
-    # per-replay device-to-host copies the upstream plan() always issues.
-    qo_indptr_host: Optional[torch.Tensor] = None,
-    kv_indptr_host: Optional[torch.Tensor] = None,
-    kv_lens_host: Optional[torch.Tensor] = None,
-    max_q_len: Optional[int] = None,
-    max_kv_len: Optional[int] = None,
+    # Required host-known metadata: lets us skip the per-replay device-to-host
+    # copies upstream plan() always issues. Keyword-only with no default so a
+    # caller that forgets them fails at the call boundary, not with a cryptic
+    # None crash deeper in.
+    *,
+    qo_indptr_host: torch.Tensor,
+    kv_indptr_host: torch.Tensor,
+    kv_lens_host: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
@@ -235,25 +230,10 @@ def fast_prefill_plan(
         head_dim_vo = head_dim_qk
     batch_size = len(paged_kv_last_page_len)
 
-    # Host scheduling metadata without any device-to-host copy. Fall back to the
-    # original .cpu() reads only if a host value was not supplied (keeps the
-    # function correct even off the fast path).
-    if qo_indptr_host is None:
-        qo_indptr_host = qo_indptr.to("cpu")
-    if kv_indptr_host is None:
-        kv_indptr_host = paged_kv_indptr.to("cpu")
-    if kv_lens_host is None:
-        last_page_len_host = paged_kv_last_page_len.to("cpu")
-        kv_lens_host = get_seq_lens(kv_indptr_host, last_page_len_host, page_size)
-
     total_num_rows = int(qo_indptr_host[-1])
     self._qo_indptr_last = total_num_rows
-    self._max_q_len = (
-        max_q_len
-        if max_q_len is not None
-        else int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max())
-    )
-    self._max_kv_len = max_kv_len if max_kv_len is not None else int(kv_lens_host.max())
+    self._max_q_len = max_q_len
+    self._max_kv_len = max_kv_len
 
     if self._max_total_num_rows is None:
         self._max_total_num_rows = total_num_rows
@@ -1444,7 +1424,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
