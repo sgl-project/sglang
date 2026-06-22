@@ -145,7 +145,21 @@ jobs:
             echo "Begin ($i/$total): python3 $cmd"
             echo "."
             file_start=$SECONDS
-            (cd test/ && python3 $cmd -f) || exit 1
+            # Match the gated PR test's per-stage env: base-a tests (e.g. the
+            # fwd-occupancy sanity kit) run with async assert OFF, since its
+            # probes skew the occupancy measurement. The rule lives in
+            # async_assert_for_stage.sh (shared with _pr-test-stage.yml); the
+            # file's stage is resolved the same way the dispatcher registers it.
+            test_file="${cmd%% *}"
+            test_file="${test_file%%::*}"
+            async_assert=true
+            for stage in $(python3 scripts/ci/utils/resolve_test_stage.py "test/$test_file" 2>/dev/null); do
+              if [ "$(bash scripts/ci/async_assert_for_stage.sh "$stage")" = "false" ]; then
+                async_assert=false
+              fi
+            done
+            echo "SGLANG_ENABLE_ASYNC_ASSERT=$async_assert for $test_file"
+            (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f) || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
