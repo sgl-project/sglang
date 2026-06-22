@@ -328,13 +328,8 @@ class ModelRunnerKVCacheMixin:
                     HybridMambaDecodeReqToTokenPool,
                 )
 
-                # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-
-                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
+                # Extra slots for pre-allocated requests
+                pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
