@@ -53,6 +53,31 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def swiglu_oai_func(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up (split layout)
+    alpha: float,
+    clamp_limit: Optional[float],
+) -> None:
+    """SwiGLU-OAI on a split-layout ``[*, 2I]`` tensor: ``gate * sigmoid(alpha * gate) * (up + 1)``
+    with optional clamp on both halves. Matches MiniMax-M3
+    ``swiglu_no_interleaved_with_alpha_and_limit`` so the marlin MoE path
+    produces the same activation as the BF16 dense MLP / shared-expert MLP."""
+    d = input.shape[1] // 2
+    gate = input[:, :d]
+    up = input[:, d:]
+    if clamp_limit is not None and clamp_limit > 0:
+        gate = torch.clamp(gate, max=clamp_limit)
+        up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    out_dtype = output.dtype
+    activated = (
+        gate.to(torch.float32)
+        * torch.sigmoid(alpha * gate.to(torch.float32))
+        * (up.to(torch.float32) + 1.0)
+    )
+    output.copy_(activated.to(out_dtype))
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -79,6 +104,7 @@ def fused_marlin_moe(
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
 ) -> torch.Tensor:
@@ -233,7 +259,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and clamp_limit is not None:
+    if activation == "silu" and is_gated and gemm1_alpha is not None:
+        # SwiGLU-OAI path (MiniMax-M3 ``swigluoai``): a single elementwise op
+        # in fp32 with `alpha` and optional clamp to match the BF16 dense MLP.
+        swiglu_oai_func(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, gemm1_n),
+            float(gemm1_alpha),
+            clamp_limit,
+        )
+    elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),

@@ -94,9 +94,14 @@ __global__ void per_tensor_quant_fp8_kernel(
   }
 }
 
-template <bool kIsStatic, typename DType>
-void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+template <bool kIsStatic, bool kSkipQuant, typename DType>
+void per_tensor_quant_fp8_impl(
+    tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   using namespace host;
+  static_assert(
+      !(kIsStatic && kSkipQuant),
+      "kIsStatic+kSkipQuant=no work. Use per_tensor_absmax_fp8 for absmax-only "
+      "or per_tensor_quant_fp8<is_static=true> for static-scale quant.");
 
   auto device = SymbolicDevice{};
   auto N = SymbolicSize{"num_elements"};
@@ -106,10 +111,12 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
       .with_dtype<DType>()
       .with_device(device)
       .verify(input);
-  TensorMatcher({N})  //
-      .with_dtype<fp8_e4m3_t>()
-      .with_device(device)
-      .verify(output_q);
+  if constexpr (!kSkipQuant) {
+    TensorMatcher({N})  //
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output_q);
+  }
   TensorMatcher({1})  //
       .with_dtype<float>()
       .with_device(device)
@@ -128,12 +135,28 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
         static_cast<int64_t>(num_elements));
   }
 
-  LaunchKernel(num_blocks, kBlockSize, device.unwrap())(
-      per_tensor_quant_fp8_kernel<DType, fp8_e4m3_t>,
-      static_cast<const DType*>(input.data_ptr()),
-      static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-      static_cast<const float*>(output_s.data_ptr()),
-      static_cast<int64_t>(num_elements));
+  if constexpr (!kSkipQuant) {
+    LaunchKernel(num_blocks, kBlockSize, device.unwrap())(
+        per_tensor_quant_fp8_kernel<DType, fp8_e4m3_t>,
+        static_cast<const DType*>(input.data_ptr()),
+        static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
+        static_cast<const float*>(output_s.data_ptr()),
+        static_cast<int64_t>(num_elements));
+  }
+}
+
+template <bool kIsStatic, typename DType>
+void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+  per_tensor_quant_fp8_impl<kIsStatic, /*kSkipQuant=*/false, DType>(input, output_q, output_s);
+}
+
+// output_q is statically unused when kSkipQuant=true; reuse output_s as a zero-cost placeholder.
+template <typename DType>
+void per_tensor_absmax_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_s) {
+  per_tensor_quant_fp8_impl<
+      /*kIsStatic=*/false,
+      /*kSkipQuant=*/true,
+      DType>(input, output_s, output_s);
 }
 
 }  // namespace

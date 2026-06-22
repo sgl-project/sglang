@@ -1678,6 +1678,24 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        elif self.quant_config is not None and any(
+            "shared_experts" in pat
+            for pat in (getattr(self.quant_config, "ignore", []) or [])
+        ):
+            # Mixed-precision ckpt (e.g. W4A16 with bf16 shared_experts):
+            # routed experts are quantized into the fused-MoE packed grid,
+            # but shared_experts are stored as unquantized bf16 raw weight.
+            # Fusing them into the quantized expert-128 slot would silently
+            # drop the bf16 weight (no matching `experts.w*_weight` param
+            # exists; only `_weight_packed/_scale/_shape` do), leaving
+            # expert 128 at its torch.ones() init and corrupting every
+            # token. Force-disable fusion so shared_experts goes through the
+            # independent MiniMaxM3MLP path (UnquantizedLinearMethod + bf16).
+            disable_reason = (
+                "Quant config ignores shared_experts (ckpt stores them as "
+                "unquantized bf16), which cannot be fused into the quantized "
+                "expert grid."
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -1780,6 +1798,18 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             num_experts=self.config.num_local_experts + self.num_fused_shared_experts,
         )
 
+        # [DEBUG W4A16] track how each expert-related ckpt key is dispatched.
+        debug_dbg_seen_expert_suffixes: Set[str] = set()
+        debug_dbg_expert_loaded = 0
+        debug_dbg_expert_default_loader = 0
+        debug_dbg_expert_not_in_params = 0
+        debug_dbg_expert_warned = 0
+        # [DEBUG W4A16] collect every ckpt key that belongs to dense layers
+        # (layers.0 / layers.1) so we can see whether the checkpoint stores
+        # them as plain ".weight" (i.e. unquantized) or as packed/scale (i.e.
+        # quantized but compressed_tensors failed to recognise the target).
+        debug_dbg_dense_ckpt_names: Set[str] = set()
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -1788,6 +1818,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
+
+            # [DEBUG W4A16] capture the original ckpt name for dense layers
+            # before any internal renaming so we can see what the checkpoint
+            # really stored for layer 0/1 (the layers that fell back to
+            # UnquantizedLinearMethod in the linear-scheme dispatch log).
+            if ".layers.0." in name or ".layers.1." in name:
+                # store the suffix starting at "layers." for compactness
+                idx = name.find("layers.")
+                debug_dbg_dense_ckpt_names.add(name[idx:])
 
             # MiniMax-M3 checkpoints name MoE blocks "block_sparse_moe", while
             # this implementation exposes the same module as layer.mlp to match
@@ -1837,6 +1876,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 break
             else:
                 is_expert_weight = False
+                # [DEBUG W4A16] record the ckpt-side suffix for any name that
+                # contains "experts." so we know exactly what keys the loader
+                # is being asked to dispatch.
+                if "experts." in name:
+                    suffix_idx = name.rfind("experts.")
+                    debug_dbg_seen_expert_suffixes.add(name[suffix_idx:])
 
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
@@ -1859,6 +1904,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    debug_dbg_expert_loaded += 1
                     break
                 else:
                     if is_expert_weight:
@@ -1879,14 +1925,58 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if "experts." in name:
+                            # [DEBUG W4A16] expert key fell through into the
+                            # generic default_weight_loader path. This is the
+                            # canonical sign of a missing expert mapping.
+                            debug_dbg_expert_default_loader += 1
+                            logger.warning(
+                                "[DEBUG W4A16] expert weight fell through to "
+                                "default loader: name=%s shape=%s",
+                                name,
+                                tuple(loaded_weight.shape),
+                            )
                         try:
                             weight_loader(param, loaded_weight)
                         except Exception as e:
                             logger.warning(f"Error loading weight {name}: {e}")
                             continue
                     else:
+                        if "experts." in name:
+                            debug_dbg_expert_not_in_params += 1
+                        else:
+                            debug_dbg_expert_warned += 1
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+
+        # [DEBUG W4A16] one-shot summary of how expert ckpt keys were dispatched.
+        logger.warning(
+            "[DEBUG W4A16] load_weights summary: "
+            "expert_loaded=%d expert_fell_through_to_default=%d "
+            "expert_not_in_params=%d non_expert_missing=%d "
+            "unique_expert_ckpt_suffixes=%d",
+            debug_dbg_expert_loaded,
+            debug_dbg_expert_default_loader,
+            debug_dbg_expert_not_in_params,
+            debug_dbg_expert_warned,
+            len(debug_dbg_seen_expert_suffixes),
+        )
+        # Print up to 32 distinct expert ckpt suffixes so we can see the
+        # checkpoint's actual naming convention (e.g. ".weight" vs
+        # ".weight_packed" / ".weight_scale" / ".scales").
+        sample_suffixes = sorted(debug_dbg_seen_expert_suffixes)[:32]
+        for s in sample_suffixes:
+            logger.warning("[DEBUG W4A16] expert ckpt suffix sample: %s", s)
+
+        # [DEBUG W4A16] also print every distinct ckpt name from the dense
+        # layers (layer 0 and 1). This tells us whether the checkpoint stored
+        # them as plain ".weight" (=> compressed_tensors correctly identified
+        # them as unquantized) or as ".weight_packed"/".weight_scale"
+        # (=> compressed_tensors mis-classified them as unquantized while the
+        # checkpoint actually contains quantized data, which would cause the
+        # plain `param.weight` to never get filled).
+        for s in sorted(debug_dbg_dense_ckpt_names):
+            logger.warning("[DEBUG W4A16] dense ckpt name: %s", s)
 
         # Fuse main qkv_proj + sparse index_qkv_proj into one GEMM. The raw fp8
         # weight + uint8 scale are final at this point (the mxfp8 post-process
