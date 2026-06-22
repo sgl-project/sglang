@@ -946,14 +946,6 @@ class DeepseekMLAForwardMixin:
 # fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
 # paying per-submodule host overhead with no fusion benefit.
 #
-# The further module fusion, coalescing this op with the strictly adjacent
-# `pcg_dsa_indexer_prefill_split` into a single eager region, is currently
-# BCG-only: breakable CUDA graph drops the empty segment and chains adjacent
-# replay fns. Under PCG, `split_graph` leaves each split op in its own eager
-# submodule for now. The adjacency this relies on currently holds on the
-# trtllm-FP8 DSA path where `_fuse_rope_for_trtllm_mla` skips the Python
-# `rotary_emb` call. The call site gates this by `_can_fuse_bmm_into_attention`.
-#
 # `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
 # `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
 # `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
