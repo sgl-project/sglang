@@ -107,9 +107,13 @@ def get_hash_str(
     token_ids: List[int],
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
+    extra_key: Optional[str] = None,
 ) -> str | List[str]:
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
-    return get_native_hash(token_ids, prior_digest, page_size)
+    cache_extra_key = (
+        extra_key if extra_key is not None else getattr(token_ids, "extra_key", None)
+    )
+    return get_native_hash(token_ids, prior_digest, page_size, cache_extra_key)
 
 
 def hash_str_to_int64(hash_str: str) -> int:

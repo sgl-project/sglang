@@ -1118,14 +1118,16 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        anchor_extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        cache_extra_key = extra_key if extra_key is not None else anchor_extra_key
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=extra_key,
+            extra_key=cache_extra_key,
             is_bigram=self.tree_core.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)

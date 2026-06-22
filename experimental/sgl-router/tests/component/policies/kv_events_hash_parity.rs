@@ -19,7 +19,7 @@
 //! whatever fixture is checked in.
 
 use serde::Deserialize;
-use sgl_router::policies::kv_events::compute_block_hashes;
+use sgl_router::policies::kv_events::compute_block_hashes_with_extra_key;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +27,7 @@ struct ParityCase {
     name: String,
     tokens: Vec<u32>,
     block_size: usize,
+    extra_key: Option<String>,
     expected_i64_hashes: Vec<i64>,
 }
 
@@ -65,7 +66,11 @@ fn rust_block_hashes_match_python_radix_cache() {
         // doesn't include a 0 case, so unwrap is safe.
         let block_size = std::num::NonZeroUsize::new(case.block_size)
             .unwrap_or_else(|| panic!("case {} has block_size=0 which is invalid", case.name));
-        let got = compute_block_hashes(&case.tokens, block_size.get());
+        let got = compute_block_hashes_with_extra_key(
+            &case.tokens,
+            block_size.get(),
+            case.extra_key.as_deref(),
+        );
         assert_eq!(
             got, case.expected_i64_hashes,
             "case {}: tokens={:?} block_size={} — Rust produced {:?}, fixture says {:?}",

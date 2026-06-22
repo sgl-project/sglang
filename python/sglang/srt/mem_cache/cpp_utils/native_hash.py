@@ -78,9 +78,18 @@ def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:
 
 
 def get_native_hash(
-    token_ids: Any, prior_digest: Optional[bytes], page_size: Optional[int] = None
+    token_ids: Any,
+    prior_digest: Optional[bytes],
+    page_size: Optional[int] = None,
+    extra_key: Optional[str] = None,
 ) -> str | list[str]:
     raw, logical_len, unit_width, is_bigram = _native_hash_input(token_ids)
     return _load_native_hash_module().get_hash(
-        raw, logical_len, unit_width, is_bigram, prior_digest, page_size
+        raw,
+        logical_len,
+        unit_width,
+        is_bigram,
+        prior_digest,
+        extra_key,
+        page_size,
     )

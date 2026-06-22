@@ -29,8 +29,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-def _legacy_get_hash_str(token_ids, prior_hash=None):
+def _legacy_get_hash_str(token_ids, prior_hash=None, extra_key=None):
     hasher = hashlib.sha256()
+    cache_extra_key = (
+        extra_key if extra_key is not None else getattr(token_ids, "extra_key", None)
+    )
+    if cache_extra_key is not None:
+        encoded_extra_key = cache_extra_key.encode("utf-8")
+        hasher.update(len(encoded_extra_key).to_bytes(4, byteorder="little"))
+        hasher.update(encoded_extra_key)
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
     for t in token_ids:
@@ -54,9 +61,10 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False):
+    def __init__(self, token_ids, is_bigram=False, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -68,8 +76,12 @@ class _HashKey:
             start = index.start or 0
             stop = index.stop if index.stop is not None else len(self)
             if self.is_bigram:
-                return _HashKey(self.token_ids[start : stop + 1], is_bigram=True)
-            return _HashKey(self.token_ids[start:stop])
+                return _HashKey(
+                    self.token_ids[start : stop + 1],
+                    is_bigram=True,
+                    extra_key=self.extra_key,
+                )
+            return _HashKey(self.token_ids[start:stop], extra_key=self.extra_key)
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -246,9 +258,42 @@ class TestGetHashStr(unittest.TestCase):
         self.assertNotEqual(
             chained, get_hash_str([3, 4], prior_hash=get_hash_str([9, 9]))
         )
+
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
             with self.subTest(tokens=tokens):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
+
+    def test_extra_key_namespaces_first_step(self):
+        salted_a = get_hash_str([1, 2, 3, 4], extra_key="salt-A")
+        salted_b = get_hash_str([1, 2, 3, 4], extra_key="salt-B")
+        unsalted = get_hash_str([1, 2, 3, 4])
+
+        self.assertEqual(
+            salted_a, _legacy_get_hash_str([1, 2, 3, 4], extra_key="salt-A")
+        )
+        self.assertNotEqual(salted_a, salted_b)
+        self.assertNotEqual(salted_a, unsalted)
+        self.assertNotEqual(get_hash_str([1, 2, 3, 4], extra_key=""), unsalted)
+
+    def test_extra_key_is_carried_by_token_view_slices(self):
+        token_view = _HashKey(array("q", [1, 2, 3, 4, 5]), extra_key="salt-A")
+
+        first_hash = get_hash_str(token_view[:4])
+        self.assertEqual(first_hash, get_hash_str([1, 2, 3, 4], extra_key="salt-A"))
+
+        second_hash = get_hash_str(token_view[4:5], prior_hash=first_hash)
+        self.assertEqual(
+            second_hash, get_hash_str([5], prior_hash=first_hash, extra_key="salt-A")
+        )
+
+    def test_page_hashes_apply_extra_key_to_each_page(self):
+        token_view = _HashKey(array("q", [1, 2, 3, 4, 5]), extra_key="salt-A")
+        page_hashes = get_hash_str(token_view, page_size=4)
+
+        first_hash = get_hash_str(token_view[:4])
+        second_hash = get_hash_str(token_view[4:5], prior_hash=first_hash)
+        self.assertEqual(page_hashes, [first_hash, second_hash])
+        self.assertEqual(page_hashes, _legacy_page_hashes(token_view, page_size=4))
 
     def test_hash_key_hash_page_matches_get_hash_str(self):
         key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)

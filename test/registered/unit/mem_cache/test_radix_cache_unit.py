@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.utils import get_device
 
 # Test constants
@@ -104,6 +105,24 @@ class TestRadixKey(unittest.TestCase):
         key = RadixKey(array("q", [1, 2, 3]))
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
+
+    def test_hash_page_includes_extra_key_namespace(self):
+        """hash_page uses the same extra_key namespace as child_key."""
+        tokens = array("q", [1, 2, 3, 4, 5])
+        key_a = RadixKey(tokens, "salt-A")
+        key_b = RadixKey(tokens, "salt-B")
+        key_empty = RadixKey(tokens, "")
+        key_none = RadixKey(tokens, None)
+
+        first_a = key_a.hash_page(0, 4)
+        first_b = key_b.hash_page(0, 4)
+        self.assertNotEqual(first_a, first_b)
+        self.assertNotEqual(key_empty.hash_page(0, 4), key_none.hash_page(0, 4))
+
+        # Storage-hit queries recompute the same chain from RadixKey slices.
+        self.assertEqual(first_a, get_hash_str(key_a[:4]))
+        second_a = key_a.hash_page(4, 5, first_a)
+        self.assertEqual(second_a, get_hash_str(key_a[4:5], first_a))
 
     def _assert_match(self, a, b, page_size, expected, is_bigram=False):
         key_a = RadixKey(array("q", a), is_bigram=is_bigram)
@@ -469,6 +488,36 @@ class TestRadixCache(unittest.TestCase):
         remove_events = [e for e in events if isinstance(e, BlockRemoved)]
         self.assertEqual(len(remove_events), 1)
         self.assertEqual(remove_events[0].block_hashes, stored_hashes)
+
+    def test_block_hashes_are_isolated_by_extra_key(self):
+        """KV event block hashes differ across extra_key namespaces."""
+        cache = RadixCache.create_simulated(
+            page_size=4,
+            enable_kv_cache_events=True,
+        )
+        tokens = array("q", [1, 2, 3, 4])
+
+        cache.insert(InsertParams(key=RadixKey(tokens, "salt-A"), value=None))
+        events_a = [
+            event for event in cache.take_events() if isinstance(event, BlockStored)
+        ]
+
+        match_other_namespace = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, "salt-B"))
+        )
+        self.assertEqual(len(match_other_namespace.device_indices), 0)
+
+        cache.insert(InsertParams(key=RadixKey(tokens, "salt-B"), value=None))
+        events_b = [
+            event for event in cache.take_events() if isinstance(event, BlockStored)
+        ]
+
+        self.assertEqual(len(events_a), 1)
+        self.assertEqual(len(events_b), 1)
+        self.assertNotEqual(
+            events_a[0].block_hashes[0],
+            events_b[0].block_hashes[0],
+        )
 
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""

@@ -24,8 +24,9 @@
 //!    for callers that didn't pre-tokenize. On any failure (no tokens, no
 //!    tokenizer, encode error, empty), fall through to step 4 (min-load).
 //! 3. **Hash + match.** Compute block hashes via
-//!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
-//!    for the longest matching prefix. If `match_rate > cache_threshold`,
+//!    [`super::kv_events::compute_block_hashes_with_extra_key`], including the
+//!    request's `cache_salt`/`extra_key` namespace when present, then query the
+//!    shared hash tree for the longest matching prefix. If `match_rate > cache_threshold`,
 //!    pick the lowest-load worker whose `url` appears in the match result.
 //!    Otherwise, fall through.
 //! 4. **Min-load fallback.** Pick the lowest-load worker by
@@ -38,9 +39,10 @@
 use crate::config::CacheAwareConfig;
 
 use crate::policies::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+    compute_block_hashes_bigram_with_extra_key, compute_block_hashes_with_extra_key,
+    BlockSizeOracle, HashTree,
 };
-use crate::policies::{request_tokens_for, Policy, SelectionContext};
+use crate::policies::{request_extra_key_for, request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
@@ -149,8 +151,15 @@ impl Policy for CacheAwareZmqPolicy {
         //    callers that don't pre-tokenize (e.g. unit tests). In production
         //    the ingress always pre-tokenizes, so this is a single tokenize.
         let fallback_ids;
+        let extra_key: Option<String>;
         let tokens: &[u32] = match ctx.request_tokens() {
-            Some(t) if !t.is_empty() => t,
+            Some(t) if !t.is_empty() => {
+                extra_key = ctx
+                    .request_body()
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                    .and_then(|value| request_extra_key_for(&value));
+                t
+            }
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
@@ -159,6 +168,7 @@ impl Policy for CacheAwareZmqPolicy {
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
                     return Self::pick_min_load(workers);
                 };
+                extra_key = request_extra_key_for(&value);
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
                     return Self::pick_min_load(workers);
                 };
@@ -185,9 +195,13 @@ impl Policy for CacheAwareZmqPolicy {
         // reported flag.
         let is_bigram = self.block_size_oracle.is_bigram();
         let block_hashes = if is_bigram {
-            compute_block_hashes_bigram(tokens, block_size as usize)
+            compute_block_hashes_bigram_with_extra_key(
+                tokens,
+                block_size as usize,
+                extra_key.as_deref(),
+            )
         } else {
-            compute_block_hashes(tokens, block_size as usize)
+            compute_block_hashes_with_extra_key(tokens, block_size as usize, extra_key.as_deref())
         };
         if block_hashes.is_empty() {
             return Self::pick_min_load(workers);
@@ -255,7 +269,7 @@ mod tests {
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::kv_events::tree::KvWorkerId;
-    use crate::policies::kv_events::HashTree;
+    use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram, HashTree};
     use crate::tokenizer::adapter;
 
     fn cfg_default() -> CacheAwareConfig {
@@ -390,6 +404,54 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    #[test]
+    fn cache_salt_participates_in_route_hashes_with_precomputed_tokens() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        let salted_hashes =
+            compute_block_hashes_with_extra_key(&ids, block_size as usize, Some("salt-A"));
+        assert!(!salted_hashes.is_empty());
+        tree.insert(
+            &KvWorkerId::new("http://w0:30000".into(), 0),
+            None,
+            &salted_hashes,
+        );
+
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _w0_load = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+
+        let body_a =
+            serde_json::to_vec(&serde_json::json!({"prompt": text, "cache_salt": "salt-A"}))
+                .unwrap();
+        let ctx_a = SelectionContext::new(&model, Some(&body_a)).with_request_tokens(Some(&ids));
+        let chosen_a = policy.select(&workers, &ctx_a).expect("must pick");
+        assert_eq!(chosen_a.url, "http://w0:30000");
+
+        let body_b =
+            serde_json::to_vec(&serde_json::json!({"prompt": text, "cache_salt": "salt-B"}))
+                .unwrap();
+        let ctx_b = SelectionContext::new(&model, Some(&body_b)).with_request_tokens(Some(&ids));
+        let chosen_b = policy.select(&workers, &ctx_b).expect("must pick");
+        assert_eq!(chosen_b.url, "http://w1:30000");
     }
 
     /// The cache-aware path records the matched prefix-overlap block count

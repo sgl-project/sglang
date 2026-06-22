@@ -228,5 +228,49 @@
       3368460852864325515,
       1233425155141659070
     ]
+  },
+  {
+    "name": "salted_single_full_block",
+    "tokens": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "block_size": 4,
+    "expected_i64_hashes": [
+      1848708812856982025
+    ],
+    "extra_key": "salt-A"
+  },
+  {
+    "name": "salted_multi_block",
+    "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "block_size": 4,
+    "expected_i64_hashes": [
+      1848708812856982025,
+      -844459331919182630
+    ],
+    "extra_key": "salt-A"
+  },
+  {
+    "name": "empty_extra_key_namespace",
+    "tokens": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "block_size": 4,
+    "expected_i64_hashes": [
+      -1934027550307904538
+    ],
+    "extra_key": ""
   }
 ]

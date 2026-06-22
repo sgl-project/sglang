@@ -75,6 +75,26 @@ pub fn request_tokens_for(
     })
 }
 
+/// Compute the radix-cache namespace SGLang will attach to this request.
+///
+/// Mirrors `OpenAIServingBase._compute_extra_key`: non-empty string
+/// `cache_salt` and `extra_key` fields are concatenated in that order.
+pub fn request_extra_key_for(value: &serde_json::Value) -> Option<String> {
+    let mut out = String::new();
+    for key in ["cache_salt", "extra_key"] {
+        if let Some(part) = value.get(key).and_then(|v| v.as_str()) {
+            if !part.is_empty() {
+                out.push_str(part);
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Tokenize `text` for `model_id` via the shared registry. Returns `None` if
 /// no tokenizer is loaded (the model_id may be misconfigured) or if encoding
 /// fails / yields no tokens. An encode error logs at WARN (a loaded-but-erroring

@@ -59,11 +59,46 @@ parse_prior_digest(py::object prior_digest_obj, bool *has_prior_digest) {
   return prior_digest;
 }
 
+struct ExtraKey {
+  bool present = false;
+  std::array<unsigned char, 4> length_bytes{};
+  std::string encoded;
+};
+
+ExtraKey parse_extra_key(py::object extra_key_obj) {
+  ExtraKey extra_key;
+  if (extra_key_obj.is_none()) {
+    return extra_key;
+  }
+
+  extra_key.present = true;
+  extra_key.encoded = extra_key_obj.cast<std::string>();
+  if (extra_key.encoded.size() > UINT32_MAX) {
+    throw std::out_of_range("extra_key UTF-8 encoding exceeds uint32 length");
+  }
+  const auto length = static_cast<std::uint32_t>(extra_key.encoded.size());
+  extra_key.length_bytes = {
+      static_cast<unsigned char>(length),
+      static_cast<unsigned char>(length >> 8),
+      static_cast<unsigned char>(length >> 16),
+      static_cast<unsigned char>(length >> 24),
+  };
+  return extra_key;
+}
+
 inline void hash_page(const unsigned char *data, std::size_t len,
                       bool &has_prior_digest,
-                      std::array<unsigned char, kDigestLen> &prior_digest) {
+                      std::array<unsigned char, kDigestLen> &prior_digest,
+                      const ExtraKey &extra_key) {
   SHA256_CTX ctx;
   SHA256_Init(&ctx);
+  if (extra_key.present) {
+    SHA256_Update(&ctx, extra_key.length_bytes.data(),
+                  extra_key.length_bytes.size());
+    if (!extra_key.encoded.empty()) {
+      SHA256_Update(&ctx, extra_key.encoded.data(), extra_key.encoded.size());
+    }
+  }
   if (has_prior_digest) {
     SHA256_Update(&ctx, prior_digest.data(), prior_digest.size());
   }
@@ -185,7 +220,7 @@ void hash_pages_to_hex_blob(const RawToken *raw, std::size_t logical_len,
                             std::size_t page_size, std::size_t unit_width,
                             bool is_bigram, bool has_prior_digest,
                             std::array<unsigned char, kDigestLen> prior_digest,
-                            std::string &hex_blob) {
+                            const ExtraKey &extra_key, std::string &hex_blob) {
   if (page_size == 0) {
     throw std::invalid_argument("page_size must be positive");
   }
@@ -219,7 +254,7 @@ void hash_pages_to_hex_blob(const RawToken *raw, std::size_t logical_len,
       bytes = reinterpret_cast<const unsigned char *>(page_words.data());
     }
 
-    hash_page(bytes, page_bytes, has_prior_digest, prior_digest);
+    hash_page(bytes, page_bytes, has_prior_digest, prior_digest, extra_key);
     digest_to_hex_chars(prior_digest.data(),
                         hex_blob.data() + page_idx * kHexLen);
   }
@@ -229,7 +264,8 @@ template <typename RawToken>
 std::string hash_all(const RawToken *raw, std::size_t logical_len,
                      std::size_t unit_width, bool is_bigram,
                      bool has_prior_digest,
-                     std::array<unsigned char, kDigestLen> prior_digest) {
+                     std::array<unsigned char, kDigestLen> prior_digest,
+                     const ExtraKey &extra_key) {
   if (is_bigram) {
     unit_width = 2;
   }
@@ -253,7 +289,7 @@ std::string hash_all(const RawToken *raw, std::size_t logical_len,
     bytes = reinterpret_cast<const unsigned char *>(words.data());
   }
 
-  hash_page(bytes, num_bytes, has_prior_digest, prior_digest);
+  hash_page(bytes, num_bytes, has_prior_digest, prior_digest, extra_key);
   return digest_to_hex_string(prior_digest.data());
 }
 
@@ -284,32 +320,35 @@ py::object hex_blob_to_pylist(const std::string &hex_blob) {
 
 std::string hash_str(const py::buffer &raw_tokens, std::size_t logical_len,
                      std::size_t unit_width, bool is_bigram,
-                     py::object prior_digest_obj) {
+                     py::object prior_digest_obj, py::object extra_key_obj) {
   RawTokenBuffer buffer =
       get_raw_token_buffer(raw_tokens, logical_len, unit_width, is_bigram);
   bool has_prior_digest = false;
   auto prior_digest = parse_prior_digest(prior_digest_obj, &has_prior_digest);
+  auto extra_key = parse_extra_key(extra_key_obj);
 
   py::gil_scoped_release release;
   if (buffer.info.itemsize == 4) {
     return hash_all(static_cast<const std::uint32_t *>(buffer.info.ptr),
                     logical_len, unit_width, is_bigram, has_prior_digest,
-                    prior_digest);
+                    prior_digest, extra_key);
   }
   return hash_all(static_cast<const std::uint64_t *>(buffer.info.ptr),
                   logical_len, unit_width, is_bigram, has_prior_digest,
-                  prior_digest);
+                  prior_digest, extra_key);
 }
 
 py::object pages_hashes(const py::buffer &raw_tokens, std::size_t logical_len,
                         std::size_t page_size, std::size_t unit_width,
-                        bool is_bigram, py::object prior_digest_obj) {
+                        bool is_bigram, py::object prior_digest_obj,
+                        py::object extra_key_obj) {
   RawTokenBuffer buffer =
       get_raw_token_buffer(raw_tokens, logical_len, unit_width, is_bigram);
   const std::size_t num_pages =
       page_size == 0 ? 0 : (logical_len + page_size - 1) / page_size;
   bool has_prior_digest = false;
   auto prior_digest = parse_prior_digest(prior_digest_obj, &has_prior_digest);
+  auto extra_key = parse_extra_key(extra_key_obj);
   std::string hex_blob(num_pages * kHexLen, '\0');
 
   {
@@ -318,12 +357,12 @@ py::object pages_hashes(const py::buffer &raw_tokens, std::size_t logical_len,
       hash_pages_to_hex_blob(
           static_cast<const std::uint32_t *>(buffer.info.ptr), logical_len,
           page_size, unit_width, is_bigram, has_prior_digest, prior_digest,
-          hex_blob);
+          extra_key, hex_blob);
     } else {
       hash_pages_to_hex_blob(
           static_cast<const std::uint64_t *>(buffer.info.ptr), logical_len,
           page_size, unit_width, is_bigram, has_prior_digest, prior_digest,
-          hex_blob);
+          extra_key, hex_blob);
     }
   }
 
@@ -332,14 +371,15 @@ py::object pages_hashes(const py::buffer &raw_tokens, std::size_t logical_len,
 
 py::object get_hash(const py::buffer &raw_tokens, std::size_t logical_len,
                     std::size_t unit_width, bool is_bigram,
-                    py::object prior_digest_obj, py::object page_size_obj) {
+                    py::object prior_digest_obj, py::object extra_key_obj,
+                    py::object page_size_obj) {
   if (page_size_obj.is_none()) {
     return py::cast(hash_str(raw_tokens, logical_len, unit_width, is_bigram,
-                             prior_digest_obj));
+                             prior_digest_obj, extra_key_obj));
   }
   return pages_hashes(raw_tokens, logical_len,
                       page_size_obj.cast<std::size_t>(), unit_width, is_bigram,
-                      prior_digest_obj);
+                      prior_digest_obj, extra_key_obj);
 }
 
 } // namespace
@@ -347,5 +387,5 @@ py::object get_hash(const py::buffer &raw_tokens, std::size_t logical_len,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_hash", &get_hash, py::arg("raw_tokens"), py::arg("logical_len"),
         py::arg("unit_width"), py::arg("is_bigram"), py::arg("prior_digest"),
-        py::arg("page_size") = py::none());
+        py::arg("extra_key"), py::arg("page_size") = py::none());
 }

@@ -1801,11 +1801,14 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
-        prefetch_length = len(new_input_tokens) - (
-            len(new_input_tokens) % self.page_size
+        cache_extra_key = (
+            extra_key if extra_key is not None else last_host_node.key.extra_key
         )
-        new_input_tokens = new_input_tokens[:prefetch_length]
+        prefetch_key = RadixKey(new_input_tokens, extra_key=cache_extra_key)
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
+        prefetch_length = len(prefetch_key)
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -1816,7 +1819,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._protect_host_node(last_host_node, protect_mamba=False)
 
         # Allocate host mamba slot
-        extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
+        extra_pools = self.mamba_prefetch_alloc(prefetch_key.token_ids, last_hash)
         if extra_pools is None:
             self._release_host_node(last_host_node, release_mamba=False)
             return
@@ -1828,24 +1831,24 @@ class HiMambaRadixCache(MambaRadixCache):
 
         operation = self.cache_controller.prefetch(
             req_id,
-            new_input_tokens,
+            prefetch_key,
             last_hash,
             prefix_keys,
             extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
-            new_input_tokens,
+            prefetch_key,
             None,
             operation,
         )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
 
@@ -1889,14 +1892,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
                 break
 
-        fetched_token_ids = token_ids[:min_completed_tokens]
+        fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids,
-                extra_key=last_host_node.key.extra_key,
-            ),
+            fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
             mamba_host_indices,
@@ -1917,7 +1917,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self._release_host_node(last_host_node)
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
