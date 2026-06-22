@@ -707,6 +707,7 @@
                   "docs/basic_usage/openai_api_embeddings"
                 ]
               },
+              "docs/basic_usage/anthropic_api",
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",

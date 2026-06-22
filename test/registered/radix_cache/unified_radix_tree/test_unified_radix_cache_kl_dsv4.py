@@ -200,7 +200,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.9",
+                "0.95",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
