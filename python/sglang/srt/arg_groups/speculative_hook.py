@@ -127,6 +127,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    if server_args.speculative_adaptive:
+        strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
+        if strategy == "throughput_aware":
+            _validate_throughput_aware_adaptive(server_args)
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
@@ -484,14 +489,56 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
         server_args.speculative_adaptive = False
 
 
-def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
-    from sglang.srt.speculative.adaptive_spec_params import (
-        resolve_candidate_steps_from_config,
+def _validate_throughput_aware_adaptive(server_args: ServerArgs) -> None:
+    """Validate throughput_aware strategy config at startup."""
+    from sglang.srt.speculative.throughput_aware_controller import (
+        _parse_bs_candidates,
+        load_throughput_aware_config,
     )
 
-    candidate_steps = resolve_candidate_steps_from_config(
-        cfg_path=server_args.speculative_adaptive_config,
+    cfg = load_throughput_aware_config(server_args.speculative_adaptive_config)
+    # This will raise ValueError if the config is malformed.
+    _, bs_candidates = _parse_bs_candidates(cfg)
+
+    all_candidate_steps = sorted({s for steps in bs_candidates.values() for s in steps})
+    initial_steps = server_args.speculative_num_steps
+    if initial_steps not in all_candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={initial_steps} is not in the "
+            f"throughput_aware config candidate_steps {all_candidate_steps}. "
+            "Pass one of those values."
+        )
+
+    config_source = (
+        server_args.speculative_adaptive_config
+        if server_args.speculative_adaptive_config is not None
+        else "built-in default"
     )
+    logger.info(
+        f"throughput_aware adaptive: config loaded from {config_source}, "
+        f"candidate_steps={all_candidate_steps}, "
+        f"initial_steps={initial_steps}"
+    )
+
+
+def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
+    strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
+    if strategy == "throughput_aware":
+        from sglang.srt.speculative.throughput_aware_controller import (
+            resolve_throughput_aware_candidate_steps,
+        )
+
+        candidate_steps = resolve_throughput_aware_candidate_steps(
+            cfg_path=server_args.speculative_adaptive_config,
+        )
+    else:
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidate_steps = resolve_candidate_steps_from_config(
+            cfg_path=server_args.speculative_adaptive_config,
+        )
 
     if server_args.speculative_eagle_topk is None:
         server_args.speculative_eagle_topk = 1
