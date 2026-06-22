@@ -433,6 +433,14 @@ class ModelConfig:
                 )
             )
         )
+        # Multimodal archs whose language-model prefill is verified safe to capture
+        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
+        # CG for every multimodal model; this opt-in re-enables it for listed archs
+        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
+        # LM forward is captured).
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -1710,6 +1718,14 @@ piecewise_cuda_graph_disabled_model_archs = [
     "LLaDAModelLM",
 ]
 
+# Multimodal archs allowed to keep prefill piecewise CUDA graph enabled. The
+# generic "multimodal model" rule in ServerArgs disables prefill piecewise CG for
+# all multimodal models; archs here opt back in because their LM prefill captures
+# cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
+multimodal_piecewise_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1777,8 +1793,9 @@ multimodal_piecewise_cuda_graph_supported_archs = [
 
 
 def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
     return any(
-        arch in multimodal_piecewise_cuda_graph_supported_archs
+        arch in multimodal_piecewise_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 
