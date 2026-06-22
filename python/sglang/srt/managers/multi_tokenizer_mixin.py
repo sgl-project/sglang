@@ -380,7 +380,7 @@ class MultiTokenizerRouter:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
         self.receive_from_worker = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
+            context, zmq.PULL, port_args.tokenizer_router_input_ipc_name, True
         )
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)

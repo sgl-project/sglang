@@ -373,6 +373,10 @@ def add_linear_attn_kernel_backend_choices(choices):
 class ServerArgs:
     """The arguments of the server.
 
+    NOTE for adding new arguments:
+    Group new arguments into the appropriate existing section or create a
+    new section as needed.
+
     There are two styles for defining arguments. New arguments MUST use the
     ``A[T, ...]`` style; the legacy style is being migrated and should not be
     used for new additions.
@@ -398,9 +402,6 @@ class ServerArgs:
     ``parser.add_argument(...)`` call in ``add_cli_args`` defines the CLI
     surface. When modifying these fields, keep the order in this class
     definition consistent with the order in ``add_cli_args``.
-
-    Group new arguments into the appropriate existing section or create a
-    new section as needed.
     """
 
     # Model and tokenizer
@@ -507,6 +508,7 @@ class ServerArgs:
             )
         ),
     ] = "auto"
+    json_model_override_args: str = "{}"
 
     # HTTP server
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
@@ -518,13 +520,9 @@ class ServerArgs:
         Optional[str],
         "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
     ] = None
-    nccl_port: A[
-        Optional[int],
-        "The port for NCCL distributed environment setup. Defaults to a random port.",
-    ] = None
-    checkpoint_engine_wait_weights_before_ready: A[
+    enable_http2: A[
         bool,
-        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
     ] = False
 
     # SSL/TLS
@@ -537,10 +535,6 @@ class ServerArgs:
     enable_ssl_refresh: A[
         bool,
         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
-    ] = False
-    enable_http2: A[
-        bool,
-        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
     ] = False
 
     # Quantization and data type
@@ -750,6 +744,163 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
     ] = "lru"
+    prefill_only_disable_kv_cache: A[
+        bool,
+        "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+    ] = False
+    disable_radix_cache: bool = False
+    disable_chunked_prefix_cache: bool = False
+    disable_overlap_schedule: bool = False
+    num_continuous_decode_steps: int = 1
+    scheduler_recv_interval: int = 1
+    enable_mixed_chunk: bool = False
+
+    # Device info and server timeout
+    device: Optional[str] = None
+    base_gpu_id: int = 0
+    gpu_id_step: int = 1
+    random_seed: Optional[int] = None
+    watchdog_timeout: float = 300
+    soft_watchdog_timeout: Optional[float] = None
+    sleep_on_idle: bool = False
+    use_ray: bool = False
+    custom_sigquit_handler: Optional[Callable] = None
+    checkpoint_engine_wait_weights_before_ready: A[
+        bool,
+        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+    ] = False
+    numa_node: Optional[List[int]] = None
+    gc_threshold: Optional[List[int]] = None
+
+    # Tensor parallel, pipeline parallel, data parallel, and context parallel
+    nccl_port: A[
+        Optional[int],
+        "The port for NCCL distributed environment setup. Defaults to a random port.",
+    ] = None
+    dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    tp_size: int = 1
+    pp_size: int = 1
+    pp_max_micro_batch_size: Optional[int] = None
+    pp_async_batch_depth: int = 0
+    dp_size: A[
+        int,
+        Arg(
+            help="The data parallelism size.",
+            cli_name="--data-parallel-size",
+            aliases=["--dp-size"],
+        ),
+    ] = 1
+    load_balance_method: A[
+        str,
+        Arg(
+            help="The load balancing strategy for data parallelism.",
+            choices=[
+                "auto",
+                "round_robin",
+                "follow_bootstrap_room",
+                "total_requests",
+                "total_tokens",
+            ],
+        ),
+    ] = "auto"
+    attn_cp_size: int = 1
+    moe_dp_size: int = 1
+    enable_prefill_cp: bool = False
+    cp_strategy: Optional[str] = None
+    enable_dsa_prefill_context_parallel: bool = False
+    dsa_prefill_cp_mode: str = "round-robin-split"
+    enable_prefill_context_parallel: bool = False
+    prefill_cp_mode: str = "in-seq-split"
+    # DP attention
+    enable_dp_attention: bool = False
+    enable_dp_attention_local_control_broadcast: bool = False
+    enable_dp_lm_head: bool = False
+    enable_attn_tp_input_scattered: bool = False
+    disable_attn_tp_gather: bool = False
+    enable_p2p_check: bool = False
+
+    # Multi-node distributed serving
+    dist_init_addr: Optional[str] = None
+    nnodes: int = 1
+    node_rank: int = 0
+
+    # Streaming
+    stream_interval: int = 1
+    batch_notify_size: int = 16
+    stream_response_default_include_usage: bool = False
+    incremental_streaming_output: bool = False
+    enable_streaming_session: bool = False
+    load_snapshot_publish_interval: int = 15
+
+    # Constrained decoding
+    constrained_json_whitespace_pattern: Optional[str] = None
+    constrained_json_disable_any_whitespace: bool = False
+
+    # Logging, metrics, and tracing
+    log_level: str = "info"
+    log_level_http: Optional[str] = None
+    log_requests: bool = False
+    log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
+    crash_dump_folder: Optional[str] = None
+    show_time_cost: bool = False
+    enable_metrics: bool = False
+    grpc_http_sidecar_port: Optional[int] = None
+    enable_mfu_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
+    tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
+    tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
+    extra_metric_labels: Optional[Dict[str, str]] = None
+    bucket_time_to_first_token: Optional[List[float]] = None
+    bucket_inter_token_latency: Optional[List[float]] = None
+    bucket_e2e_request_latency: Optional[List[float]] = None
+    prompt_tokens_buckets: Optional[List[str]] = None
+    generation_tokens_buckets: Optional[List[str]] = None
+    gc_warning_threshold_secs: float = 0.0
+    decode_log_interval: int = 40
+    enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
+    enable_trace: bool = False
+    trace_modules: str = "request"
+    otlp_traces_endpoint: str = "localhost:4317"
+    # RequestMetricsExporter configuration
+    export_metrics_to_file: bool = False
+    export_metrics_to_file_dir: Optional[str] = None
+    # Class-level DI for the five *MetricsCollector classes. Maps collector role
+    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
+    # to a subclass of the matching base collector. The five instantiation sites
+    # read from this map and fall back to the base class. Class-object only (no
+    # CLI surface) since this exists for embedded use cases that pass a Python
+    # class directly. Default None preserves existing behavior.
+    stat_loggers: Optional[Dict[str, type]] = None
+
+    # API related
+    api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
+    served_model_name: Optional[str] = None
+    weight_version: str = "default"
+    chat_template: Optional[str] = None
+    hf_chat_template_name: Optional[str] = None
+    completion_template: Optional[str] = None
+    file_storage_path: str = "sglang_storage"
+    enable_cache_report: bool = False
+    reasoning_parser: Optional[str] = None
+    strip_thinking_cache: bool = False
+    enable_strict_thinking: bool = False
+    tool_call_parser: Optional[str] = None
+    tool_server: Optional[str] = None
+    sampling_defaults: str = "model"
+    asr_max_buffer_seconds: int = 60
+    asr_max_concurrent_sessions: int = 32
+    preferred_sampling_params: Optional[str] = None
+    allow_auto_truncate: bool = False
 
     # Prefill delayer
     enable_prefill_delayer: A[
@@ -788,133 +939,6 @@ class ServerArgs:
             "5000; defaults to 5000 if unset."
         ),
     ] = None
-
-    # Runtime options
-    device: Optional[str] = None
-    tp_size: int = 1
-    pp_size: int = 1
-    pp_max_micro_batch_size: Optional[int] = None
-    pp_async_batch_depth: int = 0
-    stream_interval: int = 1
-    batch_notify_size: int = 16
-    stream_response_default_include_usage: bool = False
-    incremental_streaming_output: bool = False
-    enable_streaming_session: bool = False
-    random_seed: Optional[int] = None
-    constrained_json_whitespace_pattern: Optional[str] = None
-    constrained_json_disable_any_whitespace: bool = False
-    watchdog_timeout: float = 300
-    soft_watchdog_timeout: Optional[float] = None
-    dist_timeout: Optional[int] = None  # timeout for torch.distributed
-    download_dir: Optional[str] = None
-    model_checksum: Optional[str] = None
-    base_gpu_id: int = 0
-    gpu_id_step: int = 1
-    sleep_on_idle: bool = False
-    load_snapshot_publish_interval: int = 15
-    use_ray: bool = False
-    custom_sigquit_handler: Optional[Callable] = None
-
-    # Logging
-    log_level: str = "info"
-    log_level_http: Optional[str] = None
-    log_requests: bool = False
-    log_requests_level: int = 2
-    log_requests_format: str = "text"
-    log_requests_target: Optional[List[str]] = None
-    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
-        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
-    )
-    crash_dump_folder: Optional[str] = None
-    show_time_cost: bool = False
-    enable_metrics: bool = False
-    grpc_http_sidecar_port: Optional[int] = None
-    enable_mfu_metrics: bool = False
-    enable_metrics_for_all_schedulers: bool = False
-    tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
-    tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
-    extra_metric_labels: Optional[Dict[str, str]] = None
-    bucket_time_to_first_token: Optional[List[float]] = None
-    bucket_inter_token_latency: Optional[List[float]] = None
-    bucket_e2e_request_latency: Optional[List[float]] = None
-    prompt_tokens_buckets: Optional[List[str]] = None
-    generation_tokens_buckets: Optional[List[str]] = None
-    gc_warning_threshold_secs: float = 0.0
-    decode_log_interval: int = 40
-    enable_request_time_stats_logging: bool = False
-    kv_events_config: Optional[str] = None
-    enable_forward_pass_metrics: bool = False
-    forward_pass_metrics_worker_id: str = ""
-    forward_pass_metrics_ipc_name: Optional[str] = None
-    enable_trace: bool = False
-    trace_modules: str = "request"
-    otlp_traces_endpoint: str = "localhost:4317"
-
-    # RequestMetricsExporter configuration
-    export_metrics_to_file: bool = False
-    export_metrics_to_file_dir: Optional[str] = None
-
-    # Class-level DI for the five *MetricsCollector classes. Maps collector role
-    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
-    # to a subclass of the matching base collector. The five instantiation sites
-    # read from this map and fall back to the base class. Class-object only (no
-    # CLI surface) since this exists for embedded use cases that pass a Python
-    # class directly. Default None preserves existing behavior.
-    stat_loggers: Optional[Dict[str, type]] = None
-
-    # API related
-    api_key: Optional[str] = None
-    admin_api_key: Optional[str] = None
-    served_model_name: Optional[str] = None
-    weight_version: str = "default"
-    chat_template: Optional[str] = None
-    hf_chat_template_name: Optional[str] = None
-    completion_template: Optional[str] = None
-    file_storage_path: str = "sglang_storage"
-    enable_cache_report: bool = False
-    reasoning_parser: Optional[str] = None
-    strip_thinking_cache: bool = False
-    enable_strict_thinking: bool = False
-    tool_call_parser: Optional[str] = None
-    tool_server: Optional[str] = None
-    sampling_defaults: str = "model"
-    asr_max_buffer_seconds: int = 60
-    asr_max_concurrent_sessions: int = 32
-
-    # Data parallelism
-    dp_size: A[
-        int,
-        Arg(
-            help="The data parallelism size.",
-            cli_name="--data-parallel-size",
-            aliases=["--dp-size"],
-        ),
-    ] = 1
-    load_balance_method: A[
-        str,
-        Arg(
-            help="The load balancing strategy for data parallelism.",
-            choices=[
-                "auto",
-                "round_robin",
-                "follow_bootstrap_room",
-                "total_requests",
-                "total_tokens",
-            ],
-        ),
-    ] = "auto"
-
-    attn_cp_size: int = 1
-    moe_dp_size: int = 1
-
-    # Multi-node distributed serving
-    dist_init_addr: Optional[str] = None
-    nnodes: int = 1
-    node_rank: int = 0
-
-    # Model override args in JSON
-    json_model_override_args: str = "{}"
-    preferred_sampling_params: Optional[str] = None
 
     # LoRA
     enable_lora: Optional[bool] = None
@@ -977,6 +1001,7 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    enable_multi_layer_eagle: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -987,7 +1012,6 @@ class ServerArgs:
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
-    enable_multi_layer_eagle: bool = False
 
     # Adaptive speculative decoding
     speculative_adaptive: bool = False
@@ -1007,12 +1031,6 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
-    enable_flashinfer_allreduce_fusion: bool = False
-    enforce_disable_flashinfer_allreduce_fusion: bool = False
-    flashinfer_allreduce_fusion_backend: Optional[
-        Literal["auto", "trtllm", "mnnvl"]
-    ] = None
-    enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
@@ -1037,8 +1055,11 @@ class ServerArgs:
     mooncake_ib_device: Optional[str] = None
     enable_deepep_waterfill: bool = False
     elastic_ep_rejoin: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    disable_shared_experts_fusion: bool = False
+    enforce_shared_experts_fusion: bool = False
 
-    # Mamba cache
+    # Mamba cache and linear attn
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
@@ -1092,28 +1113,10 @@ class ServerArgs:
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
-    # Scoring configuration
-    # Enable Multi-Item Scoring optimization. Combines query and multiple items
-    # into a single sequence for efficient batch processing. Item boundaries are
-    # determined by pre-computed delimiter indices (from item lengths), not by the
-    # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
-    enable_mis: bool = False
-
-    # Optimization/debug options
-    prefill_only_disable_kv_cache: A[
-        bool,
-        "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
-    ] = False
-    disable_radix_cache: bool = False
-    disable_cuda_graph_padding: bool = False
-    enable_profile_cuda_graph: bool = False
-    enable_cudagraph_gc: bool = False
-    debug_cuda_graph: bool = False
-
+    # Cuda graphs
     # Accepts dict (CLI JSON / SDK) at construction time; normalized to
     # CudaGraphConfig by _parse_cuda_graph_config.
     cuda_graph_config: Optional[CudaGraphConfig] = None
-
     # Per-phase convenience CLI inputs that fold into cuda_graph_config.
     cuda_graph_backend_decode: Optional[
         Literal["full", "breakable", "tc_piecewise", "disabled"]
@@ -1130,85 +1133,82 @@ class ServerArgs:
     # --cuda-graph-backend-{prefill,decode}=disabled.
     disable_prefill_cuda_graph: bool = False
     disable_decode_cuda_graph: bool = False
-
     # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
+    disable_cuda_graph_padding: bool = False
+    enable_profile_cuda_graph: bool = False
+    enable_cudagraph_gc: bool = False
+    debug_cuda_graph: bool = False
+
+    # Communication and kernels
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
-    enable_tokenizer_batch_encode: bool = False
-    disable_tokenizer_batch_decode: bool = False
-    disable_outlines_disk_cache: bool = False
+    triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
+    triton_attention_split_tile_size: Optional[int] = None
+    flashinfer_mla_disable_ragged: bool = False
+    enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
+    enable_fused_moe_sum_all_reduce: bool = False
+    enable_deepseek_v4_fp4_indexer: bool = False
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
-    disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
-    enable_dp_attention: bool = False
-    enable_dp_attention_local_control_broadcast: bool = False
-    enable_dp_lm_head: bool = False
+    enable_quant_communications: Optional[bool] = False
+    enable_flashinfer_allreduce_fusion: bool = False
+    enforce_disable_flashinfer_allreduce_fusion: bool = False
+    flashinfer_allreduce_fusion_backend: Optional[
+        Literal["auto", "trtllm", "mnnvl"]
+    ] = None
+    enable_aiter_allreduce_fusion: bool = False
+
+    # Two batch overlap
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
+
+    # Torch compile and torchao
     enable_torch_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
-    enable_p2p_check: bool = False
-    triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: int = 8
-    triton_attention_split_tile_size: Optional[int] = None
-    num_continuous_decode_steps: int = 1
-    delete_ckpt_after_loading: bool = False
+
+    # Other mics server features
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
-    allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
-    flashinfer_mla_disable_ragged: bool = False
-    disable_shared_experts_fusion: bool = False
-    enforce_shared_experts_fusion: bool = False
-    disable_chunked_prefix_cache: bool = False
-    disable_fast_image_processor: bool = False
-    keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
-    enable_deepseek_v4_fp4_indexer: bool = False
-    scheduler_recv_interval: int = 1
-    numa_node: Optional[List[int]] = None
+    disable_outlines_disk_cache: bool = False
+    # Scoring configuration
+    # Enable Multi-Item Scoring optimization. Combines query and multiple items
+    # into a single sequence for efficient batch processing. Item boundaries are
+    # determined by pre-computed delimiter indices (from item lengths), not by the
+    # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
+    enable_mis: bool = False
+
+    # Deterministic inference
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
-    enable_attn_tp_input_scattered: bool = False
-    disable_attn_tp_gather: bool = False
-    gc_threshold: Optional[List[int]] = None
+
+    # KV canary
     kv_canary: str = "none"
     kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
-    enable_fused_qk_norm_rope: bool = False
-    enable_precise_embedding_interpolation: bool = False
-    enable_fused_moe_sum_all_reduce: bool = False
-
-    # Context parallelism (unified API)
-    enable_prefill_cp: bool = False
-    # "zigzag" is former in-seq-split; "interleave" is former round-robin-split.
-    cp_strategy: Optional[str] = None
-
-    # Context parallelism (deprecated aliases)
-    enable_dsa_prefill_context_parallel: bool = False
-    dsa_prefill_cp_mode: str = "round-robin-split"
-    enable_prefill_context_parallel: bool = False
-    prefill_cp_mode: str = "in-seq-split"
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
     dynamic_batch_tokenizer_batch_timeout: float = 0.002
+    enable_tokenizer_batch_encode: bool = False
+    disable_tokenizer_batch_decode: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1243,7 +1243,12 @@ class ServerArgs:
     encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
-    # For model weight update and weight loading
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    pdmux_config_path: Optional[str] = None
+    sm_group_num: int = 8
+
+    # Model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
@@ -1258,31 +1263,25 @@ class ServerArgs:
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
     engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
+    download_dir: Optional[str] = None
+    model_checksum: Optional[str] = None
+    delete_ckpt_after_loading: bool = False
+    # Checkpoint decryption
+    decrypted_config_file: Optional[str] = None
+    decrypted_draft_config_file: Optional[str] = None
 
-    # For PD-Multiplexing
-    enable_pdmux: bool = False
-    pdmux_config_path: Optional[str] = None
-    sm_group_num: int = 8
-
-    # For Multi-Modal
+    # Multi-modal optimization configs
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
+    disable_fast_image_processor: bool = False
+    keep_mm_feature_on_device: bool = False
 
-    # For checkpoint decryption
-    decrypted_config_file: Optional[str] = None
-    decrypted_draft_config_file: Optional[str] = None
-
-    # For forward hooks
+    # Custom hooks, probe, and plugins
     forward_hooks: Optional[List[dict[str, Any]]] = None
-
-    # For communications compression
-    enable_quant_communications: Optional[bool] = False
-
-    # For msProbe
     msprobe_dump_config: Optional[str] = None
 
     def __post_init__(self):
@@ -8285,8 +8284,8 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for Tokenizer and worker tokenizer
-    tokenizer_worker_ipc_name: Optional[str]
+    # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
+    tokenizer_router_input_ipc_name: Optional[str]
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -8308,9 +8307,9 @@ class PortArgs:
             nccl_port = server_args.nccl_port
 
         if server_args.tokenizer_worker_num == 1:
-            tokenizer_worker_ipc_name = None
+            tokenizer_router_input_ipc_name = None
         else:
-            tokenizer_worker_ipc_name = (
+            tokenizer_router_input_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
@@ -8325,7 +8324,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                tokenizer_router_input_ipc_name=tokenizer_router_input_ipc_name,
                 instance_id=instance_id,
             )
         else:
@@ -8395,7 +8394,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
-                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                tokenizer_router_input_ipc_name=tokenizer_router_input_ipc_name,
                 load_collector_ipc_name=NetworkAddress(
                     dist_init_host, load_collector_port
                 ).to_tcp(),
