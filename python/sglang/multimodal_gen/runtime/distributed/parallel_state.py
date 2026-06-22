@@ -139,6 +139,20 @@ def init_world_group(
     )
 
 
+def _sync_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is None:
+        srt_parallel_state._WORLD = _WORLD
+
+
+def _clear_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is _WORLD:
+        srt_parallel_state._WORLD = None
+
+
 def init_parallel_group_coordinator(
     group_ranks: List[List[int]],
     local_rank: int,
@@ -175,8 +189,14 @@ def init_parallel_group_coordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
+            use_device_communicator=parallel_mode != "tensor",
+            use_srt_custom_allreduce=parallel_mode == "tensor",
             group_name=(
-                "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
+                "tp_group"
+                if parallel_mode == "tensor"
+                else (
+                    "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
+                )
             ),
         )
 
@@ -264,6 +284,7 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+    _sync_srt_world_group()
 
 
 def get_sp_group() -> SequenceParallelGroupCoordinator:
@@ -591,6 +612,7 @@ def get_tp_rank() -> int:
 
 def destroy_distributed_environment() -> None:
     global _WORLD
+    _clear_srt_world_group()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None

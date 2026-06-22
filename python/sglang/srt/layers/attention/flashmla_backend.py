@@ -17,13 +17,13 @@ from sglang.srt.layers.attention.utils import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.utils.dcp_utils import (
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +66,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.forward_metadata: Union[FlashMLADecodeMetadata] = None
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank

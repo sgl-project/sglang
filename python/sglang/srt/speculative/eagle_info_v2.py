@@ -37,21 +37,7 @@ class EagleDraftInputV2Mixin:
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
-            output_ids = torch.tensor(
-                [
-                    (
-                        req.output_ids[-1]
-                        if len(req.output_ids)
-                        else req.origin_input_ids[-1]
-                    )
-                    for req in batch.reqs
-                ],
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                output_ids
-            )
+            batch.cumulate_penalty_output_tokens()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         double_alloc = get_alloc_reserve_per_decode()

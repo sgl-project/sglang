@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -21,7 +23,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils.dcp_utils import (
     DecodeContextParallelMetadata,
     dcp_enabled,
@@ -88,7 +89,7 @@ class FlashInferMhaChunkKVRunner:
     ):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -661,7 +662,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         # Parse Constants
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
-            // get_attention_tp_size()
+            // get_parallel().attn_tp_size
             * get_attention_dcp_world_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -781,7 +782,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim

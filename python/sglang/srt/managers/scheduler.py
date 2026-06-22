@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -351,6 +352,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+        self.gracefully_exit = False
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -688,6 +692,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    model_name=server_args.model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -984,6 +989,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -1387,6 +1393,7 @@ class Scheduler(
                     lambda req: self.profiler_manager._profile(req),
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
+                (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -1443,6 +1450,12 @@ class Scheduler(
 
         return result_dict
 
+    def release_host_resources(self) -> None:
+        # Release pinned host buffers in userspace on graceful shutdown; see
+        # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.destroy()
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
@@ -1471,6 +1484,9 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1507,6 +1523,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1785,7 +1804,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
-            load_inquirer_get_loads=lambda req: self.load_inquirer.get_loads(req),
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2200,7 +2218,10 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
+                match_end = req._compute_max_prefix_len(
+                    len(req.full_untruncated_fill_ids)
+                )
+                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2424,6 +2445,52 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def process_pending_chunked_abort(self) -> None:
+        """Abort an in-flight chunked-prefill request once it is safe to do so.
+
+        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
+        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
+        the top of the scheduling step stops the next chunk from launching; the
+        chunk already launched is drained when its result is resolved. Under overlap
+        the result lands a step later, so the batch-result processors keep
+        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
+        ``process_batch_result_prefill`` via its chunked branch (the finished req
+        is excluded from streaming and its logprob offset is still accounted).
+        Mirrors ``handle_bootstrap_failure``.
+        """
+        req = self._pending_chunked_abort_req
+        if req is None:
+            return
+        if self.chunked_req is not req:
+            # Already past chunked prefill; the running-batch abort path handles
+            # it. Drop the marker once the request is actually gone.
+            if req.finished() or req.req_pool_idx is None:
+                self._pending_chunked_abort_req = None
+            return
+
+        prepare_abort(req, "Aborted")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        req.to_finish = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.disagg_kv_sender.abort()
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            req.pending_bootstrap = False
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if (
+            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+        ) and not req.kv_committed_freed:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        self.chunked_req = None
+        self._chunked_req_scheduled_last_iter = False
+        self._pending_chunked_abort_req = None
+        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2438,9 +2505,11 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
+        req_pool_indices = [r.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+            req_pool_indices, dtype=torch.int64, device=device
         )
+        batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
@@ -2465,6 +2534,8 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -3682,6 +3753,10 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if (chunked_req := self.chunked_req) is not None:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
@@ -3944,6 +4019,11 @@ class Scheduler(
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def handle_shutdown(self, recv_req: ShutdownReq):
+        # Break the event loop; the finally in run_scheduler_process releases resources.
+        self.gracefully_exit = True
+        return None
+
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
@@ -4124,7 +4204,7 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        # Run the event loop (blocks until shutdown)
+        # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
     except Exception:
@@ -4143,3 +4223,7 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Graceful path only: on the exception path the GPU may be wedged
+            # and the synchronize() in destroy() could itself hang.
+            if scheduler.gracefully_exit:
+                scheduler.release_host_resources()
