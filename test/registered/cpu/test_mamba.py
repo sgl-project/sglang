@@ -252,7 +252,7 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
 
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
-        B, T_PER_SEQ, HK, HV, K, V, N = 1, 128, 16, 32, 64, 64, 4
+        B, T_PER_SEQ, HK, HV, K, V, N = 1, 128, 16, 32, 128, 128, 4
         seq_lens = torch.tensor(
             [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
             dtype=torch.int32,
@@ -271,6 +271,7 @@ class TestMambaAttention(CustomTestCase):
         beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
         initial_state_ = torch.randn((N, HV, V, K), dtype=torch.float32) * 0.1
 
+        # skip `use_qk_l2norm_in_kernel=False` case since it's not numerically stable in bfloat16
         for use_qk_l2norm_in_kernel in [True]:
             core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
                 query=query_,
