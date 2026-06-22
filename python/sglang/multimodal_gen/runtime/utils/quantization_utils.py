@@ -312,9 +312,8 @@ def _canonicalize_modulation_exclude(module_name: str) -> str:
     canonicalizes ``.img_mod.1``/``.txt_mod.1`` to ``.img_mod``/``.txt_mod``).
     No-op for any other module name.
     """
-    for container in (".img_mod", ".txt_mod"):
-        if module_name.endswith(f"{container}.1"):
-            return module_name[: -len(".1")]
+    if module_name.endswith((".img_mod.1", ".txt_mod.1")):
+        return module_name.removesuffix(".1")
     return module_name
 
 
