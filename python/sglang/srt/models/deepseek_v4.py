@@ -365,6 +365,9 @@ class MQALayer(nn.Module):
         from sglang.srt.utils import is_blackwell_supported
 
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._prefill_multi_stream_max_tokens = (
+            envs.SGLANG_OPT_DSV4_PREFILL_MULTI_STREAM_MAX_TOKENS.get()
+        )
 
         self.compressor = None
         self.indexer = None
@@ -913,6 +916,23 @@ class MQALayer(nn.Module):
 
         return q, kv
 
+    def _get_multi_stream_token_limit(self, forward_batch: ForwardBatch) -> int:
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if self._prefill_multi_stream_max_tokens is not None:
+                return self._prefill_multi_stream_max_tokens
+
+            cuda_graph_config = get_global_server_args().cuda_graph_config
+            if cuda_graph_config is not None and cuda_graph_config.prefill.max_bs:
+                return cuda_graph_config.prefill.max_bs
+            return 4096
+
+        return self._multi_stream_bs_limit
+
+    def within_multi_stream_token_limit(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        return num_tokens <= self._get_multi_stream_token_limit(forward_batch)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -934,7 +954,7 @@ class MQALayer(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
-            and x.shape[0] <= self._multi_stream_bs_limit
+            and self.within_multi_stream_token_limit(forward_batch, x.shape[0])
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         )
@@ -1601,11 +1621,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+
+        enable_moe_alt_stream = True
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            enable_moe_alt_stream = self.self_attn.within_multi_stream_token_limit(
+                forward_batch, hidden_states.shape[0]
+            )
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+            enable_alt_stream=enable_moe_alt_stream,
             # Skip the MoE-internal post-experts all_reduce when we will do the
             # reduce via reduce_scatterv at the combine below (else double-reduce).
             use_reduce_scatter=_use_cp or _use_gatherv_pair,
