@@ -132,6 +132,9 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetPrepareReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -734,6 +737,26 @@ async def finish_pd_flip_migration_source(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_pd_flip_migration(obj: PDFlipMigrationAbortReq, request: Request):
     return await _global_state.tokenizer_manager.abort_pd_flip_migration(obj)
+
+
+@app.get("/pd_flip/runtime_role/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_pd_runtime_role_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_runtime_role_status(
+        PDRuntimeRoleStatusReq()
+    )
+
+
+@app.post("/pd_flip/runtime_role/set")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_pd_runtime_role(obj: PDRuntimeRoleSetReq, request: Request):
+    return await _global_state.tokenizer_manager.set_pd_runtime_role(obj)
+
+
+@app.post("/pd_flip/runtime_role/admission")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_pd_runtime_admission(obj: PDRuntimeRoleAdmissionReq, request: Request):
+    return await _global_state.tokenizer_manager.set_pd_runtime_admission(obj)
 
 
 # Do not import `dumper.py` to avoid dependency

@@ -73,6 +73,40 @@ class TestPDRuntimeRoleSwitch(unittest.TestCase):
         self.assertIn("def _disaggregation_mode", source)
         self.assertNotIn("disaggregation_mode: DisaggregationMode", source)
 
+    def test_worker_runtime_role_control_surface_is_declared(self):
+        io_struct = (REPO_ROOT / "python/sglang/srt/managers/io_struct.py").read_text()
+        tokenizer_control = (
+            REPO_ROOT / "python/sglang/srt/managers/tokenizer_control_mixin.py"
+        ).read_text()
+        scheduler = (REPO_ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
+        http_server = (
+            REPO_ROOT / "python/sglang/srt/entrypoints/http_server.py"
+        ).read_text()
+
+        self.assertIn("class PDRuntimeRoleSetReq", io_struct)
+        self.assertIn("class PDRuntimeRoleStatusReq", io_struct)
+        self.assertIn("class PDRuntimeRoleAdmissionReq", io_struct)
+        self.assertIn("class PDRuntimeRoleReqOutput", io_struct)
+
+        self.assertIn("(\"pd_runtime_role\", PDRuntimeRoleReqOutput)", tokenizer_control)
+        self.assertIn("async def set_pd_runtime_role", tokenizer_control)
+        self.assertIn("async def get_pd_runtime_role_status", tokenizer_control)
+        self.assertIn("async def set_pd_runtime_admission", tokenizer_control)
+
+        self.assertIn("(PDRuntimeRoleSetReq, self.set_pd_runtime_role)", scheduler)
+        self.assertIn(
+            "(PDRuntimeRoleStatusReq, self.get_pd_runtime_role_status)", scheduler
+        )
+        self.assertIn(
+            "(PDRuntimeRoleAdmissionReq, self.set_pd_runtime_admission)", scheduler
+        )
+        self.assertIn("def set_pd_runtime_role", scheduler)
+        self.assertIn("def get_pd_runtime_role_status", scheduler)
+
+        self.assertIn("/pd_flip/runtime_role/status", http_server)
+        self.assertIn("/pd_flip/runtime_role/set", http_server)
+        self.assertIn("/pd_flip/runtime_role/admission", http_server)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,10 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetPrepareReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleReqOutput,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1232,6 +1236,103 @@ class Scheduler(
     def pd_runtime_role_switch_enabled(self) -> bool:
         return bool(getattr(self.server_args, "enable_pd_runtime_role_switch", False))
 
+    def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:
+        is_idle = False
+        try:
+            is_idle = bool(self.is_fully_idle())
+        except Exception:
+            logger.exception("Failed to compute PD runtime role idle status.")
+
+        return {
+            "dp_rank": self.ps.dp_rank,
+            "tp_rank": self.ps.tp_rank,
+            "role": self.pd_runtime_role(),
+            "runtime_role_switch_enabled": self.pd_runtime_role_switch_enabled(),
+            "admission_paused": bool(
+                getattr(self, "pd_runtime_admission_paused", False)
+            ),
+            "pd_flip_admission_paused": self.pd_flip_should_reject_new_work(),
+            "is_idle": is_idle,
+            "dual_queues_initialized": bool(
+                hasattr(self, "disagg_decode_prealloc_queue")
+                and hasattr(self, "disagg_decode_transfer_queue")
+                and hasattr(self, "disagg_prefill_bootstrap_queue")
+            ),
+            "event_loop_dynamic": False,
+        }
+
+    def get_pd_runtime_role_status(
+        self, recv_req: PDRuntimeRoleStatusReq
+    ) -> PDRuntimeRoleReqOutput:
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message="ok",
+            role=status["role"],
+            status=status,
+        )
+
+    def set_pd_runtime_admission(
+        self, recv_req: PDRuntimeRoleAdmissionReq
+    ) -> PDRuntimeRoleReqOutput:
+        self.pd_runtime_admission_paused = bool(recv_req.paused)
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message=(
+                "PD runtime admission paused"
+                if recv_req.paused
+                else "PD runtime admission resumed"
+            ),
+            role=status["role"],
+            status=status,
+        )
+
+    def set_pd_runtime_role(
+        self, recv_req: PDRuntimeRoleSetReq
+    ) -> PDRuntimeRoleReqOutput:
+        target_mode = DisaggregationMode(recv_req.role)
+        if target_mode not in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message=f"Invalid PD runtime role: {recv_req.role}",
+                role=status["role"],
+                status=status,
+            )
+
+        if not self.pd_runtime_role_switch_enabled():
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="PD runtime role switch is disabled.",
+                role=status["role"],
+                status=status,
+            )
+
+        status = self._pd_runtime_role_status_dict()
+        if not recv_req.force and not status["is_idle"]:
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="PD runtime role switch requires an idle scheduler.",
+                role=status["role"],
+                status=status,
+            )
+
+        self.disaggregation_mode = target_mode
+        self.server_args.disaggregation_mode = target_mode.value
+        get_global_server_args().disaggregation_mode = target_mode.value
+        if hasattr(self, "output_streamer"):
+            self.output_streamer.disaggregation_mode = target_mode
+
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message=f"PD runtime role switched to {target_mode.value}.",
+            role=status["role"],
+            status=status,
+        )
+
     def init_pd_flip_state_machine(self):
         if not self.server_args.enable_pd_flip_state_machine:
             self.pd_flip_state_machine: Optional[FlipStateMachine] = None
@@ -1277,6 +1378,8 @@ class Scheduler(
             evaluator.slo_threshold = server_args.pd_flip_slo_threshold
 
     def pd_flip_should_reject_new_work(self) -> bool:
+        if getattr(self, "pd_runtime_admission_paused", False):
+            return True
         machine = getattr(self, "pd_flip_state_machine", None)
         return machine is not None and machine.state in (
             FlipState.PREPARING,
@@ -2577,6 +2680,9 @@ class Scheduler(
                     self.finish_pd_flip_migration_source,
                 ),
                 (PDFlipMigrationAbortReq, self.abort_pd_flip_migration),
+                (PDRuntimeRoleSetReq, self.set_pd_runtime_role),
+                (PDRuntimeRoleStatusReq, self.get_pd_runtime_role_status),
+                (PDRuntimeRoleAdmissionReq, self.set_pd_runtime_admission),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),

@@ -60,6 +60,10 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetPrepareReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleReqOutput,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -124,6 +128,7 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("pd_flip_migration", PDFlipMigrationReqOutput),
+    ("pd_runtime_role", PDRuntimeRoleReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
@@ -869,6 +874,27 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         return await self.pd_flip_migration_communicator(obj)
+
+    async def set_pd_runtime_role(
+        self: TokenizerManager, obj: PDRuntimeRoleSetReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_runtime_role_communicator(obj)
+        if all(res.success for res in responses):
+            self.server_args.disaggregation_mode = obj.role
+        return responses
+
+    async def get_pd_runtime_role_status(
+        self: TokenizerManager, obj: PDRuntimeRoleStatusReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_runtime_role_communicator(obj)
+
+    async def set_pd_runtime_admission(
+        self: TokenizerManager, obj: PDRuntimeRoleAdmissionReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_runtime_role_communicator(obj)
 
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput

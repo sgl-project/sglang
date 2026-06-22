@@ -1775,6 +1775,30 @@ class PDFlipMigrationReqOutput(BaseReq):
 
 
 @dataclass
+class PDRuntimeRoleSetReq(BaseReq):
+    role: Literal["prefill", "decode"]
+    force: bool = False
+
+
+@dataclass
+class PDRuntimeRoleStatusReq(BaseReq):
+    pass
+
+
+@dataclass
+class PDRuntimeRoleAdmissionReq(BaseReq):
+    paused: bool
+
+
+@dataclass
+class PDRuntimeRoleReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    role: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
