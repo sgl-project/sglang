@@ -1465,9 +1465,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   int64_t Dv = v.size(3);
   int64_t NT = chunk_indices.size(0);
 
-  // TODO: now only optimized for qwen3.5 D == Dv
-  CHECK_EQ(D, Dv);
-
   at::Tensor w = at::empty({B, T, Hv, D}, k.options());                                 // BFloat16
   at::Tensor u = at::empty({B, T, Hv, Dv}, k.options());                                // BFloat16
   at::Tensor decay_mask = at::empty({B, NT, Hv, CHUNK_SIZE, CHUNK_SIZE}, g.options());  // Float
@@ -1582,6 +1579,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   TORCH_CHECK(Hv % H == 0, __func__, ": expect num_heads_kv multiple of num_heads.");
   TORCH_CHECK(D % 32 == 0, __func__, ": expect head_dim to be multiples of 32.");
   TORCH_CHECK(Dv % 32 == 0, __func__, ": expect head_dim_v to be multiples of 32.");
+  TORCH_CHECK(D == Dv, __func__, ": expect head_dim to be equal to head_dim_v.");
   CHECK_INPUT_SHAPE_DTYPE<true>(query, {B, T, H, D}, at::kBFloat16);
   CHECK_INPUT_SHAPE_DTYPE<true>(key, {B, T, H, D}, at::kBFloat16);
   CHECK_INPUT_SHAPE_DTYPE<true>(value, {B, T, Hv, Dv}, at::kBFloat16);
