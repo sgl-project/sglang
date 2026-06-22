@@ -436,7 +436,11 @@ class SessionController:
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
         )
 
-    def maybe_reap(self, now: float, interval: float = 1.0):
+    def maybe_reap(
+        self,
+        now: float,
+        interval: float = 1.0,
+    ):
         # reap sessions every second
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
@@ -461,6 +465,7 @@ class SessionController:
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
+
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:

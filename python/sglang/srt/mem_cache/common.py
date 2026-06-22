@@ -295,7 +295,11 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    active_pool_idxs: Optional[set] = None,
+):
     if tree_cache is None:
         return
 
@@ -319,6 +323,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+
+    # If the tree is exhausted and still short, soft-evict idle session slots in
+    # LRU order. active_pool_idxs guards in-flight session KV from being freed.
+    if tree_cache.supports_streaming_session():
+        remaining = num_tokens - allocator.available_size()
+        if remaining > 0:
+            tree_cache.evict_sessions(remaining, active_pool_idxs or set())
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):

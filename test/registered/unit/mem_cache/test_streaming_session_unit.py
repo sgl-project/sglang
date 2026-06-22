@@ -244,6 +244,143 @@ def test_trim_overshoot_postcondition():
     assert allocator.freed[0].tolist() == list(range(38, 44))
 
 
+def _make_session_tree(page_size=1, num_pool_slots=4, tokens_per_slot=64):
+    """Return (tree_cache, req_to_token_pool, allocator) ready for slot tests."""
+    req_to_token = torch.zeros(
+        num_pool_slots, tokens_per_slot, dtype=torch.int32
+    )
+    # Fill each row with its own token indices so freed ranges are distinct.
+    for i in range(num_pool_slots):
+        req_to_token[i] = torch.arange(tokens_per_slot, dtype=torch.int32) + i * 1000
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    tree_cache = StreamingSession(inner)
+    return tree_cache, req_to_token_pool, allocator
+
+
+def test_soft_evict_slot_frees_kv_and_releases_lock():
+    """soft_evict_slot frees [protected, allocated) tokens, calls dec_lock_ref,
+    returns req_pool_idx to the pool, resets slot KV fields, and keeps the slot
+    alive in self.slots."""
+    tree_cache, req_to_token_pool, allocator = _make_session_tree(page_size=1)
+
+    sentinel_node = object()
+    tree_cache.slots["s1"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=30,
+        kv_allocated_len=50,
+        cache_protected_len=10,
+        last_node=sentinel_node,
+    )
+
+    freed = tree_cache.soft_evict_slot("s1")
+
+    # Freed = allocated - protected = 50 - 10 = 40
+    assert freed == 40
+
+    # Token indices in [10, 50) from row 0 were freed.
+    assert len(allocator.freed) == 1
+    freed_indices = allocator.freed[0].tolist()
+    expected = (torch.arange(10, 50, dtype=torch.int32) + 0).tolist()
+    assert freed_indices == expected
+
+    # Pool slot returned.
+    assert req_to_token_pool.free_slots == [0]
+
+    # dec_lock_ref called on last_node.
+    assert tree_cache.inner.dec_lock_ref_calls == [sentinel_node]
+
+    # Slot is still alive but KV fields are reset.
+    slot = tree_cache.slots["s1"]
+    assert slot.req_pool_idx is None
+    assert slot.kv_allocated_len == 0
+    assert slot.kv_committed_len == 0
+    assert slot.last_node is None
+    assert slot.cache_protected_len == 0
+
+
+def test_soft_evict_slot_no_op_when_no_kv():
+    """soft_evict_slot returns 0 and does nothing when the slot holds no KV."""
+    tree_cache, req_to_token_pool, allocator = _make_session_tree()
+    tree_cache.slots["s1"] = SessionSlot(req_pool_idx=None)
+
+    freed = tree_cache.soft_evict_slot("s1")
+
+    assert freed == 0
+    assert len(allocator.freed) == 0
+    assert req_to_token_pool.free_slots == []
+    # Slot still alive and unchanged.
+    assert "s1" in tree_cache.slots
+
+
+def test_soft_evict_slot_missing_session_is_no_op():
+    """soft_evict_slot returns 0 for a session that has no slot."""
+    tree_cache, _, _ = _make_session_tree()
+    assert tree_cache.soft_evict_slot("nonexistent") == 0
+
+
+def test_evict_lru_sessions_oldest_first():
+    """evict_lru_sessions evicts in ascending last_active_time order and stops
+    once enough tokens have been freed."""
+    tree_cache, req_to_token_pool, allocator = _make_session_tree(
+        num_pool_slots=3, tokens_per_slot=64
+    )
+
+    # Three slots with distinct timestamps and token counts.
+    # s_old: 30 tokens (protected=0, allocated=30), oldest
+    # s_mid: 30 tokens, middle
+    # s_new: 30 tokens, newest
+    for i, (sid, ts) in enumerate([("s_old", 1.0), ("s_mid", 2.0), ("s_new", 3.0)]):
+        tree_cache.slots[sid] = SessionSlot(
+            req_pool_idx=i,
+            kv_committed_len=30,
+            kv_allocated_len=30,
+            cache_protected_len=0,
+            last_active_time=ts,
+        )
+
+    # Ask for 35 tokens: s_old frees 30, still short; s_mid frees 30 more -> done.
+    freed = tree_cache.evict_lru_sessions(35, active_pool_idxs=set())
+
+    assert freed == 60  # both s_old and s_mid were evicted
+    assert tree_cache.slots["s_old"].req_pool_idx is None
+    assert tree_cache.slots["s_mid"].req_pool_idx is None
+    # s_new untouched.
+    assert tree_cache.slots["s_new"].req_pool_idx == 2
+    assert len(allocator.freed) == 2
+
+
+def test_evict_lru_sessions_skips_active_pool_idxs():
+    """evict_lru_sessions must not touch slots whose req_pool_idx is in
+    active_pool_idxs (request currently in-flight on that slot)."""
+    tree_cache, _, allocator = _make_session_tree(num_pool_slots=2, tokens_per_slot=64)
+
+    tree_cache.slots["s_active"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=40,
+        kv_allocated_len=40,
+        cache_protected_len=0,
+        last_active_time=1.0,  # oldest — would be first if not guarded
+    )
+    tree_cache.slots["s_idle"] = SessionSlot(
+        req_pool_idx=1,
+        kv_committed_len=40,
+        kv_allocated_len=40,
+        cache_protected_len=0,
+        last_active_time=2.0,
+    )
+
+    freed = tree_cache.evict_lru_sessions(10, active_pool_idxs={0})
+
+    # s_active must not be touched even though it is oldest.
+    assert tree_cache.slots["s_active"].req_pool_idx == 0
+    # s_idle should be evicted.
+    assert tree_cache.slots["s_idle"].req_pool_idx is None
+    assert freed == 40
+    assert len(allocator.freed) == 1
+
+
 if __name__ == "__main__":
     import sys
 

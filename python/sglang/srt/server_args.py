@@ -800,6 +800,7 @@ class ServerArgs:
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
+
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -5169,6 +5170,7 @@ class ServerArgs:
             default=ServerArgs.enable_streaming_session,
             help="Enable streaming session mode and StreamingSession wrapper.",
         )
+
         parser.add_argument(
             "--random-seed",
             type=int,
