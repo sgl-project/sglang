@@ -6,6 +6,8 @@ register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -20,6 +22,7 @@ from sglang.test.test_utils import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLLaDA2Mini(CustomTestCase):
     @classmethod
     def setUpClass(cls):

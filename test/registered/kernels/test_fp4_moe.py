@@ -3,20 +3,29 @@ from typing import Callable
 
 import pytest
 import torch
-from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
-from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import silu_and_mul
+
+if torch.cuda.is_available():
+    from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from sgl_kernel import silu_and_mul
+
 from torch.nn import functional as F
 
-from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
-from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+if torch.cuda.is_available():
+    from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
+    from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+    from sglang.srt.layers.moe.cutlass_moe_params import (
+        CutlassMoEParams,
+        CutlassMoEType,
+    )
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 
-if torch.cuda.get_device_capability() < (10, 0):
+if torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
         reason="Nvfp4 Requires compute capability of 10 or above.",
         allow_module_level=True,
@@ -365,6 +374,7 @@ def check_moe(
     torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])
@@ -412,6 +422,7 @@ def test_cutlass_fp4_moe_no_graph(
     check_moe(m, n, k, e, topk, dtype, cutlass_moe_impl, flip_w13=False)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])
@@ -454,5 +465,4 @@ def test_flashinfer_fp4_moe_no_graph(
 
 
 if __name__ == "__main__":
-    test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
-    test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
+    pytest.main([__file__, "-v"])

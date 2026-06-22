@@ -28,6 +28,7 @@ _HEAD_DIM = 128
 _SCALE = _HEAD_DIM**-0.5
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestCPPrefixLenFA3Parity(CustomTestCase):
     """Per-rank FA3 output under CP must match a full-sequence reference."""
 
