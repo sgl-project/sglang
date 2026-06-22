@@ -171,6 +171,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -244,6 +245,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.87)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
