@@ -43,6 +43,14 @@ class Krea2ArchConfig(DiTArchConfig):
     # identity mapping.
     param_names_mapping: dict = field(default_factory=dict)
 
+    # Diffusers LoRA checkpoints prefix every DiT key with the pipeline component name
+    # (e.g. transformer.transformer_blocks.0.attn.to_q.lora_A). Strip that prefix so the
+    # LoRA keys line up with this model's module names. Only the LoRA path uses this; the
+    # main checkpoint still loads with the identity param_names_mapping above.
+    lora_param_names_mapping: dict = field(
+        default_factory=lambda: {r"^transformer\.": ""}
+    )
+
     def __post_init__(self) -> None:
         super().__post_init__()
         self.hidden_size = self.features
