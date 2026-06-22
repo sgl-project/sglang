@@ -8,6 +8,7 @@ export const MiniMaxM27Deployment = () => {
       items: [
         { id: 'h200',   label: 'H200',   default: true  },
         { id: 'b200',   label: 'B200',   default: false },
+        { id: 'b300',   label: 'B300',   default: false },
         { id: 'gb300',  label: 'GB300',  default: false },
         { id: 'a100',   label: 'A100',   default: false },
         { id: 'h100',   label: 'H100',   default: false },
@@ -23,6 +24,7 @@ export const MiniMaxM27Deployment = () => {
       getDynamicItems: (values) => {
         const hw = values.hardware;
         const isAMD = hw === 'mi300x' || hw === 'mi325x' || hw === 'mi355x';
+        const isB300 = hw === 'b300';
         const isGB300 = hw === 'gb300';
         const isXeon = hw === 'xeon';
         if (isXeon) {
@@ -33,8 +35,8 @@ export const MiniMaxM27Deployment = () => {
         const canUse2GPU = isAMD || isGB300;
         return [
           { id: '2gpu', label: '2', default: canUse2GPU,  disabled: !canUse2GPU },
-          { id: '4gpu', label: '4', default: !canUse2GPU, disabled: false },
-          { id: '8gpu', label: '8', default: false,       disabled: isGB300 }
+          { id: '4gpu', label: '4', default: !canUse2GPU || isB300, disabled: false },
+          { id: '8gpu', label: '8', default: false,       disabled: isGB300 || isB300 }
         ];
       }
     },
@@ -43,11 +45,11 @@ export const MiniMaxM27Deployment = () => {
       title: 'Precision',
       getDynamicItems: (values) => {
         const hw = values.hardware;
-        const isBlackwell = hw === 'b200' || hw === 'gb300';
+        const isBlackwell = hw === 'b200' || hw === 'b300' || hw === 'gb300';
         return [
           { id: 'fp8', label: 'FP8', default: true,  disabled: false },
           { id: 'fp4', label: 'FP4', default: false, disabled: !isBlackwell,
-            disabledReason: 'NVFP4 requires Blackwell (B200/GB300)' }
+            disabledReason: 'NVFP4 requires Blackwell (B200/B300/GB300)' }
         ];
       }
     },
@@ -131,6 +133,7 @@ export const MiniMaxM27Deployment = () => {
     const { hardware, gpuCount, precision, thinking, toolcall } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
+    const isB300 = hardware === 'b300';
     const isGB300 = hardware === 'gb300';
     const isXeon = hardware === 'xeon';
     const canUse2GPU = isAMD || isGB300;
@@ -139,11 +142,11 @@ export const MiniMaxM27Deployment = () => {
       return '# Please select compatible hardware\n# 2-GPU requires AMD MI300X/MI325X/MI355X or GB300';
     }
 
-    const isBlackwell = hardware === 'b200' || hardware === 'gb300';
+    const isBlackwell = hardware === 'b200' || hardware === 'b300' || hardware === 'gb300';
     const isFp4 = precision === 'fp4';
 
     if (isFp4 && !isBlackwell) {
-      return '# NVFP4 requires Blackwell hardware (B200 or GB300)';
+      return '# NVFP4 requires Blackwell hardware (B200, B300, or GB300)';
     }
 
     const modelName = isFp4 ? 'nvidia/MiniMax-M2.7-NVFP4' : 'MiniMaxAI/MiniMax-M2.7';
@@ -183,6 +186,9 @@ export const MiniMaxM27Deployment = () => {
     if (!isXeon && isAMD) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --attention-backend triton';
+    }
+    if (isB300) {
+      cmd += ' \\\n  --attention-backend flashinfer';
     }
 
     if (isBlackwell) {

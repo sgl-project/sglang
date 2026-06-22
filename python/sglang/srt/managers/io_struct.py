@@ -1179,8 +1179,6 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1248,9 +1246,6 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
-
-    # Load for DP balance
-    load: GetLoadsReqOutput = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -1820,6 +1815,13 @@ class FreezeGCReq(BaseReq):
 
 
 @dataclass
+class ShutdownReq(BaseReq):
+    # Broadcast across TP ranks via the normal recv path, so all ranks break
+    # the scheduler loop on the same iteration.
+    pass
+
+
+@dataclass
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -2154,11 +2156,6 @@ class GetLoadsReqOutput(BaseReq):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
-
-
-@dataclass
-class WatchLoadUpdateReq(BaseReq):
-    loads: List[GetLoadsReqOutput]
 
 
 @dataclass
