@@ -88,8 +88,6 @@ class SessionSlot:
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
-        # TODO: this should key off resource-object presence once opid6 makes
-        # the objects Optional; kept req_pool_idx-based to preserve behavior.
         return self.req_pool_idx is not None
 
     def save_from_req(self, req: Req, is_first: bool):
@@ -111,10 +109,6 @@ class SessionSlot:
         # the req still has a ping-pong buffer and skip alloc, causing
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
-        # TODO: to form real move semantics the slot should TAKE these objects
-        # and the req side should be `req.kv = None` / `req.mamba = None` /
-        # (is_first) `req.cache = None`, instead of the copy.copy above and the
-        # field-level nulling below. Kept as-is to preserve original behavior.
         req.req_pool_idx = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
@@ -312,13 +306,6 @@ class StreamingSession(BasePrefixCache):
         # req). Next request re-prefills from scratch.
         if isinstance(req.finished_reason, FINISH_ABORT):
             if slot is None:
-                # First-request mid-processing abort: create ephemeral slot
-                # from the req's resource objects so release_session handles
-                # cleanup. cache carries last_node/cache_protected_len so
-                # release_session calls dec_lock_ref; mamba carries the
-                # (possibly extra_buffer ping-pong) slots so _free_slot_mamba
-                # returns them to the mamba pool; otherwise the abort orphans
-                # them.
                 slot = SessionSlot(
                     req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
@@ -326,9 +313,7 @@ class StreamingSession(BasePrefixCache):
                     mamba=copy.copy(req.mamba),
                 )
                 self.slots[session_id] = slot
-                # Slot now owns these resources — drop the req's refs so
                 # the abort fall-through doesn't double-free.
-                # TODO: with real move semantics this would be `req.mamba = None`.
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
             slot.kv.kv_allocated_len = max(
