@@ -128,9 +128,20 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
         )
     elif a2a_backend.is_torch_npu():
-        # Use NPU-optimised dispatcher with native init/finalize ops
         return TorchNpuDispatcher(
             moe_runner_config,
+        )
+    elif a2a_backend.is_ascend_fuseep():
+        from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
+
+        return NpuFuseEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            permute_fusion=True,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
