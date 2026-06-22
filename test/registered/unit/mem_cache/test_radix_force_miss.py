@@ -12,6 +12,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -32,13 +33,12 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.prefix_indices = None
-        self.last_node = None
         self.last_host_node = None
         self.best_match_node = None
         self.host_hit_length = None
         self.num_matched_prefix_tokens = 0
-        self.mamba_branching_seqlen = None
-        self.cache_protected_len = None
+        self.cache = SimpleNamespace(last_node=None, cache_protected_len=None)
+        self.mamba = SimpleNamespace(mamba_branching_seqlen=None)
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -91,14 +91,14 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
             match_prefix_for_req(tree, baseline_req)
         self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
-        self.assertIsNot(baseline_req.last_node, tree.root_node)
+        self.assertIsNot(baseline_req.cache.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
             match_prefix_for_req(tree, forced_req)
         self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
-        self.assertIs(forced_req.last_node, tree.root_node)
+        self.assertIs(forced_req.cache.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
 

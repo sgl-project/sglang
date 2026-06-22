@@ -278,7 +278,7 @@ class DecodeKVCacheOffloadManager:
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = kv_committed_len, req.kv_allocated_len
+        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
         if self.page_size > 1:
             start_p = ceil_align(start_p, self.page_size)
         if start_p < end_p:

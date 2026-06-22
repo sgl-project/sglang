@@ -8,6 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -34,7 +35,7 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv_allocated_len = kv_allocated_len
+    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: kv_committed_len
     return req

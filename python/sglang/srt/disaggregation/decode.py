@@ -924,11 +924,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.cache.last_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.cache.last_node)
                 break
 
             if uses_swa_tail_prealloc:
@@ -946,7 +946,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self.tree_cache.dec_lock_ref(decode_req.req.cache.last_node)
                     break
 
             dst_kv_indices = self._pre_alloc(
@@ -980,7 +980,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     swa_uuid_for_lock=None,
                     swa_prefix_lock_released=False,
                 )
-            decode_req.req.cache_protected_len = total_prefix_len
+            decode_req.req.cache.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1314,7 +1314,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        req.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1401,7 +1401,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
-                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
+                req.kv.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(
