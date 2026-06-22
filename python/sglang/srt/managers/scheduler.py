@@ -2892,6 +2892,16 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.server_args.enable_sparse_attention:
+            # Register newly admitted requests with the sparse-attention coordinator
+            # (records prompt length + resets per-request representation state).
+            from sglang.srt.mem_cache.sparsity.factory import get_sparse_coordinator
+
+            _sc = get_sparse_coordinator()
+            if _sc is not None:
+                for req in new_batch.reqs:
+                    _sc.on_request_begin(req)
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,

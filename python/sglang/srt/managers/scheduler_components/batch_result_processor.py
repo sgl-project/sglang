@@ -855,6 +855,16 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                if self.server_args.enable_sparse_attention:
+                    # Clear sparse-attention per-request state before the req slot
+                    # is released/reused (avoids stale page representations).
+                    from sglang.srt.mem_cache.sparsity.factory import (
+                        get_sparse_coordinator,
+                    )
+
+                    _sc = get_sparse_coordinator()
+                    if _sc is not None:
+                        _sc.on_request_end(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

@@ -721,6 +721,12 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # Experimental: query-aware sparse attention (selection, e.g. Quest) wired
+    # onto the FlashAttention decode path for non-MLA models. This is decoupled
+    # from HiSparse above (which is a DeepSeek/DSA host-offload engine).
+    enable_sparse_attention: bool = False
+    sparse_attention_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
     lmcache_config_file: Optional[str] = None
@@ -6648,6 +6654,23 @@ class ServerArgs:
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
             'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+        )
+
+        # Experimental query-aware sparse attention (e.g. Quest) on FlashAttention
+        parser.add_argument(
+            "--enable-sparse-attention",
+            action="store_true",
+            help="(Experimental) Enable query-aware sparse attention (e.g. Quest) "
+            "on the FlashAttention decode path for non-MLA models.",
+        )
+        parser.add_argument(
+            "--sparse-attention-config",
+            dest="sparse_attention_config",
+            type=str,
+            default=ServerArgs.sparse_attention_config,
+            help="A JSON string configuring sparse attention. "
+            'Example: \'{"algorithm": "quest", "backend": "fa3", '
+            '"min_sparse_prompt_len": 256, "sparsity_ratio": 0.5, "num_recent_pages": 4}\'',
         )
 
         # LMCache
