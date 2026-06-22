@@ -27,6 +27,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -74,13 +75,15 @@ class MockReq:
         )
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
         self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = cache_protected_len
-        self.last_node = last_node
+        self.cache = SimpleNamespace(
+            cache_protected_len=cache_protected_len,
+            last_node=last_node,
+        )
         self.extra_key = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
-        self.kv_allocated_len = len(fill_ids)
+        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
         self.kv_committed_freed = False
 
     def get_fill_ids(self):
@@ -91,7 +94,7 @@ class MockReq:
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self):
-        return (self.kv_committed_len, self.kv_allocated_len)
+        return (self.kv_committed_len, self.kv.kv_allocated_len)
 
 
 def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
@@ -301,9 +304,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.rid = "req-1"
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
-        req.last_node = object()
+        req.cache.last_node = object()
         req.finished_reason = None
-        req.cache_protected_len = 0
+        req.cache.cache_protected_len = 0
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -321,7 +324,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 prefix_indices=torch.arange(4, dtype=torch.int64),
                 l2_host_hit_length=0,
                 l3_storage_hit_length=0,
-                last_device_node=req.last_node,
+                last_device_node=req.cache.last_node,
             )
         )
         queue._pre_alloc = MagicMock(
@@ -359,7 +362,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.cache.last_node)
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):

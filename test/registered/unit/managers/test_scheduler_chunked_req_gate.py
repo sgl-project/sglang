@@ -38,16 +38,16 @@ def _make_req(
     req.extend_input_len = extend_input_len
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
-    req.cache_protected_len = 0
+    req.cache.cache_protected_len = 0
     req.skip_radix_cache_insert = False
-    req.last_node = None
-    req.swa_uuid_for_lock = None
+    req.cache.last_node = None
+    req.cache.swa_uuid_for_lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
-    req.mamba_pool_idx = None
+    req.mamba.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
 

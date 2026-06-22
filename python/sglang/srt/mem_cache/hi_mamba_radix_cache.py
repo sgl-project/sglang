@@ -1058,7 +1058,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
-            if req.mamba_pool_idx is None:
+            if req.mamba.mamba_pool_idx is None:
                 dst_index = self._alloc_with_evict(
                     self.req_to_token_pool.mamba_allocator,
                     1,
@@ -1066,7 +1066,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=mamba_node,
                     error_message="Can not alloc mamba cache",
                 )
-                req.mamba_pool_idx = dst_index[0]
+                req.mamba.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = mamba_node.mamba_value
             req.mamba_needs_clear = False
 
@@ -2097,8 +2097,8 @@ class HiMambaRadixCache(MambaRadixCache):
             and last_hit_node in nodes_to_restore
             and last_hit_node.mamba_host_value is not None
         ):
-            if req.mamba_pool_idx is None:
-                req.mamba_pool_idx = self._alloc_with_evict(
+            if req.mamba.mamba_pool_idx is None:
+                req.mamba.mamba_pool_idx = self._alloc_with_evict(
                     self.req_to_token_pool.mamba_allocator,
                     len(last_hit_node.mamba_host_value),
                     self.evict_mamba,
@@ -2109,7 +2109,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 PoolTransfer(
                     name=PoolName.MAMBA,
                     host_indices=last_hit_node.mamba_host_value,
-                    device_indices=req.mamba_pool_idx.unsqueeze(0),
+                    device_indices=req.mamba.mamba_pool_idx.unsqueeze(0),
                 )
             )
 

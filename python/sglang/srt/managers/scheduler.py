@@ -2851,13 +2851,13 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
                     not added
-                    and req.mamba_pool_idx is not None
+                    and req.mamba.mamba_pool_idx is not None
                     and not getattr(req, "session", None)
                 ):
                     self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
+                        req.mamba.mamba_pool_idx.unsqueeze(-1)
                     )
-                    req.mamba_pool_idx = None
+                    req.mamba.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
@@ -3793,7 +3793,7 @@ class Scheduler(
 
             # For mamba radix cache
             if (
-                req.mamba_pool_idx is not None
+                req.mamba.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
