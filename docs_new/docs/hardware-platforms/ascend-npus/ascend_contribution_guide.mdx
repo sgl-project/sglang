@@ -5,7 +5,7 @@ metatags:
     description: "Set up the Ascend NPU development environment, run tests, build documentation, and open SGLang pull requests."
 ---
 
-Welcome to **SGLang**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR). Whether you're fixing a small bug or developing a major feature, we encourage following these steps for a smooth contribution process.
+Welcome to **SGLang**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR). Whether you’re fixing a small bug or developing a major feature, we encourage following these steps for a smooth contribution process.
 
 ## Install SGLang from Source
 
@@ -89,7 +89,7 @@ If this is not the case, use following command on CI server:
     --model {your_model_repo}/{your_model} \
     --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
   ```
-  > Note: If you don't have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
+  > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
 3. Add model to `python/sglang/test/ascend/test_ascend_utils.py` (use docker `"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"` path).
 
 ## Write documentation
@@ -136,17 +136,17 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the "run-ci-extra" label, opting the PR into the extra test workflow (`pr-test-extra.yml`).
 - `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, or skipped**.
-- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
+- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won’t. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
 - `/rerun-stage <stage-name>`: Reruns a single test stage without waiting for its dependencies. Useful for quickly validating a specific test fix instead of waiting ~30 minutes for preceding stages.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly, bypassing stage boundaries. Each `<test-spec>` is pytest-style `<file>::<TestClass>[.<test_method>]` (the `::TestClass` and `.<test_method>` parts are optional). The handler resolves each spec, groups specs by their registered runner-label, and dispatches one [Rerun Test workflow](https://github.com/sgl-project/sglang/actions/workflows/rerun-test.yml) per group. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py` (multiple at once).
 
-If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here's a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
 Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
 
-If you don't have permission, please ask maintainers to trigger CI for you.
+If you don’t have permission, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
 
@@ -162,7 +162,7 @@ cool-down-minutes:
   default: 120
 ```
 
-Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow's default window and the user-specific interval.
+Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
 
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
@@ -176,7 +176,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
   - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
-- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
+- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python’s [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_npu.py`).
@@ -200,11 +200,11 @@ Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates
 
 ## Tips for newcomers
 
-If you want to contribute but don't have a specific idea in mind, pick issues labeled ["good first issue" or "help wanted"](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.
+If you want to contribute but don’t have a specific idea in mind, pick issues labeled ["good first issue" or "help wanted"](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.
 
 Also check out the following materials as startup guide:
 - [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of sglang.
-- [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang's workflow.
+- [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 - [GTC-2026 Training Lab](https://drive.google.com/file/d/1mwOZEtipNLJzrflCTodj34KhuOZEoEw5/view?usp=drive_link) for hands-on practices of how to do optimization, benchmarking, or profiling on a launched SGLang instance.
 
 If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.io).
