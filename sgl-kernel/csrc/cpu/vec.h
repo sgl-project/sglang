@@ -287,6 +287,77 @@ inline void quantize_row_int8<at::BFloat16>(
 // transpose utils
 // taken from my PR in ggml: https://github.com/ggml-org/llama.cpp/pull/8998
 #if defined(CPU_CAPABILITY_AVX512)
+inline void transpose_16x16_16bit(__m256i* v) {
+  __m256i v1[16];
+  v1[0] = _mm256_unpacklo_epi16(v[0], v[1]);
+  v1[1] = _mm256_unpackhi_epi16(v[0], v[1]);
+  v1[2] = _mm256_unpacklo_epi16(v[2], v[3]);
+  v1[3] = _mm256_unpackhi_epi16(v[2], v[3]);
+  v1[4] = _mm256_unpacklo_epi16(v[4], v[5]);
+  v1[5] = _mm256_unpackhi_epi16(v[4], v[5]);
+  v1[6] = _mm256_unpacklo_epi16(v[6], v[7]);
+  v1[7] = _mm256_unpackhi_epi16(v[6], v[7]);
+  v1[8] = _mm256_unpacklo_epi16(v[8], v[9]);
+  v1[9] = _mm256_unpackhi_epi16(v[8], v[9]);
+  v1[10] = _mm256_unpacklo_epi16(v[10], v[11]);
+  v1[11] = _mm256_unpackhi_epi16(v[10], v[11]);
+  v1[12] = _mm256_unpacklo_epi16(v[12], v[13]);
+  v1[13] = _mm256_unpackhi_epi16(v[12], v[13]);
+  v1[14] = _mm256_unpacklo_epi16(v[14], v[15]);
+  v1[15] = _mm256_unpackhi_epi16(v[14], v[15]);
+
+  v[0] = _mm256_unpacklo_epi32(v1[0], v1[2]);
+  v[1] = _mm256_unpackhi_epi32(v1[0], v1[2]);
+  v[2] = _mm256_unpacklo_epi32(v1[1], v1[3]);
+  v[3] = _mm256_unpackhi_epi32(v1[1], v1[3]);
+  v[4] = _mm256_unpacklo_epi32(v1[4], v1[6]);
+  v[5] = _mm256_unpackhi_epi32(v1[4], v1[6]);
+  v[6] = _mm256_unpacklo_epi32(v1[5], v1[7]);
+  v[7] = _mm256_unpackhi_epi32(v1[5], v1[7]);
+  v[8] = _mm256_unpacklo_epi32(v1[8], v1[10]);
+  v[9] = _mm256_unpackhi_epi32(v1[8], v1[10]);
+  v[10] = _mm256_unpacklo_epi32(v1[9], v1[11]);
+  v[11] = _mm256_unpackhi_epi32(v1[9], v1[11]);
+  v[12] = _mm256_unpacklo_epi32(v1[12], v1[14]);
+  v[13] = _mm256_unpackhi_epi32(v1[12], v1[14]);
+  v[14] = _mm256_unpacklo_epi32(v1[13], v1[15]);
+  v[15] = _mm256_unpackhi_epi32(v1[13], v1[15]);
+
+  v1[0] = _mm256_unpacklo_epi64(v[0], v[4]);
+  v1[1] = _mm256_unpackhi_epi64(v[0], v[4]);
+  v1[2] = _mm256_unpacklo_epi64(v[1], v[5]);
+  v1[3] = _mm256_unpackhi_epi64(v[1], v[5]);
+  v1[4] = _mm256_unpacklo_epi64(v[2], v[6]);
+  v1[5] = _mm256_unpackhi_epi64(v[2], v[6]);
+  v1[6] = _mm256_unpacklo_epi64(v[3], v[7]);
+  v1[7] = _mm256_unpackhi_epi64(v[3], v[7]);
+  v1[8] = _mm256_unpacklo_epi64(v[8], v[12]);
+  v1[9] = _mm256_unpackhi_epi64(v[8], v[12]);
+  v1[10] = _mm256_unpacklo_epi64(v[9], v[13]);
+  v1[11] = _mm256_unpackhi_epi64(v[9], v[13]);
+  v1[12] = _mm256_unpacklo_epi64(v[10], v[14]);
+  v1[13] = _mm256_unpackhi_epi64(v[10], v[14]);
+  v1[14] = _mm256_unpacklo_epi64(v[11], v[15]);
+  v1[15] = _mm256_unpackhi_epi64(v[11], v[15]);
+
+  v[0] = _mm256_permute2x128_si256(v1[0], v1[8], 0x20);
+  v[1] = _mm256_permute2x128_si256(v1[1], v1[9], 0x20);
+  v[2] = _mm256_permute2x128_si256(v1[2], v1[10], 0x20);
+  v[3] = _mm256_permute2x128_si256(v1[3], v1[11], 0x20);
+  v[4] = _mm256_permute2x128_si256(v1[4], v1[12], 0x20);
+  v[5] = _mm256_permute2x128_si256(v1[5], v1[13], 0x20);
+  v[6] = _mm256_permute2x128_si256(v1[6], v1[14], 0x20);
+  v[7] = _mm256_permute2x128_si256(v1[7], v1[15], 0x20);
+  v[8] = _mm256_permute2x128_si256(v1[0], v1[8], 0x31);
+  v[9] = _mm256_permute2x128_si256(v1[1], v1[9], 0x31);
+  v[10] = _mm256_permute2x128_si256(v1[2], v1[10], 0x31);
+  v[11] = _mm256_permute2x128_si256(v1[3], v1[11], 0x31);
+  v[12] = _mm256_permute2x128_si256(v1[4], v1[12], 0x31);
+  v[13] = _mm256_permute2x128_si256(v1[5], v1[13], 0x31);
+  v[14] = _mm256_permute2x128_si256(v1[6], v1[14], 0x31);
+  v[15] = _mm256_permute2x128_si256(v1[7], v1[15], 0x31);
+}
+
 inline void transpose_16x16_32bit(__m512i* v) {
   __m512i v1[16];
   v1[0] = _mm512_unpacklo_epi32(v[0], v[1]);
