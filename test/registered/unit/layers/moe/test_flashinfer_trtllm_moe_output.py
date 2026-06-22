@@ -61,9 +61,10 @@ def test_moe_output_copy_add_folds_shared_output_on_alt_stream():
 @requires_cuda
 def test_routed_fp8_wrapper_writes_real_flashinfer_output_tensor():
     fused_moe = pytest.importorskip("flashinfer.fused_moe")
-    if "output" not in inspect.signature(
-        fused_moe.trtllm_fp8_block_scale_routed_moe
-    ).parameters:
+    if (
+        "output"
+        not in inspect.signature(fused_moe.trtllm_fp8_block_scale_routed_moe).parameters
+    ):
         pytest.skip("FlashInfer routed FP8 MoE does not expose output=.")
 
     seq_len = 4
