@@ -1770,6 +1770,56 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.assertEqual(result.normal_text, "")
         self.assertIn("｜DSML｜", detector._buffer)
 
+    def test_streaming_array_recipe_partial_value_chunked_1_7_64(self):
+        """Regression (V4-Flash, array-valued args): a non-string parameter
+        carrying a spreadsheet-edit ``operations: [...]`` recipe streams in as a
+        not-yet-valid-JSON prefix (the model emits Python-style single quotes),
+        so partial_json_parser raises MalformedJSON -- a ValueError that is NOT
+        a stdlib json.JSONDecodeError. Replaying the whole tool call at chunk
+        sizes 1, 7 and 64 must never raise, never leak DSML markers into
+        normal_text, and must still recover the tool name. Leaks on the
+        unpatched detector at every chunk size; clean after the fix.
+        """
+        apply_tool = Tool(
+            type="function",
+            function=Function(
+                name="apply_edits",
+                parameters={
+                    "type": "object",
+                    "properties": {"operations": {"type": "array"}},
+                },
+            ),
+        )
+        payload = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="apply_edits">\n'
+            '<｜DSML｜parameter name="operations" string="false">'
+            "[{'set': 'A1', 'value': 42}, {'set': 'B2', 'value': 7}]"
+            "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        for chunk_size in (1, 7, 64):
+            detector = DeepSeekV32Detector()
+            names = {}
+            for i in range(0, len(payload), chunk_size):
+                result = detector.parse_streaming_increment(
+                    payload[i : i + chunk_size], [apply_tool]
+                )
+                self.assertNotIn(
+                    "｜DSML｜",
+                    result.normal_text,
+                    f"raw DSML markers leaked into normal_text at chunk_size={chunk_size}",
+                )
+                for call in result.calls:
+                    if call.name:
+                        names[call.tool_index] = call.name
+            self.assertEqual(
+                names,
+                {0: "apply_edits"},
+                f"tool name not recovered at chunk_size={chunk_size}",
+            )
+
     def test_self_closing_zero_arg_invoke(self):
         """V32 inherits the same regex; verify self-closing parses to empty
         params here too (V32 model rarely emits this shape, but the parser
