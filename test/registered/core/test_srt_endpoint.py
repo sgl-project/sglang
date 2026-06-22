@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 import requests
+import torch
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
@@ -149,6 +150,7 @@ class TestSRTEndpoint(CustomTestCase):
                 "".join([x[-1] for x in res["meta_info"]["output_token_logprobs"]]),
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_logprob_with_chunked_prefill(self):
         """Test a long prompt that requests output logprobs will not hit OOM."""
         new_tokens = 4
@@ -242,6 +244,7 @@ class TestSRTEndpoint(CustomTestCase):
         max_diff = np.max(diff)
         self.assertLess(max_diff, 0.35)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_logprob_mixed(self):
         args = []
         temperature = 0

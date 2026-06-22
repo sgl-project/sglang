@@ -87,6 +87,7 @@ class TestSRTEngine(CustomTestCase):
         print(out2)
         self.assertEqual(out1, out2)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_6_engine_cpu_offload(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -117,6 +118,7 @@ class TestSRTEngine(CustomTestCase):
         print(out2)
         self.assertEqual(out1, out2)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_7_engine_offline_throughput(self):
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
