@@ -72,6 +72,16 @@ install_with_retry() {
   return 1
 }
 
+# The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
+# exists in httpx>=0.25.0. The CI image ships an older httpx, and several deps
+# installed below (lmms-eval, aiter's requirements.txt, etc.) can pull a stale
+# httpx back in, so test_anthropic_server fails with:
+#   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
+# Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
+ensure_httpx() {
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+}
+
 # Helper function to git clone with retries
 git_clone_with_retry() {
   local repo_url="$1"
@@ -122,14 +132,6 @@ else
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
-
-  # The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
-  # exists in httpx>=0.25.0. The CI image ships an older httpx that pip's editable
-  # reinstall above does not upgrade (only-if-needed strategy keeps the pre-baked
-  # version), so test_anthropic_server fails with:
-  #   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
-  # Force the upgrade explicitly.
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
@@ -220,6 +222,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
 fi
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
+  ensure_httpx
   exit 0
 fi
 
@@ -339,6 +342,10 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
+
+# Must be the final pip operation: force httpx>=0.25.0 so the anthropic SDK can
+# construct its httpx transport (see ensure_httpx definition above).
+ensure_httpx
 
 
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults
