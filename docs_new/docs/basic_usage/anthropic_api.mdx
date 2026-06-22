@@ -23,7 +23,7 @@ This tutorial covers:
 Launch the server in your terminal and wait for it to initialize. The Anthropic `/v1/messages` endpoint
 is registered automatically — no extra flag is required beyond the usual server launch. The example below
 is a single-node GLM-5.2-FP8 config; see the
-[GLM-5.2 cookbook](https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2) for verified commands
+[GLM-5.2 cookbook](/cookbook/autoregressive/GLM/GLM-5.2) for verified commands
 across hardware and quantizations.
 
 ```bash Command
@@ -244,7 +244,7 @@ on every turn.
 
 Setting `CLAUDE_CODE_ATTRIBUTION_HEADER=0` removes the whole attribution line from the system prompt.
 This is a documented Claude Code env var whose explicit purpose is to "improve prompt-cache hit rates when
-routing through an LLM gateway" (see the Claude Code env-vars reference).
+routing through an [LLM gateway](https://code.claude.com/docs/en/llm-gateway)" (see the [Claude Code env-vars reference](https://code.claude.com/docs/en/env-vars)).
 
 <Note>
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` does **not** remove the attribution block — it only covers
