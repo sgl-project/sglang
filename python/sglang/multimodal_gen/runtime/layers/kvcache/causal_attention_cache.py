@@ -104,7 +104,7 @@ class CausalSelfAttentionKVCache:
         current_chunk_start: int,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
-        """write kv into the cache, returns the part visible to the current chunk
+        """write fresh kv into the cache, returns the part of view visible to the current chunk
 
         Args:
             current_chunk_start: the global position of the start of the chunk
@@ -116,7 +116,7 @@ class CausalSelfAttentionKVCache:
         sink_tokens = self.sink_tokens
         global_end_index, local_end_index_prev = self._read_indices()
 
-        # local_end_index: the local position of the end of current chunk
+        # local_start(/end)_index: the local position of the start/end of current chunk
         # updated_local_end: the updated local end
         # updated_global_end: the updated global end
 
@@ -159,19 +159,19 @@ class CausalSelfAttentionKVCache:
                     local_end_index_prev - num_evicted_tokens - sink_tokens,
                 )
                 if num_rolled_tokens > 0:
-                    self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.k[
+                    self.k[:, sink_tokens: sink_tokens + num_rolled_tokens] = self.k[
                         :,
                         sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
+                        + num_evicted_tokens: sink_tokens
+                                              + num_evicted_tokens
+                                              + num_rolled_tokens,
                     ].clone()
-                    self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.v[
+                    self.v[:, sink_tokens: sink_tokens + num_rolled_tokens] = self.v[
                         :,
                         sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
+                        + num_evicted_tokens: sink_tokens
+                                              + num_evicted_tokens
+                                              + num_rolled_tokens,
                     ].clone()
 
                 # if we move the minimum number of tokens, the right bound of the append token would be aligned with end of the buffer
@@ -229,8 +229,16 @@ class CausalSelfAttentionKVCache:
         local_head_start: int | None = None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
-        """write local-head kv into a full-head cache and return the local-head view"""
-        if self.k.shape[2] == key.shape[2]:
+        """write local-head kv into a full-head cache and return the local-head view
+
+          Args:
+            local_head_start: the start index attention heads the current rank takes charge of
+
+        """
+        num_input_heads = key.shape[2]
+
+        if self.k.shape[2] == num_input_heads:
+            # head is not splitted: the global head num equals to input head num. no adjustment needed
             return self.update_and_get_attention_kv(
                 key=key,
                 value=value,
@@ -241,10 +249,10 @@ class CausalSelfAttentionKVCache:
         if local_head_start is None:
             raise ValueError(
                 f"{debug_name} requires local_head_start when cache heads "
-                f"({self.k.shape[2]}) differ from input heads ({key.shape[2]})."
+                f"({self.k.shape[2]}) differ from input heads ({num_input_heads})."
             )
 
-        local_head_slice = slice(local_head_start, local_head_start + key.shape[2])
+        local_head_slice = slice(local_head_start, local_head_start + num_input_heads)
         cache_key = key.new_zeros(
             key.shape[0],
             key.shape[1],

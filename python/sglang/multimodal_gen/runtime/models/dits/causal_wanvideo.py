@@ -256,6 +256,7 @@ class CausalWanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("to_out", prefix),
             )
+            # megatron-style tp shards the weight (qkv) column-wise, effectively splitting the attention heads
             tp_size = get_tp_world_size()
             self.local_num_heads = divide(num_heads, tp_size)
             head_start = get_tp_rank() * self.local_num_heads
