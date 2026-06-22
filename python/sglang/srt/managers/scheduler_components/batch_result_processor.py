@@ -559,10 +559,8 @@ class SchedulerBatchResultProcessor:
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
             if req.is_retracted or req.finished():
-                # retracted: reset_for_retract() already zeroed KV. finished:
-                # nothing to settle -- prepare_for_decode does not pre-claim the
-                # bonus (it is not in KV yet), so kv_committed_len already holds
-                # the committed prefix.
+                # Nothing to settle: no worker pre-claims the bonus, so
+                # kv_committed_len already holds the committed prefix.
                 pass
             else:
                 if req.grammar is not None:
@@ -572,9 +570,7 @@ class SchedulerBatchResultProcessor:
                     # grammar.finished.
                     accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
-                # Commit the full accepted run (drafts + bonus). No worker
-                # pre-claims the bonus in prepare_for_decode, so the count is
-                # uniform across EAGLE / DFLASH / Frozen / ngram.
+                # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
                 req.kv_committed_len += num_accept_tokens
                 req.spec_verify_ct += 1

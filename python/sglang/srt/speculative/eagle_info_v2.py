@@ -47,11 +47,9 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for i, r in enumerate(batch.reqs):
             cur = r.kv_allocated_len
-            # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
-            # cannot make nxt < cur and corrupt allocator state. kv_committed_len is
-            # the truly-committed length: the bonus token isn't in KV yet (resolve
-            # commits the full accepted run, incl. bonus), so it lags batch.seq_lens
-            # by ~1 verify in overlap mode; the 2*alloc buffer absorbs that lag.
+            # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
+            # kv_committed_len is honest (bonus committed in resolve, not here),
+            # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
             nxt = max(cur, r.kv_committed_len + double_alloc)
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt

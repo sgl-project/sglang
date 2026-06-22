@@ -331,19 +331,15 @@ class StreamingSession(BasePrefixCache):
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
-        # Authoritative committed length at finish: output_ids[:finished_len] all
-        # have their KV written, so origin + finished_len is the real count. We set
-        # it on the *slot* (not the req clock) so the next turn inherits the full
-        # prefix without depending on whether the committed clock has caught up.
-        # Under overlap + honest committed (no bonus pre-claim), the clock lags the
-        # in-flight verify by ~1 at save time; min() in _trim_overshoot would let
-        # that lag through and the next turn inherits one short. Setting the slot
-        # directly decouples streaming inheritance from the committed clock's timing.
         target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
         slot.save_from_req(req, is_first=is_first)
-        slot.kv_committed_len = target
+        # Inherit the authoritative finished length on the slot, not the lagging
+        # req clock (under overlap + honest committed the clock lags the in-flight
+        # verify by ~1, which would short-change inheritance). Clamp to allocated
+        # to keep committed <= allocated for prepare_for_decode.
+        slot.kv_committed_len = min(target, slot.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)

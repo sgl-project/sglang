@@ -55,16 +55,10 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
-    # spec v2: the scheduler-driven mixin only advances iter / alloc; the bonus
-    # slot is NOT pre-claimed (no kv_committed_len mutation here). All workers
-    # commit the full accepted run (incl. bonus) uniformly in resolve.
+    # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,
-    # Single resolve mutation: running req commits the full accepted run
-    # (drafts + bonus). Finished/retracted are no-ops; grammar truncation commits
-    # only the retained (pre-termination) length so the dropped suffix is never
-    # over-committed.
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     (
@@ -93,9 +87,7 @@ _OWNER_SITES = {
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
-    # Honest committed: the slot inherits the authoritative finished length
-    # directly (not the lagging req clock), decoupling streaming inheritance
-    # from the committed clock's overlap timing.
+    # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
 }
 
