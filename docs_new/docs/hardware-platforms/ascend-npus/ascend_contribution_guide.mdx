@@ -66,7 +66,8 @@ See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/
 4. Register your test with `register_npu_ci()`:
    ```python
    from sglang.test.ci.ci_register import register_npu_ci
-   register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+   register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+   register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
    ```
 
 ### Running tests locally
@@ -104,8 +105,10 @@ If your code changes the model output, please run the accuracy tests. A quick sa
 # Launch a server
 python3 -m sglang.launch_server --model Qwen/Qwen2-7B-Instruct
 
-# Evaluate
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+# Evaluate. --base-url must point at the server launched above.
+# The default SGLang server port is 30000; change it if you launched
+# the server with a different --port.
+python3 -m sglang.test.run_eval --base-url http://localhost:30000 --eval-name gsm8k --num-examples 200
 ```
 
 Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test.
@@ -170,7 +173,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
   - A common pattern is some runtime checks in the model forward pass (e.g., [this](https://github.com/sgl-project/sglang/blob/f1b0eda55c2c4838e8ab90a0fac7fb1e3d7064ab/python/sglang/srt/models/deepseek_v2.py#L486-L491)). These are very likely the same for every layer. Please cache the result as a single boolean value in `__init__` whenever possible.
 - Make functions as pure as possible. Avoid in-place modification of arguments.
-- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files. (e.g., `scheduler.py`, `scheduler_output_processor_mixin.py`)
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files. (e.g., `scheduler.py`, `scheduler_pp_mixin.py`)
 - In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
 - Keep tests run fast.
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
