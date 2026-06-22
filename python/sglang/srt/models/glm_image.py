@@ -39,6 +39,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -372,11 +373,6 @@ class GlmImageVQVAE(nn.Module):
 # --------------------------------------------------------------------------- #
 # Text model
 # --------------------------------------------------------------------------- #
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_glm_image_rotary_pos_emb(
