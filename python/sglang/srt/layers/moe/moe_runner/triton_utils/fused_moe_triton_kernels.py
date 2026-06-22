@@ -1256,7 +1256,7 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
     Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
-    Shared IDs:   shared_id_base + s               (route to home rank)
+    Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
     Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
     """
     pid = tl.program_id(0)

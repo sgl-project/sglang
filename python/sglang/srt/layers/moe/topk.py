@@ -1205,20 +1205,23 @@ def _fill_padded_rows(
     """
     # Metadata-only checks (no device sync): the kernel reads a single scalar
     # routing count from device memory, so it must be a 1-element integer tensor
-    # on the same device as ``x``.
-    assert isinstance(
-        num_token_non_padded, torch.Tensor
-    ), "num_token_non_padded must be a torch.Tensor"
-    assert num_token_non_padded.numel() == 1, (
-        "num_token_non_padded must be a single-element tensor, got shape "
-        f"{tuple(num_token_non_padded.shape)}"
-    )
-    assert (
-        not num_token_non_padded.dtype.is_floating_point
-    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
-    assert (
-        num_token_non_padded.device == x.device
-    ), "num_token_non_padded and x must be on the same device"
+    # on the same device as ``x``. Use explicit raises (not asserts) so the
+    # checks survive ``python -O`` and invalid inputs fail loudly instead of
+    # turning into opaque Triton/memory errors.
+    if not isinstance(num_token_non_padded, torch.Tensor):
+        raise TypeError("num_token_non_padded must be a torch.Tensor")
+    if num_token_non_padded.numel() != 1:
+        raise ValueError(
+            "num_token_non_padded must be a single-element tensor, got shape "
+            f"{tuple(num_token_non_padded.shape)}"
+        )
+    if num_token_non_padded.dtype.is_floating_point:
+        raise TypeError(
+            "num_token_non_padded must be an integer tensor, got "
+            f"{num_token_non_padded.dtype}"
+        )
+    if num_token_non_padded.device != x.device:
+        raise ValueError("num_token_non_padded and x must be on the same device")
     n_rows, n_cols = x.shape
     _fill_padded_rows_kernel[(n_rows,)](
         x,
@@ -1692,8 +1695,10 @@ def _post_process_topk_ids(
         # Shared weight is 1.0 here because this branch is aiter-only:
         # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
         # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
-        # so the always-on shared expert must contribute 1.0x (matches the
-        # _remap_topk_for_deepep aiter branch, see PR #28237).
+        # so the always-on shared expert must contribute 1.0x. (The eager
+        # _remap_topk_for_deepep instead sets shared weight to
+        # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
+        # path does not apply; see PR #28237.)
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
