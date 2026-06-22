@@ -98,13 +98,6 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    if req.locked_cache is None:
-        req.locked_cache = ReqLockedCacheInfo(
-            last_node=None,
-            swa_uuid_for_lock=None,
-            swa_prefix_lock_released=False,
-        )
-
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
@@ -672,6 +665,10 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
+        req.locked_cache = ReqLockedCacheInfo(
+            swa_uuid_for_lock=None,
+            swa_prefix_lock_released=False,
+        )
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 

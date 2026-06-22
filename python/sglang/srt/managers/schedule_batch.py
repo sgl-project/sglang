@@ -680,8 +680,6 @@ class ReqCacheMatchSnapshot:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqLockedCacheInfo:
-    # TODO(ispobock): rename to last_device_node
-    last_node: Any
     # The node to lock until for swa radix tree lock ref
     swa_uuid_for_lock: Optional[int]
     # Whether the prefill-time SWA tree lock has been released early
@@ -878,6 +876,8 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.cache_match_snapshot: Optional[ReqCacheMatchSnapshot] = None
         self.locked_cache: Optional[ReqLockedCacheInfo] = None
+        # TODO(ispobock): rename to last_device_node
+        self.last_node: Any = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
@@ -1111,14 +1111,6 @@ class Req(ReqDllmMixin):
         )
 
     @property
-    def last_node(self) -> Any:
-        return self.locked_cache.last_node
-
-    @last_node.setter
-    def last_node(self, value: Any) -> None:
-        self.locked_cache.last_node = value
-
-    @property
     def swa_uuid_for_lock(self) -> Optional[int]:
         return self.locked_cache.swa_uuid_for_lock
 
@@ -1284,12 +1276,6 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
-            if self.locked_cache is None:
-                self.locked_cache = ReqLockedCacheInfo(
-                    last_node=None,
-                    swa_uuid_for_lock=None,
-                    swa_prefix_lock_released=False,
-                )
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1566,7 +1552,8 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.cache_match_snapshot = None
-        self.locked_cache = None
+        assert self.locked_cache is None, "expect it is already released"
+        self.last_node = None
         self.cache_protected_len = 0
         self.extend_input_len = 0
         self.is_retracted = True

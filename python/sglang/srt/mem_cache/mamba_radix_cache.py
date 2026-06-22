@@ -621,7 +621,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
 
-        self.dec_lock_ref(req.last_node)
+        if req.locked_cache is not None:
+            self.dec_lock_ref(req.last_node)
+            req.locked_cache = None
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

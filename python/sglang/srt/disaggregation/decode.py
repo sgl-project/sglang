@@ -519,6 +519,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
+        req.locked_cache = ReqLockedCacheInfo(
+            swa_uuid_for_lock=None,
+            swa_prefix_lock_released=False,
+        )
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -929,10 +933,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                decode_req.req.locked_cache = None
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                decode_req.req.locked_cache = None
                 break
 
             if uses_swa_tail_prealloc:
@@ -951,6 +957,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    decode_req.req.locked_cache = None
                     break
 
             dst_kv_indices = self._pre_alloc(
@@ -977,12 +984,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
-            if decode_req.req.locked_cache is None:
-                decode_req.req.locked_cache = ReqLockedCacheInfo(
-                    last_node=None,
-                    swa_uuid_for_lock=None,
-                    swa_prefix_lock_released=False,
-                )
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size

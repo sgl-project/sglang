@@ -478,12 +478,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
-        )
-        req.swa_prefix_lock_released = False
+        if req.locked_cache is not None:
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+                skip_swa=req.swa_prefix_lock_released,
+            )
+            req.locked_cache = None
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

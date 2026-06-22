@@ -765,11 +765,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
-        )
+        if req.locked_cache is not None:
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+                skip_swa=req.swa_prefix_lock_released,
+            )
+            req.locked_cache = None
 
         # cleanup
         for comp in self._components_tuple:
