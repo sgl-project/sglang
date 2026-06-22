@@ -48,7 +48,7 @@ from sglang.benchmark.utils import (
     set_ulimit,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -106,6 +106,8 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    cached_tokens: int = 0
+    cached_tokens_details: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -229,6 +231,19 @@ async def async_request_trt_llm(
         return output
 
 
+def _extract_cache_from_sglext(data, output):
+    """Extract cache hit details from sglext in OAI-compatible responses."""
+    sglext = data.get("sglext") or {}
+    details = sglext.get("cached_tokens_details")
+    if details:
+        output.cached_tokens = (
+            (details.get("device") or 0)
+            + (details.get("host") or 0)
+            + (details.get("storage") or 0)
+        )
+        output.cached_tokens_details = details
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -301,6 +316,9 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            if getattr(args, "cache_report", False):
+                                _extract_cache_from_sglext(data, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -455,6 +473,8 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        if getattr(args, "cache_report", False):
+                            _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -473,6 +493,9 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
+
+                                if getattr(args, "cache_report", False):
+                                    _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
                                 if not choices:
@@ -675,6 +698,13 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            if getattr(args, "cache_report", False):
+                                _meta = data.get("meta_info") or {}
+                                output.cached_tokens = _meta.get("cached_tokens", 0)
+                                output.cached_tokens_details = _meta.get(
+                                    "cached_tokens_details"
+                                )
+
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
@@ -886,40 +916,75 @@ ASYNC_REQUEST_FUNCS = {
     "truss": async_request_truss,
 }
 
+# API path appended to the base URL per backend. gserver is special (bare
+# host:port, no path) and is handled separately, so it is not listed here.
+_BACKEND_API_PATHS = {
+    "sglang": "/generate",
+    "sglang-native": "/generate",
+    "sglang-oai": "/v1/completions",
+    "sglang-oai-chat": "/v1/chat/completions",
+    "sglang-embedding": "/v1/embeddings",
+    "vllm": "/v1/completions",
+    "vllm-chat": "/v1/chat/completions",
+    "lmdeploy": "/v1/completions",
+    "lmdeploy-chat": "/v1/chat/completions",
+    "trt": "/v2/models/ensemble/generate_stream",
+    "truss": "/v1/models/model:predict",
+}
+
 
 @dataclass
 class BenchmarkMetrics:
+    # Request counts and token totals
     completed: int
     total_input: int
     total_input_text: int
     total_input_vision: int
     total_output: int
     total_output_retokenized: int
+
+    # Throughput (req/s and tok/s)
     request_throughput: float
     input_throughput: float
     output_throughput: float
     output_throughput_retokenized: float
     total_throughput: float
     total_throughput_retokenized: float
+
+    # TTFT - Time to First Token (ms)
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
+    p90_ttft_ms: float
+    p95_ttft_ms: float
     p99_ttft_ms: float
+
+    # TPOT - Time per Output Token, excluding the first token (ms)
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
+    p90_tpot_ms: float
+    p95_tpot_ms: float
     p99_tpot_ms: float
+
+    # ITL - Inter-Token Latency (ms)
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
+    p90_itl_ms: float
     p95_itl_ms: float
     p99_itl_ms: float
     max_itl_ms: float
+
+    # E2E - End-to-End request latency (ms)
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
     p90_e2e_latency_ms: float
+    p95_e2e_latency_ms: float
     p99_e2e_latency_ms: float
+
+    # Concurrency and peak metrics
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
@@ -1116,14 +1181,19 @@ def calculate_metrics(
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
+        p90_ttft_ms=np.percentile(ttfts or 0, 90) * 1000,
+        p95_ttft_ms=np.percentile(ttfts or 0, 95) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
+        p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
+        p95_tpot_ms=np.percentile(tpots or 0, 95) * 1000,
         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
         mean_itl_ms=np.mean(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
+        p90_itl_ms=np.percentile(itls or 0, 90) * 1000,
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
@@ -1131,6 +1201,7 @@ def calculate_metrics(
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
+        p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
@@ -1554,12 +1625,17 @@ async def benchmark(
         "{:<40} {:<10.2f}".format("P90 E2E Latency (ms):", metrics.p90_e2e_latency_ms)
     )
     print(
+        "{:<40} {:<10.2f}".format("P95 E2E Latency (ms):", metrics.p95_e2e_latency_ms)
+    )
+    print(
         "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
     )
     if not is_embedding:
         print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
         print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P90 TTFT (ms):", metrics.p90_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P95 TTFT (ms):", metrics.p95_ttft_ms))
         print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
         print(
             "{s:{c}^{n}}".format(
@@ -1568,13 +1644,68 @@ async def benchmark(
         )
         print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
         print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P90 TPOT (ms):", metrics.p90_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P95 TPOT (ms):", metrics.p95_tpot_ms))
         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
         print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if args.cache_report:
+        total_prompt_tokens = 0
+        total_cached = 0
+        total_device = total_host = total_storage = 0
+        storage_backend_name = None
+        has_details = False
+        for o in outputs:
+            if not o.success:
+                continue
+            total_prompt_tokens += o.prompt_len
+            total_cached += o.cached_tokens
+            if o.cached_tokens_details:
+                has_details = True
+                total_device += o.cached_tokens_details.get("device") or 0
+                total_host += o.cached_tokens_details.get("host") or 0
+                s = o.cached_tokens_details.get("storage") or 0
+                if s:
+                    total_storage += s
+                    storage_backend_name = o.cached_tokens_details.get(
+                        "storage_backend"
+                    )
+        hit_rate = (
+            total_cached / total_prompt_tokens * 100 if total_prompt_tokens > 0 else 0.0
+        )
+
+        print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
+        print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
+        print("{:<40} {:<10}".format("Total cached tokens:", total_cached))
+        if has_details and total_cached > 0:
+            print("{:<40} {:<10}".format("  Device:", total_device))
+            print("{:<40} {:<10}".format("  Host:", total_host))
+            if total_storage > 0:
+                label = (
+                    f"  Storage ({storage_backend_name}):"
+                    if storage_backend_name
+                    else "  Storage:"
+                )
+                print("{:<40} {:<10}".format(label, total_storage))
+        print("{:<40} {:.1f}%".format("Cache hit rate:", hit_rate))
+        if has_details and total_cached > 0:
+            device_pct = total_device / total_cached * 100
+            host_pct = total_host / total_cached * 100
+            print("{:<40} {:.1f}%".format("  Device:", device_pct))
+            print("{:<40} {:.1f}%".format("  Host:", host_pct))
+            if total_storage > 0:
+                storage_pct = total_storage / total_cached * 100
+                label = (
+                    f"  Storage ({storage_backend_name}):"
+                    if storage_backend_name
+                    else "  Storage:"
+                )
+                print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
     resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
@@ -1614,18 +1745,24 @@ async def benchmark(
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
             "p90_e2e_latency_ms": metrics.p90_e2e_latency_ms,
+            "p95_e2e_latency_ms": metrics.p95_e2e_latency_ms,
             "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
             "std_ttft_ms": metrics.std_ttft_ms,
+            "p90_ttft_ms": metrics.p90_ttft_ms,
+            "p95_ttft_ms": metrics.p95_ttft_ms,
             "p99_ttft_ms": metrics.p99_ttft_ms,
             "mean_tpot_ms": metrics.mean_tpot_ms,
             "median_tpot_ms": metrics.median_tpot_ms,
             "std_tpot_ms": metrics.std_tpot_ms,
+            "p90_tpot_ms": metrics.p90_tpot_ms,
+            "p95_tpot_ms": metrics.p95_tpot_ms,
             "p99_tpot_ms": metrics.p99_tpot_ms,
             "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
             "std_itl_ms": metrics.std_itl_ms,
+            "p90_itl_ms": metrics.p90_itl_ms,
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
@@ -1633,6 +1770,17 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+
+        if args.cache_report:
+            result["cache_report"] = {
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_cached_tokens": total_cached,
+                "cache_hit_rate_pct": round(hit_rate, 2),
+                "device_cached_tokens": total_device if has_details else None,
+                "host_cached_tokens": total_host if has_details else None,
+                "storage_cached_tokens": (total_storage if total_storage > 0 else None),
+                "storage_backend": storage_backend_name,
+            }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1663,6 +1811,12 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+
+    if args.cache_report:
+        result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
+        result_details["cached_tokens_details"] = [
+            o.cached_tokens_details for o in outputs
+        ]
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -1739,6 +1893,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
 
+    if not hasattr(args, "cache_report"):
+        args.cache_report = False
+
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
 
@@ -1752,6 +1909,13 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    if args.cache_report:
+        sglang_backends = ("sglang", "sglang-native", "sglang-oai", "sglang-oai-chat")
+        if args.backend not in sglang_backends:
+            print("WARNING: --cache-report is only supported with sglang backends.")
+        elif args.backend in ("sglang-oai", "sglang-oai-chat"):
+            extra_request_body["return_cached_tokens_details"] = True
 
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):
@@ -1776,59 +1940,22 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
-    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
-    if not args.base_url:
-        _na = NetworkAddress(args.host, args.port)
-        _host_base = _na.to_url()
-    else:
-        _na = None
-        _host_base = None
+    # Base URL the client sends to: --base-url if given, else http://host:port
+    # (IPv6-correct). gserver uses the scheme-less host:port form instead.
+    base_url = resolve_base_url(args.base_url, args.host, args.port)
 
-    model_url = (
-        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
-    )
+    model_url = f"{base_url}/v1/models"
 
-    if args.backend == "sglang-embedding":
-        api_url = (
-            f"{args.base_url}/v1/embeddings"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/embeddings"
-        )
-    elif args.backend in ["sglang", "sglang-native"]:
-        api_url = (
-            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
-        )
-    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = (
-            f"{args.base_url}/v1/completions"
-            if args.base_url
-            else f"{_host_base}/v1/completions"
-        )
-    elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
-        api_url = (
-            f"{args.base_url}/v1/chat/completions"
-            if args.base_url
-            else f"{_host_base}/v1/chat/completions"
-        )
-    elif args.backend == "trt":
-        api_url = (
-            f"{args.base_url}/v2/models/ensemble/generate_stream"
-            if args.base_url
-            else f"{_host_base}/v2/models/ensemble/generate_stream"
-        )
-        if args.model is None:
-            print("Please provide a model using `--model` when using `trt` backend.")
-            sys.exit(1)
-    elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else _na.to_host_port_str()
+    if args.backend == "gserver":
+        # gRPC server takes a bare host:port, not an http URL.
+        api_url = resolve_host_port(args.base_url, args.host, args.port)
         args.model = args.model or "default"
-    elif args.backend == "truss":
-        api_url = (
-            f"{args.base_url}/v1/models/model:predict"
-            if args.base_url
-            else f"{_host_base}/v1/models/model:predict"
-        )
-    base_url = _host_base if args.base_url is None else args.base_url
+    else:
+        api_url = f"{base_url}{_BACKEND_API_PATHS[args.backend]}"
+
+    if args.backend == "trt" and args.model is None:
+        print("Please provide a model using `--model` when using `trt` backend.")
+        sys.exit(1)
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
@@ -1892,7 +2019,20 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.served_model_name or args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer_id = args.tokenizer
+    if tokenizer_id is None:
+        try:
+            resp = requests.get(
+                base_url + "/model_info", headers=get_auth_headers(), timeout=5
+            )
+            if resp.status_code == 200:
+                info = resp.json()
+                tokenizer_id = info.get("tokenizer_path") or info.get("model_path")
+        except Exception:
+            pass
+    if tokenizer_id is None:
+        tokenizer_id = args.model
+
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
@@ -2207,7 +2347,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Return routed experts.",
     )
-    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+    parser.add_argument(
+        "--cache-report",
+        action="store_true",
+        help="Collect and display cache hit statistics after the benchmark. "
+        "Supported with sglang backends (native, oai, oai-chat).",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
