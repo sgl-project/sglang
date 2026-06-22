@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
     recv_from_rpc: Optional[zmq.Socket]
@@ -62,8 +62,8 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
+    skip_shm_flush: Callable[[], bool] = lambda: False
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
-    skip_shm_flush: bool = False
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -219,7 +219,7 @@ class SchedulerRequestReceiver:
         # Unwrap shared memory features AFTER all broadcasts complete,
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
-        if self.skip_shm_flush:
+        if self.skip_shm_flush():
             return
         if recv_reqs:
             # Barrier for the non-DP-attention path only: there is a single

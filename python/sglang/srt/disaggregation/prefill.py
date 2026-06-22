@@ -501,35 +501,38 @@ class SchedulerDisaggregationPrefillMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
-        from concurrent.futures import ThreadPoolExecutor
-
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
-        mm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mm_proc")
+        # Only multimodal models benefit from pipelining mm_inputs processing
+        # with GPU forward; text-only requests keep the plain synchronous path.
+        pipeline_mm = self.model_config.is_multimodal
+        if pipeline_mm:
+            from concurrent.futures import ThreadPoolExecutor
 
-        self._skip_recv_shm_flush = True
-        self.request_receiver.skip_shm_flush = True
-
-        prev_recv_reqs = None
-        prev_mm_future = None
-        prev_mm_indices = None
+            mm_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mm_proc"
+            )
+            self._skip_recv_shm_flush = True
+            prev_recv_reqs = prev_mm_future = prev_mm_indices = None
 
         while True:
-            if prev_recv_reqs is not None:
+            if pipeline_mm and prev_recv_reqs is not None:
                 self._collect_mm_results_and_dispatch(
                     prev_recv_reqs, prev_mm_future, prev_mm_indices
                 )
-                prev_recv_reqs = None
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
-            self._flush_oldest_shm_generation()
 
-            prev_mm_future, prev_mm_indices = self._submit_mm_processing(
-                mm_executor, recv_reqs
-            )
-            prev_recv_reqs = recv_reqs
+            if pipeline_mm:
+                self._flush_oldest_shm_generation()
+                prev_mm_future, prev_mm_indices = self._submit_mm_processing(
+                    mm_executor, recv_reqs
+                )
+                prev_recv_reqs = recv_reqs
+            else:
+                self.process_input_requests(recv_reqs)
 
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()

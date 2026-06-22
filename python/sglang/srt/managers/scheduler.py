@@ -1740,6 +1740,7 @@ class Scheduler(
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
+            skip_shm_flush=lambda: self._skip_recv_shm_flush,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
