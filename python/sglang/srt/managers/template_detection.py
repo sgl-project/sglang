@@ -278,14 +278,10 @@ def _is_lfm2(ctx):
 
 
 def _is_step3p5(ctx):
-    return (
-        ctx.has_pattern(r"Step-?3(?:\.|p)?[57]", re.IGNORECASE)
-        or ctx.has_pattern(r"step3p[57]", re.IGNORECASE)
-        or (
-            ctx.has_text("reasoning_effort")
-            and ctx.has_text("Reasoning: ")
-            and _is_qwen3_coder(ctx)
-        )
+    return ctx.has_pattern(r"Step-?3(?:\.|p)?[57]", re.IGNORECASE) or (
+        ctx.has_text("reasoning_effort")
+        and ctx.has_text("Reasoning: ")
+        and _is_qwen3_coder(ctx)
     )
 
 
