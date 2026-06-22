@@ -246,7 +246,7 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
@@ -267,7 +267,21 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
+        # NIXL's nixlAgent is not thread-safe by default. We drive a single
+        # agent from several of our own threads -- the transfer_worker pool
+        # calls agent.check_xfer_state()/get_xfer_status() (reads the internal
+        # remote-agent map) while the bootstrap thread calls
+        # agent.add_remote_agent() (writes that map).
+        #
+        # NIXL only auto-enables locking when it starts its
+        # own communication thread, i.e. when its etcd metadata transport
+        # (NIXL_ETCD_ENDPOINTS) or TCP listener is in use, not when we handle
+        # our own communication.
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=num_threads,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+        )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
