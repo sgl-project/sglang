@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
+    ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -2642,6 +2643,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        # Stop the watchdog: child exits are expected during shutdown, not crashes.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        # Ask schedulers to release resources in userspace and exit (see
+        # ShutdownReq), then wait for them before hard-killing the rest.
+        self.send_to_scheduler.send_pyobj(ShutdownReq())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
