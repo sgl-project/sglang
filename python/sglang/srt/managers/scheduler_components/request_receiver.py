@@ -219,8 +219,6 @@ class SchedulerRequestReceiver:
         # Unwrap shared memory features AFTER all broadcasts complete,
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
-        # When skip_shm_flush is set (pipelined prefill), the bg thread
-        # handles SHM unwrap instead — skip both barrier and unwrap here.
         if self.skip_shm_flush:
             return
         if recv_reqs:

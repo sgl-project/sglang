@@ -989,7 +989,6 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
-        # -- Pipelined mm processing state (used by overlap_disagg_prefill) --
         self._skip_recv_shm_flush: bool = False
         self._pending_shm_unlinks: List[str] = []
         self._shm_unlink_generations: deque = deque()
@@ -1986,8 +1985,6 @@ class Scheduler(
             req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
         return True
 
-    # ── Pipelined mm processing helpers (overlap_disagg_prefill) ──────────
-
     def _flush_pending_shm_unlinks(self):
         if self._pending_shm_unlinks:
             for name in self._pending_shm_unlinks:
@@ -1995,24 +1992,17 @@ class Scheduler(
             self._pending_shm_unlinks.clear()
 
     def _rotate_shm_generation(self):
-        """Move pending SHM names into the generation queue."""
         if self._pending_shm_unlinks:
             self._shm_unlink_generations.append(list(self._pending_shm_unlinks))
             self._pending_shm_unlinks.clear()
 
     def _flush_oldest_shm_generation(self):
-        """Unlink the oldest SHM generation if we have >= 2 queued.
-
-        Must be called after a cross-rank sync point (e.g. Gloo broadcast)
-        to ensure all TP ranks have finished reading those SHM blocks.
-        """
         if len(self._shm_unlink_generations) >= 2:
             old_names = self._shm_unlink_generations.popleft()
             for name in old_names:
                 ShmPointerMMData.unlink_shm(name)
 
     def _extract_mm_inputs(self, recv_reqs):
-        """Extract mm_inputs from recv_reqs for background processing."""
         mm_req_indices = []
         mm_inputs_list = []
         for i, req in enumerate(recv_reqs):
@@ -2025,13 +2015,6 @@ class Scheduler(
         return mm_req_indices, mm_inputs_list
 
     def _batch_process_mm_inputs_bg(self, mm_inputs_list):
-        """Background thread: convert raw mm_inputs and unwrap SHM.
-
-        Runs in a ThreadPoolExecutor. No Gloo calls — only CPU work whose
-        GIL is released during tensor clone(). SHM names to unlink are
-        returned to the main thread to avoid mutating shared scheduler
-        state from the bg thread.
-        """
         results = []
         all_shm_names: List[str] = []
         is_entry_rank = self.ps.tp_rank == 0
@@ -2047,7 +2030,6 @@ class Scheduler(
         return results, all_shm_names
 
     def _submit_mm_processing(self, executor, recv_reqs):
-        """Submit mm_inputs to the background thread pool."""
         mm_req_indices, mm_inputs_list = self._extract_mm_inputs(recv_reqs)
         if mm_inputs_list:
             mm_future = executor.submit(
@@ -2059,12 +2041,6 @@ class Scheduler(
         return mm_future, mm_req_indices
 
     def _collect_mm_results_and_dispatch(self, recv_reqs, mm_future, mm_indices):
-        """Wait for bg mm thread, attach results to requests, then dispatch.
-
-        SHM names collected by the bg thread are appended to
-        ``_pending_shm_unlinks`` here on the main thread — keeping all
-        mutation of that list single-threaded.
-        """
         if mm_future is not None:
             mm_results, shm_names = mm_future.result()
             for idx, result in zip(mm_indices, mm_results):
@@ -2265,7 +2241,6 @@ class Scheduler(
                 return
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            # Use pre-processed result from pipelined bg thread if available.
             image_inputs = getattr(recv_req, "_bg_mm_result", None)
             if image_inputs is None:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)

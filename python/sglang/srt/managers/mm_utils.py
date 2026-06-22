@@ -1689,12 +1689,10 @@ class ShmPointerMMData:
         return tensor
 
     def read_tensor(self) -> torch.Tensor:
-        """Clone tensor from SHM without unlinking the block."""
         return self.tensor.clone()
 
     @staticmethod
     def unlink_shm(shm_name: str):
-        """Unlink a SHM block by name. Safe to call if already unlinked."""
         try:
             shm = shared_memory.SharedMemory(name=shm_name)
             shm.close()
@@ -1712,11 +1710,6 @@ class ShmPointerMMData:
 def materialize_shm_in_mm_inputs(
     mm_input: Optional["MultimodalInputs"],
 ) -> List[str]:
-    """Replace ShmPointerMMData references with real tensors (in-place).
-
-    Returns the list of shm_name strings so the caller can defer unlinking
-    until all readers have finished.
-    """
     if mm_input is None:
         return []
     shm_names: List[str] = []
@@ -1734,7 +1727,6 @@ def materialize_shm_in_mm_inputs(
                         materialized.append(elem.read_tensor())
                     else:
                         materialized.append(elem)
-                # Preserve the original container type (e.g. tuple).
                 setattr(item, field, type(val)(materialized))
     return shm_names
 
