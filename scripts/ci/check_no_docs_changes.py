@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Reject staged changes under the legacy docs/ tree."""
+"""Reject newly added or modified files under the legacy docs/ tree.
+
+The legacy Sphinx docs/ tree has been removed; documentation now lives under
+docs_new/ (Mintlify). This guard keeps it from being recreated: adding or
+editing any docs/ path fails. Deletions (and renames out of docs/) are allowed
+so cleanup of any leftover files stays unblocked.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +13,11 @@ import subprocess
 import sys
 
 ERROR_MESSAGE = """\
-Changes under the legacy docs/ directory are not allowed.
+The legacy docs/ directory has been removed; adding or editing files there is
+not allowed.
 
-The documentation has been migrated. Please make documentation updates in the
-corresponding location under docs_new/ instead.
+Please make documentation updates under docs_new/ instead.
 """
-
-LEGACY_DOCS_ALLOWLIST = {
-    "docs/_static/css/custom_log.css",
-    "docs/_static/js/deprecation_banner.js",
-    "docs/conf.py",
-    # Has relative links into the source tree that the offline lychee check
-    # validates, so it must be updated when the linked source files move.
-    "docs/developer_guide/development_jit_kernel_guide.md",
-}
 
 
 def staged_paths() -> list[str]:
@@ -30,7 +27,8 @@ def staged_paths() -> list[str]:
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACMRDTUXB",
+            "--no-renames",
+            "--diff-filter=ACM",
         ],
         check=True,
         capture_output=True,
@@ -42,17 +40,14 @@ def staged_paths() -> list[str]:
 def main() -> int:
     paths = sys.argv[1:] or staged_paths()
     docs_paths = sorted(
-        path
-        for path in paths
-        if (path == "docs" or path.startswith("docs/"))
-        and path not in LEGACY_DOCS_ALLOWLIST
+        path for path in paths if path == "docs" or path.startswith("docs/")
     )
 
     if not docs_paths:
         return 0
 
     print(ERROR_MESSAGE, file=sys.stderr)
-    print("Detected legacy docs/ changes:", file=sys.stderr)
+    print("Detected new or modified legacy docs/ paths:", file=sys.stderr)
     for path in docs_paths:
         print(f"  - {path}", file=sys.stderr)
     return 1
