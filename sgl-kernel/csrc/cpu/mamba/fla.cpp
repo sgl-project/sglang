@@ -1059,6 +1059,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
       // move to the next index
       data_index_step(bs, num_seqs, hv, Hv);
     }
+    at::native::cpublas::brgemm_release();
   });
 }
 
@@ -1535,6 +1536,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
       case 128:
         LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTER_KERNEL(128);
         break;
+      default:
+        TORCH_CHECK(false, "Unexpected head dim size, ", D);
     }
   });
 
