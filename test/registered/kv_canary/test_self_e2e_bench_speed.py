@@ -7,13 +7,13 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
 
-from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.server_args import ServerArgs
-from sglang.test.bench_one_batch_server_internal import (
+from sglang.bench_one_batch_server import (
     BenchArgs,
     BenchOneCaseResult,
     run_benchmark_internal,
 )
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 

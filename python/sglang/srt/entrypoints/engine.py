@@ -42,9 +42,6 @@ from typing import (
     Union,
 )
 
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
 import multiprocessing as mp
 
 import torch
@@ -1404,7 +1401,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.3",
+                "0.4.4",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
