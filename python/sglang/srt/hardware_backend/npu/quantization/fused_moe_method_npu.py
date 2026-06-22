@@ -239,7 +239,10 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-        if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
+        if (
+            hidden_states.dtype == torch.bfloat16 
+            or hidden_states.dtype == torch.float16
+        ):
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
             )
@@ -343,7 +346,10 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-        if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
+        if (
+            hidden_states.dtype == torch.bfloat16 
+            or hidden_states.dtype == torch.float16
+        ):
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
             )
@@ -490,7 +496,10 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-        if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
+        if (
+            hidden_states.dtype == torch.bfloat16 
+            or hidden_states.dtype == torch.float16
+        ):
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
             )
