@@ -110,7 +110,7 @@ class CausalSelfAttentionKVCache:
         Args:
             current_chunk_start: the global position of the start of the chunk
             cache_head_start: first cache head for key/value when they only
-                carry a slice of the cache heads; other heads are left untouched
+                carry a local slice of the cache heads; other heads are left untouched
 
         """
         num_new_tokens = key.shape[1]
