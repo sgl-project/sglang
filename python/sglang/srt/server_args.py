@@ -3922,7 +3922,11 @@ class ServerArgs:
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only and not self.language_model_only:
+            if (
+                model_config.is_multimodal
+                and not self.language_only
+                and not self.language_model_only
+            ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB

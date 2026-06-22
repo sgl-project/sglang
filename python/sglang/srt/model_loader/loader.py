@@ -328,9 +328,7 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
     # Strip multimodal components after weight loading for loaders that bypass
     # the DefaultModelLoader path (dummy, sharded state, remote, etc.).
-    if hasattr(model, "config") and getattr(
-        model.config, "language_model_only", False
-    ):
+    if hasattr(model, "config") and getattr(model.config, "language_model_only", False):
         _strip_multimodal_components(model)
 
 
