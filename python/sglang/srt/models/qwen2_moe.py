@@ -207,6 +207,27 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # FP8 quant fusion (port of #28327): when down_proj runs as online w8a8 FP8
+        # (e.g. the SGLANG_QUARK_DENSE_FP8 dense-fp8 path), fuse SiluAndMul + the
+        # per-token activation quant into one aiter kernel (silu_and_mul_quant) and
+        # feed the pre-quantized (fp8, scale) tuple straight to down_proj, dropping
+        # the standalone activation quant. Aiter-only and env-gated; default off.
+        self._fp8_silu_fuse = False
+        if _use_aiter and get_bool_env_var("SGLANG_MLP_FP8_SILU_FUSE", "False"):
+            quant_method = getattr(self.down_proj, "quant_method", None)
+            # Only fuse when down_proj is the aiter per-token a8w8 FP8 path: the
+            # pre-quantized (fp8, scale) tuple requires the gemm_a8w8_bpreshuffle
+            # path (use_per_token_if_dynamic + pre-shuffled weight); otherwise it
+            # would hit the NotImplementedError guard in apply_fp8_linear. We gate
+            # on use_aiter_fp8_per_token (set in Fp8LinearMethod.__init__) rather
+            # than use_per_token_if_dynamic, because the latter is only set later
+            # in process_weights_after_loading (after this __init__ runs). When the
+            # env is unset we silently fall back to the unfused path.
+            self._fp8_silu_fuse = type(
+                quant_method
+            ).__name__ == "Fp8LinearMethod" and getattr(
+                quant_method, "use_aiter_fp8_per_token", False
+            )
 
     def forward(
         self,
@@ -215,6 +236,20 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fp8_silu_fuse and gate_up.shape[0] > 0:
+            import aiter
+            from aiter import dtypes
+
+            M = gate_up.shape[0]
+            N = gate_up.shape[-1] // 2
+            out_fp8 = torch.empty((M, N), dtype=dtypes.fp8, device=gate_up.device)
+            scale = torch.empty((M, 1), dtype=torch.float32, device=gate_up.device)
+            aiter.silu_and_mul_quant(out_fp8, gate_up, scale, N)
+            x, _ = self.down_proj(
+                (out_fp8, scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
