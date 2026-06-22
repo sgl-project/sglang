@@ -42,17 +42,6 @@ class _VirtualNode:
     pass
 
 
-def _new_cache() -> ReqCacheInfo:
-    from sglang.srt.managers.schedule_batch import ReqCacheInfo
-
-    return ReqCacheInfo(
-        cache_protected_len=0,
-        last_node=None,
-        swa_uuid_for_lock=None,
-        swa_prefix_lock_released=False,
-    )
-
-
 def _new_kv() -> ReqKvInfo:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 
@@ -81,7 +70,7 @@ class SessionSlot:
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
 
-    cache: ReqCacheInfo = field(default_factory=_new_cache)
+    cache: Optional[ReqCacheInfo] = None
     kv: ReqKvInfo = field(default_factory=_new_kv)
     mamba: ReqMambaInfo = field(default_factory=_new_mamba)
 
@@ -98,6 +87,7 @@ class SessionSlot:
 
         if is_first:
             self.cache = copy.copy(req.cache)
+            req.cache = None
 
         self.mamba = copy.copy(req.mamba)
 
@@ -321,6 +311,7 @@ class StreamingSession(BasePrefixCache):
             )
             self.release_session(session_id)
             req.req_pool_idx = None
+            req.cache = None
             req.session.abort_req()
             return True
 
@@ -401,8 +392,14 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
-        protected_len = slot.cache.cache_protected_len
-        lock_node = slot.cache.last_node
+        if slot.cache is not None:
+            protected_len = slot.cache.cache_protected_len
+            lock_node = slot.cache.last_node
+            swa_uuid_for_lock = slot.cache.swa_uuid_for_lock
+        else:
+            protected_len = 0
+            lock_node = None
+            swa_uuid_for_lock = None
         tokens_freed = (
             max(0, slot.kv.kv_allocated_len - protected_len)
             if slot.is_holding_kv
@@ -413,10 +410,10 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.cache.swa_uuid_for_lock is not None:
+            if swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
                     lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.cache.swa_uuid_for_lock),
+                    DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock),
                 )
             else:
                 self.inner.dec_lock_ref(lock_node)

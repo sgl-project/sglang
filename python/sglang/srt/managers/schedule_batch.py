@@ -869,12 +869,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache: ReqCacheInfo = ReqCacheInfo(
-            cache_protected_len=0,
-            last_node=None,
-            swa_uuid_for_lock=None,
-            swa_prefix_lock_released=False,
-        )
+        self.cache: Optional[ReqCacheInfo] = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1070,7 +1065,7 @@ class Req(ReqDllmMixin):
 
     @property
     def cache_protected_len(self) -> int:
-        return self.cache.cache_protected_len
+        return self.cache.cache_protected_len if self.cache is not None else 0
 
     @cache_protected_len.setter
     def cache_protected_len(self, value: int) -> None:
@@ -1250,6 +1245,13 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
+            if self.cache is None:
+                self.cache = ReqCacheInfo(
+                    cache_protected_len=0,
+                    last_node=None,
+                    swa_uuid_for_lock=None,
+                    swa_prefix_lock_released=False,
+                )
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1529,11 +1531,8 @@ class Req(ReqDllmMixin):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
-        self.last_node = None
-        self.cache_protected_len = 0
+        self.cache = None
         self.num_matched_prefix_tokens = 0
-        self.swa_uuid_for_lock = None
-        self.swa_prefix_lock_released = False
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -2962,6 +2961,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # evictable so SWA LRU can reclaim it under pressure.
                     if (
                         release_leaf_lock
+                        and req.cache is not None
                         and not req.swa_prefix_lock_released
                         and req.swa_uuid_for_lock is not None
                         and req.last_node is not None
