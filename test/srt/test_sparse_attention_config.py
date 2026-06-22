@@ -47,7 +47,9 @@ class TestSparseAttentionConfig(unittest.TestCase):
 
     def test_nested_algorithm_config(self):
         config = parse_sparse_attention_config(
-            _server_args('{"algorithm":"quest","algorithm_config":{"sparsity_ratio":0.3}}')
+            _server_args(
+                '{"algorithm":"quest","algorithm_config":{"sparsity_ratio":0.3}}'
+            )
         )
         self.assertEqual(config.sparse_extra_config["sparsity_ratio"], 0.3)
 
@@ -62,7 +64,9 @@ class TestSparseAttentionConfig(unittest.TestCase):
 
     def test_unknown_algorithm_rejected_at_parse(self):
         with self.assertRaises(ValueError):
-            parse_sparse_attention_config(_server_args('{"algorithm":"does_not_exist"}'))
+            parse_sparse_attention_config(
+                _server_args('{"algorithm":"does_not_exist"}')
+            )
 
     def test_unsupported_backend_rejected(self):
         with self.assertRaises(ValueError):

@@ -31,9 +31,7 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         adaptor = FlashAttentionAdaptor(dev)
         page_size = 1
         # request 0 tokens at slots 0..3, request 1 at slots 10..13
-        req_to_token = torch.tensor(
-            [[0, 1, 2, 3], [10, 11, 12, 13]], dtype=torch.int64
-        )
+        req_to_token = torch.tensor([[0, 1, 2, 3], [10, 11, 12, 13]], dtype=torch.int64)
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
         seq_lens = torch.tensor([4, 4], dtype=torch.int64)
         page_table = torch.tensor([[0, 1, 2, 3], [10, 11, 12, 13]], dtype=torch.int32)

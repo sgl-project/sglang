@@ -165,9 +165,7 @@ def parse_sparse_attention_config(server_args) -> SparseConfig:
 
     sparsity_ratio = extra.get("sparsity_ratio")
     if sparsity_ratio is not None and not 0.0 <= float(sparsity_ratio) < 1.0:
-        raise ValueError(
-            f"sparsity_ratio must be in [0, 1), got {sparsity_ratio}"
-        )
+        raise ValueError(f"sparsity_ratio must be in [0, 1), got {sparsity_ratio}")
 
     return SparseConfig(
         top_k=top_k,

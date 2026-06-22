@@ -35,7 +35,6 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -53,6 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.server_args import ServerArgs
 
@@ -70,7 +70,7 @@ class SchedulerBatchResultProcessor:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
-    sparse_coordinator: Optional["SparseCoordinator"]
+    sparse_coordinator: Optional[SparseCoordinator]
     req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
