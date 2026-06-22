@@ -57,8 +57,7 @@ from sglang.test.test_utils import (
 # ---------------------------------------------------------------------------
 register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
 
-DEEPSEEK_V31_MODEL_PATH = "/home/local/workspace/models/DeepSeek-V3.1"
-# DEEPSEEK_V31_MODEL_PATH = "/home/local/workspace/models/moonshotai/Moonlight-16B-A3B-Instruct"
+DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 _COMMON_SERVER_ARGS = [
     "--tp",
