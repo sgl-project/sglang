@@ -28,6 +28,7 @@ register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakableCUDAGraphBasic(CustomTestCase):
     """Test basic breakable CUDA graph capture and replay."""
 
@@ -267,6 +268,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestCopyOutput(CustomTestCase):
     """Test the _copy_output helper for structured output writeback."""
 
@@ -325,6 +327,7 @@ class TestCopyOutput(CustomTestCase):
         self.assertEqual(result, 99)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakGraphHelper(CustomTestCase):
     """Test the break_graph() convenience function."""
 
@@ -363,6 +366,7 @@ class TestBreakGraphHelper(CustomTestCase):
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBreakableCudaGraph(CustomTestCase):
     """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
 
