@@ -295,7 +295,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
             if (
                 fused_rope_qk_mqa is not None
-                and query.shape[0] * query.shape[1] < 65535
+                and query.shape[0] < 65535
             ):
                 return fused_rope_qk_mqa(
                     query,
