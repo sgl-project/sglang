@@ -145,9 +145,8 @@ jobs:
             echo "Begin ($i/$total): python3 $cmd"
             echo "."
             file_start=$SECONDS
-            # base-a runs the fwd-occupancy sanity kit, whose async-assert probes
-            # skew the measurement; match _pr-test-stage.yml's base-a carve-out
-            # and turn them off. Other stages keep the top-level env default (on).
+            # base-a perf tests (fwd_occupancy) need async assert off; match
+            # _pr-test-stage.yml's base-a carve-out.
             test_file="${cmd%% *}"
             test_file="${test_file%%::*}"
             async_assert=true
