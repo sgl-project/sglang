@@ -59,9 +59,6 @@ class HashTopK(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
-        self.apply_routed_scaling_factor_on_output = (
-            apply_routed_scaling_factor_on_output
-        )
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
