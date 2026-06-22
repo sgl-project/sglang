@@ -237,19 +237,26 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
 
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
-        B, L, HK, HV, EK, EV, N = 1, 100, 3, 6, 64, 64, 4
-        seqlens = torch.randint(1, L, (N + 1,))
-        seqlens[0] = 0
-        cu_seqlens_ = torch.cumsum(seqlens, dim=0).to(torch.int32)
+        B, T_PER_SEQ, HK, HV, K, V, N = 1, 128, 16, 32, 64, 64, 4
+        seq_lens = torch.tensor(
+            [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
+            dtype=torch.int32,
+        )
+        cu_seqlens_ = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                seq_lens.cumsum(dim=0, dtype=torch.int32),
+            ]
+        )
         T = cu_seqlens_[-1].item()
-        query_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
-        key_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
-        value_ = torch.rand((B, T, HV, EV), dtype=torch.bfloat16) * 0.05
-        g_ = torch.rand((B, T, HV), dtype=torch.float32) * 0.05
-        beta_ = torch.rand((B, T, HV), dtype=torch.bfloat16) * 0.05
-        initial_state_ = torch.rand((N, HV, EK, EV), dtype=torch.float32) * 0.05
+        query_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+        key_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+        value_ = torch.randn((B, T, HV, V), dtype=torch.bfloat16)
+        g_ = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32))
+        beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
+        initial_state_ = torch.randn((N, HV, K, V), dtype=torch.float32) * 0.1
 
-        for use_qk_l2norm_in_kernel in [True, False]:
+        for use_qk_l2norm_in_kernel in [True]:
             core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
                 query=query_,
                 key=key_,

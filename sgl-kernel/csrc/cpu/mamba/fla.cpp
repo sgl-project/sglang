@@ -2537,7 +2537,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, Dv, D}, at::kFloat);
 
   constexpr int CHUNK_SIZE = 64;
-  bool debug = false;
+  bool debug = true;
 
   // prepare chunk indices
   auto [chunk_indices, chunk_offsets] = prepare_chunk_indices<CHUNK_SIZE>(cu_seqlens);
