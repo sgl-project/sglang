@@ -82,6 +82,12 @@ HIGH_THROUGHPUT_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
 
+PERFORMANCE_BATCH_SIZES = {
+    "low-latency": [1, 4, 16],
+    "balanced": [64],
+    "high-throughput": [128],
+}
+
 
 class TestDeepSeekV4ProFp4(unittest.TestCase):
     """DeepSeek-V4-Pro FP4 on GB300 (4x B200 NVL4, tp=4)."""
@@ -113,19 +119,31 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
             ),
         ]
 
-        run_combined_tests(
-            models=variants,
-            test_name="DeepSeek-V4-Pro-FP4",
-            accuracy_params=AccuracyTestParams(
-                dataset="gsm8k",
-                baseline_accuracy=0.935,
-                temperature=1.0,
-                top_p=1.0,
-            ),
-            performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
-            ),
+        failures = []
+        accuracy_params = AccuracyTestParams(
+            dataset="gsm8k",
+            baseline_accuracy=0.935,
+            temperature=1.0,
+            top_p=1.0,
         )
+        for variant in variants:
+            try:
+                run_combined_tests(
+                    models=[variant],
+                    test_name=f"DeepSeek-V4-Pro-FP4 ({variant.variant})",
+                    accuracy_params=accuracy_params,
+                    performance_params=PerformanceTestParams(
+                        batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
+                        profile_dir="performance_profiles_gb300",
+                    ),
+                )
+            except AssertionError as e:
+                failures.append(f"{variant.variant}: {e}")
+
+        if failures:
+            raise AssertionError(
+                "DeepSeek-V4-Pro-FP4 failures:\n" + "\n".join(failures)
+            )
 
 
 if __name__ == "__main__":
