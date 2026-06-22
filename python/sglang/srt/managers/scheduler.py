@@ -2852,7 +2852,6 @@ class Scheduler(
                 if (
                     not added
                     and req.mamba is not None
-                    and req.mamba.mamba_pool_idx is not None
                     and not getattr(req, "session", None)
                 ):
                     self.tree_cache.req_to_token_pool.mamba_allocator.free(

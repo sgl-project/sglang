@@ -1060,7 +1060,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if cow_mamba and mamba_node.mamba_value is not None:
             from sglang.srt.managers.schedule_batch import ReqMambaInfo
 
-            if req.mamba is None or req.mamba.mamba_pool_idx is None:
+            if req.mamba is None:
                 dst_index = self._alloc_with_evict(
                     self.req_to_token_pool.mamba_allocator,
                     1,
@@ -1068,16 +1068,13 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=mamba_node,
                     error_message="Can not alloc mamba cache",
                 )
-                if req.mamba is None:
-                    req.mamba = ReqMambaInfo(
-                        mamba_pool_idx=dst_index[0],
-                        mamba_ping_pong_track_buffer=None,
-                        mamba_next_track_idx=None,
-                        mamba_last_track_seqlen=None,
-                        mamba_branching_seqlen=None,
-                    )
-                else:
-                    req.mamba.mamba_pool_idx = dst_index[0]
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=dst_index[0],
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
             req.mamba_cow_src_index = mamba_node.mamba_value
             req.mamba_needs_clear = False
 
@@ -2108,7 +2105,7 @@ class HiMambaRadixCache(MambaRadixCache):
             and last_hit_node in nodes_to_restore
             and last_hit_node.mamba_host_value is not None
         ):
-            if req.mamba is None or req.mamba.mamba_pool_idx is None:
+            if req.mamba is None:
                 from sglang.srt.managers.schedule_batch import ReqMambaInfo
 
                 new_mamba_pool_idx = self._alloc_with_evict(
@@ -2118,16 +2115,13 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=last_hit_node,
                     error_message="Cannot alloc request mamba cache for host load back",
                 )[0]
-                if req.mamba is None:
-                    req.mamba = ReqMambaInfo(
-                        mamba_pool_idx=new_mamba_pool_idx,
-                        mamba_ping_pong_track_buffer=None,
-                        mamba_next_track_idx=None,
-                        mamba_last_track_seqlen=None,
-                        mamba_branching_seqlen=None,
-                    )
-                else:
-                    req.mamba.mamba_pool_idx = new_mamba_pool_idx
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=new_mamba_pool_idx,
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
             transfers.append(
                 PoolTransfer(
                     name=PoolName.MAMBA,

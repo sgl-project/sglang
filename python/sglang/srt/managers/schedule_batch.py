@@ -701,7 +701,7 @@ class ReqKvInfo:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqMambaInfo:
-    mamba_pool_idx: Optional[torch.Tensor]  # shape (1)
+    mamba_pool_idx: torch.Tensor  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor]  # shape (2)
     mamba_next_track_idx: Optional[int]  # 0 or 1
     mamba_last_track_seqlen: Optional[int]  # seq len of the last cached mamba state

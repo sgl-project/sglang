@@ -97,7 +97,7 @@ class MambaComponent(TreeComponent):
             from sglang.srt.managers.schedule_batch import ReqMambaInfo
 
             assert req is not None
-            if req.mamba is None or req.mamba.mamba_pool_idx is None:
+            if req.mamba is None:
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     # Capture the inc result and thread swa_uuid_for_lock back
@@ -110,16 +110,13 @@ class MambaComponent(TreeComponent):
                     dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
                     assert dst_index is not None, "Can not alloc mamba cache"
-                if req.mamba is None:
-                    req.mamba = ReqMambaInfo(
-                        mamba_pool_idx=dst_index[0],
-                        mamba_ping_pong_track_buffer=None,
-                        mamba_next_track_idx=None,
-                        mamba_last_track_seqlen=None,
-                        mamba_branching_seqlen=None,
-                    )
-                else:
-                    req.mamba.mamba_pool_idx = dst_index[0]
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=dst_index[0],
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
 
@@ -432,22 +429,19 @@ class MambaComponent(TreeComponent):
             if req is not None and cd.host_value is not None:
                 from sglang.srt.managers.schedule_batch import ReqMambaInfo
 
-                if req.mamba is None or req.mamba.mamba_pool_idx is None:
+                if req.mamba is None:
                     dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     if dst is None:
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                         assert dst is not None, "Cannot alloc mamba for load_back"
-                    if req.mamba is None:
-                        req.mamba = ReqMambaInfo(
-                            mamba_pool_idx=dst[0],
-                            mamba_ping_pong_track_buffer=None,
-                            mamba_next_track_idx=None,
-                            mamba_last_track_seqlen=None,
-                            mamba_branching_seqlen=None,
-                        )
-                    else:
-                        req.mamba.mamba_pool_idx = dst[0]
+                    req.mamba = ReqMambaInfo(
+                        mamba_pool_idx=dst[0],
+                        mamba_ping_pong_track_buffer=None,
+                        mamba_next_track_idx=None,
+                        mamba_last_track_seqlen=None,
+                        mamba_branching_seqlen=None,
+                    )
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,

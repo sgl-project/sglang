@@ -94,11 +94,7 @@ class SessionSlot:
             swa_uuid_for_lock=self.locked_cache.swa_uuid_for_lock,
             swa_prefix_lock_released=False,
         )
-        req.mamba = (
-            copy.copy(self.mamba)
-            if self.mamba is not None and self.mamba.mamba_pool_idx is not None
-            else None
-        )
+        req.mamba = copy.copy(self.mamba) if self.mamba is not None else None
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -475,8 +471,7 @@ class StreamingSession(BasePrefixCache):
             )
             if in_batch or slot.mamba is None:
                 continue
-            if slot.mamba.mamba_pool_idx is not None:
-                total += slot.mamba.mamba_pool_idx.numel()
+            total += slot.mamba.mamba_pool_idx.numel()
             if slot.mamba.mamba_ping_pong_track_buffer is not None:
                 total += slot.mamba.mamba_ping_pong_track_buffer.numel()
         return total
@@ -486,12 +481,10 @@ class StreamingSession(BasePrefixCache):
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is None or slot.mamba is None:
             return
-        if slot.mamba.mamba_pool_idx is not None:
-            mamba_allocator.free(slot.mamba.mamba_pool_idx.unsqueeze(0))
-            slot.mamba.mamba_pool_idx = None
+        mamba_allocator.free(slot.mamba.mamba_pool_idx.unsqueeze(0))
         if slot.mamba.mamba_ping_pong_track_buffer is not None:
             mamba_allocator.free(slot.mamba.mamba_ping_pong_track_buffer)
-            slot.mamba.mamba_ping_pong_track_buffer = None
+        slot.mamba = None
 
     # -- Internal helpers (streaming body bits) --
 
