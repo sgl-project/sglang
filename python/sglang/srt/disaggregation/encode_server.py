@@ -317,6 +317,13 @@ class MMEncoder:
             )
         self.background_tasks: Set[asyncio.Task] = set()
 
+        # Embedding dtype = model param dtype. Always available (both transfer
+        # backends and the global-cache pool rely on it).
+        self._embedding_dtype = next(self.model.parameters()).dtype
+        self._element_size = torch.tensor(
+            [], dtype=self._embedding_dtype
+        ).element_size()
+
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
@@ -329,6 +336,7 @@ class MMEncoder:
                 hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
+                dtype=self._embedding_dtype,
             )
         else:
             self.mm_global_cache = None
@@ -336,10 +344,6 @@ class MMEncoder:
         # Pre-compute embedding metadata (needed by all ranks for mooncake)
         if self.server_args.encoder_transfer_backend == "mooncake":
             self._embedding_dims = self._infer_embedding_dims()
-            self._embedding_dtype = next(self.model.parameters()).dtype
-            self._element_size = torch.tensor(
-                [], dtype=self._embedding_dtype
-            ).element_size()
 
         if self.rank == 0:
             logger.info(

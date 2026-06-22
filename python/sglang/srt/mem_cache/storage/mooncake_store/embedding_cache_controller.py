@@ -314,13 +314,17 @@ class EmbeddingCacheController:
         all_rank_get=False,
         enable_eviction: bool = True,
         max_eviction_batch: int = 100,
+        dtype: torch.dtype = torch.float32,
     ):
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.tp_rank = tp_rank
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
-        self.dtype = torch.float32
+        # Pool dtype must match the model's embedding dtype so that pool views,
+        # ViT output, and the final send buffer share one dtype — assembly then
+        # copies without any cast. Defaults to float32 for backward compat.
+        self.dtype = dtype
         self.element_size = _dtype_element_size(self.dtype)
         self.enable_eviction = enable_eviction
         self.max_eviction_batch = max_eviction_batch
