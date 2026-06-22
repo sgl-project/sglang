@@ -277,6 +277,7 @@ class BaseMultimodalProcessor(ABC):
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                self.server_args.base_gpu_id,
             )
 
     def compute_mrope_positions(self, input_ids, mm_items):
