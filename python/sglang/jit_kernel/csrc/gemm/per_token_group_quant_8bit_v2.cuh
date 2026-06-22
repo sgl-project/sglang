@@ -222,8 +222,8 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
     const int32_t* __restrict__ masked_m,
     const int subwarps_per_block,
     const int hidden_dim_num_groups,
-    const int scale_leading_stride,
-    const int scale_secondary_stride,
+    const int scale_expert_stride,
+    const int scale_hidden_stride,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
@@ -272,8 +272,6 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
           constexpr int column_major_scale_token_stride = 1;
-          const int scale_expert_stride = scale_leading_stride;
-          const int scale_hidden_stride = scale_secondary_stride;
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
@@ -282,9 +280,11 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
                           token_idx * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
-          if (scale_leading_stride > 0) {
-            const int scale_outer_stride = scale_leading_stride;
-            const int scale_token_stride = scale_secondary_stride;
+          if (scale_expert_stride > 0) {
+            // Non-masked 3D row-major output_s uses the existing stride slots
+            // for the new outer-major layout: (outer_stride, token_stride).
+            const int scale_outer_stride = scale_expert_stride;
+            const int scale_token_stride = scale_hidden_stride;
             const int outer_idx = token_idx / num_tokens_per_expert;
             const int token_idx_in_outer = token_idx % num_tokens_per_expert;
             const int64_t scale_offset = (expert_idx + outer_idx) * scale_outer_stride +
@@ -387,8 +387,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
       dim3 block,
       int subwarps_per_block,
       int hidden_dim_num_groups,
-      int scale_leading_stride,
-      int scale_secondary_stride,
+      int scale_expert_stride,
+      int scale_hidden_stride,
       int num_tokens_per_expert,
       const void* input,
       void* output_q,
@@ -414,8 +414,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
             masked_m,
             subwarps_per_block,
             hidden_dim_num_groups,
-            scale_leading_stride,
-            scale_secondary_stride,
+            scale_expert_stride,
+            scale_hidden_stride,
             num_tokens_per_expert);
   }
 
@@ -429,8 +429,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
-      int scale_leading_stride,
-      int scale_secondary_stride,
+      int scale_expert_stride,
+      int scale_hidden_stride,
       int num_tokens_per_expert,
       const void* input,
       void* output_q,
@@ -456,8 +456,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
           block,
           subwarps_per_block,
           hidden_dim_num_groups,
-          scale_leading_stride,
-          scale_secondary_stride,
+          scale_expert_stride,
+          scale_hidden_stride,
           num_tokens_per_expert,
           input,
           output_q,
@@ -501,8 +501,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
       bool is_column_major,
       int64_t hidden_dim_num_groups,
       int64_t num_tokens_per_expert,
-      int64_t scale_leading_stride,
-      int64_t scale_secondary_stride) {
+      int64_t scale_expert_stride,
+      int64_t scale_hidden_stride) {
     const DLDevice dev = input.device();
     const void* in = input.data_ptr();
     void* oq = output_q.data_ptr();
@@ -521,8 +521,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
           static_cast<int>(num_local_experts),
           static_cast<int>(hidden_dim_num_groups),
           static_cast<int>(num_groups),
-          static_cast<int>(scale_leading_stride),
-          static_cast<int>(scale_secondary_stride),
+          static_cast<int>(scale_expert_stride),
+          static_cast<int>(scale_hidden_stride),
           static_cast<int>(num_tokens_per_expert),
           in,
           oq,

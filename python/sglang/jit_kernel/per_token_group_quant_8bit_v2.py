@@ -76,11 +76,11 @@ def _per_token_group_quant_8bit_v2_custom_op(
     hidden_dim_num_groups = output_q.shape[last] // group_size
     num_tokens_per_expert = output_q.shape[last - 1]
     if is_column_major:
-        scale_leading_stride = output_s.stride(0) if masked_layout else 0
-        scale_secondary_stride = output_s.stride(-1)
+        scale_expert_stride = output_s.stride(0) if masked_layout else 0
+        scale_hidden_stride = output_s.stride(-1)
     else:
-        scale_leading_stride = output_s.stride(-3) if output_s.dim() == 3 else 0
-        scale_secondary_stride = (
+        scale_expert_stride = output_s.stride(-3) if output_s.dim() == 3 else 0
+        scale_hidden_stride = (
             output_s.stride(-2) if output_s.dim() == 3 else output_s.stride(-1)
         )
 
@@ -99,8 +99,8 @@ def _per_token_group_quant_8bit_v2_custom_op(
         bool(is_column_major),
         int(hidden_dim_num_groups),
         int(num_tokens_per_expert),
-        int(scale_leading_stride),
-        int(scale_secondary_stride),
+        int(scale_expert_stride),
+        int(scale_hidden_stride),
     )
 
 
