@@ -93,6 +93,10 @@ class SessionSlot:
         # the req still has a ping-pong buffer and skip alloc, causing
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
+        # TODO: to form real move semantics the slot should TAKE these objects
+        # and the req side should be `req.kv = None` / `req.mamba = None` /
+        # (is_first) `req.cache = None`, instead of the copy.copy above and the
+        # field-level nulling below. Kept as-is to preserve original behavior.
         req.req_pool_idx = None
         req.kv = None
         req.mamba_pool_idx = None
@@ -299,6 +303,7 @@ class StreamingSession(BasePrefixCache):
                 )
                 self.slots[session_id] = slot
                 # the abort fall-through doesn't double-free.
+                # TODO: with real move semantics this would be `req.mamba = None`.
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
             slot.kv.kv_allocated_len = max(
