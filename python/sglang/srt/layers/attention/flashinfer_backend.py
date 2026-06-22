@@ -1793,21 +1793,22 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
-        # When this wrapper uses fast_prefill_plan, hand it the host-known layout:
-        # draft-extend has a constant qo (num_tokens_per_req per req) and a host kv
-        # length (seq_lens_cpu). Otherwise fall through to the plain D2H plan().
+        # fast_prefill_plan (installed at capture) is sync-free: it needs the
+        # host-known qo/kv layout from the caller. Assert rather than silently
+        # fall back to plan()'s blocking D2H on the replay hot-path.
         paged_plan_kwargs = {}
         num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
         uses_fast_prefill = (
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
-        if (
-            uses_fast_prefill
-            and seq_lens_cpu is not None
-            and num_tokens_per_req is not None
-            and num_tokens_per_req > 0
-        ):
+        if uses_fast_prefill:
+            assert (
+                seq_lens_cpu is not None
+            ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+            assert (
+                num_tokens_per_req is not None and num_tokens_per_req > 0
+            ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
