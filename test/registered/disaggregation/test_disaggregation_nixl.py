@@ -8,6 +8,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k_eval
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -19,10 +20,13 @@ from sglang.test.server_fixtures.disaggregation_utils import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
+    popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=520, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=700, stage="base-c", runner_config="8-gpu-h20")
+#stage-c required for RDMA 
 
 
 def _nixl_backend_config(backend, backend_params_json):
@@ -89,11 +93,69 @@ def _require_configured_nixl_backend():
 _HAS_CONFIGURED_NIXL_BACKEND = is_in_ci() or _has_configured_nixl_backend()
 
 
+class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
+    prefill_tp_size = 4
+    decode_tp_size = 4
+    decode_base_gpu_id = 4
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            str(cls.prefill_tp_size),
+        ] + list(cls.extra_prefill_args)
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=dict(cls.extra_prefill_env),
+            return_stdout_stderr=(
+                (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            str(cls.decode_tp_size),
+            "--base-gpu-id",
+            str(cls.decode_base_gpu_id),
+        ] + list(cls.extra_decode_args)
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+            env=dict(cls.extra_decode_env),
+            return_stdout_stderr=(
+                (cls._decode_stdout_buf, cls._decode_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
+        )
+
+
 @unittest.skipUnless(
     _HAS_CONFIGURED_NIXL_BACKEND,
     "NIXL with the configured backend is required for this test.",
 )
-class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
+class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
     """Small NIXL PD E2E coverage.
 
     Mooncake already owns the broad disaggregation functional matrix in
@@ -156,7 +218,47 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
     _HAS_CONFIGURED_NIXL_BACKEND,
     "NIXL with the configured backend is required for this test.",
 )
-class TestDisaggregationNixlFailure(PDDisaggregationServerBase):
+class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        _require_configured_nixl_backend()
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        configure_nixl_pd_backend(cls)
+        cls.launch_all()
+
+    def test_gsm8k_accuracy(self):
+        args = SimpleNamespace(
+            host=self.base_host,
+            port=int(self.lb_port),
+            num_questions=200,
+            num_shots=5,
+            data_path=None,
+            max_new_tokens=512,
+            parallel=128,
+            temperature=0.0,
+        )
+
+        metrics = run_few_shot_gsm8k_eval(args)
+        self.assertGreaterEqual(
+            metrics["accuracy"],
+            0.90,
+            f"Expected NIXL PD transfer to preserve GSM8K accuracy, got {metrics}",
+        )
+        self.assertEqual(
+            metrics["invalid"], 0.0, f"Unexpected invalid outputs: {metrics}"
+        )
+
+        assert_process_healthy(self, "load balancer", self.process_lb, self.lb_url)
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
+@unittest.skipUnless(
+    _HAS_CONFIGURED_NIXL_BACKEND,
+    "NIXL with the configured backend is required for this test.",
+)
+class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         _require_configured_nixl_backend()
