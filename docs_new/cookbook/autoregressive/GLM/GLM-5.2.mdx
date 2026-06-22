@@ -99,6 +99,20 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **DP-Attention + DeepEP** for the balanced/high-throughput strategies spreads attention across data-parallel ranks and routes MoE through DeepEP.
 - **BF16 weights need more GPUs.** The full-precision build (`zai-org/GLM-5.2`, ~1.5 TB) does not fit a single 8×H200 / 8×B200 / 4×GB300 node. It fits single-node on **8×B300** (TP8, ~2.1 TB HBM) — **verified**; on the smaller GPUs it needs a **multi-node** layout (e.g. 2×8×H200 or 2×8×B200 at TP16, 2×4×GB300 at TP8), and those **multi-node BF16 recipes are still proposed/inferred** (`verified: false`). FP8 is the recommended deployment. Use the same DSA / MTP / chunked-prefill guidance as FP8. On B300, BF16 low-latency matches FP8 (the sm103 FP8 path is not yet optimized), but FP8 wins at the balanced/high-throughput points.
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
+- **AllReduce fusion backend (GB300 deployment tuning).** On **4×GB300 (SM10X, TP4)**, switching the FlashInfer allreduce fusion backend with `--flashinfer-allreduce-fusion-backend trtllm` is a deployment-tuning flag that improved on the default (`auto`→`mnnvl`) in our testing — benchmarked on a clean non-speculative TP4 baseline (`--tp 4 --mem-fraction-static 0.88 --context-length 32768`, no EAGLE/DP/DeepEP) at 80 prompts with `--flush-cache` + varied seed:
+
+  | scenario | metric | default (`auto`/mnnvl) | `trtllm` | delta |
+  |---|---|---|---|---|
+  | chat (1K-in/1K-out) | throughput tok/s | 1257.2 | 1358.9 | +8.1% |
+  | chat | mean TTFT ms | 6172.8 | 5415.5 | −12.3% |
+  | chat | mean TPOT ms | 32.60 | 31.26 | −4.1% |
+  | summarization (8K-in/1K-out) | throughput tok/s | 1013.2 | 1022.1 | +0.9% |
+  | summarization | mean TTFT ms | 7402.3 | 8008.2 | +8.2% (regression) |
+  | summarization | mean TPOT ms | 91.57 | 52.63 | −42.5% |
+
+  Correctness was checked with `sgl-eval run gsm8k` (full 1319, `--max-tokens 8192`, thinking on): `trtllm` and the default backend produced the **same aggregate** score (1255/1319 = 95.15%), stop-rate (97.19%), truncation rate (2.81%), and stopped-only accuracy (1255/1282 = 97.89%), with 0 runaway and 0 errors — i.e. **aggregate-safe, no correctness regression**. The lower-than-baseline overall score is a `max_tokens=8192` cap artifact (37 truncated examples scored wrong) affecting both backends identically, not a fusion effect. **Note:** the two backends are **not** token-equivalent — per-problem token counts, generations, and individual correctness differ (fusion backends shift allreduce numerics); the result is only that the shifts cancel at the aggregate level.
+
+  **Scope & limitations.** This is benchmarked on this environment (GLM-5.2-FP8, 4×GB300, clean TP4 non-speculative baseline) only. It is **not** a generic default change: the same `trtllm` swap **regressed** on a cross-check with Qwen3-30B-A3B (bf16) on 8×H200 (there `mnnvl` was better), so do not carry this flag over to other model/hardware combinations without re-benchmarking. The GB300 cookbook recipes above use EAGLE/DP/DeepEP, under which this flag has **not** been re-verified; if you add `trtllm` on top of a speculative recipe, treat it as unverified and re-benchmark. The summarization-TTFT regression (+8.2%) is the one metric that did not improve with `trtllm`.
 
 ## 3. Advanced Usage
 
