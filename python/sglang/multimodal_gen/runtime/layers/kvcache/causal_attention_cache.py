@@ -253,6 +253,8 @@ class CausalSelfAttentionKVCache:
         if self.v.requires_grad:
             self.v = self.v.detach()
         attn_start_index = max(0, updated_local_end - self.attention_window_size)
+
+        # write fresh kv and return visible view
         if cache_head_slice is None:
             self.k[:, local_start_index:local_end_index] = key
             self.v[:, local_start_index:local_end_index] = value
