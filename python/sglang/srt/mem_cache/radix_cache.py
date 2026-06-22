@@ -481,7 +481,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Remove req slot release the cache lock
         if req.locked_cache is not None:
-            self.dec_lock_ref(req.last_node)
+            self.dec_lock_ref(req.locked_cache.last_node)
             req.locked_cache = None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -535,7 +535,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        self.dec_lock_ref(req.locked_cache.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -549,6 +549,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+        req.locked_cache.last_node = new_last_node
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

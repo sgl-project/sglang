@@ -306,4 +306,4 @@ class DecodeHiCacheTransferMixin:
         decode_req.req.prefix_indices = torch.cat(
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
-        decode_req.req.last_node = decode_req.hicache_restored_node
+        decode_req.req.locked_cache.last_node = decode_req.hicache_restored_node

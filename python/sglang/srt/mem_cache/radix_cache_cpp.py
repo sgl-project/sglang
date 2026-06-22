@@ -207,7 +207,7 @@ class RadixCacheCpp(BasePrefixCache):
 
         # Remove req slot release the cache lock
         if req.locked_cache is not None:
-            self.dec_lock_ref(req.last_node)
+            self.dec_lock_ref(req.locked_cache.last_node)
             req.locked_cache = None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -247,7 +247,7 @@ class RadixCacheCpp(BasePrefixCache):
             ] = reused_indices
 
         if req.last_node != new_last_node:
-            self.dec_lock_ref(req.last_node)
+            self.dec_lock_ref(req.locked_cache.last_node)
             self.inc_lock_ref(new_last_node)
 
         # NOTE: there might be unaligned tail, so we may need to append it
@@ -259,6 +259,7 @@ class RadixCacheCpp(BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
+        req.locked_cache.last_node = new_last_node
 
     def pretty_print(self):
         return self.tree.debug_print()

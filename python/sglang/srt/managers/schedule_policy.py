@@ -666,6 +666,7 @@ class PrefillAdder:
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
         req.locked_cache = ReqLockedCacheInfo(
+            last_node=req.last_node,
             swa_uuid_for_lock=None,
             swa_prefix_lock_released=False,
         )

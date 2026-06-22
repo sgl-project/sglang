@@ -52,7 +52,6 @@ class SessionSlot:
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
 
-    last_node: Any = None
     locked_cache: Optional[ReqLockedCacheInfo] = None
     cache_protected_len: int = 0
     kv: Optional[ReqKvInfo] = None
@@ -70,7 +69,6 @@ class SessionSlot:
         self.kv = copy.copy(req.kv)
 
         if is_first:
-            self.last_node = req.last_node
             self.locked_cache = copy.copy(req.locked_cache)
             self.cache_protected_len = req.cache_protected_len
             req.locked_cache = None
@@ -92,6 +90,7 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.locked_cache = ReqLockedCacheInfo(
+            last_node=self.locked_cache.last_node,
             swa_uuid_for_lock=self.locked_cache.swa_uuid_for_lock,
             swa_prefix_lock_released=False,
         )
@@ -286,7 +285,6 @@ class StreamingSession(BasePrefixCache):
                 slot = SessionSlot(
                     req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
-                    last_node=req.last_node,
                     locked_cache=copy.copy(req.locked_cache),
                     cache_protected_len=req.cache_protected_len,
                     mamba=copy.copy(req.mamba) if req.mamba is not None else None,
@@ -382,7 +380,7 @@ class StreamingSession(BasePrefixCache):
             return
         protected_len = slot.cache_protected_len
         if slot.locked_cache is not None:
-            lock_node = slot.last_node
+            lock_node = slot.locked_cache.last_node
             swa_uuid_for_lock = slot.locked_cache.swa_uuid_for_lock
         else:
             lock_node = None

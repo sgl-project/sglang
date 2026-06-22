@@ -680,6 +680,8 @@ class ReqCacheMatchSnapshot:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqLockedCacheInfo:
+    # The locked radix-tree node; releasing the lock only needs this object.
+    last_node: Any
     # The node to lock until for swa radix tree lock ref
     swa_uuid_for_lock: Optional[int]
     # Whether the prefill-time SWA tree lock has been released early
@@ -2981,11 +2983,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.locked_cache is not None
                         and not req.swa_prefix_lock_released
                         and req.swa_uuid_for_lock is not None
-                        and req.last_node is not None
+                        and req.locked_cache.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.locked_cache.last_node, req.swa_uuid_for_lock
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():

@@ -520,6 +520,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
         req.locked_cache = ReqLockedCacheInfo(
+            last_node=result.last_device_node,
             swa_uuid_for_lock=None,
             swa_prefix_lock_released=False,
         )
@@ -932,12 +933,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.locked_cache.last_node)
                 decode_req.req.locked_cache = None
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.locked_cache.last_node)
                 decode_req.req.locked_cache = None
                 break
 
@@ -956,7 +957,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self.tree_cache.dec_lock_ref(
+                            decode_req.req.locked_cache.last_node
+                        )
                     decode_req.req.locked_cache = None
                     break
 
