@@ -6,7 +6,10 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import subprocess
 import time
+import uuid
+from pathlib import Path
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -94,6 +97,95 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     return result, latency, sampler
 
 
+def _run_sgl_eval(eval_name, args) -> dict:
+    # Black-box subprocess wrapper around the external `sgl-eval` CLI. Returns a
+    # metrics dict with at least {"score", "latency", "output_throughput"} so the
+    # existing write_results_to_json + check_evaluation_test_results gate keep
+    # working unchanged. sgl-eval owns prompting + grading (chat, \boxed{},
+    # math_verify symbolic); sglang does NOT parse its internals.
+    from sglang.test.test_utils import dump_metric
+
+    base_url = (
+        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    )
+    out_parent = Path(
+        getattr(args, "sgl_eval_out_dir", None)
+        or (Path.home() / ".sgl_eval" / "sglang_run_eval" / uuid.uuid4().hex)
+    ).expanduser()
+    out_parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "sgl-eval",
+        "run",
+        eval_name,
+        "--base-url",
+        base_url,
+        "--num-threads",
+        str(getattr(args, "num_threads", 64)),
+        "--temperature",
+        str(getattr(args, "temperature", 0.0)),
+        "--out-dir",
+        str(out_parent),
+    ]
+    if getattr(args, "model", None):
+        cmd += ["--model", args.model]
+    if getattr(args, "num_examples", None) is not None:
+        cmd += ["--num-examples", str(args.num_examples)]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=getattr(args, "sgl_eval_timeout", None),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(
+            f"sgl-eval timed out after {e.timeout}s: {' '.join(cmd)}\n"
+            f"stdout:\n{e.stdout or ''}\nstderr:\n{e.stderr or ''}"
+        ) from e
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"sgl-eval failed with exit code {completed.returncode}: "
+            f"{' '.join(cmd)}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+
+    metrics_files = sorted(out_parent.glob(f"sgl_eval_{eval_name}_*/metrics.json"))
+    if len(metrics_files) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one metrics.json under {out_parent}, "
+            f"found {len(metrics_files)}"
+        )
+    payload = json.loads(metrics_files[0].read_text())
+    aggregate = payload.get("aggregate")
+    if not isinstance(aggregate, dict) or "score" not in aggregate:
+        raise KeyError(f"{metrics_files[0]} missing aggregate.score")
+
+    metrics = dict(aggregate)  # score, no_answer, ...
+    metrics["latency"] = payload.get("latency_seconds", 0.0)
+    metrics["output_throughput"] = payload.get("output_throughput_tps", 0.0)
+    metrics["sgl_eval_metrics_path"] = str(metrics_files[0])
+
+    model = payload.get("model") or getattr(args, "model", None)
+    dump_metric(
+        f"{eval_name}_score",
+        metrics["score"],
+        labels={"model": model, "eval": eval_name},
+    )
+    dump_metric(
+        f"{eval_name}_latency",
+        metrics["latency"],
+        labels={"model": model, "eval": eval_name},
+    )
+    print(f"Score: {metrics['score']:.3f}")
+    print(f"Total latency: {metrics['latency']:.3f} s")
+    print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
+    print(f"sgl-eval metrics: {metrics_files[0]}")
+    return metrics
+
+
 def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
@@ -172,24 +264,11 @@ def run_eval(args):
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
-        from sglang.test.simple_eval_gsm8k import GSM8KEval
-
-        # Default stop sequences keep Mistral/Mixtral from continuing into a
-        # self-generated `Question:` block. Do not apply them to other models:
-        # reasoning models (e.g. GLM-5 served with --reasoning-parser) restate
-        # `Question:` inside their chain-of-thought, and a global stop
-        # truncates the reasoning mid-way.
-        gsm8k_model = (getattr(args, "model", None) or "").lower()
-        if getattr(args, "stop", None) is None and (
-            "mistral" in gsm8k_model or "mixtral" in gsm8k_model
-        ):
-            args.stop = ["\nQuestion:", "\n\nQuestion:"]
-        eval_obj = GSM8KEval(
-            num_examples=args.num_examples,
-            num_threads=args.num_threads,
-            num_shots=getattr(args, "num_shots", 5),
-            data_path=getattr(args, "gsm8k_data_path", None),
-        )
+        # GSM8K is evaluated by the external sgl-eval harness (black-box
+        # subprocess): zero-shot chat, \boxed{} answer format, math_verify
+        # symbolic grading. sgl-eval owns prompting + grading, so stop
+        # sequences / chat-vs-completion / num_shots no longer apply here.
+        return _run_sgl_eval("gsm8k", args)
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
 
