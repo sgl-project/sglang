@@ -673,7 +673,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
-            req.mamba_pool_idx,
+            req.mamba.mamba_pool_idx,
             [FakeNativeCache(mx.array([42.0], dtype=mx.float32)), None],
             [0],
         )
@@ -696,7 +696,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsInstance(pending.cache[1], ContiguousAttentionKVCache)
         restored = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_pool_idx, restored, [0]
+            req.mamba.mamba_pool_idx, restored, [0]
         )
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
 
@@ -747,11 +747,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+            req.mamba.mamba_ping_pong_track_buffer[0], tracked, [0]
         )
 
         self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [64, 6])
-        self.assertEqual(req.mamba_last_track_seqlen, 64)
+        self.assertEqual(req.mamba.mamba_last_track_seqlen, 64)
         self.assertEqual(tracked[0].state[0].tolist(), [64.0])
         self.assertEqual(pending.synced_offset, 70)
 
@@ -790,7 +790,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
-            req.mamba_pool_idx,
+            req.mamba.mamba_pool_idx,
             [FakeNativeCache(mx.array([64.0], dtype=mx.float32)), None],
             [0],
         )
@@ -809,12 +809,12 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+            req.mamba.mamba_ping_pong_track_buffer[0], tracked, [0]
         )
 
         self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [192, 1])
         self.assertEqual(runner.model.seen_auxiliary_states, [[64.0], [192.0]])
-        self.assertEqual(req.mamba_last_track_seqlen, 256)
+        self.assertEqual(req.mamba.mamba_last_track_seqlen, 256)
         self.assertEqual(tracked[0].state[0].tolist(), [192.0])
         self.assertEqual(pending.synced_offset, 257)
 
@@ -877,10 +877,10 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(req_indices, [1])
         self.assertIsNotNone(auxiliary_state_idx)
         self.assertIsNone(req.req_pool_idx)
-        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNotNone(req.mamba.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
         pool.free_auxiliary_state_cache(req)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
         self.assertEqual(pool.available_size(), 2)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
@@ -894,13 +894,13 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
+        req.mamba.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba.mamba_next_track_idx = 0
 
         pool.free_auxiliary_state_cache(req, track_buffer_to_keep=0)
 
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_ping_pong_track_buffer)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
@@ -913,9 +913,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
-        req.mamba_last_track_seqlen = 64
+        req.mamba.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba.mamba_next_track_idx = 0
+        req.mamba.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -938,9 +938,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache_len, 64)
         self.assertTrue(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
         self.assertEqual(insert_params.mamba_value.tolist(), [2])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
@@ -953,9 +953,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
-        req.mamba_last_track_seqlen = 64
+        req.mamba.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba.mamba_next_track_idx = 0
+        req.mamba.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -977,9 +977,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(cache_len, 64)
         self.assertEqual(insert_params.mamba_value.tolist(), [3])
-        self.assertIsNotNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNotNone(req.mamba.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
 
     def test_auxiliary_state_component_keeps_new_live_slot_owned_by_radix(self):
@@ -1014,7 +1014,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache_len, 7)
         self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
         self.assertEqual(insert_params.mamba_value.tolist(), [1])
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
@@ -1029,8 +1029,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
+        req.mamba.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba.mamba_next_track_idx = 0
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -1053,9 +1053,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache_len, 7)
         self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
         self.assertEqual(insert_params.mamba_value.tolist(), [1])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_next_track_idx)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba.mamba_next_track_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
@@ -1087,7 +1087,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             insert_params=insert_params,
         )
 
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
 
@@ -1461,7 +1461,13 @@ if _HAS_MLX:
     class FakeRequest:
         def __init__(self):
             self.req_pool_idx = None
-            self.mamba_pool_idx = None
+            self.mamba = SimpleNamespace(
+                mamba_pool_idx=None,
+                mamba_ping_pong_track_buffer=None,
+                mamba_next_track_idx=None,
+                mamba_last_track_seqlen=None,
+                mamba_branching_seqlen=None,
+            )
             self.inflight_middle_chunks = 0
             self.kv_committed_len = 0
 
