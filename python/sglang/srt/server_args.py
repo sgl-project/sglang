@@ -3131,10 +3131,11 @@ class ServerArgs:
 
         # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3Next/Qwen3.5 MoE families). SM90 is not auto-enabled because
-        # auto resolves to mnnvl, which requires a working NVLink multicast fabric
-        # that SM90 nodes do not reliably have; SM90 users can opt in explicitly
-        # via --flashinfer-allreduce-fusion-backend.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). SM90 is not
+        # auto-enabled because auto resolves to mnnvl, which requires a working
+        # NVLink multicast fabric that SM90 nodes do not reliably have; SM90
+        # users can opt in explicitly via
+        # --flashinfer-allreduce-fusion-backend.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -3147,6 +3148,7 @@ class ServerArgs:
                 "Glm4MoeLiteForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Qwen3VLMoeForConditionalGeneration",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
