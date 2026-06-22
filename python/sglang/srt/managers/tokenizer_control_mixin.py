@@ -551,6 +551,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            if not obj.lora_name or not obj.lora_path:
+                raise ValueError("Both 'lora_name' and 'lora_path' must be provided.")
+
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
             assert (
@@ -628,6 +631,9 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            if not obj.lora_name:
+                raise ValueError("'lora_name' must be provided.")
 
             assert (
                 self.server_args.dp_size == 1
