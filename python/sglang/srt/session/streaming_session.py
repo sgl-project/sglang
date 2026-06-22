@@ -510,11 +510,25 @@ class StreamingSession(BasePrefixCache):
         ]
         candidates.sort()  # oldest last_active_time first
 
+        logger.info(
+            "evict_lru_sessions: need %d tokens, %d candidates (total slots=%d, active=%d)",
+            num_tokens,
+            len(candidates),
+            len(self.slots),
+            len(active_pool_idxs),
+        )
+
         freed = 0
         for _, session_id in candidates:
             if freed >= num_tokens:
                 break
             freed += self.soft_evict_slot(session_id)
+
+        logger.info(
+            "evict_lru_sessions: freed %d / %d requested tokens",
+            freed,
+            num_tokens,
+        )
         return freed
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
