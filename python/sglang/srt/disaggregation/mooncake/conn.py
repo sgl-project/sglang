@@ -1753,17 +1753,8 @@ class MooncakeKVSender(CommonKVSender):
 
     def abort(self):
         super().abort()
-        # In PD disaggregation, prefill and decode run as separate instances
-        # paired by bootstrap_room. The decode peer blocks in
-        # KVPoll.WaitingForInput until it receives the KV cache or hits
-        # SGLANG_DISAGGREGATION_WAITING_TIMEOUT (default 300s). When a prefill
-        # request is aborted (e.g. the client disconnects) after bootstrap but
-        # before/while the KV cache is sent, the decode peer is never notified
-        # and waits out the full timeout, holding its slot the whole time.
-        # If bootstrap has completed we already know the decode endpoint(s) for
-        # this room, so proactively notify them so the paired decode request
-        # fails fast. This is the prefill->decode counterpart of the existing
-        # decode->prefill abort notification.
+        # Notify decode peer so it fails fast instead of waiting 300s.
+        # Only possible after bootstrap (when transfer_infos is populated).
         transfer_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room)
         if transfer_infos:
             prefill_unique_rank = (
