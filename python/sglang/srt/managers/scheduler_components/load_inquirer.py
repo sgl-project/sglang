@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    disaggregation_mode: DisaggregationMode
     ps: ParallelState
     server_args: ServerArgs
     max_total_num_tokens: int
@@ -41,6 +40,7 @@ class SchedulerLoadInquirer:
     tp_worker: BaseTpWorker
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
+    get_disaggregation_mode: Callable
     get_running_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
@@ -51,6 +51,9 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+
+    def _disaggregation_mode(self) -> DisaggregationMode:
+        return self.get_disaggregation_mode()
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -74,7 +77,7 @@ class SchedulerLoadInquirer:
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Get uncached input tokens waiting for prefill compute."""
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self._disaggregation_mode() == DisaggregationMode.DECODE:
             return 0
         num_tokens = 0
         for req in self.get_waiting_queue():
@@ -104,9 +107,10 @@ class SchedulerLoadInquirer:
         num_running_reqs = len(self.get_running_batch().reqs)
 
         waiting_queues = [self.get_waiting_queue()]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        disaggregation_mode = self._disaggregation_mode()
+        if disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.get_disagg_prefill_bootstrap_queue().queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.get_disagg_decode_prealloc_queue().queue)
             waiting_queues.append(self.get_disagg_decode_transfer_queue().queue)
             waiting_queues.append(
@@ -170,11 +174,11 @@ class SchedulerLoadInquirer:
             decode_transfer = 0
             decode_retracted = 0
 
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
                 prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
                 prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
-            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            elif disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
                 decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
                 decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)

@@ -54,6 +54,25 @@ class TestPDRuntimeRoleSwitch(unittest.TestCase):
         self.assertTrue(status["can_hot_switch_in_process"])
         self.assertFalse(status["requires_process_restart"])
 
+    def test_scheduler_declares_hybrid_queue_initialization_helpers(self):
+        source = (REPO_ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
+
+        self.assertIn("enable_pd_runtime_role_switch", source)
+        self.assertIn("def _init_decode_disaggregation", source)
+        self.assertIn("def _init_prefill_disaggregation", source)
+        self.assertIn("def pd_runtime_role", source)
+        self.assertIn("def pd_runtime_role_switch_enabled", source)
+
+    def test_load_inquirer_reads_runtime_role_dynamically(self):
+        source = (
+            REPO_ROOT
+            / "python/sglang/srt/managers/scheduler_components/load_inquirer.py"
+        ).read_text()
+
+        self.assertIn("get_disaggregation_mode: Callable", source)
+        self.assertIn("def _disaggregation_mode", source)
+        self.assertNotIn("disaggregation_mode: DisaggregationMode", source)
+
 
 if __name__ == "__main__":
     unittest.main()
