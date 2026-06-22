@@ -273,6 +273,37 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(DEFAULT_WORKER_COST)
     }
 
+    /// Effective capacity weight derived from `priority` and `cost` labels.
+    ///
+    /// Higher weight = more requests should land here. Two heterogeneous workers
+    /// (e.g. one 8-GPU, one 2-GPU) can be balanced by setting their `priority`
+    /// or `cost` labels at registration time so that
+    /// `effective_load = load / weight` keeps each box at the same utilization.
+    ///
+    /// `weight = (priority / DEFAULT_WORKER_PRIORITY) * (DEFAULT_WORKER_COST / cost)`
+    ///
+    /// With the defaults (priority=50, cost=1.0) this returns exactly 1.0 — i.e.
+    /// existing deployments that never set these labels see identical scheduling
+    /// behavior. Clamped to a small positive number to keep `load / weight` well
+    /// defined even if an operator sets `cost=0` by mistake.
+    fn weight(&self) -> f32 {
+        let priority_factor = self.priority() as f32 / DEFAULT_WORKER_PRIORITY as f32;
+        let cost = self.cost();
+        let cost_factor = if cost > 0.0 {
+            DEFAULT_WORKER_COST / cost
+        } else {
+            // Treat a misconfigured / non-positive cost as the baseline rather
+            // than letting it blow up the divisor in `effective_load`.
+            1.0
+        };
+        let w = priority_factor * cost_factor;
+        if w.is_finite() && w > 0.0 {
+            w
+        } else {
+            1.0
+        }
+    }
+
     /// Get tokenizer path for a specific model.
     fn tokenizer_path(&self, model_id: &str) -> Option<&str> {
         self.metadata()
