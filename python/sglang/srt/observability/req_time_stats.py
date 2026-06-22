@@ -708,27 +708,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         last_node_id: Optional[int] = None,
         ts=None,
     ):
-        """Record a per-request cache-match snapshot via two independent sinks.
-
-        Captures, at scheduling time, how many prefix tokens this request hit in
-        each tier (device / host / storage), the total matched prefix length, and
-        the matched radix node id -- the scheduler-side "decision snapshot" that
-        answers "why did this request (not) hit cache at this moment".
-
-        Two independent sinks (either, both, or neither may be active):
-          * a DEBUG log line, gated on the logger level only -- lets operators
-            grep per-request cache hits without standing up a tracing backend;
-          * a ``cache_match`` trace event, gated on tracing being enabled --
-            correlatable with the gateway routing span via the shared rid.
-        Both are no-ops on the hot path by default (INFO level, tracing disabled).
-        """
-        # Clamp to 1.0: on retraction/re-prefill, prefix_indices can also match
-        # previously generated output tokens, so prefix_tokens may exceed the
-        # original input length and push the raw ratio above 1.0.
+        """Record per-request cache-match snapshot (DEBUG log + trace event)."""
         hit_rate = min(1.0, prefix_tokens / input_tokens) if input_tokens > 0 else 0.0
 
-        # Log sink: DEBUG-gated, independent of tracing. Lazy %-formatting so
-        # nothing is built unless DEBUG is actually enabled.
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "cache_match rid=%s device=%d host=%d storage=%d prefix=%d "
@@ -743,7 +725,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 last_node_id,
             )
 
-        # Trace sink: independent of the log sink above.
         if self.trace_ctx.tracing_enable:
             ts = ts or time.perf_counter()
             attrs = {
