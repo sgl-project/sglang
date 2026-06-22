@@ -149,6 +149,7 @@ class Runner {
       int32_t* expandedIdxToPermutedIdx,
       int32_t* permutedIdxToExpandedIdx,
       int32_t* permutedIdxToTokenIdx,
+      int32_t* expertIds,
       void* expertWeights,
       int32_t* numTokensPerExpert,
       int32_t* ctaIdxXyToBatchIdx,

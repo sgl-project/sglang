@@ -544,8 +544,8 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -590,8 +590,8 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()

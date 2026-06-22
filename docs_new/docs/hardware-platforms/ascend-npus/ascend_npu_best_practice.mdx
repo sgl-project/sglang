@@ -5799,9 +5799,8 @@ do
         export GLOO_SOCKET_IFNAME=your_nic
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
-        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --disaggregation-decode-extra-slots 96 \
         --cuda-graph-bs 8 16 24 32 40 \
         --port 33000 --trust-remote-code \
         --tp-size 16 --mem-fraction-static 0.76 --attention-backend ascend --device npu --quantization modelslim \
@@ -5934,9 +5933,8 @@ do
         export GLOO_SOCKET_IFNAME=your_nic
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
-        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --disaggregation-decode-extra-slots 96 \
         --cuda-graph-bs 2 4 8 \
         --port 33000 --trust-remote-code \
         --tp-size 16 --mem-fraction-static 0.76 --attention-backend ascend --device npu --quantization modelslim \

@@ -136,43 +136,17 @@ def _ensure_gguf_version():
 
 
 def _patch_rope_parameters_validation():
-    """Fix rope_parameters validation for unregistered model types.
+    """Guard ``standardize_rope_params()`` against missing
+    ``max_position_embeddings``.
 
-    For unregistered model types (e.g. ``deepseek_v32``), the generic
-    ``PretrainedConfig`` lacks a ``rope_parameters`` field so the conversion
-    that injects ``rope_theta`` from the top-level config is skipped.
-    Additionally, ``standardize_rope_params()`` accesses
+    For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
     ``self.max_position_embeddings`` during ``__post_init__`` before extra
     kwargs are set as attributes, causing ``AttributeError``.
 
-    Fix: (1) patch ``from_dict`` to inject ``rope_theta`` into
-    ``rope_scaling``, (2) guard ``standardize_rope_params`` against missing
+    Fix: guard ``standardize_rope_params`` against missing
     ``max_position_embeddings``.
-
-    TODO(upstream): remove once unregistered model types handle rope
-    standardization correctly in transformers.
     """
     from transformers import PretrainedConfig
-
-    original = PretrainedConfig.from_dict.__func__
-
-    @classmethod  # type: ignore[misc]
-    def patched(cls, config_dict, **kwargs):
-        rope_scaling = config_dict.get("rope_scaling")
-        rope_theta = config_dict.get("rope_theta")
-        needs_rope_theta = (
-            isinstance(rope_scaling, dict)
-            and rope_theta is not None
-            and "rope_theta" not in rope_scaling
-        )
-        result = original(cls, config_dict, **kwargs)
-        if needs_rope_theta:
-            result_rs = getattr(result, "rope_scaling", None)
-            if isinstance(result_rs, dict) and "rope_theta" not in result_rs:
-                result_rs["rope_theta"] = rope_theta
-        return result
-
-    PretrainedConfig.from_dict = patched
 
     # standardize_rope_params accesses self.max_position_embeddings before
     # __post_init__ sets extra kwargs — skip when the attribute is absent.
