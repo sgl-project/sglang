@@ -1,7 +1,5 @@
 """Start bootstrap/kv-store-related server"""
 
-import os
-
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
