@@ -10,7 +10,8 @@ because `--enable-pd-runtime-role-switch` is enabled.
 - `env.example`: shared cluster variables.
 - `run_worker.sh`: launch one worker container on the current physical node.
 - `run_router.sh`: launch sgl-router against the four worker URLs.
-- `run_controller.sh`: collect metrics or build a D->P/P->D dry-run plan.
+- `run_controller.sh`: collect metrics, build a D->P/P->D dry-run plan, or
+  execute the plan against live workers/router.
 
 ## Setup
 
@@ -65,6 +66,7 @@ On the controller host:
 ```bash
 ./run_controller.sh metrics
 DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run
+DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh execute
 ```
 
 ## Checks
@@ -87,9 +89,21 @@ Controller dry-run:
 DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run | jq '.actions'
 ```
 
+Controller execution:
+
+```bash
+DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh execute | tee d_to_p-result.json
+DIRECTION=p_to_d SOURCE_NAME=node0 ./run_controller.sh execute | tee p_to_d-result.json
+```
+
 The D->P plan should drain `node2`, pause its admission, migrate active decode
 state to another decode node, call target prepare with `adopt_on_success=true`,
 switch `node2` to `prefill`, refresh the router role, and undrain.
+
+The execution result includes `success`, `message`, `source`, `migration_target`,
+`migration_seconds`, `total_seconds`, and per-step `actions`. For the basic
+experiment, accept the run only when `success=true`, router workers show the new
+role, and client traffic records no unexpected 5xx errors during the flip.
 
 ## Notes
 

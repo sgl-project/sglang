@@ -11,6 +11,13 @@ SCRIPT_PATH = (
     / "disaggregation"
     / "pd_flip_experiment.py"
 )
+DOCKER_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "playground"
+    / "disaggregation"
+    / "pd_flip_docker"
+)
 
 
 def load_script_module():
@@ -259,6 +266,23 @@ class TestPDFlipExperimentScript(unittest.TestCase):
                 (source_url, {"server_args": {"pd_flip_commit_ack": True}}),
             ],
         )
+
+    def test_docker_env_default_uses_eight_gpus_per_worker(self):
+        values = {}
+        for line in (DOCKER_DIR / "env.example").read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value
+
+        self.assertEqual(int(values["TP_SIZE"]) * int(values["DP_SIZE"]), 8)
+
+    def test_docker_controller_script_supports_execute_action(self):
+        script = (DOCKER_DIR / "run_controller.sh").read_text()
+
+        self.assertIn("execute)", script)
+        self.assertIn("execute --direction", script)
 
     def _server_info(self, state, idle, direction="d_to_p", current_role="decode"):
         return {

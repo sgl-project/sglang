@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib import error, request
@@ -154,6 +155,33 @@ class FlipPlan:
     metrics: List[NodeMetrics] = field(default_factory=list)
 
 
+@dataclass
+class ActionRecord:
+    step: str
+    target: str
+    method: str
+    url: str
+    payload: Optional[JsonDict] = None
+    response: Any = None
+    success: bool = True
+    message: str = ""
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
+class FlipExecutionResult:
+    success: bool
+    message: str
+    direction: str
+    source: Optional[str]
+    target_role: Optional[str]
+    migration_target: Optional[str]
+    actions: List[ActionRecord] = field(default_factory=list)
+    metrics: List[NodeMetrics] = field(default_factory=list)
+    total_seconds: float = 0.0
+    migration_seconds: float = 0.0
+
+
 class PDFlipController:
     def __init__(self, config: PDClusterConfig, client: HttpLike):
         if not config.nodes:
@@ -246,6 +274,394 @@ class PDFlipController:
             actions=actions,
             metrics=metrics,
         )
+
+    def execute(
+        self,
+        direction: str,
+        source_name: Optional[str] = None,
+    ) -> FlipExecutionResult:
+        started = time.monotonic()
+        records: List[ActionRecord] = []
+        metrics: List[NodeMetrics] = []
+        source: Optional[NodeMetrics] = None
+        target: Optional[NodeMetrics] = None
+        target_role: Optional[str] = None
+        migration_seconds = 0.0
+        direction = direction.strip().lower()
+
+        try:
+            metrics = self.collect_metrics()
+            if direction == "d_to_p":
+                source = self._select_source(
+                    metrics,
+                    source_name=source_name,
+                    expected_role="decode",
+                    prefer_high_load=True,
+                )
+                target = self._select_decode_migration_target(metrics, source)
+                target_role = "prefill"
+                migration_seconds = self._execute_d_to_p(source, target, records)
+            elif direction == "p_to_d":
+                source = self._select_source(
+                    metrics,
+                    source_name=source_name,
+                    expected_role="prefill",
+                    prefer_high_load=False,
+                )
+                target_role = "decode"
+                self._execute_p_to_d(source, records)
+            else:
+                raise ValueError("direction must be d_to_p or p_to_d")
+
+            return FlipExecutionResult(
+                success=True,
+                message="pd flip executed",
+                direction=direction,
+                source=source.name if source else None,
+                target_role=target_role,
+                migration_target=target.name if target else None,
+                actions=records,
+                metrics=metrics,
+                total_seconds=time.monotonic() - started,
+                migration_seconds=migration_seconds,
+            )
+        except Exception as exc:
+            if source is not None:
+                self._cleanup_source_after_failure(source, records)
+            return FlipExecutionResult(
+                success=False,
+                message=str(exc),
+                direction=direction,
+                source=source.name if source else source_name,
+                target_role=target_role,
+                migration_target=target.name if target else None,
+                actions=records,
+                metrics=metrics,
+                total_seconds=time.monotonic() - started,
+                migration_seconds=migration_seconds,
+            )
+
+    def _execute_d_to_p(
+        self,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        records: List[ActionRecord],
+    ) -> float:
+        session_id = f"pd-flip-{source.name}-to-{target.name}"
+        self._post_router(
+            records,
+            "router_drain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": True},
+        )
+        self._post_worker(
+            records,
+            "pause_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": True},
+        )
+
+        migration_started = time.monotonic()
+        source_start = self._post_worker(
+            records,
+            "start_decode_migration_source",
+            source,
+            "/pd_flip/migration/source/start",
+            {"session_id": session_id, "target_url": target.worker_url},
+        )
+        manifests = _response_manifests(source_start)
+        self._post_worker(
+            records,
+            "prepare_decode_migration_target",
+            target,
+            "/pd_flip/migration/target/prepare",
+            {
+                "session_id": session_id,
+                "source_url": source.worker_url,
+                "manifests": manifests,
+                "adopt_on_success": True,
+            },
+        )
+        self._wait_migration(records, "wait_decode_migration_source", source)
+        target_status = self._wait_migration(
+            records, "wait_decode_migration_target", target
+        )
+        migration_seconds = time.monotonic() - migration_started
+
+        released_rids = _manifest_rids(_response_manifests(target_status) or manifests)
+        self._post_worker(
+            records,
+            "finish_decode_migration_source",
+            source,
+            "/pd_flip/migration/source/finish",
+            {"session_id": session_id, "released_rids": released_rids},
+        )
+        self._wait_source_idle(records, source)
+        self._post_worker(
+            records,
+            "set_source_runtime_role",
+            source,
+            "/pd_flip/runtime_role/set",
+            {"role": "prefill", "force": False},
+        )
+        self._post_router(
+            records,
+            "refresh_router_source_role",
+            source,
+            "/pd_flip/router/worker/role",
+            {
+                "worker_id": source.router_worker_id,
+                "role": "prefill",
+                "bootstrap_port": source.bootstrap_port,
+                "draining": False,
+            },
+        )
+        self._post_worker(
+            records,
+            "resume_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": False},
+        )
+        self._post_router(
+            records,
+            "router_undrain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": False},
+        )
+        return migration_seconds
+
+    def _execute_p_to_d(
+        self,
+        source: NodeMetrics,
+        records: List[ActionRecord],
+    ) -> None:
+        self._post_router(
+            records,
+            "router_drain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": True},
+        )
+        self._post_worker(
+            records,
+            "pause_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": True},
+        )
+        self._wait_source_idle(records, source)
+        self._post_worker(
+            records,
+            "set_source_runtime_role",
+            source,
+            "/pd_flip/runtime_role/set",
+            {"role": "decode", "force": False},
+        )
+        self._post_router(
+            records,
+            "refresh_router_source_role",
+            source,
+            "/pd_flip/router/worker/role",
+            {
+                "worker_id": source.router_worker_id,
+                "role": "decode",
+                "bootstrap_port": None,
+                "draining": False,
+            },
+        )
+        self._post_worker(
+            records,
+            "resume_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": False},
+        )
+        self._post_router(
+            records,
+            "router_undrain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": False},
+        )
+
+    def _post_worker(
+        self,
+        records: List[ActionRecord],
+        step: str,
+        node: NodeMetrics,
+        path: str,
+        payload: JsonDict,
+    ) -> Any:
+        return self._record_post(records, step, node.name, node.worker_url, path, payload)
+
+    def _post_router(
+        self,
+        records: List[ActionRecord],
+        step: str,
+        node: NodeMetrics,
+        path: str,
+        payload: JsonDict,
+    ) -> Any:
+        return self._record_post(
+            records,
+            step,
+            f"router:{node.router_worker_id}",
+            self.config.router_url,
+            path,
+            payload,
+        )
+
+    def _record_post(
+        self,
+        records: List[ActionRecord],
+        step: str,
+        target: str,
+        base_url: str,
+        path: str,
+        payload: JsonDict,
+    ) -> Any:
+        started = time.monotonic()
+        url = _join_url(base_url, path)
+        try:
+            response = self.client.post_json(base_url, path, payload)
+            _raise_if_unsuccessful(response, step)
+            records.append(
+                ActionRecord(
+                    step=step,
+                    target=target,
+                    method="POST",
+                    url=url,
+                    payload=payload,
+                    response=response,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            return response
+        except Exception as exc:
+            records.append(
+                ActionRecord(
+                    step=step,
+                    target=target,
+                    method="POST",
+                    url=url,
+                    payload=payload,
+                    success=False,
+                    message=str(exc),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            raise
+
+    def _record_get(
+        self,
+        records: List[ActionRecord],
+        step: str,
+        target: str,
+        base_url: str,
+        path: str,
+    ) -> Any:
+        started = time.monotonic()
+        url = _join_url(base_url, path)
+        try:
+            response = self.client.get_json(base_url, path)
+            _raise_if_unsuccessful(response, step)
+            records.append(
+                ActionRecord(
+                    step=step,
+                    target=target,
+                    method="GET",
+                    url=url,
+                    response=response,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            return response
+        except Exception as exc:
+            records.append(
+                ActionRecord(
+                    step=step,
+                    target=target,
+                    method="GET",
+                    url=url,
+                    success=False,
+                    message=str(exc),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            raise
+
+    def _wait_migration(
+        self,
+        records: List[ActionRecord],
+        step: str,
+        node: NodeMetrics,
+    ) -> Any:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        last_response: Any = None
+        while time.monotonic() <= deadline:
+            last_response = self._record_get(
+                records,
+                step,
+                node.name,
+                node.worker_url,
+                "/pd_flip/migration/status",
+            )
+            if _migration_response_complete(last_response):
+                return last_response
+            time.sleep(self.config.migration_poll_interval_seconds)
+        raise TimeoutError(f"{step} timed out for {node.name}: {last_response}")
+
+    def _wait_source_idle(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+    ) -> Any:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        last_response: Any = None
+        while time.monotonic() <= deadline:
+            last_response = self._record_get(
+                records,
+                "wait_source_idle",
+                source.name,
+                source.worker_url,
+                "/pd_flip/runtime_role/status",
+            )
+            status = _first_successful_response(last_response)
+            _, is_idle, _ = _parse_runtime_status(status)
+            if is_idle:
+                return last_response
+            time.sleep(self.config.migration_poll_interval_seconds)
+        raise TimeoutError(f"wait_source_idle timed out for {source.name}: {last_response}")
+
+    def _cleanup_source_after_failure(
+        self,
+        source: NodeMetrics,
+        records: List[ActionRecord],
+    ) -> None:
+        try:
+            self._post_worker(
+                records,
+                "cleanup_resume_source_admission",
+                source,
+                "/pd_flip/runtime_role/admission",
+                {"paused": False},
+            )
+        except Exception:
+            pass
+        try:
+            self._post_router(
+                records,
+                "cleanup_router_undrain_source",
+                source,
+                "/pd_flip/router/worker/drain",
+                {"worker_id": source.router_worker_id, "draining": False},
+            )
+        except Exception:
+            pass
 
     def _fetch_router_workers(self) -> Dict[str, JsonDict]:
         body = self.client.get_json(self.config.router_url, "/pd_flip/router/workers")
@@ -340,7 +756,7 @@ class PDFlipController:
                 },
             ),
             self._worker_action(
-                "wait_decode_migration",
+                "wait_decode_migration_source",
                 source,
                 "GET",
                 "/pd_flip/migration/status",
@@ -351,6 +767,17 @@ class PDFlipController:
                 },
             ),
             self._worker_action(
+                "wait_decode_migration_target",
+                target,
+                "GET",
+                "/pd_flip/migration/status",
+                {
+                    "timeout_seconds": self.config.migration_timeout_seconds,
+                    "poll_interval_seconds": self.config.migration_poll_interval_seconds,
+                    "source_url": source.worker_url,
+                },
+            ),
+            self._worker_action(
                 "finish_decode_migration_source",
                 source,
                 "POST",
@@ -358,6 +785,16 @@ class PDFlipController:
                 {
                     "session_id": session_id,
                     "released_rids": "<from migration target manifests>",
+                },
+            ),
+            self._worker_action(
+                "wait_source_idle",
+                source,
+                "GET",
+                "/pd_flip/runtime_role/status",
+                {
+                    "timeout_seconds": self.config.migration_timeout_seconds,
+                    "poll_interval_seconds": self.config.migration_poll_interval_seconds,
                 },
             ),
             self._worker_action(
@@ -504,6 +941,35 @@ def _first_successful_response(response: Any) -> JsonDict:
     return {}
 
 
+def _raise_if_unsuccessful(response: Any, step: str) -> None:
+    responses = response if isinstance(response, list) else [response]
+    for item in responses:
+        if isinstance(item, dict) and item.get("success", True) is False:
+            raise RuntimeError(item.get("message") or f"{step} failed")
+
+
+def _response_manifests(response: Any) -> List[JsonDict]:
+    item = _first_successful_response(response)
+    manifests = item.get("manifests", [])
+    return [manifest for manifest in manifests if isinstance(manifest, dict)]
+
+
+def _manifest_rids(manifests: List[JsonDict]) -> List[str]:
+    return [
+        str(manifest["rid"])
+        for manifest in manifests
+        if isinstance(manifest, dict) and manifest.get("rid") is not None
+    ]
+
+
+def _migration_response_complete(response: Any) -> bool:
+    item = _first_successful_response(response)
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    failed = int(status.get("failed_reqs") or 0)
+    pending = int(status.get("pending_reqs") or 0)
+    return failed == 0 and pending == 0
+
+
 def _parse_runtime_status(item: JsonDict) -> Tuple[str, bool, bool]:
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
     role = _normalize_role(
@@ -619,6 +1085,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dry_run = subparsers.add_parser("dry-run", help="Build a flip plan without POSTs")
     dry_run.add_argument("--direction", choices=["d_to_p", "p_to_d"], required=True)
     dry_run.add_argument("--source-name", default=None)
+
+    execute = subparsers.add_parser("execute", help="Execute a PD role flip")
+    execute.add_argument("--direction", choices=["d_to_p", "p_to_d"], required=True)
+    execute.add_argument("--source-name", default=None)
     return parser
 
 
@@ -636,9 +1106,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 direction=args.direction,
                 source_name=args.source_name,
             )
+        elif args.command == "execute":
+            output = controller.execute(
+                direction=args.direction,
+                source_name=args.source_name,
+            )
         else:
             parser.error(f"unknown command {args.command}")
         print(json.dumps(output, default=_json_default, indent=2, sort_keys=True))
+        if args.command == "execute" and isinstance(output, FlipExecutionResult):
+            return 0 if output.success else 1
         return 0
     except Exception as exc:
         print(f"pd_flip_controller: {exc}", file=sys.stderr)

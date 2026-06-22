@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -90,6 +92,102 @@ class FakeClient:
         return {"success": True}
 
 
+class ExecutingFakeClient(FakeClient):
+    def __init__(self, *, fail_target_prepare=False):
+        super().__init__()
+        self.fail_target_prepare = fail_target_prepare
+        self.migration_status_gets = {}
+        self.runtime_status_gets = {}
+
+    def get_json(self, base_url, path):
+        if path == "/pd_flip/migration/status":
+            count = self.migration_status_gets.get(base_url, 0)
+            self.migration_status_gets[base_url] = count + 1
+            state = "source_transferred" if "node-a" in base_url else "target_transferred"
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": state,
+                        "pending_reqs": 0,
+                        "transferred_reqs": 1,
+                        "failed_reqs": 0,
+                    },
+                    "manifests": [{"rid": "rid-1"}],
+                }
+            ]
+
+        if path == "/pd_flip/runtime_role/status":
+            self.gets.append((base_url, path))
+            count = self.runtime_status_gets.get(base_url, 0)
+            self.runtime_status_gets[base_url] = count + 1
+            role = "prefill" if "node-c" in base_url else "decode"
+            is_idle = "node-c" in base_url or count > 0
+            return [
+                {
+                    "success": True,
+                    "role": role,
+                    "status": {
+                        "role": role,
+                        "is_idle": is_idle,
+                        "admission_paused": False,
+                    },
+                }
+            ]
+
+        return super().get_json(base_url, path)
+
+    def post_json(self, base_url, path, payload):
+        self.posts.append((base_url, path, payload))
+        if path == "/pd_flip/migration/source/start":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "source_started",
+                        "pending_reqs": 1,
+                        "failed_reqs": 0,
+                    },
+                    "manifests": [
+                        {
+                            "rid": "rid-1",
+                            "origin_input_ids": [1, 2],
+                            "output_ids": [3],
+                            "kv_committed_len": 2,
+                        }
+                    ],
+                }
+            ]
+        if path == "/pd_flip/migration/target/prepare":
+            if self.fail_target_prepare:
+                raise RuntimeError("target prepare failed")
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "target_prepared",
+                        "pending_reqs": 1,
+                        "failed_reqs": 0,
+                    },
+                    "manifests": payload["manifests"],
+                }
+            ]
+        if path == "/pd_flip/migration/source/finish":
+            return [
+                {
+                    "success": True,
+                    "status": {
+                        "state": "source_released",
+                        "pending_reqs": 0,
+                        "released_reqs": len(payload.get("released_rids") or []),
+                        "failed_reqs": 0,
+                    },
+                    "manifests": [{"rid": "rid-1"}],
+                }
+            ]
+        return {"success": True, "status": {"role": payload.get("role")}}
+
+
 class TestPDFlipController(unittest.TestCase):
     def setUp(self):
         self.script = load_script_module()
@@ -146,8 +244,10 @@ class TestPDFlipController(unittest.TestCase):
             "pause_source_admission",
             "start_decode_migration_source",
             "prepare_decode_migration_target",
-            "wait_decode_migration",
+            "wait_decode_migration_source",
+            "wait_decode_migration_target",
             "finish_decode_migration_source",
+            "wait_source_idle",
             "set_source_runtime_role",
             "refresh_router_source_role",
             "resume_source_admission",
@@ -165,7 +265,7 @@ class TestPDFlipController(unittest.TestCase):
             },
         )
         self.assertEqual(
-            plan.actions[7].payload,
+            plan.actions[9].payload,
             {
                 "worker_id": "node-a",
                 "role": "prefill",
@@ -205,6 +305,126 @@ class TestPDFlipController(unittest.TestCase):
                 "draining": False,
             },
         )
+
+    def test_d_to_p_execute_runs_migration_and_role_switch(self):
+        client = ExecutingFakeClient()
+        controller = self.script.PDFlipController(self.config, client)
+
+        result = controller.execute(direction="d_to_p", source_name="node-a")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "node-a")
+        self.assertEqual(result.migration_target, "node-b")
+        self.assertEqual(result.target_role, "prefill")
+        self.assertEqual(
+            [record.step for record in result.actions],
+            [
+                "router_drain_source",
+                "pause_source_admission",
+                "start_decode_migration_source",
+                "prepare_decode_migration_target",
+                "wait_decode_migration_source",
+                "wait_decode_migration_target",
+                "finish_decode_migration_source",
+                "wait_source_idle",
+                "set_source_runtime_role",
+                "refresh_router_source_role",
+                "resume_source_admission",
+                "router_undrain_source",
+            ],
+        )
+        target_prepare = [
+            post for post in client.posts if post[1] == "/pd_flip/migration/target/prepare"
+        ][0]
+        self.assertEqual(target_prepare[0], "http://node-b:30000")
+        self.assertEqual(target_prepare[2]["manifests"][0]["rid"], "rid-1")
+        finish_source = [
+            post for post in client.posts if post[1] == "/pd_flip/migration/source/finish"
+        ][0]
+        self.assertEqual(finish_source[2]["released_rids"], ["rid-1"])
+        self.assertGreaterEqual(result.total_seconds, 0.0)
+        self.assertGreaterEqual(result.migration_seconds, 0.0)
+
+    def test_p_to_d_execute_waits_idle_and_switches_role(self):
+        client = ExecutingFakeClient()
+        controller = self.script.PDFlipController(self.config, client)
+
+        result = controller.execute(direction="p_to_d", source_name="node-c")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "node-c")
+        self.assertIsNone(result.migration_target)
+        self.assertEqual(result.target_role, "decode")
+        self.assertEqual(
+            [record.step for record in result.actions],
+            [
+                "router_drain_source",
+                "pause_source_admission",
+                "wait_source_idle",
+                "set_source_runtime_role",
+                "refresh_router_source_role",
+                "resume_source_admission",
+                "router_undrain_source",
+            ],
+        )
+        self.assertIn(
+            (
+                "http://node-c:30000",
+                "/pd_flip/runtime_role/set",
+                {"role": "decode", "force": False},
+            ),
+            client.posts,
+        )
+
+    def test_execute_failure_resumes_admission_and_undrains_source(self):
+        client = ExecutingFakeClient(fail_target_prepare=True)
+        controller = self.script.PDFlipController(self.config, client)
+
+        result = controller.execute(direction="d_to_p", source_name="node-a")
+
+        self.assertFalse(result.success)
+        self.assertIn("target prepare failed", result.message)
+        self.assertEqual(result.source, "node-a")
+        self.assertEqual(
+            client.posts[-2:],
+            [
+                (
+                    "http://node-a:30000",
+                    "/pd_flip/runtime_role/admission",
+                    {"paused": False},
+                ),
+                (
+                    "http://router",
+                    "/pd_flip/router/worker/drain",
+                    {"worker_id": "node-a", "draining": False},
+                ),
+            ],
+        )
+
+    def test_main_execute_returns_nonzero_when_execution_fails(self):
+        client = ExecutingFakeClient(fail_target_prepare=True)
+        self.script.HttpClient = lambda api_key=None, timeout_seconds=10.0: client
+
+        with redirect_stdout(io.StringIO()):
+            rc = self.script.main(
+                [
+                    "--router-url",
+                    "http://router",
+                    "--node",
+                    "name=node-a,worker_url=http://node-a:30000,router_worker_id=node-a,bootstrap_port=8997",
+                    "--node",
+                    "name=node-b,worker_url=http://node-b:30000,router_worker_id=node-b,bootstrap_port=8997",
+                    "--node",
+                    "name=node-c,worker_url=http://node-c:30000,router_worker_id=node-c,bootstrap_port=8997",
+                    "execute",
+                    "--direction",
+                    "d_to_p",
+                    "--source-name",
+                    "node-a",
+                ]
+            )
+
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

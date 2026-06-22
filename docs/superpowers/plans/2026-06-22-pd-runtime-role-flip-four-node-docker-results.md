@@ -2,7 +2,7 @@
 
 Date: 2026-06-22
 
-Branch: `pd-runtime-role-flip-four-node-docker`
+Branch: `pd-flip-execute-docker-ready`
 
 ## Local Verification
 
@@ -25,10 +25,28 @@ Observed results:
 ```text
 test_pd_runtime_role_switch.py: 6 passed
 test_pd_flip_active_decode_handoff.py: 4 passed
-test_pd_flip_controller.py: 4 passed
-test_pd_flip_experiment_script.py: 5 passed
+test_pd_flip_controller.py: 8 passed
+test_pd_flip_experiment_script.py: 7 passed
 sgl-router cargo test --lib: 409 passed
 sgl-router proxy pd_mode subset: 8 passed
+```
+
+Additional execute-controller verification on this branch:
+
+```bash
+python3 test/srt/test_pd_flip_controller.py -v
+python3 test/srt/test_pd_flip_experiment_script.py -v
+python3 test/srt/test_pd_runtime_role_switch.py -v
+python3 -m py_compile scripts/playground/disaggregation/pd_flip_controller.py test/srt/test_pd_flip_controller.py test/srt/test_pd_flip_experiment_script.py
+```
+
+Observed results:
+
+```text
+test_pd_flip_controller.py: 8 passed
+test_pd_flip_experiment_script.py: 7 passed
+test_pd_runtime_role_switch.py: 6 passed
+py_compile: passed
 ```
 
 Blocked in this local environment:
@@ -92,7 +110,19 @@ Run order:
 # controller host
 ./run_controller.sh metrics
 DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run
+DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh execute
 ```
+
+The Docker defaults now map one physical 8-GPU node to one worker:
+
+```text
+TP_SIZE=8
+DP_SIZE=1
+TP_SIZE * DP_SIZE = 8
+```
+
+Use `DIRECTION=p_to_d SOURCE_NAME=node0 ./run_controller.sh execute` for the
+reverse idle prefill-to-decode switch.
 
 Fields to record during the real run:
 
@@ -108,6 +138,18 @@ total flip seconds:
 router unavailable errors:
 request success count:
 request failure count:
+```
+
+Controller result fields to save:
+
+```text
+success:
+message:
+source:
+migration_target:
+migration_seconds:
+total_seconds:
+actions:
 ```
 
 Acceptance target:

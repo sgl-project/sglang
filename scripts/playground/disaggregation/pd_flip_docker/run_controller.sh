@@ -30,9 +30,18 @@ case "${ACTION}" in
     exec python3 "${REPO_ROOT}/scripts/playground/disaggregation/pd_flip_controller.py" \
       "${base_args[@]}" "${dry_run_args[@]}"
     ;;
+  execute)
+    execute_args=(execute --direction "${DIRECTION}")
+    if [[ -n "${SOURCE_NAME}" ]]; then
+      execute_args+=(--source-name "${SOURCE_NAME}")
+    fi
+    exec python3 "${REPO_ROOT}/scripts/playground/disaggregation/pd_flip_controller.py" \
+      "${base_args[@]}" "${execute_args[@]}"
+    ;;
   *)
-    echo "usage: run_controller.sh [metrics|dry-run]" >&2
+    echo "usage: run_controller.sh [metrics|dry-run|execute]" >&2
     echo "       DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run" >&2
+    echo "       DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh execute" >&2
     exit 2
     ;;
 esac
