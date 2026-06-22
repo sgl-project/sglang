@@ -54,6 +54,7 @@ in the GitHub search bar.
 | **Qwen3-ASR** (0.6B, 1.7B) | `Qwen/Qwen3-ASR-1.7B` | Alibaba's automatic speech recognition models supporting 52 languages. Served via the `/v1/audio/transcriptions` endpoint. |  |
 | **Qwen3-Omni** | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |  Alibaba's omni-modal MoE model. Currently supports the **Thinker** component (multimodal understanding for text, images, audio, and video), while the **Talker** component (audio generation) is not yet supported. |  |
 | **LFM2-VL** | `LiquidAI/LFM2.5-VL-1.6B` | Liquid AI's vision-language model combining a SigLip2 vision encoder (NaFlex variable-resolution) with the LFM2 hybrid attention + short convolution language model. Supports multi-image inputs. |  |
+| **LocateAnything** (3B)    | `nvidia/LocateAnything-3B`                 | NVIDIA's visual grounding/detection model (MoonViT vision encoder + Qwen2 backbone) that emits `<ref>label</ref><box>...</box>` outputs with coordinates normalized to [0, 1000]. Covers object detection, phrase grounding, scene-text detection, GUI grounding, and pointing. | Use `--trust-remote-code`. Set `skip_special_tokens=false` so the `<ref>`/`<box>` grounding tokens survive in the output. |
 
 ## Audio Transcription
 
