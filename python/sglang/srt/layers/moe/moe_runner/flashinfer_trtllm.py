@@ -965,6 +965,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         gemm1_clamp_limit = None
 
+    if runner_config.gemm1_alpha is not None:
+        raise NotImplementedError(
+            "flashinfer_trtllm FP4 MoE does not support parameterized "
+            "(GPT-OSS-style) SwiGLU (gemm1_alpha is set); use "
+            "--moe-runner-backend flashinfer_cutlass instead."
+        )
+
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True

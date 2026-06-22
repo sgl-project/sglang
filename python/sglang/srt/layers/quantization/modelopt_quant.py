@@ -2455,6 +2455,33 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
+            swiglu_kwargs = {}
+            _gemm1_alpha = moe_runner_config.gemm1_alpha
+            _gemm1_limit = moe_runner_config.gemm1_clamp_limit
+            if _gemm1_alpha is not None and _gemm1_limit is None:
+                raise ValueError("gemm1_alpha requires gemm1_clamp_limit")
+            if _gemm1_alpha is not None or _gemm1_limit is not None:
+                _num_local_experts = layer.w13_weight.shape[0]
+                swiglu_kwargs["swiglu_alpha"] = torch.full(
+                    (_num_local_experts,),
+                    _gemm1_alpha if _gemm1_alpha is not None else 1.0,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                swiglu_kwargs["swiglu_beta"] = torch.full(
+                    (_num_local_experts,),
+                    1.0 if _gemm1_alpha is not None else 0.0,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                if _gemm1_limit is not None:
+                    swiglu_kwargs["swiglu_limit"] = torch.full(
+                        (_num_local_experts,),
+                        _gemm1_limit,
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
                 input=x,
@@ -2480,6 +2507,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=fi_activation,
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
+                **swiglu_kwargs,
             )[0]
 
             return StandardCombineInput(hidden_states=output)
