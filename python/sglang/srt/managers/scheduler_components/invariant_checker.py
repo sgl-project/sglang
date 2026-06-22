@@ -114,6 +114,9 @@ class SchedulerInvariantChecker:
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
+        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        if ckpt_pool is not None:
+            return self._check_mamba_pool_with_int8(ps, ckpt_pool)
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -149,6 +152,37 @@ class SchedulerInvariantChecker:
                 f", leaked_mamba_pages={leaked_mamba_pages or None}"
             )
         return leak, msg
+
+    def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
+        """Two-pool invariant for int8 mamba checkpoints.
+
+        The radix-cached states live in the int8 checkpoint pool, NOT the active
+        bf16 pool. So the single-pool equation (active.available + radix_cached ==
+        active.size) is wrong -- it double-counts the radix states against a pool
+        that does not hold them. Instead check the two pools independently:
+
+          * active bf16 pool: backs running requests only; the radix owns ZERO
+            active slots. Checked at idle (in-flight == 0) -> available == total.
+          * int8 checkpoint pool: backs the radix-cached states; its occupancy is
+            exactly the radix evictable + protected counts.
+        """
+        active_leak, active_msg = self._check_pool_invariant(
+            "mamba-active",
+            ps.mamba_available_size,
+            ps.mamba_evictable_size,  # 0 in int8 mode (radix owns no active slots)
+            0,
+            self.pool_stats_observer.session_held_mamba_slots(),
+            self.req_to_token_pool.mamba_pool.size,
+        )
+        int8_leak, int8_msg = self._check_pool_invariant(
+            "mamba-int8",
+            ckpt_pool.available_size(),
+            self.tree_cache.mamba_evictable_size(),
+            self.tree_cache.mamba_protected_size(),
+            0,
+            ckpt_pool.num_slots,
+        )
+        return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _get_total_uncached_sizes(
         self,

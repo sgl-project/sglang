@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -31,6 +32,7 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -38,9 +40,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import (
-    get_linear_attn_spec_by_arch,
-)
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -304,7 +304,7 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-MAMBA_SCHEDULER_STRATEGY_CHOICES = [
+MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
     "no_buffer",
     "extra_buffer",
@@ -371,51 +371,177 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 @dataclasses.dataclass
 class ServerArgs:
-    """
-    The arguments of the server.
+    """The arguments of the server.
 
-    NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the function
-    `ServerArgs.add_cli_args`.
-    Please follow the existing style to group the new arguments into related groups or create new groups.
+    There are two styles for defining arguments. New arguments MUST use the
+    ``A[T, ...]`` style; the legacy style is being migrated and should not be
+    used for new additions.
+
+    **Style 1 — ``A[T, ...]`` (required for all new arguments):**
+
+    Each field carries its own CLI metadata. ``A`` is an alias for
+    ``typing.Annotated``. For simple fields, use a bare string as the
+    help text. Use ``Arg(...)`` only when extra metadata is needed
+    (choices, aliases, custom type parser, etc.)::
+
+        # Simple — bare string is the help text:
+        host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+        trust_remote_code: A[bool, "Whether to allow custom models."] = False
+
+        # With extra metadata:
+        load_format: A[str, Arg(help="Format.", choices=LOAD_FORMAT_CHOICES)] = "auto"
+        model_path: A[str, Arg(help="Path to model.", aliases=["--model"])]
+
+    **Style 2 — Legacy (existing arguments, to be migrated):**
+
+    The field is a plain type annotation with a default, and a separate
+    ``parser.add_argument(...)`` call in ``add_cli_args`` defines the CLI
+    surface. When modifying these fields, keep the order in this class
+    definition consistent with the order in ``add_cli_args``.
+
+    Group new arguments into the appropriate existing section or create a
+    new section as needed.
     """
 
     # Model and tokenizer
-    model_path: str
-    tokenizer_path: Optional[str] = None
-    tokenizer_mode: str = "auto"
-    tokenizer_backend: str = "huggingface"
-    tokenizer_worker_num: int = 1
-    detokenizer_worker_num: int = 1
-    skip_tokenizer_init: bool = False
-    load_format: str = "auto"
-    model_loader_extra_config: str = "{}"
-    trust_remote_code: bool = False
-    context_length: Optional[int] = None
-    is_embedding: bool = False
-    prefill_only_disable_kv_cache: bool = False
-    enable_multimodal: Optional[bool] = None
-    revision: Optional[str] = None
-    model_impl: str = "auto"
-    model_config_parser: str = "auto"
+    model_path: A[
+        str,
+        Arg(
+            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            aliases=["--model"],
+        ),
+    ]
+    tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
+    tokenizer_mode: A[
+        str,
+        Arg(
+            help="Tokenizer mode. 'auto' will use the fast tokenizer if available, "
+            "and 'slow' will always use the slow tokenizer.",
+            choices=["auto", "slow"],
+        ),
+    ] = "auto"
+    tokenizer_backend: A[
+        str,
+        Arg(
+            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
+            "tokenizers library, and 'fastokens' uses the fastokens library "
+            "for faster tokenization. Requires the fastokens package to be installed.",
+            choices=["huggingface", "fastokens"],
+        ),
+    ] = "huggingface"
+    tokenizer_worker_num: A[int, "The worker num of the tokenizer manager."] = 1
+    detokenizer_worker_num: A[int, "The worker num of the detokenizer manager."] = 1
+    skip_tokenizer_init: A[
+        bool, "If set, skip init tokenizer and pass input_ids in generate request."
+    ] = False
+    load_format: A[
+        str,
+        Arg(
+            help="The format of the model weights to load. "
+            '"auto" will try to load the weights in the safetensors format '
+            "and fall back to the pytorch bin format if safetensors format "
+            "is not available. "
+            '"pt" will load the weights in the pytorch bin format. '
+            '"safetensors" will load the weights in the safetensors format. '
+            '"npcache" will load the weights in pytorch format and store '
+            "a numpy cache to speed up the loading. "
+            '"dummy" will initialize the weights with random values, '
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
+            choices=LOAD_FORMAT_CHOICES,
+        ),
+    ] = "auto"
+    model_loader_extra_config: A[
+        str,
+        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+    ] = "{}"
+    trust_remote_code: A[
+        bool,
+        "Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+    ] = False
+    context_length: A[
+        Optional[int],
+        Arg(
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
+            f"\n\n{human_readable_int.__doc__}",
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    is_embedding: A[bool, "Whether to use a CausalLM as an embedding model."] = False
+    enable_multimodal: A[
+        Optional[bool],
+        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+    ] = None
+    revision: A[
+        Optional[str],
+        "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
+    ] = None
+    model_impl: A[
+        str,
+        Arg(
+            help=(
+                "Which implementation of the model to use.\n\n"
+                '* "auto" will try to use the SGLang implementation if it exists '
+                "and fall back to the Transformers implementation if no SGLang "
+                "implementation is available.\n"
+                '* "sglang" will use the SGLang model implementation.\n'
+                '* "transformers" will use the Transformers model '
+                '* "mindspore" will use the MindSpore model '
+                "implementation.\n"
+            )
+        ),
+    ] = "auto"
+    model_config_parser: A[
+        str,
+        Arg(
+            help=(
+                'Which model-config parser to use. "auto" picks "mistral" '
+                'via the is_mistral_model name heuristic, else "hf" '
+                "(AutoConfig over config.json). Plugins can register additional "
+                "parsers via @register_model_config_parser."
+            )
+        ),
+    ] = "auto"
 
     # HTTP server
-    host: str = "127.0.0.1"
-    port: int = 30000
-    fastapi_root_path: str = ""
-    grpc_mode: bool = False
-    skip_server_warmup: bool = False
-    warmups: Optional[str] = None
-    nccl_port: Optional[int] = None
-    checkpoint_engine_wait_weights_before_ready: bool = False
+    host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+    port: A[int, "The port of the HTTP server."] = 30000
+    fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
+    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
+    skip_server_warmup: A[bool, "If set, skip warmup."] = False
+    warmups: A[
+        Optional[str],
+        "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+    ] = None
+    nccl_port: A[
+        Optional[int],
+        "The port for NCCL distributed environment setup. Defaults to a random port.",
+    ] = None
+    checkpoint_engine_wait_weights_before_ready: A[
+        bool,
+        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+    ] = False
 
     # SSL/TLS
-    ssl_keyfile: Optional[str] = None
-    ssl_certfile: Optional[str] = None
-    ssl_ca_certs: Optional[str] = None
-    ssl_keyfile_password: Optional[str] = None
-    enable_ssl_refresh: bool = False
-    enable_http2: bool = False
+    ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
+    ssl_certfile: A[Optional[str], "The file path to the SSL certificate file."] = None
+    ssl_ca_certs: A[Optional[str], "The CA certificates file."] = None
+    ssl_keyfile_password: A[
+        Optional[str], "The password to decrypt the SSL keyfile."
+    ] = None
+    enable_ssl_refresh: A[
+        bool,
+        "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+    ] = False
+    enable_http2: A[
+        bool,
+        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
+    ] = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -619,6 +745,7 @@ class ServerArgs:
     speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_use_rejection_sampling: bool = False
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -692,8 +819,14 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
-    mamba_scheduler_strategy: str = "auto"
+    mamba_radix_cache_strategy: str = "auto"
     mamba_track_interval: int = 256
+    # int8-compress radix-cached linear-attn (mamba) checkpoints -> ~2x cached
+    # prefixes at fixed memory (quality-safe; see mem_cache/mamba_checkpoint_pool.py).
+    enable_int8_mamba_checkpoint: bool = False
+    int8_mamba_ckpt_size: Optional[int] = (
+        None  # #int8 checkpoint slots; default 2x the active pool
+    )
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -744,6 +877,10 @@ class ServerArgs:
     enable_mis: bool = False
 
     # Optimization/debug options
+    prefill_only_disable_kv_cache: A[
+        bool,
+        "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+    ] = False
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -866,6 +1003,8 @@ class ServerArgs:
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    # Extra req_to_token slots for in-transfer requests; None -> default in PD hook
+    disaggregation_decode_extra_slots: Optional[int] = None
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
@@ -1009,6 +1148,7 @@ class ServerArgs:
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
@@ -1171,12 +1311,6 @@ class ServerArgs:
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
 
-            if self.tokenizer_worker_num > 1:
-                raise ValueError(
-                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
-                    "Multi-worker HTTP/2 support will be added in a future release."
-                )
-
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -1268,12 +1402,6 @@ class ServerArgs:
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
-
-        # Mamba scheduler strategy
-        if self.mamba_scheduler_strategy == "auto":
-            # TODO: when extra_buffer is more verified, we can set the default path based on
-            #       [overlap, non-overlap]
-            self.mamba_scheduler_strategy = "no_buffer"
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -1534,9 +1662,9 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own __init__; config-time
-        rules can be added here as they're discovered.
+        """Breakable (segmented capture, no torch.compile). Breakable enforces
+        memory-saver rejection in its own __init__; config-time rules can be
+        added here as they're discovered.
         """
         rules = [
             # MLA prefill takes a different attn-forward path under BCG (no
@@ -1951,6 +2079,16 @@ class ServerArgs:
             f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )
 
+    def _validate_hisparse_dsa_backend(self, attr: str, label: str):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
+
+        validate_hisparse_dsa_backend(self, attr, label)
+
+    def _validate_hisparse_kv_cache_dtype(self):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_kv_cache_dtype
+
+        validate_hisparse_kv_cache_dtype(self)
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -1967,11 +2105,7 @@ class ServerArgs:
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=_hybrid_spec.support_mamba_cache,
-                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -2016,7 +2150,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
@@ -2341,9 +2475,9 @@ class ServerArgs:
                     )
                 elif is_sm120_supported() and is_mxfp4_quant_format:
                     # trtllm-gen only supports SM100
-                    self.moe_runner_backend = "triton_kernel"
+                    self.moe_runner_backend = "marlin"
                     logger.warning(
-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
@@ -2609,16 +2743,9 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["KimiLinearForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=False,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=True,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
@@ -2679,22 +2806,20 @@ class ServerArgs:
                     ):
                         sm100_default_attn_backend = "trtllm_mha"
 
-                self._handle_mamba_radix_cache(
-                    model_arch=model_arch,
-                    support_mamba_cache=True,
-                    support_mamba_cache_extra_buffer=True,
-                    sm100_default_attention_backend=sm100_default_attn_backend,
-                )
+                    if self.attention_backend is None:
+                        self.attention_backend = sm100_default_attn_backend
+                        self.page_size = (
+                            64 if sm100_default_attn_backend == "trtllm_mha" else 1
+                        )
+
+                self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
             # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
             # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=True,
-                sm100_default_attention_backend="triton",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "triton"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -2725,10 +2850,9 @@ class ServerArgs:
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                sm100_default_attention_backend="triton",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "triton"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch == "GraniteMoeHybridForCausalLM":
             hf_config = self.get_model_config().hf_config
@@ -2737,29 +2861,21 @@ class ServerArgs:
                 for layer_type in getattr(hf_config, "layer_types", [])
             )
             if has_mamba:
-                self._handle_mamba_radix_cache(
-                    model_arch=model_arch,
-                    sm100_default_attention_backend="flashinfer",
-                )
+                if is_sm100_supported() and self.attention_backend is None:
+                    self.attention_backend = "flashinfer"
+                self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Lfm2ForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-                sm100_default_attention_backend="flashinfer",
-            )
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "flashinfer"
+            self._handle_mamba_radix_cache(model_arch=model_arch)
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
 
         elif model_arch in ["ZayaForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-            )
+            self._handle_mamba_radix_cache(model_arch=model_arch)
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
@@ -2801,6 +2917,8 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                "NemotronHForCausalLM",
+                "NemotronHPuzzleForCausalLM",
             ]
             and is_sm100_supported()
             and self.tp_size > 1
@@ -2820,100 +2938,68 @@ class ServerArgs:
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
 
-    def _handle_mamba_radix_cache(
-        self,
-        model_arch: str,
-        support_mamba_cache: bool = True,
-        support_mamba_cache_extra_buffer: bool = True,
-        sm100_default_attention_backend: str = None,
-        fallback_attention_backend: str = "triton",
-    ):
-        self.uses_mamba_radix_cache = True
+    def _support_mamba_cache_extra_buffer(self, model_arch: str):
+        if model_arch in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3NextForCausalLM",
+            "InternS2PreviewForConditionalGeneration",
+            "MiniCPMV4_6ForConditionalGeneration",
+            "BailingMoeV2_5ForCausalLM",
+            "FalconH1ForCausalLM",
+            "GraniteMoeHybridForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+        ]:
+            return self.linear_attn_backend == "triton"
 
-        if (
-            is_sm100_supported()
-            and self.attention_backend is None
-            and sm100_default_attention_backend is not None
-        ):
-            self.attention_backend = sm100_default_attention_backend
-            logger.info(
-                f"Use {sm100_default_attention_backend} as attention backend on sm100 for {model_arch}"
-            )
+        return False
 
-        if not support_mamba_cache:
-            logger.warning(
-                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
-            )
-            self.disable_radix_cache = True
+    def _validate_mamba_no_buffer(self, model_arch: str):
+        assert self.page_size in (1, None), "no_buffer only supports page_size=1."
+        assert (
+            self.disable_overlap_schedule
+        ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+        assert (
+            self.attention_backend != "trtllm_mha"
+        ), "no_buffer do not support trtllm_mha attention backend."
+
+    def _validate_mamba_extra_buffer(self, model_arch: str):
+        assert self._support_mamba_cache_extra_buffer(
+            model_arch
+        ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+        assert (
+            is_cuda() or is_musa() or is_npu()
+        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+        if self.speculative_num_draft_tokens is not None:
+            assert (
+                not self.enable_mamba_extra_buffer_lazy()
+            ), "extra_buffer_lazy unsupported with spec."
+            assert self.mamba_track_interval >= self.speculative_num_draft_tokens
+        if self.page_size is not None:
+            assert self.mamba_track_interval % self.page_size == 0
+            assert self.mamba_cache_chunk_size is not None
+
+    def _handle_mamba_radix_cache(self, model_arch: str):
+        if self.disable_radix_cache:
             return
 
-        if not support_mamba_cache_extra_buffer:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
-
-        if self.enable_mamba_extra_buffer():  # extra_buffer
-            if self.disable_radix_cache:
-                raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache. "
-                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
-                    "Please use --mamba-scheduler-strategy no_buffer instead."
-                )
-
-            assert (
-                is_cuda() or is_musa() or is_npu()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
-            if self.speculative_num_draft_tokens is not None:
-                assert not self.enable_mamba_extra_buffer_lazy(), (
-                    "extra_buffer_lazy is not yet supported with speculative decoding. "
-                    "Use --mamba-scheduler-strategy extra_buffer instead."
-                )
-                assert (
-                    self.mamba_track_interval >= self.speculative_num_draft_tokens
-                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
-
-            if self.page_size is not None:
-                assert (
-                    self.mamba_track_interval % self.page_size == 0
-                ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                assert self.mamba_cache_chunk_size is not None
-        elif not self.disable_radix_cache:  # no_buffer
-            if self.page_size is not None and self.page_size != 1:
-                logger.warning(
-                    f"{model_arch} with radix cache requires page_size=1 in the current "
-                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
-                    "Automatically setting page_size=1."
-                )
-                self.page_size = 1
-            if self.speculative_algorithm is None:
-                logger.warning(
-                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
-                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if self.attention_backend == "trtllm_mha":
-                    logger.warning(
-                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        f"Try to use --attention-backend {fallback_attention_backend} if radix cache is necessary."
-                    )
-                    self.disable_radix_cache = True
-                    self.disable_overlap_schedule = False
+        self.uses_mamba_radix_cache = True
+        if self.mamba_radix_cache_strategy == "auto":
+            wants_overlap = not self.disable_overlap_schedule
+            wants_paging = self.page_size is not None and self.page_size > 1
+            if (
+                wants_overlap or wants_paging
+            ) and self._support_mamba_cache_extra_buffer(model_arch):
+                self.mamba_radix_cache_strategy = "extra_buffer"
             else:
-                if not self.disable_radix_cache:
-                    if is_hip():
-                        # On ROCm, extra_buffer is unsupported.
-                        # Automatically disable radix cache instead.
-                        logger.warning(
-                            f"Speculative decoding for {model_arch} is not compatible "
-                            "with radix cache on ROCm devices. "
-                            "Automatically disabling radix cache."
-                        )
-                        self.disable_radix_cache = True
-                    else:
-                        raise ValueError(
-                            f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer."
-                        )
+                self.mamba_radix_cache_strategy = "no_buffer"
+                self.disable_overlap_schedule = True
+
+        if self.enable_mamba_extra_buffer():
+            self._validate_mamba_extra_buffer(model_arch)
+        else:
+            self._validate_mamba_no_buffer(model_arch)
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -3376,6 +3462,28 @@ class ServerArgs:
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
 
+    def _handle_int8_mamba_checkpoint(self):
+        # The int8 mamba checkpoint pool is only wired into the built-in
+        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # --enable-hierarchical-cache) and custom radix-cache backends are NOT
+        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
+        # (wrong pool / out-of-range). Reject the combination up front rather than
+        # silently corrupting state.
+        if not self.enable_int8_mamba_checkpoint:
+            return
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported together with "
+                "--enable-hierarchical-cache: the host-offload path "
+                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+            )
+        if self.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint only supports the built-in mamba "
+                f"radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
+                "is not int8-aware. Omit --radix-cache-backend."
+            )
+
     def _handle_linear_attn_backend(self):
         import torch
 
@@ -3467,6 +3575,17 @@ class ServerArgs:
         self.prefill_cp_mode = mode
 
     def _handle_context_parallelism(self):
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+
+            model_config = self.get_model_config()
+            model_arch = model_config.hf_config.architectures[0]
+            if (
+                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
+                and not envs.SGLANG_ENABLE_CP_V2.is_set()
+            ):
+                envs.SGLANG_ENABLE_CP_V2.set(True)
+
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
@@ -3686,6 +3805,21 @@ class ServerArgs:
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
         decode_tokens = decode_max_bs * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
+
+    def max_prefill_buffer_tokens(self) -> int:
+        """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
+        chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+        chunked = (
+            self.chunked_prefill_size
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0
+            else 0
+        )
+        tokens = chunked
+        if self.enable_dynamic_chunking and self.pp_size > 1 and chunked:
+            tokens = max(
+                tokens, self.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+            )
+        return tokens
 
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
@@ -4005,6 +4139,26 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
+
+        # Step 3: HiCache is not yet supported with the DeepSeek-V4 hip unified_kv
+        # layout, so fall back to the default tilelang FlashMLA backend.
+        self._resolve_unified_kv_hicache_compatibility()
+
+    def _resolve_unified_kv_hicache_compatibility(self):
+        # The DeepSeek-V4 unified_kv layout (SGLANG_HACK_FLASHMLA_BACKEND=
+        # unified_kv_triton) keeps swa/c4/c128 in a single per-layer buffer and
+        # has no HiCache host-pool support yet, so reset the backend to the
+        # default (tilelang) so the server still starts.
+        if not self.enable_hierarchical_cache:
+            return
+
+        if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
+            envs.SGLANG_HACK_FLASHMLA_BACKEND.set("tilelang")
+            logger.warning(
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is not yet "
+                "compatible with --enable-hierarchical-cache; falling back to "
+                "SGLANG_HACK_FLASHMLA_BACKEND=tilelang."
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -4355,9 +4509,9 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
-            if not is_cuda():
+            if not (is_cuda() or is_hip()):
                 logger.warning(
-                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                     "Disabling breakable CUDA graph."
                 )
                 self.debug_cuda_graph = False
@@ -4705,232 +4859,8 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Model and tokenizer
-        parser.add_argument(
-            "--model-path",
-            "--model",
-            type=str,
-            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=True,
-        )
-        parser.add_argument(
-            "--tokenizer-path",
-            type=str,
-            default=ServerArgs.tokenizer_path,
-            help="The path of the tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-mode",
-            type=str,
-            default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-backend",
-            type=str,
-            default=ServerArgs.tokenizer_backend,
-            choices=["huggingface", "fastokens"],
-            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-            "tokenizers library, and 'fastokens' uses the fastokens library "
-            "for faster tokenization. Requires the fastokens package to be installed.",
-        )
-        parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
-        )
-        parser.add_argument(
-            "--detokenizer-worker-num",
-            type=int,
-            default=ServerArgs.detokenizer_worker_num,
-            help="The worker num of the detokenizer manager.",
-        )
-        parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request.",
-        )
-        parser.add_argument(
-            "--load-format",
-            type=str,
-            default=ServerArgs.load_format,
-            choices=LOAD_FORMAT_CHOICES,
-            help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. '
-            '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization."
-            '"layered" loads weights layer by layer so that one can quantize a '
-            "layer before loading another to make the peak memory envelope "
-            "smaller.",
-        )
-        parser.add_argument(
-            "--model-loader-extra-config",
-            type=str,
-            help="Extra config for model loader. "
-            "This will be passed to the model loader corresponding to the chosen load_format.",
-            default=ServerArgs.model_loader_extra_config,
-        )
-        parser.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
-        )
-        parser.add_argument(
-            "--context-length",
-            type=human_readable_int,
-            default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead)."
-            + f"\n\n{human_readable_int.__doc__}",
-        )
-        parser.add_argument(
-            "--is-embedding",
-            action="store_true",
-            help="Whether to use a CausalLM as an embedding model.",
-        )
-        parser.add_argument(
-            "--prefill-only-disable-kv-cache",
-            action="store_true",
-            help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
-        )
-        parser.add_argument(
-            "--enable-multimodal",
-            default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
-        )
-        parser.add_argument(
-            "--revision",
-            type=str,
-            default=None,
-            help="The specific model version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
-        )
-        parser.add_argument(
-            "--model-impl",
-            type=str,
-            default=ServerArgs.model_impl,
-            help="Which implementation of the model to use.\n\n"
-            '* "auto" will try to use the SGLang implementation if it exists '
-            "and fall back to the Transformers implementation if no SGLang "
-            "implementation is available.\n"
-            '* "sglang" will use the SGLang model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            '* "mindspore" will use the MindSpore model '
-            "implementation.\n",
-        )
-        parser.add_argument(
-            "--model-config-parser",
-            type=str,
-            default=ServerArgs.model_config_parser,
-            help='Which model-config parser to use. "auto" picks "mistral" '
-            'via the is_mistral_model name heuristic, else "hf" '
-            "(AutoConfig over config.json). Plugins can register additional "
-            "parsers via @register_model_config_parser.",
-        )
-
-        # HTTP server
-        parser.add_argument(
-            "--host",
-            type=str,
-            default=ServerArgs.host,
-            help="The host of the HTTP server.",
-        )
-        parser.add_argument(
-            "--port",
-            type=int,
-            default=ServerArgs.port,
-            help="The port of the HTTP server.",
-        )
-        parser.add_argument(
-            "--fastapi-root-path",
-            type=str,
-            default=ServerArgs.fastapi_root_path,
-            help="App is behind a path based routing proxy.",
-        )
-        parser.add_argument(
-            "--grpc-mode",
-            action="store_true",
-            help="If set, use gRPC server instead of HTTP server.",
-        )
-        parser.add_argument(
-            "--skip-server-warmup",
-            action="store_true",
-            help="If set, skip warmup.",
-        )
-        parser.add_argument(
-            "--warmups",
-            type=str,
-            required=False,
-            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
-        )
-        parser.add_argument(
-            "--nccl-port",
-            type=int,
-            default=ServerArgs.nccl_port,
-            help="The port for NCCL distributed environment setup. Defaults to a random port.",
-        )
-        parser.add_argument(
-            "--checkpoint-engine-wait-weights-before-ready",
-            action="store_true",
-            help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
-            "before serving inference requests.",
-        )
-
-        # SSL/TLS
-        parser.add_argument(
-            "--ssl-keyfile",
-            type=str,
-            default=ServerArgs.ssl_keyfile,
-            help="The file path to the SSL key file.",
-        )
-        parser.add_argument(
-            "--ssl-certfile",
-            type=str,
-            default=ServerArgs.ssl_certfile,
-            help="The file path to the SSL certificate file.",
-        )
-        parser.add_argument(
-            "--ssl-ca-certs",
-            type=str,
-            default=ServerArgs.ssl_ca_certs,
-            help="The CA certificates file.",
-        )
-        parser.add_argument(
-            "--ssl-keyfile-password",
-            type=str,
-            default=ServerArgs.ssl_keyfile_password,
-            help="The password to decrypt the SSL keyfile.",
-        )
-        parser.add_argument(
-            "--enable-ssl-refresh",
-            action="store_true",
-            default=ServerArgs.enable_ssl_refresh,
-            help="Enable automatic SSL certificate hot-reloading when cert/key "
-            "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
-        )
-        parser.add_argument(
-            "--enable-http2",
-            action="store_true",
-            default=ServerArgs.enable_http2,
-            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
-            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
-            "Requires 'pip install sglang[http2]'.",
-        )
+        # Auto-derived from Annotated[..., Arg(...)] field metadata.
+        add_cli_args_from_dataclass(parser, ServerArgs)
 
         # Quantization and data type
         parser.add_argument(
@@ -6106,6 +6036,12 @@ class ServerArgs:
             default=ServerArgs.speculative_accept_threshold_acc,
         )
         parser.add_argument(
+            "--speculative-use-rejection-sampling",
+            action="store_true",
+            help="Use rejection sampling for speculative decoding (requires topk=1).",
+            default=ServerArgs.speculative_use_rejection_sampling,
+        )
+        parser.add_argument(
             "--speculative-token-map",
             type=str,
             help="The path of the draft model's small vocab table.",
@@ -6445,6 +6381,19 @@ class ServerArgs:
             help="The maximum size of the mamba cache.",
         )
         parser.add_argument(
+            "--enable-int8-mamba-checkpoint",
+            action="store_true",
+            help="Store radix-cached linear-attn (mamba) states in int8 (separate "
+            "checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        )
+        parser.add_argument(
+            "--int8-mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.int8_mamba_ckpt_size,
+            help="Number of int8 mamba checkpoint slots (default: 2x the active "
+            "mamba pool size).",
+        )
+        parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
             default=None,
@@ -6460,9 +6409,18 @@ class ServerArgs:
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",
+            dest="mamba_radix_cache_strategy",
             type=str,
-            choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
-            default=ServerArgs.mamba_scheduler_strategy,
+            action=DeprecatedAliasStoreAction,
+            new_flag="--mamba-radix-cache-strategy",
+            default=ServerArgs.mamba_radix_cache_strategy,
+            help="Deprecated alias for --mamba-radix-cache-strategy.",
+        )
+        parser.add_argument(
+            "--mamba-radix-cache-strategy",
+            type=str,
+            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            default=ServerArgs.mamba_radix_cache_strategy,
             help="The strategy to use for mamba radix cache.",
         )
         parser.add_argument(
@@ -7393,6 +7351,12 @@ class ServerArgs:
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
         )
         parser.add_argument(
+            "--disaggregation-decode-extra-slots",
+            type=int,
+            default=ServerArgs.disaggregation_decode_extra_slots,
+            help="Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",
+        )
+        parser.add_argument(
             "--disaggregation-decode-polling-interval",
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
@@ -7730,10 +7694,16 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_scheduler_strategy in ("extra_buffer", "extra_buffer_lazy")
+        return (
+            self.disable_radix_cache is False
+            and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
+        )
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return self.mamba_scheduler_strategy == "extra_buffer_lazy"
+        return (
+            self.disable_radix_cache is False
+            and self.mamba_radix_cache_strategy == "extra_buffer_lazy"
+        )
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
