@@ -122,6 +122,17 @@ kill_existing_processes() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+cleanup_stale_shm() {
+    # Reclaim /dev/shm segments leaked by SIGKILLed processes from earlier
+    # jobs; leaked segments accumulate until the tmpfs fills and scheduler
+    # init dies with SIGBUS. Runs right after killall so every dead creator's
+    # segments are reclaimable. The module is dependency-free and runnable by
+    # path, so this works before sglang is installed.
+    SGLANG_IS_IN_CI=true python3 "${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py" || true
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_apt_packages() {
     apt-get update || true
     CI_APT_PACKAGES=(
@@ -278,11 +289,18 @@ install_sglang_kernel() {
 
     # Reinstall torch with matching CUDA version if needed
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
-    echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    REINSTALL_TORCH=false
+    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
+        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    else
+        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
+        TORCH_CUDA_VER=""
+        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
+        printf '%s\n' "${TORCH_IMPORT_ERROR}"
+        REINSTALL_TORCH=true
+    fi
     TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
     TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    REINSTALL_TORCH=false
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         REINSTALL_TORCH=true
     else
@@ -297,6 +315,11 @@ install_sglang_kernel() {
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
+            echo "ERROR: could not determine installed torch package versions before reinstall."
+            pip show torch torchaudio torchvision || true
+            exit 1
+        fi
         echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
@@ -418,13 +441,20 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
+    MOONCAKE_VERSION="0.3.11.post1"
+    NIXL_VERSION="1.3.0"
+    NIXL_PKG="nixl==${NIXL_VERSION}"
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+        NIXL_BIN_PKG="nixl-cu13==${NIXL_VERSION}"
+        NIXL_STALE_BIN_PKG="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+        NIXL_BIN_PKG="nixl-cu12==${NIXL_VERSION}"
+        NIXL_STALE_BIN_PKG="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
     # Both variants own the same mooncake/ package files and bin/ scripts
@@ -436,10 +466,12 @@ install_extra_deps() {
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
-    $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
-
     # Best-effort NIXL install for decode-radix disaggregation coverage.
-    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+    if pip show ${NIXL_STALE_BIN_PKG} >/dev/null 2>&1; then
+        $PIP_UNINSTALL_CMD ${NIXL_STALE_BIN_PKG} $PIP_UNINSTALL_SUFFIX || true
+        $PIP_CMD install ${NIXL_PKG} ${NIXL_BIN_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    fi
+    $PIP_CMD install ${MOONCAKE_PKG} ${NIXL_PKG} ${NIXL_BIN_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -511,6 +543,7 @@ main() {
     configure_environment "$@"
     detect_host
     kill_existing_processes
+    cleanup_stale_shm
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain

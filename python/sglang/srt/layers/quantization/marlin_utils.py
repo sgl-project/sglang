@@ -242,7 +242,9 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     )[0]
 
 
-def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
+def check_moe_marlin_supports_layer(
+    layer: FusedMoE, group_size: int, allow_tile_padding: bool = False
+) -> bool:
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
@@ -255,13 +257,21 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
             "relu2",
         }
 
-    # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
-    # down: (n, k) = (hidden_size, intermediate_size_per_partition)
-    # moe marlin requires n % 128 == 0 and k % 64 == 0
-    supports_shape = (
-        hidden_size % 128 == 0
-        and intermediate_size_per_partition % max(64, group_size) == 0
-    )
+    if allow_tile_padding:
+        # Thread-tile misalignment can be fixed by zero-padding the expert
+        # intermediate dimension before Marlin repack. The original K still
+        # needs to fit a Marlin tile family, and quant groups must stay whole.
+        supports_shape = (
+            hidden_size % 64 == 0 and intermediate_size_per_partition % group_size == 0
+        )
+    else:
+        # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
+        # down: (n, k) = (hidden_size, intermediate_size_per_partition)
+        # moe marlin requires n % 128 == 0 and k % 64 == 0
+        supports_shape = (
+            hidden_size % 128 == 0
+            and intermediate_size_per_partition % max(64, group_size) == 0
+        )
     supports_group_size = group_size in [-1, 32, 64, 128]
     return (
         supports_shape
@@ -679,7 +689,7 @@ class MarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "MarlinConfig":
+    def from_config(cls, config: dict[str, Any]) -> MarlinConfig:
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         return cls(group_size, lm_head_quantized)

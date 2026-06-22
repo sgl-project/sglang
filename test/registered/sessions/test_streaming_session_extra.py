@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
 from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=562, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestStreamingSessionRetractMixedChunk(
@@ -74,7 +75,6 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
         *_EAGLE3_SPEC_ARGS,
     ]
     env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 

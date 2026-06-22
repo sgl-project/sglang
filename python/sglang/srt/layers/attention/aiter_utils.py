@@ -43,12 +43,12 @@ if TYPE_CHECKING:
 
 
 def forward_extend_vectorized_5d(
-    backend: "AiterAttnBackend",
+    backend: AiterAttnBackend,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    layer: "RadixAttention",
-    forward_batch: "ForwardBatch",
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
     bs0: int,
     window_size,
     sinks,
@@ -207,10 +207,10 @@ def forward_extend_vectorized_5d(
 
 
 def forward_decode_vectorized_5d(
-    backend: "AiterAttnBackend",
+    backend: AiterAttnBackend,
     q: torch.Tensor,
-    layer: "RadixAttention",
-    forward_batch: "ForwardBatch",
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     o: torch.Tensor,

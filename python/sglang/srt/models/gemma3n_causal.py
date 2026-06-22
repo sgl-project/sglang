@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -26,6 +25,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -325,7 +325,7 @@ class Gemma3nAttention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
