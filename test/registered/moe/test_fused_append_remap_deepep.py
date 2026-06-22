@@ -7,16 +7,15 @@ single Triton launch on the aiter/DeepEP-class path. The kernel is GPU-only
 """
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, _remap_topk_for_deepep
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -132,18 +131,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
                     num_local_routed,
                 )
 
-                with (
-                    patch.object(
-                        topk_module,
-                        "get_moe_expert_parallel_world_size",
-                        return_value=ep_size,
-                    ),
-                    patch.object(
-                        topk_module,
-                        "get_moe_expert_parallel_rank",
-                        return_value=ep_rank,
-                    ),
-                ):
+                with get_parallel().override(moe_ep_size=ep_size, moe_ep_rank=ep_rank):
                     eager_ids, eager_w = fused_append_shared_experts(
                         topk_ids.clone(),
                         topk_weights.clone(),
