@@ -122,6 +122,14 @@ else
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+
+  # The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
+  # exists in httpx>=0.25.0. The CI image ships an older httpx that pip's editable
+  # reinstall above does not upgrade (only-if-needed strategy keeps the pre-baked
+  # version), so test_anthropic_server fails with:
+  #   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
+  # Force the upgrade explicitly.
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
