@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqCacheMatchSnapshot
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
@@ -384,7 +384,7 @@ class TestPrefillAdder(CustomTestCase):
         # Add a prefill that exactly consumes the chunk budget
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
         req1.extend_input_len = 56
-        req1.host_hit_length = 0
+        req1.cache_match_snapshot = ReqCacheMatchSnapshot()
         req1.prefix_indices = []
         req1.full_untruncated_fill_ids = list(range(56))
         req1.fill_len = 56
@@ -419,7 +419,7 @@ class TestPrefillAdder(CustomTestCase):
         # Same prefill no longer exhausts the chunk budget
         req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
         req2.extend_input_len = 56
-        req2.host_hit_length = 0
+        req2.cache_match_snapshot = ReqCacheMatchSnapshot()
         req2.prefix_indices = []
         req2.full_untruncated_fill_ids = list(range(56))
         req2.fill_len = 56
@@ -437,7 +437,7 @@ class TestPrefillAdder(CustomTestCase):
         # Fit last small prefill request
         req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
         req3.extend_input_len = 3
-        req3.host_hit_length = 0
+        req3.cache_match_snapshot = ReqCacheMatchSnapshot()
         req3.prefix_indices = []
         req3.full_untruncated_fill_ids = list(range(3))
         req3.fill_len = 3

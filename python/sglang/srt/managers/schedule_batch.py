@@ -669,13 +669,13 @@ class ReqCacheMatchSnapshot:
     # capped at the max allowed prefix. Set during prefix matching at schedule
     # time and used to estimate uncached tokens / sort by longest prefix for
     # load reporting.
-    num_matched_prefix_tokens: int
+    num_matched_prefix_tokens: int = 0
     # Per-component host hit lengths split off from host_hit_length:
-    host_hit_length: int
-    swa_host_hit_length: int
-    mamba_host_hit_length: int
-    last_host_node: Any
-    best_match_node: Any
+    host_hit_length: int = 0
+    swa_host_hit_length: int = 0
+    mamba_host_hit_length: int = 0
+    last_host_node: Any = None
+    best_match_node: Any = None
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -876,7 +876,7 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache_match_snapshot: Optional[ReqCacheMatchSnapshot] = None
+        self.cache_match_snapshot: ReqCacheMatchSnapshot = ReqCacheMatchSnapshot()
         self.locked_cache: Optional[ReqLockedCacheInfo] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
@@ -1059,57 +1059,9 @@ class Req(ReqDllmMixin):
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
-            self.host_hit_length > 0
-            or self.swa_host_hit_length > 0
-            or self.mamba_host_hit_length > 0
-        )
-
-    @property
-    def num_matched_prefix_tokens(self) -> int:
-        return (
-            self.cache_match_snapshot.num_matched_prefix_tokens
-            if self.cache_match_snapshot is not None
-            else 0
-        )
-
-    @property
-    def host_hit_length(self) -> int:
-        return (
-            self.cache_match_snapshot.host_hit_length
-            if self.cache_match_snapshot is not None
-            else 0
-        )
-
-    @property
-    def swa_host_hit_length(self) -> int:
-        return (
-            self.cache_match_snapshot.swa_host_hit_length
-            if self.cache_match_snapshot is not None
-            else 0
-        )
-
-    @property
-    def mamba_host_hit_length(self) -> int:
-        return (
-            self.cache_match_snapshot.mamba_host_hit_length
-            if self.cache_match_snapshot is not None
-            else 0
-        )
-
-    @property
-    def last_host_node(self) -> Any:
-        return (
-            self.cache_match_snapshot.last_host_node
-            if self.cache_match_snapshot is not None
-            else None
-        )
-
-    @property
-    def best_match_node(self) -> Any:
-        return (
-            self.cache_match_snapshot.best_match_node
-            if self.cache_match_snapshot is not None
-            else None
+            self.cache_match_snapshot.host_hit_length > 0
+            or self.cache_match_snapshot.swa_host_hit_length > 0
+            or self.cache_match_snapshot.mamba_host_hit_length > 0
         )
 
     def effective_kv_committed_len(self) -> int:
@@ -1224,7 +1176,7 @@ class Req(ReqDllmMixin):
             self.prefix_indices = match_result.device_indices
             self.last_node = match_result.last_device_node
             self.cache_match_snapshot = ReqCacheMatchSnapshot(
-                num_matched_prefix_tokens=self.num_matched_prefix_tokens,
+                num_matched_prefix_tokens=self.cache_match_snapshot.num_matched_prefix_tokens,
                 host_hit_length=match_result.host_hit_length,
                 swa_host_hit_length=match_result.swa_host_hit_length,
                 mamba_host_hit_length=match_result.mamba_host_hit_length,
@@ -1481,7 +1433,7 @@ class Req(ReqDllmMixin):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
-        self.cache_match_snapshot = None
+        self.cache_match_snapshot = ReqCacheMatchSnapshot()
         assert self.locked_cache is None, "expect it is already released"
         self.last_node = None
         self.cache_protected_len = 0
@@ -2146,7 +2098,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
+                    host_total = req.cache_match_snapshot.host_hit_length
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion

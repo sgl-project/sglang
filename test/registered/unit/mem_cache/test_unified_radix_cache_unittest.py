@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqCacheMatchSnapshot
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -648,11 +648,13 @@ class UnifiedRadixCacheSuite:
     def _apply_match_to_req(self, req, match):
         req.prefix_indices = match.device_indices
         req.last_node = match.last_device_node
-        req.last_host_node = match.last_host_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
-        req.mamba_host_hit_length = match.mamba_host_hit_length
+        req.cache_match_snapshot = ReqCacheMatchSnapshot(
+            host_hit_length=match.host_hit_length,
+            swa_host_hit_length=match.swa_host_hit_length,
+            mamba_host_hit_length=match.mamba_host_hit_length,
+            last_host_node=match.last_host_node,
+            best_match_node=match.best_match_node,
+        )
 
     def _make_seq(self, start: int, num_pages: int) -> list[int]:
         """Page-aligned token sequence of num_pages pages."""
@@ -3439,8 +3441,8 @@ class UnifiedRadixCacheSuite:
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
+                best_match_node=req.cache_match_snapshot.best_match_node,
+                host_hit_length=req.cache_match_snapshot.host_hit_length,
                 req=req,
             )
         )
@@ -3480,8 +3482,8 @@ class UnifiedRadixCacheSuite:
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
+                best_match_node=req.cache_match_snapshot.best_match_node,
+                host_hit_length=req.cache_match_snapshot.host_hit_length,
                 req=req,
             )
         )
@@ -3518,8 +3520,8 @@ class UnifiedRadixCacheSuite:
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
+                best_match_node=req.cache_match_snapshot.best_match_node,
+                host_hit_length=req.cache_match_snapshot.host_hit_length,
                 req=req,
                 mem_quota=-1_000_000,
             )

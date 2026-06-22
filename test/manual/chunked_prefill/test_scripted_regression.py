@@ -370,7 +370,7 @@ class TestRegressionPriority(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
-        r1_host_hit_before = r1.req.host_hit_length
+        r1_host_hit_before = r1.req.cache_match_snapshot.host_hit_length
 
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
@@ -380,10 +380,13 @@ class TestRegressionPriority(ScriptedTestCase):
         )
         prev_chunks = r1.chunks_done
         while not (r1.finished and r2.finished):
-            assert r1.req is None or r1.req.host_hit_length == r1_host_hit_before, (
+            assert (
+                r1.req is None
+                or r1.req.cache_match_snapshot.host_hit_length == r1_host_hit_before
+            ), (
                 f"aaf3752d2b: priority calc re-matched the chunked-resume req; "
                 f"host_hit_length changed {r1_host_hit_before} -> "
-                f"{r1.req.host_hit_length}"
+                f"{r1.req.cache_match_snapshot.host_hit_length}"
             )
             assert r1.chunks_done >= prev_chunks, (
                 f"r1 chunked prefill was preempted by higher-priority r2: "
@@ -450,13 +453,16 @@ class TestRegressionLpm(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
-        host_hit_before = r1.req.host_hit_length
+        host_hit_before = r1.req.cache_match_snapshot.host_hit_length
 
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         while not (r1.finished and r2.finished):
-            assert r1.req is None or r1.req.host_hit_length == host_hit_before, (
+            assert (
+                r1.req is None
+                or r1.req.cache_match_snapshot.host_hit_length == host_hit_before
+            ), (
                 f"calc_priority re-matched the chunked-resume req; host_hit_length "
-                f"changed {host_hit_before} -> {r1.req.host_hit_length}"
+                f"changed {host_hit_before} -> {r1.req.cache_match_snapshot.host_hit_length}"
             )
             yield
 

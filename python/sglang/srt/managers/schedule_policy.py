@@ -296,7 +296,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -r.num_matched_prefix_tokens
+                -r.cache_match_snapshot.num_matched_prefix_tokens
                 if r.rid not in temporary_deprioritized
                 else float("inf")
             )
@@ -894,7 +894,9 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = (
+            req.extend_input_len - req.cache_match_snapshot.host_hit_length
+        )
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -903,7 +905,8 @@ class PrefillAdder:
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
-                req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                req.extend_input_len,
+                swa_host_hit_length=req.cache_match_snapshot.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
@@ -925,7 +928,8 @@ class PrefillAdder:
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
-                    req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                    req.extend_input_len,
+                    swa_host_hit_length=req.cache_match_snapshot.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
@@ -933,8 +937,8 @@ class PrefillAdder:
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
+                        best_match_node=req.cache_match_snapshot.best_match_node,
+                        host_hit_length=req.cache_match_snapshot.host_hit_length,
                         req=req,
                     )
                 )

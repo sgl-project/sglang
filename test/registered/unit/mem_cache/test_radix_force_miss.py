@@ -33,10 +33,6 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.prefix_indices = None
-        self.last_host_node = None
-        self.best_match_node = None
-        self.host_hit_length = None
-        self.num_matched_prefix_tokens = 0
         self.cache = SimpleNamespace(last_node=None, cache_protected_len=None)
         self.mamba = SimpleNamespace(mamba_branching_seqlen=None)
 
@@ -99,8 +95,8 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
             match_prefix_for_req(tree, forced_req)
         self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
         self.assertIs(forced_req.last_node, tree.root_node)
-        self.assertIs(forced_req.last_host_node, tree.root_node)
-        self.assertEqual(forced_req.host_hit_length, 0)
+        self.assertIs(forced_req.cache_match_snapshot.last_host_node, tree.root_node)
+        self.assertEqual(forced_req.cache_match_snapshot.host_hit_length, 0)
 
 
 if __name__ == "__main__":
