@@ -844,11 +844,17 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
 
-    def init_all_backends(self):
-        """Initialize attention backends and capture cuda graphs for all workers."""
-        self.tp_worker.init_backends()
+    def init_all_attention_backends(self):
+        """Initialize attention backends for all workers."""
+        self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
-            self.draft_worker.init_backends()
+            self.draft_worker.init_attention_backends()
+
+    def init_all_cuda_graphs(self):
+        """Capture cuda graphs for all workers."""
+        self.tp_worker.init_cuda_graphs()
+        if self.draft_worker is not None:
+            self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
         # Load model weights.
@@ -859,12 +865,11 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Allocate KV cache pools for all workers.
-        # Memory profiling now sees all loaded weights.
         self.init_memory_pools()
 
-        # Initialize attention backends and capture cuda graphs.
         # TODO: make memory profile consider cuda graph memory as well
-        self.init_all_backends()
+        self.init_all_attention_backends()
+        self.init_all_cuda_graphs()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
