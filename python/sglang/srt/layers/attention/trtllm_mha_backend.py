@@ -730,7 +730,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                             self.topk
                         )
                     )
-                    metadata.max_seq_len_k = seq_lens_cpu.max().item() + (
+                    metadata.max_seq_len_k = int(seq_lens.max().item()) + (
                         self.speculative_step_id + 1
                     )
                     metadata.cu_seqlens_k[1:].copy_(
@@ -1368,7 +1368,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             # per-step _apply only refreshes the per-step sequence lengths.
             seq_lens_cpu = (
                 forward_batch.seq_lens.cpu()
-                if in_capture
+                if in_capture or forward_batch.seq_lens_cpu is None
                 else forward_batch.seq_lens_cpu
             )
             self._update_draft_branch_page_tables(

@@ -72,6 +72,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
     per_step_draft_out_cache_loc,
     resolve_tree_mask_mode,
+    TreeMaskMode,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -209,22 +210,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with (
-            self.draft_tp_context(self.draft_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
-            self.init_attention_backend()
-            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
-                self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
-            self.init_cuda_graphs()
-
-        if (c := self.draft_runner.canary_manager) is not None:
-            c.mark_init_finished()
-
-        self.tree_mask_mode = resolve_tree_mask_mode(
-            self.target_worker.model_runner.attn_backend
-        )
+        self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
