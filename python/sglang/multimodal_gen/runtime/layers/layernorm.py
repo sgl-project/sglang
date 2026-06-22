@@ -430,6 +430,16 @@ class FP32LayerNorm(nn.LayerNorm):
         return fp32_param
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if _is_npu:
+            output, _, _ = torch.ops.attentions.layernorm(
+                input=inputs,
+                normalized_shape=list(self.normalized_shape),
+                weight=self.weight,
+                bias=self.bias,
+                eps=self.eps,
+                impl_mode = 0 # 0 - high precision, 1 - high perfomance, 2 - float16.
+            )
+        return output
         origin_dtype = inputs.dtype
         device = inputs.device
         weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
