@@ -1366,20 +1366,6 @@ void fused_gdn_gating_kernel_impl(
 
 }  // anonymous namespace
 
-// TODO: remove this one
-template <bool is_last_dim_contiguous>
-inline void
-CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
-  TORCH_CHECK(tensor.sizes() == sizes, "Input tensor shape mismatch: expected ", sizes, ", got ", tensor.sizes());
-  TORCH_CHECK(tensor.dtype() == st, "Input tensor dtype mismatch");
-  CHECK_DIM(dim, tensor);
-  if (is_last_dim_contiguous) {
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor);
-  } else {
-    CHECK_CONTIGUOUS(tensor);
-  }
-}
-
 template <int CHUNK_SIZE>
 std::tuple<at::Tensor, at::Tensor> prepare_chunk_indices(const at::Tensor& cu_seqlens) {
   int64_t num_seqs = cu_seqlens.size(0) - 1;
@@ -1448,17 +1434,6 @@ std::tuple<at::Tensor, at::Tensor> l2norm_fwd(const at::Tensor& query, const at:
   return std::make_tuple(query_norm, key_norm);
 }
 
-// TODO: debug code remove me!!!
-at::Tensor l2norm(const at::Tensor& x, double eps, bool has_scale) {
-  auto xf = x.to(at::kFloat);
-  auto inv_norm = at::rsqrt((xf * xf).sum(-1, true) + eps);
-  auto out = xf * inv_norm;
-  if (has_scale) {
-    out.mul_(1.0 / std::sqrt(static_cast<double>(x.size(-1))));
-  }
-  return out.to(x.scalar_type());
-}
-
 // [NB]: instantiate decay_mask to avoid heavy recomputation in the kernel with exp
 template <int CHUNK_SIZE>
 at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, const at::Tensor& chunk_indices) {
@@ -1478,135 +1453,6 @@ at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens,
         NT);
   });
   return g_;
-}
-
-// TODO: debug code remove me!!!
-// Reference for chunk_local_cumsum on a single sequence.
-// Matches test_mamba.py: F.pad(g, (0, pad_size)) + reshape + g.cumsum(dim=-1)
-// on head-first g with shape [B, Hv, T], returning [B, Hv, NT, chunk_size].
-at::Tensor cumsum(const at::Tensor& g, int chunk_size) {
-  TORCH_CHECK(g.dim() == 3, "cumsum: expect g with shape [B, T, Hv]");
-  TORCH_CHECK(chunk_size > 0, "cumsum: chunk_size must be positive");
-
-  auto g_hf = g.transpose(1, 2).contiguous();
-  const int64_t B = g_hf.size(0);
-  const int64_t Hv = g_hf.size(1);
-  const int64_t seq_len = g_hf.size(2);
-  const int64_t pad_size = (chunk_size - seq_len % chunk_size) % chunk_size;
-  if (pad_size > 0) {
-    auto padding = at::zeros({B, Hv, pad_size}, g.options());
-    g_hf = at::cat({g_hf, padding}, 2);
-  }
-  const int64_t NT = g_hf.size(2) / chunk_size;
-  return g_hf.view({B, Hv, NT, chunk_size}).cumsum(-1);
-}
-
-// Varlen packed batch reference: run single-sequence cumsum per cu_seqlens entry
-// and concatenate along the global chunk dimension.
-at::Tensor cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, int chunk_size) {
-  TORCH_CHECK(g.dim() == 3, "cumsum: expect g with shape [B, T, Hv]");
-  TORCH_CHECK(g.size(0) == 1, "cumsum: varlen expects batch size 1");
-  TORCH_CHECK(cu_seqlens.dim() == 1, "cumsum: expect cu_seqlens to be 1D");
-
-  const int64_t num_seqs = cu_seqlens.size(0) - 1;
-  std::vector<at::Tensor> outputs;
-  outputs.reserve(num_seqs);
-  for (int64_t i = 0; i < num_seqs; ++i) {
-    const int64_t start = cu_seqlens[i].item<int32_t>();
-    const int64_t end = cu_seqlens[i + 1].item<int32_t>();
-    outputs.push_back(cumsum(g.narrow(1, start, end - start), chunk_size));
-  }
-  return at::cat(outputs, 2).transpose_(1, 2);
-}
-
-// TODO: debug code remove me!!!
-// Reference for decay_mask on chunked local cumsum g.
-// Matches test_mamba.py: ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-// on g with shape [B, NT, Hv, chunk_size], returning [B, NT, Hv, chunk_size, chunk_size].
-at::Tensor decay_mask_ref(const at::Tensor& g, int chunk_size) {
-  TORCH_CHECK(g.dim() == 4, "decay_mask: expect g with shape [B, NT, Hv, chunk_size]");
-  TORCH_CHECK(chunk_size > 0, "decay_mask: chunk_size must be positive");
-  TORCH_CHECK(g.size(-1) == chunk_size, "decay_mask: g last dim must equal chunk_size");
-
-  auto gf = g.to(at::kFloat);
-  return (gf.unsqueeze(-1) - gf.unsqueeze(-2)).tril().exp().tril();
-}
-
-// TODO: debug code remove me!!!
-// Reference for recompute_w_u (intra), mirrors torch_chunk_gated_delta_rule:
-//   attn = -((k*beta) @ k^T * decay_mask).tril(-1); forward-subst; attn += eye
-//   w = attn @ (k * beta * exp(g))
-//   u = attn @ (v * beta)
-// key_:[B,T,H,D] value:[B,T,Hv,Dv] g_:[B,NT,Hv,C] beta:[B,T,Hv]
-// returns w_ref:[B,T,Hv,D], u_ref:[B,T,Hv,Dv] (float)
-std::tuple<at::Tensor, at::Tensor> recompute_w_u_ref(
-    const at::Tensor& key_,
-    const at::Tensor& value,
-    const at::Tensor& g_,
-    const at::Tensor& beta,
-    const at::Tensor& cu_seqlens,
-    const at::Tensor& chunk_indices,
-    int chunk_size) {
-  const int64_t T = key_.size(1);
-  const int64_t H = key_.size(2);
-  const int64_t D = key_.size(3);
-  const int64_t Hv = value.size(2);
-  const int64_t Dv = value.size(3);
-  const int64_t NT = chunk_indices.size(0);
-  const int64_t HG = Hv / H;
-
-  auto key_f = key_.to(at::kFloat)[0];                            // [T, H, D]
-  auto value_f = value.to(at::kFloat)[0];                         // [T, Hv, Dv]
-  auto beta_f = beta.to(at::kFloat)[0];                           // [T, Hv]
-  auto g_f = g_.to(at::kFloat)[0];                                // [NT, Hv, C]
-  auto decay = decay_mask_ref(g_, chunk_size).to(at::kFloat)[0];  // [NT, Hv, C, C]
-
-  auto w_ref = at::zeros({1, T, Hv, D}, at::kFloat);
-  auto u_ref = at::zeros({1, T, Hv, Dv}, at::kFloat);
-  auto w0 = w_ref[0];  // [T, Hv, D]
-  auto u0 = u_ref[0];  // [T, Hv, Dv]
-
-  auto ci = chunk_indices.to(at::kCPU).contiguous();
-  auto cs = cu_seqlens.to(at::kCPU).contiguous();
-  const int32_t* ci_p = ci.data_ptr<int32_t>();
-  const int32_t* cs_p = cs.data_ptr<int32_t>();
-
-  for (int64_t c = 0; c < NT; ++c) {
-    int32_t bs = ci_p[c * 2 + 0];
-    int32_t cpos = ci_p[c * 2 + 1];
-    int32_t bos = cs_p[bs];
-    int32_t seqlen = cs_p[bs + 1] - cs_p[bs];
-    int64_t mb_start = static_cast<int64_t>(cpos) * chunk_size;
-    int64_t mb_size = std::min<int64_t>(seqlen - mb_start, chunk_size);
-    int64_t tok = bos + mb_start;
-
-    for (int64_t hv = 0; hv < Hv; ++hv) {
-      int64_t h = hv / HG;
-      auto K = key_f.narrow(0, tok, mb_size).select(1, h);                                          // [mb, D]
-      auto V = value_f.narrow(0, tok, mb_size).select(1, hv);                                       // [mb, Dv]
-      auto beta_c = beta_f.narrow(0, tok, mb_size).select(1, hv).unsqueeze(-1);                     // [mb, 1]
-      auto g_c = g_f.select(0, c).select(0, hv).narrow(0, 0, mb_size);                              // [mb]
-      auto decay_c = decay.select(0, c).select(0, hv).narrow(0, 0, mb_size).narrow(1, 0, mb_size);  // [mb, mb]
-
-      // attn = -((k*beta) @ k^T) * decay_mask, strict-lower
-      auto kkt = at::matmul(K, K.transpose(0, 1));       // [mb, mb]
-      auto attn = (-(beta_c * kkt) * decay_c).tril(-1);  // [mb, mb]
-      // forward substitution: attn[i, :i] += attn[i, :i] @ attn[:i, :i]
-      for (int64_t i = 1; i < mb_size; ++i) {
-        auto row = attn.select(0, i).narrow(0, 0, i);                       // [i]
-        auto sub = attn.narrow(0, 0, i).narrow(1, 0, i);                    // [i, i]
-        auto updated = row + at::matmul(row.unsqueeze(0), sub).squeeze(0);  // [i]
-        attn.select(0, i).narrow(0, 0, i).copy_(updated);
-      }
-      attn = attn + at::eye(mb_size, attn.options());
-
-      auto u_c = at::matmul(attn, V * beta_c);                            // [mb, Dv]
-      auto w_c = at::matmul(attn, K * beta_c * g_c.exp().unsqueeze(-1));  // [mb, D]
-      u0.narrow(0, tok, mb_size).select(1, hv).copy_(u_c);
-      w0.narrow(0, tok, mb_size).select(1, hv).copy_(w_c);
-    }
-  }
-  return std::make_tuple(w_ref, u_ref);
 }
 
 #define LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL(HD)                \
@@ -1768,72 +1614,18 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, Dv, D}, at::kFloat);
 
   constexpr int CHUNK_SIZE = 64;
-  bool debug = false;
 
   // prepare chunk indices
   auto [chunk_indices, chunk_offsets] = prepare_chunk_indices<CHUNK_SIZE>(cu_seqlens);
-  if (debug) {
-    std::cout << "### chunk_gated_delta_rule_cpu ..." << std::endl;
-    std::cout << "### cu_seqlens" << cu_seqlens << std::endl;
-    std::cout << "### chunk_indices" << chunk_indices << std::endl;
-  }
 
   float scale = 1.0 / std::sqrt(D);
   auto [query_, key_] = use_qk_l2norm_in_kernel ? l2norm_fwd(query, key, eps) : std::make_tuple(query.mul(scale), key);
 
-  if (debug && use_qk_l2norm_in_kernel) {
-    auto q_ref = l2norm(query, eps, true);
-    auto k_ref = l2norm(key, eps, false);
-    std::cout << "### check l2norm q max_err: "
-              << (query_.to(at::kFloat) - q_ref.to(at::kFloat)).abs().max().item<float>() << std::endl;
-    std::cout << "### check l2norm k max_err: "
-              << (key_.to(at::kFloat) - k_ref.to(at::kFloat)).abs().max().item<float>() << std::endl;
-  }
-
   auto g_ = chunk_local_cumsum<CHUNK_SIZE>(g, cu_seqlens, chunk_indices);
-
-  if (debug) {
-    auto g_ref = cumsum(g, cu_seqlens, CHUNK_SIZE);
-    std::cout << "### check cumsum g max_err: " << (g_.to(at::kFloat) - g_ref.to(at::kFloat)).abs().max().item<float>()
-              << std::endl;
-    // std::cout << "### g_ref[0][0]: " << g_ref[0][0].view({-1, CHUNK_SIZE}) << std::endl;
-    // std::cout << "### g_[0][0]: " << g_[0][0].view({-1, CHUNK_SIZE}) << std::endl;
-  }
 
   // fused kkt + solve_tril + recompute_w_u
   auto [w, u, decay_mask] =
       chunk_gated_delta_rule_fwd_intra<CHUNK_SIZE>(key_, value, g_, beta, cu_seqlens, chunk_indices);
-
-  if (debug) {
-    auto decay_mask2 = decay_mask_ref(g_, CHUNK_SIZE);
-    auto decay_mask_f = decay_mask.to(at::kFloat);
-    auto decay_mask2_f = decay_mask2.to(at::kFloat);
-    // fexp_u20 vs torch.exp: use relaxed rtol/atol (same spirit as torch.allclose)
-    constexpr double rtol = 1e-3;
-    constexpr double atol = 1e-2;
-    const bool decay_mask_ok = at::allclose(decay_mask_f, decay_mask2_f, rtol, atol);
-    std::cout << "### check decay_mask allclose: " << (decay_mask_ok ? "true" : "false") << " (rtol=" << rtol
-              << ", atol=" << atol << ")" << std::endl;
-  }
-
-  if (debug) {
-    auto [w_ref, u_ref] = recompute_w_u_ref(key_, value, g_, beta, cu_seqlens, chunk_indices, CHUNK_SIZE);
-    auto w_f = w.to(at::kFloat);
-    auto u_f = u.to(at::kFloat);
-    // w/u are stored in bf16; vs fp32 reference, use bf16-appropriate tolerance.
-    // NOTE: exp(cumsum(g)) has huge dynamic range when g has positive values,
-    // which destroys bf16 precision; realistic GDN gates are <= 0 (bounded).
-    constexpr double rtol = 1e-2;
-    constexpr double atol = 1e-2;
-    const bool w_ok = at::allclose(w_f, w_ref, rtol, atol);
-    const bool u_ok = at::allclose(u_f, u_ref, rtol, atol);
-    std::cout << "### check w allclose: " << (w_ok ? "true" : "false")
-              << " max_err: " << (w_f - w_ref).abs().max().item<float>() << " (rtol=" << rtol << ", atol=" << atol
-              << ")" << std::endl;
-    std::cout << "### check u allclose: " << (u_ok ? "true" : "false")
-              << " max_err: " << (u_f - u_ref).abs().max().item<float>() << " (rtol=" << rtol << ", atol=" << atol
-              << ")" << std::endl;
-  }
 
   // fused `chunk_gated_delta_rule_fwd_h` + `chunk_fwd_o`
   auto [output, final_state] = chunk_gated_delta_rule_fwd_inter<CHUNK_SIZE>(
