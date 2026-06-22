@@ -673,9 +673,14 @@ class RuntimeHandle:
                 error_body = json.dumps(
                     {"error": {"message": str(e), "type": "BadRequest"}}
                 ).encode("utf-8")
-                self._safe_callback(
-                    chunk_callback, error_body, finished=True, status_code=400
-                )
+                if streaming:
+                    self._safe_callback(
+                        chunk_callback, error_body, finished=True, error=str(e)
+                    )
+                else:
+                    self._safe_callback(
+                        chunk_callback, error_body, finished=True, status_code=400
+                    )
                 return
 
             mock_request = _GrpcRequest(
