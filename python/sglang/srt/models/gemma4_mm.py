@@ -301,6 +301,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def prepare_attn_masks(
         self,
         forward_batch: ForwardBatch,
@@ -608,9 +616,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+            # Use torch.where instead of boolean indexing for NPU graph compatibility
+            ple_ids = torch.where(
+                input_ids == self.config.image_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.video_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.audio_token_id, pad_id, ple_ids
+            )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.

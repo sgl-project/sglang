@@ -1,0 +1,29 @@
+// TEMPLATE — instantiate via the cookbook-add-model skill. NOT a live cookbook.
+// Copy to docs_new/src/snippets/configs/<hf-org>/<model-slug>-benchmarks.jsx and
+// fill measured numbers — OR delete this file entirely if you have none yet (the
+// MDX simply omits the `benchmarks` import/prop).
+//
+// One entry per cell `match` tuple (same 5 keys as config cells). The card stays
+// "pending" until an entry has a non-null speed metric or accuracy. Speed shape:
+//   speed: [{ workload: {dataset, isl, osl, max_concurrency}, ttft_ms, tpot_ms,
+//             tokens_per_sec_per_gpu }, ...]   // interactivity is derived (1000/TPOT)
+// Per-cell `accuracy: { <key>: <pct> }` overrides the config's defaultAccuracy.
+
+export const benchmarks = [
+  // EXAMPLE — one filled entry showing the shape; replace numbers, add one per cell.
+  {
+    match: { hw: "b200", variant: "default", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.0.0", // TODO: ASK the user for the sglang version these numbers were measured on — don't invent one
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: null },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: null },
+    ],
+  },
+  // Bare-match stubs (no data yet) are fine — the card shows "pending" for these.
+  { match: { hw: "h200",   variant: "default", quant: "fp8",  strategy: "balanced",        nodes: "single"  } },
+  { match: { hw: "h100",   variant: "default", quant: "fp4",  strategy: "high-throughput", nodes: "single"  } },
+  { match: { hw: "mi300x", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "single"  } },
+  { match: { hw: "b200",   variant: "default", quant: "fp4",  strategy: "high-throughput", nodes: "multi-2" } },
+];

@@ -3360,6 +3360,69 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_get_model_structural_tag(self):
+        """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
+        import xgrammar as xgr
+
+        self.assertTrue(self.detector.supports_structural_tag())
+        self.assertEqual(self.detector.get_structural_tag_name(), "glm_4_7")
+
+        # thinking_mode=True keeps the </think> reasoning prefix.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("glm_xml", serialized)
+        self.assertIn("<tool_call>", serialized)
+        self.assertIn("</think>", serialized)
+
+        # thinking_mode=False drops the reasoning prefix (ReasonerGrammarBackend
+        # owns </think> when --reasoning-parser is configured).
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        self.assertNotEqual("sequence", structural_tag.model_dump()["format"]["type"])
+
+        # tool_choice="required" must still compile to a grammar.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+
+    def test_required_tool_choice_falls_back_when_native_tag_is_unavailable(self):
+        from unittest.mock import patch
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.function_call.glm47_moe_detector import (
+            _glm47_native_structural_tag_available,
+        )
+
+        with patch(
+            "sglang.srt.function_call.glm47_moe_detector.get_model_structural_tag",
+            None,
+        ):
+            _glm47_native_structural_tag_available.cache_clear()
+            self.assertFalse(self.detector.supports_structural_tag())
+            self.assertIsNone(self.detector.get_structural_tag(self.tools))
+
+            parser = FunctionCallParser(self.tools, "glm47")
+            constraint = parser.get_structure_constraint("required")
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual("json_schema", constraint[0])
+            _glm47_native_structural_tag_available.cache_clear()
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):

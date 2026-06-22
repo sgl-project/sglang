@@ -322,7 +322,7 @@ def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
     assert "lingbot_cam_conditioner" not in forward_batch.extra
 
 
-def test_lingbot_cam_conditioner_cache_skips_context_update(monkeypatch):
+def test_lingbot_cam_conditioner_cache_reuses_context_update(monkeypatch):
     class _CamConditioner:
         def __init__(self):
             self.calls = 0
@@ -337,6 +337,9 @@ def test_lingbot_cam_conditioner_cache_skips_context_update(monkeypatch):
     block.cam_conditioner = _CamConditioner()
     forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
         lingbot_world_module,
         "get_forward_context",
         lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=-1),
@@ -346,9 +349,9 @@ def test_lingbot_cam_conditioner_cache_skips_context_update(monkeypatch):
     first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
     second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
 
-    assert first is not second
-    assert block.cam_conditioner.calls == 2
-    assert "lingbot_cam_conditioner" not in forward_batch.extra
+    assert first is second
+    assert block.cam_conditioner.calls == 1
+    assert "lingbot_cam_conditioner" in forward_batch.extra
 
 
 def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
