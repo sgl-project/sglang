@@ -32,7 +32,6 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -52,6 +51,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP as GlmImageTextMLP
+from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
@@ -63,40 +63,6 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Vision encoder components
 # --------------------------------------------------------------------------- #
-
-
-class GlmImageVisionMLP(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int,
-        bias: bool = True,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("fc1", prefix),
-        )
-        self.fc2 = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("fc2", prefix),
-            use_dp_attention_reduce=is_dp_attention_enabled(),
-        )
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc1(x)
-        x = self.act(x)
-        x, _ = self.fc2(x)
-        return x
 
 
 class GlmImageVisionPatchEmbed(nn.Module):
