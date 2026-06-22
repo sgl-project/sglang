@@ -542,6 +542,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
+        # WAR fast-path: a decode-graph forward publishes a fresh event here after
+        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
+        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
+        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 

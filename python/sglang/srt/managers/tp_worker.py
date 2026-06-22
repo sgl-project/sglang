@@ -71,6 +71,13 @@ class BaseTpWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # For a plain worker that's its own runner.
+        return self.model_runner
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 
