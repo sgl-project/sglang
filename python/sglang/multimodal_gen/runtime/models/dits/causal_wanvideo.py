@@ -183,11 +183,11 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            cache_view = kv_cache.update_and_get_attention_kv_for_local_heads(
+            cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=v,
                 current_chunk_start=current_start,
-                local_head_start=self.head_start,
+                cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
             )
             x = self.attn(
@@ -256,6 +256,7 @@ class CausalWanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("to_out", prefix),
             )
+            # megatron-style tp shards the weight (qkv) column-wise, effectively splitting the attention heads
             tp_size = get_tp_world_size()
             self.local_num_heads = divide(num_heads, tp_size)
             head_start = get_tp_rank() * self.local_num_heads

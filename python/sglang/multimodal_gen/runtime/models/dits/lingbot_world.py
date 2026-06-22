@@ -282,16 +282,16 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
-        local_head_start = (
+        cache_head_start = (
             get_tp_rank() * roped_key.shape[2]
             if sequence_shard_enabled
             else self.head_start
         )
-        cache_view = kv_cache.update_and_get_attention_kv_for_local_heads(
+        cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
             current_chunk_start=current_start,
-            local_head_start=local_head_start,
+            cache_head_start=cache_head_start,
             debug_name="LingBot KV cache",
         )
         if update_cache_only:
