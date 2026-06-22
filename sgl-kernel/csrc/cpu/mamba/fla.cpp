@@ -4,9 +4,14 @@
 #include "vec_pack.h"
 
 namespace {
-// For this cpu kernel, we have some innovations aside from the existing gpu kernels:
-// 1) Use less parallel loops, i.e. 4 including l2_norm.
-// 2) Fuse part of l2_norm with the rest of the computation.
+
+// [NOTE] GDN Optimizations on AMX CPU
+//   * intra loop: fuse `kkt_solve` and `recompute_w_u` so as to avoid materialize `A`.
+//   * inter loop: fuse `recompute_w_u` and `update_v` so as to avoid materialize `h` and `v_new`.
+//   * intra loop parallel on H instead of Hv, remove duplicated key @ key.T
+//   * fuse format pack with elemwise OP as much as possible.
+//   * update state (FP32) with amx-bf16 where C(FP32) += A(BF16) * B(BF16)
+//   * compile time mask out upper triangular part in decay mask and tril solve, reduce fma needed.
 
 // * convert to vnni format， expect contiguous input and output
 //     from [K/2, 2, N] FP32 to [K/2, N, 2] BF16
