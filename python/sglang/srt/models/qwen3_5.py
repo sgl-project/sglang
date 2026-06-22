@@ -14,12 +14,8 @@
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
-import json
 import logging
-import os
-import struct
 from functools import lru_cache
-from pathlib import Path
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -67,7 +63,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
-    maybe_squeeze_modelopt_fp4_weight,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -117,12 +112,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
-_MODELOPT_FP4_NAME = "modelopt_fp4"
-_MODELOPT_FP4_PACKED_DTYPES = frozenset({"U8"})
-_MODELOPT_FP4_UNQUANTIZED_DTYPES = frozenset({"BF16", "F16", "F32"})
-_MODELOPT_FP4_POLICY_PACKED = "packed"
-_MODELOPT_FP4_POLICY_UNQUANTIZED = "unquantized"
-_MODELOPT_FP4_POLICY_UNKNOWN = "unknown"
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -145,285 +134,6 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
     return get_global_server_args().disable_shared_experts_fusion
-
-
-def _is_modelopt_fp4_quant_config(quant_config: Optional[QuantizationConfig]) -> bool:
-    return bool(quant_config and quant_config.get_name() == _MODELOPT_FP4_NAME)
-
-
-def _resolve_modelopt_fp4_submodule_quant_config(
-    config: Qwen3_5TextConfig,
-    quant_config: Optional[QuantizationConfig],
-    module_kind: str,
-    layer_id: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    if not _is_modelopt_fp4_quant_config(quant_config):
-        return quant_config
-
-    policy = _get_modelopt_fp4_submodule_policy(
-        _get_model_path(config), _get_model_revision(config), module_kind, layer_id
-    )
-    if policy == _MODELOPT_FP4_POLICY_PACKED:
-        return quant_config
-    if policy == _MODELOPT_FP4_POLICY_UNKNOWN:
-        logger.warning(
-            "Unable to resolve Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoint layout "
-            "for %s. Falling back to the existing unquantized loading path.",
-            _format_modelopt_fp4_module_kind(module_kind, layer_id),
-        )
-    return None
-
-
-def _resolve_modelopt_fp4_mtp_quant_config(
-    config: Qwen3_5TextConfig,
-    quant_config: Optional[QuantizationConfig],
-) -> Optional[QuantizationConfig]:
-    if not _is_modelopt_fp4_quant_config(quant_config):
-        return quant_config
-
-    policy = _get_modelopt_fp4_submodule_policy(
-        _get_model_path(config), _get_model_revision(config), "mtp", None
-    )
-    if policy == _MODELOPT_FP4_POLICY_PACKED:
-        raise ValueError(
-            "Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoints with packed MTP weights "
-            "are not supported yet."
-        )
-    return None
-
-
-def _get_model_path(config: Qwen3_5TextConfig) -> Optional[str]:
-    model_path = getattr(config, "_name_or_path", None)
-    if isinstance(model_path, str) and model_path:
-        return model_path
-
-    try:
-        server_args = get_global_server_args()
-    except Exception:
-        return None
-
-    model_path = getattr(server_args, "model_path", None)
-    if isinstance(model_path, str) and model_path:
-        return model_path
-    return None
-
-
-def _get_model_revision(config: Qwen3_5TextConfig) -> Optional[str]:
-    try:
-        server_args = get_global_server_args()
-    except Exception:
-        server_args = None
-
-    if server_args is not None:
-        revision = getattr(server_args, "revision", None)
-        if isinstance(revision, str) and revision:
-            return revision
-
-    # Hugging Face configs loaded from a non-default revision commonly keep the
-    # resolved commit hash here. It is also useful for unit tests that do not set
-    # global server args.
-    for attr_name in ("revision", "_commit_hash"):
-        revision = getattr(config, attr_name, None)
-        if isinstance(revision, str) and revision:
-            return revision
-    return None
-
-
-@lru_cache(maxsize=None)
-def _get_modelopt_fp4_submodule_policy(
-    model_path: Optional[str],
-    revision: Optional[str],
-    module_kind: str,
-    layer_id: Optional[int],
-) -> str:
-    if not model_path:
-        return _MODELOPT_FP4_POLICY_UNKNOWN
-
-    try:
-        dtypes = _read_modelopt_fp4_submodule_dtypes(
-            model_path, revision, module_kind, layer_id
-        )
-    except Exception as err:
-        logger.warning(
-            "Failed to inspect Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoint layout "
-            "for %s: %s",
-            _format_modelopt_fp4_module_kind(module_kind, layer_id),
-            err,
-        )
-        return _MODELOPT_FP4_POLICY_UNKNOWN
-
-    if not dtypes:
-        return _MODELOPT_FP4_POLICY_UNKNOWN
-
-    has_packed = any(dtype in _MODELOPT_FP4_PACKED_DTYPES for dtype in dtypes)
-    has_unquantized = any(dtype in _MODELOPT_FP4_UNQUANTIZED_DTYPES for dtype in dtypes)
-    has_unknown = any(
-        dtype not in _MODELOPT_FP4_PACKED_DTYPES
-        and dtype not in _MODELOPT_FP4_UNQUANTIZED_DTYPES
-        for dtype in dtypes
-    )
-
-    if has_packed and not has_unquantized and not has_unknown:
-        return _MODELOPT_FP4_POLICY_PACKED
-    if has_unquantized and not has_packed and not has_unknown:
-        return _MODELOPT_FP4_POLICY_UNQUANTIZED
-
-    raise ValueError(
-        "Unsupported mixed Qwen3.5/Qwen3.6 ModelOpt FP4 checkpoint layout "
-        f"for {_format_modelopt_fp4_module_kind(module_kind, layer_id)}: "
-        f"{sorted(dtypes)}"
-    )
-
-
-def _read_modelopt_fp4_submodule_dtypes(
-    model_path: str,
-    revision: Optional[str],
-    module_kind: str,
-    layer_id: Optional[int],
-) -> Set[str]:
-    return {
-        dtype
-        for key, dtype in _get_modelopt_fp4_checkpoint_weight_dtypes(
-            model_path, revision
-        )
-        if _is_modelopt_fp4_relevant_weight_key(key, module_kind, layer_id)
-    }
-
-
-@lru_cache(maxsize=None)
-def _get_modelopt_fp4_checkpoint_weight_dtypes(
-    model_path: str,
-    revision: Optional[str],
-) -> Tuple[Tuple[str, str], ...]:
-    dtypes = []
-    for shard_file in _iter_safetensors_files(model_path, revision):
-        with _open_checkpoint_file(model_path, shard_file, revision) as file_obj:
-            header_len = struct.unpack("<Q", file_obj.read(8))[0]
-            header = json.loads(file_obj.read(header_len))
-        for key, meta in header.items():
-            if key == "__metadata__" or not isinstance(meta, dict):
-                continue
-            dtype = meta.get("dtype")
-            if dtype and key.endswith(".weight"):
-                dtypes.append((key, str(dtype)))
-    return tuple(dtypes)
-
-
-def _iter_safetensors_files(
-    model_path: str, revision: Optional[str]
-) -> Tuple[str, ...]:
-    if _checkpoint_file_exists(model_path, "model.safetensors.index.json", revision):
-        with _open_checkpoint_file(
-            model_path, "model.safetensors.index.json", revision
-        ) as f:
-            weight_map = json.loads(f.read()).get("weight_map", {})
-        if isinstance(weight_map, dict):
-            return tuple(
-                sorted(
-                    {
-                        shard
-                        for key, shard in weight_map.items()
-                        if _is_modelopt_fp4_candidate_weight_key(key)
-                    }
-                )
-            )
-
-    if _checkpoint_file_exists(model_path, "model.safetensors", revision):
-        return ("model.safetensors",)
-
-    return _list_safetensors_files(model_path, revision)
-
-
-def _checkpoint_file_exists(
-    model_path: str, file_name: str, revision: Optional[str]
-) -> bool:
-    if os.path.isdir(model_path):
-        return os.path.exists(os.path.join(model_path, file_name))
-
-    from huggingface_hub import HfFileSystem
-
-    return bool(HfFileSystem().exists(f"{model_path}/{file_name}", revision=revision))
-
-
-def _open_checkpoint_file(model_path: str, file_name: str, revision: Optional[str]):
-    if os.path.isdir(model_path):
-        return open(os.path.join(model_path, file_name), "rb")
-
-    from huggingface_hub import HfFileSystem
-
-    return HfFileSystem().open(f"{model_path}/{file_name}", "rb", revision=revision)
-
-
-def _list_safetensors_files(
-    model_path: str, revision: Optional[str]
-) -> Tuple[str, ...]:
-    if os.path.isdir(model_path):
-        return tuple(
-            sorted(path.name for path in Path(model_path).glob("*.safetensors"))
-        )
-
-    from huggingface_hub import HfFileSystem
-
-    fs = HfFileSystem()
-    prefix = f"{model_path}/"
-    files = []
-    for path in fs.glob(f"{prefix}*.safetensors", revision=revision):
-        path = str(path)
-        files.append(path.removeprefix(prefix).split("/")[-1])
-    return tuple(sorted(files))
-
-
-def _is_modelopt_fp4_relevant_weight_key(
-    key: str,
-    module_kind: str,
-    layer_id: Optional[int],
-) -> bool:
-    if layer_id is not None and f".layers.{layer_id}." not in f".{key}":
-        return False
-
-    if module_kind == "linear_attn":
-        return key.endswith(
-            (
-                ".linear_attn.in_proj_qkv.weight",
-                ".linear_attn.in_proj_z.weight",
-                ".linear_attn.in_proj_b.weight",
-                ".linear_attn.in_proj_a.weight",
-                ".linear_attn.out_proj.weight",
-            )
-        )
-
-    if module_kind == "attention":
-        return ".linear_attn." not in key and key.endswith(
-            (
-                ".self_attn.q_proj.weight",
-                ".self_attn.k_proj.weight",
-                ".self_attn.v_proj.weight",
-                ".self_attn.o_proj.weight",
-                ".q_proj.weight",
-                ".k_proj.weight",
-                ".v_proj.weight",
-                ".o_proj.weight",
-            )
-        )
-
-    if module_kind == "mtp":
-        return ".mtp." in f".{key}" and key.endswith(".weight")
-
-    return False
-
-
-def _is_modelopt_fp4_candidate_weight_key(key: str) -> bool:
-    return (
-        _is_modelopt_fp4_relevant_weight_key(key, "linear_attn", None)
-        or _is_modelopt_fp4_relevant_weight_key(key, "attention", None)
-        or _is_modelopt_fp4_relevant_weight_key(key, "mtp", None)
-    )
-
-
-def _format_modelopt_fp4_module_kind(module_kind: str, layer_id: Optional[int]) -> str:
-    if layer_id is None:
-        return module_kind
-    return f"{module_kind}:{layer_id}"
 
 
 if _is_npu:
@@ -648,7 +358,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
-            loaded_weight = maybe_squeeze_modelopt_fp4_weight(param, loaded_weight)
             # Only intercept split-checkpoint tuple shards.
             # int shard_id and None should preserve original behavior.
             if isinstance(loaded_shard_id, tuple):
@@ -896,9 +605,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = _resolve_modelopt_fp4_submodule_quant_config(
-            config, quant_config, "linear_attn", layer_id
-        )
+        linear_attn_quant_config = quant_config
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
@@ -1071,9 +778,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = _resolve_modelopt_fp4_submodule_quant_config(
-            config, quant_config, "attention", layer_id
-        )
+        attn_quant_config = quant_config
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

@@ -23,25 +23,11 @@ __all__ = [
     "BlockQuantScaleParameter",
     "PackedColumnParameter",
     "RowvLLMParameter",
-    "maybe_squeeze_modelopt_fp4_weight",
 ]
 
 logger = logging.getLogger(__name__)
 
 _is_cpu = is_cpu()
-_MODELOPT_FP4_WEIGHT_ATTR = "is_modelopt_fp4_weight"
-
-
-def maybe_squeeze_modelopt_fp4_weight(
-    param: Parameter, loaded_weight: torch.Tensor
-) -> torch.Tensor:
-    if (
-        getattr(param, _MODELOPT_FP4_WEIGHT_ATTR, False)
-        and loaded_weight.ndim == param.data.ndim + 1
-        and loaded_weight.shape[0] == 1
-    ):
-        return loaded_weight.squeeze(0)
-    return loaded_weight
 
 
 def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
@@ -121,7 +107,6 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
-        loaded_weight = maybe_squeeze_modelopt_fp4_weight(self, loaded_weight)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
@@ -163,7 +148,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         tp_rank: int,
         use_presharded_weights: bool = False,
     ):
-        loaded_weight = maybe_squeeze_modelopt_fp4_weight(self, loaded_weight)
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
 
@@ -191,7 +175,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         copy_with_check(self.data, loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        loaded_weight = maybe_squeeze_modelopt_fp4_weight(self, loaded_weight)
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -247,7 +230,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         use_presharded_weights: bool = False,
         **kwargs,
     ):
-        loaded_weight = maybe_squeeze_modelopt_fp4_weight(self, loaded_weight)
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -314,7 +296,6 @@ class RowvLLMParameter(BasevLLMParameter):
         tp_rank: int,
         use_presharded_weights: bool = False,
     ):
-        loaded_weight = maybe_squeeze_modelopt_fp4_weight(self, loaded_weight)
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
 

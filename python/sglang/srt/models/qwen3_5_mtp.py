@@ -33,10 +33,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import (
-    Qwen3_5ForCausalLM,
-    _resolve_modelopt_fp4_mtp_quant_config,
-)
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -60,8 +57,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The known Qwen3.5 ModelOpt FP4 checkpoints keep MTP unquantized.
-        quant_config = _resolve_modelopt_fp4_mtp_quant_config(config, quant_config)
+        # The MTP model is unquantized in the nvfp4 checkpoint.
+        if quant_config and quant_config.get_name() == "modelopt_fp4":
+            quant_config = None
         if (
             is_npu()
             and get_global_server_args().speculative_draft_model_quantization is None

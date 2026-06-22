@@ -1,5 +1,5 @@
 """
-Unit tests for Qwen3_5GatedDeltaNet._make_packed_weight_loader.
+Unit tests for Qwen3_5GatedDeltaNet packed weight loading.
 
 Validates that per-tensor FP8 scales (scalar or single-element tensors)
 are broadcast to every logical shard, while normal multi-element weights
@@ -12,33 +12,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-import json
-import struct
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
-from sglang.srt.models import qwen3_5
+from sglang.srt.layers.linear import MergedColumnParallelLinear
+from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from sglang.test.test_utils import CustomTestCase
-
-
-class MockQuantConfig:
-    def __init__(self, name: str):
-        self.name = name
-
-    def get_name(self) -> str:
-        return self.name
-
-
-def _write_safetensors_header(path: Path, header: dict) -> None:
-    payload = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(payload)) + payload)
 
 
 def _make_mock_module(output_sizes):
@@ -244,178 +232,47 @@ class TestMakePackedWeightLoader(CustomTestCase):
 
 
 class TestQwen35ModelOptFp4Loading(CustomTestCase):
-    def setUp(self):
-        qwen3_5._get_modelopt_fp4_submodule_policy.cache_clear()
-        qwen3_5._get_modelopt_fp4_checkpoint_weight_dtypes.cache_clear()
-
-    def test_modelopt_fp4_policy_uses_layer_scope(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _write_safetensors_header(
-                Path(tmpdir) / "model.safetensors",
-                {
-                    "model.layers.0.self_attn.q_proj.weight": {"dtype": "U8"},
-                    "model.layers.0.self_attn.k_proj.weight": {"dtype": "U8"},
-                    "model.layers.0.self_attn.v_proj.weight": {"dtype": "U8"},
-                    "model.layers.1.self_attn.q_proj.weight": {"dtype": "BF16"},
-                    "model.layers.1.self_attn.k_proj.weight": {"dtype": "BF16"},
-                    "model.layers.1.self_attn.v_proj.weight": {"dtype": "BF16"},
-                },
-            )
-            config = SimpleNamespace(_name_or_path=tmpdir)
-            modelopt = MockQuantConfig("modelopt_fp4")
-            awq = MockQuantConfig("awq")
-
-            self.assertIs(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "attention", 0
-                ),
-                modelopt,
-            )
-            self.assertIsNone(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "attention", 1
-                )
-            )
-            self.assertIs(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, awq, "attention", 0
-                ),
-                awq,
-            )
-
-    def test_modelopt_fp4_policy_scans_safetensors_without_index(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _write_safetensors_header(
-                Path(tmpdir) / "part-00001.safetensors",
-                {
-                    "model.layers.0.linear_attn.in_proj_b.weight": {"dtype": "U8"},
-                    "model.layers.0.linear_attn.in_proj_a.weight": {"dtype": "U8"},
-                },
-            )
-            config = SimpleNamespace(_name_or_path=tmpdir)
-            modelopt = MockQuantConfig("modelopt_fp4")
-
-            self.assertIs(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "linear_attn", 0
-                ),
-                modelopt,
-            )
-
-    def test_modelopt_fp4_policy_uses_server_revision(self):
-        config = SimpleNamespace(_name_or_path="remote/model")
-        modelopt = MockQuantConfig("modelopt_fp4")
-        server_args = SimpleNamespace(revision="refs/pr/1")
-
-        with (
-            patch.object(
-                qwen3_5,
-                "get_global_server_args",
-                return_value=server_args,
-            ),
-            patch.object(
-                qwen3_5,
-                "_get_modelopt_fp4_submodule_policy",
-                return_value=qwen3_5._MODELOPT_FP4_POLICY_PACKED,
-            ) as mock_policy,
-        ):
-            self.assertIs(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "attention", 0
-                ),
-                modelopt,
-            )
-
-        mock_policy.assert_called_once_with("remote/model", "refs/pr/1", "attention", 0)
-
-    def test_remote_checkpoint_probe_passes_revision(self):
-        fs = MagicMock()
-        fs.exists.return_value = True
-
-        with patch("huggingface_hub.HfFileSystem", return_value=fs):
-            self.assertTrue(
-                qwen3_5._checkpoint_file_exists(
-                    "remote/model", "model.safetensors", "commit"
-                )
-            )
-
-        fs.exists.assert_called_once_with(
-            "remote/model/model.safetensors", revision="commit"
+    def test_modelopt_fp4_config_uses_packed_mapping_for_linear_attn(self):
+        packed_mapping = {"in_proj_qkvz": ["in_proj_qkv", "in_proj_z"]}
+        excluded_quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="auto",
+            group_size=16,
+            exclude_modules=[
+                "model.layers.0.linear_attn.in_proj_qkv",
+                "model.layers.0.linear_attn.in_proj_z",
+            ],
+            packed_modules_mapping=packed_mapping,
+        )
+        quantized_quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="auto",
+            group_size=16,
+            exclude_modules=[],
+            packed_modules_mapping=packed_mapping,
         )
 
-    def test_modelopt_fp4_policy_scans_safetensors_index(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            index = {
-                "weight_map": {
-                    "model.layers.0.linear_attn.in_proj_b.weight": "shard-a.safetensors",
-                    "model.layers.0.linear_attn.in_proj_a.weight": "shard-a.safetensors",
-                    "model.layers.0.mlp.up_proj.weight": "missing.safetensors",
-                }
-            }
-            (Path(tmpdir) / "model.safetensors.index.json").write_text(
-                json.dumps(index)
-            )
-            _write_safetensors_header(
-                Path(tmpdir) / "shard-a.safetensors",
-                {
-                    "model.layers.0.linear_attn.in_proj_b.weight": {"dtype": "U8"},
-                    "model.layers.0.linear_attn.in_proj_a.weight": {"dtype": "U8"},
-                },
-            )
-            config = SimpleNamespace(_name_or_path=tmpdir)
-            modelopt = MockQuantConfig("modelopt_fp4")
-
-            self.assertIs(
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "linear_attn", 0
-                ),
-                modelopt,
-            )
-
-    def test_modelopt_fp4_policy_rejects_mixed_layer_layout(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _write_safetensors_header(
-                Path(tmpdir) / "model.safetensors",
-                {
-                    "model.layers.0.linear_attn.in_proj_b.weight": {"dtype": "BF16"},
-                    "model.layers.0.linear_attn.in_proj_a.weight": {"dtype": "U8"},
-                },
-            )
-            config = SimpleNamespace(_name_or_path=tmpdir)
-            modelopt = MockQuantConfig("modelopt_fp4")
-
-            with self.assertRaisesRegex(ValueError, "Unsupported mixed"):
-                qwen3_5._resolve_modelopt_fp4_submodule_quant_config(
-                    config, modelopt, "linear_attn", 0
-                )
-
-    def test_modelopt_fp4_mtp_packed_layout_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _write_safetensors_header(
-                Path(tmpdir) / "model.safetensors",
-                {
-                    "mtp.layers.0.self_attn.q_proj.weight": {"dtype": "U8"},
-                },
-            )
-            config = SimpleNamespace(_name_or_path=tmpdir)
-            modelopt = MockQuantConfig("modelopt_fp4")
-
-            with self.assertRaisesRegex(ValueError, "packed MTP weights"):
-                qwen3_5._resolve_modelopt_fp4_mtp_quant_config(config, modelopt)
-
-    def test_modelopt_fp4_weight_load_squeezes_leading_singleton(self):
-        param = ModelWeightParameter(
-            data=torch.empty(4, 2, dtype=torch.uint8),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=lambda *args, **kwargs: None,
+        excluded_layer = MergedColumnParallelLinear(
+            input_size=16,
+            output_sizes=[16, 16],
+            bias=False,
+            quant_config=excluded_quant_config,
+            prefix="model.layers.0.linear_attn.in_proj_qkvz",
+            tp_rank=0,
+            tp_size=1,
         )
-        param.is_modelopt_fp4_weight = True
-        loaded_weight = torch.arange(16, dtype=torch.uint8).reshape(1, 8, 2)
+        quantized_layer = MergedColumnParallelLinear(
+            input_size=16,
+            output_sizes=[16, 16],
+            bias=False,
+            quant_config=quantized_quant_config,
+            prefix="model.layers.0.linear_attn.in_proj_qkvz",
+            tp_rank=0,
+            tp_size=1,
+        )
 
-        param.load_column_parallel_weight(loaded_weight, tp_rank=1)
-
-        torch.testing.assert_close(param.data, loaded_weight.squeeze(0)[4:8])
+        self.assertIsInstance(excluded_layer.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(quantized_layer.quant_method, ModelOptFp4LinearMethod)
 
     def test_conv1d_loader_accepts_checkpoint_singleton_dim(self):
         calls = []
