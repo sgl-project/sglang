@@ -1161,17 +1161,24 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
     assertion during graph capture.
     """
 
-    def _make_runner(self, deepep_mode, max_running_requests=None):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="deepep",
-            deepep_mode=deepep_mode,
+    def _make_runner(self, moe_a2a_backend="deepep", deepep_mode="auto"):
+        # The non-spec decode capture list for max_bs=512 (see
+        # _generate_decode_cuda_graph_batch_sizes): includes 256 and 512.
+        decode_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + [512]
         )
-        server_args.deepep_mode = deepep_mode
-        server_args.enable_torch_compile = False
-        # Default decode capture list (max_bs=512): includes 256 and 512.
-        server_args.cuda_graph_config.decode.bs = (
-            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        server_args = SimpleNamespace(
+            moe_a2a_backend=moe_a2a_backend,
+            deepep_mode=deepep_mode,
+            enable_two_batch_overlap=False,
+            enable_torch_compile=False,
+            torch_compile_max_bs=32,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=list(decode_bs)),
+            ),
         )
         runner = MagicMock()
         runner.server_args = server_args
@@ -1190,7 +1197,7 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         )
 
         mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
-        runner = self._make_runner("auto")
+        runner = self._make_runner("deepep", "auto")
         capture_bs, _ = get_batch_sizes_to_capture(runner)
         self.assertGreater(max(capture_bs), 0)
         # DeepEP low_latency buffer default is 128; capture list must not exceed it.
@@ -1208,7 +1215,7 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         )
 
         mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
-        runner = self._make_runner("low_latency")
+        runner = self._make_runner("deepep", "low_latency")
         capture_bs, _ = get_batch_sizes_to_capture(runner)
         self.assertLessEqual(max(capture_bs), 128)
 
@@ -1224,7 +1231,7 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         )
 
         mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
-        runner = self._make_runner("normal")
+        runner = self._make_runner("deepep", "normal")
         capture_bs, _ = get_batch_sizes_to_capture(runner)
         # 512 is in the default list and normal mode must NOT clamp it away.
         self.assertIn(512, capture_bs)
@@ -1240,8 +1247,7 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         )
 
         mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
-        runner = self._make_runner("auto")
-        runner.server_args.moe_a2a_backend = "none"
+        runner = self._make_runner("none", "auto")
         capture_bs, _ = get_batch_sizes_to_capture(runner)
         self.assertIn(512, capture_bs)
 
