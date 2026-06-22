@@ -167,6 +167,87 @@ def test_sglang_per_token_group_quant_fp8_ue8m0_outer_major_scale_layout(
     assert x_s[:, 0, :].is_contiguous()
 
 
+def test_dsv4_fp8_einsum_matches_old_flattened_quant_path(monkeypatch):
+    deep_gemm = pytest.importorskip("deep_gemm")
+    if not hasattr(deep_gemm, "fp8_einsum") or not hasattr(
+        deep_gemm, "transform_sf_into_required_layout"
+    ):
+        pytest.skip("deep_gemm fp8_einsum is unavailable")
+
+    torch.manual_seed(0)
+    num_tokens, num_groups, hidden, rank = 8, 8, 256, 128
+    x = torch.randn(
+        num_tokens, num_groups, hidden, device="cuda", dtype=torch.bfloat16
+    )
+    w = torch.randn(
+        num_groups, rank, hidden, device="cuda", dtype=torch.bfloat16
+    ).to(fp8_dtype)
+    raw_w_s = torch.ones(
+        num_groups,
+        rank // G,
+        hidden // G,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    w_s = deep_gemm.transform_sf_into_required_layout(
+        raw_w_s,
+        mn=rank,
+        k=hidden,
+        recipe=(1, G, G),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+
+    def fail_aot(*args, **kwargs):
+        raise AssertionError("DSV4 fp8_einsum quant test must not call AOT quant")
+
+    monkeypatch.setattr(fp8_kernel_module, "sgl_per_token_group_quant_8bit", fail_aot)
+
+    old_q, old_s = fp8_kernel_module.sglang_per_token_group_quant_fp8(
+        x.reshape(num_tokens * num_groups, hidden).contiguous(),
+        G,
+        scale_ue8m0=True,
+    )
+    new_q, new_s = fp8_kernel_module.sglang_per_token_group_quant_fp8(
+        x.contiguous(),
+        G,
+        scale_ue8m0=True,
+        scale_outer_major=True,
+    )
+
+    num_scale_groups = hidden // G
+    old_q = old_q.view(num_tokens, num_groups, hidden)
+    old_s = old_s.view(num_tokens, num_groups, num_scale_groups)
+
+    assert torch.equal(old_q.view(torch.int8), new_q.view(torch.int8))
+    assert torch.equal(old_s, new_s)
+    assert old_s.stride() == (num_groups * num_scale_groups, num_scale_groups, 1)
+    assert new_s.stride() == (num_scale_groups, num_tokens * num_scale_groups, 1)
+    assert new_s[:, 0, :].is_contiguous()
+
+    old_out = torch.empty(
+        num_tokens, num_groups, rank, device="cuda", dtype=torch.bfloat16
+    )
+    new_out = torch.empty_like(old_out)
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (old_q, old_s),
+        (w, w_s),
+        old_out,
+        recipe=(1, 1, G),
+    )
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (new_q, new_s),
+        (w, w_s),
+        new_out,
+        recipe=(1, 1, G),
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(new_out, old_out, rtol=0, atol=0)
+
+
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the
 # column-major + ue8m0 + fused-silu+mul + masked combination. Input is 3D
 # [num_experts, tokens_padded, hidden*2]; only tokens < masked_m[e] are processed
