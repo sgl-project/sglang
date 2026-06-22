@@ -1027,7 +1027,10 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
     ):
         # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
+        attn_out = getattr(forward_batch, "_attn_output", None)
+        if attn_out is not None:
+            o = attn_out
+        elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)

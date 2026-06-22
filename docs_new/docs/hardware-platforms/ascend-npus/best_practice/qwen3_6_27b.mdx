@@ -18,7 +18,6 @@ This guide describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
 
-
 ## Optimal Configuration
 
 ### Qwen3.6-27B 1P IN1024X1024 30 OUT1024 50ms
@@ -321,6 +320,8 @@ python -m sglang.bench_serving \
     --num-prompts 80 \
     --request-rate inf
 ```
+
+<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.6-27B W8A8 1P IN3K5 OUT1K5 50ms
 
