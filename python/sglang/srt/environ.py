@@ -206,6 +206,10 @@ class Envs:
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # None => fall back to ThreadPoolExecutor's default worker count.
+    # Lower this (e.g. to 4) for very large MoE checkpoints where the default
+    # creates too much aggregate host I/O pressure across ranks.
+    SGLANG_DEEPSEEK_LOAD_MAX_WORKERS = EnvInt(None)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # Logging Options
