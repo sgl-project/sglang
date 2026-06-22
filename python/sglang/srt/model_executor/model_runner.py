@@ -2594,25 +2594,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.is_draft_worker and not force_for_draft_worker:
             return
 
-        # EAGLE-family target worker: the prefill graph captures
-        # CaptureHiddenMode.NULL, but target prefill needs FULL hidden states to
-        # feed the draft, so can_run_graph always rejects it and prefill runs
-        # eagerly. The graph is therefore never used; capturing it (now before
-        # the decode graph) can perturb backend state on FP4 / TRTLLM-MoE paths
-        # and corrupt decode replay, so skip its capture and route prefill
-        # through the eager runner — the runtime path either way. With
-        # enable_return_hidden_states the prefill graph is FULL and usable, so
-        # only skip when it would capture NULL.
+        # Skip prefill CG for EAGLE target on tc_piecewise: that backend
+        # captures CaptureHiddenMode.NULL while runtime requests FULL, so
+        # the captured graph is dead, and capturing it perturbs FP4 /
+        # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
+        # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
+        # (restored from #25795), so it does NOT need this skip.
         if (
             self.spec_algorithm.is_eagle()
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
         ):
             logger.info(
-                "Disable prefill CUDA graph for the EAGLE target worker: target "
-                "prefill needs FULL hidden states but the prefill graph captures "
-                "NULL, so the graph is unused; skipping its capture keeps decode "
-                "graph capture clean."
+                "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
+                "to avoid FP4/MoE decode-replay corruption (#28386)."
             )
             self.prefill_cuda_graph_runner = self.eager_runner
             return
