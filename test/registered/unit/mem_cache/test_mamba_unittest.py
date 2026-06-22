@@ -136,7 +136,7 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
-        req.mamba_pool_idx = None
+        req.mamba.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
@@ -172,7 +172,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req1_kv_indices[: len(key)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -190,7 +190,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req2_kv_indices[: len(key)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -209,7 +209,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req3_kv_indices[: len(key)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -227,7 +227,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req4_kv_indices[: len(key)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -311,13 +311,13 @@ class TestMamba(unittest.TestCase):
             )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
-        assert req9.mamba_pool_idx is not None
+        assert req9.mamba.mamba_pool_idx is not None
         assert torch.all(
-            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.conv[0][:, req9.mamba.mamba_pool_idx]
             == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
         )
         assert torch.all(
-            mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.temporal[:, req9.mamba.mamba_pool_idx]
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
 
@@ -339,7 +339,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
@@ -354,7 +354,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(5)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
@@ -391,7 +391,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(4)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         first_insert_events = [
@@ -406,7 +406,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(4)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         second_insert_events = [
@@ -695,7 +695,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.mamba.mamba_pool_idx.unsqueeze(0),
             )
         )
         assert allocator.available_size() == initial_avail - 3
@@ -708,7 +708,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(7)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.mamba.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=0,
             )
         )
@@ -726,7 +726,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key3,
                 value=allocator.alloc(8)[: len(key3)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.mamba.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=2,
             )
         )
@@ -743,7 +743,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key4,
                 value=allocator.alloc(9)[: len(key4)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.mamba.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=8,
             )
         )

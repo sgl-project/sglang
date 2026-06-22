@@ -727,7 +727,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=req.cache.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -745,7 +745,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Truncate if needed
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
+                free_start = max(effective_cache_len, req.cache.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
@@ -763,7 +763,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache.cache_protected_len :]
+            )
 
         if req.locked_cache is not None:
             self.dec_lock_ref(
@@ -798,7 +800,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=req.cache.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -847,14 +849,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            req.cache.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(req.cache.cache_protected_len, len(new_indices))),
+            new_indices[req.cache.cache_protected_len :],
         )
 
         self.dec_lock_ref(
@@ -2421,7 +2423,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
-        last_best_match_device_node = req.last_node
+        last_best_match_device_node = req.cache.last_node
 
         def _collect_new_prefix_indices() -> torch.Tensor:
             prefix_chunks: list[torch.Tensor] = []

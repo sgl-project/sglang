@@ -905,13 +905,13 @@ class SchedulerBatchResultProcessor:
         if not at_boundary:
             return
 
-        req.mamba_last_track_seqlen = track_seqlen
+        req.mamba.mamba_last_track_seqlen = track_seqlen
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch)
         else:
-            req.mamba_next_track_idx = (
+            req.mamba.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+                    req.mamba.mamba_next_track_idx
                 )
             )
 
@@ -954,12 +954,12 @@ class SchedulerBatchResultProcessor:
         Running reqs: free the old ping-pong slot so we go back to
         holding only 1 slot until the next boundary.
         """
-        other_idx = 1 - req.mamba_next_track_idx
-        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
+        other_idx = 1 - req.mamba.mamba_next_track_idx
+        other_val = req.mamba.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
-                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
+                req.mamba.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
         elif req.finished():

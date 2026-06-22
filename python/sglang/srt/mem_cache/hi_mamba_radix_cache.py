@@ -2132,7 +2132,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 PoolTransfer(
                     name=PoolName.MAMBA,
                     host_indices=last_hit_node.mamba_host_value,
-                    device_indices=req.mamba_pool_idx.unsqueeze(0),
+                    device_indices=req.mamba.mamba_pool_idx.unsqueeze(0),
                 )
             )
 

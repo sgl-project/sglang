@@ -292,7 +292,7 @@ class StreamingSession(BasePrefixCache):
                 self.slots[session_id] = slot
                 req.mamba = None
             slot.kv.kv_allocated_len = max(
-                slot.kv.kv_allocated_len, req.kv_allocated_len
+                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
             )
             self.release_session(session_id)
             req.req_pool_idx = None
@@ -505,9 +505,9 @@ class StreamingSession(BasePrefixCache):
         slot.kv.kv_allocated_len = prefix_len
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv_allocated_len = prefix_len
+        req.kv.kv_allocated_len = prefix_len
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Trim slot KV to finished_len boundary. Spec v2 may overshoot
@@ -516,10 +516,10 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
-        req.kv_allocated_len = min(req.kv_allocated_len, target)
+        self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
+        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:

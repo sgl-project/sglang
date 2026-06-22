@@ -283,7 +283,7 @@ class MlxModelRunner:
 
         chunk_size = get_global_server_args().mamba_cache_chunk_size
         track_len = prefix_len + (new_token_count // chunk_size) * chunk_size
-        branching_len = getattr(req, "mamba_branching_seqlen", None)
+        branching_len = req.mamba.mamba_branching_seqlen
         if (
             branching_len is not None
             and prefix_len < branching_len <= prefix_len + new_token_count
@@ -311,7 +311,7 @@ class MlxModelRunner:
         if pool is None or not hasattr(pool, "store_cache"):
             return
 
-        track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+        track_buffer = req.mamba.mamba_ping_pong_track_buffer
         if track_buffer is None:
             track_buffer = pool.alloc(1)
             if track_buffer is None:
@@ -320,15 +320,15 @@ class MlxModelRunner:
                     "falling back to leaf-only auxiliary-state radix caching."
                 )
                 return
-            req.mamba_ping_pong_track_buffer = track_buffer
-            req.mamba_next_track_idx = 0
+            req.mamba.mamba_ping_pong_track_buffer = track_buffer
+            req.mamba.mamba_next_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
             cache,
             self._cache_layout.auxiliary_layer_indices,
         )
-        req.mamba_last_track_seqlen = track_len
+        req.mamba.mamba_last_track_seqlen = track_len
 
     def _cache_with_pool_backed_attention(
         self, prefix_slot_ids: list[int], prefix_len: int

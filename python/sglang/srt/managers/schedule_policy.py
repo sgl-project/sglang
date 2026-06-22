@@ -123,7 +123,7 @@ def match_prefix_for_req(
     if match_result.mamba_branching_seqlen is not None and req.mamba is not None:
         req.mamba.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.cache_protected_len = match_result.cache_protected_len
+        req.cache.cache_protected_len = match_result.cache_protected_len
     return match_result
 
 
@@ -309,7 +309,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            last_node_to_reqs[req.cache.last_node].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:
@@ -671,7 +671,7 @@ class PrefillAdder:
             swa_prefix_lock_released=False,
         )
         if self.is_hybrid_swa:
-            req.swa_uuid_for_lock = result.swa_uuid_for_lock
+            req.cache.swa_uuid_for_lock = result.swa_uuid_for_lock
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -918,7 +918,7 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
-        with self._lock_node(req.last_node):
+        with self._lock_node(req.cache.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -931,7 +931,7 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                new_indices, req.cache.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
@@ -943,7 +943,7 @@ class PrefillAdder:
                     len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
                 )
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                req.cache.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

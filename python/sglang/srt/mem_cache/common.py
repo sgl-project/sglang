@@ -77,9 +77,11 @@ def free_swa_out_of_window_slots(
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
-        req.cache_protected_len % page_size == 0
+        req.cache.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+    req.kv.swa_evicted_seqlen = max(
+        req.kv.swa_evicted_seqlen, req.cache.cache_protected_len
+    )
 
     # Subtract an extra page_size so the eviction frontier never reaches the
     # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
@@ -92,22 +94,22 @@ def free_swa_out_of_window_slots(
     else:
         evict_threshold = pre_len - sliding_window_size - page_size
     new_swa_evicted_seqlen = max(
-        req.swa_evicted_seqlen,
+        req.kv.swa_evicted_seqlen,
         evict_threshold,
     )
 
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
         )
-        req.swa_evicted_seqlen = new_swa_evicted_seqlen
+        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -635,7 +637,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba is not None and req.mamba.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.mamba_pool_idx.unsqueeze(-1)
+                req.mamba.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba = None
         return
@@ -652,7 +654,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None:
         return
 
-    start_p, end_p = kv_committed_len, req.kv_allocated_len
+    start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
@@ -663,7 +665,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)

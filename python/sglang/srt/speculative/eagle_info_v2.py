@@ -46,7 +46,7 @@ class EagleDraftInputV2Mixin:
         nxt_kv_lens = [0] * bs
         num_needed_tokens = 0
         for i, r in enumerate(batch.reqs):
-            cur = r.kv_allocated_len
+            cur = r.kv.kv_allocated_len
             # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
             # cannot make nxt < cur and corrupt allocator state. kv_committed_len lags
             # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
@@ -56,7 +56,7 @@ class EagleDraftInputV2Mixin:
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
-            r.kv_allocated_len = nxt
+            r.kv.kv_allocated_len = nxt
             r.decode_batch_idx += 1
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1

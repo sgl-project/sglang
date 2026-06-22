@@ -469,11 +469,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
+                kv_indices[req.cache.cache_protected_len : result.prefix_len]
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
+                kv_indices[req.cache.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
@@ -511,7 +511,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+            kv_indices[req.cache.cache_protected_len : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
@@ -525,15 +525,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ), f"{len(new_indices)=}, {len(radix_key)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(req.cache.cache_protected_len, len(new_indices))),
+            new_indices[req.cache.cache_protected_len :],
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
-        req.cache_protected_len = len(new_indices)
+        req.cache.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.locked_cache.last_node)
         self.inc_lock_ref(new_last_node)
