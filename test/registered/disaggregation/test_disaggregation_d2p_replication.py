@@ -54,14 +54,10 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
 
     extra_prefill_args = [
         "--disaggregation-enable-d2p-kv-replication",
-        "--disaggregation-ib-device",
-        "mlx5_2"
     ]
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
         "--disaggregation-enable-d2p-kv-replication",
-        "--disaggregation-ib-device",
-        "mlx5_10"
     ]
     transfer_backend_name = "mooncake"
 
@@ -105,7 +101,7 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
             num_prompts=1,
             range_ratio=1.0,
             tokenizer=tokenizer,
-            dataset_path="/workdir/ShareGPT_V3_unfiltered_cleaned_split.json",
+            dataset_path="",
             return_text=False,
         )
         suffixes = sample_random_requests(
@@ -114,7 +110,7 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
             num_prompts=1,
             range_ratio=1.0,
             tokenizer=tokenizer,
-            dataset_path="/workdir/ShareGPT_V3_unfiltered_cleaned_split.json",
+            dataset_path="",
             return_text=False,
         )
 
@@ -217,7 +213,7 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
             num_prompts=num_clients,
             range_ratio=1.0,
             tokenizer=tokenizer,
-            dataset_path="/workdir/ShareGPT_V3_unfiltered_cleaned_split.json",
+            dataset_path="",
             return_text=False,
         )
         questions = sample_random_requests(
@@ -226,7 +222,7 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
             num_prompts=num_clients * max(num_rounds - 1, 1),
             range_ratio=1.0,
             tokenizer=tokenizer,
-            dataset_path="/workdir/ShareGPT_V3_unfiltered_cleaned_split.json",
+            dataset_path="",
             return_text=False,
         )
 
