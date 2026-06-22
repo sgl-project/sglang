@@ -126,6 +126,12 @@ sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177
 # HELP sglang:num_queue_reqs The number of requests in the waiting queue
 # TYPE sglang:num_queue_reqs gauge
 sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
+# HELP sglang:spec_num_steps Currently active speculative_num_steps.
+# TYPE sglang:spec_num_steps gauge
+sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
+# HELP sglang:spec_num_draft_tokens Currently active speculative_num_draft_tokens (decouples from steps under topk>1).
+# TYPE sglang:spec_num_draft_tokens gauge
+sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
 ## Setup Guide

@@ -14,7 +14,6 @@ The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → 
 - `registered/`: CI test files, auto-discovered by `run_suite.py`. Most tests live here. JIT kernel tests are an exception (see below).
 - `manual/`: Non-CI tests for local debugging or special setups.
 - `run_suite.py`: CI runner — scans `registered/` and JIT kernel directories.
-- `srt/`: Legacy CI setup, to be deprecated.
 
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
@@ -45,7 +44,7 @@ python3 test/registered/core/test_srt_endpoint.py
 python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 
 # Single JIT kernel test
-python3 python/sglang/jit_kernel/tests/test_add_constant.py
+python3 test/registered/jit/test_add_constant.py
 
 # Run a suite
 python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
@@ -73,9 +72,9 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel files live outside `test/registered/` but still use registration:
-- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py` → `base-b-kernel-unit-1-gpu-large`
-- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py` → `base-b-kernel-benchmark-1-gpu-large`
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
+- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-1-gpu-large`
+- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-1-gpu-large`
 
 ## Choosing a Suite
 
@@ -112,4 +111,4 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 
 ### Adding New Models to Nightly CI
 - **Text models**: Extend the [global model list variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`.
-- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`.
+- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/registered/eval/test_vlms_mmmu_eval.py`.
