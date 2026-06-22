@@ -1,0 +1,258 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+diff --git a/include/cute/arch/copy_sm90_desc.hpp b/include/cute/arch/copy_sm90_desc.hpp
+index 63bfb563..786b361b 100644
+--- a/include/cute/arch/copy_sm90_desc.hpp
++++ b/include/cute/arch/copy_sm90_desc.hpp
+@@ -303,7 +303,7 @@ CUTE_HOST_DEVICE
+ void
+ prefetch_tma_descriptor(TmaDescriptor const* desc_ptr)
+ {
+-#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
++#if defined(CUTE_ARCH_TMA_SM90_ENABLED) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 1200)
+   uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+   // Prefetch TMA Descriptor using generic addressing (i.e. no specific state space: const or param)
+   asm volatile (
+@@ -311,6 +311,16 @@ prefetch_tma_descriptor(TmaDescriptor const* desc_ptr)
+     :
+     : "l"(gmem_int_desc)
+     : "memory");
++#elif defined(CUTE_ARCH_TMA_SM90_ENABLED)
++  // OmniDreams patch: On SM120+ (Blackwell), nvcc 13.x can materialize a
++  // __grid_constant__ kernel-param TMA descriptor into local memory before the
++  // generic-address load resolves its state space. The `prefetch.tensormap`
++  // PTX instruction rejects .shared / .local state-space addresses and aborts
++  // the kernel with "misaligned shared or local address". The prefetch is
++  // purely a performance hint (warms the descriptor cache on first TMA use)
++  // and the kernel is functionally correct without it. Skip on SM120+ until a
++  // compiler/CUTLASS fix lands upstream.
++  (void)desc_ptr;
+ #else
+   CUTE_INVALID_CONTROL_PATH("Trying to use TMA Descriptor Prefetch without CUTE_ARCH_TMA_SM90_ENABLED.");
+ #endif
+diff --git a/include/cute/atom/copy_traits_sm90_tma.hpp b/include/cute/atom/copy_traits_sm90_tma.hpp
+index 3be30af7..47abafee 100644
+--- a/include/cute/atom/copy_traits_sm90_tma.hpp
++++ b/include/cute/atom/copy_traits_sm90_tma.hpp
+@@ -44,6 +44,11 @@
+
+ #include <cutlass/cuda_host_adapter.hpp>
+
++// OmniDreams patch: host-side TMA descriptor pool used to keep descriptors
++// in `.global` state space, working around the nvcc 13.x SM120 spill bug.
++#include <cute/atom/detail/tma_descriptor_pool.hpp>
++#include <stdexcept>
++
+ namespace cute
+ {
+
+@@ -94,6 +98,14 @@ struct SM90_TMA_LOAD_OP : SM90_TMA_LOAD {};
+
+ // The non-executable SM90_TMA_LOAD with tma_desc and no tma_mbar
+ // Use .with(tma_mbar) to construct an executable version
++//
++// OmniDreams patch: `tma_desc_` is a `TmaDescriptor const*` pointing into
++// a `cudaMalloc`'d global-memory slot (managed by `cute::detail::TmaDescriptorPool`)
++// rather than an embedded by-value descriptor. This works around an nvcc 13.x
++// bug on SM120 where embedded TMA descriptors inside __grid_constant__ kernel
++// params get materialized into thread-local memory, causing
++// `prefetch.tensormap` / `cp.async.bulk.tensor` to abort with "Misaligned
++// shared or local address".
+ template <class NumBitsPerTMA, class AuxParams_>
+ struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+ {
+@@ -106,7 +118,8 @@ struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+   using RefLayout = SrcLayout;
+
+   // SM90_TMA_LOAD arguments
+-  TmaDescriptor tma_desc_;
++  // OmniDreams patch: pointer to descriptor in cudaMalloc'd global memory (was: TmaDescriptor by value).
++  TmaDescriptor const* tma_desc_;
+   using AuxParams = AuxParams_;
+   AuxParams aux_params_;
+
+@@ -114,7 +127,7 @@ struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+   CUTE_HOST_DEVICE constexpr
+   TmaDescriptor const*
+   get_tma_descriptor() const {
+-    return &tma_desc_;
++    return tma_desc_;
+   }
+
+   // Construct an executable SM90_TMA_LOAD with tma_mbar
+@@ -125,7 +138,7 @@ struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+     [[maybe_unused]] uint16_t const& multicast_mask = 0,
+     TMA::CacheHintSm90 const& cache_hint = TMA::CacheHintSm90::EVICT_NORMAL) const {
+     // We accept multicast_mask here to keep the API for both atoms consistent
+-    return {&tma_desc_, &tma_mbar, static_cast<uint64_t>(cache_hint)};
++    return {tma_desc_, &tma_mbar, static_cast<uint64_t>(cache_hint)};
+   }
+
+   // Construct an executable SM90_TMA_LOAD with tma_mbar (temp. overloaded for grouped gemm/ptr array gemm)
+@@ -157,11 +170,14 @@ struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+               Tensor<TS,SLayout> const& src,
+               Tensor<TD,DLayout>      & dst) = delete;
+
+-  // Construct with updated TMA descriptor only (no barrier change)
++  // Construct with updated TMA descriptor only (no barrier change).
++  // OmniDreams patch: with pointer storage, we just store the new pointer directly
++  // (the caller is expected to keep the underlying descriptor alive in
++  // .global state space, e.g. via the pool).
+   CUTE_HOST_DEVICE constexpr
+   Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
+   with(TmaDescriptor const* new_tma_desc) const {
+-    return {*new_tma_desc, aux_params_};
++    return {new_tma_desc, aux_params_};
+   }
+ };
+
+@@ -252,6 +268,9 @@ struct SM90_TMA_LOAD_MULTICAST_OP : SM90_TMA_LOAD_MULTICAST {};
+
+ // The non-executable SM90_TMA_LOAD_MULTICAST with tma_desc and no tma_mbar
+ // Use .with(tma_mbar, multicast_mask) to construct an executable version
++//
++// OmniDreams patch: see comment on Copy_Traits<SM90_TMA_LOAD>. Same
++// pointer-storage workaround for the nvcc 13.x SM120 __grid_constant__ spill bug.
+ template <class NumBitsPerTMA, class AuxParams_>
+ struct Copy_Traits<SM90_TMA_LOAD_MULTICAST, NumBitsPerTMA, AuxParams_>
+ {
+@@ -264,7 +283,8 @@ struct Copy_Traits<SM90_TMA_LOAD_MULTICAST, NumBitsPerTMA, AuxParams_>
+   using RefLayout = SrcLayout;
+
+   // SM90_TMA_LOAD_MULTICAST arguments
+-  TmaDescriptor tma_desc_;
++  // OmniDreams patch: pointer to descriptor in cudaMalloc'd global memory.
++  TmaDescriptor const* tma_desc_;
+   using AuxParams = AuxParams_;
+   AuxParams aux_params_;
+
+@@ -272,7 +292,7 @@ struct Copy_Traits<SM90_TMA_LOAD_MULTICAST, NumBitsPerTMA, AuxParams_>
+   CUTE_HOST_DEVICE constexpr
+   TmaDescriptor const*
+   get_tma_descriptor() const {
+-    return &tma_desc_;
++    return tma_desc_;
+   }
+
+   // Construct an executable SM90_TMA_LOAD_MULTICAST with tma_mbar
+@@ -282,7 +302,7 @@ struct Copy_Traits<SM90_TMA_LOAD_MULTICAST, NumBitsPerTMA, AuxParams_>
+     uint64_t& tma_load_mbar,
+     uint16_t const& multicast_mask,
+     TMA::CacheHintSm90 const& cache_hint = TMA::CacheHintSm90::EVICT_NORMAL) const {
+-    return {&tma_desc_, &tma_load_mbar, multicast_mask, static_cast<uint64_t>(cache_hint)};
++    return {tma_desc_, &tma_load_mbar, multicast_mask, static_cast<uint64_t>(cache_hint)};
+   }
+
+   // Construct an executable SM90_TMA_LOAD_MULTICAST_OP with tma_mbar (temp. overloaded for grouped gemm/ptr array gemm)
+@@ -354,6 +374,9 @@ struct Copy_Traits<SM90_TMA_LOAD_MULTICAST_OP, NumBitsPerTMA>
+ struct SM90_TMA_STORE_PTR : SM90_TMA_STORE {};
+
+ // The executable SM90_TMA_STORE with tma_desc
++//
++// OmniDreams patch: see comment on Copy_Traits<SM90_TMA_LOAD>. Same
++// pointer-storage workaround for the nvcc 13.x SM120 __grid_constant__ spill bug.
+ template <class NumBitsPerTMA, class AuxParams_>
+ struct Copy_Traits<SM90_TMA_STORE, NumBitsPerTMA, AuxParams_>
+ {
+@@ -366,7 +389,8 @@ struct Copy_Traits<SM90_TMA_STORE, NumBitsPerTMA, AuxParams_>
+   using RefLayout = SrcLayout;
+
+   // SM90_TMA_STORE arguments
+-  TmaDescriptor tma_desc_;
++  // OmniDreams patch: pointer to descriptor in cudaMalloc'd global memory.
++  TmaDescriptor const* tma_desc_;
+   using AuxParams = AuxParams_;
+   AuxParams aux_params_;
+
+@@ -374,7 +398,7 @@ struct Copy_Traits<SM90_TMA_STORE, NumBitsPerTMA, AuxParams_>
+   CUTE_HOST_DEVICE constexpr
+   TmaDescriptor const*
+   get_tma_descriptor() const {
+-    return &tma_desc_;
++    return tma_desc_;
+   }
+
+   // Generate the TMA coord tensor
+@@ -403,7 +427,8 @@ struct Copy_Traits<SM90_TMA_STORE, NumBitsPerTMA, AuxParams_>
+     static_assert(is_smem<TS>::value, "Expected smem src for SM90_TMA_STORE");
+     //static_assert(is_gmem<TD>::value, "Expected gmem dst for SM90_TMA_STORE");  // TMA spoofed src tensor
+
+-    void const* const desc_ptr = &(traits.tma_desc_);
++    // OmniDreams patch: tma_desc_ is already a pointer; no address-of needed.
++    void const* const desc_ptr = traits.tma_desc_;
+     void const* const src_ptr  = cute::raw_pointer_cast(src.data());
+     auto dst_coord = dst.data().coord_;
+ #if 0
+@@ -465,6 +490,9 @@ struct Copy_Traits<SM90_TMA_STORE_PTR, NumBitsPerTMA>
+ //////////////////////////////////////////////////////////////////////////////
+
+ // The executable SM90_TMA_REDUCE_ADD with tma_desc
++//
++// OmniDreams patch: see comment on Copy_Traits<SM90_TMA_LOAD>. Same
++// pointer-storage workaround for the nvcc 13.x SM120 __grid_constant__ spill bug.
+ template <class NumBitsPerTMA, class AuxParams_>
+ struct Copy_Traits<SM90_TMA_REDUCE_ADD, NumBitsPerTMA, AuxParams_>
+ {
+@@ -479,7 +507,8 @@ struct Copy_Traits<SM90_TMA_REDUCE_ADD, NumBitsPerTMA, AuxParams_>
+   using RefLayout = SrcLayout;
+
+   // SM90_TMA_REDUCE_ADD arguments
+-  TmaDescriptor tma_desc_;
++  // OmniDreams patch: pointer to descriptor in cudaMalloc'd global memory.
++  TmaDescriptor const* tma_desc_;
+   using AuxParams = AuxParams_;
+   AuxParams aux_params_;
+
+@@ -487,7 +516,7 @@ struct Copy_Traits<SM90_TMA_REDUCE_ADD, NumBitsPerTMA, AuxParams_>
+   CUTE_HOST_DEVICE constexpr
+   TmaDescriptor const*
+   get_tma_descriptor() const {
+-    return &tma_desc_;
++    return tma_desc_;
+   }
+
+   // Generate the TMA coord tensor
+@@ -513,7 +542,8 @@ struct Copy_Traits<SM90_TMA_REDUCE_ADD, NumBitsPerTMA, AuxParams_>
+            int32_t(c0), int32_t(c1), int32_t(c2), int32_t(c3), int32_t(c4), src_ptr);
+ #endif
+
+-    SM90_TMA_REDUCE_ADD::copy(&tma_desc_,
++    // OmniDreams patch: tma_desc_ is already a pointer; no address-of needed.
++    SM90_TMA_REDUCE_ADD::copy(tma_desc_,
+                          src_ptr, get<Is>(dst_coord)...);
+   }
+
+@@ -1151,7 +1181,31 @@ make_tma_copy_atom(CopyOp,
+   using Traits = Copy_Traits<CopyOp, cute::C<num_bits_per_tma>, decltype(aux_params)>;
+   using Atom   = Copy_Atom<Traits, typename GEngine::value_type>;
+
+-  Traits tma_traits{tma_desc, aux_params};
++  // OmniDreams patch: pin the host-built TMA descriptor into a cudaMalloc'd
++  // global-memory slot so that subsequent kernel-side accesses (prefetch /
++  // cp.async.bulk.tensor) resolve to `.global` state space. Without this, on
++  // SM120 + nvcc 13.x, the embedded-by-value descriptor inside __grid_constant__
++  // params materializes to thread-local memory and the PTX instructions abort
++  // with "Misaligned shared or local address". The pool storage lasts for the
++  // process lifetime (intentional leak) and dedupes by content so subsequent
++  // calls during CUDA Graph capture are pure cache hits.
++#if !defined(__CUDACC_RTC__)
++  TmaDescriptor const* tma_desc_ptr = cute::detail::pin_tma_descriptor(tma_desc);
++  if (tma_desc_ptr == nullptr) {
++    // Pool exhausted or cudaMalloc failed. Stop host-side construction so the
++    // native TMA path fails explicitly instead of launching with an invalid
++    // descriptor pointer.
++    throw std::runtime_error(
++        "cute::make_tma_copy_atom failed to pin TMA descriptor");
++  }
++  Traits tma_traits{tma_desc_ptr, aux_params};
++#else
++  // NVRTC path: no pool available. Force a compile error if this path is
++  // instantiated under NVRTC since the SM90 TMA collectives we use are AOT.
++  static_assert(sizeof(TmaInternalType) == 0,
++                "OmniDreams patch: TMA descriptor pool unavailable under NVRTC. "
++                "Compile this kernel ahead-of-time instead.");
++#endif
+
+ #if 0
+   print("num_bits_per_tma :  "); print(num_bits_per_tma); print("\n");

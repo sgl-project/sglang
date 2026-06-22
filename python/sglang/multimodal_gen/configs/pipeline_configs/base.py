@@ -911,6 +911,10 @@ class PipelineConfig:
         pipeline_config_or_path: str | PipelineConfig | dict[str, Any] | None = (
             kwargs.get(prefix_with_dot + "pipeline_config", None)
             or kwargs.get("pipeline_config")
+            # --pipeline-config-path stores the JSON path here; treat it as a
+            # pipeline_config str source when no explicit pipeline_config is given.
+            or kwargs.get(prefix_with_dot + "pipeline_config_path", None)
+            or kwargs.get("pipeline_config_path")
         )
         if model_path is None:
             raise ValueError("model_path is required in kwargs")

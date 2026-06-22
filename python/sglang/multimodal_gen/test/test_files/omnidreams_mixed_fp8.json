@@ -1,0 +1,8 @@
+{
+    "native_dit_acceleration": "required",
+    "native_dit_backend": "auto",
+    "image_encoder_config": {"impl": "lightvae", "native_acceleration": "required"},
+    "encoder_config": {"impl": "lightvae", "native_acceleration": "required"},
+    "decoder_config": {"impl": "lighttae"},
+    "text_encoder_config": {"impl": "fp8_w8a8"}
+}

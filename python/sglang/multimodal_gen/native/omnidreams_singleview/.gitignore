@@ -1,0 +1,2 @@
+# Managed third-party native source checkouts. Populate with tools/sync_thirdparty.py.
+/3rdparty/

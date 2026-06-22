@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "name": "cutlass",
+      "repo": "https://github.com/NVIDIA/cutlass.git",
+      "commit": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
+      "directory": "cutlass",
+      "delete_paths": [
+        "python/CuTeDSL"
+      ],
+      "patches": [
+        {
+          "path": "patches/cutlass/sm120-tma-pool.patch",
+          "strip": 1
+        }
+      ],
+      "overlays": [
+        {
+          "source": "patches/cutlass/include",
+          "destination": "include"
+        }
+      ]
+    },
+    {
+      "name": "cudnn-frontend",
+      "repo": "https://github.com/NVIDIA/cudnn-frontend.git",
+      "commit": "deda80e5372d50e925d7bf4f76c5db779be3fbd5",
+      "directory": "cudnn-frontend"
+    }
+  ]
+}

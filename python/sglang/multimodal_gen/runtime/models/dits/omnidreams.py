@@ -826,16 +826,10 @@ class OmniDreamsDiT(BaseDiT):
             "call post_load_weights() before forward (fuses padding-mask + "
             "last-layer shuffle)"
         )
-        # Phase 6: the outer AR loop (dynamic chunk count + BlockKVCache ops)
-        # is not torch.compile-safe. The hot-path OmniDreamsBlocks ARE compiled
-        # via _compile_conditions, which is sufficient.
-        assert not torch.compiler.is_compiling(), (
-            "OmniDreamsDiT.forward() is not torch.compile-safe (dynamic chunk "
-            "loop + KV cache operations break fullgraph). Individual blocks are "
-            "compiled via _compile_conditions."
-        )
-        # Phase 6: SP (ulysses/ring sequence parallelism) is not yet supported
-        # for the autoregressive chunk loop. Guard with a clear error.
+        # A single chunk's forward is compile-safe under fullgraph=False: the
+        # only dynamic ops here are the per-block KV read/write, which graph-break
+        # cleanly. torch.compile must use max-autotune-no-cudagraphs so inductor
+        # does not install CUDA graphs that collide with OmniDreamsCUDAGraphRunner.
         if self._sp_size > 1:
             raise RuntimeError(
                 "Sequence parallelism (SP) is not yet supported for OmniDreams. "

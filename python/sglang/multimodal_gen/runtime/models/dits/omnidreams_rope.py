@@ -92,6 +92,31 @@ class RotaryPositionEmbedding3D:
         cos, sin = self._rope.forward(self._positions(autoregressive_index))
         return torch.cat([cos, sin], dim=-1)
 
+    def shift_t_freqs(self, autoregressive_index: int = 0) -> Tensor:
+        """``[L, 1, 1, D]`` raw angle tensor for the native FP8 path.
+
+        The native FP8 DiT applies cos/sin internally (via
+        ``_make_cosmos_rope_cache``), so it needs the raw frequency×position
+        angles rather than the precomputed cos|sin cache returned by
+        :meth:`shift_t`.
+        """
+        pos = self._positions(autoregressive_index)  # [L, 3] (t, h, w)
+        dim_t, dim_h, dim_w = rope_dims(self.head_dim)
+        parts: list[Tensor] = []
+        for axis_idx, axis_dim in enumerate((dim_t, dim_h, dim_w)):
+            gen = self._rope.rope_generators[self._rope.dim_idx_to_gen_idx[axis_idx]]
+            pos_i = pos[:, axis_idx].to(gen.dtype) * gen.interpolation_factor
+            base_freqs = gen.build_freqs(pos.device)  # [dim/2]
+            angles = torch.outer(pos_i, base_freqs)  # [L, dim/2]
+            # Duplicate for NeoX non-interleaved layout: (d, d+dim/2) pair.
+            if gen.use_real and gen.repeat_interleave_real:
+                angles = angles.repeat_interleave(2, dim=1)
+            else:
+                angles = torch.cat([angles, angles], dim=-1)  # [L, dim]
+            parts.append(angles)
+        raw = torch.cat(parts, dim=-1)  # [L, D]
+        return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
+
 
 def apply_rope_freqs(x: Tensor, cos_sin: Tensor) -> Tensor:
     """Apply NeoX 3D RoPE to ``x`` from a precomputed cos|sin cache.

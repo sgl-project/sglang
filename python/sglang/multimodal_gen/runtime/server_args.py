@@ -277,6 +277,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "video_dit": True,
             "audio_dit": True,
             "dual_tower_bridge": True,
+            "decoder": True,
         }
     )
 

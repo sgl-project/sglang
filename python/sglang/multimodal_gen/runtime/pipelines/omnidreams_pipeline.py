@@ -36,13 +36,13 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_match import (  # noqa: E501
     OmniDreamsFlowMatchScheduler,
 )
-from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
     OmniDreamsBeforeDenoisingStage,
     OmniDreamsDenoisingStage,
+    OmniDreamsLightTAEDecodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -52,14 +52,6 @@ logger = init_logger(__name__)
 
 # Default in-repo location of the distilled single-view checkpoint.
 _DEFAULT_CKPT_RELPATH = "single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt"
-
-# Cosmos-Reason1-7B text encoder (Qwen2.5-VL), pinned for numerical parity with
-# FlashDreams (flashdreams/infra/encoder/text/cosmos_reason1.py).
-_TEXT_ENCODER_ID = "nvidia/Cosmos-Reason1-7B"
-_TEXT_ENCODER_REVISION = "3210bec0495fdc7a8d3dbb8d58da5711eab4b423"
-
-# Wan 2.1 VAE weights subdirectory candidates (relative to the model path).
-_VAE_RELDIRS = ("vae", "wan_vae", "Wan2.1_VAE")
 
 
 class OmniDreamsPipeline(ComposedPipelineBase):
@@ -100,29 +92,6 @@ class OmniDreamsPipeline(ComposedPipelineBase):
             return matches[0]
         raise FileNotFoundError(
             f"OmniDreams checkpoint (.pt) not found under {model_path}"
-        )
-
-    @staticmethod
-    def _resolve_vae_path(model_path: str) -> str:
-        """Locate the Wan 2.1 VAE weights (a flat ``.pth`` or a weights dir).
-
-        Looks for a ``vae``-like subdirectory first, then any ``*VAE*.pth`` /
-        ``*vae*.safetensors`` under the model path. The caller (GPU bring-up)
-        may also point ``model_path`` directly at a Wan VAE directory.
-        """
-        base = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
-        for sub in _VAE_RELDIRS:
-            cand = os.path.join(base, sub)
-            if os.path.isdir(cand) or os.path.isfile(cand):
-                return cand
-        for pattern in ("**/*vae*.safetensors", "**/*VAE*.safetensors"):
-            matches = sorted(glob.glob(os.path.join(base, pattern), recursive=True))
-            if matches:
-                return matches[0]
-        raise FileNotFoundError(
-            f"Diffusers-format Wan 2.1 VAE not found under {base}. Place a "
-            f"diffusers Wan VAE (*.safetensors + config.json) under a 'vae/' "
-            f"subdirectory or pass its path explicitly."
         )
 
     # ----- component loaders ------------------------------------------------ #
@@ -167,111 +136,6 @@ class OmniDreamsPipeline(ComposedPipelineBase):
 
         return model.eval()
 
-    @classmethod
-    def _load_wan_vae(
-        cls,
-        vae_config: Any,
-        vae_path: str,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> nn.Module:
-        """Build the SGLang Wan 2.1 VAE and load diffusers-format weights.
-
-        SGLang's ``AutoencoderKLWan`` uses the diffusers WanVAE key naming, so
-        the VAE must be supplied in **diffusers format**: a ``vae/`` directory
-        with ``*.safetensors`` (+ ``config.json``) as exported by diffusers.
-
-        The original lightx2v flat ``Wan2.1_VAE.pth`` uses a different
-        (original-Wan) key naming and is intentionally **not** remapped here —
-        converting between the two schemes is exactly what diffusers'
-        ``convert_wan_to_diffusers`` already does. Point this at a diffusers Wan
-        VAE (any ``Wan2.1-*-Diffusers/vae``) instead of the flat ``.pth``.
-        """
-        with set_default_torch_dtype(dtype):
-            vae = AutoencoderKLWan(vae_config)
-
-        state = cls._read_vae_state_dict(vae_path)
-
-        try:
-            vae.load_state_dict(state, strict=True)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Failed to load Wan VAE weights from '{vae_path}' into the "
-                "diffusers-format AutoencoderKLWan. Supply the VAE in diffusers "
-                "format (a 'vae/' directory with *.safetensors + config.json). "
-                "The flat lightx2v 'Wan2.1_VAE.pth' uses original-Wan key names; "
-                "convert it with diffusers' convert_wan_to_diffusers first.\n"
-                f"Underlying error: {exc}"
-            ) from exc
-        return vae.to(device=device, dtype=dtype).eval()
-
-    @staticmethod
-    def _read_vae_state_dict(vae_path: str) -> dict[str, torch.Tensor]:
-        """Read a VAE state dict from a diffusers ``*.safetensors`` dir/file."""
-        if os.path.isdir(vae_path):
-            files = sorted(glob.glob(os.path.join(vae_path, "*.safetensors")))
-            if not files:
-                raise FileNotFoundError(
-                    f"No *.safetensors found under '{vae_path}'. Supply a "
-                    "diffusers-format Wan VAE directory."
-                )
-            from safetensors.torch import load_file as safetensors_load_file
-
-            state: dict[str, torch.Tensor] = {}
-            for f in files:
-                state.update(safetensors_load_file(f))
-        elif vae_path.endswith(".safetensors"):
-            from safetensors.torch import load_file as safetensors_load_file
-
-            state = safetensors_load_file(vae_path)
-        else:
-            state = torch.load(vae_path, map_location="cpu", weights_only=True)
-
-        # Some checkpoints nest the state dict under "model"/"state_dict".
-        if "state_dict" in state and isinstance(state["state_dict"], dict):
-            state = state["state_dict"]
-        return state
-
-    @staticmethod
-    def _resolve_text_encoder_src(model_path: str) -> tuple[str, str | None]:
-        """Resolve the Cosmos-Reason1-7B source.
-
-        Prefers a local ``<model_path>/text_encoder`` directory (offline /
-        mirrored deployments), returning ``(local_dir, None)``; otherwise falls
-        back to the pinned HF id + revision.
-        """
-        if os.path.isdir(model_path):
-            local = os.path.join(model_path, "text_encoder")
-            if os.path.isfile(os.path.join(local, "config.json")):
-                return local, None
-        return _TEXT_ENCODER_ID, _TEXT_ENCODER_REVISION
-
-    @classmethod
-    def _load_text_encoder(
-        cls, model_path: str, device: torch.device
-    ) -> tuple[Any, Any]:
-        """Load Cosmos-Reason1-7B (Qwen2.5-VL) + processor.
-
-        Uses a local ``<model_path>/text_encoder`` dir when present, else the
-        pinned HF id + revision (see :meth:`_resolve_text_encoder_src`).
-        """
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-
-        src, revision = cls._resolve_text_encoder_src(model_path)
-        logger.info("OmniDreams: loading text encoder from %s", src)
-        processor = AutoProcessor.from_pretrained(src, revision=revision)
-        text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                src,
-                revision=revision,
-                torch_dtype=torch.bfloat16,  # canonical kwarg; avoids fp32 load
-            )
-            .eval()
-            .requires_grad_(False)
-            .to(device)
-        )
-        return text_encoder, processor
-
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -307,15 +171,45 @@ class OmniDreamsPipeline(ComposedPipelineBase):
             pipeline_config.dit_config, ckpt_path, dit_device, dit_dtype
         )
 
-        vae_path = self._resolve_vae_path(model_path)
-        logger.info("OmniDreams: loading Wan 2.1 VAE from %s", vae_path)
-        vae = self._load_wan_vae(
-            pipeline_config.vae_config, vae_path, vae_device, vae_dtype
-        )
+        # A single AutoencoderKLWan has both encode + decode, so when several
+        # roles use the full WanVAE we build it once and share the instance —
+        # reading the ~485MB safetensors and allocating the weights up to 3x
+        # (image_encoder + encoder + decoder) is pure waste.
+        _wanvae_cache: dict[tuple, nn.Module] = {}
 
-        text_encoder, tokenizer = self._load_text_encoder(
-            model_path, text_encoder_device
-        )
+        def _setup_vae_component(cfg):
+            if cfg is None:
+                return None
+            cfg.model_path = model_path
+            cfg.device = vae_device
+            cfg.dtype = vae_dtype
+            if cfg.impl != "wanvae":
+                return cfg.setup()
+            key = (
+                cfg.checkpoint_path,
+                str(vae_device),
+                vae_dtype,
+                tuple(cfg.latents_mean),
+                tuple(cfg.latents_std),
+            )
+            if key not in _wanvae_cache:
+                _wanvae_cache[key] = cfg.setup()
+            return _wanvae_cache[key]
+
+        # image_encoder (one-shot first-frame I2V conditioning)
+        image_encoder = _setup_vae_component(pipeline_config.image_encoder_config)
+        # encoder (per-AR-step HDMap conditioning)
+        encoder = _setup_vae_component(pipeline_config.encoder_config)
+        # decoder (per-AR-step latent decode)
+        decoder = _setup_vae_component(pipeline_config.decoder_config)
+
+        # text_encoder
+        if pipeline_config.text_encoder_config is not None:
+            pipeline_config.text_encoder_config.device = text_encoder_device
+            pipeline_config.text_encoder_config.model_path = model_path
+            text_encoder, tokenizer = pipeline_config.text_encoder_config.setup()
+        else:
+            text_encoder, tokenizer = None, None
 
         scheduler = OmniDreamsFlowMatchScheduler(
             num_inference_steps=len(pipeline_config.denoising_timesteps),
@@ -332,22 +226,33 @@ class OmniDreamsPipeline(ComposedPipelineBase):
         # Phase 6: populate memory budgets (GiB, approximate) for the
         # ComponentResidencyManager offload scheduler. Exact values are
         # TODO(gpu): measure on the target GPU with torch.cuda.memory_stats().
+        impl_image = pipeline_config.image_encoder_config.impl if pipeline_config.image_encoder_config else "wanvae"
+        impl_encoder = pipeline_config.encoder_config.impl
+        impl_decoder = pipeline_config.decoder_config.impl
+
         self.memory_usages = {
             "transformer": 4.0,  # ~2B params in bf16 ≈ 4 GiB
             "text_encoder": 14.0,  # Cosmos-Reason1-7B ≈ 14 GiB
-            "vae": 1.0,  # Wan 2.1 VAE ≈ 1 GiB
+            "image_encoder": 1.0 if impl_image == "wanvae" else 0.2,
+            "encoder": 1.0 if impl_encoder == "wanvae" else 0.2,
+            "decoder": 1.0 if impl_decoder == "wanvae" else 0.2,
         }
 
-        return {
+        modules = {
             "transformer": transformer,
-            "vae": vae,
+            "image_encoder": image_encoder,
+            "encoder": encoder,
+            "decoder": decoder,
             "text_encoder": text_encoder,
             "tokenizer": tokenizer,
             "scheduler": scheduler,
         }
+        return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         config = server_args.pipeline_config
+
+        # BeforeDenoisingStage: needs image_encoder (I2V first-frame) + encoder (HDMap)
         self.add_stage(
             stage_name="omnidreams_before_denoising",
             stage=OmniDreamsBeforeDenoisingStage(
@@ -355,24 +260,40 @@ class OmniDreamsPipeline(ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
-                vae=self.get_module("vae"),
+                image_encoder=self.get_module("image_encoder"),
+                encoder=self.get_module("encoder"),
                 config=config,
             ),
         )
+
+        # DenoisingStage: no VAE (only validates use_feature_cache attribute)
         self.add_stage(
             stage_name="omnidreams_denoising",
             stage=OmniDreamsDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                vae=self.get_module("vae"),
+                decoder=self.get_module("decoder"),
+                encoder=self.get_module("encoder"),
             ),
         )
-        # Standard single-pass VAE decode. The denoising stage concatenates the
-        # AR chunks into batch.latents; the Wan VAE's causal temporal feature
-        # cache flows frame-to-frame within one decode() call, giving correct
-        # cross-chunk continuity and the FlashDreams frame counts (chunk0 ->
-        # 1+(len_t-1)*4, each later chunk -> len_t*4).
-        self.add_standard_decoding_stage(stage_name="omnidreams_decoding")
+
+        # DecodingStage: uses decoder
+        if config.decoder_config.impl == "lighttae":
+            # LightTAE has own latent mean/std -> skip scale_and_shift
+            self.add_stage(
+                stage_name="omnidreams_decoding",
+                stage=OmniDreamsLightTAEDecodingStage(
+                    vae=self.get_module("decoder"),
+                    pipeline=self,
+                    component_name="decoder",
+                ),
+            )
+        else:
+            # Standard WanVAE decode
+            self.add_standard_decoding_stage(
+                stage_name="omnidreams_decoding",
+                vae_key="decoder",
+            )
 
 
 EntryClass = OmniDreamsPipeline

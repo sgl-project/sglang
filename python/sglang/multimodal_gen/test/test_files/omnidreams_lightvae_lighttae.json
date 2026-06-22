@@ -1,0 +1,5 @@
+{
+    "image_encoder_config": {"impl": "lightvae", "native_acceleration": "auto"},
+    "encoder_config": {"impl": "lightvae", "native_acceleration": "auto"},
+    "decoder_config": {"impl": "lighttae"}
+}

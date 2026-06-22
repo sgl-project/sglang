@@ -16,10 +16,10 @@ on GPU (no checkpoint, no GPU required):
    rollout length (``_MAX_AR_CHUNKS``) against unbounded requests.
 5. ``apply_chat_template`` BatchEncoding output is normalized to the input_ids
    tensor (newer transformers return a dict-like, not a bare tensor).
-6. ``_read_vae_state_dict`` reads diffusers safetensors; ``_load_wan_vae`` raises
+6. ``read_vae_state_dict`` reads diffusers safetensors; ``load_wan_vae`` raises
    a helpful error for a non-diffusers (original-Wan) state dict.
-7. ``_resolve_text_encoder_src`` prefers a local ``text_encoder`` dir, else the
-   pinned HF id + revision.
+7. ``OmniDreamsTextEncoderConfig._resolve_bf16_src`` prefers a local
+   ``text_encoder`` dir, else the pinned HF id + revision.
 """
 
 import json
@@ -177,8 +177,7 @@ def test_encode_text_normalizes_batchencoding():
     stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
     stage.tokenizer = _DictTokenizer()
     stage.text_encoder = _text_encoder
-    # __init__ is bypassed here, so seed the LRU cache _encode_text reads.
-    stage._text_embed_cache = OrderedDict()
+    stage._text_embed_cache = OrderedDict()  # __new__ bypasses __init__
 
     out = stage._encode_text("a prompt", torch.device("cpu"))
     assert out.shape == (1, _TEXT_MAX_LENGTH, n_layers * hidden)
@@ -189,35 +188,35 @@ def test_encode_text_normalizes_batchencoding():
 def test_read_vae_state_dict_safetensors_file_and_dir(tmp_path):
     from safetensors.torch import save_file
 
-    from sglang.multimodal_gen.runtime.pipelines.omnidreams_pipeline import (
-        OmniDreamsPipeline,
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        read_vae_state_dict,
     )
 
     tensors = {"w": torch.zeros(2, 3)}
     f = tmp_path / "vae.safetensors"
     save_file(tensors, str(f))
 
-    sd_file = OmniDreamsPipeline._read_vae_state_dict(str(f))
+    sd_file = read_vae_state_dict(str(f))
     assert set(sd_file.keys()) == {"w"}
 
     d = tmp_path / "vae"
     d.mkdir()
     save_file(tensors, str(d / "diffusion_pytorch_model.safetensors"))
-    sd_dir = OmniDreamsPipeline._read_vae_state_dict(str(d))
+    sd_dir = read_vae_state_dict(str(d))
     assert set(sd_dir.keys()) == {"w"}
 
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(FileNotFoundError):
-        OmniDreamsPipeline._read_vae_state_dict(str(empty))
+        read_vae_state_dict(str(empty))
 
 
 def test_load_wan_vae_raises_helpful_error_on_key_mismatch(tmp_path, monkeypatch):
     from safetensors.torch import save_file
 
-    import sglang.multimodal_gen.runtime.pipelines.omnidreams_pipeline as pipe_mod
-    from sglang.multimodal_gen.runtime.pipelines.omnidreams_pipeline import (
-        OmniDreamsPipeline,
+    import sglang.multimodal_gen.runtime.models.vaes.wanvae as wanvae_mod
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        load_wan_vae,
     )
 
     class _FakeVAE:
@@ -233,32 +232,32 @@ def test_load_wan_vae_raises_helpful_error_on_key_mismatch(tmp_path, monkeypatch
         def eval(self):
             return self
 
-    monkeypatch.setattr(pipe_mod, "AutoencoderKLWan", _FakeVAE)
+    monkeypatch.setattr(wanvae_mod, "AutoencoderKLWan", _FakeVAE)
 
     f = tmp_path / "vae.safetensors"
     save_file({"original_wan_key": torch.zeros(1)}, str(f))
 
     with pytest.raises(RuntimeError, match="diffusers format"):
-        OmniDreamsPipeline._load_wan_vae(
+        load_wan_vae(
             object(), str(f), torch.device("cpu"), torch.float32
         )
 
 
 # ---- 7. text-encoder source resolution ------------------------------------- #
 def test_resolve_text_encoder_src_prefers_local_then_hf(tmp_path):
-    from sglang.multimodal_gen.runtime.pipelines.omnidreams_pipeline import (
-        _TEXT_ENCODER_ID,
-        _TEXT_ENCODER_REVISION,
-        OmniDreamsPipeline,
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsTextEncoderConfig,
     )
 
+    cfg = OmniDreamsTextEncoderConfig(model_path=str(tmp_path))
+
     # No local text_encoder dir -> falls back to the pinned HF id + revision.
-    src, rev = OmniDreamsPipeline._resolve_text_encoder_src(str(tmp_path))
-    assert src == _TEXT_ENCODER_ID and rev == _TEXT_ENCODER_REVISION
+    src, rev = cfg._resolve_bf16_src()
+    assert src == cfg.model_id and rev == cfg.revision
 
     # Local text_encoder/config.json present -> use the local dir, no revision.
     te = tmp_path / "text_encoder"
     te.mkdir()
     (te / "config.json").write_text("{}")
-    src2, rev2 = OmniDreamsPipeline._resolve_text_encoder_src(str(tmp_path))
+    src2, rev2 = cfg._resolve_bf16_src()
     assert src2 == str(te) and rev2 is None

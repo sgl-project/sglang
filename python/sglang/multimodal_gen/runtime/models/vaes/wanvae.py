@@ -990,8 +990,16 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 for i in range(iter_):
                     feat_idx.set(0)
                     first_chunk.set(i == 0)
-                    out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
-                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
+                    # Stream each decoded chunk to CPU so the GPU holds only one
+                    # chunk activation at a time (the causal feature cache lives
+                    # in conv state, not the output). Keep the assembled video on
+                    # CPU through cat/float/clamp to avoid the .to()+.float() GPU
+                    # spike that OOMs long rollouts; downstream saves via
+                    # .cpu().numpy() so a CPU tensor is safe.
+                    out_chunks.append(
+                        self.decoder(x[:, :, i : i + 1, :, :]).cpu()
+                    )
+                out = torch.cat(out_chunks, 2)
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
