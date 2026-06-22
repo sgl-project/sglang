@@ -1428,6 +1428,12 @@ class Scheduler(
 
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched.
+        # In PP mode, this check is done in event_loop_pp by
+        # _pp_check_and_sync_running_timeout, which aborts timed-out
+        # requests on the first PP stage and forwards the AbortReq to
+        # every subsequent stage so all stages agree on the abort.
+        if self.ps.pp_size > 1:
+            return
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
@@ -3853,8 +3859,25 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
+        # Delete requests in the running batch.
+        # In PP mode a request's decode copy lives in one of the per micro-batch
+        # running_mbs slots, not necessarily self.running_batch (which is the
+        # slot for the current mb_id). Scanning only self.running_batch misses
+        # the copy when it is staged in another slot, which leaves the
+        # downstream PP stage waiting for proxy tensors that the first stage
+        # stopped sending after finishing the aborted copy -> PP ring deadlock.
+        # Scan every running_mbs slot (plus the about-to-launch cur_batch) so
+        # the AbortReq applies on every stage regardless of which slot holds
+        # the copy.
+        if self.ps.pp_size > 1 and getattr(self, "running_mbs", None) is not None:
+            candidate_batches = list(self.running_mbs)
+            if self.cur_batch is not None and self.cur_batch not in candidate_batches:
+                candidate_batches.append(self.cur_batch)
+            reqs = []
+            for batch in candidate_batches:
+                if batch is not None:
+                    reqs.extend(batch.reqs)
+        elif self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
         else:
             reqs = self.running_batch.reqs + self.cur_batch.reqs
@@ -3867,7 +3890,10 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    recv_req.abort_message,
+                    recv_req.abort_status_code,
+                )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -6,6 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -23,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -99,6 +101,10 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
+
+                # Close timed-out requests before the batch is launched.
+                self._pp_check_and_sync_running_timeout(recv_reqs)
+
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -535,6 +541,57 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
+
+    def _pp_check_and_sync_running_timeout(self: Scheduler, recv_reqs: List):
+        """Abort timed-out running requests on the first PP stage and forward
+        the abort to every subsequent stage so all stages agree.
+
+        Only the first PP stage decides: it owns the request lifecycle from
+        the tokenizer, so its running_batch is the authoritative place to
+        detect a stall. forward_entry_time is recorded per-stage at local
+        first-forward (see set_forward_entry_time), so it does NOT match
+        across stages — checking on a non-first stage would both miss
+        requests that stalled before reaching it and diverge from the stage
+        that actually owns the request.
+
+        For each timed-out rid the first stage builds an AbortReq carrying
+        the timeout message and HTTP 503, applies it locally via
+        abort_request (sets to_finish = FINISH_ABORT on the running req),
+        and appends it to recv_reqs. recv_reqs is then forwarded to the
+        next stage by event_loop_pp, so every subsequent stage receives the
+        AbortReq through the normal process_input_requests path and aborts
+        its own copy of the request. This reuses the existing abort
+        forwarding chain and keeps FINISH_ABORT semantics end-to-end
+        (client gets an error, not a fake EOS).
+        """
+        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if timeout_s <= 0:
+            return
+        if not self.pp_group.is_first_rank:
+            return
+        if self.running_batch.is_empty():
+            return
+
+        deadline = time.perf_counter() - timeout_s
+        for req in self.running_batch.reqs:
+            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                logger.warning(
+                    "PP running timeout: rid=%s forward_entry_time=%.2fs deadline=%.2fs timeout_s=%s",
+                    req.rid,
+                    req.time_stats.forward_entry_time,
+                    deadline,
+                    timeout_s,
+                )
+                abort_req = AbortReq(
+                    rid=req.rid,
+                    abort_message="Request running timeout reached.",
+                    abort_status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                # Apply locally on the first stage so its own running_batch
+                # is aborted in this iteration.
+                self.abort_request(abort_req)
+                # Forward to subsequent stages via the recv_reqs pipeline.
+                recv_reqs.append(abort_req)
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
