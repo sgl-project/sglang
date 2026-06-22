@@ -314,7 +314,9 @@ class MambaComponent(TreeComponent):
                     req
                 )
                 mamba_value = (
-                    req.mamba.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                    req.mamba.mamba_ping_pong_track_buffer[keep_idx]
+                    .unsqueeze(-1)
+                    .clone()
                 )
             else:
                 mamba_value = req.mamba.mamba_pool_idx.unsqueeze(-1).clone()

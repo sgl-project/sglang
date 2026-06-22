@@ -756,7 +756,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            if req.mamba.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+            if (
+                req.mamba.mamba_pool_idx is not None
+            ):  # for radix cache / continuing chunked
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
@@ -769,7 +771,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if self.enable_mamba_extra_buffer:
                 if req.mamba.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(req.mamba.mamba_ping_pong_track_buffer)
+                mamba_ping_pong_track_buffers.append(
+                    req.mamba.mamba_ping_pong_track_buffer
+                )
         assert len(select_index) == len(
             mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."

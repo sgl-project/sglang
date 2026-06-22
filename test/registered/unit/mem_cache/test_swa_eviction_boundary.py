@@ -215,7 +215,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
             self.assertLess(req.kv.swa_evicted_seqlen, seq_len)
-            self.assertEqual(req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1)
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
@@ -388,7 +390,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             batch = _make_batch(tree, allocator, pool)
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
-            self.assertEqual(req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1)
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()

@@ -2303,7 +2303,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         mask = req.extend_input_len >= mamba_cache_chunk_size
-        track_index = req.mamba.mamba_ping_pong_track_buffer[req.mamba.mamba_next_track_idx].item()
+        track_index = req.mamba.mamba_ping_pong_track_buffer[
+            req.mamba.mamba_next_track_idx
+        ].item()
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -2360,7 +2362,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                     # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba.mamba_branching_seqlen)
+                    mamba_track_seqlen = _force_track_h(
+                        req.mamba.mamba_branching_seqlen
+                    )
                     mamba_track_seqlen_aligned = req.mamba.mamba_branching_seqlen
             req.mamba.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 

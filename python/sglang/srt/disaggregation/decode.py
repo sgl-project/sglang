@@ -1903,7 +1903,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
                 if self.server_args.disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.cache.last_node is None else None
+                    tree_cache = (
+                        self.tree_cache if req.cache.last_node is None else None
+                    )
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
