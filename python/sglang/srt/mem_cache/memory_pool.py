@@ -275,6 +275,8 @@ class ReqToTokenPool:
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
@@ -284,6 +286,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                r.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -291,6 +294,7 @@ class ReqToTokenPool:
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
+        req.kv = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))

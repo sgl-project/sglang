@@ -42,12 +42,6 @@ class _VirtualNode:
     pass
 
 
-def _new_kv() -> ReqKvInfo:
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-    return ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
-
-
 def _new_mamba() -> ReqMambaInfo:
     from sglang.srt.managers.schedule_batch import ReqMambaInfo
 
@@ -71,13 +65,13 @@ class SessionSlot:
     kv_committed_len: int = 0
 
     cache: Optional[ReqCacheInfo] = None
-    kv: ReqKvInfo = field(default_factory=_new_kv)
+    kv: Optional[ReqKvInfo] = None
     mamba: ReqMambaInfo = field(default_factory=_new_mamba)
 
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
-        return self.req_pool_idx is not None
+        return self.kv is not None
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -100,6 +94,7 @@ class SessionSlot:
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
+        req.kv = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -215,7 +210,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or slot.req_pool_idx is None:
+        if slot is None or slot.kv is None:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -311,6 +306,7 @@ class StreamingSession(BasePrefixCache):
             )
             self.release_session(session_id)
             req.req_pool_idx = None
+            req.kv = None
             req.cache = None
             req.session.abort_req()
             return True
