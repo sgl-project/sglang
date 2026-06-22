@@ -407,28 +407,30 @@ def detect_tool_call_parser(
 
 
 def detect_inline_system_support(chat_template: Optional[str]) -> bool:
-    """Whether the chat template renders mid-conversation ``role: "system"``
-    turns inline (True) or rejects them and needs merging into the leading
-    system block (False). Probed by rendering a ``[system, user, system,
-    user]`` conversation; a raise (e.g. a system-first guard) means merge."""
+    """True if mid-conversation ``role: "system"`` renders inline; False if the
+    template raises or silently drops it (then merge into the leading block).
+
+    The probe requires the second system's sentinel to appear in the output —
+    not raising isn't enough, since some templates ignore non-leading system."""
     if not chat_template:
         return False
+    sentinel = "__sglang_inline_system_sentinel__"
     try:
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(
             trim_blocks=True,
             lstrip_blocks=True,
             extensions=[jinja2.ext.loopcontrols],
         )
-        env.from_string(chat_template).render(
+        rendered = env.from_string(chat_template).render(
             messages=[
                 {"role": "system", "content": "t"},
                 {"role": "user", "content": "t"},
-                {"role": "system", "content": "t"},
+                {"role": "system", "content": sentinel},
                 {"role": "user", "content": "t"},
             ],
             add_generation_prompt=False,
         )
-        return True
+        return sentinel in rendered
     except jinja2.TemplateError:
         return False
     except Exception:

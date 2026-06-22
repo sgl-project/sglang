@@ -1483,7 +1483,6 @@ class TestDetectInlineSystemSupport(unittest.TestCase):
     """Chat-template detection for mid-conversation system messages (#28883)."""
 
     def test_guarded_template_not_supported(self):
-        # A system-first guard that raise_exceptions on non-first system.
         guarded = (
             "{%- for message in messages %}"
             "{%- if message.role == 'system' and not loop.first %}"
@@ -1494,7 +1493,6 @@ class TestDetectInlineSystemSupport(unittest.TestCase):
         self.assertFalse(detect_inline_system_support(guarded))
 
     def test_inline_template_supported(self):
-        # Renders system at any position (GLM/Kimi/Qwen3).
         inline = (
             "{%- for message in messages %}"
             "{{- message.role }}: {{ message.content }}\n"
@@ -1502,8 +1500,21 @@ class TestDetectInlineSystemSupport(unittest.TestCase):
         )
         self.assertTrue(detect_inline_system_support(inline))
 
+    def test_silent_drop_template_not_supported(self):
+        # Renders only the leading system; silently ignores later system turns.
+        silent_drop = (
+            "{%- if messages[0].role == 'system' %}"
+            "{{ messages[0].content }}\n"
+            "{%- endif %}"
+            "{%- for message in messages %}"
+            "{%- if message.role in ('user', 'assistant') %}"
+            "{{ message.role }}: {{ message.content }}\n"
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+        self.assertFalse(detect_inline_system_support(silent_drop))
+
     def test_no_template_not_supported(self):
-        # No chat_template → conservative default: not supported (merge).
         self.assertFalse(detect_inline_system_support(None))
         self.assertFalse(detect_inline_system_support(""))
 
