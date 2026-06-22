@@ -38,6 +38,7 @@ MTP_BASE_ARGS = [
     "trtllm_mha",
     "--quantization",
     "modelopt_fp4",
+    "--disable-flashinfer-autotune",
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",

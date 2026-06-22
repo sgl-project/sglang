@@ -26,9 +26,7 @@ class TestDeepseekV32FP4DPSpec(GSM8KMixin, DefaultServerBase):
         "flashinfer_trtllm",
         "--quantization",
         "modelopt_fp4",
-        # TEMP: Torch 2.12 makes auto -> flashinfer_cutedsl FP4 GEMM autotune time out in B200 CI.
-        "--fp4-gemm-backend",
-        "flashinfer_cutlass",
+        "--disable-flashinfer-autotune",
         "--tool-call-parser",
         "deepseekv32",
         "--reasoning-parser",

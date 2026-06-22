@@ -46,6 +46,7 @@ class TestQwen35FP4FlashInfer(CustomTestCase):
             "trtllm_mha",
             "--quantization",
             "modelopt_fp4",
+            "--disable-flashinfer-autotune",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
             "--linear-attn-decode-backend",
