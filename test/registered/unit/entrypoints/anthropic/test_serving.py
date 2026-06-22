@@ -1278,13 +1278,13 @@ class TestAnthropicServing(unittest.TestCase):
                 {"role": "user", "content": "go"},
             ],
         )
-        self.assertIsNone(request.system)
-        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
             [m.role for m in chat_request.messages], ["system", "user", "user"]
         )
         self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
+        self.assertIsNone(request.system)
+        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
 
     def test_in_messages_system_role_passthrough_on_inline_capable_template(self):
         serving = self._serving()
@@ -1349,10 +1349,11 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
-        # After conversion: combined top-level system first, then the in-
-        # messages turn, joined into a single string.
-        self.assertEqual(request.system, "You are terse.\nOne word only.")
-        self.assertEqual([m.role for m in request.messages], ["user", "user"])
+        self.assertEqual(request.system, "You are terse.")
+        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
+        self.assertEqual(
+            [m.role for m in chat_request.messages], ["system", "user", "user"]
+        )
         self.assertEqual(
             chat_request.messages[0].content, "You are terse.\nOne word only."
         )

@@ -242,8 +242,7 @@ class AnthropicServing:
                             extracted.append(text)
 
         if not extracted:
-            request.messages = clean_messages
-            return request
+            return request.model_copy(update={"messages": clean_messages})
 
         combined: list[str] = []
         existing = request.system
@@ -258,9 +257,9 @@ class AnthropicServing:
                         combined.append(text)
         combined.extend(extracted)
 
-        request.system = "\n".join(combined)
-        request.messages = clean_messages
-        return request
+        return request.model_copy(
+            update={"system": "\n".join(combined), "messages": clean_messages}
+        )
 
     async def handle_messages(
         self,
