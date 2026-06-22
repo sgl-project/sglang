@@ -20,10 +20,8 @@ def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None
 
 
 class TestRunSglEval(CustomTestCase):
-    """Unit tests for the sgl-eval subprocess shim. sgl-eval itself is a
-    black box; these mock subprocess.run and prove the shim builds the CLI
-    correctly and parses metrics.json (aggregate.score, not top-level score).
-    """
+    """sgl-eval is a black box, so these mock subprocess.run and assert the shim
+    builds the CLI and parses metrics.json's aggregate.score (not top-level)."""
 
     def _args(self, out_dir: str, **overrides):
         defaults = dict(

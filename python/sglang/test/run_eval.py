@@ -98,11 +98,8 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
 
 def _run_sgl_eval(eval_name, args) -> dict:
-    # Black-box subprocess wrapper around the external `sgl-eval` CLI. Returns a
-    # metrics dict with at least {"score", "latency", "output_throughput"} so the
-    # existing write_results_to_json + check_evaluation_test_results gate keep
-    # working unchanged. sgl-eval owns prompting + grading (chat, \boxed{},
-    # math_verify symbolic); sglang does NOT parse its internals.
+    # Black-box subprocess wrapper around `sgl-eval`. Returns a metrics dict
+    # shaped like run_eval_once's so the existing threshold gate is unchanged.
     from sglang.test.test_utils import dump_metric
 
     base_url = (
@@ -136,9 +133,8 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--max-tokens", str(args.max_tokens)]
     else:
         cmd += ["--max-tokens", "2048"]
-    # Reasoning models (e.g. Qwen3.5) emit their answer in the reasoning
-    # channel by default; without --thinking their `message.content` is empty
-    # and sgl-eval scores 0. Pass --thinking for known reasoning families.
+    # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
+    # without --thinking their message.content is empty and sgl-eval scores 0.
     if getattr(args, "sgl_eval_thinking", None) is None:
         model_l = (getattr(args, "model", None) or "").lower()
         if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
@@ -177,7 +173,7 @@ def _run_sgl_eval(eval_name, args) -> dict:
     if not isinstance(aggregate, dict) or "score" not in aggregate:
         raise KeyError(f"{metrics_files[0]} missing aggregate.score")
 
-    metrics = dict(aggregate)  # score, no_answer, ...
+    metrics = dict(aggregate)
     metrics["latency"] = payload.get("latency_seconds", 0.0)
     metrics["output_throughput"] = payload.get("output_throughput_tps", 0.0)
     metrics["sgl_eval_metrics_path"] = str(metrics_files[0])
@@ -278,10 +274,7 @@ def run_eval(args):
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
-        # GSM8K is evaluated by the external sgl-eval harness (black-box
-        # subprocess): zero-shot chat, \boxed{} answer format, math_verify
-        # symbolic grading. sgl-eval owns prompting + grading, so stop
-        # sequences / chat-vs-completion / num_shots no longer apply here.
+        # Routed to the external sgl-eval harness; see _run_sgl_eval.
         return _run_sgl_eval("gsm8k", args)
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval

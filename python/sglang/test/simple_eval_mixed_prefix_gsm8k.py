@@ -1,12 +1,6 @@
 # Adapted from https://github.com/openai/simple-evals/
-#
-# MixedPrefixGSM8KEval: a GSM8K variant that builds a randomized primary +
-# secondary few-shot prefix per question, used to exercise chunked-prefill KV
-# correctness. The main nightly GSM8K path now runs via the external sgl-eval
-# harness (see run_eval._run_sgl_eval); this module is the only remaining
-# hand-rolled GSM8K scorer and exists solely for the mixed-prefix KV test. It
-# uses the completion-style prompt + last-number extraction (sufficient for a
-# KV-correctness gate, which does not need sgl-eval's symbolic \boxed{} grading).
+# Hand-rolled GSM8K scorer kept only for the mixed-prefix KV-correctness test,
+# which needs randomized completion-style prefixes sgl-eval does not produce.
 
 import ast
 import random
@@ -82,15 +76,12 @@ class GSM8KEval(Eval):
     def _build_prefix(self, idx: int) -> str:
         return self._few_shot_prompt
 
-    def _build_prompt(self, idx: int, question: str) -> str:
-        return self._build_prefix(idx) + question
-
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
-            prompt_content = self._build_prompt(idx, question)
+            prompt_content = self._build_prefix(idx) + question
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]

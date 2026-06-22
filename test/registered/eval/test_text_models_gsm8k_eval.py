@@ -26,13 +26,9 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
-    # GSM8K is evaluated by the external sgl-eval harness (zero-shot chat,
-    # \boxed{} answer format, math_verify symbolic grading). Thresholds are
-    # measured_score - 0.05, re-baselined on a devbox (H200) on the full 1319
-    # test split. The TP1 lineup was refreshed to modern models that behave
-    # well under zero-shot \boxed{} grading (Llama-3.1-8B + Qwen3-8B/4B +
-    # Qwen3.5-4B with --thinking). FP8/TP2 entries still carry the legacy
-    # models and 0.0 placeholders pending their own sgl-eval re-baseline.
+    # sgl-eval (zero-shot chat, \boxed{}, math_verify grading). Thresholds are
+    # measured_score - 0.05, baselined on H200 over the full 1319 test split.
+    # FP8/TP2 entries are 0.0 placeholders pending their own sgl-eval baseline.
     "meta-llama/Llama-3.1-8B-Instruct": 0.77,  # 81.88% measured - 5%
     "Qwen/Qwen3-8B": 0.76,  # 81.20% measured - 5%
     "Qwen/Qwen3-4B": 0.77,  # 82.03% measured - 5%
