@@ -63,6 +63,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -217,7 +220,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
-        self.backend = resolve_prefill_backend(self)
+        try:
+            self.backend = resolve_prefill_backend(self)
+        except RuntimeError as e:
+            if _prefill_backend_name == Backend.TC_PIECEWISE:
+                raise Exception(
+                    f"Capture prefill CUDA graph failed: {e}\n"
+                    f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
+            raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
@@ -299,7 +310,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture prefill CUDA graph failed: {e}\n"
+                f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
 
         self.raw_num_tokens = 0
 
