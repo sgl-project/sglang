@@ -70,6 +70,7 @@ class Arg:
     required: Optional[bool] = None
     action: Optional[Any] = None
     action_kwargs: Optional[dict] = None
+    const: Optional[Any] = None
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
     no_cli: bool = False
@@ -212,15 +213,18 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             kwargs = dict(type=type_func, choices=choices, help=arg_meta.help)
             if default is not _MISSING:
                 kwargs["default"] = default
+            if arg_meta.const is not None:
+                kwargs["const"] = arg_meta.const
             parser.add_argument(*names, **kwargs)
             continue
 
-        # Check for List[X]
+        # Check for List[X] — but skip if type_parser is set (the parser
+        # handles the whole value as a single string, e.g. json_list_type).
         origin = get_origin(inner_type)
-        if origin is list or origin is List:
+        if (origin is list or origin is List) and arg_meta.type_parser is None:
             elem_args = get_args(inner_type)
             elem_type = elem_args[0] if elem_args else str
-            type_func = arg_meta.type_parser or _infer_type_func(elem_type)
+            type_func = _infer_type_func(elem_type)
             nargs = arg_meta.nargs or "+"
             kwargs = dict(
                 type=type_func,
@@ -231,6 +235,8 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
                 kwargs["choices"] = arg_meta.choices
             if default is not _MISSING:
                 kwargs["default"] = default
+            if arg_meta.const is not None:
+                kwargs["const"] = arg_meta.const
             parser.add_argument(*names, **kwargs)
             continue
 
@@ -251,6 +257,8 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             kwargs["nargs"] = arg_meta.nargs
         if default is not _MISSING:
             kwargs["default"] = default
+        if arg_meta.const is not None:
+            kwargs["const"] = arg_meta.const
         if (
             arg_meta.required is True
             or (arg_meta.required is None and default is _MISSING)
