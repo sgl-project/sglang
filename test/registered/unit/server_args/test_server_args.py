@@ -272,6 +272,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
         args.model_config = MagicMock()
+        args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
