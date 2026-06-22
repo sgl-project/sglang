@@ -44,8 +44,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -78,7 +78,7 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -916,10 +916,10 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset under
+        # host memory pressure), so a conditional skip desyncs the NCCL op
+        # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -1341,6 +1341,13 @@ class HiRadixCache(RadixCache):
         else:
             # unknown prefetch stop policy, just return True
             return True
+
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(

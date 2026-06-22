@@ -111,7 +111,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
-    def initialize(self, pre_model_load_memory: float):
+    def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
 
         Creates minimal req_to_token_pool and token_to_kv_pool_allocator
@@ -186,7 +186,7 @@ class MlxModelRunnerStub(ModelRunner):
         )
 
         # No CUDA graphs, no attention backend
-        self.graph_runner = None
+        self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.attn_backend = None
 

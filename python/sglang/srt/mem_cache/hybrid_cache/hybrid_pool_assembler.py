@@ -19,9 +19,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     PoolEntry,
+    get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
@@ -57,7 +57,9 @@ def build_kv_host_pool(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
 ):
-    kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
+    kv_host_pool_cls = (
+        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+    )
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -319,7 +321,9 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
+    logical_host_pool = LogicalHostPool(
+        num_host_pages * page_size, page_size, layout=server_args.hicache_mem_layout
+    )
     swa_host_pool = DeepSeekV4PagedHostPool(
         pool_name=str(PoolName.SWA),
         device_buffers=kvcache.swa_kv_pool.kv_buffer,
@@ -439,17 +443,8 @@ def build_deepseek_v4_hicache_stack(
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
-        c128_state_host_pool = DeepSeekV4StateHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
-            state_pools=[
-                kvcache.compress_state_pools[layer_id]
-                for layer_id in c128_state_global_layers
-            ],
-            num_host_pages=swa_num_host_pages,
-            swa_page_size=kvcache.swa_page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-        )
+        # C128 state pool is intentionally not registered with hicache.
+        # page_size=256 % 128 == 0, so state pool is not consumed on load.
         entries.extend(
             [
                 build_pool_entry(
@@ -457,13 +452,6 @@ def build_deepseek_v4_hicache_stack(
                     host_pool=c128_host_pool,
                     device_pool=kvcache.c128_kv_pool,
                     layer_mapping=c128_layer_mapping,
-                    transfer_layer_num=transfer_layer_num,
-                ),
-                build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C128_STATE,
-                    host_pool=c128_state_host_pool,
-                    device_pool=None,
-                    layer_mapping=c128_state_mapping,
                     transfer_layer_num=transfer_layer_num,
                 ),
             ]
