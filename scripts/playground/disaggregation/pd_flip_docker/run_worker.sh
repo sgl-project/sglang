@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${ENV_FILE:-${SCRIPT_DIR}/env.example}"
+
+ROLE="${1:?usage: run_worker.sh prefill|decode <local-bind-ip-or-0.0.0.0>}"
+LOCAL_IP="${2:?usage: run_worker.sh prefill|decode <local-bind-ip-or-0.0.0.0>}"
+
+if [[ "${ROLE}" != "prefill" && "${ROLE}" != "decode" ]]; then
+  echo "ROLE must be prefill or decode, got: ${ROLE}" >&2
+  exit 2
+fi
+
+mounts=(-v "${SGLANG_REPO}:/sgl-workspace/sglang")
+if [[ -d "${MODEL_PATH}" ]]; then
+  mounts+=(-v "${MODEL_PATH}:${MODEL_PATH}:ro")
+fi
+if [[ -d /dev/infiniband ]]; then
+  mounts+=(-v /dev/infiniband:/dev/infiniband)
+fi
+
+cmd=(
+  cd /sgl-workspace/sglang '&&'
+  PYTHONPATH=python
+  python3 -m sglang.launch_server
+  --model-path "${MODEL_PATH}"
+  --host "${LOCAL_IP}"
+  --port "${PORT}"
+  --tp "${TP_SIZE}"
+  --dp "${DP_SIZE}"
+  --enable-dp-attention
+  --disaggregation-mode "${ROLE}"
+  --disaggregation-transfer-backend "${TRANSFER_BACKEND}"
+  --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+  --disaggregation-ib-device "${IB_DEVICE}"
+  --enable-pd-flip-state-machine
+  --enable-pd-runtime-role-switch
+  --mem-fraction-static "${MEM_FRACTION_STATIC}"
+)
+
+if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  extra_args=(${EXTRA_SGLANG_ARGS})
+  cmd+=("${extra_args[@]}")
+fi
+
+printf -v launch_cmd '%q ' "${cmd[@]}"
+
+# shellcheck disable=SC2206
+extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
+
+exec docker run --rm \
+  --gpus all \
+  --network host \
+  --ipc host \
+  --privileged \
+  "${extra_docker_args[@]}" \
+  "${mounts[@]}" \
+  "${IMAGE}" \
+  bash -lc "${launch_cmd}"
