@@ -92,9 +92,15 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
-    def test_online_uses_request_slot(self):
+    def test_online_aligned_boundary_has_no_partial_state(self):
         np.testing.assert_array_equal(
             get_dsv4_c128_state_indices(7, 256, online=True, ring_size=1),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_online_partial_boundary_uses_request_slot(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c128_state_indices(7, 257, online=True, ring_size=1),
             np.array([7], dtype=np.int32),
         )
 

@@ -958,7 +958,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 snapshots.append(state[req_pool_idx : req_pool_idx + 1].clone())
             else:
                 start = req_pool_idx * pool.ring_size
-                state_len = seq_len % pool.ring_size
+                state_len = seq_len % 128
                 if state_len == 0:
                     continue
                 snapshot = state.new_empty((pool.ring_size, state.shape[-1]))
@@ -998,6 +998,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 state[start : start + pool.ring_size].copy_(snapshot)
 
         assert snapshot_idx == len(snapshots)
+
+    def clear_c128_radix_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state at a radix-restorable boundary."""
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                row = state[req_pool_idx]
+                head_dim = row.shape[-1] // 3
+                row[:head_dim].fill_(float("-inf"))
+                row[head_dim:].zero_()
+            else:
+                start = req_pool_idx * pool.ring_size
+                rows = state[start : start + pool.ring_size]
+                half = rows.shape[-1] // 2
+                rows[:, :half].zero_()
+                rows[:, half:].fill_(float("-inf"))
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)

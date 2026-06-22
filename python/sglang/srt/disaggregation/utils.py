@@ -40,10 +40,10 @@ def get_dsv4_c128_state_indices(
     ring_size: int,
 ) -> np.ndarray:
     """Return the PD transfer row/page indices for DSV4 C128 state."""
-    if online:
-        return np.array([int(req_pool_idx)], dtype=np.int32)
     if seq_len == 0 or seq_len % 128 == 0:
         return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
 
     assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
     pages_per_req = ring_size // 128

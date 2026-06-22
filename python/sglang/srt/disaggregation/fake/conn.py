@@ -125,6 +125,7 @@ class FakeKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        transfer_input_len: Optional[int] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

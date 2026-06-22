@@ -395,8 +395,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if get_kvcache is None:
             return None
         kv_pool = get_kvcache()
-        if not hasattr(kv_pool, "snapshot_c128_radix_state") or not hasattr(
-            kv_pool, "restore_c128_radix_state"
+        if (
+            not hasattr(kv_pool, "snapshot_c128_radix_state")
+            or not hasattr(kv_pool, "restore_c128_radix_state")
+            or not hasattr(kv_pool, "clear_c128_radix_state")
         ):
             return None
         return kv_pool
@@ -490,6 +492,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             assert self._node_prefix_len(node) == prefix_len
             if snapshot is not None:
                 kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
+            else:
+                kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
