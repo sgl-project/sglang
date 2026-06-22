@@ -789,11 +789,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 else:
                     req.mamba.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
-            mamba_indices.append(req.mamba_pool_idx)
+            mamba_indices.append(req.mamba.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
-                if req.mamba_ping_pong_track_buffer is None:
+                if req.mamba.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+                mamba_ping_pong_track_buffers.append(
+                    req.mamba.mamba_ping_pong_track_buffer
+                )
         assert len(select_index) == len(
             mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
@@ -841,8 +843,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         In normal mode it is at the "other" index (swapped after each track).
         """
         if self.enable_mamba_extra_buffer_lazy:
-            return req.mamba_next_track_idx
-        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+            return req.mamba.mamba_next_track_idx
+        return self.get_mamba_ping_pong_other_idx(req.mamba.mamba_next_track_idx)
 
     def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
@@ -867,8 +869,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=slots.device,
         )
         buf[:n] = slots
-        req.mamba_ping_pong_track_buffer = buf
-        req.mamba_next_track_idx = 0
+        req.mamba.mamba_ping_pong_track_buffer = buf
+        req.mamba.mamba_next_track_idx = 0
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -877,9 +879,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
-        req.mamba_ping_pong_track_buffer[idx] = value
+        req.mamba.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
-            req.mamba_ping_pong_track_buffer
+            req.mamba.mamba_ping_pong_track_buffer
         )
 
     def donate_mamba_ping_pong_slot(
@@ -894,12 +896,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
-            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+            req.mamba.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
         assert mamba_value_donated.item() != -1, (
             f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
+            f"buf={req.mamba.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.mamba.mamba_next_track_idx}, "
             f"rid={req.rid}"
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])

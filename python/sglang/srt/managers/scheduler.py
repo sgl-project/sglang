@@ -2856,7 +2856,7 @@ class Scheduler(
                     and not getattr(req, "session", None)
                 ):
                     self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
+                        req.mamba.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba = None
                 break
