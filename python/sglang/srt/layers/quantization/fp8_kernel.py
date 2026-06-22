@@ -563,9 +563,9 @@ def sglang_per_token_group_quant_fp8(
         enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
 
     if scale_outer_major:
-        assert _is_cuda and enable_sgl_per_token_group_quant_8bit and enable_v2, (
-            "scale_outer_major is only supported by the CUDA JIT v2 quant kernel"
-        )
+        assert (
+            _is_cuda and enable_sgl_per_token_group_quant_8bit and enable_v2
+        ), "scale_outer_major is only supported by the CUDA JIT v2 quant kernel"
         assert not fuse_silu_and_mul
         assert masked_m is None
 

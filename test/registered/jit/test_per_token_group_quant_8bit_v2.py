@@ -176,12 +176,10 @@ def test_dsv4_fp8_einsum_matches_old_flattened_quant_path(monkeypatch):
 
     torch.manual_seed(0)
     num_tokens, num_groups, hidden, rank = 8, 8, 256, 128
-    x = torch.randn(
-        num_tokens, num_groups, hidden, device="cuda", dtype=torch.bfloat16
+    x = torch.randn(num_tokens, num_groups, hidden, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(num_groups, rank, hidden, device="cuda", dtype=torch.bfloat16).to(
+        fp8_dtype
     )
-    w = torch.randn(
-        num_groups, rank, hidden, device="cuda", dtype=torch.bfloat16
-    ).to(fp8_dtype)
     raw_w_s = torch.ones(
         num_groups,
         rank // G,
