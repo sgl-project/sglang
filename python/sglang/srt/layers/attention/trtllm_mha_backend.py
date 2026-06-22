@@ -1383,7 +1383,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             # per-step _apply only refreshes the per-step sequence lengths.
             seq_lens_cpu = (
                 forward_batch.seq_lens.cpu()
-                if in_capture
+                if in_capture or forward_batch.seq_lens_cpu is None
                 else forward_batch.seq_lens_cpu
             )
             self._update_draft_branch_page_tables(
