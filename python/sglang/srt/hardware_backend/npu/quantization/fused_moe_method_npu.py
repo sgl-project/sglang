@@ -269,9 +269,37 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
+    @staticmethod
+    def maybe_apply_fuseep_weights(layer: torch.nn.Module) -> bool:
+        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
+
+        Returns True when the FuseEP layout was (or has already been) applied,
+        so that the caller can skip its own ``process_weights_after_loading`` body.
+        """
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_ascend_fuseep():
+            return False
+
+        # Guard against double processing when called for multiple prefixes.
+        if getattr(layer, "_fuseep_weights_processed", False):
+            return True
+
+        from sglang.srt.hardware_backend.npu.moe.fuseep import process_fuseep_weights
+
+        for prefix in ("w13", "w2"):
+            process_fuseep_weights(layer, prefix)
+        layer._fuseep_weights_processed = True
+        return True
+
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        # If the FuseEP weight layout is used, process weights via
+        # maybe_apply_fuseep_weights and skip the rest of this method.
+        if self.maybe_apply_fuseep_weights(layer):
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         # Process scale
