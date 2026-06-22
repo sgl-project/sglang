@@ -181,6 +181,9 @@ class DecodeReqToTokenPool:
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
+        # TODO(th4): clearing owned-kv ownership (req.kv) belongs in the owned-kv
+        # subsystem, not in the low-level ReqToTokenPool; kept here in the
+        # presence op to preserve equivalence.
         req.kv = None
 
     def clear(self):
