@@ -63,8 +63,7 @@ class SamplingParams:
     """
     The sampling parameters.
 
-    See docs/backend/sampling_params.md or
-    https://docs.sglang.io/backend/sampling_params.html
+    See https://docs.sglang.io/docs/basic_usage/sampling_params
     for the documentation.
     """
 

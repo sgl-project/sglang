@@ -97,7 +97,7 @@ def gen(
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in https://docs.sglang.io/docs/basic_usage/sampling_params"""
 
     if choices:
         return SglSelect(
