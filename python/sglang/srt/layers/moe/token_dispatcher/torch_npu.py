@@ -61,6 +61,7 @@ class TorchNpuDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
+        self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[TorchNpuDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
@@ -112,6 +113,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             hidden_states,
             topk_ids,
             self.num_experts,
+            self.top_k,
         )
 
         self._dispatch_output = TorchNpuDispatchOutput(
