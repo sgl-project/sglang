@@ -1747,6 +1747,7 @@ class PDFlipMigrationTargetPrepareReq(BaseReq):
     session_id: Optional[str] = None
     source_url: Optional[str] = None
     manifests: List[Dict[str, Any]] = field(default_factory=list)
+    adopt_on_success: bool = False
 
 
 @dataclass

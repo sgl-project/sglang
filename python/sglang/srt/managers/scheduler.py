@@ -26,6 +26,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -1682,6 +1683,7 @@ class Scheduler(
             "failed_reqs": len(manifests) if real_error else 0,
             "last_error": real_error,
             "dry_run": not bool(target_entries),
+            "adopt_on_success": recv_req.adopt_on_success,
             "target_entries": target_entries,
         }
         if target_entries:
@@ -2098,9 +2100,9 @@ class Scheduler(
                 continue
             req = entry.get("req")
             if req is not None and not req.finished():
+                req.pd_flip_migrated_to_target = True
                 req.to_finish = FINISH_ABORT(
-                    "Request migrated during PD role flip.",
-                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Request migrated during PD role flip; output continues on target decode.",
                 )
             self._pd_flip_free_source_metadata(entry)
 
@@ -2160,7 +2162,7 @@ class Scheduler(
             array("q", list(manifest.get("origin_input_ids") or [])),
             sampling_params,
             return_logprob=bool(manifest.get("return_logprob", False)),
-            stream=False,
+            stream=bool(manifest.get("stream", False)),
             eos_token_ids=self.model_config.hf_eos_token_id,
             bootstrap_host=source_host,
             bootstrap_port=int(
@@ -2182,13 +2184,46 @@ class Scheduler(
             ),
             routing_key=manifest.get("routing_key"),
             extra_key=manifest.get("extra_key"),
+            http_worker_ipc=manifest.get("http_worker_ipc"),
+            time_stats=self._pd_flip_deserialize_time_stats(
+                manifest.get("time_stats")
+            ),
         )
         req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
         req.kv_committed_len = int(
             manifest.get("kv_committed_len")
             or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         )
         return req
+
+    @staticmethod
+    def _pd_flip_serialize_time_stats(time_stats) -> Dict[str, Any]:
+        if time_stats is None:
+            return {}
+        values = getattr(time_stats, "__dict__", {})
+        return {
+            key: value
+            for key, value in values.items()
+            if key not in ("metrics_collector", "trace_ctx", "disagg_mode")
+            and (
+                isinstance(value, (str, int, float, bool))
+                or value is None
+                or (
+                    isinstance(value, (list, tuple))
+                    and all(
+                        isinstance(item, (str, int, float, bool)) or item is None
+                        for item in value
+                    )
+                )
+            )
+        }
+
+    @staticmethod
+    def _pd_flip_deserialize_time_stats(values: Optional[Dict[str, Any]]):
+        if not values or not isinstance(values, dict):
+            return None
+        return SimpleNamespace(**values)
 
     @staticmethod
     def _pd_flip_deserialize_sampling_params(values: Dict[str, Any]) -> SamplingParams:
@@ -2234,8 +2269,13 @@ class Scheduler(
                     ):
                         transferred.add(rid)
                         entry["phase"] = "transferred"
-                        decode_req.kv_receiver.clear()
-                        self._pd_flip_release_target_request(entry)
+                        if getattr(decode_req, "kv_receiver", None) is not None:
+                            decode_req.kv_receiver.clear()
+                            decode_req.kv_receiver = None
+                        if session.get("adopt_on_success", False):
+                            self._pd_flip_adopt_target_request(entry)
+                        else:
+                            self._pd_flip_release_target_request(entry)
                         self._pd_flip_free_target_metadata(entry)
             except Exception as exc:
                 failed.add(rid)
@@ -2394,6 +2434,22 @@ class Scheduler(
         release_kv_cache(req, self.tree_cache, is_insert=False)
         entry["request_released"] = True
 
+    def _pd_flip_adopt_target_request(self, entry: Dict[str, Any]) -> None:
+        if entry.get("request_adopted"):
+            return
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            entry["request_adopted"] = True
+            return
+        req.init_next_round_input(self.tree_cache)
+        if hasattr(req, "time_stats") and hasattr(
+            req.time_stats, "set_wait_queue_entry_time"
+        ):
+            req.time_stats.set_wait_queue_entry_time()
+        self.waiting_queue.append(req)
+        entry["request_adopted"] = True
+
     def _pd_flip_build_migration_manifest(self, req: Req) -> Dict[str, Any]:
         origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
         output_ids = list(getattr(req, "output_ids", []) or [])
@@ -2408,7 +2464,13 @@ class Scheduler(
             "priority": getattr(req, "priority", None),
             "routing_key": getattr(req, "routing_key", None),
             "extra_key": getattr(req, "extra_key", None),
+            "http_worker_ipc": getattr(req, "http_worker_ipc", None),
+            "stream": bool(getattr(req, "stream", False)),
             "return_logprob": bool(getattr(req, "return_logprob", False)),
+            "logprob_start_len": getattr(req, "logprob_start_len", -1),
+            "time_stats": self._pd_flip_serialize_time_stats(
+                getattr(req, "time_stats", None)
+            ),
             "req_pool_idx": getattr(req, "req_pool_idx", None),
             "kv_committed_len": int(kv_committed_len),
             "sampling_params": self._pd_flip_serialize_sampling_params(

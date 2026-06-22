@@ -173,6 +173,7 @@ class TestPDFlipController(unittest.TestCase):
                 "draining": False,
             },
         )
+        self.assertEqual(plan.actions[3].payload["adopt_on_success"], True)
         self.assertEqual(self.client.posts, [])
 
     def test_d_to_p_dry_run_auto_selects_highest_load_decode_source(self):

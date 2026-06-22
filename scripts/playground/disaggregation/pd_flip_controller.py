@@ -336,6 +336,7 @@ class PDFlipController:
                     "session_id": session_id,
                     "source_url": source.worker_url,
                     "manifests": "<from start_decode_migration_source>",
+                    "adopt_on_success": True,
                 },
             ),
             self._worker_action(
