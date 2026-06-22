@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensResponse,
     AnthropicError,
     AnthropicErrorResponse,
+    AnthropicMessage,
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -169,6 +170,97 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
+        self._inline_system_capable: Optional[bool] = None
+
+    _INLINE_SYSTEM_PROBE_MESSAGES = (
+        {"role": "system", "content": "a"},
+        {"role": "user", "content": "x"},
+        {"role": "system", "content": "b"},
+        {"role": "user", "content": "y"},
+    )
+
+    def _chat_template_supports_inline_system(self) -> bool:
+        """Cache whether the active chat template renders mid-conversation system turns without raising."""
+        if self._inline_system_capable is not None:
+            return self._inline_system_capable
+
+        try:
+            tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
+        except AttributeError:
+            self._inline_system_capable = False
+            return False
+
+        apply = getattr(tokenizer, "apply_chat_template", None)
+        if apply is None:
+            self._inline_system_capable = False
+            return False
+
+        try:
+            apply(
+                list(self._INLINE_SYSTEM_PROBE_MESSAGES),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as e:
+            logger.debug(
+                "Chat template rejects mid-conversation system turns "
+                "(%s: %s); hoisting to top-level system field.",
+                type(e).__name__,
+                e,
+            )
+            self._inline_system_capable = False
+            return False
+
+        self._inline_system_capable = True
+        return True
+
+    def _maybe_hoist_mid_conversation_system(
+        self, request: AnthropicMessagesRequest
+    ) -> AnthropicMessagesRequest:
+        """Fold mid-conversation system turns into top-level system field when the template can't render them inline."""
+        if not any(m.role == "system" for m in request.messages):
+            return request
+
+        if self._chat_template_supports_inline_system():
+            return request
+
+        extracted: list[str] = []
+        clean_messages: list[AnthropicMessage] = []
+        for msg in request.messages:
+            if msg.role != "system":
+                clean_messages.append(msg)
+                continue
+            if isinstance(msg.content, str):
+                text = msg.content.strip()
+                if text:
+                    extracted.append(text)
+            else:
+                for block in msg.content:
+                    if getattr(block, "type", None) == "text":
+                        text = (getattr(block, "text", "") or "").strip()
+                        if text:
+                            extracted.append(text)
+
+        if not extracted:
+            request.messages = clean_messages
+            return request
+
+        combined: list[str] = []
+        existing = request.system
+        if isinstance(existing, str):
+            if existing.strip():
+                combined.append(existing.strip())
+        elif isinstance(existing, list):
+            for block in existing:
+                if getattr(block, "type", None) == "text":
+                    text = (getattr(block, "text", "") or "").strip()
+                    if text:
+                        combined.append(text)
+        combined.extend(extracted)
+
+        request.system = "\n".join(combined)
+        request.messages = clean_messages
+        return request
 
     async def handle_messages(
         self,
@@ -197,6 +289,8 @@ class AnthropicServing:
         self, anthropic_request: AnthropicMessagesRequest
     ) -> ChatCompletionRequest:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
+        anthropic_request = self._maybe_hoist_mid_conversation_system(anthropic_request)
+
         openai_messages = []
 
         def _convert_anthropic_image_source_to_openai_part(

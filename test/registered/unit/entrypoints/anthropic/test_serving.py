@@ -1268,10 +1268,8 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(roles, ["user", "assistant", "user"])
 
     def test_in_messages_system_role_folded_to_top_level(self):
-        """A mid-conversation ``role: "system"`` turn is folded into the
-        top-level ``system`` field by the request validator, so it does not
-        appear as a dialogue turn — matching the official Anthropic API."""
         serving = self._serving()
+        serving._inline_system_capable = False
         request = self._anthropic_request(
             stream=False,
             messages=[
@@ -1280,20 +1278,67 @@ class TestAnthropicServing(unittest.TestCase):
                 {"role": "user", "content": "go"},
             ],
         )
-        # The validator moved the system turn into the top-level system field.
-        self.assertEqual(request.system, "Reply with exactly: OK")
-        self.assertEqual([m.role for m in request.messages], ["user", "user"])
-        # And the converted OpenAI request has one leading system message.
+        self.assertIsNone(request.system)
+        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
             [m.role for m in chat_request.messages], ["system", "user", "user"]
         )
         self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
 
-    def test_in_messages_system_role_merged_with_top_level(self):
-        """A top-level ``system`` field and a mid-conversation system turn are
-        merged; top-level text comes first."""
+    def test_in_messages_system_role_passthrough_on_inline_capable_template(self):
         serving = self._serving()
+        serving._inline_system_capable = True
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages], ["user", "system", "user"]
+        )
+        self.assertIsNone(request.system)
+
+    def test_chat_template_probe_caches_and_falls_back_when_render_raises(self):
+        class _StrictTokenizer:
+            calls = 0
+
+            def apply_chat_template(self, messages, **kwargs):
+                _StrictTokenizer.calls += 1
+                raise ValueError("Conversation roles must alternate")
+
+        class _TM:
+            tokenizer = _StrictTokenizer()
+
+        class _ChatWithTM(_FakeOpenAIServingChat):
+            tokenizer_manager = _TM()
+
+        serving = AnthropicServing(_ChatWithTM())
+        self.assertFalse(serving._chat_template_supports_inline_system())
+        self.assertFalse(serving._chat_template_supports_inline_system())
+        self.assertEqual(_StrictTokenizer.calls, 1)
+
+    def test_chat_template_probe_detects_inline_capable_template(self):
+        class _InlineTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                return "ok"
+
+        class _TM:
+            tokenizer = _InlineTokenizer()
+
+        class _ChatWithTM(_FakeOpenAIServingChat):
+            tokenizer_manager = _TM()
+
+        serving = AnthropicServing(_ChatWithTM())
+        self.assertTrue(serving._chat_template_supports_inline_system())
+
+    def test_in_messages_system_role_merged_with_top_level(self):
+        serving = self._serving()
+        serving._inline_system_capable = False
         request = self._anthropic_request(
             stream=False,
             system="You are terse.",
@@ -1303,10 +1348,14 @@ class TestAnthropicServing(unittest.TestCase):
                 {"role": "user", "content": "go"},
             ],
         )
-        # Validator combines top-level system first, then the in-messages turn,
-        # joined into a single string.
+        chat_request = serving._convert_to_chat_completion_request(request)
+        # After conversion: combined top-level system first, then the in-
+        # messages turn, joined into a single string.
         self.assertEqual(request.system, "You are terse.\nOne word only.")
         self.assertEqual([m.role for m in request.messages], ["user", "user"])
+        self.assertEqual(
+            chat_request.messages[0].content, "You are terse.\nOne word only."
+        )
 
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages
@@ -1336,10 +1385,7 @@ class TestAnthropicServing(unittest.TestCase):
             chat_request.messages[0].content, "You are a helpful assistant."
         )
 
-    def test_validator_handles_constructed_message_objects(self):
-        """The ``mode="before"`` validator must also handle requests built
-        programmatically with ``AnthropicMessage`` objects (not just raw dicts),
-        e.g. ``handle_count_tokens`` constructs the request this way."""
+    def test_validator_accepts_constructed_system_message_objects(self):
         request = AnthropicMessagesRequest(
             model="m",
             max_tokens=8,
@@ -1349,8 +1395,8 @@ class TestAnthropicServing(unittest.TestCase):
                 AnthropicMessage(role="user", content="go"),
             ],
         )
-        self.assertEqual(request.system, "be terse")
-        self.assertEqual([m.role for m in request.messages], ["user", "user"])
+        self.assertIsNone(request.system)
+        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""
