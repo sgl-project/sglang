@@ -572,6 +572,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
+        elif forward_mode.is_draft_extend_v2():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.draft_extend_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+            )
         else:
             raise ValueError("Invalid forward mode")
 
@@ -678,6 +690,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -797,6 +810,11 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
+        elif forward_mode.is_draft_extend_v2():
+            # Draft-extend: causal paged prefill over the full sequence (no mask).
+            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
+            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -1306,6 +1324,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1324,13 +1343,16 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         if use_ragged:
             assert prefix_lens is not None
-            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
-            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            if extend_prefix_lens_cpu is not None:
+                # Host-known prefix lens; avoids a per-step D2H sync.
+                paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+            else:
+                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -1366,6 +1388,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
@@ -1486,6 +1509,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
