@@ -2568,7 +2568,16 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                if self.dllm_config.first_done_first_out_mode:
+                    if not req.dllm_incomplete_ids:
+                        # Block resolved: cache it and release the req slot.
+                        self.stash_chunked_request(req)
+                        self.req_to_token_pool.free(req)
+                    # Block still unresolved: retain the req slot and its block KV
+                    # so the next denoise round reuses the same HBM in place
+                    # instead of freeing and reallocating it.
+                else:
+                    self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

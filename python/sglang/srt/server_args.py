@@ -1084,6 +1084,7 @@ class ServerArgs:
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
+    dllm_fdfo: bool = True
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -6537,6 +6538,16 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+        parser.add_argument(
+            "--dllm-fdfo",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.dllm_fdfo,
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM "
+            "inference (default: enabled). Completed requests leave the batch "
+            "immediately instead of waiting for slower requests in the same batch, "
+            "which eliminates head-of-line blocking. Works with any dLLM algorithm. "
+            "Use --no-dllm-fdfo to fall back to synchronous block scheduling.",
         )
 
         # Offloading
