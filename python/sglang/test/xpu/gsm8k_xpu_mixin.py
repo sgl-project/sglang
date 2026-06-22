@@ -69,9 +69,7 @@ class GSM8KXPUMixin(ABC):
             )
             cls.server_cmd = subprocess.list2cmdline(cls.process.args)
         except Exception as e:
-            write_github_step_summary(
-                f"Failed to launch server for {cls.model}: {e}"
-            )
+            write_github_step_summary(f"Failed to launch server for {cls.model}: {e}")
             raise AssertionError(f"Test failed for {cls.model}: {e}")
 
     @classmethod
@@ -112,7 +110,7 @@ class GSM8KXPUMixin(ABC):
             self.assertGreaterEqual(
                 metrics["output_throughput"],
                 output_throughput_threshold,
-                f'Output throughput of {self.model} is '
+                f"Output throughput of {self.model} is "
                 f'{metrics["output_throughput"]}, is lower than '
                 f"{output_throughput_threshold}",
             )
