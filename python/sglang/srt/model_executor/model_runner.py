@@ -891,6 +891,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         because they capture their own decode-style graphs separately.
         """
 
+        # Pick the DeepEP low_latency dispatch cap before any DeepEP buffer is
+        # created or the capture list is built — both read the env downstream.
+        self._maybe_auto_tune_deepep_num_max_dispatch_tokens()
+
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
         # fixed-max static buffer — both before the cuda-graph runners, so that
@@ -930,6 +934,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
+        """Size the DeepEP low_latency dispatch cap to the scheduler's decode concurrency.
+
+        num_max must cover the largest per-rank decode batch the scheduler can run
+        (req_to_token_pool.size): nothing clamps the runtime decode batch to num_max,
+        so a smaller value lets an eager decode batch dispatch more tokens than the
+        buffer holds and trip a DeepEP assert. Capped at DeepEP's FINISHED_SUM_TAG
+        ceiling (1024). User env wins; only ever raised above the default.
+        """
+        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+        if env.is_set():
+            return
+        if (
+            self.server_args.moe_a2a_backend != "deepep"
+            or self.server_args.deepep_mode == "normal"
+        ):
+            return
+
+        num_max = min(self.req_to_token_pool.size, 1024)
+        if num_max > env.get():
+            env.set(num_max)
+            log_info_on_rank0(
+                logger,
+                f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={num_max} "
+                f"(decode concurrency={self.req_to_token_pool.size}).",
+            )
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
