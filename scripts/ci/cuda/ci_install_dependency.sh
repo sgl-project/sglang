@@ -448,12 +448,14 @@ install_extra_deps() {
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         NIXL_BIN_PKG="nixl-cu13==${NIXL_VERSION}"
+        NIXL_BIN_NAME="nixl-cu13"
         NIXL_STALE_BIN_PKG="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
         MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         NIXL_BIN_PKG="nixl-cu12==${NIXL_VERSION}"
+        NIXL_BIN_NAME="nixl-cu12"
         NIXL_STALE_BIN_PKG="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
@@ -466,12 +468,25 @@ install_extra_deps() {
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
-    # Best-effort NIXL install for decode-radix disaggregation coverage.
+    # Best-effort NIXL install for decode-radix disaggregation coverage. The
+    # nixl meta wheel declares both CUDA backends as dependencies, so install it
+    # with --no-deps and then install only the backend matching this CI image.
+    # If a stale backend was removed, force-reinstall the selected backend
+    # because the CUDA backend wheels share some bin/ and pkgconfig files.
+    NIXL_FORCE_REINSTALL=0
     if pip show ${NIXL_STALE_BIN_PKG} >/dev/null 2>&1; then
         $PIP_UNINSTALL_CMD ${NIXL_STALE_BIN_PKG} $PIP_UNINSTALL_SUFFIX || true
-        $PIP_CMD install ${NIXL_PKG} ${NIXL_BIN_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        NIXL_FORCE_REINSTALL=1
     fi
-    $PIP_CMD install ${MOONCAKE_PKG} ${NIXL_PKG} ${NIXL_BIN_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+    NIXL_INSTALL_FLAGS="--no-deps"
+    if [ "$NIXL_FORCE_REINSTALL" = "1" ]; then
+        NIXL_INSTALL_FLAGS="--force-reinstall --no-deps"
+    fi
+    if ! $PIP_CMD install ${NIXL_PKG} --no-deps $PIP_INSTALL_SUFFIX ||
+        ! $PIP_CMD install ${NIXL_BIN_PKG} ${NIXL_INSTALL_FLAGS} $PIP_INSTALL_SUFFIX; then
+        echo "Warning: ${NIXL_PKG} ${NIXL_BIN_NAME} install failed; continuing without nixl"
+    fi
+    $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
