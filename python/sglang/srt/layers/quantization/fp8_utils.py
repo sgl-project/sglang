@@ -1700,8 +1700,7 @@ def apply_fp8_linear(
         # -> bf16 matmul, which is numerically equivalent
         # (C = s_x * s_w * (X @ W) + bias) and supported on all ROCm GEMM backends.
         if _is_hip and (
-            qinput.dtype == torch.float8_e4m3fn
-            or weight.dtype == torch.float8_e4m3fn
+            qinput.dtype == torch.float8_e4m3fn or weight.dtype == torch.float8_e4m3fn
         ):
             output = torch.matmul(
                 qinput.to(input.dtype) * x_scale.to(input.dtype),
