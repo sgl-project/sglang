@@ -37,7 +37,12 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ReqCacheInfo, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ReqCacheMatchSnapshot,
+    ReqLockedCacheInfo,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -93,9 +98,8 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    if req.cache is None:
-        req.cache = ReqCacheInfo(
-            cache_protected_len=0,
+    if req.locked_cache is None:
+        req.locked_cache = ReqLockedCacheInfo(
             last_node=None,
             swa_uuid_for_lock=None,
             swa_prefix_lock_released=False,
@@ -110,26 +114,18 @@ def match_prefix_for_req(
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(tree_cache, match_result)
-    (
-        req.prefix_indices,
-        req.last_node,
-        req.last_host_node,
-        req.best_match_node,
-        req.host_hit_length,
-        req.swa_host_hit_length,
-        req.mamba_host_hit_length,
-    ) = (
-        match_result.device_indices,
-        match_result.last_device_node,
-        match_result.last_host_node,
-        match_result.best_match_node,
-        match_result.host_hit_length,
-        match_result.swa_host_hit_length,
-        match_result.mamba_host_hit_length,
-    )
+    req.prefix_indices = match_result.device_indices
+    req.last_node = match_result.last_device_node
     max_len = req._compute_max_prefix_len(len(token_ids))
-    req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
+    req.cache_match_snapshot = ReqCacheMatchSnapshot(
+        num_matched_prefix_tokens=min(
+            len(req.prefix_indices) + match_result.host_hit_length, max_len
+        ),
+        host_hit_length=match_result.host_hit_length,
+        swa_host_hit_length=match_result.swa_host_hit_length,
+        mamba_host_hit_length=match_result.mamba_host_hit_length,
+        last_host_node=match_result.last_host_node,
+        best_match_node=match_result.best_match_node,
     )
     if match_result.mamba_branching_seqlen is not None and req.mamba is not None:
         req.mamba.mamba_branching_seqlen = match_result.mamba_branching_seqlen

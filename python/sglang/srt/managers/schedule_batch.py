@@ -664,9 +664,22 @@ class ReqLogprob:
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
-class ReqCacheInfo:
-    # The prefix length that is inserted into the tree cache
-    cache_protected_len: int
+class ReqCacheMatchSnapshot:
+    # Total cached prefix length (on-device prefix_indices + host_hit_length),
+    # capped at the max allowed prefix. Set during prefix matching at schedule
+    # time and used to estimate uncached tokens / sort by longest prefix for
+    # load reporting.
+    num_matched_prefix_tokens: int
+    # Per-component host hit lengths split off from host_hit_length:
+    host_hit_length: int
+    swa_host_hit_length: int
+    mamba_host_hit_length: int
+    last_host_node: Any
+    best_match_node: Any
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqLockedCacheInfo:
     # TODO(ispobock): rename to last_device_node
     last_node: Any
     # The node to lock until for swa radix tree lock ref
@@ -863,18 +876,10 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.cache: Optional[ReqCacheInfo] = None
-        self.last_host_node: Any = None
-        self.best_match_node: Any = None
-        # Per-component host hit lengths split off from host_hit_length:
-        self.host_hit_length = 0
-        self.swa_host_hit_length = 0
-        self.mamba_host_hit_length = 0
-        # Total cached prefix length (on-device prefix_indices + host_hit_length),
-        # capped at the max allowed prefix. Set during prefix matching at schedule
-        # time and used to estimate uncached tokens / sort by longest prefix for
-        # load reporting.
-        self.num_matched_prefix_tokens = 0
+        self.cache_match_snapshot: Optional[ReqCacheMatchSnapshot] = None
+        self.locked_cache: Optional[ReqLockedCacheInfo] = None
+        # The prefix length that is inserted into the tree cache
+        self.cache_protected_len = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
 
@@ -1058,36 +1063,76 @@ class Req(ReqDllmMixin):
         )
 
     @property
-    def cache_protected_len(self) -> int:
-        return self.cache.cache_protected_len if self.cache is not None else 0
+    def num_matched_prefix_tokens(self) -> int:
+        return (
+            self.cache_match_snapshot.num_matched_prefix_tokens
+            if self.cache_match_snapshot is not None
+            else 0
+        )
 
-    @cache_protected_len.setter
-    def cache_protected_len(self, value: int) -> None:
-        self.cache.cache_protected_len = value
+    @property
+    def host_hit_length(self) -> int:
+        return (
+            self.cache_match_snapshot.host_hit_length
+            if self.cache_match_snapshot is not None
+            else 0
+        )
+
+    @property
+    def swa_host_hit_length(self) -> int:
+        return (
+            self.cache_match_snapshot.swa_host_hit_length
+            if self.cache_match_snapshot is not None
+            else 0
+        )
+
+    @property
+    def mamba_host_hit_length(self) -> int:
+        return (
+            self.cache_match_snapshot.mamba_host_hit_length
+            if self.cache_match_snapshot is not None
+            else 0
+        )
+
+    @property
+    def last_host_node(self) -> Any:
+        return (
+            self.cache_match_snapshot.last_host_node
+            if self.cache_match_snapshot is not None
+            else None
+        )
+
+    @property
+    def best_match_node(self) -> Any:
+        return (
+            self.cache_match_snapshot.best_match_node
+            if self.cache_match_snapshot is not None
+            else None
+        )
 
     @property
     def last_node(self) -> Any:
-        return self.cache.last_node
+        return self.locked_cache.last_node
 
     @last_node.setter
     def last_node(self, value: Any) -> None:
-        self.cache.last_node = value
+        self.locked_cache.last_node = value
 
     @property
     def swa_uuid_for_lock(self) -> Optional[int]:
-        return self.cache.swa_uuid_for_lock
+        return self.locked_cache.swa_uuid_for_lock
 
     @swa_uuid_for_lock.setter
     def swa_uuid_for_lock(self, value: Optional[int]) -> None:
-        self.cache.swa_uuid_for_lock = value
+        self.locked_cache.swa_uuid_for_lock = value
 
     @property
     def swa_prefix_lock_released(self) -> bool:
-        return self.cache.swa_prefix_lock_released
+        return self.locked_cache.swa_prefix_lock_released
 
     @swa_prefix_lock_released.setter
     def swa_prefix_lock_released(self, value: bool) -> None:
-        self.cache.swa_prefix_lock_released = value
+        self.locked_cache.swa_prefix_lock_released = value
 
     @property
     def kv_allocated_len(self) -> int:
@@ -1239,9 +1284,8 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
-            if self.cache is None:
-                self.cache = ReqCacheInfo(
-                    cache_protected_len=0,
+            if self.locked_cache is None:
+                self.locked_cache = ReqLockedCacheInfo(
                     last_node=None,
                     swa_uuid_for_lock=None,
                     swa_prefix_lock_released=False,
@@ -1261,22 +1305,15 @@ class Req(ReqDllmMixin):
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.best_match_node,
-                self.host_hit_length,
-                self.swa_host_hit_length,
-                self.mamba_host_hit_length,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.best_match_node,
-                match_result.host_hit_length,
-                match_result.swa_host_hit_length,
-                match_result.mamba_host_hit_length,
+            self.prefix_indices = match_result.device_indices
+            self.last_node = match_result.last_device_node
+            self.cache_match_snapshot = ReqCacheMatchSnapshot(
+                num_matched_prefix_tokens=self.num_matched_prefix_tokens,
+                host_hit_length=match_result.host_hit_length,
+                swa_host_hit_length=match_result.swa_host_hit_length,
+                mamba_host_hit_length=match_result.mamba_host_hit_length,
+                last_host_node=match_result.last_host_node,
+                best_match_node=match_result.best_match_node,
             )
             if (
                 match_result.mamba_branching_seqlen is not None
@@ -1528,8 +1565,9 @@ class Req(ReqDllmMixin):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
-        self.cache = None
-        self.num_matched_prefix_tokens = 0
+        self.cache_match_snapshot = None
+        self.locked_cache = None
+        self.cache_protected_len = 0
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -2953,7 +2991,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # evictable so SWA LRU can reclaim it under pressure.
                     if (
                         release_leaf_lock
-                        and req.cache is not None
+                        and req.locked_cache is not None
                         and not req.swa_prefix_lock_released
                         and req.swa_uuid_for_lock is not None
                         and req.last_node is not None
