@@ -81,6 +81,7 @@ import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-dep
 
 ### 3.2 Configuration Tips
 
+- **Trust remote code** (`--trust-remote-code`): Laguna-XS.2 ships custom modeling/config code on the Hugging Face Hub, so this flag is required for the server to load the model.
 - **Quantization**: NVFP4 requires Blackwell (B200 / B300); BF16 and FP8 run on either H200 or B200. FP8's first launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min); pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8` to avoid that cost on every restart.
 - **Reasoning parser** (`--reasoning-parser poolside_v1`): Splits `<think>...</think>` segments into `reasoning_content` so `content` holds only the final answer. Disable only if you want the raw `<think>` tags in `content`.
 - **Tool call parser** (`--tool-call-parser poolside_v1`): Required for OpenAI-compatible tool-call streaming. Disable only for chat-only deployments.

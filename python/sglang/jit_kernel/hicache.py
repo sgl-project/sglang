@@ -26,14 +26,33 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         *args,
         cuda_files=[
             "kvcacheio/hicache.cuh",
-            "kvcacheio/relayout.cuh",
-            "kvcacheio/staged_write_back.cuh",
         ],
         cuda_wrappers=[
             ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
             ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
             ("launch_one_mla", f"&HiCacheKernel<{args}>::run_one_mla"),
             ("launch_all_mla", f"&HiCacheKernel<{args}>::run_all_mla"),
+        ],
+    )
+
+
+@cache_once
+def _jit_hicache_staged_module(
+    *, element_size: int, unroll: int, block_quota: int
+) -> Module:
+    args = make_cpp_args(
+        element_size,
+        unroll,
+        block_quota,
+        1024,  # num_threads, kept for template compatibility
+    )
+    return load_jit(
+        "hicache_staged",
+        *args,
+        cuda_files=[
+            "kvcacheio/staged_write_back.cuh",
+        ],
+        cuda_wrappers=[
             (
                 "launch_all_lf_pf_staged",
                 f"&HiCacheStagedWriteBackKernel<{args}>::run_all_lf_pf_staged",
@@ -67,6 +86,30 @@ def can_use_hicache_jit_kernel(
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT HiCache kernel: {e}")
+        return False
+
+
+def can_use_write_back_jit_kernel(
+    *,
+    element_size: int,
+    unroll: int | None = None,  # can be tuned for performance
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> bool:
+    logger = logging.getLogger(__name__)
+    if element_size % 16 != 0:
+        logger.warning(f"Unsupported {element_size = } for staged JIT HiCache kernel")
+        return False
+    try:
+        unroll = unroll or _default_unroll(element_size)
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        _jit_hicache_staged_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load staged JIT HiCache kernel: {e}")
         return False
 
 
@@ -238,7 +281,7 @@ def transfer_hicache_all_layer_staged_lf_pf(
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     src_page_indices = src_indices[::page_size].contiguous()
-    module = _jit_hicache_module(
+    module = _jit_hicache_staged_module(
         element_size=element_size,
         unroll=unroll,
         block_quota=block_quota,
@@ -284,7 +327,7 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     src_page_indices = src_indices[::page_size].contiguous()
-    module = _jit_hicache_module(
+    module = _jit_hicache_staged_module(
         element_size=element_size,
         unroll=unroll,
         block_quota=block_quota,
