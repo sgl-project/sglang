@@ -347,13 +347,11 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        # A large value will lead to large memory occupation, thus users should change it accordingly
-        self.num_max_dispatch_tokens_per_rank = (
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        # Resolved lazily on first use rather than cached here: model_runner may
+        # auto-tune SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK from post-KV
+        # free memory after this dispatcher is constructed but before the first
+        # forward (ModelRunner._maybe_auto_tune_deepep_num_max_dispatch_tokens).
+        self._num_max_dispatch_tokens_per_rank: Optional[int] = None
 
         self.handle = None
 
@@ -363,6 +361,18 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    @property
+    def num_max_dispatch_tokens_per_rank(self) -> int:
+        # Cache on first read so the per-dispatch path stays free of env lookups,
+        # while still honoring a value auto-tuned after construction.
+        if self._num_max_dispatch_tokens_per_rank is None:
+            value = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024 and requires
+            # num-tokens-sent-from-one-rank-to-another-rank below it.
+            assert value <= 1024
+            self._num_max_dispatch_tokens_per_rank = value
+        return self._num_max_dispatch_tokens_per_rank
 
     def dispatch_a(
         self,

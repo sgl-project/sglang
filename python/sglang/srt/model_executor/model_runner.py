@@ -890,6 +890,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         because they capture their own decode-style graphs separately.
         """
 
+        # Pick the DeepEP low_latency dispatch cap before any DeepEP buffer is
+        # created or the capture list is built — both read the env downstream.
+        self._maybe_auto_tune_deepep_num_max_dispatch_tokens()
+
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
         # fixed-max static buffer — both before the cuda-graph runners, so that
@@ -929,6 +933,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
+        """Auto-pick SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK for the
+        DeepEP low_latency path from post-KV free memory.
+
+        DeepEP caps per-rank dispatch tokens at this value; the default (128)
+        forces DP+DeepEP high-throughput serving to hand-set it just to avoid
+        the dispatch assertion (deep_ep.cpp) at high concurrency, and the same
+        value bounds the cuda-graph capture list (get_batch_sizes_to_capture).
+        Raising it costs cuda-graph capture-activation memory, which is what
+        OOMs on smaller GPUs (e.g. H200) — so the cap is chosen from free GPU
+        memory measured after the KV pool is allocated. An explicit user env
+        always wins, and the value is only ever raised above the default.
+        """
+        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+        if env.is_set():
+            return
+        if (
+            self.server_args.moe_a2a_backend != "deepep"
+            or self.server_args.deepep_mode == "normal"
+        ):
+            return
+
+        # Min across ranks so every rank picks the same cap (the DeepEP buffer
+        # is collective and must be sized identically on all ranks).
+        free_gb = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        if free_gb >= 32:
+            num_max = 512
+        elif free_gb >= 20:
+            num_max = 256
+        else:
+            num_max = 128
+
+        if num_max > env.get():
+            env.set(num_max)
+        log_info_on_rank0(
+            logger,
+            f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+            f"{num_max} (post-KV free mem={free_gb:.1f} GB).",
+        )
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
