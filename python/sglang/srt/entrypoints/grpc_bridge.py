@@ -105,14 +105,105 @@ class RuntimeHandle:
         """
         return self._event_loop
 
-    def _safe_callback(self, chunk_callback, payload, **kwargs) -> None:
+    def _safe_callback(self, chunk_callback, payload, **kwargs):
+        """Invoke chunk_callback swallowing exceptions; returns the status it returned, or None on failure.
+
+        The Rust callbacks return ``ChunkSendStatus`` (Ready/Pending/Closed);
+        callers that care about backpressure should use
+        ``_send_with_backpressure`` instead, which awaits on Pending.
+        """
         try:
-            chunk_callback(payload, **kwargs)
+            return chunk_callback(payload, **kwargs)
         except Exception as e:
             # Most often: Rust receiver dropped (client disconnect, channel
             # closed). Log at warning so it's visible without spamming on
             # every normal cancellation.
             logger.warning("gRPC chunk_callback failed: %s", e)
+            return None
+
+    # Generous ceiling so a Rust-side close that fails to fire on_ready
+    # (only possible when the channel closes during a parked send) doesn't
+    # deadlock the stream coroutine forever. Legitimate slow clients can
+    # easily take seconds per chunk, so this is a stuck-stream backstop, not
+    # a normal pacing knob.
+    _BACKPRESSURE_TIMEOUT_S = 300.0
+
+    @staticmethod
+    def _is_pending_status(status) -> bool:
+        # ChunkSendStatus is a Rust pyclass enum with eq_int, so name-based
+        # comparison via the variant on the value's type works regardless of
+        # discriminant values.
+        return status is not None and status == type(status).Pending
+
+    @staticmethod
+    def _is_closed_status(status) -> bool:
+        return status is not None and status == type(status).Closed
+
+    async def _send_with_backpressure(
+        self,
+        chunk_callback,
+        ready_event: Optional[asyncio.Event],
+        payload,
+        **kwargs,
+    ) -> bool:
+        """Send one chunk and honor ChunkSendStatus backpressure.
+
+        Returns True if the caller should keep producing, False if the Rust
+        side reported the channel closed (or the call itself failed).
+        ``ready_event`` may be None if the callback doesn't support
+        set_on_ready (test stubs); in that case Pending is treated as
+        Ready — best-effort, not crash.
+        """
+        status = self._safe_callback(chunk_callback, payload, **kwargs)
+        if status is None or self._is_closed_status(status):
+            return False
+        if self._is_pending_status(status) and ready_event is not None:
+            try:
+                await asyncio.wait_for(
+                    ready_event.wait(), timeout=self._BACKPRESSURE_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "gRPC chunk backpressure wait timed out after %ss; aborting stream",
+                    self._BACKPRESSURE_TIMEOUT_S,
+                )
+                return False
+            ready_event.clear()
+        return True
+
+    def _install_on_ready(self, chunk_callback) -> Optional[asyncio.Event]:
+        """Register an on_ready hook on ``chunk_callback`` that wakes a TM-loop Event.
+
+        Returns the event, or None if the callback doesn't expose
+        set_on_ready (e.g. unit-test stub) so callers can no-op gracefully.
+        """
+        set_on_ready = getattr(chunk_callback, "set_on_ready", None)
+        if set_on_ready is None:
+            return None
+        ready_event = asyncio.Event()
+        loop = self._tm_loop
+
+        def _on_ready() -> None:
+            # Fired from a Tokio thread under the GIL; bounce onto the TM
+            # loop so the awaiting coroutine wakes safely.
+            loop.call_soon_threadsafe(ready_event.set)
+
+        try:
+            set_on_ready(_on_ready)
+        except Exception as e:
+            logger.warning("gRPC set_on_ready failed: %s", e)
+            return None
+        return ready_event
+
+    @staticmethod
+    def _uninstall_on_ready(chunk_callback) -> None:
+        clear = getattr(chunk_callback, "clear_on_ready", None)
+        if clear is None:
+            return
+        try:
+            clear()
+        except Exception as e:
+            logger.warning("gRPC clear_on_ready failed: %s", e)
 
     def _submit_on_tm_loop(self, coro: Awaitable) -> None:
         future = asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
@@ -252,6 +343,10 @@ class RuntimeHandle:
             )
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
+        # ChunkCallback expects a PyDict positional arg; even error chunks
+        # send {} (the body is ignored when error= is set, but pyo3 still
+        # extracts the dict before dispatching).
+        ready_event = self._install_on_ready(chunk_callback) if stream else None
         try:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
@@ -259,11 +354,12 @@ class RuntimeHandle:
                     finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
-                    self._safe_callback(chunk_callback, chunk, finished=finished)
-                    if finished:
+                    keep_going = await self._send_with_backpressure(
+                        chunk_callback, ready_event, chunk, finished=finished
+                    )
+                    if finished or not keep_going:
                         return
                 # Defensive: generator exited without a finish_reason chunk.
-                # Send a terminal callback so the Rust side closes the stream.
                 self._safe_callback(chunk_callback, {}, finished=True)
             else:
                 result = await gen.__anext__()
@@ -272,12 +368,10 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(
-                chunk_callback,
-                json.dumps({"error": {"message": str(e)}}).encode("utf-8"),
-                finished=True,
-                error=str(e),
-            )
+            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
+        finally:
+            if stream:
+                self._uninstall_on_ready(chunk_callback)
 
     async def _run_embed(self, obj, chunk_callback, request):
         try:
@@ -288,12 +382,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(
-                chunk_callback,
-                json.dumps({"error": {"message": str(e)}}).encode("utf-8"),
-                finished=True,
-                error=str(e),
-            )
+            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
 
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
@@ -666,9 +755,17 @@ class RuntimeHandle:
             # single status-bearing chunk even on streaming endpoints.
             try:
                 request_dict = json.loads(json_body)
+                # `[]`, `null`, `"…"`, numbers etc. parse as JSON but can't be
+                # **-unpacked into the request model; that raises TypeError
+                # outside our handler and ends up as an internal 500. Reject
+                # non-object bodies up front as a client error.
+                if not isinstance(request_dict, dict):
+                    raise TypeError(
+                        f"Request body must be a JSON object, got {type(request_dict).__name__}"
+                    )
                 request_cls = self._get_openai_request_class(serving_key)
                 request_obj = request_cls(**request_dict)
-            except (json.JSONDecodeError, ValidationError) as e:
+            except (json.JSONDecodeError, ValidationError, TypeError) as e:
                 error_body = json.dumps(
                     {"error": {"message": str(e), "type": "BadRequest"}}
                 ).encode("utf-8")
@@ -692,37 +789,53 @@ class RuntimeHandle:
                 # else — multi-line data, comments, future event/id usage.
                 # See follow-up: replace SSE round-trip with a (dict,
                 # finished) hook on OpenAIServing*.
+                ready_event = self._install_on_ready(chunk_callback)
                 data_buf: List[str] = []
+                stream_closed = False
 
-                def _flush_event() -> None:
+                async def _flush_event() -> bool:
+                    """Flush buffered SSE data lines as one chunk. Returns False if Rust closed."""
                     if not data_buf:
-                        return
+                        return True
                     body = "\n".join(data_buf)
                     data_buf.clear()
                     if body == "[DONE]" or not body:
-                        return
-                    chunk_callback(body.encode("utf-8"), finished=False)
+                        return True
+                    return await self._send_with_backpressure(
+                        chunk_callback,
+                        ready_event,
+                        body.encode("utf-8"),
+                        finished=False,
+                    )
 
-                async for raw_chunk in result.body_iterator:
-                    if isinstance(raw_chunk, bytes):
-                        raw_chunk = raw_chunk.decode("utf-8", errors="replace")
-                    for line in raw_chunk.split("\n"):
-                        line = line.rstrip("\r")
-                        if not line:
-                            _flush_event()
-                        elif line.startswith(":"):
-                            continue  # SSE comment / heartbeat
-                        elif line.startswith("data:"):
-                            value = line[5:]
-                            if value.startswith(" "):
-                                value = value[1:]
-                            data_buf.append(value)
-                        # event:, id:, retry:, unknown fields: ignored
+                try:
+                    async for raw_chunk in result.body_iterator:
+                        if isinstance(raw_chunk, bytes):
+                            raw_chunk = raw_chunk.decode("utf-8", errors="replace")
+                        for line in raw_chunk.split("\n"):
+                            line = line.rstrip("\r")
+                            if not line:
+                                if not await _flush_event():
+                                    stream_closed = True
+                                    break
+                            elif line.startswith(":"):
+                                continue  # SSE comment / heartbeat
+                            elif line.startswith("data:"):
+                                value = line[5:]
+                                if value.startswith(" "):
+                                    value = value[1:]
+                                data_buf.append(value)
+                            # event:, id:, retry:, unknown fields: ignored
+                        if stream_closed:
+                            break
 
-                # Defensive: emit a trailing event if the stream ended
-                # without a final blank line.
-                _flush_event()
-                chunk_callback(b"", finished=True)
+                    if not stream_closed:
+                        # Defensive: emit a trailing event if the stream ended
+                        # without a final blank line.
+                        await _flush_event()
+                        self._safe_callback(chunk_callback, b"", finished=True)
+                finally:
+                    self._uninstall_on_ready(chunk_callback)
             else:
                 if hasattr(result, "model_dump"):
                     resp_bytes = json.dumps(result.model_dump()).encode("utf-8")
