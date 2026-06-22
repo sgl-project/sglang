@@ -95,6 +95,23 @@ class TestMaybeInitCustomMemPool(CustomTestCase):
         mock_init.assert_called_once_with("cuda:0")
 
 
+class _TokenView:
+    def __init__(self, tokens, extra_key):
+        self.tokens = tokens
+        self.extra_key = extra_key
+
+    def __iter__(self):
+        return iter(self.tokens)
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return _TokenView(self.tokens[item], self.extra_key)
+        return self.tokens[item]
+
+
 class TestGetHashStr(CustomTestCase):
     def test_empty_list(self):
         result = get_hash_str([])
@@ -131,6 +148,26 @@ class TestGetHashStr(CustomTestCase):
         # ...and a different prior_hash must yield a different chained digest.
         self.assertNotEqual(
             chained, get_hash_str([3, 4], prior_hash=get_hash_str([9, 9]))
+        )
+
+    def test_extra_key_namespaces_first_step(self):
+        salted_a = get_hash_str([1, 2, 3, 4], extra_key="salt-A")
+        salted_b = get_hash_str([1, 2, 3, 4], extra_key="salt-B")
+        unsalted = get_hash_str([1, 2, 3, 4])
+
+        self.assertNotEqual(salted_a, salted_b)
+        self.assertNotEqual(salted_a, unsalted)
+        self.assertNotEqual(get_hash_str([1, 2, 3, 4], extra_key=""), unsalted)
+
+    def test_extra_key_is_carried_by_token_view_slices(self):
+        token_view = _TokenView([1, 2, 3, 4, 5], "salt-A")
+
+        first_hash = get_hash_str(token_view[:4])
+        self.assertEqual(first_hash, get_hash_str([1, 2, 3, 4], extra_key="salt-A"))
+
+        second_hash = get_hash_str(token_view[4:5], prior_hash=first_hash)
+        self.assertEqual(
+            second_hash, get_hash_str([5], prior_hash=first_hash, extra_key="salt-A")
         )
 
     def test_prior_hash_single_step(self):

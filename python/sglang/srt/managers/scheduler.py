@@ -2300,6 +2300,7 @@ class Scheduler(
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    req.extra_key,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

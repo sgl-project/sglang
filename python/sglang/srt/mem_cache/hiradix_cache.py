@@ -1301,13 +1301,17 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> int:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
             return 0
 
+        cache_extra_key = (
+            extra_key if extra_key is not None else last_host_node.key.extra_key
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=cache_extra_key,
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
@@ -1548,10 +1552,14 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
+        cache_extra_key = (
+            extra_key if extra_key is not None else last_host_node.key.extra_key
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=cache_extra_key,
             is_bigram=self.is_eagle,
         )
         # align the number of fetching tokens to the page size

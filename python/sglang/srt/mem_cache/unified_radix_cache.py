@@ -1860,7 +1860,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         operation_id = self.cache_controller.write_storage(
             node.component_data[BASE_COMPONENT_TYPE].host_value,
-            node.key.token_ids,
+            node.key,
             node.hash_value,
             prefix_keys,
             extra_pools=aux_xfers or None,
@@ -1877,14 +1877,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        cache_extra_key = (
+            extra_key
+            if extra_key is not None
+            else last_host_node.key.extra_key
+            if last_host_node.key
+            else None
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=extra_key,
+            extra_key=cache_extra_key,
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)

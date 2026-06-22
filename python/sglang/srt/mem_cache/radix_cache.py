@@ -48,7 +48,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
-from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+    split_node_hash_value,
+    update_hash_with_extra_key,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -207,6 +211,7 @@ class RadixKey:
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
         """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
         hasher = hashlib.sha256()
+        update_hash_with_extra_key(hasher, self.extra_key)
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids

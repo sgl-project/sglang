@@ -25,7 +25,9 @@ Source-of-truth implementation:
 sglang`) so the script runs without the heavy SGLang dependency tree and
 can be audited at a glance. The algorithm is intentionally tiny:
 
-    sha256(prior_digest_bytes ++ token_LE_u32 ++ token_LE_u32 ++ ...)
+    sha256(token_LE_u32 ++ token_LE_u32 ++ ...)
+    or, with extra_key and/or parent digest:
+    sha256(len(extra_key_utf8)_LE_u32 ++ extra_key_utf8 ++ prior_digest_bytes ++ token_LE_u32 ++ ...)
     truncate to i64 = signed(first 16 hex chars)
 
 If SGLang ever changes the algorithm, update both the SGLang side AND
@@ -41,6 +43,7 @@ A JSON array of cases. Each case is:
       "name": "<descriptive label>",
       "tokens": [<u32>, ...],
       "block_size": <usize>,
+      "extra_key": "<optional namespace>",
       "expected_i64_hashes": [<i64>, ...]
     }
 """
@@ -54,7 +57,9 @@ import pathlib
 import sys
 
 
-def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
+def hash_page_chain(
+    tokens: list[int], block_size: int, extra_key: str | None = None
+) -> list[int]:
     """Compute the i64-truncated block hashes for `tokens` using SGLang's
     `RadixKey.hash_page` algorithm + `hash_str_to_int64`.
 
@@ -75,6 +80,10 @@ def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
     while start < n:
         end = min(start + block_size, n)
         hasher = hashlib.sha256()
+        if extra_key is not None:
+            encoded_extra_key = extra_key.encode("utf-8")
+            hasher.update(len(encoded_extra_key).to_bytes(4, byteorder="little"))
+            hasher.update(encoded_extra_key)
         if prior_digest is not None:
             hasher.update(prior_digest)
         for t in tokens[start:end]:
@@ -133,19 +142,42 @@ CASES: list[dict] = [
         "tokens": list(range(1, 129)),
         "block_size": 16,
     },
+    {
+        "name": "salted_single_full_block",
+        "tokens": [1, 2, 3, 4],
+        "block_size": 4,
+        "extra_key": "salt-A",
+    },
+    {
+        "name": "salted_multi_block",
+        "tokens": [1, 2, 3, 4, 5],
+        "block_size": 4,
+        "extra_key": "salt-A",
+    },
+    {
+        "name": "empty_extra_key_namespace",
+        "tokens": [1, 2, 3, 4],
+        "block_size": 4,
+        "extra_key": "",
+    },
 ]
 
 
 def _materialize_cases() -> list[dict]:
-    return [
-        {
+    cases_out = []
+    for c in CASES:
+        out = {
             "name": c["name"],
             "tokens": c["tokens"],
             "block_size": c["block_size"],
-            "expected_i64_hashes": hash_page_chain(c["tokens"], c["block_size"]),
+            "expected_i64_hashes": hash_page_chain(
+                c["tokens"], c["block_size"], c.get("extra_key")
+            ),
         }
-        for c in CASES
-    ]
+        if "extra_key" in c:
+            out["extra_key"] = c["extra_key"]
+        cases_out.append(out)
+    return cases_out
 
 
 def _validate_against_sglang() -> int:
@@ -167,7 +199,7 @@ def _validate_against_sglang() -> int:
 
     failures: list[str] = []
     for c in CASES:
-        local = hash_page_chain(c["tokens"], c["block_size"])
+        local = hash_page_chain(c["tokens"], c["block_size"], c.get("extra_key"))
         if c["block_size"] == 0 or not c["tokens"]:
             # `RadixKey.hash_page` requires a non-empty page; the local
             # replica handles edge cases (empty input → empty list)
@@ -176,10 +208,10 @@ def _validate_against_sglang() -> int:
             continue
         sglang_hashes: list[int] = []
         prior_hex: str | None = None
+        key = RadixKey(token_ids=c["tokens"], extra_key=c.get("extra_key"))
         for start in range(0, len(c["tokens"]), c["block_size"]):
-            page = c["tokens"][start : start + c["block_size"]]
-            key = RadixKey(token_ids=page, extra_key=None)
-            hex_digest = key.hash_page(prior_hex)
+            end = min(start + c["block_size"], len(c["tokens"]))
+            hex_digest = key.hash_page(start, end, prior_hex)
             # SGLang's hash_page returns the hex digest; truncate to i64
             # the same way `hash_str_to_int64` does.
             uint64_val = int(hex_digest[:16], 16)

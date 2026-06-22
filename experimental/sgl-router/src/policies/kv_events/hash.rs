@@ -9,11 +9,13 @@
 //!
 //! For each page (chunk of `block_size` tokens, last page possibly short):
 //! 1. Initialize a SHA256 hasher.
-//! 2. If a prior page exists, feed the prior page's **full 32-byte SHA256
+//! 2. If the request has a `RadixKey.extra_key` namespace, feed its UTF-8 byte
+//!    length as a 4-byte little-endian integer followed by the UTF-8 bytes.
+//! 3. If a prior page exists, feed the prior page's **full 32-byte SHA256
 //!    digest** (raw bytes, not the truncated i64) into the hasher.
-//! 3. Feed each token in the page as 4 little-endian unsigned bytes.
-//! 4. Take the 32-byte digest as the new "prior" for the next page.
-//! 5. Truncate the digest to a signed i64 by reading the first 16 hex chars
+//! 4. Feed each token in the page as 4 little-endian unsigned bytes.
+//! 5. Take the 32-byte digest as the new "prior" for the next page.
+//! 6. Truncate the digest to a signed i64 by reading the first 16 hex chars
 //!    (top 64 bits) and reinterpreting as signed.
 //!
 //! ### Why no `parent_hash: Option<i64>` argument
@@ -55,6 +57,18 @@ use sha2::{Digest, Sha256};
 /// up-front against the worker-published `block_size`; an invalid value is
 /// a programmer/config bug, not a runtime input we should swallow.
 pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    compute_block_hashes_with_extra_key(token_ids, block_size, None)
+}
+
+/// Compute per-block i64 hashes with SGLang's `RadixKey.extra_key` namespace.
+///
+/// The namespace is folded into every page before the parent digest. This mirrors
+/// `RadixKey.hash_page` and `mem_cache.utils.get_hash_str`.
+pub fn compute_block_hashes_with_extra_key(
+    token_ids: &[u32],
+    block_size: usize,
+    extra_key: Option<&str>,
+) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     if token_ids.is_empty() {
         return Vec::new();
@@ -68,7 +82,7 @@ pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
     let mut start = 0;
     while start < n {
         let end = (start + block_size).min(n);
-        let digest = chain_block(prior.as_ref(), &token_ids[start..end]);
+        let digest = chain_block(prior.as_ref(), &token_ids[start..end], extra_key);
         out.push(sha256_to_i64(&digest));
         prior = Some(digest);
         start = end;
@@ -80,8 +94,13 @@ pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
 /// Hash a single page, optionally chained to a parent block's full 32-byte
 /// SHA256 digest. Returns the new 32-byte digest.
 #[inline]
-fn chain_block(parent_digest: Option<&[u8; 32]>, block_tokens: &[u32]) -> [u8; 32] {
+fn chain_block(
+    parent_digest: Option<&[u8; 32]>,
+    block_tokens: &[u32],
+    extra_key: Option<&str>,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    update_hasher_with_extra_key(&mut hasher, extra_key);
     if let Some(parent) = parent_digest {
         hasher.update(parent);
     }
@@ -89,6 +108,17 @@ fn chain_block(parent_digest: Option<&[u8; 32]>, block_tokens: &[u32]) -> [u8; 3
         hasher.update(t.to_le_bytes());
     }
     hasher.finalize().into()
+}
+
+#[inline]
+fn update_hasher_with_extra_key(hasher: &mut Sha256, extra_key: Option<&str>) {
+    let Some(extra_key) = extra_key else {
+        return;
+    };
+    let encoded = extra_key.as_bytes();
+    let len = u32::try_from(encoded.len()).expect("extra_key length exceeds u32");
+    hasher.update(len.to_le_bytes());
+    hasher.update(encoded);
 }
 
 /// Convert a full 32-byte SHA256 digest to the signed i64 truncation that
@@ -127,6 +157,15 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 /// hashes won't match the worker's stored bigram block hashes and cache-aware
 /// routing silently degrades to min-load.
 pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    compute_block_hashes_bigram_with_extra_key(token_ids, block_size, None)
+}
+
+/// Bigram variant of [`compute_block_hashes_with_extra_key`].
+pub fn compute_block_hashes_bigram_with_extra_key(
+    token_ids: &[u32],
+    block_size: usize,
+    extra_key: Option<&str>,
+) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     // N raw tokens -> N-1 overlapping bigrams; fewer than 2 tokens -> no blocks.
     let logical_len = token_ids.len().saturating_sub(1);
@@ -140,7 +179,7 @@ pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<
     let mut start = 0;
     while start < logical_len {
         let end = (start + block_size).min(logical_len);
-        let digest = chain_block_bigram(prior.as_ref(), token_ids, start, end);
+        let digest = chain_block_bigram(prior.as_ref(), token_ids, start, end, extra_key);
         out.push(sha256_to_i64(&digest));
         prior = Some(digest);
         start = end;
@@ -160,8 +199,10 @@ fn chain_block_bigram(
     tokens: &[u32],
     start: usize,
     end: usize,
+    extra_key: Option<&str>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    update_hasher_with_extra_key(&mut hasher, extra_key);
     if let Some(parent) = parent_digest {
         hasher.update(parent);
     }
@@ -182,6 +223,42 @@ mod tests {
     // the deployed DeepSeek-V4-Flash engine. These lock byte-exact equivalence
     // with the worker's stored block hashes — the contract that makes
     // cache-aware routing actually match for EAGLE/bigram models.
+
+    #[test]
+    fn extra_key_namespaces_first_block_and_propagates() {
+        assert_eq!(
+            compute_block_hashes_with_extra_key(&[1, 2, 3, 4], 4, Some("salt-A")),
+            vec![1848708812856982025_i64]
+        );
+        assert_eq!(
+            compute_block_hashes_with_extra_key(&[1, 2, 3, 4], 4, Some("salt-B")),
+            vec![-3770730224180675262_i64]
+        );
+        assert_eq!(
+            compute_block_hashes_with_extra_key(&[1, 2, 3, 4, 5], 4, Some("salt-A")),
+            vec![1848708812856982025_i64, -844459331919182630_i64]
+        );
+    }
+
+    #[test]
+    fn empty_extra_key_is_a_namespace() {
+        assert_eq!(
+            compute_block_hashes_with_extra_key(&[1, 2, 3, 4], 4, Some("")),
+            vec![-1934027550307904538_i64]
+        );
+        assert_eq!(
+            compute_block_hashes_with_extra_key(&[1, 2, 3, 4], 4, None),
+            vec![-3488128144981237669_i64]
+        );
+    }
+
+    #[test]
+    fn bigram_extra_key_namespaces_first_block_and_propagates() {
+        assert_eq!(
+            compute_block_hashes_bigram_with_extra_key(&[10, 20, 30, 40, 50], 2, Some("salt-A"),),
+            vec![-3307084293699386976_i64, -4477231418096748271_i64]
+        );
+    }
 
     #[test]
     fn bigram_golden_single_block_full() {

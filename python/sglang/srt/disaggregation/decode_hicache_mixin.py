@@ -86,6 +86,7 @@ class DecodeHiCachePreallocMixin:
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
+                    req.extra_key,
                 )
 
         return DecodePrefixMatch(
@@ -122,7 +123,7 @@ class DecodeHiCachePreallocMixin:
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid, node, suffix, last_hash, prefix_keys, req.extra_key
             )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
