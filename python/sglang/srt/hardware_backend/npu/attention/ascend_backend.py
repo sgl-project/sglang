@@ -376,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
         """Check if TND layout is supported."""
         d = layer.qk_head_dim
         v = layer.v_head_dim
-        return (d == v and d in (128, 192)) or (d == 192 and v == 128)
+        return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -463,7 +463,6 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_draft_extend()
             and not forward_batch.forward_mode.is_target_verify()
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
@@ -480,7 +479,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
@@ -551,6 +550,16 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        # V4-specific extra graph buffers. Default no-op on the base class;
+        # DeepseekV4AscendAttnBackend overrides.
+        self._init_dsv4_graph_buffers(max_bs=max_bs, max_num_tokens=max_num_tokens)
+
+    def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
+        """Hook for V4-Flash to preallocate dsv4-specific graph buffers.
+
+        Default no-op. Overridden by DeepseekV4AscendAttnBackend.
+        """
+        pass
 
     def _init_cuda_graph_metadata(
         self,
@@ -570,11 +579,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        if (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-            or forward_mode.is_draft_extend()
-        ):
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens
@@ -980,7 +985,6 @@ class AscendAttnBackend(AttentionBackend):
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_draft_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
 
@@ -1011,12 +1015,6 @@ class AscendAttnBackend(AttentionBackend):
                             self.speculative_num_draft_tokens,
                             dtype=torch.int32,
                         )
-                        .to(q.device)
-                        .to(torch.int32)
-                    )
-                elif forward_batch.forward_mode.is_draft_extend():
-                    actual_seq_qlen = (
-                        forward_batch.extend_seq_lens.cumsum()
                         .to(q.device)
                         .to(torch.int32)
                     )
@@ -1118,7 +1116,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return self.forward_mtp(
@@ -1888,10 +1885,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            if (
-                forward_batch.forward_mode.is_draft_extend()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_batch.forward_mode.is_draft_extend_v2():
                 actual_seq_lengths = (
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
@@ -2004,16 +1998,44 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            if forward_batch.forward_mode.is_draft_extend():
-                actual_seq_lengths = (
-                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
+            actual_seq_lengths = np.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens + q_nope.shape[0],
+                self.speculative_num_draft_tokens,
+            )
+
+            if (
+                self.q_head_num_padding is not None
+                and self.q_head_num_padding > self.tp_q_head_num
+            ):
+                nope_padding = torch.empty(
+                    [
+                        q_nope.shape[0],
+                        self.q_head_num_padding - self.tp_q_head_num,
+                        self.kv_lora_rank,
+                    ],
+                    dtype=(
+                        self.model_dtype
+                        if self.model_dtype is not None
+                        else torch.bfloat16
+                    ),
+                    device=q_nope.device,
                 )
-            else:
-                actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + q_nope.shape[0],
-                    self.speculative_num_draft_tokens,
+                rope_padding = torch.empty(
+                    [
+                        q_rope.shape[0],
+                        self.q_head_num_padding - self.tp_q_head_num,
+                        self.qk_rope_head_dim,
+                    ],
+                    dtype=(
+                        self.model_dtype
+                        if self.model_dtype is not None
+                        else torch.bfloat16
+                    ),
+                    device=q_rope.device,
                 )
+                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 q_nope,
@@ -2021,7 +2043,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
@@ -2042,7 +2064,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
@@ -2057,6 +2079,7 @@ class AscendAttnBackend(AttentionBackend):
                 workspace=workspace,
                 out=[attn_output, softmax_lse],
             )
+            attn_output = attn_output[:, : layer.tp_q_head_num, :]
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode

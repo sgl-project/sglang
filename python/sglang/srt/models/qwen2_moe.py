@@ -29,15 +29,13 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_pp_indices,
-    get_tensor_model_parallel_world_size,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.parallel_state import (
-    get_attn_context_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -48,11 +46,11 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -95,6 +93,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -236,7 +235,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         enable_cuda_shared_expert_fusion: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
@@ -265,6 +264,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
+        # Disable inplace MoE when fused gate will need hidden_states after experts
+        _needs_hidden_after_experts = (
+            config.shared_expert_intermediate_size > 0
+            and not self.enable_shared_expert_fusion
+        )
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
@@ -285,6 +289,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            inplace=not _needs_hidden_after_experts,
         )
 
         self.gate = ReplicatedLinear(
@@ -332,7 +337,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
@@ -366,7 +371,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # post-experts all_reduce sums it ep_size times. Pre-scale the per-token
         # routing weight by 1/ep_size to cancel this, mirroring DeepSeek-V2's
         # fused_shared_experts_scaling_factor pattern.
-        moe_ep_size = get_moe_expert_parallel_world_size()
+        moe_ep_size = get_parallel().moe_ep_size
         if moe_ep_size > 1 and not is_deepep_class_backend():
             w = w / float(moe_ep_size)
         return w
@@ -400,11 +405,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor, apply_gate: bool = True
+    ):
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
+            if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
                         hidden_states,
@@ -413,6 +420,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         True,
                         shared_output,
                     )
+                elif _is_hip:
+                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                        sigmoid_gate_mul_broadcast,
+                    )
+
+                    gate = self.shared_expert_gate(hidden_states)
+                    shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
@@ -476,11 +490,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        use_fused_gate: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
-            self._forward_shared_experts(hidden_states.clone())
+            self._forward_shared_experts(
+                hidden_states.clone(), apply_gate=not use_fused_gate
+            )
             if self.shared_expert is not None
             else None
         )
@@ -525,6 +542,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
+        use_fused_gate = (
+            self.shared_expert_gate is not None
+            and not use_intel_amx_backend(self.shared_expert_gate)
+            and not is_npu()
+        )
+
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -534,14 +557,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+                hidden_states, use_fused_gate=use_fused_gate
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(
+                hidden_states, apply_gate=not use_fused_gate
+            )
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
-            final_hidden_states += shared_output
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
@@ -576,8 +609,8 @@ class Qwen2MoeAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -690,8 +723,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Qwen2MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -792,8 +825,8 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        self.moe_dp_size = get_moe_data_parallel_world_size()
-        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+        self.moe_dp_size = get_parallel().moe_dp_size
+        self.attn_cp_size = get_parallel().attn_cp_size
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -861,6 +894,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             is_prefill_context_parallel_enabled()
+            and not is_cp_v2_active(forward_batch)
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
@@ -901,6 +935,16 @@ class Qwen2MoeModel(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
+            if (
+                hidden_states is not None
+                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                and hidden_states._sglang_needs_allreduce_fusion
+            ):
+                if get_moe_expert_parallel_world_size() > 1:
+                    hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+                if get_moe_tensor_parallel_world_size() > 1:
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -916,6 +960,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             self.pp_group.is_last_rank
+            and not is_cp_v2_active(forward_batch)
             and is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
