@@ -114,12 +114,12 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
         self.run_throughput()
 
 
-class TestNPUMiniMaxM2_5_W8A8_4P_In3k5_Out1k5_aime25(TestNpuAccuracyTestCaseBase):
+class TestNPUMiniMaxM2_5_W8A8_4P_In3k5_Out1k5_GPQA(TestNpuAccuracyTestCaseBase):
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS
-    accuracy = 0.863
-    datasets = ["aime25"]
+    accuracy = 0.852
+    datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
     max_concurrency = 64
