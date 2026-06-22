@@ -12,7 +12,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # Token id -> decoded text; decode() concatenates. Distinct symbols so no
 # accidental cross-matches (10-39 are lowercase letters).

@@ -34,7 +34,7 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 
 
 _KV_LORA_RANK = DEFAULT_KV_LORA_RANK

@@ -8,9 +8,9 @@ from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=8, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class _FakeWorkspace:

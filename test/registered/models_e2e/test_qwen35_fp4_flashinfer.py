@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     ModelLaunchSettings,
 )
 
-register_cuda_ci(est_time=720, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=381, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}

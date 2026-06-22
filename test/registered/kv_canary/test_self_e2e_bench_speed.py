@@ -17,7 +17,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=308, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
