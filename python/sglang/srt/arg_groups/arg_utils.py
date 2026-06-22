@@ -186,12 +186,18 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
         cli_name = arg_meta.cli_name or _field_to_cli_name(field.name)
         names = [cli_name] + (arg_meta.aliases or [])
         default = _field_default(field)
+        # Anchor dest to the field name so argparse stores the value
+        # under the dataclass attribute directly, even when cli_name
+        # differs (e.g. --tensor-parallel-size → tp_size).
+        auto_dest = cli_name.lstrip("-").replace("-", "_")
+        dest_kwarg = {"dest": field.name} if field.name != auto_dest else {}
 
         # Handle custom action
         if arg_meta.action is not None:
             kwargs = {
                 "action": arg_meta.action,
                 "help": arg_meta.help,
+                **dest_kwarg,
             }
             if default is not _MISSING:
                 kwargs["default"] = default
@@ -210,7 +216,9 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
             # Infer type from first literal value
             val_type = type(literal_vals[0]) if literal_vals else str
             type_func = arg_meta.type_parser or _infer_type_func(val_type)
-            kwargs = dict(type=type_func, choices=choices, help=arg_meta.help)
+            kwargs = dict(
+                type=type_func, choices=choices, help=arg_meta.help, **dest_kwarg
+            )
             if default is not _MISSING:
                 kwargs["default"] = default
             if arg_meta.const is not None:
@@ -230,6 +238,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
                 type=type_func,
                 nargs=nargs,
                 help=arg_meta.help,
+                **dest_kwarg,
             )
             if arg_meta.choices:
                 kwargs["choices"] = arg_meta.choices
@@ -242,7 +251,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
 
         # Bool → store_true
         if inner_type is bool:
-            kwargs = dict(action="store_true", help=arg_meta.help)
+            kwargs = dict(action="store_true", help=arg_meta.help, **dest_kwarg)
             if default is not _MISSING:
                 kwargs["default"] = default
             parser.add_argument(*names, **kwargs)
@@ -250,7 +259,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
 
         # Scalar types (str, int, float, etc.)
         type_func = arg_meta.type_parser or _infer_type_func(inner_type)
-        kwargs = dict(type=type_func, help=arg_meta.help)
+        kwargs = dict(type=type_func, help=arg_meta.help, **dest_kwarg)
         if arg_meta.choices:
             kwargs["choices"] = arg_meta.choices
         if arg_meta.nargs:

@@ -396,12 +396,9 @@ class ServerArgs:
         load_format: A[str, Arg(help="Format.", choices=LOAD_FORMAT_CHOICES)] = "auto"
         model_path: A[str, Arg(help="Path to model.", aliases=["--model"])]
 
-    **Style 2 — Legacy (existing arguments, to be migrated):**
-
-    The field is a plain type annotation with a default, and a separate
-    ``parser.add_argument(...)`` call in ``add_cli_args`` defines the CLI
-    surface. When modifying these fields, keep the order in this class
-    definition consistent with the order in ``add_cli_args``.
+    The primary CLI name is auto-derived from the field name
+    (``tp_size`` → ``--tp-size``). Use ``aliases`` for longer alternate
+    names (``aliases=["--tensor-parallel-size"]``).
     """
 
     # -------------------------------------------------------------------------
@@ -843,16 +840,14 @@ class ServerArgs:
         int,
         Arg(
             help="The tensor parallelism size.",
-            cli_name="--tensor-parallel-size",
-            aliases=["--tp-size"],
+            aliases=["--tensor-parallel-size"],
         ),
     ] = 1
     pp_size: A[
         int,
         Arg(
             help="The pipeline parallelism size.",
-            cli_name="--pipeline-parallel-size",
-            aliases=["--pp-size"],
+            aliases=["--pipeline-parallel-size"],
         ),
     ] = 1
     pp_max_micro_batch_size: A[
@@ -864,8 +859,7 @@ class ServerArgs:
         int,
         Arg(
             help="The data parallelism size.",
-            cli_name="--data-parallel-size",
-            aliases=["--dp-size"],
+            aliases=["--data-parallel-size"],
         ),
     ] = 1
     load_balance_method: A[
@@ -885,16 +879,14 @@ class ServerArgs:
         int,
         Arg(
             help="The attention context parallelism size.",
-            cli_name="--attention-context-parallel-size",
-            aliases=["--attn-cp-size"],
+            aliases=["--attention-context-parallel-size"],
         ),
     ] = 1
     moe_dp_size: A[
         int,
         Arg(
             help="The moe data parallelism size.",
-            cli_name="--moe-data-parallel-size",
-            aliases=["--moe-dp-size"],
+            aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
     enable_prefill_cp: A[
@@ -1578,8 +1570,7 @@ class ServerArgs:
         int,
         Arg(
             help="The expert parallelism size.",
-            cli_name="--expert-parallel-size",
-            aliases=["--ep-size", "--ep"],
+            aliases=["--expert-parallel-size", "--ep"],
         ),
     ] = 1
     moe_a2a_backend: A[
@@ -6470,15 +6461,6 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        args.tp_size = args.tensor_parallel_size
-        args.pp_size = args.pipeline_parallel_size
-        args.attn_cp_size = args.attention_context_parallel_size
-        args.moe_dp_size = args.moe_data_parallel_size
-        args.dp_size = args.data_parallel_size
-        args.ep_size = args.expert_parallel_size
-        args.fp8_gemm_runner_backend = args.fp8_gemm_backend
-        args.fp4_gemm_runner_backend = args.fp4_gemm_backend
-
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
         # surface and won't appear on the argparse Namespace. Skip them so the
         # dataclass default applies.
