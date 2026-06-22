@@ -439,7 +439,8 @@ class FP32LayerNorm(nn.LayerNorm):
                 eps=self.eps,
                 impl_mode = 0 # 0 - high precision, 1 - high perfomance, 2 - float16.
             )
-        return output
+            return output
+        
         origin_dtype = inputs.dtype
         device = inputs.device
         weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
