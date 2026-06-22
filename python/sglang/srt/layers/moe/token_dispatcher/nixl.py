@@ -261,6 +261,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         return nixl_output
 

@@ -430,15 +430,9 @@ def maybe_apply_deepep_npu(
     else:
         if TYPE_CHECKING:
             assert isinstance(dispatch_output, DeepEPLLDispatchOutput)
-        (
-            hidden_states,
-            hidden_states_scale,
-            _,
-            _,
-            group_list,
-            _,
-        ) = dispatch_output
-        group_list = group_list.to(torch.int64)
+        hidden_states = dispatch_output.hidden_states
+        hidden_states_scale = dispatch_output.hidden_states_scale
+        group_list = dispatch_output.masked_m.to(torch.int64)
         combine_cls = DeepEPLLCombineInput
 
     hidden_states = quant_method.apply_without_routing_weights(
