@@ -2,7 +2,7 @@
 
 import fnmatch
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, cast
 
 import torch
 
@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, get_device_capability
+from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -49,47 +49,18 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "down_proj",
 )
 
-# Selective dense-FP8 (port of #28327): for quark MXFP4 checkpoints, optionally
-# route the large dense projections that quark leaves unquantized (bf16) to online
-# w8a8 FP8, where the tuned aiter FP8 GEMM beats tuned bf16. Only the big
-# projections (N >= _DENSE_FP8_MIN_N) win; small-N layers, conv1d, router/gate,
-# lm_head and embeddings stay bf16. For our Qwen3.5-MXFP4-AttnFP8 checkpoint the
-# attention projections are already FP8 in-checkpoint (not excluded), so the only
-# layer this actually promotes is the excluded bf16 ``shared_expert.down_proj``.
-# Env-gated (SGLANG_QUARK_DENSE_FP8=1); default off.
-_DENSE_FP8_ELIGIBLE: tuple[str, ...] = (
-    ".in_proj_qkvz",
-    "linear_attn.out_proj",
-    ".shared_expert.down_proj",
-)
-_DENSE_FP8_BLOCKED: tuple[str, ...] = (
-    "conv1d",
-    "shared_expert_gate",
-    "mlp.gate",
-    "in_proj_a",
-    "in_proj_b",
-    "in_proj_ba",
-    "lm_head",
-    "embed",
-)
-_DENSE_FP8_MIN_N = 2048
+# Selective dense-FP8: route bf16 dense projections the checkpoint left unquantized to
+# online w8a8 FP8. quark holds no per-model names/thresholds; each model registers its
+# own policy via register_dense_fp8_modules(). Gated by --enable-dense-fp8.
 
 
 def _dense_fp8_enabled() -> bool:
-    return get_bool_env_var("SGLANG_QUARK_DENSE_FP8", "False")
+    from sglang.srt.server_args import get_global_server_args
 
-
-def _dense_fp8_eligible(prefix: str, layer: torch.nn.Module) -> bool:
-    if any(b in prefix for b in _DENSE_FP8_BLOCKED):
+    try:
+        return get_global_server_args().enable_dense_fp8
+    except ValueError:
         return False
-    if not any(e in prefix for e in _DENSE_FP8_ELIGIBLE):
-        return False
-    n = getattr(layer, "output_size_per_partition", None) or getattr(
-        layer, "output_size", None
-    )
-    if n is not None and n < _DENSE_FP8_MIN_N:
-        return False
-    return True
 
 
 class QuarkConfig(QuantizationConfig):
@@ -129,6 +100,10 @@ class QuarkConfig(QuantizationConfig):
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
         self._quantized_layers = set()
+        # Dense-FP8 policy registered by the active model; empty include -> no-op.
+        self._dense_fp8_include: tuple[str, ...] = ()
+        self._dense_fp8_exclude: tuple[str, ...] = ()
+        self._dense_fp8_min_output_size: int = 0
 
     @property
     def quantized_layers(self) -> tuple[list[str], int]:
@@ -140,6 +115,35 @@ class QuarkConfig(QuantizationConfig):
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
+
+    def register_dense_fp8_modules(
+        self,
+        include: Iterable[str],
+        exclude: Iterable[str] = (),
+        min_output_size: int = 0,
+    ) -> None:
+        """Register a model's dense-FP8 policy (quark owns no names/thresholds):
+        ``include``/``exclude`` module-name substrings and a min output size. Only
+        excluded (bf16) layers matching the policy are promoted, under --enable-dense-fp8."""
+        self._dense_fp8_include = tuple(
+            dict.fromkeys((*self._dense_fp8_include, *include))
+        )
+        self._dense_fp8_exclude = tuple(
+            dict.fromkeys((*self._dense_fp8_exclude, *exclude))
+        )
+        self._dense_fp8_min_output_size = max(
+            self._dense_fp8_min_output_size, min_output_size
+        )
+
+    def _dense_fp8_eligible(self, prefix: str, layer: torch.nn.Module) -> bool:
+        if any(b in prefix for b in self._dense_fp8_exclude):
+            return False
+        if not any(m in prefix for m in self._dense_fp8_include):
+            return False
+        n = getattr(layer, "output_size_per_partition", None) or getattr(
+            layer, "output_size", None
+        )
+        return n is None or n >= self._dense_fp8_min_output_size
 
     def _get_dense_fp8_method(self, prefix: str) -> "Fp8LinearMethod":
         cfg = getattr(self, "_dense_fp8_config", None)
@@ -182,14 +186,11 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
-                if self.dequantization_config is not None:
-                    # In case of online requantization, "exclude" means keeping the original precision.
-                    # NOTE: Only FP8 supported for now.
-                    return Fp8LinearMethod(quant_config=self.dequantization_config)
-                else:
-                    if _dense_fp8_enabled() and _dense_fp8_eligible(prefix, layer):
-                        return self._get_dense_fp8_method(prefix)
-                    return UnquantizedLinearMethod()
+                if _dense_fp8_enabled() and self._dense_fp8_eligible(
+                    prefix, layer
+                ):
+                    return self._get_dense_fp8_method(prefix)
+                return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
