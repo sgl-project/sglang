@@ -443,6 +443,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device
             ](self)
+            # draft_extend is the step's last shared-buffer-reading phase; its
+            # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -974,6 +976,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def war_fastpath_runner(self):
+        # Per the base contract: the step's last shared-buffer-reading phase is
+        # draft_extend, which runs on the draft runner.
+        return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
