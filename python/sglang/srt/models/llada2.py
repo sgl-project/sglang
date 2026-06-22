@@ -95,8 +95,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
-    split_qkv_rmsnorm_rope_pos_cache_half_npu = None
     try:
         from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
             split_qkv_rmsnorm_rope_pos_cache_half_npu,
