@@ -333,11 +333,19 @@ class TpModelWorker(BaseTpWorker):
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
-    def init_backends(self, disable_cuda_graph: bool = False):
-        """Initialize attention backends and capture cuda graphs."""
-        self.model_runner.init_backends(disable_cuda_graph=disable_cuda_graph)
+    def init_attention_backends(self):
+        """Initialize attention backends for all model runners."""
+        self.model_runner.init_attention_backends()
         for mr in self.model_runner_list[1:]:
-            mr.init_backends(disable_cuda_graph=disable_cuda_graph)
+            mr.init_attention_backends()
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs for all model runners."""
+        self.model_runner.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+        for mr in self.model_runner_list[1:]:
+            mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
