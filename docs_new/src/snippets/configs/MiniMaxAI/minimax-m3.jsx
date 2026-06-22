@@ -71,6 +71,13 @@ sgl-eval run gpqa \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking --n-repeats 4 --max-tokens 40960`,
+      mmmu_pro_pct:
+`pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run mmmu_pro \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --model {{MODEL_NAME}} \\
+  --temperature 1.0 --top-p 0.95 \\
+  --thinking`,
     },
     numPromptsByConc: { 24: 24, 64: 128 },
   },
@@ -78,6 +85,7 @@ sgl-eval run gpqa \\
   accuracyLabels: [
     ["gpqa_pct", "GPQA Diamond", "%"],
     ["gsm8k_pct", "GSM8K", "%"],
+    ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
   dockerImages: {
