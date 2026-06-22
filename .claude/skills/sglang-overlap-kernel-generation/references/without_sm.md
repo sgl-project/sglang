@@ -121,13 +121,13 @@ def consumer_gemm_compute_kernel(
     ag_signal_ptr,      # signal from AG [world_size] int32 (per-rank-shard)
     M, N, K,
     M_local,            # rows per rank
+    M_local_tiles,      # = cdiv(M_local, BLOCK_SIZE_M)
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    M_per_rank_tiles: tl.constexpr,  # = cdiv(M_local, BLOCK_SIZE_M)
     rank: tl.constexpr,
     world_size: tl.constexpr,
 ):
@@ -137,11 +137,8 @@ def consumer_gemm_compute_kernel(
     pid_n = pid % num_pid_n
 
     # Rank-aware tile rotation: remap pid_m so local tiles come first
-    # tile_in_rank = pid_m % M_per_rank_tiles
-    # rank_offset = pid_m // M_per_rank_tiles
-    # src_rank = (rank + rank_offset) % world_size
-    tile_in_rank = pid_m % M_per_rank_tiles
-    rank_offset = pid_m // M_per_rank_tiles
+    tile_in_rank = pid_m % M_local_tiles
+    rank_offset = pid_m // M_local_tiles
     src_rank = (rank + rank_offset) % world_size
 
     # Poll AG signal for this rank's shard (skip for local)
@@ -213,17 +210,19 @@ def ag_gemm_overlap(ctx, a_input, compute_kernel):
         )
 
     # Step 2: launch consumer compute kernel on current_stream (polls ag_signal)
+    # Without-SM mode: communication is on copy engine (zero SM cost), so the
+    # compute kernel can use ALL SMs. This kernel is non-persistent (one CTA per tile,
+    # no grid barrier), so num_tiles > SMs is safe — CUDA scheduler handles it.
     M = M_local * world_size
     N = ctx.N
-    M_per_rank_tiles = triton.cdiv(M_local, BLOCK_SIZE_M)
-    num_tiles = M_per_rank_tiles * world_size * triton.cdiv(N, BLOCK_SIZE_N)
+    M_local_tiles = triton.cdiv(M_local, BLOCK_SIZE_M)
+    num_tiles = M_local_tiles * world_size * triton.cdiv(N, BLOCK_SIZE_N)
 
     c = torch.empty((M, N), dtype=ctx.output_dtype, device=a_input.device)
     compute_kernel[(num_tiles,)](
         symm_ag_output, ctx.weight, c, ag_signal,
-        M, N, K, M_local,
+        M, N, K, M_local, M_local_tiles,
         # ... strides, block sizes, etc.
-        M_per_rank_tiles=M_per_rank_tiles,
         rank=rank,
         world_size=world_size,
     )

@@ -113,11 +113,16 @@ def launch_inter_sm_overlap(ctx, compute_fn, comm_fn, data, ...):
     # Ensure comm_stream sees signal reset
     comm_stream.wait_stream(current_stream)
 
-    # Launch compute kernel on current_stream (producer of signals)
+    # Launch compute kernel on current_stream (producer of signals).
+    # Compute kernel uses ctx.num_gemm_sms (= total SMs - num_comm_sms).
+    # This leaves num_comm_sms SMs free for the concurrent comm kernel.
+    compute_grid = (ctx.num_gemm_sms,)
     compute_fn[compute_grid](data, ctx.symm_buffer, ctx.signal, ...)
 
     # Launch persistent comm kernel on comm_stream.
-    # Comm kernel polls signal[] per-tile — no need to wait for GEMM to finish.
+    # Comm kernel uses ctx.num_comm_sms SMs — a small subset of total SMs.
+    # This kernel is persistent: CTAs loop over all tiles, polling signals.
+    # Grid size must not exceed num_comm_sms to avoid scheduling deadlock.
     with torch.cuda.stream(comm_stream):
         comm_fn[(ctx.num_comm_sms,)](
             ctx.symm_buffer,

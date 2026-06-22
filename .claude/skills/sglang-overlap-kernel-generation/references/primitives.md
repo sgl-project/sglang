@@ -107,7 +107,7 @@ def _load_acquire(ptr):
         "=r, l",
         [ptr],
         dtype=tl.uint32,
-        is_pure=True,
+        is_pure=False,
         pack=1,
     )
 ```
@@ -243,6 +243,14 @@ def barrier_on_this_grid(barrier_ptr):
 ```
 
 **Host-side requirement**: the counter must be reset to 0 between kernel launches (`ctx.grid_barrier.zero_()`).
+
+**⚠️ CRITICAL: `num_ctas` must not exceed SM for persistent kernels.** This barrier requires ALL CTAs to arrive before any can proceed. If `num_ctas > SMs`, some CTAs cannot be scheduled (SMs are fully occupied by earlier CTAs that are already spinning at the barrier) and the kernel deadlocks. Always cap the grid size:
+
+```python
+num_sm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+num_ctas = min(total_tiles, num_sm)  # conservative: assume 1 CTA/SM
+# or query actual occupancy and use: min(total_tiles, num_sm * occupancy)
+```
 
 ### 5.3 Rank level: `barrier_all_intra_node_atomic_cas_block`
 

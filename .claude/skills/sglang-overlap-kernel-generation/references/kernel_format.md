@@ -47,7 +47,13 @@ class <Op>OverlapContext:
     num_ranks: int
     num_local_ranks: int
 
-    # SM allocation
+    # SM allocation — semantics differ by overlap mode:
+    #   intra-sm:   num_comm_sms = total SMs (single kernel uses all SMs);
+    #               num_gemm_sms is unused (0).
+    #   inter-sm:   num_comm_sms = small set of SMs for persistent comm kernel;
+    #               num_gemm_sms = remaining SMs for compute kernel.
+    #   without-sm: comm is on copy engine (zero SMs); compute kernel uses all SMs;
+    #               num_comm_sms = 0, num_gemm_sms = total SMs.
     num_comm_sms: int
     num_gemm_sms: int = field(default=0, init=False)  # computed in __post_init__
 
@@ -225,11 +231,22 @@ def <op>_overlap(
     ctx.signal.zero_()
     ctx.grid_barrier.zero_()
 
-    # Compute grid dimensions (use ctx.num_comm_sms for persistent comm grid)
+    # Compute grid dimensions
+    # SM allocation differs by overlap mode:
+    #   intra-sm:   single kernel uses ALL SMs — num_ctas = min(total_tiles, num_sms)
+    #   inter-sm:   comm kernel uses num_comm_sms; compute kernel uses num_gemm_sms
+    #   without-sm: compute kernel uses all SMs; comm is on copy engine (zero SMs)
     n_blocks_m = triton.cdiv(M_per_rank, block_m)
     n_blocks_n = triton.cdiv(N_per_chunk, block_n)
     total_tiles = world_size * n_blocks_m * n_blocks_n
-    num_ctas = min(total_tiles, ctx.num_comm_sms)
+
+    # For intra-sm: the single fused kernel handles both compute and communication,
+    # so it should use all SMs on the device. The kernel contains a grid barrier,
+    # so num_ctas must not exceed the number of SMs (otherwise scheduling deadlock).
+    num_sm = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    num_ctas = min(total_tiles, num_sm)
 
     grid = (num_ctas,)
 

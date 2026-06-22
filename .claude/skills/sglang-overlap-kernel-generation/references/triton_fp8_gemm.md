@@ -48,6 +48,7 @@ def _w8a8_block_fp8_matmul(
     # Dimensions
     M, N, K,
     M_local,         # rows per rank (for compact AG layout row addressing)
+    M_local_tiles,   # cdiv(M_local, BLOCK_SIZE_M)
     # Block quantization sizes
     group_n, group_k,
     # Strides
@@ -63,13 +64,12 @@ def _w8a8_block_fp8_matmul(
     GROUP_SIZE_M: tl.constexpr,
     needs_k_masking: tl.constexpr,
     needs_m_masking: tl.constexpr,
-    M_per_rank_tiles: tl.constexpr,  # cdiv(M_local, BLOCK_SIZE_M)
     rank: tl.constexpr,
     world_size: tl.constexpr,
 ):
     # Swizzled PID for L2 locality
     pid = tl.program_id(axis=0)
-    num_pid_m = M_per_rank_tiles * world_size
+    num_pid_m = M_local_tiles * world_size
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
@@ -79,8 +79,8 @@ def _w8a8_block_fp8_matmul(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Rank-aware tile rotation (match AG signal arrival order)
-    logical_src_rank = min(pid_m // M_per_rank_tiles, world_size - 1)
-    tile_in_rank = pid_m - logical_src_rank * M_per_rank_tiles
+    logical_src_rank = min(pid_m // M_local_tiles, world_size - 1)
+    tile_in_rank = pid_m - logical_src_rank * M_local_tiles
     src_rank = (rank + logical_src_rank) % world_size
 
     # Row offsets — compact layout: src_rank * M_local + tile_in_rank * BLOCK_SIZE_M
@@ -194,8 +194,8 @@ def w8a8_block_fp8_matmul_triton(
 
     needs_k_masking = bool(K % block_k != 0)
     needs_m_masking = bool(M_local % block_m != 0)
-    M_per_rank_tiles = triton.cdiv(M_local, block_m)
-    num_pid_m = M_per_rank_tiles * world_size
+    M_local_tiles = triton.cdiv(M_local, block_m)
+    num_pid_m = M_local_tiles * world_size
     num_pid_n = triton.cdiv(N, block_n)
     num_tiles = num_pid_m * num_pid_n
 
@@ -203,6 +203,7 @@ def w8a8_block_fp8_matmul_triton(
         A, B, C, As, Bs,
         M, N, K,
         M_local,
+        M_local_tiles,
         block_n, block_k,
         A.stride(-2), A.stride(-1),
         B.stride(1), B.stride(0),
@@ -215,7 +216,6 @@ def w8a8_block_fp8_matmul_triton(
         GROUP_SIZE_M=32,
         needs_k_masking=needs_k_masking,
         needs_m_masking=needs_m_masking,
-        M_per_rank_tiles=M_per_rank_tiles,
         rank=rank,
         world_size=world_size,
         num_warps=4,

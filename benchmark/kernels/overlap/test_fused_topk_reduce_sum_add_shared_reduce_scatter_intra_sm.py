@@ -83,8 +83,8 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 def reference_topk_rss(
     expert_outputs: torch.Tensor,
     shared_expert_output: torch.Tensor,
-    topk_weights: torch.Tensor | None,
     pg,
+    routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     """
     Reference implementation using standard PyTorch ops + NCCL reduce-scatter.
@@ -92,19 +92,16 @@ def reference_topk_rss(
     Args:
         expert_outputs: [M, TOPK, N] routed expert outputs
         shared_expert_output: [M, N] shared expert output
-        topk_weights: [M, TOPK] gate weights, or None (unweighted sum)
         pg: process group for reduce-scatter
+        routed_scaling_factor: scalar applied after topk reduce-sum (default 1.0)
 
     Returns:
         [M_per_rank, N] reduced and scattered output
     """
     M, topk, N = expert_outputs.shape
 
-    # topk reduce-sum
-    if topk_weights is not None:
-        result = (expert_outputs * topk_weights[:, :, None]).sum(dim=1)
-    else:
-        result = expert_outputs.sum(dim=1)
+    # topk reduce-sum, then apply routed_scaling_factor
+    result = expert_outputs.sum(dim=1) * routed_scaling_factor
 
     # add shared expert output
     result = result + shared_expert_output
@@ -123,13 +120,10 @@ def reference_topk_rss(
 def compute_only(
     expert_outputs: torch.Tensor,
     shared_expert_output: torch.Tensor,
-    topk_weights: torch.Tensor | None,
 ) -> torch.Tensor:
     """Standalone compute: topk_reduce_sum + add shared expert output (no comm)."""
-    if topk_weights is not None:
-        result = (expert_outputs * topk_weights[:, :, None]).sum(dim=1)
-    else:
-        result = expert_outputs.sum(dim=1)
+    result = expert_outputs.sum(dim=1)
+    result = result * 2.5
     return result + shared_expert_output
 
 
@@ -142,12 +136,11 @@ def comm_only(tensor: torch.Tensor, output: torch.Tensor, pg) -> torch.Tensor:
 def non_overlap(
     expert_outputs: torch.Tensor,
     shared_expert_output: torch.Tensor,
-    topk_weights: torch.Tensor | None,
     output: torch.Tensor,
     pg,
 ) -> torch.Tensor:
     """Non-overlap: compute + comm sequentially (no overlap)."""
-    result = compute_only(expert_outputs, shared_expert_output, topk_weights)
+    result = compute_only(expert_outputs, shared_expert_output)
     dist.reduce_scatter_tensor(output, result, op=dist.ReduceOp.SUM, group=pg)
     return output
 
@@ -193,7 +186,6 @@ def test_correctness(args):
     N = args.N
     topk = args.topk
     dtype = getattr(torch, args.dtype)
-    has_weights = not args.no_weights
 
     assert M % world_size == 0, f"M ({M}) must be divisible by world_size ({world_size})"
 
@@ -205,17 +197,18 @@ def test_correctness(args):
     # Generate random inputs
     expert_outputs = torch.randn(M, topk, N, dtype=dtype, device=f"cuda:{local_rank}")
     shared_expert_output = torch.randn(M, N, dtype=dtype, device=f"cuda:{local_rank}")
-    topk_weights = None
-    if has_weights:
-        topk_weights = torch.randn(M, topk, dtype=dtype, device=f"cuda:{local_rank}")
 
     # Run overlap kernel
     overlap_out = fused_topk_reduce_sum_add_shared_reduce_scatter(
-        ctx, expert_outputs, shared_expert_output, topk_weights,
+        ctx, expert_outputs, shared_expert_output,
+        routed_scaling_factor=1.0,
     )
 
     # Run reference
-    ref_out = reference_topk_rss(expert_outputs, shared_expert_output, topk_weights, pg)
+    ref_out = reference_topk_rss(
+        expert_outputs, shared_expert_output, pg,
+        routed_scaling_factor=1.0,
+    )
 
     # Compare
     torch.cuda.synchronize()
@@ -230,7 +223,7 @@ def test_correctness(args):
         status = "PASSED" if passed else "FAILED"
         print(f"[Correctness] {status}")
         print(f"  Config: M={M}, N={N}, topk={topk}, dtype={args.dtype}, "
-              f"world_size={world_size}, has_weights={has_weights}")
+              f"world_size={world_size}")
         print(f"  cosine_diff={diff:.6f}, max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
         if not passed:
             print(f"  Expected (first row): {ref_out[0, :8]}")
@@ -257,7 +250,6 @@ def test_performance(args):
     N = args.N
     topk = args.topk
     dtype = getattr(torch, args.dtype)
-    has_weights = not args.no_weights
     warmup = args.warmup
     iters = args.iters
 
@@ -272,9 +264,6 @@ def test_performance(args):
     # Generate inputs
     expert_outputs = torch.randn(M, topk, N, dtype=dtype, device=f"cuda:{local_rank}")
     shared_expert_output = torch.randn(M, N, dtype=dtype, device=f"cuda:{local_rank}")
-    topk_weights = None
-    if has_weights:
-        topk_weights = torch.randn(M, topk, dtype=dtype, device=f"cuda:{local_rank}")
 
     # Pre-allocate comm-only tensors
     compute_result = torch.randn(M, N, dtype=dtype, device=f"cuda:{local_rank}")
@@ -290,12 +279,12 @@ def test_performance(args):
     # 1. Compute-only
     _, compute_ms = perf_func(
         compute_only, warmup, iters,
-        expert_outputs, shared_expert_output, topk_weights,
+        expert_outputs, shared_expert_output,
     )
 
     # 2. Comm-only (NCCL reduce-scatter)
     # Need a fresh compute_result for comm input
-    fresh_result = compute_only(expert_outputs, shared_expert_output, topk_weights)
+    fresh_result = compute_only(expert_outputs, shared_expert_output)
     _, comm_ms = perf_func(
         comm_only, warmup, iters,
         fresh_result, comm_output, pg,
@@ -304,14 +293,39 @@ def test_performance(args):
     # 3. Non-overlap (compute + comm sequential)
     _, non_overlap_ms = perf_func(
         non_overlap, warmup, iters,
-        expert_outputs, shared_expert_output, topk_weights,
+        expert_outputs, shared_expert_output,
         non_overlap_output, pg,
     )
 
     # 4. Overlap kernel
     _, overlap_ms = perf_func(
         fused_topk_reduce_sum_add_shared_reduce_scatter, warmup, iters,
-        ctx, expert_outputs, shared_expert_output, topk_weights,
+        ctx, expert_outputs, shared_expert_output, 1.0,
+    )
+
+    from moe_reduce_rs import (
+        MoEReduceRSSymmMemContext,
+        create_moe_rs_symm_mem_context,
+        reduce_topk_reduce_scatter_a2a_intra_node_with_shared_expert_symm_mem,
+    )
+
+    ctx = create_moe_rs_symm_mem_context(
+        rank=rank,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        max_token_num=M,
+        hidden_dim=N,
+        num_experts=0,
+        topk=topk,
+        input_dtype=dtype,
+        group=pg,
+    )
+    output = torch.empty(
+        (M_per_rank, N), dtype=expert_outputs.dtype, device=expert_outputs.device,
+    )
+    _, overlap_ms = perf_func(
+        reduce_topk_reduce_scatter_a2a_intra_node_with_shared_expert_symm_mem, warmup, iters,
+        expert_outputs, shared_expert_output, ctx, M, 7, output, 1.0,
     )
 
     if rank == 0:
@@ -338,7 +352,7 @@ def test_performance(args):
         print(f"  Overlap efficiency = max(compute, comm) / overlap = "
               f"{overlap_efficiency:.3f}")
         print(f"  Config: M={M}, N={N}, topk={topk}, dtype={args.dtype}, "
-              f"world_size={world_size}, has_weights={has_weights}")
+              f"world_size={world_size}")
 
     ctx.finalize()
     dist.destroy_process_group()
@@ -375,12 +389,12 @@ def test_multi_size(args):
 
         expert_outputs = torch.randn(M, topk, N, dtype=dtype, device=f"cuda:{local_rank}")
         shared_expert_output = torch.randn(M, N, dtype=dtype, device=f"cuda:{local_rank}")
-        topk_weights = torch.randn(M, topk, dtype=dtype, device=f"cuda:{local_rank}")
 
         overlap_out = fused_topk_reduce_sum_add_shared_reduce_scatter(
-            ctx, expert_outputs, shared_expert_output, topk_weights,
+            ctx, expert_outputs, shared_expert_output,
+            routed_scaling_factor=1.0,
         )
-        ref_out = reference_topk_rss(expert_outputs, shared_expert_output, topk_weights, pg)
+        ref_out = reference_topk_rss(expert_outputs, shared_expert_output, pg)
 
         torch.cuda.synchronize()
         diff = calc_diff(overlap_out, ref_out)
@@ -411,7 +425,6 @@ def test_stability(args, n_iters=50):
     N = args.N
     topk = args.topk
     dtype = getattr(torch, args.dtype)
-    has_weights = not args.no_weights
 
     assert M % world_size == 0, f"M ({M}) must be divisible by world_size ({world_size})"
 
@@ -426,14 +439,12 @@ def test_stability(args, n_iters=50):
         torch.manual_seed(100 + i + rank)
         expert_outputs = torch.randn(M, topk, N, dtype=dtype, device=f"cuda:{local_rank}")
         shared_expert_output = torch.randn(M, N, dtype=dtype, device=f"cuda:{local_rank}")
-        topk_weights = None
-        if has_weights:
-            topk_weights = torch.randn(M, topk, dtype=dtype, device=f"cuda:{local_rank}")
 
         overlap_out = fused_topk_reduce_sum_add_shared_reduce_scatter(
-            ctx, expert_outputs, shared_expert_output, topk_weights,
+            ctx, expert_outputs, shared_expert_output,
+            routed_scaling_factor=1.0,
         )
-        ref_out = reference_topk_rss(expert_outputs, shared_expert_output, topk_weights, pg)
+        ref_out = reference_topk_rss(expert_outputs, shared_expert_output, pg)
 
         torch.cuda.synchronize()
         diff = calc_diff(overlap_out, ref_out)
@@ -467,7 +478,7 @@ def parse_args():
         help="Test mode",
     )
     # Shape parameters
-    parser.add_argument("--M", type=int, default=4096, help="Total token count (must be divisible by world_size)")
+    parser.add_argument("--M", type=int, default=8192, help="Total token count (must be divisible by world_size)")
     parser.add_argument("--N", type=int, default=7168, help="Hidden dimension")
     parser.add_argument("--topk", type=int, default=8, help="Number of selected experts")
     # Benchmark parameters
@@ -476,8 +487,6 @@ def parse_args():
     # Misc
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["bfloat16", "float16"], help="Data type")
-    parser.add_argument("--no-weights", action="store_true",
-                        help="Disable gating weights (unweighted sum)")
     parser.add_argument("--profile", action="store_true",
                         help="Export torch profiler trace")
     return parser.parse_args()

@@ -189,7 +189,8 @@ def fused_compute_allgather(input_ptr, output_ptr, peer_ptrs, ...):
 
 ## Step 3: Host-Side Launch
 
-Single kernel launch, no stream management needed:
+Single kernel launch, no stream management needed. The fused kernel handles both
+compute and communication, so it uses **all SMs** on the device.
 
 ```python
 def launch_intra_sm_overlap(kernel_fn, input_tensor, ...):
@@ -220,7 +221,12 @@ def launch_intra_sm_overlap(kernel_fn, input_tensor, ...):
     barrier = torch.zeros(1, dtype=torch.int32, device=device)
     output = torch.empty(output_shape, dtype=input_tensor.dtype, device=device)
 
-    grid = (num_tiles,)
+    # Intra-SM: single kernel uses ALL SMs (compute + communication are fused).
+    # num_ctas must not exceed SM count — this is a persistent kernel with a grid barrier,
+    # so all CTAs must be concurrently schedulable to avoid deadlock.
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    num_ctas = min(num_tiles, num_sm)
+    grid = (num_ctas,)
     kernel_fn[grid](
         input_tensor, output, peer_ptrs, barrier,
         signal_pad_ptrs_device,

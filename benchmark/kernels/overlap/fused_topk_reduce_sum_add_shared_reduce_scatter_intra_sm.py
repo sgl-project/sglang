@@ -4,8 +4,9 @@ Fused TopK Reduce-Sum + Add Shared Expert Output + Reduce-Scatter Overlap Kernel
 Intra-SM Mode: compute and communication are fused into a single kernel.
 
 Compute:
-  1. topk_reduce_sum: sum routed expert outputs across topk dimension (with optional
-     gating weights)
+  1. topk_reduce_sum: sum routed expert outputs across topk dimension
+     (gating weights have already been applied by the expert GEMM kernels,
+      so only a plain sum is needed here)
   2. add shared_expert_output: element-wise add the shared expert output
 
 Communication:
@@ -21,9 +22,8 @@ Architecture:
   +---------------------------------------------------+
 
 Input shapes (per rank):
-  - expert_outputs:      [M, TOPK, N] or [M * TOPK, N]  (routed expert outputs)
-  - topk_weights:        [M, TOPK]                       (gate weights, optional)
-  - shared_expert_output: [M, N]                         (shared expert output)
+  - expert_outputs:       [M, TOPK, N] or [M * TOPK, N]  (routed expert outputs)
+  - shared_expert_output: [M, N]                          (shared expert output)
 
 Output shape (per rank):
   - output: [M_per_rank, N]  where M_per_rank = M // world_size
@@ -105,7 +105,7 @@ def _load_acquire(ptr):
         "=r, l",
         [ptr],
         dtype=tl.uint32,
-        is_pure=True,
+        is_pure=False,
         pack=1,
     )
 
@@ -355,8 +355,8 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter_kernel(
     # ---- input/output pointers ----
     expert_outputs_ptr,       # [M * TOPK, N] — flattened routed expert outputs
     shared_expert_ptr,        # [M, N]        — shared expert output
-    topk_weights_ptr,         # [M, TOPK]     — gate weights (dummy if HAS_WEIGHTS=False)
     output_ptr,               # [M_per_rank, N] — reduce-scatter output (written by host-side torch.sum)
+    routed_scaling_factor,    # scalar float — applied after topk reduce-sum
     # ---- symmetric buffer pointer arrays ----
     buf_ptrs,                 # [world_size], int64
     # ---- sync ----
@@ -370,8 +370,6 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter_kernel(
     stride_xn: tl.constexpr,      # expert_outputs col stride
     stride_shared_m: tl.constexpr,  # shared_expert row stride
     stride_shared_n: tl.constexpr,  # shared_expert col stride
-    stride_wm: tl.constexpr,      # topk_weights row stride
-    stride_wk: tl.constexpr,      # topk_weights expert stride
     stride_buf_m: tl.constexpr,   # symm_buffer row stride
     stride_buf_n: tl.constexpr,   # symm_buffer col stride
     # ---- distributed (constexpr) ----
@@ -383,14 +381,14 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter_kernel(
     N_CHUNKS: tl.constexpr,       # number of chunks along N dimension
     TOPK: tl.constexpr,           # compile-time topk for full unrolling
     DTYPE: tl.constexpr,          # output dtype (tl.bfloat16 or tl.float16)
-    HAS_WEIGHTS: tl.constexpr,    # whether to use gating weights
 ):
     """
     Fused kernel: topk_reduce_sum + add shared_expert_output + reduce-scatter (A2A push).
 
     Phase 1: Each CTA (persistent) iterates over tiles for all destination peers.
              For each tile:
-               a) Load expert_outputs, reduce across TOPK dimension (weighted or unweighted)
+               a) Load expert_outputs, reduce across TOPK dimension (plain sum),
+                  then multiply by routed_scaling_factor
                b) Load and add shared_expert_output
                c) Push the result to the destination peer's symmetric buffer
     Phase 2: Grid barrier + cross-rank barrier
@@ -442,25 +440,12 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter_kernel(
                             + offs_n[None, :].to(tl.int64) * stride_xn)
             expert_ptrs = expert_outputs_ptr + n_chunk_off_x + base_row_off
 
-            if HAS_WEIGHTS:
-                # Weighted accumulation: accum += weight_k * expert_k
-                accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                for k in tl.static_range(0, TOPK):
-                    expert_val = tl.load(expert_ptrs + k * stride_xm,
-                                         mask=mask, other=0.0).to(tl.float32)
-                    weight_k = tl.load(
-                        topk_weights_ptr
-                        + global_row.to(tl.int64)[:, None] * stride_wm
-                        + k * stride_wk,
-                        mask=mask_m[:, None], other=0.0,
-                    ).to(tl.float32)
-                    accum += weight_k * expert_val
-            else:
-                # Unweighted sum: accum = sum over experts
-                accum = tl.load(expert_ptrs, mask=mask, other=0.0).to(tl.float32)
-                for k in tl.static_range(1, TOPK):
-                    accum += tl.load(expert_ptrs + k * stride_xm,
-                                     mask=mask, other=0.0).to(tl.float32)
+            # Sum across TOPK dimension (gating weights already applied upstream)
+            accum = tl.load(expert_ptrs, mask=mask, other=0.0).to(tl.float32)
+            for k in tl.static_range(1, TOPK):
+                accum += tl.load(expert_ptrs + k * stride_xm,
+                                 mask=mask, other=0.0).to(tl.float32)
+            accum = accum * routed_scaling_factor
 
             # --- Add shared expert output ---
             shared_row_off = (global_row.to(tl.int64)[:, None] * stride_shared_m
@@ -509,7 +494,7 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
     ctx: TopkRsSOverlapContext,
     expert_outputs: torch.Tensor,
     shared_expert_output: torch.Tensor,
-    topk_weights: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.0,
     output: Optional[torch.Tensor] = None,
     block_m: Optional[int] = None,
     block_n: Optional[int] = None,
@@ -525,7 +510,7 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
         ctx:           pre-allocated overlap context
         expert_outputs:  routed expert outputs, shape [M, TOPK, N] or [M*TOPK, N]
         shared_expert_output: shared expert output, shape [M, N]
-        topk_weights:    gate weights, shape [M, TOPK], or None for unweighted sum
+        routed_scaling_factor: scalar applied after topk reduce-sum (default 1.0)
         output:          pre-allocated output tensor [M_per_rank, N], or None
         block_m:         tile size in M dimension (auto-computed if None)
         block_n:         tile size in N dimension (auto-computed if None)
@@ -571,11 +556,6 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
 
     # Resolve dtype
     DTYPE = tl.bfloat16 if x_flat.dtype == torch.bfloat16 else tl.float16
-    HAS_WEIGHTS = topk_weights is not None
-
-    # If no weights provided, use a dummy (won't be accessed by the kernel)
-    if topk_weights is None:
-        topk_weights = x_flat  # dummy — HAS_WEIGHTS=False ensures it's never loaded
 
     # Allocate output
     if output is None:
@@ -591,7 +571,15 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
     num_tiles_n = triton.cdiv(N_per_chunk, block_n)
     blocks_per_rank = num_tiles_m * num_tiles_n
     total_tiles = ctx.num_ranks * blocks_per_rank
-    num_ctas = min(total_tiles, 256)  # cap CTAs to avoid launch overhead
+    # Cap CTAs to SM count — this is a persistent kernel with a grid barrier,
+    # so ALL CTAs must be concurrently resident on SMs to avoid scheduling
+    # deadlock.  is_pure=False on _load_acquire increases register pressure,
+    # which can reduce occupancy to 1 CTA/SM; if num_ctas > SMs, later CTAs
+    # cannot be scheduled and the barrier deadlocks.
+    num_sm = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    num_ctas = min(total_tiles, num_sm)
 
     grid = (num_ctas,)
 
@@ -599,8 +587,8 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
     fused_topk_reduce_sum_add_shared_reduce_scatter_kernel[grid](
         x_flat,
         shared_expert_output,
-        topk_weights,
         output,
+        routed_scaling_factor,
         ctx.buf_ptrs,
         ctx.grid_barrier,
         ctx.signal_pad_ptrs,
@@ -609,8 +597,6 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
         stride_xn=x_flat.stride(1),
         stride_shared_m=shared_expert_output.stride(0),
         stride_shared_n=shared_expert_output.stride(1),
-        stride_wm=topk_weights.stride(0),
-        stride_wk=topk_weights.stride(1),
         stride_buf_m=ctx.symm_buffer.stride(0),
         stride_buf_n=ctx.symm_buffer.stride(1),
         rank=ctx.rank,
@@ -620,7 +606,6 @@ def fused_topk_reduce_sum_add_shared_reduce_scatter(
         N_CHUNKS=n_chunks,
         TOPK=topk,
         DTYPE=DTYPE,
-        HAS_WEIGHTS=HAS_WEIGHTS,
         num_warps=num_warps,
         num_stages=num_stages,
     )
