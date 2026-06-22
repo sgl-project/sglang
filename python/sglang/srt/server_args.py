@@ -4651,7 +4651,11 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         if (
-            self.prefill_attention_backend == "fa4"
+            (
+                self.attention_backend == "fa4"
+                or self.decode_attention_backend == "fa4"
+                or self.prefill_attention_backend == "fa4"
+            )
             and not self.use_mla_backend()
             and is_sm100_supported()
         ):
