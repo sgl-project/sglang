@@ -1154,5 +1154,97 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestDeepEPCaptureBsClamp(unittest.TestCase):
+    """get_batch_sizes_to_capture clamps the decode capture list to the
+    DeepEP low_latency dispatch buffer when deepep runs the low_latency path,
+    so HT can drop --max-running-requests without tripping the dispatch
+    assertion during graph capture.
+    """
+
+    def _make_runner(self, deepep_mode, max_running_requests=None):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            deepep_mode=deepep_mode,
+        )
+        server_args.deepep_mode = deepep_mode
+        server_args.enable_torch_compile = False
+        # Default decode capture list (max_bs=512): includes 256 and 512.
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        runner = MagicMock()
+        runner.server_args = server_args
+        # req_to_token_pool.size large enough not to clamp before the DeepEP gate.
+        runner.req_to_token_pool.size = 2048
+        return runner
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_auto_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("auto")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertGreater(max(capture_bs), 0)
+        # DeepEP low_latency buffer default is 128; capture list must not exceed it.
+        self.assertLessEqual(max(capture_bs), 128)
+        self.assertIn(128, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_low_latency_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("low_latency")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertLessEqual(max(capture_bs), 128)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_in_normal_mode(self, mock_get_parallel, _):
+        # normal mode disables cuda graph; the clamp must not fire.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("normal")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        # 512 is in the default list and normal mode must NOT clamp it away.
+        self.assertIn(512, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_non_deepep_backend(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("auto")
+        runner.server_args.moe_a2a_backend = "none"
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertIn(512, capture_bs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
@@ -90,6 +91,17 @@ def get_batch_sizes_to_capture(
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
+
+    # DeepEP low_latency dispatch caps per-rank dispatch tokens at
+    # num_max_dispatch_tokens_per_rank (default 128). When the MoE A2A backend is
+    # DeepEP and the mode runs the low_latency path (auto/low_latency, not normal),
+    # a decode capture bs above that cap overflows the dispatch buffer and trips an
+    # assertion during graph capture. Clamp the list so the default capture list
+    # works without forcing the user to set --max-running-requests just to dodge it.
+    if server_args.moe_a2a_backend == "deepep" and server_args.deepep_mode != "normal":
+        deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if max(capture_bs) > deepep_cap:
+            capture_bs = [bs for bs in capture_bs if bs <= deepep_cap]
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
