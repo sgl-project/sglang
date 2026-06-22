@@ -36,7 +36,9 @@ class TestHiSparseOnlineC128MTPValidation(CustomTestCase):
             stack.enter_context(
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(experimental)
             )
-            stack.enter_context(envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(compressor_v2))
+            stack.enter_context(
+                envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(compressor_v2)
+            )
             stack.enter_context(
                 patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
             )

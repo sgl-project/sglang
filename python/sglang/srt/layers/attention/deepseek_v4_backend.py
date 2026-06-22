@@ -521,7 +521,9 @@ class DeepseekV4AttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None and pool.ratio == 128
         )
-        state_slot_offset = self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
+        state_slot_offset = (
+            self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
+        )
         max_draft_tokens = self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
 
         if getattr(model_runner, "is_draft_worker", False):
@@ -1159,9 +1161,7 @@ class DeepseekV4AttnBackend(
             if max_seq_len_override is None
             else max_seq_len_override
         )
-        verify_bs = self._active_batch_size(
-            forward_batch, req_pool_indices, seq_lens
-        )
+        verify_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
