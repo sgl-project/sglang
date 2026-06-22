@@ -57,8 +57,8 @@ def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
 @contextmanager
 def moe_output_copy_add_ctx(
     shared_output: torch.Tensor,
-    ready_event: Optional[object] = None,
-) -> Generator[Optional[MoeOutputCopyAddState], None, None]:
+    ready_event: Optional[torch.cuda.Event] = None,
+) -> Generator[MoeOutputCopyAddState, None, None]:
     state = MoeOutputCopyAddState(
         shared_output=shared_output,
         ready_event=ready_event,
