@@ -42,8 +42,6 @@ from typing import (
     Union,
 )
 
-import multiprocessing as mp
-
 import torch
 import uvloop
 import zmq
