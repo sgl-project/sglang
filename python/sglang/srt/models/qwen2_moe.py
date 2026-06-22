@@ -352,17 +352,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _get_shared_expert_weights(
         self, hidden_states: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, float]]:
-        """Return raw shared_expert_gate logits and the 1/ep_size scale.
+        """Return the shared_expert_gate weights and the 1/ep_size scale.
 
-        The sigmoid activation and the scale are applied (in fp32) inside the
-        fused append kernel, so this returns the raw gate logits rather than
-        ``sigmoid(logits)`` to avoid a standalone activation kernel + cast.
+        On the AMD AITER path the sigmoid activation and the scale are applied
+        (in fp32) inside the fused append kernel, so this returns the raw gate
+        logits to avoid a standalone activation kernel + cast. On the CUDA path
+        the legacy eager ``sigmoid(logits) * scale`` is returned unchanged.
         """
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return None
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
-        # This block runs only on the AMD AITER shared_expert_fusion path
         # Allreduce-EP path: the fused shared expert occupies a single global
         # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
         # == num_fused_shared_experts when not is_deepep_class_backend()). Every
@@ -374,6 +374,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         moe_ep_size = get_parallel().moe_ep_size
         if moe_ep_size > 1 and not is_deepep_class_backend():
             scale = 1.0 / float(moe_ep_size)
+        # Only AITER fuses sigmoid + cast in-kernel; on CUDA keep the legacy
+        # eager activation so the NVIDIA path behavior is unchanged.
+        if not _use_aiter:
+            return F.sigmoid(shared_logits) * scale, 1.0
         return shared_logits, scale
 
     def _append_shared_to_topk_output(
@@ -387,19 +391,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared = self._get_shared_expert_weights(hidden_states)
         if shared is None:
             return topk_output
-        shared_logits, shared_scale = shared
+        shared_weights, shared_scale = shared
 
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
+        # AITER returns raw logits + scale for in-kernel sigmoid fusion; CUDA
+        # returns pre-activated weights (scale already folded in) → no fusion.
         fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
             topk_output.topk_ids,
             topk_output.topk_weights,
-            shared_logits,
+            shared_weights,
             self.num_fused_shared_experts,
             N=self.num_experts,
-            apply_sigmoid=True,
+            apply_sigmoid=_use_aiter,
             scale=shared_scale,
         )
         return StandardTopKOutput(
