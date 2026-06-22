@@ -20,6 +20,8 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
+BOOTSTRAP_CONTENTION_REQUESTS = 4
+BOOTSTRAP_CONTENTION_WORKERS = 4
 
 
 def rid_that_forces_retry(prefix: str) -> str:
