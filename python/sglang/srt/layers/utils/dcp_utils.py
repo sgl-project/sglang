@@ -587,9 +587,9 @@ def all_gather_kv_cache_for_mla_extend(
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):
-    dcp_world_size = get_dcp_world_size()
     if not dcp_enabled():
         return
+    dcp_world_size = get_dcp_world_size()
     dcp_rank = get_dcp_rank()
     offset = dcp_rank + 1
     kv_len_arr.sub_(offset).div_(dcp_world_size, rounding_mode="floor").add_(1)
