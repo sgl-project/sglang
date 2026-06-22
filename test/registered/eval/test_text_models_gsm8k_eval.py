@@ -92,6 +92,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         base_url=self.base_url,
                         model=model_setup.model_path,
                         eval_name="gsm8k",
+                        api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
                     )

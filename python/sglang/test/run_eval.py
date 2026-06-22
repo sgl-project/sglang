@@ -272,22 +272,21 @@ def run_eval(args):
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
-        if getattr(args, "api", "chat") == "completion":
-            # Completion-mode callers (EAGLE/PCG/hybrid-attn spec-decoding tests,
-            # test_max_token_one) depend on the 5-shot last-number scorer for
-            # score/throughput at low max_tokens; sgl-eval is chat + \boxed{} and
-            # cannot serve them. Keep the hand-rolled scorer for completion mode.
-            from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
-
-            eval_obj = GSM8KEval(
-                num_examples=args.num_examples,
-                num_threads=args.num_threads,
-                num_shots=getattr(args, "num_shots", 5),
-                data_path=getattr(args, "gsm8k_data_path", None),
-            )
-        else:
-            # Nightly correctness eval (chat mode) uses the external sgl-eval harness.
+        if getattr(args, "api", None) == "sgl_eval":
+            # Only the nightly correctness eval opts into sgl-eval (zero-shot
+            # chat, \boxed{}, math_verify). Every other gsm8k caller — spec
+            # decoding perf/accuracy, disaggregation, quant, model e2e — uses
+            # the 5-shot completion last-number scorer and relies on
+            # max_tokens/throughput behavior sgl-eval cannot provide.
             return _run_sgl_eval("gsm8k", args)
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
 
