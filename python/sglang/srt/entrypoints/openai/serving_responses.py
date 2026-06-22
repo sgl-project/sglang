@@ -57,16 +57,22 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
     Function,
+    LogProbs,
     MessageProcessingResult,
+    OutputTokenUsageInfo,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseUsageInfo,
     Tool,
-    UsageInfo,
+    ToolChoice,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.utils import (
+    to_openai_style_logprobs,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -319,6 +325,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
 
+                    should_return_logprobs = self._should_return_logprobs(request)
+                    # Extract routed_dp_rank from header (has higher priority than body)
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         image_data=(
@@ -346,6 +358,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=self._is_thinking_enabled_for_request(
+                            request
+                        ),
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+                        priority=request.priority,
+                        routing_key=self.extract_routing_key(raw_request),
+                        custom_labels=self.extract_custom_labels(raw_request),
+                        return_logprob=should_return_logprobs,
+                        logprob_start_len=-1,
+                        top_logprobs_num=(
+                            request.top_logprobs if should_return_logprobs else 0
+                        ),
+                        return_text_in_logprobs=True,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -461,6 +490,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
@@ -524,8 +555,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
+            logprobs = None
+            if self._should_return_logprobs(request):
+                logprobs = self._build_response_logprobs(final_res)
+
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request, final_res["text"], logprobs, tokenizer
             )
 
             # Calculate usage from actual output
@@ -572,14 +607,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
+        usage = ResponseUsageInfo(
+            input_tokens=num_prompt_tokens,
+            output_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+            output_tokens_details=OutputTokenUsageInfo(
+                reasoning_tokens=num_reasoning_tokens
+            ),
         )
         if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
+            usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
         request_metadata.final_usage_info = usage
@@ -629,7 +666,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             if mode in ("thinking", "enable_thinking"):
                 return effort != "none"
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                return False
+                toggle = mode.replace("explicit_", "")
+                return (
+                    request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.get(toggle) is True
+                )
             return False
         if config.special_case == "always":
             return True
@@ -639,12 +680,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             return False
         if effort == "none":
             return False
-        return bool(config.default_enabled)
+        if config.default_enabled:
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get(config.toggle_param) is not False
+            )
+        return (
+            request.chat_template_kwargs is not None
+            and request.chat_template_kwargs.get(config.toggle_param) is True
+        )
 
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
         final_output: Any,
+        logprobs: Optional[list[dict]],
         tokenizer: Any,
     ):
         if self.reasoning_parser:
@@ -688,7 +738,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items.append(reasoning_item)
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        is_required = request.tool_choice == "required"
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
         if (
@@ -750,7 +802,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=logprobs,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -783,6 +835,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = []
         for tool in request.tools:
             if tool.type != "function":
+                continue
+            if not tool.name:
+                logger.warning(
+                    f"Skipping function tool without function name definition: {tool}"
+                )
                 continue
             chat_tools.append(
                 Tool(
@@ -888,7 +945,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": message.get("output", ""),
+                "content": cls._normalize_response_content_part_for_chat(
+                    message.get("output", "")
+                ),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
@@ -1777,7 +1836,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        is_required = request.tool_choice == "required"
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
@@ -1825,6 +1886,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+        n_prev_token = 0
+        return_logprobs = self._should_return_logprobs(request)
 
         def _open_reasoning_item() -> str:
             nonlocal current_output_index
@@ -2022,6 +2085,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 finish_reason = meta.get("finish_reason") or finish_reason
 
+                streaming_logprobs = None
+                if return_logprobs:
+                    streaming_logprobs = self._process_streaming_logprobs_for_responses(
+                        ctx.last_output,
+                        n_prev_token,
+                    )
+                    if meta.get("output_token_logprobs_length"):
+                        n_prev_token = meta["output_token_logprobs_length"]
+
                 text = chunk.get("text", "") or ""
                 if incremental:
                     delta = text
@@ -2074,6 +2146,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     sequence_number=-1,
                                 )
                             )
+
                     reasoning_state["text"] += reasoning_chunk
                     if wants_summary:
                         yield _send_event(
@@ -2158,7 +2231,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                             output_index=message_state["output_index"],
                             item_id=message_state["item_id"],
                             delta=normal_text,
-                            logprobs=[],
+                            logprobs=(
+                                streaming_logprobs
+                                if streaming_logprobs is not None
+                                else []
+                            ),
                         )
                     )
 
@@ -2253,14 +2330,16 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         final_output_items = list(emitted_items)
 
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+        usage = ResponseUsageInfo(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
-            reasoning_tokens=reasoning_tokens_meta,
+            output_tokens_details=OutputTokenUsageInfo(
+                reasoning_tokens=reasoning_tokens_meta
+            ),
         )
         if self.enable_prompt_tokens_details and cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
+            usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
             )
         request_metadata.final_usage_info = usage
@@ -2281,19 +2360,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[final_response.id] = final_response
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": cached_tokens,
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": reasoning_tokens_meta,
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -2374,3 +2440,115 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+
+    def _should_return_logprobs(self, request: ResponsesRequest) -> bool:
+        """Check if logprobs should be returned based on include parameter."""
+        return (
+            request.include is not None
+            and "message.output_text.logprobs" in request.include
+        )
+
+    def _build_response_logprobs(
+        self, ret_item: dict[str, Any]
+    ) -> Optional[list[dict]]:
+        """Convert logprobs for ResponseOutputText format."""
+
+        meta_info = ret_item.get("meta_info", {})
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=meta_info["output_token_logprobs"],
+            output_top_logprobs=meta_info.get("output_top_logprobs", None),
+        )
+
+        # 转换为 ResponseOutputText.logprobs 所需格式
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _process_streaming_logprobs_for_responses(
+        self,
+        output: dict[str, Any],
+        n_prev_token: int,
+    ) -> Optional[list[dict]]:
+        """Process logprobs for streaming response in Responses API format.
+
+        Args:
+            output: The output dict containing meta_info with logprobs data
+            n_prev_token: Number of previously processed tokens
+
+        Returns:
+            List of logprob dicts for ResponseTextDeltaEvent, or None if not available
+        """
+        meta_info = output.get("meta_info", {})
+
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        output_token_logprobs = meta_info["output_token_logprobs"]
+        output_top_logprobs = meta_info.get("output_top_logprobs", [])
+
+        # 获取已处理的总 token 数
+        total_output_logprobs = meta_info["output_token_logprobs_length"]
+
+        # 只处理新增的 tokens
+        if n_prev_token >= total_output_logprobs:
+            return None
+
+        # 切片获取新增的 logprobs
+        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+            output_token_logprobs = output_token_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
+            output_top_logprobs = (
+                output_top_logprobs[n_prev_token:total_output_logprobs]
+                if output_top_logprobs
+                else []
+            )
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
+        )
+
+        # 转换为 ResponseTextDeltaEvent.logprobs 所需格式
+        # 格式: List[Dict] 每个元素包含 token, logprob, bytes, top_logprobs
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _parse_logprobs_tokens(
+        self, logprobs: LogProbs, use_token_index: bool = False
+    ) -> Optional[list[dict]]:
+        """Common helper to process logprobs tokens for both streaming and non-streaming"""
+        token_logprobs = []
+
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
+        ):
+            token_bytes = list(token.encode("utf-8"))
+            top_logprobs = []
+            if logprobs.top_logprobs:
+                # - Non-streaming (use_token_index=True): uses token_idx for full data
+                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
+                top_logprobs_idx = token_idx if use_token_index else 0
+                for top_token, top_logprob in logprobs.top_logprobs[
+                    top_logprobs_idx
+                ].items():
+                    top_token_bytes = list(top_token.encode("utf-8"))
+                    top_logprobs.append(
+                        {
+                            "token": top_token,
+                            "bytes": top_token_bytes,
+                            "logprob": top_logprob,
+                        }
+                    )
+            token_logprobs.append(
+                {
+                    "token": token,
+                    "bytes": token_bytes,
+                    "logprob": logprob,
+                    "top_logprobs": top_logprobs,
+                }
+            )
+
+        return token_logprobs
