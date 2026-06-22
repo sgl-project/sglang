@@ -563,6 +563,7 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self._shared_ready_event: Optional[torch.cuda.Event] = None
         self.is_nextn = is_nextn
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
@@ -890,7 +891,9 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None and not self._shared_expert_tp1:
             from sglang.srt.layers.moe.moe_runner.base import moe_output_copy_add_ctx
 
-            shared_ready_event = current_stream.record_event()
+            if self._shared_ready_event is None:
+                self._shared_ready_event = torch.cuda.Event(enable_timing=False)
+            shared_ready_event = current_stream.record_event(self._shared_ready_event)
             copy_add_ctx = moe_output_copy_add_ctx(
                 shared_output,
                 shared_ready_event,
