@@ -148,6 +148,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.deepseek_common.pp_proxy import PPProxyTopKBuffer
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -2265,6 +2266,7 @@ class DeepseekV2Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+        self.pp_proxy_topk_buffer = PPProxyTopKBuffer()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
             is_prefill_context_parallel_enabled() and not self.use_dsa
@@ -2541,6 +2543,8 @@ class DeepseekV2Model(nn.Module):
                     topk_indices = hidden_states.new_empty(
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
+                else:
+                    topk_indices = self.pp_proxy_topk_buffer.copy(topk_indices)
                 proxy_tensors["topk_indices"] = topk_indices
             return PPProxyTensors(proxy_tensors)
         else:
