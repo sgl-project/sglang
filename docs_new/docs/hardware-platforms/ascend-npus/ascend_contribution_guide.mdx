@@ -136,7 +136,7 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the "run-ci-extra" label, opting the PR into the extra test workflow (`pr-test-extra.yml`).
 - `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, or skipped**.
-- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won’t. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
+- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
 - `/rerun-stage <stage-name>`: Reruns a single test stage without waiting for its dependencies. Useful for quickly validating a specific test fix instead of waiting ~30 minutes for preceding stages.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly, bypassing stage boundaries. Each `<test-spec>` is pytest-style `<file>::<TestClass>[.<test_method>]` (the `::TestClass` and `.<test_method>` parts are optional). The handler resolves each spec, groups specs by their registered runner-label, and dispatches one [Rerun Test workflow](https://github.com/sgl-project/sglang/actions/workflows/rerun-test.yml) per group. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py` (multiple at once).
 
@@ -157,7 +157,7 @@ Each CI workflow has a default limit defined in its workflow configuration file.
 
 ```yaml
 cool-down-minutes:
-  description: "Default cooldown period in minutes; 0 disables rate limiting"
+  description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
   type: number
   default: 120
 ```
