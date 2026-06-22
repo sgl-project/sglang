@@ -204,16 +204,26 @@ def cutlass_w4a8_moe(
     if use_swiglu_oai:
         # SwiGLU-OAI (e.g. MiniMax-M3): clamp + alpha-scaled sigmoid + (up+1).
         # The fused silu_mul_*_tensorwise_quant_for_cutlass_moe kernels are
-        # plain SiLU, which would silently corrupt outputs. Do the activation
-        # in bf16 here, then per-tensor FP8 quantize.
-        alpha = 1.702 if gemm1_alpha is None else float(gemm1_alpha)
-        gate, up = c1.chunk(2, dim=-1)
-        if gemm1_clamp_limit is not None:
-            limit = float(gemm1_clamp_limit)
-            gate = gate.clamp(max=limit)
-            up = up.clamp(min=-limit, max=limit)
-        intermediate = gate * torch.sigmoid(gate * alpha) * (up + 1)
-        intermediate = intermediate.contiguous()
+        # plain SiLU, which would silently corrupt outputs. Reuse the marlin
+        # SwiGLU-OAI helper (fp32 intermediate for numerics) and then do the
+        # per-tensor FP8 quantization separately.
+        if gemm1_alpha is None:
+            raise ValueError(
+                "cutlass_w4a8_moe: gemm1_clamp_limit was provided but "
+                "gemm1_alpha is None. SwiGLU-OAI requires an explicit alpha "
+                "(model config.swiglu_alpha); refusing to fall back to a "
+                "magic default."
+            )
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            swiglu_oai_func,
+        )
+
+        alpha = float(gemm1_alpha)
+        limit = None if gemm1_clamp_limit is None else float(gemm1_clamp_limit)
+        intermediate = torch.empty(
+            (m * topk, n), dtype=torch.bfloat16, device=device
+        )
+        swiglu_oai_func(intermediate, c1, alpha, limit)
         if a2_scale is None:
             a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
             # is_static=False: kernel computes absmax-based scale itself.

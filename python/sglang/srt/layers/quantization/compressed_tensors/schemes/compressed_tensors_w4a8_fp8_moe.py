@@ -292,18 +292,6 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU / SwiGLU-OAI activations are supported."
 
-        # [DEBUG W4A8-OAI] one-shot: confirm gemm1_alpha / gemm1_clamp_limit
-        # are propagated to the W4A8 cutlass path (else SwiGLU-OAI silently
-        # collapses to plain SiLU and corrupts every token).
-        if not getattr(self, "_dbg_oai_logged", False):
-            logger.warning(
-                "[DEBUG W4A8-OAI] activation=%s gemm1_alpha=%s gemm1_clamp_limit=%s",
-                self.moe_runner_config.activation,
-                self.moe_runner_config.gemm1_alpha,
-                self.moe_runner_config.gemm1_clamp_limit,
-            )
-            self._dbg_oai_logged = True
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
