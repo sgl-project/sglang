@@ -77,7 +77,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -134,10 +133,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
         self.max_bs = model_runner.req_to_token_pool.size
-
-        log_info_on_rank0(
-            logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
-        )
 
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
