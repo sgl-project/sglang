@@ -324,7 +324,7 @@ class TestServerArgsMigrationParity(CustomTestCase):
     # ------------------------------------------------------------------
     def test_total_option_count(self):
         actions = [a for a in self.parser._actions if a.option_strings]
-        self.assertEqual(len(actions), 422)
+        self.assertEqual(len(actions), 421)
 
     # ------------------------------------------------------------------
     # Combined parsing

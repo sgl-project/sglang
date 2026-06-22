@@ -371,34 +371,44 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 @dataclasses.dataclass
 class ServerArgs:
-    """The arguments of the server.
+    """Server-wide configuration for SGLang.
 
-    NOTE for adding new arguments:
-    Group new arguments into the appropriate existing section or create a
-    new section as needed.
+    Adding new arguments
+    --------------------
+    1. **Place the field in the right section.** Arguments are grouped by
+       comment blocks (``# Model and tokenizer``, ``# LoRA``, etc.).
+       Add new fields to the matching section, or create a new section
+       with a ``# ---`` banner when none fits.
 
-    There are two styles for defining arguments. New arguments MUST use the
-    ``A[T, ...]`` style; the legacy style is being migrated and should not be
-    used for new additions.
+    2. **Use the ``A[T, ...]`` annotation.**  ``A`` is an alias for
+       ``typing.Annotated``.  The primary CLI flag is auto-derived from the
+       field name (``tp_size`` → ``--tp-size``).  Use ``aliases`` for
+       longer alternate names
+       (``aliases=["--tensor-parallel-size"]``)::
 
-    **Style 1 — ``A[T, ...]`` (required for all new arguments):**
+           # Bare string — simplest form (just help text):
+           host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+           trust_remote_code: A[bool, "Whether to allow custom models."] = False
 
-    Each field carries its own CLI metadata. ``A`` is an alias for
-    ``typing.Annotated``. For simple fields, use a bare string as the
-    help text. Use ``Arg(...)`` only when extra metadata is needed
-    (choices, aliases, custom type parser, etc.)::
+           # Arg(...) — when you need choices, aliases, type_parser, etc.:
+           load_format: A[str, Arg(help="...", choices=CHOICES)] = "auto"
+           model_path: A[str, Arg(help="...", aliases=["--model"])]
 
-        # Simple — bare string is the help text:
-        host: A[str, "The host of the HTTP server."] = "127.0.0.1"
-        trust_remote_code: A[bool, "Whether to allow custom models."] = False
+       See ``Arg`` in ``arg_groups/arg_utils.py`` for the full list of
+       supported metadata (``choices``, ``aliases``, ``type_parser``,
+       ``nargs``, ``const``, ``action``, ``no_cli``, …).
 
-        # With extra metadata:
-        load_format: A[str, Arg(help="Format.", choices=LOAD_FORMAT_CHOICES)] = "auto"
-        model_path: A[str, Arg(help="Path to model.", aliases=["--model"])]
+    3. **Manual entries in ``add_cli_args`` — only for special cases.**
+       A few arguments cannot use the annotation style and must be
+       registered manually in ``add_cli_args``:
 
-    The primary CLI name is auto-derived from the field name
-    (``tp_size`` → ``--tp-size``). Use ``aliases`` for longer alternate
-    names (``aliases=["--tensor-parallel-size"]``).
+       - **Deprecated flags** that redirect to another field via
+         ``DeprecatedAction`` / ``DeprecatedAliasStoreAction`` / etc.
+       - **Dynamic choices** computed at runtime (e.g. ``reasoning_parser``
+         whose choices come from a plugin registry).
+       - The ``--config`` meta-argument (not a dataclass field).
+
+       Everything else should use the ``A[T, ...]`` annotation.
     """
 
     # -------------------------------------------------------------------------
@@ -6249,12 +6259,6 @@ class ServerArgs:
                 "'partial' checks the first 16 bytes of each real-KV slot. "
                 "'all' checks the full real-KV slot."
             ),
-        )
-
-        # --- Fields kept manual ---
-        parser.add_argument(
-            "--custom-sigquit-handler",
-            help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
 
         # --- Configuration file support ---
