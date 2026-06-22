@@ -1,5 +1,5 @@
-import sys
 import inspect
+import sys
 
 import pytest
 import torch
@@ -15,11 +15,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
-pytestmark = pytest.mark.skipif(
+requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for FlashInfer MoE tests."
 )
 
 
+@requires_cuda
 def test_moe_output_copy_add_folds_shared_output_on_alt_stream():
     current_stream = torch.cuda.current_stream()
     alt_stream = torch.cuda.Stream()
@@ -57,6 +58,7 @@ def test_moe_output_copy_add_folds_shared_output_on_alt_stream():
     torch.testing.assert_close(fallback_out, routed, rtol=0, atol=0)
 
 
+@requires_cuda
 def test_routed_fp8_wrapper_writes_real_flashinfer_output_tensor():
     fused_moe = pytest.importorskip("flashinfer.fused_moe")
     if "output" not in inspect.signature(
@@ -144,6 +146,7 @@ def test_routed_fp8_wrapper_writes_real_flashinfer_output_tensor():
     )
 
     ref = trtllm_fp8_block_scale_routed_moe_wrapper(**kwargs)
+    assert ref is not None
     torch.cuda.synchronize()
     output = torch.full_like(ref, float("nan"))
 
@@ -153,7 +156,7 @@ def test_routed_fp8_wrapper_writes_real_flashinfer_output_tensor():
     )
     torch.cuda.synchronize()
 
-    assert result.data_ptr() == output.data_ptr()
+    assert result is None
     assert torch.isfinite(output).all().item()
     torch.testing.assert_close(output, ref, rtol=0, atol=0)
 

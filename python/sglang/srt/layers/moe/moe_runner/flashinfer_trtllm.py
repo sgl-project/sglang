@@ -723,7 +723,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 topk_weights=topk_output.topk_weights,
             )
 
-            output = trtllm_fp8_block_scale_routed_moe_wrapper(
+            trtllm_fp8_block_scale_routed_moe_wrapper(
                 topk_ids=packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
@@ -755,6 +755,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
+            output = symm_output
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
