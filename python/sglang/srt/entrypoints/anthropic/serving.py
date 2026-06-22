@@ -172,91 +172,74 @@ class AnthropicServing:
         self.openai_serving_chat = openai_serving_chat
         self._inline_system_capable: Optional[bool] = None
 
-    _INLINE_SYSTEM_PROBE_MESSAGES = (
-        {"role": "system", "content": "a"},
-        {"role": "user", "content": "x"},
-        {"role": "system", "content": "b"},
-        {"role": "user", "content": "y"},
-    )
-
     def _chat_template_supports_inline_system(self) -> bool:
-        """Cache whether the active chat template renders mid-conversation system turns without raising."""
+        """Cache whether the chat template renders mid-conversation system turns without raising."""
         if self._inline_system_capable is not None:
             return self._inline_system_capable
-
-        try:
-            tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-        except AttributeError:
-            self._inline_system_capable = False
-            return False
-
-        apply = getattr(tokenizer, "apply_chat_template", None)
+        apply = getattr(
+            getattr(
+                getattr(self.openai_serving_chat, "tokenizer_manager", None),
+                "tokenizer",
+                None,
+            ),
+            "apply_chat_template",
+            None,
+        )
         if apply is None:
             self._inline_system_capable = False
             return False
-
         try:
             apply(
-                list(self._INLINE_SYSTEM_PROBE_MESSAGES),
+                [
+                    {"role": "system", "content": "a"},
+                    {"role": "user", "content": "x"},
+                    {"role": "system", "content": "b"},
+                    {"role": "user", "content": "y"},
+                ],
                 tokenize=False,
                 add_generation_prompt=True,
             )
         except Exception as e:
-            logger.debug(
-                "Chat template rejects mid-conversation system turns "
-                "(%s: %s); hoisting to top-level system field.",
-                type(e).__name__,
-                e,
-            )
+            logger.debug("Chat template rejects mid-conv system (%s); hoisting.", e)
             self._inline_system_capable = False
             return False
-
         self._inline_system_capable = True
         return True
+
+    @staticmethod
+    def _extract_text(content: Any) -> list[str]:
+        if isinstance(content, str):
+            text = content.strip()
+            return [text] if text else []
+        out: list[str] = []
+        for block in content or []:
+            if getattr(block, "type", None) == "text":
+                text = (getattr(block, "text", "") or "").strip()
+                if text:
+                    out.append(text)
+        return out
 
     def _maybe_hoist_mid_conversation_system(
         self, request: AnthropicMessagesRequest
     ) -> AnthropicMessagesRequest:
-        """Fold mid-conversation system turns into top-level system field when the template can't render them inline."""
+        """Fold mid-conv system turns into top-level system when template can't render them inline."""
         if not any(m.role == "system" for m in request.messages):
             return request
-
         if self._chat_template_supports_inline_system():
             return request
 
         extracted: list[str] = []
         clean_messages: list[AnthropicMessage] = []
         for msg in request.messages:
-            if msg.role != "system":
-                clean_messages.append(msg)
-                continue
-            if isinstance(msg.content, str):
-                text = msg.content.strip()
-                if text:
-                    extracted.append(text)
+            if msg.role == "system":
+                extracted.extend(self._extract_text(msg.content))
             else:
-                for block in msg.content:
-                    if getattr(block, "type", None) == "text":
-                        text = (getattr(block, "text", "") or "").strip()
-                        if text:
-                            extracted.append(text)
+                clean_messages.append(msg)
 
         if not extracted:
             return request.model_copy(update={"messages": clean_messages})
 
-        combined: list[str] = []
-        existing = request.system
-        if isinstance(existing, str):
-            if existing.strip():
-                combined.append(existing.strip())
-        elif isinstance(existing, list):
-            for block in existing:
-                if getattr(block, "type", None) == "text":
-                    text = (getattr(block, "text", "") or "").strip()
-                    if text:
-                        combined.append(text)
-        combined.extend(extracted)
-
+        combined = self._extract_text(request.system) + extracted
         return request.model_copy(
             update={"system": "\n".join(combined), "messages": clean_messages}
         )

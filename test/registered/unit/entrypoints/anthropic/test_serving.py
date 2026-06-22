@@ -1303,37 +1303,29 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertIsNone(request.system)
 
+    def _serving_with_tokenizer(self, apply_fn):
+        tokenizer = type("_Tok", (), {"apply_chat_template": apply_fn})()
+        chat_cls = type(
+            "_ChatWithTM",
+            (_FakeOpenAIServingChat,),
+            {"tokenizer_manager": type("_TM", (), {"tokenizer": tokenizer})()},
+        )
+        return AnthropicServing(chat_cls())
+
     def test_chat_template_probe_caches_and_falls_back_when_render_raises(self):
-        class _StrictTokenizer:
-            calls = 0
+        calls = [0]
 
-            def apply_chat_template(self, messages, **kwargs):
-                _StrictTokenizer.calls += 1
-                raise ValueError("Conversation roles must alternate")
+        def apply(self, messages, **kwargs):
+            calls[0] += 1
+            raise ValueError("Conversation roles must alternate")
 
-        class _TM:
-            tokenizer = _StrictTokenizer()
-
-        class _ChatWithTM(_FakeOpenAIServingChat):
-            tokenizer_manager = _TM()
-
-        serving = AnthropicServing(_ChatWithTM())
+        serving = self._serving_with_tokenizer(apply)
         self.assertFalse(serving._chat_template_supports_inline_system())
         self.assertFalse(serving._chat_template_supports_inline_system())
-        self.assertEqual(_StrictTokenizer.calls, 1)
+        self.assertEqual(calls[0], 1)
 
     def test_chat_template_probe_detects_inline_capable_template(self):
-        class _InlineTokenizer:
-            def apply_chat_template(self, messages, **kwargs):
-                return "ok"
-
-        class _TM:
-            tokenizer = _InlineTokenizer()
-
-        class _ChatWithTM(_FakeOpenAIServingChat):
-            tokenizer_manager = _TM()
-
-        serving = AnthropicServing(_ChatWithTM())
+        serving = self._serving_with_tokenizer(lambda self, messages, **kw: "ok")
         self.assertTrue(serving._chat_template_supports_inline_system())
 
     def test_in_messages_system_role_merged_with_top_level(self):
