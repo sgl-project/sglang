@@ -1286,12 +1286,12 @@ def maybe_requant_block_scale_ue8m0(
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
 ) -> bool:
-    """Requantize block FP8 weight scales to UE8M0 for DeepGEMM.
+    """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
-    The caller owns the runtime runner decision. The model-loader gate keeps
-    conversion to bf16 outputs and DeepGEMM-aligned shapes when those facts are
-    available. UE8M0 conversion is limited to 128x128 block scales because the
-    requantization kernel assumes that layout.
+    No-op (returns False) unless the caller selected the DeepGEMM runner, the
+    block size is 128x128 (the only layout the requant kernel supports), the
+    scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
+    aligned shape). Returns True when it requantizes.
     """
     from sglang.srt.model_loader.utils import (
         should_deepgemm_weight_requant_ue8m0,

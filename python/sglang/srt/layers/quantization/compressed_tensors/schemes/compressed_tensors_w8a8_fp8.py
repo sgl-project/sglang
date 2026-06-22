@@ -201,12 +201,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight.requires_grad_(False)
                 layer.weight_scale.requires_grad_(False)
 
-            # For fp8 block weights run with DeepGEMM (e.g. Blackwell SM100),
-            # the weights and scales must be requantized to UE8M0. Otherwise the
-            # kernel combines UE8M0 activation scales with float32 weight scales
-            # and produces garbage output. Mirrors Fp8LinearMethod's block path.
-            # Only requantize when DeepGEMM is the active runner (other backends,
-            # e.g. triton/cutlass, expect float32 scales).
+            # On Blackwell, block-FP8 dispatches to DeepGEMM, which needs the
+            # weight scales UE8M0-packed to match its UE8M0 activation scales.
             use_deepgemm_runner = (
                 self.w8a8_block_fp8_linear
                 is deepgemm_w8a8_block_fp8_linear_with_fallback
