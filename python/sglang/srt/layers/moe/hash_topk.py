@@ -68,6 +68,15 @@ class HashTopK(nn.Module):
         )
         self._init_default_tid2eid()
 
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
+        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+            raise NotImplementedError(
+                "HashTopK + apply_routed_scaling_factor_on_output is not supported "
+                "with fused shared experts; pass --disable-shared-experts-fusion."
+            )
+
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
         if topk == 0:

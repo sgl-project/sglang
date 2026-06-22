@@ -29,8 +29,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_pp_indices,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -42,6 +46,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -889,6 +894,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             is_prefill_context_parallel_enabled()
+            and not is_cp_v2_active(forward_batch)
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
@@ -929,6 +935,16 @@ class Qwen2MoeModel(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
+            if (
+                hidden_states is not None
+                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                and hidden_states._sglang_needs_allreduce_fusion
+            ):
+                if get_moe_expert_parallel_world_size() > 1:
+                    hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+                if get_moe_tensor_parallel_world_size() > 1:
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -944,6 +960,7 @@ class Qwen2MoeModel(nn.Module):
 
         if (
             self.pp_group.is_last_rank
+            and not is_cp_v2_active(forward_batch)
             and is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
