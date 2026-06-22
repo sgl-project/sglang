@@ -222,8 +222,7 @@ def _check_tensors(
             if not should_compare:
                 info_messages.append(msg)
             elif allow_quant_error and num_exceed == 0:
-                # Each side is one quantization of the same weight, so they may
-                # disagree by up to 1 ULP of each quantized representation.
+                # Two faithful quantizations may differ by up to 1 ULP each.
                 info_messages.append(msg + "(within quantization ULP tolerance)")
             else:
                 error_messages.append(msg)
@@ -259,8 +258,7 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
-# Bounds GPU transients during chunked randomize/compare: full-size fp32
-# intermediates of large MoE weights do not fit next to the KV-cache pool.
+# Bound GPU memory: a full-size fp32 intermediate won't fit beside the KV-cache pool.
 _CHUNK_NUMEL = 64 * 1024 * 1024
 
 
@@ -270,8 +268,6 @@ def _random_like(t: torch.Tensor):
     dtype = t.dtype
 
     if dtype.is_floating_point:
-        # Generate chunked: a full-size fp32 rand of a large weight does not
-        # fit next to the KV-cache pool.
         out = torch.empty(shape, device=device, dtype=dtype)
         for chunk in out.view(-1).split(_CHUNK_NUMEL):
             chunk.copy_(
@@ -289,10 +285,10 @@ def _random_like(t: torch.Tensor):
 
 
 def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
-    """Per-element ULP (spacing to the next representable magnitude) of w_q in its own dtype."""
+    """Per-element ULP of w_q in its own dtype."""
     finfo = torch.finfo(w_q.dtype)
     x = w_q.to(torch.float32).abs()
-    # frexp: x = m * 2^e with m in [0.5, 1), so 2^(e-1) is the binade base of x.
+    # frexp: x = m * 2^e, m in [0.5, 1), so 2^(e-1) is x's binade base.
     _, exponent = torch.frexp(x)
     binade = torch.exp2((exponent - 1).to(torch.float32))
     # Zeros and subnormals share the spacing of the smallest normal binade.
@@ -308,13 +304,8 @@ def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
 
 
 def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
-    # fp8 block quant uses square blocks. The output (row) dim can have a partial
-    # last block (e.g. fused_qkv_a_proj_with_mqa out-dim 2112 = 16*128 + 64), and
-    # then neither ceil(n/s_n) nor n//s_n recovers the true block size (2112/17
-    # rounds to 125/124, not 128). The contraction (column) dim is 128-aligned,
-    # so column // num_col_blocks gives the true block size exactly; reuse it for
-    # rows (square blocks). block_quant_dequant handles the partial row block via
-    # its repeat_interleave + slice.
+    # Square blocks. The row dim may have a partial last block (so n//s_n is wrong),
+    # but the K dim is block-aligned, so k//s_k recovers the true block size exactly.
     k, s_k = w_q.shape[-1], w_s.shape[-1]
     assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
     block = k // s_k
@@ -339,12 +330,9 @@ def _compare_quant_pair(
     actual_q: torch.Tensor,
     actual_s: torch.Tensor,
 ) -> Tuple[bool, float, float, int]:
-    """Chunked compare of two block-quantized tensors in dequantized space.
-
-    Returns (equal, max_abs_err, mean_abs_err, num_exceed) where num_exceed
-    counts elements differing by more than 1 ULP of each side's quantized
-    representation (NaN counts as exceeding).
-    """
+    """Chunked compare of two block-quant tensors in dequant space. Returns
+    (equal, max_abs_err, mean_abs_err, num_exceed); num_exceed counts elements
+    off by >1 ULP per side (NaN counts as exceeding)."""
     assert expect_q.shape == actual_q.shape, f"{expect_q.shape=} {actual_q.shape=}"
     expect_s = _normalize_scale(expect_q, expect_s)
     actual_s = _normalize_scale(actual_q, actual_s)
@@ -384,11 +372,8 @@ def _compare_quant_pair(
 def _compare_raw_pair(
     expect: torch.Tensor, actual: torch.Tensor, compute_stats: bool
 ) -> Tuple[bool, float, float]:
-    """Chunked exact-compare of two raw tensors; optionally accumulates
-    abs-diff stats without materializing full-size fp32 intermediates.
-
-    Returns (equal, max_abs_err, mean_abs_err).
-    """
+    """Chunked exact-compare of two raw tensors, optionally accumulating
+    abs-diff stats. Returns (equal, max_abs_err, mean_abs_err)."""
     assert expect.shape == actual.shape, f"{expect.shape=} {actual.shape=}"
     expect_flat = expect.reshape(-1)
     actual_flat = actual.reshape(-1)
@@ -415,11 +400,8 @@ def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
 ) -> Iterable[Tuple[str, bool, Tuple]]:
-    """Yields (name, should_compare, entry).
-
-    entry is ("quant", w_q, w_s) for block-quantized pairs — compared/hashed in
-    dequantized space without materializing the full dequant — or ("raw", tensor).
-    """
+    """Yields (name, should_compare, entry); entry is ("quant", w_q, w_s) for
+    block-quant pairs (dequantized lazily) or ("raw", tensor)."""
     skip_compare_names = set(skip_compare_names)
 
     # Skip non-persistent buffers (registered with persistent=False; recomputed
