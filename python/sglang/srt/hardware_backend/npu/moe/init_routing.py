@@ -21,6 +21,7 @@ class BaseInitRouting(ABC):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]: ...
 
 
@@ -36,9 +37,10 @@ class NPUMoEInitRouting_v1(BaseInitRouting):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
-        row_idx_len = num_tokens * topk_ids.shape[1]
+        row_idx_len = num_tokens * top_k
         row_idx = (
             torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_ids.device)
             .view(topk_ids.shape[1], -1)
@@ -76,13 +78,14 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
                 topk_ids,
-                active_num=num_tokens * topk_ids.shape[1],
+                active_num=num_tokens * top_k,
                 expert_num=num_experts,
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
