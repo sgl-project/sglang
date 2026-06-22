@@ -10,6 +10,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 @pytest.fixture
 def stated_tp_group():
