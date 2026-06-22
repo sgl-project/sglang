@@ -206,9 +206,11 @@ class RadixCacheCpp(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
-        if req.locked_cache is not None:
-            self.dec_lock_ref(req.locked_cache.last_node)
-            req.locked_cache = None
+        assert (
+            req.locked_cache is not None
+        ), "cache_finished_req expects the req to still hold its cache lock"
+        self.dec_lock_ref(req.locked_cache.last_node)
+        req.locked_cache = None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

@@ -767,13 +767,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 kv_indices[req.cache_protected_len :]
             )
 
-        if req.locked_cache is not None:
-            self.dec_lock_ref(
-                req.locked_cache.last_node,
-                DecLockRefParams(swa_uuid_for_lock=req.locked_cache.swa_uuid_for_lock),
-                skip_swa=req.locked_cache.swa_prefix_lock_released,
-            )
-            req.locked_cache = None
+        assert (
+            req.locked_cache is not None
+        ), "cache_finished_req expects the req to still hold its cache lock"
+        self.dec_lock_ref(
+            req.locked_cache.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.locked_cache.swa_uuid_for_lock),
+            skip_swa=req.locked_cache.swa_prefix_lock_released,
+        )
+        req.locked_cache = None
 
         # cleanup
         for comp in self._components_tuple:
