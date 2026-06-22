@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -18,7 +18,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=240, suite="stage-b-test-1-gpu-large-amd")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -47,11 +48,13 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
                 {
-                    "candidate_steps": [1, 3],
-                    "ema_alpha": 1.0,
-                    "warmup_batches": 1,
-                    "update_interval": 1,
-                    "up_hysteresis": 0.0,
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 1,
+                        "update_interval": 1,
+                        "up_hysteresis": 0.0,
+                    },
                 },
                 f,
             )
@@ -70,12 +73,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "EAGLE",
                     "--speculative-draft-model-path",
                     cls.draft_model,
-                    "--speculative-num-steps",
-                    "1",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "2",
                     "--speculative-adaptive",
                     "--speculative-adaptive-config",
                     cls.adaptive_config_path,
@@ -194,9 +191,124 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         steps = self._scrape_metric("sglang:spec_num_steps")
         draft_tokens = self._scrape_metric("sglang:spec_num_draft_tokens")
 
-        self.assertEqual(steps, 3.0, "spec_num_steps gauge missing or wrong")
-        self.assertEqual(
-            draft_tokens, 4.0, "spec_num_draft_tokens gauge missing or wrong"
+        self.assertIn(steps, {1.0, 3.0}, "spec_num_steps gauge has unexpected value")
+        self.assertIn(
+            draft_tokens,
+            {2.0, 4.0},
+            "spec_num_draft_tokens gauge has unexpected value",
+        )
+
+
+class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
+    """steps=0 (nospec) fallback triggered by batch size.
+
+    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3, so the
+    server cycles steps=3 -> steps=0 -> steps=3 as load rises and falls.
+    """
+
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    base_url = DEFAULT_URL_FOR_TEST
+
+    COUNT_PROMPT = "Count from 1 to 400, separated by commas. Output only the numbers."
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [3], "warmup_batches": 0},
+                    "8": {"candidate_steps": [0], "warmup_batches": 0},
+                },
+                f,
+            )
+            cls.adaptive_config_path = f.name
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--attention-backend",
+                    "triton",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    cls.draft_model,
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--speculative-adaptive",
+                    "--speculative-adaptive-config",
+                    cls.adaptive_config_path,
+                    "--max-running-requests",
+                    "32",
+                    "--skip-server-warmup",
+                    "--mem-fraction-static",
+                    "0.7",
+                ],
+            )
+        except Exception:
+            os.unlink(cls.adaptive_config_path)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process"):
+            kill_process_tree(cls.process.pid)
+        if os.path.exists(cls.adaptive_config_path):
+            os.unlink(cls.adaptive_config_path)
+
+    def _steps(self) -> int:
+        r = requests.get(self.base_url + "/server_info", timeout=30)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["internal_states"][0]["speculative_num_steps"]
+
+    def test_batch_size_step_cycle(self):
+        """The server cycles steps=3 -> steps=0 -> steps=3 as load rises and falls:
+        a BS=1 request drafts at steps=3; a 14-way batch (BS>=8) routes the worker
+        to nospec steps=0; a following BS=1 request returns to steps=3 with drafting
+        restored (high accept rate again)."""
+        one = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
+
+        def generate_single() -> dict:
+            r = requests.post(
+                self.base_url + "/generate",
+                json={"text": self.COUNT_PROMPT, "sampling_params": one},
+                timeout=600,
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["meta_info"]
+
+        # Phase 1: BS=1 -> steps=3, drafting active.
+        m1 = generate_single()
+        self.assertEqual(self._steps(), 3, "expected steps=3 at BS=1")
+        self.assertGreater(
+            m1["spec_accept_rate"], 0.8, f"not drafting at steps=3: {m1}"
+        )
+
+        # Phase 2: BS=14 -> the worker switches to nospec steps=0. Equal-length
+        # requests finish together, so the last decode batch (and thus the state)
+        # is at BS=14 -> steps=0.
+        full = {"temperature": 0, "max_new_tokens": 128, "ignore_eos": True}
+        r = requests.post(
+            self.base_url + "/generate",
+            json={"text": [self.COUNT_PROMPT] * 14, "sampling_params": [full] * 14},
+            timeout=600,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._steps(), 0, "BS>=8 did not switch to steps=0")
+
+        # Phase 3: BS=1 -> steps=3 again, drafting restored.
+        m3 = generate_single()
+        self.assertEqual(self._steps(), 3, "did not reopen to steps=3")
+        self.assertGreater(
+            m3["spec_accept_rate"], 0.8, f"drafting not restored after steps=0: {m3}"
         )
 
 

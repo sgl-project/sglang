@@ -200,6 +200,7 @@ async def generations(
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
+            preset=_get_extra_field(request, "preset"),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

@@ -28,7 +28,11 @@
 
 from .base import RotaryEmbedding
 from .factory import get_rope, get_rotary_pos_embed
-from .mrope import NDRotaryEmbedding
+from .mrope import (
+    NDRotaryEmbedding,
+    Qwen3VLTextRotaryEmbedding,
+    qwen3_apply_rotary_pos_emb,
+)
 from .utils import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
@@ -42,6 +46,8 @@ __all__ = [
     "RotaryEmbedding",
     # _mrope
     "NDRotaryEmbedding",
+    "Qwen3VLTextRotaryEmbedding",
+    "qwen3_apply_rotary_pos_emb",
     # _factory
     "get_rope",
     "get_rotary_pos_embed",
