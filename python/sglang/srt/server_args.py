@@ -933,7 +933,14 @@ class ServerArgs:
     ] = False
     disable_attn_tp_gather: A[
         bool,
-        "Disable scheduler-side attn_tp_gather (the upstream SP path that pads num_tokens to attn_tp_size and pre-allocates a gathered buffer). Use for models that manage SP scatter/gather at the model level.",
+        "Disable scheduler-side attn_tp_gather (the upstream SP path "
+        "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+        "buffer). Use for models that manage SP scatter/gather at the "
+        "model level (e.g., perform their own all_gather/reduce_scatter "
+        "inside attention) and do not consume the upstream gathered_buffer. "
+        "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+        "which can cause kernel autotuners to select wrong-sized variants "
+        "at small batches.",
     ] = False
     enable_p2p_check: A[
         bool,
@@ -969,7 +976,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     constrained_json_whitespace_pattern: A[
         Optional[str],
-        "(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\\n\\t ]*",
+        "(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
     ] = None
     constrained_json_disable_any_whitespace: A[
         bool,
@@ -1065,11 +1072,19 @@ class ServerArgs:
     ] = None
     prompt_tokens_buckets: A[
         Optional[List[str]],
-        "The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets; 'custom <value1> <value2> ...' uses custom bucket values.",
+        "The buckets rule of prompt tokens. "
+        "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
+        "generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets "
+        "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> "
+        "<value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500').",
     ] = None
     generation_tokens_buckets: A[
         Optional[List[str]],
-        "The buckets rule for generation tokens histogram. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets; 'custom <value1> <value2> ...' uses custom bucket values.",
+        "The buckets rule for generation tokens histogram. "
+        "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
+        "generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets "
+        "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> "
+        "<value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500').",
     ] = None
     gc_warning_threshold_secs: A[
         float,
@@ -1983,7 +1998,8 @@ class ServerArgs:
     ] = False
     triton_attention_reduce_in_fp32: A[
         bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16. This only affects Triton attention kernels.",
+        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
+        "This only affects Triton attention kernels.",
     ] = False
     triton_attention_num_kv_splits: A[
         int,
@@ -2341,7 +2357,7 @@ class ServerArgs:
     ] = 6789
     modelexpress_config: A[
         Optional[str],
-        "JSON config for ModelExpress P2P weight loading. Keys: 'url' (optional gRPC host:port override), 'transport' ('nixl' or 'transfer_engine'). Example: '{\"url\": \"localhost:8001\", \"transport\": \"nixl\"}'",
+        'JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
     ] = None
     download_dir: A[Optional[str], "Model download directory for huggingface."] = None
     model_checksum: A[
