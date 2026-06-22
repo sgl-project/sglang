@@ -1546,5 +1546,39 @@ class TestPoolsideV1Registered(CustomTestCase):
         self.assertTrue(rp.detector.thinks_internally)
 
 
+class TestQwen3ToolCallThinkClose(CustomTestCase):
+    """The Qwen3 detector treats ``<tool_call>`` inside a still-open ``<think>``
+    block as an implicit reasoning close (the Qwen3.5 behavior). That heuristic
+    must stay scoped: subclasses that only reuse Qwen3 *tokens* keep the token
+    inert, and (non-streaming) it only fires when ``</think>`` is absent, so a
+    literal ``<tool_call>`` inside genuine reasoning is not mis-parsed."""
+
+    def test_qwen3_default_enables_tool_call_think_close(self):
+        self.assertEqual(Qwen3Detector().tool_start_token, "<tool_call>")
+        # No ``</think>``: the tool call implicitly closes reasoning.
+        text = "<think>deliberating<tool_call>{}"
+        result = Qwen3Detector(force_reasoning=True).detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "deliberating")
+        self.assertEqual(result.normal_text, "<tool_call>{}")
+
+    def test_non_streaming_gated_on_think_close(self):
+        # When ``</think>`` is present, a literal ``<tool_call>`` inside
+        # reasoning is NOT treated as an implicit close: it stays in
+        # reasoning_text and the split happens at ``</think>``.
+        text = "<think>maybe <tool_call> here</think>the answer"
+        result = Qwen3Detector(force_reasoning=True).detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "maybe <tool_call> here")
+        self.assertEqual(result.normal_text, "the answer")
+
+    def test_token_only_subclasses_do_not_inherit_think_close(self):
+        # DeepSeek-V3/V4, MIMO, and Poolside reuse Qwen3 tokens, but the
+        # unclosed-``</think>`` quirk was only observed on Qwen3.5, so they keep
+        # ``<tool_call>`` inert rather than force-closing reasoning.
+        for model_type in ("deepseek-v3", "deepseek-v4", "mimo", "poolside_v1"):
+            detector_cls = ReasoningParser.DetectorMap[model_type]
+            self.assertTrue(issubclass(detector_cls, Qwen3Detector))
+            self.assertIsNone(detector_cls().tool_start_token, model_type)
+
+
 if __name__ == "__main__":
     unittest.main()
