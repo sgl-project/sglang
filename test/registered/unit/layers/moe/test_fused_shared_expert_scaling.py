@@ -15,6 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -49,13 +50,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             patch.object(topk_module, "_use_aiter", use_aiter),
             patch.object(
                 topk_module,
-                "get_moe_expert_parallel_world_size",
-                return_value=self.EP_SIZE,
-            ),
-            patch.object(
-                topk_module,
-                "get_moe_expert_parallel_rank",
-                return_value=self.EP_RANK,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK
+                ),
             ),
         ):
             _out_ids, out_weights = topk_module._remap_topk_for_deepep(
@@ -96,13 +94,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             patch.object(topk_module, "_use_aiter", True),
             patch.object(
                 topk_module,
-                "get_moe_expert_parallel_world_size",
-                return_value=self.EP_SIZE,
-            ),
-            patch.object(
-                topk_module,
-                "get_moe_expert_parallel_rank",
-                return_value=self.EP_RANK,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK
+                ),
             ),
         ):
             out_ids, _ = topk_module._remap_topk_for_deepep(
