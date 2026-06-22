@@ -1066,8 +1066,8 @@ class MQALayer(nn.Module):
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
+                scale_ue8m0=True,
             )
-            o_s = deep_gemm.ceil_to_ue8m0(o_s)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
@@ -1841,6 +1841,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
+        # batched/contiguous-load rope kernels (faster on gfx95; .
+        # Module-level toggles default OFF; flipped True here for DSV4
+        if _is_hip:
+            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+
+            set_force_ck_w8a8(True)
+            set_batched_rope(True)
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -2385,7 +2394,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
-        skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        skipped_checking_patterns = [
+            "attn_mqa.k_scale",
+            "attn_mqa.v_scale",
+            "blockscale_swizzled",
+        ]
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:

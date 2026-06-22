@@ -155,7 +155,6 @@ do
         export HCCL_BUFFSIZE=1600
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
-        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
@@ -172,6 +171,7 @@ do
         --device npu \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
+        --disaggregation-decode-extra-slots 96 \
         --max-running-requests 80 \
         --chunked-prefill-size -1 \
         --moe-a2a-backend ascend_fuseep \
@@ -362,7 +362,6 @@ do
         export HCCL_BUFFSIZE=1600
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
-        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
@@ -379,6 +378,7 @@ do
         --device npu \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
+        --disaggregation-decode-extra-slots 96 \
         --max-running-requests 80 \
         --chunked-prefill-size -1 \
         --moe-a2a-backend ascend_fuseep \
