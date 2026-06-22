@@ -327,18 +327,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 )
                 torch.cuda.empty_cache()
 
-        if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            # Compressed-tensors MoE does not dispatch DeepGEMM today; the BLOCK
-            # runners here consume float32 scales, so there is no UE8M0 requant.
-            if self.use_flashinfer_trtllm:
-                layer.w13_weight = torch.nn.Parameter(
-                    swap_w13_to_w31(layer.w13_weight.data),
-                    requires_grad=False,
-                )
-                layer.w13_weight_scale = torch.nn.Parameter(
-                    swap_w13_to_w31(layer.w13_weight_scale.data),
-                    requires_grad=False,
-                )
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.BLOCK
+            and self.use_flashinfer_trtllm
+        ):
+            layer.w13_weight = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight_scale.data),
+                requires_grad=False,
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
