@@ -993,6 +993,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             seq_len = len(decode_req.req.origin_input_ids)
+            swa_state_page_size = getattr(
+                self.token_to_kv_pool, "swa_page_size", page_size
+            )
 
             def _mamba_payload():
                 return [
@@ -1006,7 +1009,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, swa_state_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -1016,7 +1019,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), swa_state_page_size
                 )
 
             def _dsa_payload():
