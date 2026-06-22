@@ -96,7 +96,7 @@ _DCP4_ARGS = [
 
 # Prompts used for logprob parity verification between DCP and non-DCP.
 _LOGPROB_PARITY_PROMPTS = [
-    "The capital of France is",
+    "The capital city of France is",
     "What is 2 + 3? The answer is",
     "In the year 1492, Christopher Columbus",
     "The largest planet in our solar system is",
