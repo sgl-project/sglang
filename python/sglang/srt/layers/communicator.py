@@ -432,6 +432,46 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
+class AuxHiddenStatePacker:
+    """Append-compatible accumulator that packs aux hidden states in place.
+
+    Drop-in for the ``[]`` a model collects Eagle3/DFlash captures into: each
+    ``.append()`` writes straight into one preallocated ``[tokens, K * hidden]``
+    buffer and ``.finalize()`` returns it. Avoids the legacy list path's transient
+    ~2x HBM (K separate tensors plus their ``torch.cat`` in ``LogitsProcessor``).
+    Assumes all captures share leading shape and feature size.
+    """
+
+    def __init__(self, num_captures: int) -> None:
+        self._num_captures = int(num_captures)
+        self._buffer: Optional[torch.Tensor] = None
+        self._feature_size: Optional[int] = None
+        self._idx = 0
+
+    def append(self, hidden: torch.Tensor) -> None:
+        feature_size = int(hidden.shape[-1])
+        if self._buffer is None:
+            self._feature_size = feature_size
+            self._buffer = hidden.new_empty(
+                (*hidden.shape[:-1], feature_size * self._num_captures)
+            )
+        start = self._idx * self._feature_size
+        self._buffer[..., start : start + self._feature_size].copy_(hidden)
+        self._idx += 1
+
+    def __len__(self) -> int:
+        return self._idx
+
+    def finalize(self) -> Optional[torch.Tensor]:
+        """Return the packed buffer, narrowed if fewer layers were captured than
+        ``num_captures``. Returns ``None`` when nothing was captured."""
+        if self._buffer is None:
+            return None
+        if self._idx != self._num_captures:
+            return self._buffer[..., : self._idx * self._feature_size]
+        return self._buffer
+
+
 class LayerCommunicator:
     def __init__(
         self,
