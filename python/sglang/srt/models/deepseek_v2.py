@@ -893,10 +893,10 @@ class DeepseekV2MoE(nn.Module):
 
             if self._shared_ready_event is None:
                 self._shared_ready_event = torch.cuda.Event(enable_timing=False)
-            shared_ready_event = current_stream.record_event(self._shared_ready_event)
+            current_stream.record_event(self._shared_ready_event)
             copy_add_ctx = moe_output_copy_add_ctx(
                 shared_output,
-                shared_ready_event,
+                self._shared_ready_event,
             )
         server_args = get_global_server_args()
         dispatch_info = (
