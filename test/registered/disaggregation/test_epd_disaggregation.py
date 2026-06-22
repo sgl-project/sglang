@@ -1384,6 +1384,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
             channel.close()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_ci(),
     "TestEPDDisaggregationMooncake test requires RDMA hardware, skipping in CI",

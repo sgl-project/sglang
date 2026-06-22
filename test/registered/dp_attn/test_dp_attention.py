@@ -108,6 +108,7 @@ class TestDPAttentionGatherv(
 
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
@@ -183,6 +184,7 @@ class TestDPRetract(
 
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
