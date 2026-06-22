@@ -1427,11 +1427,9 @@ class Req(ReqDllmMixin):
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        # A stop string takes precedence over a stop/EOS token matched in the same
-        # step: run it before _check_token_based_finish, otherwise a single decode
-        # that accepts both (e.g. speculative decoding accepting >1 token) finishes
-        # as FINISH_MATCHED_TOKEN and trims only the last token, leaking the stop
-        # string into the output.
+        # Stop string beats EOS/stop-token matched in the same step (speculative
+        # decoding can accept >1 token): token-based would trim only the last
+        # token and leak the stop string.
         if self._check_str_based_finish(new_accepted_len):
             return
 
