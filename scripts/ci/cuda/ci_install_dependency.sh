@@ -441,13 +441,20 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
+    MOONCAKE_VERSION="0.3.11.post1"
+    NIXL_VERSION="1.3.0"
+    NIXL_PKG="nixl==${NIXL_VERSION}"
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+        NIXL_BIN_PKG="nixl-cu13==${NIXL_VERSION}"
+        NIXL_STALE_BIN_PKG="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+        NIXL_BIN_PKG="nixl-cu12==${NIXL_VERSION}"
+        NIXL_STALE_BIN_PKG="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
     # Both variants own the same mooncake/ package files and bin/ scripts
@@ -459,10 +466,12 @@ install_extra_deps() {
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
-    $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
-
     # Best-effort NIXL install for decode-radix disaggregation coverage.
-    $PIP_CMD install nixl --force-reinstall --no-deps $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+    if pip show ${NIXL_STALE_BIN_PKG} >/dev/null 2>&1; then
+        $PIP_UNINSTALL_CMD ${NIXL_STALE_BIN_PKG} $PIP_UNINSTALL_SUFFIX || true
+        $PIP_CMD install ${NIXL_PKG} ${NIXL_BIN_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    fi
+    $PIP_CMD install ${MOONCAKE_PKG} ${NIXL_PKG} ${NIXL_BIN_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
