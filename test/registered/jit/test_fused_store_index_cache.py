@@ -48,8 +48,10 @@ try:
 except ImportError:
     _is_fp8_fnuz = False
 
-register_cuda_ci(est_time=24, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
+)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128

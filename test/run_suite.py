@@ -65,10 +65,10 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-1-gpu-large",
-        "base-b-kernel-unit-1-gpu-b200",
-        "base-b-kernel-unit-8-gpu-h200",
-        "base-b-kernel-benchmark-1-gpu-large",
+        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-4-gpu-b200",
+        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-4-gpu-gb300",
@@ -116,8 +116,8 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
-        "nightly-kernel-1-gpu",
-        "nightly-kernel-8-gpu-h200",
+        "nightly-kernel-test-1-gpu-large",
+        "nightly-kernel-test-8-gpu-h200",
         # Eval and perf suites (2-gpu)
         "nightly-eval-text-2-gpu",
         "nightly-eval-vlm-2-gpu",
@@ -131,7 +131,7 @@ NIGHTLY_SUITES = {
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
-        "nightly-amd-kernel-1-gpu",
+        "nightly-amd-kernel-test-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",

@@ -15,8 +15,10 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=60, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
+)
 
 DEVICE = "cuda"
 DTYPES = get_ci_test_range([torch.bfloat16, torch.float16], [torch.bfloat16])

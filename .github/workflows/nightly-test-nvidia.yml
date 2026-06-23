@@ -110,7 +110,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-kernel-test-1-gpu-large --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -140,7 +140,7 @@ jobs:
         timeout-minutes: 90
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-kernel-test-8-gpu-h200 --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()

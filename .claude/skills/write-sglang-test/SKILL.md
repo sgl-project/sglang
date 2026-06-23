@@ -65,10 +65,10 @@ Defined in `python/sglang/test/test_utils.py`:
 | `base-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
 | `base-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
 | `base-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
-| `base-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `test/registered/jit/` |
-| `base-b-kernel-unit-1-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
-| `base-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `test/registered/jit/` |
-| `base-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `test/registered/jit/benchmark/` |
+| `base-b-kernel-unit-test-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `test/registered/jit/` |
+| `base-b-kernel-unit-test-4-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
+| `base-b-kernel-unit-test-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `test/registered/jit/` |
+| `base-b-kernel-benchmark-test-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `test/registered/jit/benchmark/` |
 | `base-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `base-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `base-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
@@ -111,8 +111,8 @@ Defined in `python/sglang/test/test_utils.py`:
 Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
 
 - `nightly-1-gpu` (CUDA)
-- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
-- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
+- `nightly-kernel-test-1-gpu-large` (CUDA, JIT kernel full grids)
+- `nightly-kernel-test-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -132,9 +132,9 @@ Use the lightest suite that meets your test's needs:
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
 - **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
-- **JIT kernel correctness** → `base-b-kernel-unit-1-gpu-large`
-- **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-1-gpu-b200`
-- **JIT kernel benchmarks** → `base-b-kernel-benchmark-1-gpu-large`
+- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-large`
+- **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-test-4-gpu-b200`
+- **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-large`
 - **Multi-GPU** → only when the test actually needs multiple GPUs
 
 ---
@@ -353,19 +353,19 @@ JIT kernel files live outside `test/registered/` but still use registration:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/jit/
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
-register_cuda_ci(est_time=120, suite="base-b-kernel-unit-8-gpu-h200")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/jit/benchmark/
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
 # Optional nightly registration
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
-register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True)
+register_cuda_ci(est_time=120, stage="nightly-kernel", runner_config="8-gpu-h200", nightly=True)
 ```
 
-Keep `est_time` and `suite` as **literal values** — `run_suite.py` collects them by AST parsing
+Keep `est_time`, `stage`, and `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing
 
 ---
 

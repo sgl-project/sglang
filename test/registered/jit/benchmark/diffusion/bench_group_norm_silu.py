@@ -16,7 +16,8 @@ from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=45,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="standalone benchmark",
 )
 

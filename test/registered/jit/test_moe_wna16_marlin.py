@@ -20,8 +20,10 @@ from sglang.test.test_marlin_utils import (
     marlin_quantize,
 )
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
+)
 
 
 def _has_aot_moe_wna16_marlin_gemm() -> bool:

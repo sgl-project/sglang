@@ -18,8 +18,10 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
+)
 
 Context = Union[LegacyContext, PagedContext]
 

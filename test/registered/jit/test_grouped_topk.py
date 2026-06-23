@@ -9,8 +9,10 @@ from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
+)
 
 
 CORRECTNESS_CASES = get_ci_test_range(
