@@ -152,6 +152,9 @@ from sglang.srt.model_executor.model_runner_components.quantization_checks impor
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
 )
+from sglang.srt.model_executor.model_runner_components.server_args_adjustment import (
+    model_specific_adjustment,
+)
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
 )
@@ -465,7 +468,7 @@ class ModelRunner:
             enable_show_time_cost()
 
         # Model-specific adjustment
-        ModelRunner.model_specific_adjustment(
+        model_specific_adjustment(
             server_args=self.server_args, model_config=self.model_config
         )
 
@@ -1004,33 +1007,6 @@ class ModelRunner:
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
-
-    @staticmethod
-    def model_specific_adjustment(
-        *, server_args: ServerArgs, model_config: ModelConfig
-    ) -> None:
-        from sglang.srt.model_executor.model_runner import (
-            CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-        )
-
-        if model_config.is_multimodal:
-            if not model_config.is_multimodal_chunked_prefill_supported:
-                server_args.chunked_prefill_size = -1
-                logger.info(
-                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
-                    f"{model_config.hf_config.model_type}"
-                )
-
-        use_mla_backend = model_config.attention_arch == AttentionArch.MLA
-        if (
-            not use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            server_args.disable_chunked_prefix_cache = True
-
-        if not server_args.disable_chunked_prefix_cache:
-            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
     def init_shared_mooncake_transfer_engine(self):
         """
