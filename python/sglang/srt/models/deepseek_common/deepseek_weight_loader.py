@@ -588,6 +588,15 @@ class DeepseekV2WeightLoaderMixin:
                 if _is_npu:
                     w_vc = w_vc.contiguous()
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
+                # Cache the dequantized absorbed weights once; forward_absorb
+                # otherwise recomputes w.to(bf16) * w_scale every decode step.
+                if self_attn.w_kc.dtype in (torch.bfloat16, torch.float16):
+                    self_attn.w_kc_dequant = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc_dequant = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
