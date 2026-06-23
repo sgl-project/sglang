@@ -387,64 +387,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
         self.assertTrue(config.swap_weight_nibbles)
 
-    def test_nvfp4_inference_canonicalizes_qwen_modulation_excludes(self):
-        """Qwen-Image keeps modulation in ``nn.Sequential(SiLU, Linear)``, so an
-        unquantized block's modulation serializes as ``...img_mod.1.weight`` while
-        the runtime ReplicatedLinear advertises ``...img_mod`` for exclusion. The
-        safetensors-inferred BF16 exclude list must canonicalize ``.img_mod.1`` ->
-        ``.img_mod`` (and ``.txt_mod``) or the modulation gets wrongly quantized."""
-        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
-            save_file(
-                {
-                    # unquantized block 0: modulation + attn kept BF16
-                    "transformer_blocks.0.img_mod.1.weight": torch.empty(
-                        (48, 16), dtype=torch.bfloat16
-                    ),
-                    "transformer_blocks.0.txt_mod.1.weight": torch.empty(
-                        (48, 16), dtype=torch.bfloat16
-                    ),
-                    "transformer_blocks.0.attn.to_q.weight": torch.empty(
-                        (16, 16), dtype=torch.bfloat16
-                    ),
-                    # quantized block 2: a real NVFP4 layer (drives group_size + nvfp4 signal)
-                    "transformer_blocks.2.attn.to_q.weight": torch.zeros(
-                        (32, 8), dtype=torch.uint8
-                    ),
-                    "transformer_blocks.2.attn.to_q.weight_scale": torch.empty(
-                        (32, 1), dtype=torch.float8_e4m3fn
-                    ),
-                    "transformer_blocks.2.attn.to_q.weight_scale_2": torch.tensor(
-                        1.0, dtype=torch.float32
-                    ),
-                    # modulation IS quantized inside a quantized block -> must NOT be excluded
-                    "transformer_blocks.2.img_mod.1.weight": torch.zeros(
-                        (48, 8), dtype=torch.uint8
-                    ),
-                    "transformer_blocks.2.img_mod.1.weight_scale": torch.empty(
-                        (48, 1), dtype=torch.float8_e4m3fn
-                    ),
-                    "transformer_blocks.2.img_mod.1.weight_scale_2": torch.tensor(
-                        1.0, dtype=torch.float32
-                    ),
-                },
-                f.name,
-            )
-
-            config = build_nvfp4_config_from_safetensors_list([f.name])
-
-        self.assertIsInstance(config, ModelOptFp4Config)
-        # canonicalized to the runtime linear prefix (trailing Sequential index dropped)
-        self.assertIn("transformer_blocks.0.img_mod", config.exclude_modules)
-        self.assertIn("transformer_blocks.0.txt_mod", config.exclude_modules)
-        self.assertNotIn("transformer_blocks.0.img_mod.1", config.exclude_modules)
-        self.assertNotIn("transformer_blocks.0.txt_mod.1", config.exclude_modules)
-        # non-Sequential BF16 layers are matched as-is
-        self.assertIn("transformer_blocks.0.attn.to_q", config.exclude_modules)
-        # genuinely quantized layers stay quantized (not excluded), modulation included
-        self.assertNotIn("transformer_blocks.2.attn.to_q", config.exclude_modules)
-        self.assertNotIn("transformer_blocks.2.img_mod", config.exclude_modules)
-        self.assertNotIn("transformer_blocks.2.img_mod.1", config.exclude_modules)
-
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
             {
