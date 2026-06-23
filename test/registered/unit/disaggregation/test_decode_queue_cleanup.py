@@ -29,6 +29,76 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_hisparse_request_length_uses_full_token_pool_capacity(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.max_total_num_tokens = 10
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        scheduler = MagicMock()
+        scheduler.enable_hisparse = True
+        scheduler.tp_worker.model_runner.max_token_pool_size = 20
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        req = SimpleNamespace(
+            rid="hisparse-host-backed",
+            origin_input_ids=list(range(15)),
+            return_logprob=False,
+        )
+
+        self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
+        scheduler.output_streamer.stream_output.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_hisparse_request_length_rejects_above_full_token_pool_capacity(
+        self, mock_prepare_abort
+    ):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.max_total_num_tokens = 10
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        scheduler = MagicMock()
+        scheduler.enable_hisparse = True
+        scheduler.tp_worker.model_runner.max_token_pool_size = 20
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        req = SimpleNamespace(
+            rid="hisparse-too-long",
+            origin_input_ids=list(range(21)),
+            return_logprob=False,
+        )
+
+        self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
+        mock_prepare_abort.assert_called_once()
+        message = mock_prepare_abort.call_args.args[1]
+        self.assertIn("21 > 20", message)
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], req.return_logprob
+        )
+
+    def test_non_hisparse_request_length_keeps_max_total_num_tokens_capacity(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.max_total_num_tokens = 10
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        scheduler = MagicMock()
+        scheduler.enable_hisparse = False
+        scheduler.tp_worker.model_runner.max_token_pool_size = 20
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        req = SimpleNamespace(
+            rid="normal-too-long",
+            origin_input_ids=list(range(15)),
+            return_logprob=False,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort:
+            self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
+            message = mock_abort.call_args.args[1]
+            self.assertIn("15 > 10", message)
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
