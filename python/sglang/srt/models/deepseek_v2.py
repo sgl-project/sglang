@@ -3140,6 +3140,13 @@ class DeepseekV2Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
+    def _dsa_forward_uses_topk(self) -> bool:
+        if not self.use_dsa:
+            return False
+        backend = get_attn_backend()
+        backend = getattr(backend, "primary", backend)
+        return not getattr(backend, "use_mha", False)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3149,6 +3156,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
+        dsa_forward_uses_topk = self._dsa_forward_uses_topk()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3164,6 +3172,7 @@ class DeepseekV2Model(nn.Module):
                 not forward_batch.forward_mode.is_idle()
                 and hidden_states.shape[0] != 0
                 and self.use_dsa
+                and dsa_forward_uses_topk
                 and dsa_layer_skips_topk(self.config, self.start_layer)
                 and topk_indices is None
             ), (
@@ -3268,6 +3277,7 @@ class DeepseekV2Model(nn.Module):
             }
             if (
                 self.use_dsa
+                and dsa_forward_uses_topk
                 and self.end_layer < self.config.num_hidden_layers
                 and dsa_layer_skips_topk(self.config, self.end_layer)
             ):
