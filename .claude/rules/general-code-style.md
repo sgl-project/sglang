@@ -15,4 +15,4 @@ Default conventions for new and modified Python code. Prefer these unless there 
 - **Avoid mixins.** Don't add behavior via mixin classes; prefer explicit composition (hold a collaborator and call it) or plain functions.
 - **Prefer protected over public.** Default methods to protected (`_name`); expose only what callers actually use.
 - **Prefer keyword arguments.** Call functions of 2+ args by keyword, and design APIs to be called that way.
-- **Pass what you need, not the god object.** Give a callee the specific values it uses (by keyword), not a whole large object (`ModelRunner`, `Scheduler`); reserve passing the whole object for a leaf whose contract genuinely requires it.
+- **Pass what you need, not the god object.** Give a callee the specific values it uses (by keyword), not a whole large object (`ModelRunner`, `Scheduler`); reserve passing the whole object for a leaf whose contract genuinely requires it. Even then, keep it read-only — read fields off it and return results for the caller to assign, rather than writing fields back through it.

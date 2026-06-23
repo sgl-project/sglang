@@ -79,6 +79,34 @@ When you extract domain logic into a collaborator (a factory, an initializer, a 
 - Return a small **frozen struct** and let the orchestrator assign it onto its own fields. The collaborator should not reach back in and mutate the god object.
 - If a leaf genuinely needs the live object — its constructor contract already takes the runner, or it reads state that mutates after init — confine that dependency to the **smallest leaf** and pass narrow args everywhere above it. Note why it can't be narrowed.
 
+### If you do pass the god object, keep it read-only
+
+When a callee genuinely takes the live object, it should **read** fields off it and **return** results — and avoid **writing** fields back into it unless there is genuinely no other way. Let the orchestrator own the assignment onto its own fields. A callee that mutates the god object scatters that object's writes across other modules: you can no longer see what `ModelRunner` owns by reading `model_runner.py`, the hidden writes race with the orchestrator's own ordering, and the callee silently depends on being invoked at exactly the right moment.
+
+```python
+# Good — callee reads the runner and returns; the orchestrator owns the writes.
+# model_runner.py
+class ModelRunner:
+    def bar(self):
+        self.a, self.b, self.c = foo(self)
+
+# another_file.py
+def foo(model_runner):
+    return xxx, yy, zz
+
+# Avoid — callee reaches back in and writes the runner's fields.
+# model_runner.py
+class ModelRunner:
+    def bar(self):
+        foo(self)
+
+# another_file.py
+def foo(model_runner):
+    model_runner.a = xx
+    model_runner.b = yy
+    model_runner.c = zz
+```
+
 ## 2. `__init__` style
 
 Apply when modifying the `__init__` of the three classes above.
