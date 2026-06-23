@@ -77,6 +77,17 @@ def swiglu_oai_func(
     )
     output.copy_(activated.to(out_dtype))
 
+def swiglu_gpt_oss_sigmoid_alpha_contiguous(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    gemm1_alpha: float,
+    gemm1_limit: float,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d].clamp(max=gemm1_limit)
+    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
+    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+
 
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
@@ -98,6 +109,8 @@ def fused_marlin_moe(
     w2_zeros: Optional[torch.Tensor] = None,
     w1_global_scale: Optional[torch.Tensor] = None,
     w2_global_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
@@ -234,7 +247,7 @@ def fused_marlin_moe(
         hidden_states,
         intermediate_cache1,
         w1,
-        None,  # b_bias_or_none
+        w1_bias,
         w1_scale,
         w1_global_scale,
         w1_zeros,
@@ -290,7 +303,7 @@ def fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        None,  # b_bias_or_none
+        w2_bias,
         w2_scale,
         w2_global_scale,
         w2_zeros,

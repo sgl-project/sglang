@@ -19,18 +19,24 @@ using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
-// Optimized per-token-group quant to FP8-e4m3 (or int8), with optional
-// column-major UE8M0 (int32-packed) scale. Memory-bound rewrite of the AOT
-// `per_token_group_quant_8bit` (sgl-kernel): the previous JIT clone read the
-// input TWICE and used 16 threads/group with only group/8 active. This version:
-//   * loads each group once into registers (single 128-bit load per thread),
-//   * uses exactly kGroupSize/kVec threads per group (no idle lanes),
-//   * sub-warp shuffle-reduces the absmax over those lanes (no shared memory),
-//   * launches warp-aligned, ~256-thread blocks for high occupancy / latency
-//     hiding (the AOT kernel's 1-warp blocks left HBM ~80% idle at prefill).
-// The UE8M0 path reuses the dsv4 cast_to_ue8m0/inv_scale_ue8m0 primitives and is
-// byte-identical to `sgl_per_token_group_quant_8bit_v2` (both ceil-round the
-// scale and store the biased exponent byte).
+#ifdef USE_ROCM
+// AMD implementation: HIP warps are 64-wide and require an explicit sub-group
+// width, so the CUDA 32-bit-mask shuffle reduction below does not compile on
+// gfx942. Delegate to the portable warp-reduce primitive, which emits
+// __shfl_xor with an explicit kThreadsPerGroup sub-group width.
+__device__ __forceinline__ float GroupReduceMax(float val, const int /*tid*/) {
+  return device::warp::reduce_max<kThreadsPerGroup>(val);
+}
+#else
+__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
+  unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
+  return val;
+}
+#endif
 
 template <bool kUE8M0>
 using scale_packed_t_t = std::conditional_t<kUE8M0, uint32_t, float>;

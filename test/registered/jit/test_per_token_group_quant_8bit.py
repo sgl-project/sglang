@@ -35,12 +35,13 @@ from sglang.jit_kernel.per_token_group_quant_8bit import (
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
-# No register_amd_ci: this test compares against the AOT sgl_kernel v2 kernel,
-# which is not built in the ROCm extension (common_extension_rocm.cc).
 
 # (column_major_scales, scale_tma_aligned, scale_ue8m0)
 LAYOUTS = [

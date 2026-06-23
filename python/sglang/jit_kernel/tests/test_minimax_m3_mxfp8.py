@@ -27,7 +27,7 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.srt.layers.quantization.mxfp8_native import (  # noqa: E402
+from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
@@ -69,8 +69,8 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     xq_t, s_t = _mxfp8_e4m3_quantize_torch(x)
     xq_k, s_k = _mxfp8_e4m3_quantize_triton(x)
     assert s_k.shape == s_t.shape == (shape[0], shape[1] // 32)
-    # E8M0 block exponents share the floor(log2(amax))+127 algorithm; allow at
-    # most a 1-step difference at exact powers of two.
+    # E8M0 block exponents share the round-up ceil(log2(amax/e4m3_max))+127
+    # algorithm; allow at most a 1-step difference at exact powers of two.
     assert (s_k.int() - s_t.int()).abs().max().item() <= 1
     # Dequantized values agree to fp8 granularity.
     deq_t = dequant_mxfp8_to_bf16(xq_t, s_t)
@@ -90,7 +90,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
-    from sglang.srt.layers.quantization.mxfp8_native import mxfp8_e4m3_quantize
+    from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
 
     torch.manual_seed(0)
     alpha, beta, limit = 1.702, 1.0, 7.0
@@ -163,7 +163,7 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
 )
 @torch.inference_mode()
 def test_mxfp8_native_moe(T, H, inter, E, top_k):
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 
@@ -191,7 +191,6 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
         alpha=alpha,
         beta=beta,
         limit=limit,
-        global_num_experts=E,
     )
     # Reference consumes the dequantized weights (same bits the kernel reads).
     w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
@@ -204,13 +203,13 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
 @requires_gfx950
 @torch.inference_mode()
 def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 
     torch.manual_seed(0)
     T, H, inter = 4, 256, 512
-    local_E, global_E = 3, 6
+    local_E = 3
     alpha, beta, limit = 1.702, 1.0, 7.0
 
     w13_bf16 = (
@@ -249,7 +248,6 @@ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
         alpha=alpha,
         beta=beta,
         limit=limit,
-        global_num_experts=global_E,
         expert_map=expert_map,
     )
 
