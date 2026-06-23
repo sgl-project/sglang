@@ -28,9 +28,12 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.domino_helper import DFlashDominoHelper
+from sglang.srt.speculative.domino_rollout import DFlashDominoRollout
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -183,6 +186,39 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+
+        # Optional Domino projector rollout. Only created when the draft model
+        # carries a Domino projector; ordinary DFLASH draft selection is left
+        # untouched. The rollout owns the Domino-specific draft-token generation
+        # and currently supports CUDA + TP=1 only.
+        self.domino_helper: Optional[DFlashDominoHelper] = (
+            DFlashDominoHelper(self.draft_model)
+            if is_dflash_domino_projector(
+                getattr(self.draft_model, "projector_type", None)
+            )
+            else None
+        )
+        if self.domino_helper is not None:
+            # Fail early (at server init) for unsupported parallelism instead of
+            # raising deep inside the first decode step. The selected draft token
+            # feeds the next GRU step, so TP>1 would need per-step cross-rank
+            # synchronization that this first port does not implement.
+            domino_tp_size = int(get_tp_group().world_size)
+            if domino_tp_size != 1:
+                raise NotImplementedError(
+                    "DFLASH Domino projector currently supports TP=1 only, got "
+                    f"tp_size={domino_tp_size}. Launch with --tp-size 1 "
+                    "(alias --tensor-parallel-size 1), or use a non-Domino DFLASH "
+                    "draft model for TP>1."
+                )
+        self.domino_rollout: Optional[DFlashDominoRollout] = (
+            DFlashDominoRollout(
+                domino_helper=self.domino_helper,
+                block_size=self.block_size,
+            )
+            if self.domino_helper is not None
+            else None
+        )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -1490,10 +1526,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
+
+        if is_dflash_domino_projector(
+            getattr(self.draft_model, "projector_type", None)
+        ):
+            if self.domino_rollout is None:
+                raise RuntimeError(
+                    "DFLASH Domino projector requires an initialized Domino rollout."
+                )
+            draft_next = self.domino_rollout.rollout_draft_block(
+                draft_hidden=draft_hidden,
+                verified_id=block_ids[:, 0],
+                target_model=target_model,
+                lm_head=lm_head,
+            )
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
