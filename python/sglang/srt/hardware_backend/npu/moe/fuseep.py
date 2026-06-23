@@ -12,13 +12,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.server_args import get_global_server_args
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE

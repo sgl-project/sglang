@@ -1637,7 +1637,7 @@ class ServerArgs:
     ] = "auto"
     fuseep_mode: A[
         Literal[1, 2],
-        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2)."
+        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
     ] = 2
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
@@ -5336,7 +5336,9 @@ class ServerArgs:
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if (self.moe_a2a_backend == "none" and is_npu()) or self.moe_a2a_backend == "torch_npu":
+        if (
+            self.moe_a2a_backend == "none" and is_npu()
+        ) or self.moe_a2a_backend == "torch_npu":
             # FIXME (OrangeRedeng): for some reasons if pass "torch_npu" accuracy drops to zero
             self.moe_a2a_backend = "none"
 

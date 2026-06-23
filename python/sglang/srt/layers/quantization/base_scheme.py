@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 
