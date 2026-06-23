@@ -1149,6 +1149,10 @@ class ServerArgs:
     benchmark_prefill_granularity: A[
         int, "Number of ISL sample points for self-benchmark prefill sweep."
     ] = 16
+    benchmark_prefill_kv_read_granularity: A[
+        int,
+        "Number of KV-read sample points per ISL for self-benchmark prefill sweep. The default keeps the existing miss-only sweep.",
+    ] = 1
     benchmark_decode_length_granularity: A[
         int, "Number of context length sample points for self-benchmark decode sweep."
     ] = 6
