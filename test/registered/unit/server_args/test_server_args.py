@@ -1145,13 +1145,13 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            ServerArgs(
-                model_path="dummy",
-                enable_session_radix_cache=True,
-                radix_eviction_policy="lru",
-            )
+    def test_supports_lru_radix_eviction_policy(self):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_session_radix_cache=True,
+            radix_eviction_policy="lru",
+        )
+        self.assertEqual(args.radix_eviction_policy, "lru")
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
