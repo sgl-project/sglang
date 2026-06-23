@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     TextConditioningOutput,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
@@ -158,3 +161,9 @@ class FastHunyuanConfig(HunyuanConfig):
 
     # No need to re-specify guidance_scale or embedded_cfg_scale as they
     # already have the desired values from HunyuanConfig
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_disable_component_offload_min_available_memory_gb=150,
+            auto_disable_component_offload_components=("vae",),
+        )

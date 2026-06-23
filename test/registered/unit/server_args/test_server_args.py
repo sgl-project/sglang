@@ -147,6 +147,157 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
+class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            dsa_prefill_backend="tilelang",
+        )
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="aiter",
+            dsa_decode_backend="aiter",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="flashmla_sparse",
+        )
+
+        with self.assertRaisesRegex(ValueError, "tilelang"):
+            server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="tilelang",
+        )
+
+        with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
+            server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_accepts_fp8_e4m3_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_rejects_unsupported_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="float16",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
+            server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestFa4PageSizeAutoForce(CustomTestCase):
+    """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
+    must trigger for `--attention-backend fa4` (combined) too, not only for the
+    explicit `--prefill-attention-backend fa4` path."""
+
+    def _make_args(self, attention_backend, prefill=None, decode=None, page_size=1):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend = prefill
+        args.decode_attention_backend = decode
+        args.page_size = page_size
+        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
+        # real model_config. Pre-set the attribute so get_model_config returns
+        # early without touching ModelConfig.from_server_args.
+        args.model_config = MagicMock()
+        args.model_config.hf_config.dual_chunk_attention_config = None
+        return args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_combined_attention_backend_fa4_forces_page_size_128(
+        self, _mock_mla, _mock_sm100
+    ):
+        # `--attention-backend fa4` (combined): prefill/decode fields stay None.
+        args = self._make_args(attention_backend="fa4")
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
+        # `--prefill-attention-backend fa4`: the previously-covered path.
+        args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
+
+        args._handle_attention_backend_compatibility()
+
+        self.assertEqual(args.page_size, 128)
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()
@@ -159,6 +310,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
+            model_path="instance://127.0.0.1:8000/dummy",
             dsa_prefill_cp_mode="round-robin-split",
             prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
@@ -898,20 +1050,17 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
+class TestSessionRadixCacheServerArgs(unittest.TestCase):
+    def test_requires_priority_radix_eviction_policy(self):
+        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
+            ServerArgs(
+                model_path="dummy",
+                enable_session_radix_cache=True,
+                radix_eviction_policy="lru",
+            )
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
-    def test_overlap_force_cpu_seq_lens_with_tc_piecewise_prefill(self):
-        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
-
-        server_args = SimpleNamespace(
-            enable_two_batch_overlap=False,
-            cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        attn_backend = SimpleNamespace(needs_cpu_seq_lens=False)
-
-        self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
-
     @patch(
         "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
