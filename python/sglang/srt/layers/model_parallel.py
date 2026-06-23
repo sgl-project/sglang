@@ -2,11 +2,14 @@
 Common utilities for torch model parallelism.
 """
 
+import logging
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+
+logger = logging.getLogger(__name__)
 
 try:
     import torch.distributed.tensor as dt
