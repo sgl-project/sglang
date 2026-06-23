@@ -72,12 +72,6 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.eplb.lplb_solver import (
-    LPLBSolver,
-    assert_lplb_supported_model,
-    clear_global_lplb_solvers,
-    set_global_lplb_solver,
-)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
@@ -143,6 +137,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    init_lplb_solvers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.msprobe import (
@@ -1049,36 +1044,6 @@ class ModelRunner:
         )
 
         self._dist_barrier_after_load()
-
-    @staticmethod
-    def init_lplb_solvers(*, model_config: ModelConfig) -> None:
-        """Initialize per-layer LPLB solvers from current expert location metadata."""
-        from sglang.srt.distributed import get_moe_ep_group
-
-        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
-        # don't participate in the EP all-reduce (would deadlock under DP-
-        # attention). Failure here happens before any forward pass.
-        architectures = getattr(model_config.hf_config, "architectures", None)
-        if architectures:
-            assert_lplb_supported_model(architectures[0])
-
-        metadata = get_global_expert_location_metadata()
-        if metadata is None:
-            return
-        clear_global_lplb_solvers()
-        ep_group = get_moe_ep_group()
-        for lid in range(metadata.num_layers):
-            solver = LPLBSolver(
-                phy2log=metadata.physical_to_logical_map[lid],
-                log2phy=metadata.logical_to_all_physical_map[lid],
-                num_gpus=metadata.ep_size,
-                ep_group=ep_group,
-                logical_to_all_physical_map_num_valid=(
-                    metadata.logical_to_all_physical_map_num_valid[lid]
-                ),
-            )
-            set_global_lplb_solver(lid, solver)
-        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
     def _build_load_config(self) -> LoadConfig:
         # Prepare the model config

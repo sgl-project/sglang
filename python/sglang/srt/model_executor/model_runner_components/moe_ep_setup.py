@@ -3,6 +3,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    assert_lplb_supported_model,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.utils import log_info_on_rank0
@@ -71,3 +78,33 @@ def prepare_moe_topk(
         log_info_on_rank0(
             logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
         )
+
+
+def init_lplb_solvers(*, model_config: ModelConfig) -> None:
+    """Initialize per-layer LPLB solvers from current expert location metadata."""
+    from sglang.srt.distributed import get_moe_ep_group
+
+    # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+    # don't participate in the EP all-reduce (would deadlock under DP-
+    # attention). Failure here happens before any forward pass.
+    architectures = getattr(model_config.hf_config, "architectures", None)
+    if architectures:
+        assert_lplb_supported_model(architectures[0])
+
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        return
+    clear_global_lplb_solvers()
+    ep_group = get_moe_ep_group()
+    for lid in range(metadata.num_layers):
+        solver = LPLBSolver(
+            phy2log=metadata.physical_to_logical_map[lid],
+            log2phy=metadata.logical_to_all_physical_map[lid],
+            num_gpus=metadata.ep_size,
+            ep_group=ep_group,
+            logical_to_all_physical_map_num_valid=(
+                metadata.logical_to_all_physical_map_num_valid[lid]
+            ),
+        )
+        set_global_lplb_solver(lid, solver)
+    logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
