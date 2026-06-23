@@ -1298,12 +1298,23 @@ class TestAnthropicServing(unittest.TestCase):
         body = json.loads(bytes(response.body).decode())
         self.assertEqual(body["error"]["type"], "api_error")
 
-    def test_user_message_text_tool_text_preserves_order(self):
-        """User message [text, tool_result, text] must stay user→tool→user on the wire."""
+    def test_user_message_text_tool_text_keeps_tool_adjacent(self):
+        """User text around a tool_result flushes after the adjacent tool message."""
         serving = self._serving()
         request = self._anthropic_request(
             stream=False,
             messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_x",
+                            "name": "lookup",
+                            "input": {},
+                        }
+                    ],
+                },
                 {
                     "role": "user",
                     "content": [
@@ -1315,16 +1326,23 @@ class TestAnthropicServing(unittest.TestCase):
                         },
                         {"type": "text", "text": "second"},
                     ],
-                }
+                },
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
         # chat_request.messages items are Pydantic ChatCompletionMessage*Param
         # variants — use attribute access, not subscripts.
         roles = [m.role for m in chat_request.messages]
-        self.assertEqual(roles, ["user", "tool", "user"])
-        self.assertEqual(chat_request.messages[0].content, "first")
-        self.assertEqual(chat_request.messages[2].content, "second")
+        self.assertEqual(roles, ["assistant", "tool", "user"])
+        self.assertEqual(chat_request.messages[1].tool_call_id, "call_x")
+        self.assertEqual(chat_request.messages[1].content, "ok")
+        self.assertEqual(
+            [part.model_dump() for part in chat_request.messages[2].content],
+            [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ],
+        )
 
     def test_empty_text_assistant_turn_preserves_role_alternation(self):
         """Assistant turn with only empty text must NOT vanish from the wire."""
