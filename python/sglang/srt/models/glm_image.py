@@ -38,7 +38,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -616,7 +615,6 @@ class GlmImageTextAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -635,19 +633,6 @@ class GlmImageTextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            partial_rotary_factor=partial_rotary_factor,
-            is_neox_style=True,
-        )
-
-        self.rope_parameters = config.rope_parameters
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -671,7 +656,7 @@ class GlmImageTextAttention(nn.Module):
             )
             mrope_section = rope_parameters.get("mrope_section", mrope_section)
 
-        self.rot2 = GlmImageRotaryEmbedding(
+        self.rotary_emb = GlmImageRotaryEmbedding(
             head_dim=self.head_dim,
             max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
@@ -687,27 +672,20 @@ class GlmImageTextAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rot2(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
 
 class GlmImageTextRotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
     def __init__(self, config, device=None):
         super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
         self.config = config
-
         self.rope_type = self.config.rope_parameters["rope_type"]
         inv_freq, self.attention_scaling = self.compute_default_rope_parameters(
             self.config, device
         )
-
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
         self.mrope_section = config.rope_parameters.get("mrope_section", [8, 12, 12])
@@ -972,7 +950,6 @@ class GlmImageTextModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = GlmImageTextRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -1051,13 +1028,6 @@ class GlmImageForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
-
-        # GLM-Image uses split-half (neox-style) rotary embedding, unlike GLM4
-        # which uses interleaved rotation.  Glm4Attention defaults to
-        # is_neox_style=False, so we override it here after construction.
-        for layer in self.model.layers:
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
-                layer.self_attn.rotary_emb.is_neox_style = True
 
         # LogitsProcessor with vision_vocab_size
         vision_vocab_size = getattr(self.text_config, "vision_vocab_size", None)
