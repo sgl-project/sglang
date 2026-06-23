@@ -90,7 +90,7 @@ class EPLBManager:
                 new_expert_location_metadata=expert_location_metadata,
                 update_layer_ids=update_layer_ids,
                 nnodes=self._model_runner.server_args.nnodes,
-                tp_rank=self._model_runner.tp_rank,
+                tp_rank=self._model_runner.ps.tp_rank,
                 expert_backup_client=self._model_runner.expert_backup_client,
                 update_weights_from_disk_callable=self._model_runner.weight_updater.update_weights_from_disk,
                 ep_dispatch_algorithm=self._model_runner.server_args.ep_dispatch_algorithm,

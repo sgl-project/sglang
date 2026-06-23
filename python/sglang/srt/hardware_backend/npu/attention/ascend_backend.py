@@ -363,7 +363,7 @@ class AscendAttnBackend(AttentionBackend):
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
 
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (

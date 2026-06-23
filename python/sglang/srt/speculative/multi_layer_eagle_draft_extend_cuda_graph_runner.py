@@ -120,7 +120,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.tp_size
+        self.tp_size = model_runner.ps.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -554,7 +554,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    dp_size = runner.dp_size
+                    dp_size = runner.attn_dp_size
                     global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
                     global_num_tokens_for_logprob_gpu = torch.zeros(
                         (dp_size,), dtype=torch.int32

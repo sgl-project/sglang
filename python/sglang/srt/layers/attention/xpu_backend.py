@@ -57,7 +57,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
-        self.tp_size = model_runner.tp_size
+        self.tp_size = model_runner.ps.tp_size
         assert self.num_attention_heads % self.tp_size == 0
         self.num_local_heads = self.num_attention_heads // self.tp_size
         self.device = model_runner.device
