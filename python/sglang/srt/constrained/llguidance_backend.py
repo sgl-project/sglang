@@ -31,6 +31,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
     InvalidGrammarObject,
+    truncate_grammar_for_log,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 
@@ -154,7 +155,9 @@ class GuidanceBackend(BaseGrammarBackend):
                 },
             )
         except Exception as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={truncate_grammar_for_log(key_string)!r}, {e=}"
+            )
             return InvalidGrammarObject(str(e))
         return self._from_serialized(serialized_grammar)
 
@@ -167,7 +170,9 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid ebnf: key_string={truncate_grammar_for_log(key_string)!r}, {e=}"
+            )
             return InvalidGrammarObject(str(e))
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
@@ -186,5 +191,7 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid structural_tag: key_string={truncate_grammar_for_log(key_string)!r}, {e=}"
+            )
             return InvalidGrammarObject(str(e))
