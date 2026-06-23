@@ -2320,5 +2320,111 @@ class TestCalibrateMethod1(unittest.TestCase):
         self.assertIn("label-dim", str(ctx.exception))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "current-slot force-include is a Triton kernel")
+class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
+    """AC-7/AC-5/AC-4: the current-slot +inf force-include fails closed on a
+    selector-width miss (no clamp to a different token) and, for cosine, only
+    fires when the row q-norm and the current physical-slot k-norm are finite.
+    Only the current slot (seq_len-1) is ever touched (H3 preserved)."""
+
+    def _run(
+        self,
+        seq_len,
+        max_seq_len,
+        *,
+        cosine=False,
+        qnorm_row=None,
+        cur_knorm_row=None,
+        H=2,
+    ):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            _force_include_current_slot,
+        )
+
+        dev = torch.device("cuda")
+        bs = 1
+        scores = torch.zeros((bs, max_seq_len), dtype=torch.bfloat16, device=dev)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
+        scratch_qnorm = key_norm_cache = req_pool = rtt = None
+        layer_id = 0
+        if cosine:
+            scratch_qnorm = torch.tensor(
+                [qnorm_row if qnorm_row is not None else [1.0] * H],
+                dtype=torch.float32,
+                device=dev,
+            )
+            req_pool = torch.tensor([0], dtype=torch.int32, device=dev)
+            max_ctx = max_seq_len + 4
+            # current physical slot for logical seq_len-1 is phys=7 (arbitrary).
+            phys = 7
+            rtt = torch.zeros((1, max_ctx), dtype=torch.int32, device=dev)
+            if 0 <= seq_len - 1 < max_ctx:
+                rtt[0, seq_len - 1] = phys
+            max_tokens = 16
+            key_norm_cache = torch.ones(
+                (1, max_tokens, H), dtype=torch.float32, device=dev
+            )
+            if cur_knorm_row is not None:
+                key_norm_cache[0, phys] = torch.tensor(
+                    cur_knorm_row, dtype=torch.float32, device=dev
+                )
+        _force_include_current_slot(
+            scores,
+            seq_lens,
+            max_seq_len,
+            bs,
+            cosine=cosine,
+            scratch_qnorm=scratch_qnorm,
+            key_norm_cache=key_norm_cache,
+            layer_id=layer_id,
+            req_pool_indices=req_pool,
+            req_to_token=rtt,
+        )
+        return scores
+
+    def test_rawdot_in_range_forces_current_only(self):
+        scores = self._run(5, 8)  # cur = 4
+        self.assertTrue(torch.isinf(scores[0, 4]).item())
+        # H3: nothing else touched.
+        others = torch.cat([scores[0, :4], scores[0, 5:]])
+        self.assertFalse(torch.isinf(others).any().item())
+
+    def test_width_miss_fails_closed(self):
+        # seq_len-1 = 9 >= max_seq_len 8 -> no force-include (no clamp to col 7).
+        scores = self._run(10, 8)
+        self.assertFalse(torch.isinf(scores).any().item())
+
+    def test_cosine_finite_forces(self):
+        scores = self._run(5, 8, cosine=True, qnorm_row=[1.0, 2.0], cur_knorm_row=[1.0, 1.0])
+        self.assertTrue(torch.isinf(scores[0, 4]).item())
+
+    def test_cosine_nan_qnorm_no_force(self):
+        scores = self._run(
+            5, 8, cosine=True, qnorm_row=[float("nan"), 1.0], cur_knorm_row=[1.0, 1.0]
+        )
+        self.assertFalse(torch.isinf(scores).any().item())
+
+    def test_cosine_inf_qnorm_no_force(self):
+        scores = self._run(
+            5, 8, cosine=True, qnorm_row=[float("inf"), 1.0], cur_knorm_row=[1.0, 1.0]
+        )
+        self.assertFalse(torch.isinf(scores).any().item())
+
+    def test_cosine_nan_current_knorm_still_forces(self):
+        # The current decode token's KV is valid by construction, so a NaN in its
+        # (lagging) key-norm CACHE entry must NOT drop it — only the row q-norm
+        # and width gate the current-slot force-include.
+        scores = self._run(
+            5, 8, cosine=True, qnorm_row=[1.0, 1.0], cur_knorm_row=[float("nan"), 1.0]
+        )
+        self.assertTrue(torch.isinf(scores[0, 4]).item())
+
+    def test_cosine_width_miss_fails_closed(self):
+        scores = self._run(
+            12, 8, cosine=True, qnorm_row=[1.0, 1.0], cur_knorm_row=[1.0, 1.0]
+        )
+        self.assertFalse(torch.isinf(scores).any().item())
+
+
 if __name__ == "__main__":
     unittest.main()

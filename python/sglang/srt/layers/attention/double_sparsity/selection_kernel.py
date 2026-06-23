@@ -698,6 +698,136 @@ def absorbed_topk_select(
     return select_topk_sequence_order(scores, max_top_k)
 
 
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _current_slot_force_include_kernel(
+        scores_ptr,  # [bs, max_seq_len] authoritative topk_scores (bf16 or fp32)
+        seq_lens_ptr,  # [bs] int32
+        qnorm_ptr,  # [bs, H] fp32 — per-row query selection-channel norms (cosine)
+        knorm_ptr,  # [max_tokens, H] fp32 — key_norm_cache[layer_id] (cosine)
+        req_to_token_ptr,  # [num_pool, max_ctx] int32 (cosine)
+        req_pool_ptr,  # [bs] int32 (cosine)
+        scores_row_stride,
+        qnorm_row_stride,
+        knorm_row_stride,
+        rtt_row_stride,
+        max_seq_len,
+        H,
+        BLOCK_H: tl.constexpr,
+        COSINE: tl.constexpr,
+    ):
+        # One program per row. Force-include the current decode slot (logical
+        # position seq_len-1) by writing +inf, FAIL-CLOSED: write nothing when
+        # seq_len-1 is outside the scored width [0, max_seq_len) (no clamp to a
+        # different token). For cosine, additionally require the row's q-norm to
+        # be finite (a NaN/inf q-norm means a meaningless cosine score for the
+        # row, so it must not be force-selected). Reads the existing buffers in
+        # place — zero allocation, graph-safe.
+        #
+        # The current slot's own key-norm is intentionally NOT gated: the current
+        # decode token's KV is valid by construction (just computed this step), so
+        # it is never a stale-reuse hazard (H3 is already enforced by the
+        # written-bit mask, which keeps every OTHER reused slot -inf-masked). Its
+        # key-norm CACHE entry can still be NaN at selection time because the
+        # populate hook lags one step; gating on that lagging cache value wrongly
+        # drops the valid current token and regressed the served gate 0.970 ->
+        # 0.640. The knorm/req_to_token kernel args are kept reserved for a future
+        # current-slot k-norm gate once the populate timing (handoff §4-step-2) is
+        # fixed so the current slot's cache entry is finite at selection time.
+        b = tl.program_id(0)
+        cur = tl.load(seq_lens_ptr + b).to(tl.int32) - 1
+        in_range = (cur >= 0) & (cur < max_seq_len)
+        do_write = in_range
+        if COSINE:
+            offs = tl.arange(0, BLOCK_H)
+            hmask = offs < H
+            qn = tl.load(qnorm_ptr + b * qnorm_row_stride + offs, mask=hmask, other=0.0)
+            q_finite = (tl.sum((qn != qn).to(tl.int32)) == 0) & (
+                tl.max(qn) < float("inf")
+            )
+            do_write = in_range & q_finite
+        # Masked store: when do_write is False nothing is written; when True,
+        # in_range holds so `cur` is a safe column index.
+        store_col = tl.where(do_write, cur, 0)
+        tl.store(
+            scores_ptr + b * scores_row_stride + store_col,
+            float("inf"),
+            mask=do_write,
+        )
+
+
+def _force_include_current_slot(
+    topk_scores: torch.Tensor,  # [bs, max_seq_len] authoritative post-reduce buffer
+    seq_lens: torch.Tensor,  # int32 [bs]
+    max_seq_len: int,
+    bs: int,
+    *,
+    cosine: bool,
+    scratch_qnorm: Optional[torch.Tensor],  # fp32 [max_bs, H] (cosine)
+    key_norm_cache: Optional[torch.Tensor],  # fp32 [L, max_tokens, H] (cosine)
+    layer_id: int,
+    req_pool_indices: Optional[torch.Tensor],  # int32 [bs] (cosine)
+    req_to_token: Optional[torch.Tensor],  # int32 [num_pool, max_ctx] (cosine)
+) -> None:
+    """Fail-closed, finite-norm-gated current-slot +inf force-include (AC-7).
+
+    0-alloc / graph-safe: a single Triton program per row reads the existing
+    buffers and writes +inf in place only for a width-covered current slot whose
+    (cosine) q/k norms are finite. No clamp-to-wrong-token fallback.
+    """
+    if bs <= 0 or max_seq_len <= 0:
+        return
+    if cosine:
+        # Cosine force-include requires the norm caches + page map to verify
+        # finiteness; if any is absent, fail closed (do not force-include without
+        # the finite-norm guarantee).
+        if (
+            scratch_qnorm is None
+            or key_norm_cache is None
+            or req_pool_indices is None
+            or req_to_token is None
+        ):
+            return
+        H = int(scratch_qnorm.shape[1])
+        knorm_layer = key_norm_cache[layer_id]  # [max_tokens, H] view (0-alloc)
+        _current_slot_force_include_kernel[(bs,)](
+            topk_scores,
+            seq_lens,
+            scratch_qnorm,
+            knorm_layer,
+            req_to_token,
+            req_pool_indices,
+            topk_scores.stride(0),
+            scratch_qnorm.stride(0),
+            knorm_layer.stride(0),
+            req_to_token.stride(0),
+            max_seq_len,
+            H,
+            BLOCK_H=triton.next_power_of_2(H),
+            COSINE=True,
+        )
+    else:
+        # raw-dot: no norm gate; width fail-closed only. Dummy pointers for the
+        # cosine-only args are never dereferenced (COSINE=False is constexpr).
+        _current_slot_force_include_kernel[(bs,)](
+            topk_scores,
+            seq_lens,
+            topk_scores,
+            topk_scores,
+            seq_lens,
+            seq_lens,
+            topk_scores.stride(0),
+            0,
+            0,
+            0,
+            max_seq_len,
+            1,
+            BLOCK_H=1,
+            COSINE=False,
+        )
+
+
 def retrieve_topk_graph_safe(
     *,
     queries: torch.Tensor,
@@ -984,17 +1114,24 @@ def retrieve_topk_graph_safe(
     # BEFORE the top-k, writing the AUTHORITATIVE buffer (bf16(+inf) upcasts to
     # fp32(+inf), so the selection is identical on either dtype). Only seq_len-1
     # is touched, so every other reused slot stays -inf-masked — the stale-slot
-    # hazard is not reopened. In-place / fixed-shape / 0-alloc: the per-row index
-    # is built into scratch_cur_index (int64) and scattered with a scalar +inf.
+    # hazard is not reopened (AC-4). FAIL-CLOSED (AC-7): the helper writes +inf
+    # only for a width-covered seq_len-1 (NO clamp to a different token on a
+    # selector-width miss) and, for cosine, only when the row's q-norm and the
+    # current physical slot's k-norm are finite (AC-5: a NaN/inf norm can never
+    # be force-selected). 0-alloc / graph-safe Triton helper.
     if include_current_slot and max_seq_len > 0:
-        assert scratch_cur_index is not None, (
-            "include_current_slot requires scratch_cur_index in graph-safe path"
+        _force_include_current_slot(
+            topk_scores,
+            seq_lens,
+            max_seq_len,
+            bs,
+            cosine=(scorer_norm == "cosine"),
+            scratch_qnorm=scratch_qnorm,
+            key_norm_cache=key_norm_cache,
+            layer_id=layer_id,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
         )
-        cur_index = scratch_cur_index[:bs]
-        cur_index.copy_(seq_lens)  # int32 seq_lens -> int64 index, in place
-        cur_index.sub_(1)  # current logical position = seq_len - 1
-        cur_index.clamp_(min=0, max=max_seq_len - 1)  # range-guard the scatter
-        topk_scores.scatter_(1, cur_index.unsqueeze(1), float("inf"))
 
     torch.cuda.nvtx.range_push("ds_topk_select")
     if radix_topk_scratch is not None:
