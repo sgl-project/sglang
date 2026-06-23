@@ -44,3 +44,21 @@ dsr1-fp4-gb200-dynamo-sglang:
         - conc-list: [512, 2048, 4096, 8192]
           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/1k1k/mid-curve.yaml
           config_file: recipes/gb200-fp4/1k1k/mid-curve.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation. Driven by
+# scripts/ci/slurm/launch_mi355x.sh, which reads the recipe's `runtime` and
+# `bench` sections (see recipes/mi355x-fp8/1k1k/1p1d.yaml).
+dsv4flash-fp8-mi355x-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: recipes/mi355x-fp8/1k1k/1p1d.yaml

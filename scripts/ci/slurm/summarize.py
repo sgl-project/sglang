@@ -113,7 +113,8 @@ def main():
         for r in results
     ]
 
-    print("## GB200 Nightly Benchmark Results\n")
+    hw_label = "/".join(sorted({r["hw"].upper() for r in results})) or "Nightly"
+    print(f"## {hw_label} Nightly Benchmark Results\n")
     print(tabulate(rows, headers=HEADERS, tablefmt="github"))
     print()
 
