@@ -75,6 +75,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import _is_complete_json
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -615,7 +616,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 reasoning_tokens=num_reasoning_tokens
             ),
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
@@ -733,7 +734,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         type="reasoning_text", text=reasoning_content
                     ),
                 ],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
 
@@ -1749,21 +1750,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # OpenAI SDK's Tool union may not know extended types; drop echo.
         response_dict["tools"] = []
 
-        # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
-
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
                 type="response.completed",
@@ -2298,6 +2284,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 delta=call.parameters,
                             )
                         )
+                    if (
+                        not state["done"]
+                        and state["arguments"]
+                        and _is_complete_json(state["arguments"])
+                    ):
+                        for ev in _close_tool_call_state(tool_index):
+                            yield ev
+
         except Exception:
             logger.exception("Error while streaming /v1/responses")
             failed = _sanitize_response_dict(
@@ -2338,7 +2332,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 reasoning_tokens=reasoning_tokens_meta
             ),
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
             )
