@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -12,6 +14,7 @@ register_cuda_ci(est_time=960, stage="base-c", runner_config="4-gpu-b200")
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV3FP4SymmetricMemory(GSM8KMixin, DefaultServerBase):
     model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
     timeout = 1200

@@ -5,6 +5,7 @@ import time
 import unittest
 
 import requests
+import torch
 from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
@@ -31,6 +32,7 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
     assert actual >= lower, f"{label}: expected cached_tokens>={lower}, got {actual}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
@@ -98,6 +100,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     TestUnifiedDeepSeekV4FlashHiCache
 ):
@@ -110,6 +113,7 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 # ─── DeepSeek V4 Flash + HiCache L3 (file backend) ──────────────────────
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache L3 (file backend) + UnifiedRadixCache."""
 
@@ -168,6 +172,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash EAGLE + HiCache L3 should load from storage."""
 

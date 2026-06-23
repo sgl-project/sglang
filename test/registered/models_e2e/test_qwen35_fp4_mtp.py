@@ -108,6 +108,7 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         _run_mtp_gsm8k(self)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
     reasoning_parser_name = "qwen3"
 

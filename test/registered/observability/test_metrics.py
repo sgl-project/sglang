@@ -5,6 +5,7 @@ import unittest
 from typing import Dict, List
 
 import requests
+import torch
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
@@ -31,6 +32,7 @@ register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEnableMetrics(CustomTestCase):
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
@@ -410,6 +412,7 @@ def _clear_sglang_metrics_from_default_registry() -> None:
             REGISTRY.unregister(collector)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStatLoggersDI(CustomTestCase):
     """Verify that a custom MetricsCollector subclass passed through
     ``ServerArgs.stat_loggers`` is the one instantiated inside the
@@ -452,6 +455,7 @@ class TestStatLoggersDI(CustomTestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStatLoggersDIRecording(CustomTestCase):
     """Boot a real ``sgl.Engine`` with a custom scheduler collector that
     swaps the four DI hook classes for a FakeRayMetric-style recording

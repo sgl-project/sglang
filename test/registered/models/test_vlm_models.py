@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import (
@@ -31,6 +33,7 @@ else:
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestVLMModels(MMMUMultiModelTestBase):
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
