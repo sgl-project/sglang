@@ -2443,7 +2443,7 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{format_listen_addr(server_args)}"
                 )
                 _run_granian_server(
                     host=server_args.host,
