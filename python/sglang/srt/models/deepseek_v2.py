@@ -2342,7 +2342,7 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and getattr(self.embed_tokens, "embedding_dim", 0) == 7168
+            and getattr(self.embed_tokens, "embedding_dim", config.hidden_size) == 7168
         ):
             num_moe_layers = sum(
                 [
