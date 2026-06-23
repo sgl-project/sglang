@@ -5,7 +5,7 @@ import time
 import aiohttp
 import requests
 
-from sglang.bench_serving import RequestFuncOutput
+from sglang.bench_serving import RequestFuncOutput, get_auth_headers
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
@@ -22,7 +22,7 @@ async def async_request_sglang_generate(
     Returns a RequestFuncOutput with additional cached_tokens and output_ids attributes.
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {}
+        headers = get_auth_headers()
         generated_text = ""
         all_output_ids = []
         ttft = 0.0
@@ -108,7 +108,9 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            async with session.post(
+                url=url, json=payload, headers=get_auth_headers()
+            ) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
@@ -221,7 +223,9 @@ async def _send_round(
 def _get_page_size(base_url: str) -> int:
     """Query server for page_size used by radix cache."""
     try:
-        resp = requests.get(f"{base_url}/server_info", timeout=10)
+        resp = requests.get(
+            f"{base_url}/server_info", headers=get_auth_headers(), timeout=10
+        )
         resp.raise_for_status()
         info = resp.json()
         return info.get("page_size", 1)
@@ -266,7 +270,7 @@ def run_multiturn_cache_hit_test(
     page_size = _get_page_size(base_url)
 
     # Flush cache for clean state
-    requests.post(f"{base_url}/flush_cache")
+    requests.post(f"{base_url}/flush_cache", headers=get_auth_headers())
     time.sleep(1)
 
     # Resolve sub-question length (0 means same as request_length)
