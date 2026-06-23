@@ -851,7 +851,7 @@ class HiCacheController:
                 self.storage_backend.register_mem_host_pool_v2(
                     self.mem_pool_host_draft, PoolName.DRAFT
                 )
-            except RuntimeError as e:
+            except Exception as e:
                 logger.warning(
                     "HiCache draft L3 disabled: failed to register draft buffer "
                     "to Mooncake Store. Draft KV cache will use L2 (host DRAM) only. "
