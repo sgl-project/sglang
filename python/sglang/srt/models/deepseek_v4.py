@@ -161,6 +161,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+# PoC: in the MAX_LEN (equal per-rank padding) decode combine, replace the
+# MoE-internal post-experts all_reduce + dp_scatter with an equal-chunk
+# reduce_scatter implemented via aiter's custom (symmetric-memory) kernel.
+# Combines aiter-kernel speed with reduce_scatter's halved traffic. Default OFF.
+_AITER_RS = get_bool_env_var("SGLANG_USE_AITER_RS")
 _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
@@ -1584,6 +1589,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
         )
+        # PoC (SGLANG_USE_AITER_RS): in the MAX_LEN decode path (equal per-rank
+        # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
+        # all_reduce + dp_scatter with an equal-chunk reduce_scatter (aiter custom
+        # kernel, falls back to RCCL). The all_gather (MAX_LEN gather) already uses
+        # the aiter custom kernel, so this makes BOTH halves aiter while cutting the
+        # combine traffic ~2x vs all_reduce. tp_size==attn_dp_size required so the
+        # global buffer splits evenly into per-rank chunks.
+        _use_aiter_rs = (
+            _AITER_RS
+            and _use_tp_moe_gather
+            and not _use_gatherv_pair
+            and not should_use_dp_reduce_scatterv()
+            and forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and get_parallel().tp_size == get_parallel().attn_dp_size
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
@@ -1629,8 +1650,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             # Skip the MoE-internal post-experts all_reduce when we will do the
-            # reduce via reduce_scatterv at the combine below (else double-reduce).
-            use_reduce_scatter=_use_cp or _use_gatherv_pair,
+            # reduce via reduce_scatterv/reduce_scatter at the combine below
+            # (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_gatherv_pair or _use_aiter_rs,
             skip_shared_experts=_do_shared_local,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
@@ -1649,6 +1671,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                     global_hidden_states,
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
+                )
+            elif _use_aiter_rs:
+                # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
+                # expert outputs AND scatter each rank its own (MAX_LEN-padded)
+                # token chunk in one op (symmetric inverse of the MAX_LEN
+                # all_gather). Correct because the MoE-internal all_reduce was
+                # skipped (use_reduce_scatter above). Uses aiter custom kernel
+                # when it fits, else RCCL reduce_scatter. Call reduce_scatter_tensor
+                # directly (NOT dp_reduce_scatter_tensor) so the equal-chunk aiter
+                # path is taken even when SGLANG_DP_USE_GATHERV is set (that helper
+                # would route to the variable-length RCCL reduce_scatterv instead).
+                get_tp_group().reduce_scatter_tensor(
+                    hidden_states, global_hidden_states
                 )
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
