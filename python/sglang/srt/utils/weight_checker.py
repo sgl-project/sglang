@@ -8,9 +8,9 @@ import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
-from sglang.srt.utils.weight_checker_quant import (
+from sglang.srt.utils.weight_checker_comparator import (
     _CHUNK_NUMEL,
-    Fp8BlockReference,
+    _compare_raw_pair,
     _compare_references,
     select_quantization_method,
 )
@@ -88,8 +88,8 @@ class WeightChecker:
 
     def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
-        self._assert_quant_supported()
 
+        quant_plan = _build_quant_plan(self._model_runner.model)
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -97,10 +97,10 @@ class WeightChecker:
         }
         _check_tensors(
             expect_tensors=_postprocess_tensors(
-                self._snapshot_tensors, skip_compare_names
+                self._snapshot_tensors, skip_compare_names, quant_plan
             ),
             actual_tensors=_postprocess_tensors(
-                dict(self._model_state()), skip_compare_names
+                dict(self._model_state()), skip_compare_names, quant_plan
             ),
             allow_quant_error=allow_quant_error,
         )
@@ -108,8 +108,8 @@ class WeightChecker:
     def _compute_checksum(self) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
-        self._assert_quant_supported()
 
+        quant_plan = _build_quant_plan(self._model_runner.model)
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -121,7 +121,7 @@ class WeightChecker:
         # produce the same bf16 must produce the same checksum.
         checksums = {}
         for name, should_compare, entry in _postprocess_tensors(
-            dict(self._model_state()), skip_compare_names
+            dict(self._model_state()), skip_compare_names, quant_plan
         ):
             if not should_compare:
                 continue
@@ -166,10 +166,6 @@ class WeightChecker:
     def _model_state(self):
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
-
-    def _assert_quant_supported(self):
-        for _, module in self._model_runner.model.named_modules():
-            select_quantization_method(getattr(module, "quant_method", None))
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
@@ -279,40 +275,35 @@ def _random_like(t: torch.Tensor):
     )
 
 
-def _compare_raw_pair(
-    expect: torch.Tensor, actual: torch.Tensor, compute_stats: bool
-) -> Tuple[bool, float, float]:
-    """Chunked exact-compare of two raw tensors, optionally accumulating
-    abs-diff stats. Returns (equal, max_abs_err, mean_abs_err)."""
-    assert expect.shape == actual.shape, f"{expect.shape=} {actual.shape=}"
-    expect_flat = expect.reshape(-1)
-    actual_flat = actual.reshape(-1)
-
-    equal = True
-    max_abs_err = torch.zeros((), dtype=torch.float32)
-    sum_abs_err = 0.0
-    for start in range(0, expect_flat.numel(), _CHUNK_NUMEL):
-        e = expect_flat[start : start + _CHUNK_NUMEL].cuda()
-        a = actual_flat[start : start + _CHUNK_NUMEL].cuda()
-        if torch.all(e == a):
+def _build_quant_plan(model) -> Dict[str, Tuple[type, str]]:
+    """Apply the router across the model: {weight_name: (ReferenceWeight subclass,
+    scale_name)} for each weight in a module routed to a ReferenceWeight. Weights
+    absent from the plan (int4, mxfp8, unquantized, ...) compare raw.
+    select_quantization_method raises for an unsupported quant format (e.g. nvfp4).
+    """
+    plan = {}
+    for module_name, module in model.named_modules():
+        rw_cls = select_quantization_method(getattr(module, "quant_method", None))
+        if rw_cls is None:
             continue
-        equal = False
-        if not compute_stats:
-            break
-        abs_diff = (a.float() - e.float()).abs()
-        # torch.maximum propagates NaN, unlike builtin max().
-        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
-        sum_abs_err += abs_diff.sum().item()
-    return equal, max_abs_err.item(), sum_abs_err / max(expect_flat.numel(), 1)
+        prefix = f"{module_name}." if module_name else ""
+        own = {name for name, _ in module.named_parameters(recurse=False)}
+        for name in own:
+            scale = name.replace("weight", "weight_scale_inv")
+            if name.endswith("weight") and scale in own:
+                plan[prefix + name] = (rw_cls, prefix + scale)
+    return plan
 
 
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
+    quant_plan: Optional[Dict[str, Tuple[type, str]]] = None,
 ) -> Iterable[Tuple[str, bool, Tuple]]:
     """Yields (name, should_compare, entry); entry is ("quant", ReferenceWeight)
-    for block-quant pairs or ("raw", tensor)."""
+    for the weight pairs in quant_plan (empty => all raw) or ("raw", tensor)."""
     skip_compare_names = set(skip_compare_names)
+    quant_plan = quant_plan or {}
 
     # Skip non-persistent buffers (registered with persistent=False; recomputed
     # after weight load and not part of the synced payload).
@@ -321,25 +312,9 @@ def _postprocess_tensors(
             skip_compare_names.add(name)
             logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
 
-    # dequant fp8
-    quant_names = [
-        name
-        for name in raw
-        # Match: `something.weight`, `something.experts.w2_weight`
-        if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
-    ]
-    quant_scale_names = [
-        name.replace("weight", "weight_scale_inv") for name in quant_names
-    ]
-    skip_compare_names.update(quant_names)
-    skip_compare_names.update(quant_scale_names)
-    for name in quant_names:
-        yield name, True, (
-            "quant",
-            Fp8BlockReference(
-                raw[name], raw[name.replace("weight", "weight_scale_inv")]
-            ),
-        )
+    for w_name, (rw_cls, s_name) in quant_plan.items():
+        skip_compare_names.update((w_name, s_name))
+        yield w_name, True, ("quant", rw_cls(raw[w_name], raw[s_name]))
 
     for name in raw:
         should_compare = name not in skip_compare_names

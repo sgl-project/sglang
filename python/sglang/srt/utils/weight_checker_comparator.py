@@ -2,18 +2,14 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.base_config import (
-    FusedMoEMethodBase,
-    LinearMethodBase,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedFusedMoEMethod,
-    UnquantizedLinearMethod,
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptNvFp4FusedMoEMethod,
 )
 
 # chunk to avoid too high GPU memory peak
@@ -126,17 +122,53 @@ def _compare_references(
     return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
 
 
+def _compare_raw_pair(
+    expect: torch.Tensor, actual: torch.Tensor, compute_stats: bool
+) -> Tuple[bool, float, float]:
+    """Chunked exact-compare of two raw tensors, optionally accumulating
+    abs-diff stats. Returns (equal, max_abs_err, mean_abs_err)."""
+    assert expect.shape == actual.shape, f"{expect.shape=} {actual.shape=}"
+    expect_flat = expect.reshape(-1)
+    actual_flat = actual.reshape(-1)
+
+    equal = True
+    max_abs_err = torch.zeros((), dtype=torch.float32)
+    sum_abs_err = 0.0
+    for start in range(0, expect_flat.numel(), _CHUNK_NUMEL):
+        e = expect_flat[start : start + _CHUNK_NUMEL].cuda()
+        a = actual_flat[start : start + _CHUNK_NUMEL].cuda()
+        if torch.all(e == a):
+            continue
+        equal = False
+        if not compute_stats:
+            break
+        abs_diff = (a.float() - e.float()).abs()
+        # torch.maximum propagates NaN, unlike builtin max().
+        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
+        sum_abs_err += abs_diff.sum().item()
+    return equal, max_abs_err.item(), sum_abs_err / max(expect_flat.numel(), 1)
+
+
 def select_quantization_method(quant_method) -> Optional[type]:
-    if not isinstance(quant_method, (LinearMethodBase, FusedMoEMethodBase)):
-        return None
-    if isinstance(quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)):
-        return None
+    """Single router: map a module's quant_method to a comparison strategy.
+
+    - fp8 block quant -> Fp8BlockReference: its scale is requantized to ue8m0 on
+      load, so the same weight lands as two different fp8 encodings; compare in
+      dequant space with ULP tolerance.
+    - nvfp4 -> raise: e4m3 fractional block scale + max-recomputed global scale is
+      likewise non-bit-exact, but has no ReferenceWeight yet.
+    - everything else -> None (raw exact compare): int4 (fixed integer scale) and
+      mxfp8/mxfp4 (e8m0, same quantizer on both sides, no load-time requant) all
+      transfer bit-exact.
+    """
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
         and quant_method.block_quant
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockReference
-    raise NotImplementedError(
-        f"weight checker has no ReferenceWeight for {type(quant_method).__name__}"
-    )
+    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+        raise NotImplementedError(
+            f"weight checker has no ReferenceWeight for {type(quant_method).__name__}"
+        )
+    return None
