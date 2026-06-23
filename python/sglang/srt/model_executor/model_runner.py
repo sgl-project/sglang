@@ -1186,7 +1186,9 @@ class ModelRunner:
 
         load_kv_cache_scales(model=self.model, server_args=self.server_args)
 
-        self._resolve_sliding_window_size()
+        self.sliding_window_size = ModelRunner.resolve_sliding_window_size(
+            self.model, self.model_config
+        )
 
         self.dtype = self.model_config.dtype
 
@@ -1376,22 +1378,23 @@ class ModelRunner:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-    def _resolve_sliding_window_size(self) -> None:
+    @staticmethod
+    def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
         # Parse other args
-        self.sliding_window_size = None
-        if hasattr(self.model, "get_attention_sliding_window_size"):
-            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        sliding_window_size = None
+        if hasattr(model, "get_attention_sliding_window_size"):
+            sliding_window_size = model.get_attention_sliding_window_size()
         elif (
-            self.model_config.is_hybrid_swa
-            and self.model_config.sliding_window_size is not None
+            model_config.is_hybrid_swa and model_config.sliding_window_size is not None
         ):
             # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
-            self.sliding_window_size = self.model_config.sliding_window_size
-        elif self.model_config.attention_chunk_size is not None:
-            self.sliding_window_size = self.model_config.attention_chunk_size
+            sliding_window_size = model_config.sliding_window_size
+        elif model_config.attention_chunk_size is not None:
+            sliding_window_size = model_config.attention_chunk_size
             logger.info(
-                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+                f"Setting sliding_window_size to be attention_chunk_size: {sliding_window_size}"
             )
+        return sliding_window_size
 
     def _maybe_register_debug_tensor_dump_hook(self) -> None:
         if self.server_args.debug_tensor_dump_output_folder is not None:
