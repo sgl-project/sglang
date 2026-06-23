@@ -13,38 +13,43 @@ Conventions for SGLang's three large classes:
 
 ## 1. Frozen Code
 
-Some core files are **frozen** while they are being decomposed: their internal logic must not grow. A frozen file may be touched only to wire in a collaborator, never to add logic.
+Some core files are **frozen** while they are being decomposed: their internal logic must not grow. A frozen file may be touched only to construct, wire, and delegate to a collaborator — never to add logic.
 
-Frozen files (current):
+Put any new logic in a **collaborator class in its own module**. The frozen file then only references that collaborator, in the three ways below.
+
+### Frozen files
 
 - `python/sglang/srt/model_executor/model_runner.py`
 
-When you need new behavior reachable from a frozen file, put the logic in a **collaborator class in its own module**, then make the **only** edits allowed to the frozen file:
+### Allowed edits
 
-1. A short `init_<thing>` helper whose body is essentially a single construction (follows §2). Use `maybe_init_<thing>` with a one-line gate when construction is conditional.
-2. A short call that wires it into the orchestrator.
+1. **Construct** — a short `init_<thing>` helper whose body is essentially a single construction (follows §2); use `maybe_init_<thing>` with a one-line gate when construction is conditional.
+2. **Wire** — a short call that runs the helper from the orchestrator (e.g. in `__init__`).
+3. **Delegate** — short calls to the collaborator's methods at the necessary call sites (`self.foo.bar(...)`), with no new surrounding logic.
 
 ```python
-# In model_runner.py — the ONLY kind of edit allowed: construct + wire.
-def init_foo(self):
+# In model_runner.py — the only edits allowed: construct, wire, delegate.
+def init_foo(self):                                              # construct
     self.foo = FooManager(server_args=self.server_args, device=self.device)
 
-# ...and one line in __init__:
-self.init_foo()
+self.init_foo()                                                  # wire (in __init__)
+
+self.foo.bar(forward_batch)                                      # delegate (at the call site)
 ```
 
-Everything else — config building, branching, loops, warmup, post-processing — lives in `FooManager`, not the frozen file:
+### Not allowed
+
+Anything beyond construct / wire / delegate — config building, branching, loops, warmup orchestration, post-processing. That logic lives in the collaborator, not the frozen file.
 
 ```python
-# NOT allowed in a frozen file: logic inlined into __init__ or a new method.
+# NOT allowed in a frozen file: construction / logic inlined instead of delegated.
 self.foo = None
 if self.server_args.enable_foo:
-    config = build_foo_config(self.model_config, self.device)   # logic in frozen file
-    self.foo = FooManager(config)
-    self.foo.warmup()                                            # beyond construct + wire
+    config = build_foo_config(self.model_config, self.device)   # config logic in frozen file
+    self.foo = FooManager(config)                               # inline construction, not via (maybe_)init_foo
 ```
 
-Move that body into `FooManager.__init__` (or a factory on `FooManager`); the frozen file keeps only `init_foo` + `self.init_foo()`.
+Move that body into `FooManager` (its `__init__` or a factory) plus a `(maybe_)init_foo` helper; the frozen file keeps only construct + wire + delegate.
 
 ## 2. `__init__` style
 
