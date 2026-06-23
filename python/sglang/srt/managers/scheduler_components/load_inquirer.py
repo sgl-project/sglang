@@ -222,20 +222,25 @@ class SchedulerLoadInquirer:
             tree_cache = self.get_tree_cache()
             if hasattr(tree_cache, "build_cache_digest"):
                 dirty = getattr(tree_cache, "_digest_dirty", True)
-                if dirty or not hasattr(tree_cache, "_cached_cache_digest"):
+                # Only the expensive prefix_entries (a full tree walk) is
+                # cached behind _digest_dirty.  The capacity scalars below are
+                # cheap O(1) reads and MUST be re-sampled every snapshot;
+                # otherwise the DP controller does capacity checks against a
+                # stale evictable_tokens and can over- or under-commit a rank.
+                if dirty or not hasattr(tree_cache, "_cached_prefix_entries"):
                     chunk_size = self.server_args.dp_routing_digest_chunk_size
                     digest_data = tree_cache.build_cache_digest(
                         chunk_size=chunk_size,
                     )
-                    tree_cache._cached_cache_digest = CacheDigest(
-                        dp_rank=self.ps.dp_rank,
-                        prefix_entries=digest_data["prefix_entries"],
-                        total_cached_tokens=digest_data["total_cached_tokens"],
-                        evictable_tokens=digest_data["evictable_tokens"],
-                        protected_tokens=digest_data["protected_tokens"],
-                        timestamp=time.time(),
-                    )
-                cache_digest = tree_cache._cached_cache_digest
+                    tree_cache._cached_prefix_entries = digest_data["prefix_entries"]
+                cache_digest = CacheDigest(
+                    dp_rank=self.ps.dp_rank,
+                    prefix_entries=tree_cache._cached_prefix_entries,
+                    total_cached_tokens=tree_cache.total_size(),
+                    evictable_tokens=tree_cache.evictable_size(),
+                    protected_tokens=tree_cache.protected_size(),
+                    timestamp=time.time(),
+                )
 
         return GetLoadsReqOutput(
             dp_rank=self.ps.dp_rank,

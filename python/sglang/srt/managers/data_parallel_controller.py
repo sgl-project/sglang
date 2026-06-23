@@ -781,8 +781,20 @@ class DataParallelController:
                 and self._rank_available_tokens(r) >= input_len - match_info.get(r, 0)
             ]
             if viable:
-                best_rank = min(
-                    viable, key=lambda r: self.dp_budget.total_requests[r]
+                best_rank = min(viable, key=lambda r: self.dp_budget.total_requests[r])
+            else:
+                # No rank has enough capacity for this request.  Cache
+                # affinity is moot here, so fall back to the rank with the
+                # most free space (largest available - needed), breaking ties
+                # by fewest requests.  This keeps us from piling onto a rank
+                # we already know is over capacity.
+                best_rank = max(
+                    active_ranks,
+                    key=lambda r: (
+                        self._rank_available_tokens(r)
+                        - (input_len - match_info.get(r, 0)),
+                        -self.dp_budget.total_requests[r],
+                    ),
                 )
 
         self.dp_budget.total_requests[best_rank] += 1
