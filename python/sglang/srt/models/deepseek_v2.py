@@ -891,9 +891,15 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
+        server_args = get_global_server_args()
         copy_add_state = None
         copy_add_ctx = nullcontext(None)
-        if shared_output is not None and not self._shared_expert_tp1:
+        if (
+            shared_output is not None
+            and not self._shared_expert_tp1
+            # Streams are not supported for torch compile.
+            and not server_args.enable_torch_compile
+        ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_copy_add_ctx
 
             if self._shared_ready_event is None:
@@ -903,7 +909,6 @@ class DeepseekV2MoE(nn.Module):
                 shared_output,
                 self._shared_ready_event,
             )
-        server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
