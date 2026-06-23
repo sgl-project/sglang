@@ -1,0 +1,71 @@
+---
+name: large-class-style
+description: 'Code style for SGLang large classes `Scheduler`, `TokenizerManager`, and `ModelRunner`: frozen-code conventions and `__init__` orchestration style. Use when modifying any of these three classes or reviewing changes to them.'
+---
+
+# Code Style for Scheduler / TokenizerManager / ModelRunner
+
+Conventions for SGLang's three large classes:
+
+- `Scheduler` — `python/sglang/srt/managers/scheduler.py`
+- `TokenizerManager` — `python/sglang/srt/managers/tokenizer_manager.py`
+- `ModelRunner` — `python/sglang/srt/model_executor/model_runner.py`
+
+## 1. Frozen Code
+
+Some core files are **frozen** while they are being decomposed: their internal logic must not grow. A frozen file may be touched only to wire in a collaborator, never to add logic.
+
+Frozen files (current):
+
+- `python/sglang/srt/model_executor/model_runner.py`
+
+When you need new behavior reachable from a frozen file, put the logic in a **collaborator class in its own module**, then make the **only** edits allowed to the frozen file:
+
+1. A short `init_<thing>` helper whose body is essentially a single construction (follows §2). Use `maybe_init_<thing>` with a one-line gate when construction is conditional.
+2. A short call that wires it into the orchestrator.
+
+```python
+# In model_runner.py — the ONLY kind of edit allowed: construct + wire.
+def init_foo(self):
+    self.foo = FooManager(server_args=self.server_args, device=self.device)
+
+# ...and one line in __init__:
+self.init_foo()
+```
+
+Everything else — config building, branching, loops, warmup, post-processing — lives in `FooManager`, not the frozen file:
+
+```python
+# NOT allowed in a frozen file: logic inlined into __init__ or a new method.
+self.foo = None
+if self.server_args.enable_foo:
+    config = build_foo_config(self.model_config, self.device)   # logic in frozen file
+    self.foo = FooManager(config)
+    self.foo.warmup()                                            # beyond construct + wire
+```
+
+Move that body into `FooManager.__init__` (or a factory on `FooManager`); the frozen file keeps only `init_foo` + `self.init_foo()`.
+
+## 2. `__init__` style
+
+Apply when modifying the `__init__` of the three classes above.
+
+### Why
+
+- Downstream forks override one piece (tokenizer, KV cache, IPC, …).
+- Inline logic forces them to copy the whole `__init__`, which rots against upstream.
+- Splitting into `init_*` helpers lets them override exactly what they need.
+- Reference shape: `TokenizerManager.__init__` in `python/sglang/srt/managers/tokenizer_manager.py`.
+
+### Rules
+
+- **`__init__` is an orchestrator.** Sequence of `self.init_*(...)` calls + minimal glue. No non-trivial construction inlined.
+- **One helper per overridable unit.** Each `init_*` = one concern a subclass might swap. Don't lump.
+- **Naming:** `init_<thing>` (snake_case, names the component). Conditional construction → `maybe_init_<thing>`, gate inside the helper.
+- **No silent state coupling.** A helper only reads `self.*` set by earlier helpers. Ordering lives in `__init__`. Shared intermediates → pass as args, not via `self.*`.
+- **New logic = new helper.** Default to adding `init_<thing>`, not another inline block. One-line `self.foo = server_args.foo` is fine; structured logic is not.
+- **Preserve override points.** Prefer additive changes to existing `init_*` signatures. Breaking changes → call out in PR.
+
+### Scope
+
+Only the three classes listed above. Not other manager-style classes, not small dataclass/utility constructors.
