@@ -129,6 +129,24 @@ _is_amx_available = cpu_has_amx_support()
 cached_get_processor = lru_cache(get_processor)
 
 
+def _split_qk_gate(
+    q_gate: torch.Tensor, head_dim: int, num_heads: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """De-interleave q and gate from a per-head interleaved buffer.
+
+    ``q_gate`` is ``(seq, num_heads * 2 * head_dim)`` laid out as
+    ``[q_h0, gate_h0, q_h1, gate_h1, ...]``. Returns contiguous
+    ``q`` ``(seq, num_heads, head_dim)`` and ``gate`` ``(seq * num_heads, head_dim)``.
+    Unlike ``fused_qk_gemma_rmsnorm_with_gate`` this does NOT apply RMSNorm to q;
+    normalization is handled by the downstream AITER fused kernel.
+    """
+    seq_len = q_gate.shape[0]
+    qg = q_gate.view(seq_len, num_heads, 2, head_dim)
+    q = qg[:, :, 0, :].contiguous()
+    gate = qg[:, :, 1, :].reshape(seq_len * num_heads, head_dim).contiguous()
+    return q, gate
+
+
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
@@ -904,6 +922,99 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def _forward_prepare_hip_fused(self, positions, q, k, v, seq_len):
+        """AITER-fused QK GemmaRMSNorm + RoPE for the attn-output-gate path.
+
+        Fuses the GemmaRMSNorm (`_fused_qk_gemma_rmsnorm_gate_kernel` norm part)
+        and the RoPE (`_triton_mrope_forward_fused`) into a single AITER kernel
+        (``fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``). KV-cache storage
+        stays on the existing ``self.attn`` path: we request ``return_kv`` and
+        feed scratch cache buffers so the op's mandatory cache write is harmless.
+
+        GemmaRMSNorm scales by ``(weight + 1.0)``; the AITER op uses a plain
+        ``weight * x`` RMSNorm, so we pre-add 1.0 to the norm weights.
+        """
+        from aiter.ops.fused_qk_norm_mrope_cache_quant import (
+            fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+        )
+
+        rotary_emb = self.rotary_emb
+        rotary_emb._match_cos_sin_cache_dtype(q)
+        cos_sin = rotary_emb.cos_sin_cache
+
+        # MRoPE metadata. The aiter op expects mrope_section to sum to
+        # rotary_dim/2 and an explicit interleaved flag; MRotaryEmbedding has
+        # already validated/corrected these at construction time.
+        mrope_section = list(getattr(rotary_emb, "mrope_section", None) or [])
+        mrope_interleaved = bool(getattr(rotary_emb, "mrope_interleaved", False))
+        # The kernel views positions as (3, num_tokens) for the T/H/W axes. For
+        # text-only inference every axis is the token index, so broadcast a 1D
+        # positions tensor across the 3 mrope axes.
+        if positions.dim() == 1:
+            positions = positions.view(1, -1).expand(3, -1).contiguous()
+        else:
+            positions = positions.contiguous()
+
+        qkv_fused = torch.cat((q, k, v), dim=-1).contiguous()
+        # Pre-add 1.0 to the GemmaRMSNorm weights and build the unit per-tensor
+        # scales ONCE, cached on the module. Allocating these (esp. host-scalar
+        # ``torch.tensor(1.0)``) on every call is illegal inside a CUDA/HIP graph
+        # capture ("operation not permitted when stream is capturing"), which is
+        # exactly the decode path that gets graph-captured.
+        if getattr(self, "_fused_qk_norm_cache", None) is None:
+            qw = (self.q_norm.weight.data + 1.0).contiguous()
+            kw = (self.k_norm.weight.data + 1.0).contiguous()
+            unit_scale = torch.ones((), dtype=torch.float32, device=q.device)
+            self._fused_qk_norm_cache = (qw, kw, unit_scale)
+        qw, kw, unit_scale = self._fused_qk_norm_cache
+
+        q_out = torch.empty(
+            seq_len, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device
+        )
+        k_out = torch.empty(
+            seq_len, self.num_kv_heads, self.head_dim, dtype=k.dtype, device=k.device
+        )
+        v_out = torch.empty(
+            seq_len, self.num_kv_heads, self.head_dim, dtype=v.dtype, device=v.device
+        )
+        # Scratch cache targets (op always writes cache); real store stays on
+        # the attention backend below via ``self.attn``.
+        k_cache = torch.empty_like(k_out)
+        v_cache = torch.empty_like(v_out)
+        slot_mapping = torch.arange(seq_len, device=q.device, dtype=torch.int64)
+
+        rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            qkv_fused,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            seq_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            rotary_emb.is_neox_style,
+            mrope_section,
+            mrope_interleaved,
+            self.q_norm.variance_epsilon,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            unit_scale,
+            unit_scale,
+            k_out,
+            v_out,
+            True,
+            False,
+            0,
+            0,
+            rotary_dim if rotary_dim != self.head_dim else 0,
+        )
+        return q_out.view(seq_len, -1), k_out.view(seq_len, -1), v_out.view(seq_len, -1)
+
     def forward_prepare_hip(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -911,6 +1022,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             seq_len = q_gate.shape[0]
+            if _use_aiter:
+                # AITER-fused QK GemmaRMSNorm + RoPE. Gate is de-interleaved
+                # separately; q/k are normed+roped by the fused op.
+                q_raw, gate_flat = _split_qk_gate(q_gate, self.head_dim, self.num_heads)
+                q, k, v = self._forward_prepare_hip_fused(
+                    positions,
+                    q_raw.view(seq_len, -1),
+                    k.contiguous(),
+                    v.contiguous(),
+                    seq_len,
+                )
+                gate = gate_flat.view(seq_len, -1)
+                return q, k, v, gate
             q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_with_gate(
                 q_gate,
                 k,
