@@ -609,7 +609,10 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                         continue
                     param = params_dict[name]
                 except KeyError:
-                    print(params_dict.keys())
+                    logger.error(
+                        f"Weight '{name}' not found in params_dict "
+                        f"({len(params_dict)} params; sample: {list(params_dict)[:10]})"
+                    )
                     raise
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
