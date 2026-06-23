@@ -132,21 +132,15 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         # the attention backend).
         self._max_context_len = int(target_worker.model_runner.model_config.context_len)
 
-        # Three target-side cuda-graph runners (captured in the target
-        # model_runner's init_decode_cuda_graph, which already ran during
-        # target_worker construction):
-        #   - main  decode_cuda_graph_runner       — K_suffix (SUFFIX path)
-        #   - short_chain_graph_runner             — K_mtp    (MTP path)
-        #   - baseline_chain_graph_runner          — K=1      (NONE path)
-        # verify() swaps target_model_runner.decode_cuda_graph_runner to the
-        # K-matching runner (keyed on spec_info.draft_token_num) immediately
-        # before the verify forward, then restores the main runner. When
-        # K_suffix == K_mtp the narrower runners are absent (None); the main
-        # runner serves both and the swap is a no-op.
-        _tmr = target_worker.model_runner
-        self._main_decode_runner = _tmr.decode_cuda_graph_runner
-        self._short_chain_runner = getattr(_tmr, "short_chain_graph_runner", None)
-        self._baseline_runner = getattr(_tmr, "baseline_chain_graph_runner", None)
+        # The three target-side cuda-graph runners (main K_suffix +
+        # short_chain K_mtp + baseline K=1) are captured by the target
+        # model_runner's init_decode_cuda_graph, which on this sglang version
+        # runs AFTER the spec worker is constructed — so they do NOT exist yet
+        # here. verify() reads them lazily from target_worker.model_runner at
+        # runtime (where they are set) and swaps decode_cuda_graph_runner to the
+        # K-matching one, keyed on spec_info.draft_token_num. When
+        # K_suffix == K_mtp the narrower runners are absent and the entry
+        # (main) runner serves both — the swap is a no-op.
 
         # PD prefill instance: the MTP/EAGLE side stays fully alive (its draft
         # extend produces the draft KV that PD transfers to the decode
@@ -410,20 +404,23 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         verify_input = batch.spec_info
         K = getattr(verify_input, "draft_token_num", None)
         tmr = self.target_worker.model_runner
-        prev_runner = tmr.decode_cuda_graph_runner
+        # The entry runner is the main K_suffix runner (set by the target's
+        # init_decode_cuda_graph). Read the two narrower runners lazily — they
+        # only exist by decode time, not at __init__.
+        prev_runner = getattr(tmr, "decode_cuda_graph_runner", None)
+        short_runner = getattr(tmr, "short_chain_graph_runner", None)
+        baseline_runner = getattr(tmr, "baseline_chain_graph_runner", None)
         prev_steps = self.speculative_num_steps
         prev_ndt = self.speculative_num_draft_tokens
 
         if K is not None:
-            if K == self.K_mtp and self._short_chain_runner is not None:
-                tmr.decode_cuda_graph_runner = self._short_chain_runner
-            elif K == 1 and self._baseline_runner is not None:
-                tmr.decode_cuda_graph_runner = self._baseline_runner
-            else:
-                # K_suffix (or any unmatched width): the main runner. If no
-                # captured graph matches the width, can_run_graph's ngram width
-                # check fails and verify falls back to eager — correct, slower.
-                tmr.decode_cuda_graph_runner = self._main_decode_runner
+            if K == self.K_mtp and short_runner is not None:
+                tmr.decode_cuda_graph_runner = short_runner
+            elif K == 1 and baseline_runner is not None:
+                tmr.decode_cuda_graph_runner = baseline_runner
+            # else: K_suffix (or any unmatched width) keeps the entry/main
+            # runner. If no captured graph matches the width, can_run_graph's
+            # ngram width check fails and verify falls back to eager (slower).
             self.speculative_num_steps = K - 1
             self.speculative_num_draft_tokens = K
         try:
