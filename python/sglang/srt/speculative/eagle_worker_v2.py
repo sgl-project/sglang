@@ -1750,8 +1750,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
-            recv_req
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        success, message = ModelRunner.update_weights_from_ipc(
+            self._draft_worker.draft_runner.weight_updater, recv_req
         )
         if not success:
             return success, message
