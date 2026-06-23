@@ -213,6 +213,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    init_cublas,
     init_custom_process_group,
     is_hip,
     is_host_cpu_arm64,
@@ -881,7 +882,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_aux_hidden_state_capture()
 
         if self.device == "cuda" or self.device == "musa":
-            ModelRunner.init_cublas()
+            init_cublas()
             self.init_attention_backend()
         elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
@@ -2432,16 +2433,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.dtype,
             )
             self.kv_cache_dtype = self.dtype
-
-    @staticmethod
-    def init_cublas():
-        """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
-        dtype = torch.float16
-        device = "cuda"
-        a = torch.ones((16, 16), dtype=dtype, device=device)
-        b = torch.ones((16, 16), dtype=dtype, device=device)
-        c = a @ b
-        return c
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
