@@ -128,6 +128,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    load_kv_cache_scales,
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_trigger_remote_instance_nccl_send_group,
 )
@@ -1139,7 +1140,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        ModelRunner.load_kv_cache_scales(model=self.model, server_args=self.server_args)
+        load_kv_cache_scales(model=self.model, server_args=self.server_args)
 
         self._resolve_sliding_window_size()
 
@@ -1330,29 +1331,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
-
-    @staticmethod
-    def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
-        if server_args.kv_cache_dtype == "fp8_e4m3":
-            if server_args.quantization_param_path is not None:
-                if callable(getattr(model, "load_kv_cache_scales", None)):
-                    model.load_kv_cache_scales(server_args.quantization_param_path)
-                    logger.info(
-                        "Loaded KV cache scaling factors from %s",
-                        server_args.quantization_param_path,
-                    )
-                else:
-                    raise RuntimeError(
-                        "Using FP8 KV cache and scaling factors provided but "
-                        "model %s does not support loading scaling factors.",
-                        model.__class__,
-                    )
-            else:
-                logger.warning(
-                    "Using FP8 KV cache but no scaling factors "
-                    "provided. Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
-                )
 
     def _resolve_sliding_window_size(self) -> None:
         # Parse other args
