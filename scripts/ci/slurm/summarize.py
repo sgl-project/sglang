@@ -1,10 +1,14 @@
 """Print a markdown summary table from processed benchmark results.
 
+Shared by the GB200 and MI355 nightly pipelines.
+
 Usage:
     python3 summarize.py <results_dir>
 
 Reads all agg_*.json files recursively from <results_dir> and prints a
-markdown table to stdout (redirect to $GITHUB_STEP_SUMMARY to publish).
+markdown table to stdout (redirect to $GITHUB_STEP_SUMMARY to publish). The
+table title is derived from the `hw` field of the results, so the same script
+serves both GB200 and MI355 runs.
 """
 
 import json
@@ -113,7 +117,9 @@ def main():
         for r in results
     ]
 
-    print("## GB200 Nightly Benchmark Results\n")
+    hw_labels = sorted({r["hw"].upper() for r in results})
+    title_hw = "/".join(hw_labels) if hw_labels else "Nightly"
+    print(f"## {title_hw} Nightly PD-Disaggregation Benchmark Results\n")
     print(tabulate(rows, headers=HEADERS, tablefmt="github"))
     print()
 

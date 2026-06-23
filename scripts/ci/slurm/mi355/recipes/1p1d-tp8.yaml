@@ -1,0 +1,56 @@
+# Multi-node SGLang PD-disaggregation recipe: Qwen3-8B, 1 prefill + 1 decode.
+#
+# This is the AMD MI355 analog of an NVIDIA srt-slurm recipe (see
+# scripts/ci/slurm/nightly-configs.yaml / launch_gb200.sh). It is read by
+# launch_mi355.sh (to size the Slurm allocation and emit benchmark params) and
+# by process_result.py (topology fields under `resources` and
+# `backend.sglang_config`) — so the schema intentionally matches what
+# process_result.py already parses for the GB200 pipeline.
+#
+# Topology: 1 prefill node (TP8) + 1 decode node (TP8) = 2 MI355 nodes, 16 GPUs.
+# Transfer backend: mooncake over the RDMA NICs (rdma0..rdma7).
+
+name: 1p1d-tp8
+model: Qwen/Qwen3-8B
+served_model_name: Qwen/Qwen3-8B
+
+# Synthetic benchmark client (sglang.bench_serving --dataset-name random).
+isl: 1024
+osl: 1024
+random_range_ratio: 1.0
+# One benchmark run is executed per concurrency value below.
+concurrencies: [64, 128, 256]
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+  gpus_per_node: 8
+
+# prefill_nodes + decode_nodes == number of nodes the Slurm job allocates.
+topology:
+  prefill_nodes: 1
+  decode_nodes: 1
+
+backend:
+  sglang_config:
+    # Flags applied to both the prefill and the decode server. Mirrors the
+    # working single-node 1P1D Qwen3-8B recipe (mooncake + AITER on ROCm).
+    common:
+      attention-backend: aiter
+      trust-remote-code: true
+      page-size: 1
+      disable-radix-cache: true
+      disaggregation-transfer-backend: mooncake
+      disaggregation-ib-device: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+      mem-fraction-static: 0.9
+      chunked-prefill-size: 16384
+      max-prefill-tokens: 16384
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+      mem-fraction-static: 0.9

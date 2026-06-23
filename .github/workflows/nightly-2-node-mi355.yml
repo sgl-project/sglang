@@ -1,0 +1,159 @@
+name: Nightly Test (MI355 2-node PD-Disagg)
+
+# AMD MI355 parity for the GB200 nightly perf pipeline (see
+# nightly-72-gpu-gb200.yml and issue #22464). Runs multi-node SGLang
+# PD-disaggregation (mooncake + AITER) benchmarks on a self-hosted runner
+# backed by the `amd-sglang` Slurm partition.
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily (offset from the GB200 nightly)
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Optional. ROCm SGLang docker image (mooncake + AITER) to benchmark. Leave empty for the default.'
+        required: false
+        default: ''
+      configs:
+        description: 'Optional. Comma-separated config names to run a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. Leave empty to run all. Names are listed in the setup job log.'
+        required: false
+        default: ''
+
+concurrency:
+  group: nightly-test-mi355
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+  SLURM_PARTITION: amd-sglang
+  SLURM_ACCOUNT: amd-sglang
+  # Default ROCm MI355 image; override per-run via the `image` input. Built by
+  # release-docker-amd-nightly.yml (rocm/sgl-dev, ...-rocm700-mi35x-<date>).
+  DEFAULT_IMAGE: rocm/sgl-dev:v0.5.12.post1-rocm700-mi35x
+
+jobs:
+  setup:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate benchmark matrix
+        id: generate
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
+        run: |
+          pip install pyyaml -q
+          ALL_MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs-mi355.yaml --runner mi355)
+          echo "Available config names for runner mi355:"
+          echo "$ALL_MATRIX" | python3 -c "import json,sys; [print(f'  - {e[\"name\"]}') for e in json.load(sys.stdin)]"
+
+          FILTER_ARG=()
+          if [ -n "$CONFIGS_FILTER" ]; then
+            echo "Filtering to: $CONFIGS_FILTER"
+            FILTER_ARG=(--filter "$CONFIGS_FILTER")
+          fi
+          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs-mi355.yaml --runner mi355 "${FILTER_ARG[@]}")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  nightly-mi355-benchmark:
+    needs: setup
+    if: github.repository == 'sgl-project/sglang' && needs.setup.result == 'success'
+    runs-on: linux-sglang-mi35x-di
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env:
+      FRAMEWORK: sglang-disagg
+      MODEL: ${{ matrix.config.model }}
+      MODEL_PREFIX: ${{ matrix.config.model_prefix }}
+      PRECISION: ${{ matrix.config.precision }}
+      ISL: ${{ matrix.config.isl }}
+      OSL: ${{ matrix.config.osl }}
+      CONFIG_FILE: ${{ matrix.config.config_file }}
+      RESULT_FILENAME: mi355-${{ matrix.config.name }}
+      IMAGE: ${{ inputs.image || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve image
+        run: |
+          IMAGE="${IMAGE:-}"
+          [ -z "$IMAGE" ] && IMAGE="$DEFAULT_IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "Using image: $IMAGE"
+
+      - name: Clean up prior Slurm jobs from this runner
+        continue-on-error: true
+        env:
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          STALE=$(squeue --noheader --format="%i %j" -u "$USER" | grep "${RUNNER_NAME}" | awk '{print $1}')
+          [ -n "$STALE" ] && { echo "Cancelling stale jobs: $STALE"; scancel $STALE; } || true
+
+      - name: Launch MI355 PD-disagg benchmark via Slurm
+        timeout-minutes: 180
+        env:
+          RUNNER_NAME: ${{ runner.name }}
+        run: bash scripts/ci/slurm/launch_mi355.sh
+
+      - name: Process results
+        if: always()
+        run: |
+          pip install tabulate pyyaml -q
+          for result_file in "${GITHUB_WORKSPACE}/${RESULT_FILENAME}"_*.json; do
+            [ -f "$result_file" ] || continue
+            base=$(basename "$result_file")
+            ctx=$(echo "$base" | sed -n 's/.*_ctx_\([0-9]*\)_gen.*/\1/p')
+            gen=$(echo "$base" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')
+            [ -n "$ctx" ] && [ -n "$gen" ] || continue
+            HW=mi355 RESULT_FILENAME="${result_file%.json}" \
+              PREFILL_GPUS="$ctx" DECODE_GPUS="$gen" \
+              RECIPE_FILE="$CONFIG_FILE" \
+              python3 scripts/ci/slurm/process_result.py
+          done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi355-${{ matrix.config.name }}-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/*.json
+            ${{ github.workspace }}/multinode_server_logs.tar.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Clean up Slurm jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        env:
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          ACTIVE=$(squeue --noheader --format="%i %j" -u "$USER" | grep "${RUNNER_NAME}" | awk '{print $1}')
+          [ -n "$ACTIVE" ] && { echo "Cancelling jobs: $ACTIVE"; scancel $ACTIVE; } || true
+
+  collect-results:
+    needs: nightly-mi355-benchmark
+    if: github.repository == 'sgl-project/sglang' && always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
+          pattern: mi355-*
+
+      - name: Print summary
+        run: |
+          pip install tabulate -q
+          python3 scripts/ci/slurm/summarize.py results/ >> "$GITHUB_STEP_SUMMARY"

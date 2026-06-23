@@ -1,0 +1,27 @@
+# Nightly benchmark configurations for the AMD MI355 PD-disaggregation runner.
+#
+# AMD analog of scripts/ci/slurm/nightly-configs.yaml (the GB200 pipeline).
+# Consumed by generate_matrix.py (unchanged, generic over --runner): one matrix
+# entry is produced per search-space recipe. `config_file` points at an in-repo
+# recipe YAML under scripts/ci/slurm/mi355/recipes/ that launch_mi355.sh reads
+# to size the Slurm allocation and emit per-run benchmark parameters.
+#
+# To add/remove concurrencies: edit conc-list (documentation only; the actual
+# sweep is the `concurrencies:` list inside the recipe YAML).
+# To add a new recipe:          add a search-space entry pointing at a new
+#                               recipe YAML — never edit the workflow YAML.
+
+qwen3-8b-bf16-mi355-sglang-disagg:
+  model: Qwen/Qwen3-8B
+  model-prefix: qwen3-8b
+  runner: mi355
+  precision: bf16
+  framework: sglang-disagg
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [64, 128, 256]
+          config_file: scripts/ci/slurm/mi355/recipes/1p1d-tp8.yaml

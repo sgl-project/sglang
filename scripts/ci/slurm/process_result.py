@@ -1,4 +1,7 @@
-"""Process a raw srt-slurm benchmark result JSON into an aggregated format.
+"""Process a raw benchmark result JSON into an aggregated format.
+
+Shared by the GB200 (dynamo-sglang via srt-slurm) and the MI355
+(sglang-disagg via Slurm+Docker) nightly pipelines.
 
 Usage (called once per result file):
     RESULT_FILENAME=<path_without_.json> PREFILL_GPUS=<n> DECODE_GPUS=<n> \\
@@ -6,17 +9,19 @@ Usage (called once per result file):
 
 Required env vars:
     RESULT_FILENAME   - path to the result file without the .json extension
-    FRAMEWORK         - e.g. dynamo-sglang
-    PRECISION         - e.g. fp8, fp4
-    MODEL_PREFIX      - short model label, e.g. dsr1
+    FRAMEWORK         - e.g. dynamo-sglang, sglang-disagg
+    PRECISION         - e.g. fp8, fp4, bf16
+    MODEL_PREFIX      - short model label, e.g. dsr1, qwen3-8b
     ISL               - input sequence length
     OSL               - output sequence length
     PREFILL_GPUS      - number of prefill GPUs (extracted from result filename)
     DECODE_GPUS       - number of decode GPUs (extracted from result filename)
 
 Optional env vars:
-    RECIPE_FILE       - path to the srt-slurm recipe YAML; if set, topology
-                        fields (TP, EP, DP, workers) are parsed from it
+    HW                - hardware label for the summary table (default: gb200).
+                        Set to "mi355" by the AMD pipeline.
+    RECIPE_FILE       - path to the recipe YAML; if set, topology fields
+                        (TP, EP, DP, workers) are parsed from it
 """
 
 import json
@@ -41,6 +46,7 @@ isl = int(require("ISL"))
 osl = int(require("OSL"))
 prefill_gpus = int(require("PREFILL_GPUS"))
 decode_gpus = int(require("DECODE_GPUS"))
+hw = os.environ.get("HW", "gb200")
 
 with open(f"{result_filename}.json") as f:
     raw = json.load(f)
@@ -76,7 +82,7 @@ if recipe_file and Path(recipe_file).exists():
 total_gpus = prefill_gpus + decode_gpus
 
 data = {
-    "hw": "gb200",
+    "hw": hw,
     "conc": int(raw["max_concurrency"]),
     "model": raw["model_id"],
     "infmax_model_prefix": model_prefix,
