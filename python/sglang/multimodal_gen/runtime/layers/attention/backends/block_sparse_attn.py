@@ -161,7 +161,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.ada_sparse_block_estimate(
+        return torch.ops.attentions.sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,
