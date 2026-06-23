@@ -153,7 +153,6 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
@@ -659,21 +658,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
-        if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
-            # ModelExpress owns TransferEngine memory registration and metadata
-            # publishing for backend=modelexpress. Re-registering here would
-            # overlap the same weight buffers.
-            and self.server_args.remote_instance_weight_loader_backend
-            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-            and self.remote_instance_weight_transport.engine is not None
-            and self.remote_instance_weight_transport.weight_info is None
-        ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.remote_instance_weight_transport.weight_info = register_memory_region(
-                self.model, self.remote_instance_weight_transport.engine
-            )
-            self.remote_instance_weight_transport._register_to_engine_info_bootstrap()
+        self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
