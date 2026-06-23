@@ -110,7 +110,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
+ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
 # ===============================
 # Base image 942 with rocm700 and args
@@ -313,7 +313,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 #      this whold section can be removed.
 RUN if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
       apt-get update && apt-get install -y ninja-build patchelf cmake \
-      && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8; \
+      && git clone https://github.com/ROCm/FlyDSL.git --branch v0.2.0; \
     fi
 RUN if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
       cd FlyDSL \
