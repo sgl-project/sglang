@@ -40,7 +40,7 @@ from sglang.srt.utils.weight_checker_comparator import (
     Fp8BlockReference,
     RawReference,
     _compare_references,
-    select_reference_weight,
+    select_comparable_weight,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -542,21 +542,21 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# select_reference_weight
+# select_comparable_weight
 # ---------------------------------------------------------------------------
 
 
-class TestSelectReferenceWeight(CustomTestCase):
+class TestSelectComparableWeight(CustomTestCase):
 
     def test_returns_none_when_not_a_quant_method(self):
-        self.assertIsNone(select_reference_weight(None))
+        self.assertIsNone(select_comparable_weight(None))
 
     def test_returns_none_for_raw_safe_method(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         # unquantized / int4 / mxfp8 all route to raw (None).
         fake = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
-        self.assertIsNone(select_reference_weight(fake))
+        self.assertIsNone(select_comparable_weight(fake))
 
     def test_raises_on_nvfp4(self):
         from sglang.srt.layers.quantization.modelopt_quant import (
@@ -566,7 +566,7 @@ class TestSelectReferenceWeight(CustomTestCase):
         # nvfp4 has no ComparableWeight yet -> must raise, not silently raw-compare.
         fake = ModelOptFp4LinearMethod.__new__(ModelOptFp4LinearMethod)
         with self.assertRaises(NotImplementedError):
-            select_reference_weight(fake)
+            select_comparable_weight(fake)
 
 
 class TestBuildReferencePlan(CustomTestCase):
