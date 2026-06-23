@@ -34,7 +34,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         num_experts=256,
         num_fused_shared_experts=1,
         vocab_size=2,
-        scoring_func="softmax",
+        scoring_func="sqrtsoftplus",
         routed_scaling_factor=2.5,
     )
     with torch.no_grad():
