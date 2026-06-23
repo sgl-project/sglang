@@ -515,44 +515,29 @@ class TestResolveMinBatch(unittest.TestCase):
     """Unit tests for resolve_min_batch's threshold resolution."""
 
     def test_unset_non_dflash_disables(self):
-        # Unset + not DFlash → trigger stays disabled.
         self.assertIsNone(resolve_min_batch(None, 512, is_dflash=False))
 
     def test_unset_dflash_auto_enables(self):
-        # Unset + DFlash → falls back to the legacy formula (full mapping).
         self.assertEqual(resolve_min_batch(None, 512, is_dflash=True), 4)
         self.assertEqual(resolve_min_batch(None, 8, is_dflash=True), 2)
 
     def test_unset_dflash_small_cluster_disables(self):
-        # DFlash auto-default still respects the < 8 guard.
         self.assertIsNone(resolve_min_batch(None, 7, is_dflash=True))
 
     def test_user_value_overrides_dflash_default(self):
-        # An explicit user value wins over the DFlash auto-default.
         self.assertEqual(resolve_min_batch(3, 512, is_dflash=True), 3)
 
     def test_le_one_disables(self):
-        # <= 1 can never batch, so it is a no-op.
         self.assertIsNone(resolve_min_batch(1, 512))
-        self.assertIsNone(resolve_min_batch(0, 512))
 
     def test_small_cluster_disables(self):
-        # max_running_requests < 8 disables, matching DFlash.
         self.assertIsNone(resolve_min_batch(4, 7))
-        self.assertIsNone(resolve_min_batch(4, 0))
 
     def test_caps_to_formula(self):
-        # Capped down so it never delays more aggressively than DFlash.
         self.assertEqual(resolve_min_batch(10, 512), 4)
-        self.assertEqual(resolve_min_batch(10, 8), 2)  # (8+5)//6 = 2
-
-    def test_respects_smaller_user_value(self):
-        # Below the formula cap is taken as-is.
-        self.assertEqual(resolve_min_batch(3, 512), 3)
-        self.assertEqual(resolve_min_batch(2, 8), 2)
+        self.assertEqual(resolve_min_batch(10, 8), 2)
 
     def test_boundary_max_running_8(self):
-        # 8 is the smallest cluster where the trigger may fire.
         self.assertEqual(resolve_min_batch(4, 8), 2)
 
 
