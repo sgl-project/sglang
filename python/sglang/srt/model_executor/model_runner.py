@@ -316,9 +316,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.init_remote_instance_weight_transporter()
 
-        self.msprobe_debugger = None
-        if server_args.msprobe_dump_config is not None:
-            self.init_msprobe()
+        self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
@@ -425,6 +423,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_weight_updater()
         self.init_weight_exporter()
 
+    def init_msprobe(self):
+        self.msprobe_debugger = create_msprobe_debugger(self.server_args)
+
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
             tp_rank=self.tp_rank,
@@ -473,21 +474,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args,
             max_running_requests=self.max_running_requests,
             device=self.device,
-        )
-
-    def init_msprobe(self):
-        # Init the msprobe
-        try:
-            from msprobe.pytorch import PrecisionDebugger, seed_all
-        except ImportError:
-            logger.warning(
-                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
-                "see https://gitcode.com/Ascend/msprobe for details."
-            )
-            return
-        seed_all(mode=True)
-        self.msprobe_debugger = PrecisionDebugger(
-            config_path=self.server_args.msprobe_dump_config
         )
 
     def init_mindspore_runner(self):
@@ -2046,3 +2032,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+import logging
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+
+def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
+    if server_args.msprobe_dump_config is None:
+        return None
+
+    try:
+        from msprobe.pytorch import PrecisionDebugger, seed_all
+    except ImportError:
+        logger.warning(
+            "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+            "see https://gitcode.com/Ascend/msprobe for details."
+        )
+        return None
+
+    seed_all(mode=True)
+    return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
