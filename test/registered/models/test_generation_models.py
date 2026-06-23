@@ -128,6 +128,7 @@ MAMBA_MODEL_PATHS = [
 TORCH_DTYPES = [torch.float16]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGenerationModels(CustomTestCase):
 
     @classmethod
