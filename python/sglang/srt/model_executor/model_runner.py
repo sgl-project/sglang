@@ -30,7 +30,6 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import hybrid_arch
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -1775,40 +1774,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result
 
     @property
-    def qwen3_next_config(self):
-        return hybrid_arch.qwen3_next_config(self.model_config)
-
-    @property
-    def hybrid_lightning_config(self):
-        return hybrid_arch.hybrid_lightning_config(self.model_config)
-
-    @property
-    def hybrid_gdn_config(self):
-        return hybrid_arch.hybrid_gdn_config(self.model_config)
-
-    @property
-    def mamba2_config(self):
-        return hybrid_arch.mamba2_config(self.model_config)
-
-    @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
-
-    @property
-    def kimi_linear_config(self):
-        return hybrid_arch.kimi_linear_config(self.model_config)
-
-    @property
-    def linear_attn_model_spec(self):
-        return hybrid_arch.linear_attn_model_spec(self.model_config)
-
-    @property
-    def mambaish_config(self):
-        return hybrid_arch.mambaish_config(self.model_config)
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # Load-time resolution transition: the weight-resolved kv-cache dtype
