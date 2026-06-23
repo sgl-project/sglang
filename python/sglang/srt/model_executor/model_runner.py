@@ -48,17 +48,10 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
-    get_default_distributed_backend,
-    get_pp_group,
     get_tp_group,
     get_world_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
-    set_mscclpp_all_reduce,
-    set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.bootstrap import TorchDistributedResult
+from sglang.srt.distributed.bootstrap import init_torch_distributed
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -103,10 +96,6 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
-)
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
@@ -196,7 +185,6 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
-    monkey_patch_p2p_access_check,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
@@ -210,9 +198,6 @@ from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
     set_offloader,
-)
-from sglang.srt.utils.patch_torch import (
-    register_sgl_tp_rank,
 )
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -496,7 +481,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        result = ModelRunner.init_torch_distributed(
+        result = init_torch_distributed(
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
@@ -1140,176 +1125,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
-
-    @staticmethod
-    def init_torch_distributed(
-        *,
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-        device: str,
-        gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        pp_rank: int,
-        pp_size: int,
-        dp_size: int,
-        attn_cp_size: int,
-        moe_ep_size: int,
-        moe_dp_size: int,
-        dcp_size: int,
-        dist_port: int,
-        is_draft_worker: bool,
-        local_omp_cpuid: Optional[List[int]],
-    ):
-        tic = time.perf_counter()
-        logger.info("Init torch distributed begin.")
-
-        try:
-            torch.get_device_module(device).set_device(gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {device=} {gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {tp_rank=} {tp_size=}"
-            )
-            raise
-
-        backend = get_default_distributed_backend(device)
-        if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
-            backend = "mooncake"
-            if server_args.mooncake_ib_device:
-                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                    get_ib_devices_for_gpu,
-                )
-
-                ib_device_for_gpu = get_ib_devices_for_gpu(
-                    server_args.mooncake_ib_device, gpu_id
-                )
-                mooncake_ib_device = (
-                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-                )
-                try:
-                    from mooncake import ep as mooncake_ep
-
-                    mooncake_ep.set_device_filter(mooncake_ib_device)
-                except:
-                    pass  # A warning will be raised in `init_distributed_environment`
-
-        before_avail_memory = get_available_gpu_memory(device, gpu_id)
-        if not server_args.enable_p2p_check:
-            monkey_patch_p2p_access_check()
-
-        # Allow external orchestrators (e.g. trainpi) to override the distributed
-        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
-        # env-vars and an externally-created TCPStore, completely avoiding port
-        # conflicts with intra-host collocation.
-        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
-        if dist_init_method_override:
-            dist_init_method = dist_init_method_override
-        elif server_args.dist_init_addr:
-            na = NetworkAddress.parse(server_args.dist_init_addr)
-            dist_init_method = na.to_tcp()
-        else:
-            dist_init_method = NetworkAddress(
-                server_args.host or "127.0.0.1", dist_port
-            ).to_tcp()
-        set_custom_all_reduce(not server_args.disable_custom_all_reduce)
-        set_mscclpp_all_reduce(server_args.enable_mscclpp)
-        set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
-
-        if not is_draft_worker:
-            if device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
-
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(tp_size)
-                    torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
-
-                else:
-                    logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
-                    )
-
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=tp_size * pp_size,
-                rank=tp_size * pp_rank + tp_rank,
-                local_rank=gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=server_args.dist_timeout,
-                moe_a2a_backend=server_args.moe_a2a_backend,
-                recovered_rank=server_args.elastic_ep_rejoin,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=tp_size,
-                attention_data_parallel_size=dp_size,
-                pipeline_model_parallel_size=pp_size,
-                expert_model_parallel_size=moe_ep_size,
-                attention_context_model_parallel_size=attn_cp_size,
-                moe_data_model_parallel_size=moe_dp_size,
-                decode_context_parallel_size=dcp_size,
-                duplicate_tp_group=server_args.enable_pdmux,
-                enable_symm_mem=server_args.enable_symm_mem,
-                recovered_rank=server_args.elastic_ep_rejoin,
-            )
-            initialize_dp_attention(
-                server_args=server_args,
-                model_config=model_config,
-            )
-            if is_npu():
-                register_sgl_tp_rank(gpu_id)
-
-            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
-            # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-            if server_args.pre_warm_nccl and (
-                tp_size > 1 or pp_size > 1 or moe_ep_size > 1
-            ):
-                warmup_start = time.perf_counter()
-                tp_group_handle = get_tp_group().device_group
-
-                # Single warmup all_reduce to initialize NCCL/RCCL communicator
-                warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-                dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                current_platform.synchronize()
-
-                warmup_elapsed = time.perf_counter() - warmup_start
-                logger.info(
-                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
-                    f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
-                )
-
-        pre_model_load_memory = get_available_gpu_memory(
-            device,
-            gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-        tp_group = get_tp_group()
-        pp_group = get_pp_group()
-        attention_tp_group = get_attention_tp_group()
-
-        # Check memory for tensor parallelism
-        local_gpu_memory = get_available_gpu_memory(device, gpu_id)
-        if tp_size > 1 and not is_draft_worker:
-            if pre_model_load_memory < local_gpu_memory * 0.9:
-                msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
-                    raise RuntimeError(msg)
-                else:
-                    logger.warning(msg)
-
-        logger.info(
-            f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
-        )
-        return TorchDistributedResult(
-            tp_group=tp_group,
-            pp_group=pp_group,
-            attention_tp_group=attention_tp_group,
-            pre_model_load_memory=pre_model_load_memory,
-        )
 
     def init_shared_mooncake_transfer_engine(self):
         """
