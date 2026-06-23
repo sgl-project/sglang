@@ -190,7 +190,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -492,8 +492,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 tic = time.perf_counter()
                 before_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 logger.info(
-                    f"Capture draft extend cuda graph begin (step {step}). "
-                    f"This can take up to several minutes. avail mem={before_mem:.2f} GB"
+                    f"Capture draft extend CUDA graph begin. step={step}, "
+                    f"avail mem={before_mem:.2f} GB"
                 )
 
                 with self._capture_context(step):
@@ -501,9 +501,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
                 after_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 logger.info(
-                    f"Capture draft extend cuda graph end. Time elapsed: "
-                    f"{time.perf_counter() - tic:.2f} s. "
-                    f"mem usage={(before_mem - after_mem):.2f} GB. "
+                    "Capture draft extend CUDA graph end. "
+                    f"step={step}, elapsed={time.perf_counter() - tic:.2f} s, "
+                    f"mem usage={(before_mem - after_mem):.2f} GB, "
                     f"avail mem={after_mem:.2f} GB."
                 )
 
@@ -586,9 +586,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
-
-    def can_run(self, forward_batch):
-        return self.runners[0].can_run(forward_batch)
 
     def _prepare_extra(self, forward_batch: ForwardBatch) -> None:
         """Hook for subclasses to populate extra per-call buffers (e.g. sconv)."""
@@ -701,3 +698,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
     def get_last_runner(self):
         return self.runners[-1] if self.runners else None
+
+    def can_run_graph(self, forward_batch):
+        return self.runners[0].can_run_graph(forward_batch)

@@ -675,8 +675,8 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
