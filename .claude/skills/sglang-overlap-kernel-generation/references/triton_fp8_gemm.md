@@ -63,7 +63,6 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_k_masking: tl.constexpr,
-    needs_m_masking: tl.constexpr,
     rank: tl.constexpr,
     world_size: tl.constexpr,
 ):
@@ -84,19 +83,17 @@ def _w8a8_block_fp8_matmul(
     src_rank = (rank + logical_src_rank) % world_size
 
     # Row offsets — compact layout: src_rank * M_local + tile_in_rank * BLOCK_SIZE_M
-    offs_am = src_rank * M_local + tile_in_rank * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # Use % M to handle M not divisible by BLOCK_SIZE_M: tail tile rows wrap
+    # around to valid indices; store mask prevents overwriting wrong rows.
+    tile_row_start = src_rank * M_local + tile_in_rank * BLOCK_SIZE_M
+    offs_am = (tile_row_start + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # M-dimension row mask (tail tiles)
-    if needs_m_masking:
-        shard_end = (src_rank + 1) * M_local
-        row_mask = (offs_am < M) & (offs_am < shard_end)
 
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # Scale pointer offsets
+    # Scale pointer offsets (use % M for tail tiles)
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
@@ -107,16 +104,10 @@ def _w8a8_block_fp8_matmul(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         if needs_k_masking:
             k_mask = offs_k < K - k * BLOCK_SIZE_K
-            if needs_m_masking:
-                a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
-            else:
-                a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+            a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
             b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
         else:
-            if needs_m_masking:
-                a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            else:
-                a = tl.load(a_ptrs)
+            a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
 
         a_s = tl.load(As_ptrs)
@@ -135,10 +126,10 @@ def _w8a8_block_fp8_matmul(
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_am[:, None] + stride_cn * offs_cn[None, :]
-    if needs_m_masking:
-        c_mask = row_mask[:, None] & (offs_cn[None, :] < N)
-    else:
-        c_mask = (offs_am[:, None] < M) & (offs_cn[None, :] < N)
+    # offs_am used % M wrapping, so re-compute raw row indices for the store mask
+    offs_cm = tile_row_start + tl.arange(0, BLOCK_SIZE_M)
+    rank_row_end = (src_rank + 1) * M_local
+    c_mask = (offs_cm[:, None] < M) & (offs_cm[:, None] < rank_row_end) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 ```
 
@@ -152,7 +143,7 @@ def _w8a8_block_fp8_matmul(
 
 4. **Swizzled PID**: The `GROUP_SIZE_M` swizzling pattern reorders CTAs for better L2 cache locality. `GROUP_SIZE_M = 32` is a good default.
 
-5. **`needs_k_masking` / `needs_m_masking`**: Two `tl.constexpr` flags for fast/slow-path compilation. `needs_k_masking = K % BLOCK_SIZE_K != 0` (K-tail mask). `needs_m_masking = M_local % BLOCK_SIZE_M != 0` (M-tail row mask). Any overlap pattern where the GEMM's M dimension is partitioned across ranks (AG→GEMM, GEMM→AG, etc.) must handle tail tiles when `M_local` is not a multiple of `BLOCK_SIZE_M`. For example in AG→GEMM (compact layout): grid = `cdiv(M_local, BLOCK_SIZE_M) * world_size * num_pid_n`; row offset = `src_rank * M_local + tile_in_rank * BLOCK_SIZE_M`; row mask = `(offs_row < M) & (offs_row < (src_rank+1)*M_local)` to stay within the current rank's shard.
+5. **`needs_k_masking`**: A `tl.constexpr` flag for K-tail compilation fast/slow-path. `needs_k_masking = K % BLOCK_SIZE_K != 0`. For M-dimension tail tiles (when `M_local % BLOCK_SIZE_M != 0`), the kernel uses `% M` wrapping on row offsets instead of a separate compilation flag — the raw `tile_row_start` is stored separately for the store mask, while `offs_am = (tile_row_start + tl.arange(...)) % M` ensures A loads never go out of bounds. The store mask `(offs_cm[:, None] < M) & (offs_cm[:, None] < rank_row_end)` protects tail tiles from writing outside the current rank's shard. This follows the SGLang `consumer_bf16_a_block_fp8_matmul` pattern and avoids an extra JIT compilation path.
 
 6. **Avoid `tl.constexpr` for frequently-changing values.** Triton JIT compiles a separate kernel binary for each unique combination of `tl.constexpr` arguments. Quantities derived from dynamic problem size (`M`, `M_per_rank`, `n_chunks`, etc.) should be regular (non-constexpr) parameters, or computed inside the kernel from other arguments:
 
@@ -193,7 +184,6 @@ def w8a8_block_fp8_matmul_triton(
     C = A.new_empty(*A.shape[:-1], N, dtype=output_dtype)
 
     needs_k_masking = bool(K % block_k != 0)
-    needs_m_masking = bool(M_local % block_m != 0)
     M_local_tiles = triton.cdiv(M_local, block_m)
     num_pid_m = M_local_tiles * world_size
     num_pid_n = triton.cdiv(N, block_n)
@@ -215,7 +205,6 @@ def w8a8_block_fp8_matmul_triton(
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=32,
         needs_k_masking=needs_k_masking,
-        needs_m_masking=needs_m_masking,
         rank=rank,
         world_size=world_size,
         num_warps=4,

@@ -21,7 +21,7 @@ The user's request may only partially specify the configuration. For any item be
 
 When presenting options to the user via `AskUserQuestion`, put the full explanation directly into each option's **label** field (not just the description field, which may be hidden behind a tooltip in the UI). For example, use `"label": "inter-sm — two kernels, two streams"` rather than a bare `"label": "inter-sm"`. This ensures the user sees the explanation directly without needing to hover or click.
 
-1. **Compute kernel**: what kernel to overlap (e.g., GEMM, topk-reduce).
+1. **Compute kernel**: what kernel to overlap (e.g., GEMM, topk-reduce), users can provide the path to the target compute kernel.
 2. **Collective operation**: all-gather, reduce-scatter, all-reduce, etc.
 3. **Communication mechanism**: which hardware path for the collective? *(default: register)*
    - `register` — load/store via symmetric memory (SM-driven)

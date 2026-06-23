@@ -42,6 +42,8 @@ memory**, keeping all operations on the same CE (Memcpy PtoP) channel. This avoi
 DtoD serialization point that `fill_()` or local `copy_()` would introduce — which
 empirically prevents overlap with the consumer compute kernel.
 
+Below is a Full-Mesh Pull AllGather example:
+
 ```python
 def cp_engine_full_mesh_pull_ag(
     rank: int,
@@ -53,6 +55,7 @@ def cp_engine_full_mesh_pull_ag(
     peer_symm_input_bufs: List[torch.Tensor],  # peer views: peer_symm_input_bufs[i] is rank i's symm_input_buf
     ag_signal: torch.Tensor,               # local ag_signal [world_size] int32
     peer_signal_one_bufs: List[torch.Tensor],  # peer views of symmetric all-ones int32 [world_size]
+    ag_stream: torch.cuda.Stream = None,   # dedicated stream for CE copies (optional, caller sets stream context)
 ):
     """
     AllGather via Copy Engine (full-mesh pull).
@@ -69,21 +72,17 @@ def cp_engine_full_mesh_pull_ag(
     NOTE: caller must wrap this call in `with torch.cuda.stream(ag_stream):`
     so that all enqueued copy_ ops land on ag_stream.
     """
-    # Self-shard: data is already local, just signal via PtoP pull.
+    # Self-shard: local copy + PtoP signal
     local_dst = symm_ag_output[rank * M_local : (rank + 1) * M_local, :]
     local_dst.copy_(symm_input)
     ag_signal[rank:rank + 1].copy_(peer_signal_one_bufs[rank][rank:rank + 1])
 
-    # Pull remote shards in rotated order: (rank+1, rank+2, ..., rank-1) % world_size
-    # Rotated order spreads NVLink traffic: not all ranks pull from rank 0 first.
+    # Remote shards in rotated order
     for offset in range(1, world_size):
         src_rank = (rank + offset) % world_size
-        # Remote source: rank src_rank's own shard at peer's symm_input_buf[src_rank, :, :]
         remote_src = peer_symm_input_bufs[src_rank][src_rank, :M_local, :]
         local_dst = symm_ag_output[src_rank * M_local : (src_rank + 1) * M_local, :]
-        local_dst.copy_(remote_src)  # PtoP CE data copy
-
-        # Signal: PtoP pull 4B from peer's signal_one_buf — same channel as data.
+        local_dst.copy_(remote_src)
         ag_signal[src_rank:src_rank + 1].copy_(
             peer_signal_one_bufs[src_rank][src_rank:src_rank + 1]
         )
@@ -165,6 +164,8 @@ Launch both communication and compute in a single host function. The
 `barrier() → signal.fill_(0) → barrier()` pattern ensures all ranks have finished
 the previous iteration's communication before resetting, and all ranks see the reset
 before launching the next iteration.
+
+Below is an example implementation of AG-GEMM overlap with Copy Engine:
 
 ```python
 def ag_gemm_overlap(ctx, a_input, compute_kernel):
