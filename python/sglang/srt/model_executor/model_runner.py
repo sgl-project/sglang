@@ -102,6 +102,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -140,9 +141,6 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
-)
-from sglang.srt.model_executor.ngram_token_table import (
-    update_ngram_token_table_after_sampling,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
@@ -558,6 +556,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             gpu_id=self.gpu_id,
         )
 
+    def init_ngram_embedding_manager(self):
+        self.ngram_embedding_manager = NgramEmbeddingManager.from_model(
+            model=self.model,
+            model_config=self.model_config,
+            req_to_token_pool=self.req_to_token_pool,
+            server_args=self.server_args,
+            max_running_requests=self.max_running_requests,
+            device=self.device,
+        )
+        # Legacy double-track fields kept for now; Scheduler / CudaGraphRunner
+        # still read them. PRs 2 and 3 of this chain migrate those callers
+        # to ``self.ngram_embedding_manager`` and then drop the fields below.
+        self.use_ngram_embedding = self.ngram_embedding_manager.enabled
+        if self.ngram_embedding_manager.enabled:
+            self.token_table = self.ngram_embedding_manager.table
+
     def init_msprobe(self):
         # Init the msprobe
         try:
@@ -773,7 +787,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # Init ngram embedding token table
-        self.maybe_init_ngram_embedding()
+        self.init_ngram_embedding_manager()
 
         if self.enable_hisparse:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -1627,45 +1641,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
-    def maybe_init_ngram_embedding(self):
-        self.use_ngram_embedding = self.model_config.use_ngram_embedding
-        if self.use_ngram_embedding:
-            from sglang.srt.layers.n_gram_embedding import NgramEmbedding
-
-            # Sized to mirror req_to_token (indexed by req_pool_idx).
-            self.token_table = torch.empty(
-                self.req_to_token_pool.req_to_token.shape[0],
-                self.model_config.context_len,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            chunked_prefill_size = self.server_args.chunked_prefill_size
-            assert (
-                chunked_prefill_size is not None and chunked_prefill_size > 0
-            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
-            for module in self.model.modules():
-                if isinstance(module, NgramEmbedding):
-                    module.init_buffers(
-                        self.max_running_requests, chunked_prefill_size, self.device
-                    )
-
-    def maybe_update_ngram_token_table(
-        self,
-        next_token_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        """Update the ngram embedding token table after sampling."""
-        ngram_embedding_info = forward_batch.ngram_embedding_info
-        if ngram_embedding_info is None:
-            return
-        update_ngram_token_table_after_sampling(
-            ngram_embedding_info=ngram_embedding_info,
-            next_token_ids=next_token_ids,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            batch_size=forward_batch.batch_size,
-        )
-
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
         self.decode_cuda_graph_runner = None
@@ -2316,7 +2291,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
-        self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        self.ngram_embedding_manager.update_after_decode(
+            next_token_ids=next_token_ids,
+            forward_batch=forward_batch,
+        )
         return next_token_ids
 
     def compute_logprobs_only(
