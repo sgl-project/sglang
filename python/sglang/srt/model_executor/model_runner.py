@@ -533,6 +533,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
+        # Set float32 matmul precision
+        if server_args.enable_tf32_matmul:
+            torch.set_float32_matmul_precision("high")
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
@@ -3048,11 +3052,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+                category = (
+                    "target_verify"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "extend"
+                )
                 # TODO: device_timer.wrap is too broad here — it also includes
                 # load_batch time. Move timing into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 ctx = (
-                    self.device_timer.wrap(metadata={"category": "extend"})
+                    self.device_timer.wrap(metadata={"category": category})
                     if self.device_timer
                     else contextlib.nullcontext()
                 )

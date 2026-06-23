@@ -649,6 +649,10 @@ class ServerArgs:
         Optional[str],
         "Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
     ] = None  # For flash_rl load format
+    enable_tf32_matmul: A[
+        bool,
+        "Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Memory and scheduling
@@ -4259,6 +4263,10 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
+            )
 
         elif model_arch in [
             "FalconH1ForCausalLM",
@@ -4291,6 +4299,12 @@ class ServerArgs:
 
         elif model_arch in ["ZayaForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
+
+        elif model_arch in ["MiniMaxM2ForCausalLM"]:
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
+            )
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
@@ -4667,9 +4681,17 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         if (
-            self.prefill_attention_backend == "fa4"
+            (
+                self.attention_backend == "fa4"
+                or self.decode_attention_backend == "fa4"
+                or self.prefill_attention_backend == "fa4"
+            )
             and not self.use_mla_backend()
             and is_sm100_supported()
+            # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
+            # CUTLASS kernel aborts on at page_size>1. That path only works at
+            # page_size==1, so skip the 128 auto-force for it and keep the default.
+            and (self.speculative_eagle_topk or 0) <= 1
         ):
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
