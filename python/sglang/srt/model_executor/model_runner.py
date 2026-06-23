@@ -122,7 +122,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -202,6 +201,7 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
+from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
@@ -1985,7 +1985,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(
@@ -2259,13 +2259,3 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
-
-
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
-    mode = forward_batch.forward_mode
-    bs = forward_batch.batch_size
-    if mode == ForwardMode.EXTEND:
-        ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
