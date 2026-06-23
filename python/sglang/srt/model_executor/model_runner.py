@@ -386,7 +386,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             join_process_groups()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
+                src_rank=get_healthy_expert_location_src_rank(
                     invoked_in_elastic_ep_rejoin_path=True
                 )
             )
@@ -1145,7 +1145,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
+                src_rank=get_healthy_expert_location_src_rank(
                     invoked_in_elastic_ep_rejoin_path=False
                 )
             )
@@ -1158,25 +1158,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
-
-    def _get_healthy_expert_location_src_rank(
-        self, invoked_in_elastic_ep_rejoin_path: bool
-    ) -> int:
-        world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-        # A rank that was started as a rejoin rank may later act as a healthy
-        # rank in a subsequent recovery cycle.
-        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
-        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
-
-        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
-            if not is_rejoin_rank:
-                return world_group.ranks[rank_in_group]
-
-        raise RuntimeError(
-            "No healthy rank found for broadcasting expert location metadata. "
-            "All ranks are marked as elastic_ep_rejoin."
-        )
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -2015,3 +1996,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+def get_healthy_expert_location_src_rank(
+    *, invoked_in_elastic_ep_rejoin_path: bool
+) -> int:
+    world_group = get_world_group()
+    # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+    # A rank that was started as a rejoin rank may later act as a healthy
+    # rank in a subsequent recovery cycle.
+    local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+    gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+    for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+        if not is_rejoin_rank:
+            return world_group.ranks[rank_in_group]
+
+    raise RuntimeError(
+        "No healthy rank found for broadcasting expert location metadata. "
+        "All ranks are marked as elastic_ep_rejoin."
+    )
