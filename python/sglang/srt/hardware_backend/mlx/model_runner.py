@@ -1289,5 +1289,3 @@ class MlxModelRunner:
         self._req_synced_offset.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()
-
-

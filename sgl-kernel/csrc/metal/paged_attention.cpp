@@ -1,9 +1,8 @@
-#include "metal_common.h"
-
 #include <cmath>
 #include <stdexcept>
 #include <string>
 
+#include "metal_common.h"
 #include "mlx/allocator.h"
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
@@ -57,9 +56,9 @@ class PagedAttentionDecode : public Primitive {
     };
 
     const std::string kname = std::string("paged_attention_decode_") + dtype_suffix(q.dtype());
-    const std::string hash = kname + "_hd" + std::to_string(head_dim_) + "_q" +
-                             std::to_string(num_qo_heads_) + "_k" + std::to_string(num_kv_heads_) +
-                             "_s" + std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
+    const std::string hash = kname + "_hd" + std::to_string(head_dim_) + "_q" + std::to_string(num_qo_heads_) + "_k" +
+                             std::to_string(num_kv_heads_) + "_s" +
+                             std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
     auto* pipe = d.get_kernel(kname, g_library, hash, consts);
     if (!pipe) {
       throw std::runtime_error("paged_attention_decode: failed to resolve kernel");

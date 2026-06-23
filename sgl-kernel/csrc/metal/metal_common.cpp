@@ -11,11 +11,10 @@ NB_MODULE(_metal, m) {
   register_paged_attention(m);
 }
 
-#include "metal_common.h"
-
 #include <algorithm>
 #include <stdexcept>
 
+#include "metal_common.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/mlx.h"
 
@@ -71,4 +70,4 @@ nb::object wrap_array(array&& value) {
   return py_obj;
 }
 
-}
+}  // namespace sglang::metal_common

@@ -1,7 +1,7 @@
-#include "metal_common.h"
-
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+
+#include "metal_common.h"
 
 namespace nb = nanobind;
 

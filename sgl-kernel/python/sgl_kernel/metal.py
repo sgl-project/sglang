@@ -148,8 +148,7 @@ def paged_attention_decode(
     v_shape = tuple(v_pool.shape)
     if q_shape[1:] != (num_qo_heads, head_dim):
         raise ValueError(
-            "q shape must be [batch, num_qo_heads, head_dim], "
-            f"got {q.shape}"
+            "q shape must be [batch, num_qo_heads, head_dim], " f"got {q.shape}"
         )
     if k_shape[1:] != (num_kv_heads, head_dim):
         raise ValueError(f"k_pool has incompatible shape {k_pool.shape}")
