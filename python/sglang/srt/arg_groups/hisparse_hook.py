@@ -91,6 +91,57 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     )
 
 
+def _validate_dsv4_hisparse_online_c128_mtp(server_args: ServerArgs) -> None:
+    """Validate the DSV4 HiSparse + online C128 MTP combination early."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        return
+
+    if server_args.speculative_algorithm is None:
+        return
+
+    if not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 with speculative decode requires "
+            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+        )
+
+    if server_args.speculative_algorithm != "EAGLE":
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP supports "
+            f"EAGLE, got {server_args.speculative_algorithm!r}."
+        )
+
+    if server_args.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            f"--speculative-eagle-topk 1, got {server_args.speculative_eagle_topk}."
+        )
+
+    speculative_num_steps = int(server_args.speculative_num_steps or 0)
+    if speculative_num_steps > 2:
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP supports "
+            f"EAGLE step1/step2, got speculative_num_steps={speculative_num_steps}."
+        )
+
+    if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            "SGLANG_OPT_USE_COMPRESSOR_V2=1 because the v2 compressor carries "
+            "online state-slot metadata."
+        )
+
+    logger.warning(
+        "DSV4 HiSparse online C128 MTP enabled: C4 stays on the HiSparse "
+        "host mirror; C128 uses online EAGLE state banks; eagle_steps=%d, "
+        "draft_tokens=%s.",
+        speculative_num_steps,
+        server_args.speculative_num_draft_tokens,
+    )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
     if not server_args.enable_hisparse:
@@ -115,6 +166,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
+    if is_v4_hisparse:
+        _validate_dsv4_hisparse_online_c128_mtp(server_args)
+
     if is_hip and is_v4_hisparse:
         # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
