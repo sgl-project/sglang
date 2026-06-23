@@ -1454,14 +1454,17 @@ def build_inner_fb_view(
         batch_size=bs,
         forward_mode=forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
+        global_forward_mode=getattr(forward_batch, "global_forward_mode", None),
         input_ids=getattr(forward_batch, "input_ids", None),
         positions=getattr(forward_batch, "positions", None),
+        mrope_positions=getattr(forward_batch, "mrope_positions", None),
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
         seq_lens_sum=forward_batch.seq_lens_sum,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 

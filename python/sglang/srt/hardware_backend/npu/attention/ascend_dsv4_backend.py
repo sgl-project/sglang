@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dsv4_debug_log_enabled() -> bool:
+    return os.environ.get("SGLANG_DSV4_NPU_DEBUG_LOG", "0") == "1"
+
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
@@ -1111,7 +1115,13 @@ class DeepseekV4AscendAttnBackend(
 
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
-        forward_mode = forward_batch.global_forward_mode or forward_batch.forward_mode
+        forward_mode = (
+            getattr(forward_batch, "global_forward_mode", None)
+            or forward_batch.forward_mode
+        )
+        actual_forward_mode = getattr(forward_batch, "actual_forward_mode", None)
+        if actual_forward_mode is None:
+            actual_forward_mode = forward_batch.forward_mode
         bs = forward_batch.batch_size
         seq_lens = forward_batch.seq_lens
         req_pool_indices = forward_batch.req_pool_indices
@@ -1140,7 +1150,7 @@ class DeepseekV4AscendAttnBackend(
 
         _verify_compress = (
             forward_mode.is_target_verify()
-            and forward_batch.forward_mode.is_target_verify()
+            and actual_forward_mode.is_target_verify()
             and bool(self._dsv4_compress_ratios)
         )
         _compress_seq_lens = live_seq_lens
@@ -1157,7 +1167,7 @@ class DeepseekV4AscendAttnBackend(
             bs=bs,
             device=device,
             req_to_token_pool=self.req_to_token_pool,
-            out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             is_graph=True,
         )
 
@@ -1238,7 +1248,7 @@ class DeepseekV4AscendAttnBackend(
             # DP rank. There is no real DSV4 allocation bundle in that case;
             # zero the compressor metadata so captured writes land in the
             # reserved dummy slot instead of reusing stale locs.
-            and not forward_batch.forward_mode.is_target_verify()
+            and not actual_forward_mode.is_target_verify()
             and bool(self._dsv4_compress_ratios)
         ):
             for tensor in (
@@ -1690,8 +1700,36 @@ class DeepseekV4AscendAttnBackend(
         mask_c4 = (abs_positions % 4) != 0
         mask_c128 = (abs_positions % 128) != 0
 
-        gather_shape_c4 = min(positions.shape[0], c4_positions.shape[0])
-        gather_shape_c128 = min(positions.shape[0], c128_positions.shape[0])
+        expected_shape_c4 = min(positions.shape[0], c4_positions.shape[0])
+        expected_shape_c128 = min(positions.shape[0], c128_positions.shape[0])
+        gather_shape_c4 = min(
+            positions.shape[0], mask_c4.numel(), c4_positions.shape[0]
+        )
+        gather_shape_c128 = min(
+            positions.shape[0], mask_c128.numel(), c128_positions.shape[0]
+        )
+        if (
+            _dsv4_debug_log_enabled()
+            or gather_shape_c4 != expected_shape_c4
+            or gather_shape_c128 != expected_shape_c128
+        ):
+            logger.warning(
+                "DSV4 verify padding refresh: positions=%s c4_dst=%s c128_dst=%s "
+                "seq_lens_cpu=%s n_draft=%s request_num=%s mask_c4=%s mask_c128=%s "
+                "copy_c4=%s/%s copy_c128=%s/%s",
+                tuple(positions.shape),
+                tuple(c4_positions.shape),
+                tuple(c128_positions.shape),
+                tuple(seq_lens_cpu.shape),
+                n_draft,
+                request_num,
+                mask_c4.numel(),
+                mask_c128.numel(),
+                gather_shape_c4,
+                expected_shape_c4,
+                gather_shape_c128,
+                expected_shape_c128,
+            )
         sorted_indices_c4 = (
             torch.argsort(mask_c4.flatten(), dim=0, stable=True)[:gather_shape_c4]
             .pin_memory()
@@ -1901,6 +1939,29 @@ class DeepseekV4AscendMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
+    def _step_out_cache_loc(self, forward_batch: ForwardBatch, step_id: int):
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is None:
+            return None
+
+        single_step_width = forward_batch.batch_size * self.topk
+        if out_cache_loc.numel() <= single_step_width:
+            return out_cache_loc
+
+        step_layout_width = self.topk * self.speculative_num_steps
+        if step_layout_width == 0 or out_cache_loc.numel() % step_layout_width != 0:
+            return out_cache_loc
+
+        from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+        batch_size = out_cache_loc.numel() // step_layout_width
+        return per_step_draft_out_cache_loc(
+            out_cache_loc,
+            batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )[step_id]
+
     def _step_out_cache_loc_dsv4(self, forward_batch: ForwardBatch, step_id: int):
         bundle = forward_batch.out_cache_loc_dsv4
         if bundle is None or forward_batch.out_cache_loc is None:
@@ -1970,14 +2031,46 @@ class DeepseekV4AscendMultiStepDraftBackend:
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
+        old_out_cache_loc = forward_batch.out_cache_loc
         old_out_cache_loc_dsv4 = forward_batch.out_cache_loc_dsv4
+        step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+        if step_out_cache_loc is not None:
+            forward_batch.out_cache_loc = step_out_cache_loc
         forward_batch.out_cache_loc_dsv4 = self._step_out_cache_loc_dsv4(
             forward_batch, step_id
         )
         try:
             return call_fn()
         finally:
+            forward_batch.out_cache_loc = old_out_cache_loc
             forward_batch.out_cache_loc_dsv4 = old_out_cache_loc_dsv4
+
+    def _build_step_forward_batch(
+        self, forward_batch: ForwardBatch, step_id: int
+    ) -> ForwardBatch:
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        step_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
+        old_bundle = forward_batch.out_cache_loc_dsv4
+        step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+        step_bundle = self._step_out_cache_loc_dsv4(forward_batch, step_id)
+        step_fb.out_cache_loc_dsv4 = step_bundle
+        step_fb.global_forward_mode = getattr(
+            forward_batch, "global_forward_mode", None
+        )
+        if (
+            step_bundle is not None
+            and step_bundle is not old_bundle
+            and step_bundle.out_full_loc is not None
+        ):
+            step_fb.out_cache_loc = step_bundle.out_full_loc
+        elif step_out_cache_loc is not None:
+            step_fb.out_cache_loc = step_out_cache_loc
+        return step_fb
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
@@ -1992,6 +2085,25 @@ class DeepseekV4AscendMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                self._build_step_forward_batch(forward_batch, i),
+                in_capture=in_capture,
+            )
+
+        self.common_template(forward_batch, call_fn)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+
+        self.common_template(forward_batch, call_fn)
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
