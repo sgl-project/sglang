@@ -88,7 +88,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            cache_protected_len=0,
+            cache=SimpleNamespace(cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(
