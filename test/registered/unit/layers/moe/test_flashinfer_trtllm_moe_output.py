@@ -11,12 +11,18 @@ from sglang.srt.layers.moe.moe_runner.base import (
     maybe_moe_output_copy_add,
     moe_output_copy_add_ctx,
 )
+from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for FlashInfer MoE tests."
+)
+requires_sm100 = pytest.mark.skipif(
+    not is_sm100_supported(),
+    reason="FlashInfer TRTLLM-gen routed FP8 MoE kernels are SM100-only.",
 )
 
 
@@ -58,7 +64,7 @@ def test_moe_output_copy_add_folds_shared_output_on_alt_stream():
     torch.testing.assert_close(fallback_out, routed, rtol=0, atol=0)
 
 
-@requires_cuda
+@requires_sm100
 def test_routed_fp8_wrapper_writes_real_flashinfer_output_tensor():
     fused_moe = pytest.importorskip("flashinfer.fused_moe")
     if (
