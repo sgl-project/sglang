@@ -129,6 +129,9 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.expert_location_helpers import (
+    get_healthy_expert_location_src_rank,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     adjust_hybrid_swa_layer_ids,
     compute_attention_and_moe_layers,
@@ -1958,26 +1961,3 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
-
-
-from sglang.srt.distributed import get_world_group
-
-
-def get_healthy_expert_location_src_rank(
-    *, invoked_in_elastic_ep_rejoin_path: bool
-) -> int:
-    world_group = get_world_group()
-    # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-    # A rank that was started as a rejoin rank may later act as a healthy
-    # rank in a subsequent recovery cycle.
-    local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
-    gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
-
-    for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
-        if not is_rejoin_rank:
-            return world_group.ranks[rank_in_group]
-
-    raise RuntimeError(
-        "No healthy rank found for broadcasting expert location metadata. "
-        "All ranks are marked as elastic_ep_rejoin."
-    )
