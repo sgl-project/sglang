@@ -1730,7 +1730,7 @@ class ServerArgs:
     ] = None
     enable_mamba_cache_stochastic_rounding: A[
         bool,
-        "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100-family Blackwell (GB200/B200 or GB300/B300).",
+        "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
     ] = False
     mamba_cache_philox_rounds: A[
         int,
@@ -4890,11 +4890,10 @@ class ServerArgs:
             if self.mamba_backend == "triton" and not is_sm100_supported():
                 raise ValueError(
                     "Stochastic rounding for the Mamba SSM cache with "
-                    "--mamba-backend triton requires SM100-family Blackwell "
-                    "(GB200/B200 or GB300/B300) with CUDA >= 12.8 because it "
-                    "uses the cvt.rs.f16x2.f32 PTX instruction. On H100/SM90, "
-                    "run with --mamba-backend flashinfer --mamba-ssm-dtype "
-                    "float16, or disable "
+                    "--mamba-backend triton requires SM100 with CUDA >= 12.8 "
+                    "because it uses the cvt.rs.f16x2.f32 PTX instruction. On "
+                    "H100/SM90, run with --mamba-backend flashinfer "
+                    "--mamba-ssm-dtype float16, or disable "
                     "--enable-mamba-cache-stochastic-rounding."
                 )
 
