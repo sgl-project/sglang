@@ -31,6 +31,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mambaish_config,
+)
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -111,6 +115,9 @@ from sglang.srt.lora.lora_manager import (
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -599,6 +606,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
         )
 
+    def init_kv_cache_configurator(self):
+        self.kv_cache_configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            kv_cache_dtype=self.kv_cache_dtype,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            dflash_draft_num_layers=self.dflash_draft_num_layers,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            mambaish_config=mambaish_config(self.model_config),
+            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            num_effective_layers=self.num_effective_layers,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+        )
+
     def init_msprobe(self):
         # Init the msprobe
         try:
@@ -786,6 +816,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        self.init_kv_cache_configurator()
         self.init_memory_pool(self.pre_model_load_memory)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
