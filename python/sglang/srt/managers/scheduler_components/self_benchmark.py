@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from array import array
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -103,6 +104,8 @@ class SelfBenchmark:
         self._write_results = bool(getattr(scheduler, "enable_fpm", False))
         self._pending_seed_point: Optional[BenchmarkPoint] = None
         self._pending_seed_extra_key: Optional[str] = None
+        self._timed_out = False
+        self._deadline_monotonic = self._init_deadline_monotonic()
         self._build_grid()
         if self._warmup_remaining == 0:
             self.phase = BenchmarkPhase.SWEEP
@@ -113,7 +116,12 @@ class SelfBenchmark:
         return self.phase != BenchmarkPhase.DONE
 
     def maybe_schedule_next(self) -> None:
-        if not self.active or self._current is not None or self._has_inflight_work():
+        if not self.active:
+            return
+        if self._has_timed_out():
+            self._finish(timed_out=True)
+            return
+        if self._current is not None or self._has_inflight_work():
             return
 
         if self.phase == BenchmarkPhase.WARMUP:
@@ -202,6 +210,17 @@ class SelfBenchmark:
         self._current = None
         self._active_reqs = []
         self._grid_index += 1
+
+    def _init_deadline_monotonic(self) -> Optional[float]:
+        if self.config.timeout <= 0:
+            return None
+        return time.monotonic() + self.config.timeout
+
+    def _has_timed_out(self) -> bool:
+        return (
+            self._deadline_monotonic is not None
+            and time.monotonic() >= self._deadline_monotonic
+        )
 
     def _build_grid(self) -> None:
         mode = self.config.mode
@@ -718,7 +737,21 @@ class SelfBenchmark:
             return "prefill"
         return None
 
-    def _finish(self) -> None:
+    def _finish(self, timed_out: bool = False) -> None:
+        if self.phase == BenchmarkPhase.DONE:
+            return
+        if timed_out:
+            self._timed_out = True
+            self._current = None
+            self._active_reqs = []
+            self._pending_seed_point = None
+            self._pending_seed_extra_key = None
+            logger.warning(
+                "Self-benchmark timed out after %d seconds; writing %d completed "
+                "point(s) and continuing startup",
+                self.config.timeout,
+                len(self._results),
+            )
         if self._write_results:
             self._write_output()
         self.phase = BenchmarkPhase.DONE
@@ -731,6 +764,7 @@ class SelfBenchmark:
         output_path = self._rank_output_path(self.config.output_path)
         output = {
             "config": asdict(self.config),
+            "timed_out": self._timed_out,
             "limits": {
                 "max_num_scheduled_tokens": getattr(
                     self.scheduler, "max_prefill_tokens", None
