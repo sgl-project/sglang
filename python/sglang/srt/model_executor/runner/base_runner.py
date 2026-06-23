@@ -312,7 +312,11 @@ class BaseRunner(ABC):
             num_tokens_per_req=num_tokens_per_req,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
-            ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
+            ne_token_table=(
+                mr.ngram_embedding_manager.table
+                if mr.ngram_embedding_manager.enabled
+                else None
+            ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
