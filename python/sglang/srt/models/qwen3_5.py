@@ -132,6 +132,10 @@ _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
+_is_xpu = is_xpu()
+# Opt-in: dispatch GDN to the fused vLLM SYCL op in sgl-kernel-xpu
+# (torch.ops.sgl_kernel.gdn_attention). Default OFF -> Triton path unchanged.
+_xpu_fused_gdn = get_bool_env_var("SGLANG_XPU_FUSED_GDN", "False") and _is_xpu
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -541,39 +545,56 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
-            if _is_cpu:
-                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
-                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+        core_attn_out = z = None
+        if _xpu_fused_gdn and self.attn_tp_size == 1:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            if hasattr(backend, "forward_fused_gdn") and backend.supports_fused_gdn(
+                self.attn, forward_batch
+            ):
+                core_attn_out, z = backend.forward_fused_gdn(
+                    self.attn,
+                    forward_batch,
+                    projected_states_qkvz,
+                    projected_states_ba,
+                )
+
+        if core_attn_out is None:
+            if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+                if _is_cpu:
+                    num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+                    num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+                else:
+                    num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
+                    num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             else:
-                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
-                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
-        else:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
-            )
-            b = b.contiguous()
-            a = a.contiguous()
+                query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                    projected_states_qkvz, projected_states_ba
+                )
+                b = b.contiguous()
+                a = a.contiguous()
 
-            query, key, value = map(
-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
-            )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
+                query, key, value = map(
+                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+                )
+                mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor

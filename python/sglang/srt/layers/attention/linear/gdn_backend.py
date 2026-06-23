@@ -612,3 +612,114 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    # ------------------------------------------------------------------
+    # Optional fused GDN path (Intel XPU): dispatch the whole conv1d +
+    # gating + delta-rule pipeline to the vendored vLLM SYCL kernel exposed
+    # as ``torch.ops.sgl_kernel.gdn_attention``. Opt-in only; the default
+    # Triton path above is unchanged.
+    # ------------------------------------------------------------------
+    def supports_fused_gdn(self, layer, forward_batch: ForwardBatch) -> bool:
+        """Conservative guard: only the plain decode / non-prefix-cached,
+        non-speculative extend cases are handled by the fused kernel."""
+        if not hasattr(torch.ops.sgl_kernel, "gdn_attention"):
+            return False
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            return False
+        fm = self.forward_metadata
+        if getattr(fm, "has_mamba_track_mask", False):
+            # chunked prefix-cache intermediate-state tracking unsupported
+            return False
+        if getattr(fm, "query_start_loc", None) is None:
+            return False
+        # GDN (not KDA) shared weights must be plain tensors
+        if not isinstance(layer.conv_weights, torch.Tensor):
+            return False
+        if layer.bias is not None and not isinstance(layer.bias, torch.Tensor):
+            return False
+        return True
+
+    def forward_fused_gdn(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+    ):
+        """Run the fused SYCL GDN op and return ``(core_attn_out, z)``.
+
+        Caches stay in the SGLang pool layout and are updated in place. The conv
+        pool is ``[cache, dim, width-1]``; we pass a transposed view so the op sees
+        its logical ``[cache, width-1, dim]`` layout while the kernels index via
+        explicit width/dim strides (no gather/transpose/scatter copies). The ssm
+        pool already matches the op layout. ``mamba_cache_indices`` indexes the
+        full pool directly for both conv and ssm.
+        """
+        fm = self.forward_metadata
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = layer_cache.conv[0]  # [cache, dim, width-1]
+        ssm_states = layer_cache.temporal  # [cache, nv, hv, hk]
+        cache_indices = fm.mamba_cache_indices
+        query_start_loc = fm.query_start_loc
+
+        device = projected_states_qkvz.device
+        dtype = projected_states_qkvz.dtype
+        bs = forward_batch.batch_size
+        num_actual_tokens = projected_states_qkvz.shape[0]
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            num_decodes, num_prefills = bs, 0
+            has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
+        else:
+            num_decodes, num_prefills = 0, bs
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+
+        # Full-pool, zero-copy: transposed view for conv + native ssm pool, indexed
+        # directly by the full-pool cache indices.
+        conv_view = conv_states.transpose(1, 2)  # [cache, width-1, dim] view
+        state_idx = cache_indices.to(torch.int32).contiguous()
+
+        core_attn_out = torch.empty(
+            num_actual_tokens,
+            layer.num_v_heads,
+            layer.head_v_dim,
+            dtype=dtype,
+            device=device,
+        )
+        z = torch.empty_like(core_attn_out)
+
+        torch.ops.sgl_kernel.gdn_attention(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+            conv_view,
+            ssm_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            layer.A_log,
+            layer.dt_bias,
+            num_prefills,
+            num_decodes,
+            0,
+            has_initial_state,
+            query_start_loc,
+            None,
+            state_idx,
+            None,
+            None,
+            None,
+            None,
+            num_actual_tokens,
+            1,
+            True,
+        )
+
+        # conv/ssm states were updated in place via the pool views.
+        return core_attn_out, z
