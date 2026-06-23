@@ -1,4 +1,7 @@
-"""Bench the hybrid ``mla_kv_pack_quantize_fp8`` against an inlined naive Triton baseline."""
+"""Bench ``mla_kv_pack_quantize_fp8`` vs a naive Triton baseline.
+
+Dispatch keys on ``s * num_heads``, so sweep both ``batch_size`` and ``num_heads``.
+"""
 
 import itertools
 from typing import Tuple
@@ -20,7 +23,7 @@ from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=20, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
 @triton.jit
@@ -133,36 +136,29 @@ def _triton_pack(k_nope, k_pe, v, k_out, v_out):
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
-NUM_HEADS = 32
 NUM_LAYERS = 8
+
+# Fixed axes used by each sweep.
+FIXED_NUM_HEADS = 32
+FIXED_BATCH_SIZE = 2048
 
 BS_RANGE = get_benchmark_range(
     full_range=[1, 4, 16, 64, 256, 1024, 4096, 8192, 16384],
     ci_range=[1, 64, 1024, 4096, 16384],
 )
+NH_RANGE = get_benchmark_range(
+    full_range=[8, 16, 32, 64, 128],
+    ci_range=[16, 128],
+)
 
 LINE_VALS = ["hybrid", "triton"]
 LINE_NAMES = ["hybrid (v0+v1_flat)", "naive Triton"]
 STYLES = [("green", "-"), ("red", "--")]
-CONFIGS = list(itertools.product(BS_RANGE))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="mla-kv-pack-quantize-fp8-performance",
-        args={},
-    )
-)
-def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
+def _make_inputs(batch_size: int, num_heads: int):
     k_nope = torch.randn(
-        (NUM_LAYERS, batch_size, NUM_HEADS, QK_NOPE),
+        (NUM_LAYERS, batch_size, num_heads, QK_NOPE),
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
@@ -172,21 +168,26 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
         device=DEFAULT_DEVICE,
     )
     v = torch.randn(
-        (NUM_LAYERS, batch_size, NUM_HEADS, V_HEAD),
+        (NUM_LAYERS, batch_size, num_heads, V_HEAD),
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
     k_out = torch.empty(
-        (NUM_LAYERS, batch_size, NUM_HEADS, QK_NOPE + QK_ROPE),
+        (NUM_LAYERS, batch_size, num_heads, QK_NOPE + QK_ROPE),
         dtype=torch.float8_e4m3fn,
         device=DEFAULT_DEVICE,
     )
     v_out = torch.empty(
-        (NUM_LAYERS, batch_size, NUM_HEADS, V_HEAD),
+        (NUM_LAYERS, batch_size, num_heads, V_HEAD),
         dtype=torch.float8_e4m3fn,
         device=DEFAULT_DEVICE,
     )
     torch.cuda.synchronize()
+    return k_nope, k_pe, v, k_out, v_out
+
+
+def _run(batch_size: int, num_heads: int, provider: str) -> Tuple[float, float, float]:
+    k_nope, k_pe, v, k_out, v_out = _make_inputs(batch_size, num_heads)
 
     if provider == "hybrid":
 
@@ -210,5 +211,44 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
     )
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],
+        x_vals=list(itertools.product(BS_RANGE)),
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name=f"mla-kv-pack-quantize-fp8-batch-size (num_heads={FIXED_NUM_HEADS})",
+        args={"num_heads": FIXED_NUM_HEADS},
+    )
+)
+def benchmark_batch_size(
+    batch_size: int, num_heads: int, provider: str
+) -> Tuple[float, float, float]:
+    return _run(batch_size, num_heads, provider)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_heads"],
+        x_vals=list(itertools.product(NH_RANGE)),
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name=f"mla-kv-pack-quantize-fp8-num-heads (batch_size={FIXED_BATCH_SIZE})",
+        args={"batch_size": FIXED_BATCH_SIZE},
+    )
+)
+def benchmark_num_heads(
+    num_heads: int, batch_size: int, provider: str
+) -> Tuple[float, float, float]:
+    return _run(batch_size, num_heads, provider)
+
+
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark_batch_size.run(print_data=True)
+    benchmark_num_heads.run(print_data=True)
