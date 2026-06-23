@@ -936,6 +936,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -949,6 +950,10 @@ class Glm4MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+        )
+
+        self.layer_communicator.maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -1080,6 +1085,10 @@ class Glm4MoeModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
         else:
@@ -1131,6 +1140,7 @@ class Glm4MoeModel(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(i),
                 )
 
         if normal_end_layer != self.end_layer:

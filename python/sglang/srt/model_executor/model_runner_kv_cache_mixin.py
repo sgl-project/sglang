@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -13,7 +13,11 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -79,6 +83,24 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _is_dsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
+    return (
+        not model_runner.is_draft_worker
+        and model_runner.server_args.enable_dsa_cache_layer_split
+    )
+
+
+def _get_dsa_cp_layer_shard_info(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], int]:
+    if not _is_dsa_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_attention_cp_size()
+    if shard_size <= 1:
+        return None, 1
+    return get_attention_cp_rank(), shard_size
 
 
 class ModelRunnerKVCacheMixin:
@@ -428,6 +450,9 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = _get_dsa_cp_layer_shard_info(
+            self
+        )
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -660,6 +685,8 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                layer_shard_rank=dsa_cp_layer_shard_rank,
+                layer_shard_size=dsa_cp_layer_shard_size,
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
@@ -756,6 +783,8 @@ class ModelRunnerKVCacheMixin:
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    layer_shard_rank=dsa_cp_layer_shard_rank,
+                    layer_shard_size=dsa_cp_layer_shard_size,
                     **extra_args,
                 )
             else:

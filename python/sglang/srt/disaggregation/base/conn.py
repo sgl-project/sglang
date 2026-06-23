@@ -46,6 +46,7 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    is_hybrid_mla_backend: bool
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
