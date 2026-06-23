@@ -558,6 +558,157 @@ class ServingChatTestCase(unittest.TestCase):
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
 
+    def test_jinja_rejects_non_object_tool_call_arguments(self):
+        """History tool call arguments must parse to a JSON object."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for arguments in ['"Beijing"', '["Beijing"]']:
+            with self.subTest(arguments=arguments):
+                self.tm.tokenizer.apply_chat_template.reset_mock()
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+                    self.chat._process_messages(req, is_multimodal=False)
+
+                self.tm.tokenizer.apply_chat_template.assert_not_called()
+
+    def test_jinja_accepts_object_tool_call_arguments_string(self):
+        """OpenAI JSON string arguments are converted to dicts for templates."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            {"city": "Beijing"},
+        )
+
+    def test_dsv_encoders_reject_non_object_tool_call_arguments(self):
+        """DeepSeek encoders should reject history tool call scalars as BadRequest."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '"Beijing"',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+                    self.chat._process_messages(req, is_multimodal=False)
+
+    def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
+        """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Beijing"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "sunny",
+                        },
+                    ],
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
