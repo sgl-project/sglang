@@ -1277,11 +1277,10 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     weight_scale_inv.data = new_weight_scale_inv
 
 
-def maybe_requant_block_scale_ue8m0(
+def requant_block_scale_ue8m0_for_deepgemm(
     weight: torch.nn.Parameter,
     weight_scale: torch.nn.Parameter,
     weight_block_size: Optional[List[int]],
-    *,
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,

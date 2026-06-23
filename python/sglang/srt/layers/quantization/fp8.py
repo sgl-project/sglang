@@ -62,9 +62,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
     input_to_float8,
-    maybe_requant_block_scale_ue8m0,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -541,7 +541,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.w8a8_block_fp8_linear
                 is deepgemm_w8a8_block_fp8_linear_with_fallback
             )
-            maybe_requant_block_scale_ue8m0(
+            requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
                 layer.weight_scale_inv,
                 getattr(self.quant_config, "weight_block_size", None),
@@ -1359,7 +1359,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                if maybe_requant_block_scale_ue8m0(
+                if requant_block_scale_ue8m0_for_deepgemm(
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,
                     weight_block_size,
@@ -1368,7 +1368,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     assert isinstance(
                         layer, DeepEPMoE
                     ), "DeepGemm MoE is only supported with DeepEPMoE"
-                    maybe_requant_block_scale_ue8m0(
+                    requant_block_scale_ue8m0_for_deepgemm(
                         layer.w2_weight,
                         layer.w2_weight_scale_inv,
                         weight_block_size,

@@ -23,8 +23,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_ptpc_linear,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
-    maybe_requant_block_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_block_scale_ue8m0_for_deepgemm,
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -207,7 +207,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 self.w8a8_block_fp8_linear
                 is deepgemm_w8a8_block_fp8_linear_with_fallback
             )
-            maybe_requant_block_scale_ue8m0(
+            requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
                 layer.weight_scale,
                 self.weight_block_size,

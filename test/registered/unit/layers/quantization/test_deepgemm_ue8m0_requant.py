@@ -41,7 +41,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         with self._enabled_deepgemm_ue8m0(), patch.object(
             fp8_utils, "requant_weight_ue8m0_inplace"
         ) as requant:
-            fired = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 BLOCK_SIZE,
@@ -49,7 +49,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
                 output_dtype=torch.bfloat16,
                 weight_shape=weight.shape,
             )
-            fired_again = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired_again = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 BLOCK_SIZE,
@@ -69,7 +69,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         with self._enabled_deepgemm_ue8m0(), patch.object(
             fp8_utils, "requant_weight_ue8m0_inplace"
         ) as requant:
-            fired = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 BLOCK_SIZE,
@@ -88,7 +88,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         with self._enabled_deepgemm_ue8m0(), patch.object(
             fp8_utils, "requant_weight_ue8m0_inplace"
         ) as requant:
-            fired = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 BLOCK_SIZE,
@@ -107,7 +107,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         with self._enabled_deepgemm_ue8m0(), patch.object(
             fp8_utils, "requant_weight_ue8m0_inplace"
         ) as requant:
-            fired = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 BLOCK_SIZE,
@@ -127,7 +127,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         with self._enabled_deepgemm_ue8m0(), patch.object(
             fp8_utils, "requant_weight_ue8m0_inplace"
         ) as requant:
-            fired = fp8_utils.maybe_requant_block_scale_ue8m0(
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,
                 unsupported_block_size,
