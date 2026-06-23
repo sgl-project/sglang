@@ -199,6 +199,8 @@ class MlxModelRunnerStub(ModelRunner):
         self.graph_mem_usage = 0
         self.attn_backend = None
 
+        self.init_ngram_embedding_manager()
+
         logger.info(
             f"MLX stub: initialized minimal pools "
             f"(max_total_num_tokens={self.max_total_num_tokens}, "
