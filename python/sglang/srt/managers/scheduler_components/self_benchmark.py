@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SELF_BENCHMARK_REQ_PREFIX = "__sgl_bench_"
+SELF_BENCHMARK_DUMMY_TOKEN_ID = 0
 
 
 @dataclass
@@ -134,7 +135,7 @@ class SelfBenchmark:
             if injected > 0:
                 return
             logger.warning("Skipping benchmark point with no valid seed: %s", point)
-            self._grid_index += 1
+            self._advance_grid_point()
             return
 
         self._current = BenchmarkPointResult(point=point)
@@ -142,15 +143,13 @@ class SelfBenchmark:
         if point.point_type == "prefill":
             injected = self._inject_prefill(point=point)
         else:
-            injected = self._inject_decode(
+            injected = self._inject_synthetic_decode(
                 context_length=point.context_length, batch_size=point.batch_size
             )
 
         if injected == 0:
             logger.warning("Skipping benchmark point with no valid requests: %s", point)
-            self._current = None
-            self._active_reqs = []
-            self._grid_index += 1
+            self._advance_grid_point()
 
     def observe_forward_pass(
         self, batch: ScheduleBatch, fpm: Optional[ForwardPassMetrics]
@@ -197,6 +196,9 @@ class SelfBenchmark:
         if self._current is None:
             return
         self._results.append(self._current)
+        self._advance_grid_point()
+
+    def _advance_grid_point(self) -> None:
         self._current = None
         self._active_reqs = []
         self._grid_index += 1
@@ -332,7 +334,7 @@ class SelfBenchmark:
 
     def _inject_warmup(self) -> int:
         if self._supports_decode_points() and self._should_use_decode_warmup():
-            return self._inject_decode(
+            return self._inject_synthetic_decode(
                 context_length=min(256, self._max_decode_context_len()),
                 batch_size=1,
             )
@@ -351,14 +353,16 @@ class SelfBenchmark:
             and self.scheduler.disaggregation_mode == DisaggregationMode.DECODE
         )
 
-    def _inject_prefill(self, point: BenchmarkPoint) -> int:
+    def _inject_prefill(
+        self, point: BenchmarkPoint, extra_key: Optional[str] = None
+    ) -> int:
         # Chunked prefill requests need a decode step to reach the normal request
         # finished/release path. The benchmark still records only prefill FPMs.
         return self._inject_requests(
             prompt_len=point.isl,
             max_tokens=1,
             n=1,
-            extra_key=self._pending_seed_extra_key,
+            extra_key=extra_key,
             track_active=True,
         )
 
@@ -396,25 +400,15 @@ class SelfBenchmark:
                 point.kv_read_tokens,
                 actual_kv_read_tokens,
             )
-            self._grid_index += 1
+            self._advance_grid_point()
             return
 
-        self._pending_seed_extra_key = extra_key
         self._current = BenchmarkPointResult(point=point)
         self._active_reqs = []
-        injected = self._inject_prefill(point=point)
-        self._pending_seed_extra_key = None
+        injected = self._inject_prefill(point=point, extra_key=extra_key)
         if injected == 0:
             logger.warning("Skipping benchmark point with no valid requests: %s", point)
-            self._current = None
-            self._active_reqs = []
-            self._grid_index += 1
-
-    def _inject_decode(self, context_length: int, batch_size: int) -> int:
-        return self._inject_synthetic_decode(
-            context_length=context_length,
-            batch_size=batch_size,
-        )
+            self._advance_grid_point()
 
     def _inject_synthetic_decode(self, context_length: int, batch_size: int) -> int:
         if not self._synthetic_decode_supported():
@@ -526,13 +520,12 @@ class SelfBenchmark:
     def _new_synthetic_req(
         self, prompt_len: int, max_tokens: int, extra_key: Optional[str] = None
     ) -> Req:
-        token_id = self._dummy_token_id()
         rid = f"{SELF_BENCHMARK_REQ_PREFIX}{self._seq}"
         self._seq += 1
         req = Req(
             rid=rid,
             origin_input_text="",
-            origin_input_ids=array("q", [token_id] * prompt_len),
+            origin_input_ids=array("q", [SELF_BENCHMARK_DUMMY_TOKEN_ID] * prompt_len),
             sampling_params=SamplingParams(
                 max_new_tokens=max_tokens,
                 stop=[],
@@ -564,8 +557,7 @@ class SelfBenchmark:
             return 0
         if getattr(self.scheduler.tree_cache, "disable", True):
             return 0
-        token_id = self._dummy_token_id()
-        token_ids = array("q", [token_id] * point.isl)
+        token_ids = array("q", [SELF_BENCHMARK_DUMMY_TOKEN_ID] * point.isl)
         max_prefix_len = max(point.isl - 1, 0)
         match_result = self.scheduler.tree_cache.match_prefix(
             MatchPrefixParams(
@@ -680,10 +672,6 @@ class SelfBenchmark:
                 release_kv_cache(req, self.scheduler.tree_cache, is_insert=False)
             elif req.req_pool_idx is not None:
                 self.scheduler.req_to_token_pool.free(req)
-
-    def _dummy_token_id(self) -> int:
-        vocab_size = getattr(self.scheduler.model_config, "vocab_size", None) or 1
-        return 0 if vocab_size > 0 else 0
 
     def _has_inflight_work(self) -> bool:
         result_queue = getattr(self.scheduler, "result_queue", None)

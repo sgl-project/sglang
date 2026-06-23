@@ -324,6 +324,7 @@ class TestSelfBenchmark(CustomTestCase):
         self.assertEqual(calls[1]["max_tokens"], 1)
         self.assertTrue(calls[1]["track_active"])
         self.assertEqual(calls[0]["extra_key"], calls[1]["extra_key"])
+        self.assertIsNone(benchmark._pending_seed_extra_key)
 
     def test_prefill_kv_read_point_skips_when_seed_validation_misses(self):
         scheduler = _make_scheduler("/tmp/unused.json")
