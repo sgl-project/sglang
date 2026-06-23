@@ -179,15 +179,6 @@ class LinearBase(torch.nn.Module):
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-            print(
-                "[DEBUG LinearBase.get_quant_method] "
-                f"prefix={prefix} "
-                f"layer_cls={self.__class__.__name__} "
-                f"quant_config_cls={quant_config.__class__.__name__} "
-                f"quant_method={self.quant_method} "
-                f"quant_method_cls={type(self.quant_method).__name__ if self.quant_method is not None else 'None'}",
-                flush=True,
-            )
 
         if self.quant_method is not None:
             wrap_method_with_debug_kernel_once(
