@@ -488,6 +488,11 @@ MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
+    MODELOPT_T2I_CI_sampling_params,
+    extras={"num_inference_steps": 50, "seed": 0},
+)
+
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
