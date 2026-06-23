@@ -37,9 +37,9 @@ class ExpertBackupClient:
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
         self.model_runner = model_runner
-        self.moe_ep_size = model_runner.moe_ep_size
+        self.moe_ep_size = model_runner.ps.moe_ep_size
         self.model_config = model_runner.model_config
-        self.moe_ep_rank = model_runner.moe_ep_rank
+        self.moe_ep_rank = model_runner.ps.moe_ep_rank
         self.dram_map_list = [None] * self.engine_num
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None
