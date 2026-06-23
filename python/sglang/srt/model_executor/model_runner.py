@@ -1749,24 +1749,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
-    @staticmethod
-    def get_weights_by_name(
-        self: WeightExporter, name: str, truncate_size: int = 100
-    ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
-
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
-        """
-        # TODO: (chenyang) Add support for Qwen models.
-        try:
-            return self._mr.model.get_weights_by_name(
-                name, truncate_size, tp_size=self._mr.tp_size
-            )
-        except Exception as e:
-            logger.error(f"Error when getting parameter {name}: {e}")
-            return None
-
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -2797,29 +2779,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-
-    @staticmethod
-    def save_remote_model(self: WeightExporter, url: str):
-        from sglang.srt.model_loader.loader import RemoteModelLoader
-
-        logger.info(f"Saving model to {url}")
-        RemoteModelLoader.save_model(
-            self._mr.model, self._mr.model_config.model_path, url
-        )
-
-    @staticmethod
-    def save_sharded_model(
-        self: WeightExporter,
-        path: str,
-        pattern: Optional[str] = None,
-        max_size: Optional[int] = None,
-    ):
-        from sglang.srt.model_loader.loader import ShardedStateLoader
-
-        logger.info(
-            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
-        )
-        ShardedStateLoader.save_model(self._mr.model, path, pattern, max_size)
 
     def check_weights(self, action: str, allow_quant_error: bool = False):
         return self._weight_checker.handle(
