@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mambaish_config,
+)
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     is_deepseek_dsa,
@@ -100,7 +104,7 @@ class ModelRunnerKVCacheMixin:
         rest_memory = available_gpu_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        if self.mambaish_config is not None:
+        if mambaish_config(self.model_config) is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget
@@ -124,7 +128,7 @@ class ModelRunnerKVCacheMixin:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
-        config = self.mambaish_config
+        config = mambaish_config(self.model_config)
         server_args = self.server_args
         assert config is not None
 
@@ -308,19 +312,21 @@ class ModelRunnerKVCacheMixin:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+        elif current_platform.is_out_of_tree() and not mambaish_config(
+            self.model_config
+        ):
             unsupported_pool_family = "out-of-tree platform KV pool"
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        elif self.server_args.attention_backend == "ascend" and not mambaish_config(
+            self.model_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
-        elif self.use_mla_backend and not self.mambaish_config:
+        elif self.use_mla_backend and not mambaish_config(self.model_config):
             unsupported_pool_family = "MLA KV pool"
         elif self.is_hybrid_swa:
             unsupported_pool_family = "SWA KV pool"
-        elif self.mambaish_config:
+        elif mambaish_config(self.model_config):
             unsupported_pool_family = "hybrid linear/Mamba KV pool"
         elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
             unsupported_pool_family = "FP4 MHA KV pool"
@@ -351,7 +357,7 @@ class ModelRunnerKVCacheMixin:
 
                 # Extra slots for pre-allocated requests
                 pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
-                if config := self.mambaish_config:
+                if config := mambaish_config(self.model_config):
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
@@ -383,7 +389,7 @@ class ModelRunnerKVCacheMixin:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
-            elif config := self.mambaish_config:
+            elif config := mambaish_config(self.model_config):
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -517,7 +523,9 @@ class ModelRunnerKVCacheMixin:
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+        elif current_platform.is_out_of_tree() and not mambaish_config(
+            self.model_config
+        ):
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
@@ -567,8 +575,8 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        elif self.server_args.attention_backend == "ascend" and not mambaish_config(
+            self.model_config
         ):
             if self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -668,7 +676,7 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
-        elif self.use_mla_backend and not self.mambaish_config:
+        elif self.use_mla_backend and not mambaish_config(self.model_config):
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
@@ -728,7 +736,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     **kwargs,
                 )
-            elif config := self.mambaish_config:
+            elif config := mambaish_config(self.model_config):
                 extra_args = {}
                 if self.use_mla_backend:
                     extra_args = {
@@ -827,7 +835,7 @@ class ModelRunnerKVCacheMixin:
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or is_dsv4_model
-                or self.hybrid_gdn_config is not None
+                or hybrid_gdn_config(self.model_config) is not None
             ):
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
@@ -999,7 +1007,7 @@ class ModelRunnerKVCacheMixin:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
-        if self.mambaish_config is not None:
+        if mambaish_config(self.model_config) is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
