@@ -20,6 +20,8 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
+BOOTSTRAP_CONTENTION_REQUESTS = 4
+BOOTSTRAP_CONTENTION_WORKERS = 4
 
 
 def rid_that_forces_retry(prefix: str) -> str:
@@ -55,6 +57,43 @@ class OptimisticPrefillRetryCounterMixin:
         after_retries = self._get_retry_counter()
         self.assertGreater(after_retries, before_retries)
         return result
+
+    def _run_under_bootstrap_contention(self, fn):
+        """Run fn while decode bootstrap is contended.
+        Optimistic prefill retry only happens when bootstrap is still pending
+        (pending_bootstrap=True). A single idle request completes bootstrap
+        instantly, so we need concurrent load to keep decode busy.
+        """
+
+        def submit_contention(executor):
+            return [
+                executor.submit(
+                    requests.post,
+                    self.lb_url + "/generate",
+                    json={
+                        "rid": f"bootstrap-contention-{uuid.uuid4().hex}",
+                        "text": "The capital of France is Paris. " * 400,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 64,
+                        },
+                    },
+                    timeout=120,
+                )
+                for _ in range(BOOTSTRAP_CONTENTION_REQUESTS)
+            ]
+
+        with ThreadPoolExecutor(max_workers=BOOTSTRAP_CONTENTION_WORKERS) as executor:
+            contention_futures = submit_contention(executor)
+            # Let contention requests reach decode bootstrap first.
+            time.sleep(1.0)
+            result = fn()
+            for future in as_completed(contention_futures, timeout=120):
+                try:
+                    future.result(timeout=0)
+                except Exception:
+                    pass
+            return result
 
 
 class TestOptimisticPrefill(
@@ -111,17 +150,20 @@ class TestOptimisticPrefill(
         request_id = rid_that_forces_retry("logprob-retry-")
         prompt = f"{request_id}: " + "The capital of France is Paris. " * 900
         j = self.assert_retry_counter_increases(
-            lambda: requests.post(
-                self.lb_url + "/generate",
-                json={
-                    "rid": request_id,
-                    "text": prompt,
-                    "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-                    "return_logprob": True,
-                    "return_input_logprob": True,
-                    "logprob_start_len": 0,
-                },
-            ).json()
+            lambda: self._run_under_bootstrap_contention(
+                lambda: requests.post(
+                    self.lb_url + "/generate",
+                    json={
+                        "rid": request_id,
+                        "text": prompt,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "return_logprob": True,
+                        "return_input_logprob": True,
+                        "logprob_start_len": 0,
+                    },
+                    timeout=120,
+                ).json()
+            )
         )
         completion_tokens = j["meta_info"]["completion_tokens"]
         input_logprobs = j["meta_info"]["input_token_logprobs"]

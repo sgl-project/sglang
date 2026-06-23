@@ -195,6 +195,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
 
+            hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
@@ -203,6 +204,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.model_runner.model_config.hf_config, "hot_vocab_size"
             ):  # llama_eagle3
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
+            elif hot_token_id is not None:
+                # FR-Spec: reduced vocab is injected via a late
+                # json_model_override_args, so hf_config lacks it; size from the head.
+                vocab_size = len(hot_token_id)
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
@@ -340,6 +345,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            # Padded tree width per req; drives the constant qo layout.
+            num_tokens_per_req=self.num_tokens_per_bs,
         )
 
         forward_batch = ForwardBatch(
@@ -544,6 +551,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        # Snapshot built -- the forward is done reading the shared pool. Publish
+        # a read-done event the scheduler's WAR barrier waits on.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs
