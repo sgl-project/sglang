@@ -82,7 +82,11 @@ const lookupData = {
       "scenario": "low-latency",
       "parameters": {
         "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "quantization": "modelopt_fp4",
         "tensor_parallel_size": 4,
+        "attention_backend": "trtllm_mla",
+        "moe_runner_backend": "flashinfer_trtllm",
+        "enable_flashinfer_allreduce_fusion": true,
         "cuda_graph_max_bs": 256,
         "max_running_requests": 256,
         "mem_fraction_static": 0.85,
@@ -99,7 +103,11 @@ const lookupData = {
       "scenario": "high-throughput",
       "parameters": {
         "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "quantization": "modelopt_fp4",
         "tensor_parallel_size": 4,
+        "attention_backend": "trtllm_mla",
+        "moe_runner_backend": "flashinfer_trtllm",
+        "enable_flashinfer_allreduce_fusion": true,
         "cuda_graph_max_bs": 256,
         "max_running_requests": 256,
         "mem_fraction_static": 0.85,
@@ -116,7 +124,11 @@ const lookupData = {
       "scenario": "low-latency",
       "parameters": {
         "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "quantization": "modelopt_fp4",
         "tensor_parallel_size": 8,
+        "attention_backend": "trtllm_mla",
+        "moe_runner_backend": "flashinfer_trtllm",
+        "enable_flashinfer_allreduce_fusion": true,
         "cuda_graph_max_bs": 256,
         "max_running_requests": 256,
         "mem_fraction_static": 0.85,
@@ -135,7 +147,11 @@ const lookupData = {
       "scenario": "high-throughput",
       "parameters": {
         "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "quantization": "modelopt_fp4",
         "tensor_parallel_size": 8,
+        "attention_backend": "trtllm_mla",
+        "moe_runner_backend": "flashinfer_trtllm",
+        "enable_flashinfer_allreduce_fusion": true,
         "cuda_graph_max_bs": 256,
         "max_running_requests": 256,
         "mem_fraction_static": 0.85,
@@ -502,12 +518,10 @@ const getAvailableGpuCounts = (hardware, quantization) => {
   return gpuCounts.length > 0 ? gpuCounts.sort((a, b) => a - b) : [8];
 };
 
-const generateCommandFromConfig = (config, options = {}) => {
+const generateCommandFromConfig = (config) => {
   if (!config) {
     return '# Error: Configuration not found';
   }
-
-  const { enableDpAttention = false } = options;
 
   let command = '';
   if (config.env_vars) {
@@ -519,16 +533,6 @@ const generateCommandFromConfig = (config, options = {}) => {
 
   for (const [key, value] of Object.entries(config)) {
     if (key === 'model_path' || key === 'env_vars') {
-      continue;
-    }
-
-    if (enableDpAttention && key === 'tensor_parallel_size') {
-      command +=
-        ` \\\n  --tensor-parallel-size ${value}` +
-        ` \\\n  --data-parallel-size ${value}` +
-        ' \\\n  --enable-dp-attention' +
-        ' \\\n  --enable-dp-attention-local-control-broadcast' +
-        ' \\\n  --enable-dp-lm-head';
       continue;
     }
 
@@ -545,12 +549,6 @@ const generateCommandFromConfig = (config, options = {}) => {
     }
 
     command += ` \\\n  --${flagName} ${value}`;
-  }
-
-  if (enableDpAttention) {
-    command +=
-      ' \\\n  --schedule-conservativeness 3.33' +
-      ' \\\n  --enable-prefill-delayer';
   }
 
   return command;
@@ -734,10 +732,7 @@ const resolveItems = (option, values) =>
 # This combination is not yet supported.`;
     }
 
-    const isB200Fp4 = vals.hardware === 'b200' && vals.quantization === 'fp4';
-    return generateCommandFromConfig(config, {
-      enableDpAttention: isB200Fp4,
-    });
+    return generateCommandFromConfig(config);
   };
 
   const command = generateCommand(values);
