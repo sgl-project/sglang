@@ -789,6 +789,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             prepare_model_input=prepare_model_input,
             progress_bar=progress_bar,
         )
+        # after clean latent is generated, fill the causal kv cache with a forward with clean latent as input
         self._update_causal_context_cache(
             batch,
             server_args,

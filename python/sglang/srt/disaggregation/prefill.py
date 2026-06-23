@@ -361,7 +361,10 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
-                if not self.finalize_bootstrap(req):
+                if should_force_retry(req):  # skip checking for testing
+                    if not self.ensure_metadata_buffer(req):
+                        continue  # no more metadata buffer
+                elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
@@ -511,9 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier on shared GPU buffers (req_to_token_pool / SWA mapping).
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()

@@ -31,6 +31,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -45,13 +46,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Chosen to
-/// span 0 → ~1k blocks: blocks are 32–64 tokens each, and our `MAX_CHAT_BODY_BYTES`
-/// cap (1 MiB ≈ 250 k tokens) implies an upper bound around 4–8 k blocks for
-/// a maximum-length context. The `+Inf` bucket catches everything beyond
-/// 1000.
+/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
+/// 32–64 tokens each, and the `MAX_CHAT_BODY_BYTES` cap bounds context length —
+/// putting the practical ceiling for a maximum-length context in the low tens
+/// of thousands of blocks. The ladder spans 0 → ~8k blocks at the resolution
+/// worth charting; the `+Inf` bucket catches the longer-context tail beyond
+/// 8000.
 const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
-    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0,
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
 ];
 
 /// Histogram bucket upper bounds (seconds) for
@@ -214,6 +216,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -427,6 +430,27 @@ impl MetricsRegistry {
         let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
+    ///
+    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
+    /// router's chat encoder failed: a chat request (`messages`) on a model with
+    /// a chat encoder that did not yield engine-equivalent ids. That request
+    /// silently fell back to engine-side tokenization, defeating the offload —
+    /// the actionable "offload broken" signal. It stays at ~0 in healthy
+    /// operation and climbs only on a real tokenizer problem; successful
+    /// forwards and expected omissions (tools / multimodal / thinking, whose
+    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
+    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    pub fn record_ingress_tokenize_error(&self, model_id: &str) {
+        let mut guard = self.ingress_tokenize_errors_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -686,6 +710,26 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // ingress_tokenize_errors_total
+        out.push_str(
+            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+        );
+        out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
+        let guard = self.ingress_tokenize_errors_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -751,6 +795,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -1034,6 +1079,36 @@ mod tests {
     }
 
     #[test]
+    fn ingress_tokenize_error_counter_increments_per_model() {
+        let reg = MetricsRegistry::new();
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("other");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="tiny"} 2"#),
+            "expected tiny=2; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
+            "expected other=1; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn ingress_tokenize_error_absent_until_recorded() {
+        // Healthy operation never calls the recorder, so no per-model series
+        // should exist — only the HELP/TYPE headers.
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        assert!(
+            !out.contains("sgl_router_ingress_tokenize_errors_total{"),
+            "no per-model series until an error is recorded; got:\n{out}",
+        );
+    }
+
+    #[test]
     fn label_values_escape_quotes_and_backslashes() {
         let reg = MetricsRegistry::new();
         reg.record_request(
@@ -1056,11 +1131,11 @@ mod tests {
     #[test]
     fn histogram_plus_inf_bucket_catches_overflow() {
         let reg = MetricsRegistry::new();
-        // 1001 is just above the last finite bucket (1000); it should land
+        // 8001 is just above the last finite bucket (8000); it should land
         // in +Inf only.
-        reg.observe_overlap_blocks("m", 1001);
+        reg.observe_overlap_blocks("m", 8001);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="1000"} 0"#));
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="8000"} 0"#));
         assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
     }
 }

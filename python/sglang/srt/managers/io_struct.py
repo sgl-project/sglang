@@ -1818,6 +1818,13 @@ class FreezeGCReq(BaseReq):
 
 
 @dataclass
+class ShutdownReq(BaseReq):
+    # Broadcast across TP ranks via the normal recv path, so all ranks break
+    # the scheduler loop on the same iteration.
+    pass
+
+
+@dataclass
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None

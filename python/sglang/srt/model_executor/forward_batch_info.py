@@ -1336,6 +1336,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
+            if getattr(spec_info, "draft_probs", None) is not None:
+                spec_info.draft_probs = self._pad_tensor_to_size(
+                    spec_info.draft_probs, bs
+                )
             if getattr(spec_info, "num_correct_drafts", None) is not None:
                 spec_info.num_correct_drafts = self._pad_tensor_to_size(
                     spec_info.num_correct_drafts, bs

@@ -455,6 +455,14 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
+        from sglang.srt.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        use_rejection_sampling = (
+            get_global_server_args().speculative_use_rejection_sampling
+        )
+
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -479,14 +487,34 @@ def eagle_sample(
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = torch.zeros_like(target_probs)
+        draft_probs = (
+            verify_input.draft_probs
+            if use_rejection_sampling
+            else torch.zeros_like(target_probs)
+        )
+        # Defense-in-depth behind the spec_hook startup allowlist: validate the
+        # actual kernel inputs (catches draft_probs plumbing regressions or a
+        # startup guard bypassed by a worker subclass) before the Triton kernel.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
+            raise ValueError(
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
+            )
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        tree_speculative_sampling_target_only(
+        sampling_fn = (
+            chain_speculative_sampling_triton
+            if use_rejection_sampling
+            else tree_speculative_sampling_target_only
+        )
+        sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
