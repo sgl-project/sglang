@@ -13,9 +13,6 @@
 # ==============================================================================
 """Python orchestrator over the Rust radix cache."""
 
-# TODO(Jialin): sanity_check() is a no-op stub — wire up a Rust-side LRU/tree
-# consistency check (the scheduler calls it on idle ticks).
-
 from __future__ import annotations
 
 import logging
@@ -56,9 +53,8 @@ _DEFAULT_INIT_NODE_CAPACITY = 1024
 
 
 class RustUnifiedRadixCache(BasePrefixCache):
-    """Route tree ops to the Rust radix cache; Python owns the pools.
-
-    `req.last_node` carries an opaque Rust NodeIdx, not a Python `TreeNode`.
+    """Orchestration layer: route tree ops to the Rust radix cache and process
+    the emitted deferred actions on the Python side; Python owns the pools.
     """
 
     def __init__(self, params: CacheInitParams):
@@ -215,7 +211,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
-        # TODO: reject non-aligned keys instead of trimming in the Rust wrapper.
         aligned_key = key.page_aligned(self.page_size)
         atom_count = len(aligned_key)
         token_ids = aligned_key.token_ids
@@ -302,7 +297,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_swa(freed)
         if self.supports_mamba():
             for freed in result.freed[mamba_idx]:
-                self.req_to_token_pool.mamba_pool.free(freed)
+                self.req_to_token_pool.mamba_allocator.free(freed)
 
         self.update_eviction_metrics(sum(result.evicted), start_time)
         return EvictResult(
@@ -335,8 +330,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
     def protected_size(self) -> int:
         return self._rust_radix.protected_token_size()
 
-    def total_size(self) -> int:
-        return self._rust_radix.total_token_size()
+    def total_size(self):
+        return self._rust_radix.total_size()
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
@@ -373,7 +368,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return self._rust_radix.mamba_total_size() if self.supports_mamba() else 0
 
     def sanity_check(self) -> None:
-        # No-op stub (see the module-level TODO).
+        # TODO(Jialin): no-op stub — wire up a Rust-side LRU/tree consistency
+        # check (the scheduler calls it on idle ticks).
         return None
 
     def supports_swa(self) -> bool:

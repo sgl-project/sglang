@@ -601,13 +601,18 @@ impl<K: ChildKeyType> RadixCache<K> {
         FullSlot::locked_size(&self.tree_node_pool)
     }
 
-    /// Total tokens (evictable + protected) across FULL and SWA components.
-    pub fn total_token_size(&self) -> usize {
-        let mut total = FullSlot::total_size(&self.tree_node_pool);
+    /// `(FULL tokens, auxiliary tokens)`, where aux is the SWA + Mamba values.
+    /// Mirrors `UnifiedRadixCache.total_size()`.
+    pub fn total_size(&self) -> (usize, usize) {
+        let full = FullSlot::total_size(&self.tree_node_pool);
+        let mut aux = 0;
         if self.has_swa_component {
-            total += SwaSlot::total_size(&self.tree_node_pool);
+            aux += SwaSlot::total_size(&self.tree_node_pool);
         }
-        total
+        if self.has_mamba_component {
+            aux += MambaSlot::total_size(&self.tree_node_pool);
+        }
+        (full, aux)
     }
 
     /// Total Mamba slots (evictable + protected).

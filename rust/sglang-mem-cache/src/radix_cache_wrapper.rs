@@ -249,8 +249,8 @@ impl RustPageRadixCacheWrapper {
         self.inner.protected_token_size()
     }
 
-    fn total_token_size(&self) -> usize {
-        self.inner.total_token_size()
+    fn total_size(&self) -> (usize, usize) {
+        self.inner.total_size()
     }
 
     fn swa_evictable_token_size(&self) -> usize {
@@ -405,8 +405,8 @@ impl RustBigramRadixCacheWrapper {
         self.inner.protected_token_size()
     }
 
-    fn total_token_size(&self) -> usize {
-        self.inner.total_token_size()
+    fn total_size(&self) -> (usize, usize) {
+        self.inner.total_size()
     }
 
     fn swa_evictable_token_size(&self) -> usize {
