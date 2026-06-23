@@ -1598,6 +1598,12 @@ class Scheduler(
                 self.invariant_checker.self_check_during_busy()
 
     def _has_pending_spec_grammar_result(self) -> bool:
+        """Return whether a pending spec-grammar result must be drained early.
+
+        Processing this result can mark requests as finished and release their
+        request-pool state. Drain it before preparing the next decode batch so
+        scheduling observes the latest request state.
+        """
         return (
             self.last_batch is not None
             and len(self.result_queue) > 0
