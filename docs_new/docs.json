@@ -707,11 +707,11 @@
                   "docs/basic_usage/openai_api_embeddings"
                 ]
               },
+              "docs/basic_usage/anthropic_api",
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params",
-              "docs/basic_usage/aws_sagemaker"
+              "docs/basic_usage/sampling_params"
             ]
           },
           {
@@ -720,7 +720,6 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
-              "docs/advanced_features/object_storage",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
@@ -756,6 +755,8 @@
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
+              "docs/advanced_features/model_loading",
+              "docs/advanced_features/object_storage",
               "docs/advanced_features/checkpoint_engine",
               "docs/advanced_features/sglang_for_rl"
             ]
@@ -832,13 +833,14 @@
               "docs/references/production_metrics",
               "docs/references/production_request_trace",
               {
-                "group": "Multi-Node Deployment",
+                "group": "Deployment",
                 "pages": [
                   "docs/references/multi_node_deployment/multi_node_index",
                   "docs/references/multi_node_deployment/multi_node",
                   "docs/references/multi_node_deployment/deploy_on_k8s",
                   "docs/references/multi_node_deployment/lws_pd/lws_pd_deploy",
-                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd"
+                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd",
+                  "docs/basic_usage/aws_sagemaker"
                 ]
               },
               "docs/references/custom_chat_template",
@@ -876,6 +878,24 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
+                  {
+                    "group": "Model Tutorials",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3-8b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_32b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_27b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct"
+                    ]
+                  },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
                   "docs/hardware-platforms/ascend-npus/ascend_npu",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
