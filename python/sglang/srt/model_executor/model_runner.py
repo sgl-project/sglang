@@ -726,22 +726,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
-        # Fail-closed runtime guard: when a draft worker is configured to
-        # participate in routed-experts capture (R3), every MoE TopK on the
-        # draft model must carry allow_routed_experts_capture=False. An
-        # un-opted-out draft MoE layer raises here rather than silently
-        # polluting the target's R3 buffer at runtime.
+        # R3 routed-experts capture is target-only: opt every draft-side MoE
+        # TopK out so a draft can never write the target's capture buffer. Runs
+        # before backend/graph init, regardless of whether capture is enabled.
+        # HashTopK is intentionally untouched -- no topk_config, never calls the
+        # R3 capturer.
         if self.is_draft_worker:
-            from sglang.srt.state_capturer.draft_guard import (
-                check_draft_capture_optout,
+            from sglang.srt.state_capturer.routed_experts import (
+                disable_routed_experts_capture_for_draft,
             )
 
-            check_draft_capture_optout(
-                self.model,
-                routed_experts_capture_enabled=bool(
-                    getattr(self.server_args, "enable_return_routed_experts", False)
-                ),
-            )
+            disable_routed_experts_capture_for_draft(self.model)
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -991,6 +986,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
+        if self.is_draft_worker:
+            # R3 routed-experts capture is target-only. A draft worker shares
+            # the process with its target and is constructed after it, so it
+            # must not replace the target's global capturer (which is sized
+            # from the target model_config). In a draft-only process the
+            # global stays None, which is correct for target-only capture.
+            return
+
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -3670,7 +3673,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        if (experts_capturer := get_global_experts_capturer()) is not None:
+        # R3 routed-experts capture is target-only: a draft worker shares the
+        # process and reads the target's global capturer, so it must not run
+        # on_forward_end (that would finalize device->host copies into the
+        # target's R3 host cache keyed by the draft's batch).
+        if not self.is_draft_worker and (
+            experts_capturer := get_global_experts_capturer()
+        ) is not None:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,

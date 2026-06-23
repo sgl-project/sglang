@@ -181,8 +181,6 @@ class BailingMoESparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
-        *,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -250,7 +248,6 @@ class BailingMoESparseMoeBlock(nn.Module):
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            allow_routed_experts_capture=not is_nextn,
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
@@ -568,8 +565,6 @@ class BailingMoEBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        *,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -590,7 +585,7 @@ class BailingMoEBlock(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=is_nextn
+            config, layer_id=layer_id, is_nextn=False
         )
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False
@@ -616,7 +611,6 @@ class BailingMoEBlock(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
-                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():

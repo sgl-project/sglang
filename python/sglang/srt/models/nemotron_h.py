@@ -154,8 +154,6 @@ class NemotronHMoE(nn.Module):
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        *,
-        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
 
@@ -209,7 +207,6 @@ class NemotronHMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            allow_routed_experts_capture=allow_routed_experts_capture,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -401,8 +398,6 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        *,
-        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
@@ -413,7 +408,6 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
-            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)

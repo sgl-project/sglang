@@ -140,7 +140,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
-            allow_routed_experts_capture=False,
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
