@@ -383,6 +383,102 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("https://docs.sglang.ai", tool_message["content"])
         self.assertIn("Anthropic API notes", tool_message["content"])
 
+    def test_text_before_tool_result_keeps_tool_adjacent(self):
+        # Adjacency is the in-distribution layout: expect [assistant, tool, user].
+        request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "read_file",
+                                "input": {"path": "/tmp/f"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "summarize the log below"},
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_1",
+                                "content": "ERROR: disk full",
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+
+        messages = (
+            self._serving()
+            ._convert_to_chat_completion_request(request)
+            .model_dump()["messages"]
+        )
+
+        self.assertEqual([m["role"] for m in messages], ["assistant", "tool", "user"])
+        self.assertEqual(messages[1]["tool_call_id"], "call_1")
+        self.assertEqual(messages[1]["content"], "ERROR: disk full")
+        self.assertEqual(messages[2]["content"], "summarize the log below")
+
+    def test_image_before_tool_result_keeps_tool_adjacent(self):
+        # Multimodal: an image before the tool_result also flushes after the
+        # tool (the list-content branch), keeping tool result and call adjacent.
+        request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "screenshot",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_1",
+                                "content": "captured",
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+
+        messages = (
+            self._serving()
+            ._convert_to_chat_completion_request(request)
+            .model_dump()["messages"]
+        )
+
+        self.assertEqual([m["role"] for m in messages], ["assistant", "tool", "user"])
+        self.assertEqual(messages[1]["content"], "captured")
+        self.assertIsInstance(messages[2]["content"], list)
+        self.assertEqual(messages[2]["content"][0]["type"], "image_url")
+
     def test_builtin_web_search_tool_without_schema_is_skipped(self):
         request = AnthropicMessagesRequest.model_validate(
             {
