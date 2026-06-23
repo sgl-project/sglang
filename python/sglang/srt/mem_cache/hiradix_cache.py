@@ -198,18 +198,17 @@ class HiRadixCache(RadixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _reap_completed_async_work(self):
+    def _drain_async_work(self):
         """
-        Poll outstanding async work and reap completed ones.
+        Block until all outstanding async sends are consumed, then clear.
 
-        Must be called in the scheduler thread.
+        Called at the start of each event round, so work_list holds the sends
+        accumulated since the last round. This bounds it and applies
+        backpressure when a downstream PP rank lags. Scheduler thread only.
         """
-        count = 0
-        while count < len(self.work_list) and self.work_list[count].is_completed():
-            count += 1
-        if count > 0:
-            logger.debug(f"Reap {count} completed async work")
-            self.work_list = self.work_list[count:]
+        for work in self.work_list:
+            work.wait()
+        self.work_list.clear()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -1288,16 +1287,16 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
+        # Reap the previous round's PP-sync sends before issuing new ones.
+        self._drain_async_work()
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
-        self._reap_completed_async_work()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
-        self._reap_completed_async_work()
 
     def drain_storage_control_queues(self):
         """
