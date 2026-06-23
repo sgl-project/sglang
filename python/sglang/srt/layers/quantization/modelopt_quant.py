@@ -284,7 +284,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
     ):
         super().__init__()
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
@@ -2547,11 +2547,11 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer) -> None:
         # Wrap the pre-quantized fp8 weight + E8M0 scale as a torchao MXTensor carrying
         # the dynamic-MXFP8 activation recipe. No bf16 dequant: the weight stays fp8.
+        from torchao.prototype.mx_formats.config import ScaleCalculationMode
         from torchao.prototype.mx_formats.mx_tensor import (
             MXTensor,
             QuantizeTensorToMXKwargs,
         )
-        from torchao.prototype.mx_formats.config import ScaleCalculationMode
         from torchao.quantization.quantize_.common.kernel_preference import (
             KernelPreference,
         )

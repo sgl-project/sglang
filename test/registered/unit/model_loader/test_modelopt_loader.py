@@ -8,15 +8,18 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.linear import WEIGHT_LOADER_V2_SUPPORTED, ReplicatedLinear
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptMixedPrecisionConfig,
+    ModelOptMxfp8LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -626,6 +629,48 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_mixed_precision_with_microscaling_layer_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3"
+        model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+
+        for quant_algo in ("MXFP8", "NVFP4", "MXFP4"):
+            with self.subTest(quant_algo=quant_algo):
+                result = model_config._parse_modelopt_quant_config(
+                    {
+                        "quantization": {
+                            "quant_algo": "MIXED_PRECISION",
+                            "quantized_layers": {
+                                "model.layers.0.mlp.down_proj": {
+                                    "quant_algo": quant_algo,
+                                },
+                            },
+                        }
+                    }
+                )
+
+                self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_mixed_precision_fp8_only_keeps_w4afp8_route(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3"
+        model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.down_proj": {"quant_algo": "FP8"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "w4afp8")
+
     def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
@@ -687,6 +732,54 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
         )
+
+    def test_mixed_precision_mxfp8_linear_registers_expected_weights(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.down_proj": {"quant_algo": "MXFP8"},
+                },
+            }
+        )
+
+        layer = ReplicatedLinear(
+            input_size=64,
+            output_size=16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+            prefix="model.layers.0.mlp.down_proj",
+        )
+
+        self.assertIsInstance(layer.quant_method, ModelOptMxfp8LinearMethod)
+        self.assertEqual(layer.weight.shape, (16, 64))
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.weight_scale.shape, (16, 2))
+        self.assertEqual(layer.weight_scale.dtype, torch.uint8)
+
+    def test_mixed_precision_mxfp8_requires_block_aligned_input(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.down_proj": {"quant_algo": "MXFP8"},
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "divisible by 32"):
+            ReplicatedLinear(
+                input_size=65,
+                output_size=16,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                prefix="model.layers.0.mlp.down_proj",
+            )
+
+    def test_mxfp8_linear_uses_v2_weight_loader(self):
+        self.assertIn("ModelOptMxfp8LinearMethod", WEIGHT_LOADER_V2_SUPPORTED)
 
 
 if __name__ == "__main__":
