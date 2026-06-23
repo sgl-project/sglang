@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -23,16 +24,15 @@ from sglang.srt.configs import (
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.model_config import ModelConfig
 
-_UNSET: Any = object()
-
-_linear_attn_registry_cache: Any = _UNSET
+_linear_attn_registry_cache: WeakKeyDictionary[ModelConfig, Any] = WeakKeyDictionary()
 
 
 def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
-    global _linear_attn_registry_cache
-    if _linear_attn_registry_cache is _UNSET:
-        _linear_attn_registry_cache = get_linear_attn_config(model_config.hf_config)
-    return _linear_attn_registry_cache
+    if model_config not in _linear_attn_registry_cache:
+        _linear_attn_registry_cache[model_config] = get_linear_attn_config(
+            model_config.hf_config
+        )
+    return _linear_attn_registry_cache[model_config]
 
 
 def qwen3_next_config(model_config: ModelConfig):
