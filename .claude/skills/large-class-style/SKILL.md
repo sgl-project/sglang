@@ -15,13 +15,19 @@ Conventions for SGLang's three large classes:
 
 Some core files are **frozen** while they are being decomposed: their internal logic must not grow. A frozen file may be touched only to construct, wire, and delegate to a collaborator — never to add logic.
 
-Put any new logic in a **collaborator class in its own module**. The frozen file then only references that collaborator, in the three ways below.
+### Why
+
+- The file is a god class being decomposed; freezing stops it accreting more logic while that work is in flight.
+- Forcing new logic into collaborator classes (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
+- Without a freeze, features land in the god class faster than it can be split, so it never shrinks.
 
 ### Frozen files
 
 - `python/sglang/srt/model_executor/model_runner.py`
 
 ### Allowed edits
+
+Put any new logic in a **collaborator class in its own module**. The frozen file then references it in only these three ways:
 
 1. **Construct** — a short `init_<thing>` helper whose body is essentially a single construction (follows §2); use `maybe_init_<thing>` with a one-line gate when construction is conditional.
 2. **Wire** — a short call that runs the helper from the orchestrator (e.g. in `__init__`).
