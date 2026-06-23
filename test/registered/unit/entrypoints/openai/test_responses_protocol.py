@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from utils import make_serving  # noqa: F401 — bootstrap import
@@ -108,6 +109,69 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
                 default_params={"json_schema": '{"type": "object"}'},
                 tool_call_constraint=("json_schema", {"type": "object"}),
             )
+
+    def test_structured_text_format_maps_to_json_schema_sampling_param(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+            "additionalProperties": False,
+        }
+        request = ResponsesRequest(
+            model="x",
+            input="Invent a random fictional character.",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "person",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            store=False,
+        )
+
+        params = request.to_sampling_params(default_max_tokens=128, default_params={})
+
+        self.assertEqual(json.loads(params["json_schema"]), schema)
+
+    def test_text_json_object_maps_to_json_schema_sampling_param(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            text={"format": {"type": "json_object"}},
+            store=False,
+        )
+        params = request.to_sampling_params(default_max_tokens=128, default_params={})
+        self.assertEqual(params["json_schema"], '{"type": "object"}')
+
+    def test_text_format_conflicts_with_tool_constraint(self):
+        request = ResponsesRequest(
+            model="x",
+            input="call the tool",
+            text={"format": {"type": "json_object"}},
+            store=False,
+        )
+        with self.assertRaises(ValueError):
+            request.to_sampling_params(
+                default_max_tokens=128,
+                default_params={},
+                tool_call_constraint=("json_schema", {"type": "object"}),
+            )
+
+    def test_responses_reasoning_effort_none_disables_thinking(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            reasoning={"effort": "none"},
+            store=False,
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
     def test_structural_tag_with_model_dump(self):
         class _FakeStructuralTag:
