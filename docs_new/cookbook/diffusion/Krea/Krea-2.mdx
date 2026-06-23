@@ -88,8 +88,6 @@ sglang generate --model-path krea/Krea-2-Turbo \
 
 ### 4.2 Advanced Usage
 
-#### 4.2.1 CPU Offload
-
 Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GPUs you can keep less of it resident:
 
 - `--dit-layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).
@@ -99,28 +97,6 @@ Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GP
 - `--pin-cpu-memory`: pin host memory for offload. Add only as a temporary workaround if you hit `CUDA error: invalid argument`.
 
 On large-VRAM GPUs (e.g. H200), keep everything resident (offloads off) for the fastest latency.
-
-#### 4.2.2 Style LoRAs
-
-Krea publishes diffusers-format style LoRAs for Krea-2-Turbo. Load one with `--lora-path` (a HuggingFace repo id or local path) and `--lora-weight-name`, set its strength with `--lora-scale` (recommended 0.8-1.0), and include the LoRA's **trigger phrase** in the prompt.
-
-| LoRA | Trigger phrase | Scale |
-| --- | --- | --- |
-| `krea/Krea-2-LoRA-coolblue` | `Teal watercolor illustration style` | 0.8 |
-| `krea/Krea-2-LoRA-warmpastel` | `Muted minimalist sketch style` | 0.8 |
-| `krea/Krea-2-LoRA-plasmoid` | `Ethereal shimmering light style` | 0.8 |
-| `krea/Krea-2-LoRA-darkbrush` | `monochrome ink wash style` | 1.0 |
-
-```bash Command
-sglang generate --model-path krea/Krea-2-Turbo \
-    --lora-path krea/Krea-2-LoRA-coolblue --lora-weight-name coolblue.safetensors --lora-scale 0.8 \
-    --prompt "A deer grazing in the forest, Teal watercolor illustration style" \
-    --num-inference-steps 8 --guidance-scale 0.0 --height 1024 --width 1024 --save-output
-```
-
-The model-card previews are rendered on Turbo at 8 steps with `guidance_scale 0.0`. The same `--lora-path`/`--lora-weight-name`/`--lora-scale` flags also apply to `sglang serve`.
-
-> **Note:** LoRA requires the DiT to be GPU-resident or streamed with `--dit-layerwise-offload`; it is not compatible with full `--dit-cpu-offload` (the offloaded base weights are not streamed for LoRA-wrapped layers). On memory-constrained GPUs use `--dit-layerwise-offload true`.
 
 ## 5. Benchmark
 
