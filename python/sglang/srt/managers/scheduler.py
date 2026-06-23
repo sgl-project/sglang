@@ -1200,28 +1200,6 @@ class Scheduler(
                 scheduler=self,
             )
 
-    def _register_d2p_endpoint(self):
-        """Register the D2P receiver endpoint with the bootstrap server."""
-        import requests as _requests
-
-        bootstrap_host = self.server_args.host
-        bootstrap_port = self.server_args.disaggregation_bootstrap_port
-        url = f"http://{bootstrap_host}:{bootstrap_port}/d2p_endpoint"
-        try:
-            resp = _requests.put(
-                url,
-                json={"endpoint": self.d2p_receiver.endpoint},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                logger.info(
-                    f"D2P endpoint registered: {self.d2p_receiver.host_port}"
-                )
-            else:
-                logger.warning(f"D2P endpoint registration failed: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"D2P endpoint registration failed: {e}")
-
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
