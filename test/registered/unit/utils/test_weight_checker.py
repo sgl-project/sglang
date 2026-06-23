@@ -28,19 +28,19 @@ from sglang.srt.utils.weight_checker import (
     ChecksumInfo,
     ParallelismInfo,
     WeightChecker,
-    _build_quant_plan,
-    _check_tensors,
+    _build_entries,
+    _build_reference_plan,
+    _compare_entries,
     _hash_tensor,
     _is_non_persistent_buffer_name,
-    _postprocess_tensors,
     _random_like,
 )
 from sglang.srt.utils.weight_checker_comparator import (
+    ComparableWeight,
     Fp8BlockReference,
     RawReference,
-    ReferenceWeight,
     _compare_references,
-    select_quantization_method,
+    select_reference_weight,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -53,11 +53,11 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 # ---------------------------------------------------------------------------
 
 
-Entry = Tuple[str, bool, ReferenceWeight]
+Entry = Tuple[str, bool, ComparableWeight]
 
 
 def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:
-    """Compare two streams of (name, should_compare, ReferenceWeight)."""
+    """Compare two streams of (name, should_compare, ComparableWeight)."""
     actual_list: List[Entry] = list(actual)
     expected_list: List[Entry] = list(expected)
     assert len(actual_list) == len(
@@ -93,7 +93,7 @@ def _build_fp8_quant_pair(device: str = "cuda"):
     """Construct a real fp8-quantized weight + matching fp32 + ue8m0-packed scales.
 
     Returns (qweight, sf_fp32, sf_packed_int32) so callers can pick which scale dtype
-    drives the _postprocess_tensors branch under test.
+    drives the _build_entries branch under test.
     """
     weight_bf16 = torch.randn((256, 128), dtype=torch.bfloat16, device=device)
     block_size = [128, 128]
@@ -110,7 +110,7 @@ def _build_fp8_quant_pair(device: str = "cuda"):
 
 
 class _TinyModel(nn.Module):
-    """Mimics the buffer naming patterns _reset_tensors / _postprocess_tensors care about."""
+    """Mimics the buffer naming patterns _reset_tensors / _build_entries care about."""
 
     def __init__(self):
         super().__init__()
@@ -208,7 +208,7 @@ class TestRandomLike(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _postprocess_tensors
+# _build_entries
 # ---------------------------------------------------------------------------
 
 
@@ -221,7 +221,7 @@ class TestPostprocessTensors(CustomTestCase):
         b = torch.randn(4)
         raw = {"a.weight": a, "b.bias": b}
         _assert_entries_close(
-            _postprocess_tensors(raw, set()),
+            _build_entries(raw, set()),
             [("a.weight", True, RawReference(a)), ("b.bias", True, RawReference(b))],
         )
 
@@ -229,7 +229,7 @@ class TestPostprocessTensors(CustomTestCase):
         w = torch.randn(4)
         raw = {"x.weight": w}
         _assert_entries_close(
-            _postprocess_tensors(raw, set()), [("x.weight", True, RawReference(w))]
+            _build_entries(raw, set()), [("x.weight", True, RawReference(w))]
         )
 
     # --- non-persistent buffer skip ---
@@ -242,7 +242,7 @@ class TestPostprocessTensors(CustomTestCase):
             "model.layers.0.weight": plain,
         }
         _assert_entries_close(
-            _postprocess_tensors(raw, set()),
+            _build_entries(raw, set()),
             [
                 ("model.rotary_emb.cos_sin_cache", False, RawReference(cache)),
                 ("model.layers.0.weight", True, RawReference(plain)),
@@ -252,14 +252,14 @@ class TestPostprocessTensors(CustomTestCase):
     def test_skips_inv_freq_substring(self):
         t = torch.randn(4)
         _assert_entries_close(
-            _postprocess_tensors({"model.rotary_emb.inv_freq": t}, set()),
+            _build_entries({"model.rotary_emb.inv_freq": t}, set()),
             [("model.rotary_emb.inv_freq", False, RawReference(t))],
         )
 
     def test_skips_weight_fp32_substring(self):
         t = torch.randn(4)
         _assert_entries_close(
-            _postprocess_tensors({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
+            _build_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
             [("model.layers.0.mlp.gate._weight_fp32", False, RawReference(t))],
         )
 
@@ -267,7 +267,7 @@ class TestPostprocessTensors(CustomTestCase):
         # Pattern can appear anywhere in the name, not just at the end.
         t = torch.randn(4)
         _assert_entries_close(
-            _postprocess_tensors({"weird.cos_sin_cache.foo.bar": t}, set()),
+            _build_entries({"weird.cos_sin_cache.foo.bar": t}, set()),
             [("weird.cos_sin_cache.foo.bar", False, RawReference(t))],
         )
 
@@ -280,7 +280,7 @@ class TestPostprocessTensors(CustomTestCase):
         ref = Fp8BlockReference(qweight, sf_packed_int32)
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
-            _postprocess_tensors(raw, set(), plan),
+            _build_entries(raw, set(), plan),
             [("x.weight", True, ref)],
         )
 
@@ -296,7 +296,7 @@ class TestPostprocessTensors(CustomTestCase):
         ref = Fp8BlockReference(qweight, sf_fp32)
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
-            _postprocess_tensors(raw, set(), plan),
+            _build_entries(raw, set(), plan),
             [
                 ("x.weight", True, ref),
                 ("y.bias", True, RawReference(bias)),
@@ -308,13 +308,13 @@ class TestPostprocessTensors(CustomTestCase):
         # through as a normal entry with should_compare=True.
         s = torch.zeros(1, 1, dtype=torch.int32)
         _assert_entries_close(
-            _postprocess_tensors({"x.weight_scale_inv": s}, set()),
+            _build_entries({"x.weight_scale_inv": s}, set()),
             [("x.weight_scale_inv", True, RawReference(s))],
         )
 
 
 # ---------------------------------------------------------------------------
-# _check_tensors  (implementation moves both sides via .cuda())
+# _compare_entries  (implementation moves both sides via .cuda())
 # ---------------------------------------------------------------------------
 
 
@@ -330,13 +330,13 @@ class TestCheckTensors(CustomTestCase):
             ("a", True, RawReference(t.clone())),
             ("b", True, RawReference(t.clone())),
         ]
-        _check_tensors(expect_tensors=expect, actual_tensors=actual)
+        _compare_entries(expect_entries=expect, actual_entries=actual)
 
     def test_raises_when_should_compare_true_and_diff(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", True, RawReference(torch.zeros(2, 2)))]
         with self.assertRaises(Exception) as ctx:
-            _check_tensors(expect_tensors=expect, actual_tensors=actual)
+            _compare_entries(expect_entries=expect, actual_entries=actual)
         msg = str(ctx.exception)
         self.assertIn("name=a", msg)
         self.assertIn("max_abs_err", msg)
@@ -345,26 +345,26 @@ class TestCheckTensors(CustomTestCase):
         # should_compare=False -> diff is logged, not raised.
         expect = [("a", False, RawReference(torch.ones(2, 2)))]
         actual = [("a", False, RawReference(torch.zeros(2, 2)))]
-        _check_tensors(expect_tensors=expect, actual_tensors=actual)
+        _compare_entries(expect_entries=expect, actual_entries=actual)
 
     def test_asserts_on_name_mismatch(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("b", True, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
-            _check_tensors(expect_tensors=expect, actual_tensors=actual)
+            _compare_entries(expect_entries=expect, actual_entries=actual)
 
     def test_asserts_on_should_compare_mismatch(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", False, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
-            _check_tensors(expect_tensors=expect, actual_tensors=actual)
+            _compare_entries(expect_entries=expect, actual_entries=actual)
 
     def test_chunked_raw_stats_match_unchunked(self):
         expect = [("a", True, RawReference(torch.zeros(10)))]
         actual = [("a", True, RawReference(torch.arange(10.0)))]
         with patch("sglang.srt.utils.weight_checker_comparator._CHUNK_NUMEL", 3):
             with self.assertRaises(Exception) as ctx:
-                _check_tensors(expect_tensors=expect, actual_tensors=actual)
+                _compare_entries(expect_entries=expect, actual_entries=actual)
         self.assertIn("max_abs_err=9.0", str(ctx.exception))
         self.assertIn("mean_abs_err=4.5", str(ctx.exception))
 
@@ -376,7 +376,7 @@ class TestCheckTensors(CustomTestCase):
         ]
         actual = [("a", True, RawReference(t.clone()))]
         with self.assertRaises(ValueError):
-            _check_tensors(expect_tensors=expect, actual_tensors=actual)
+            _compare_entries(expect_entries=expect, actual_entries=actual)
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +395,7 @@ class TestQuantUlp(CustomTestCase):
             # (the largest magnitude reuses the spacing below it).
             spacing = magnitudes[1:] - magnitudes[:-1]
             expected = torch.cat([spacing, spacing[-1:]])
-            got = ReferenceWeight._quant_ulp(magnitudes.to(dtype))
+            got = ComparableWeight._quant_ulp(magnitudes.to(dtype))
             torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
@@ -482,7 +482,7 @@ class TestCompareQuantPair(CustomTestCase):
         e_q, e_s = self._quantize_partial(weight, 1.0)
         a_q, a_s = self._quantize_partial(weight, 1.001)
         self.assertEqual(list(e_s.shape), [4, 2])  # ceil(448/128)=4, 256/128=2
-        self.assertEqual(Fp8BlockReference._block_size_of(e_q, e_s), [128, 128])
+        self.assertEqual(Fp8BlockReference._infer_block_size(e_q, e_s), [128, 128])
         equal, _, _, num_exceed = _compare_quant_pair(e_q, e_s, a_q, a_s)
         self.assertFalse(equal)
         self.assertEqual(num_exceed, 0)
@@ -508,9 +508,9 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
 
     def _check(self, expect_raw, actual_raw, **kwargs):
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
-        _check_tensors(
-            expect_tensors=_postprocess_tensors(expect_raw, set(), plan),
-            actual_tensors=_postprocess_tensors(actual_raw, set(), plan),
+        _compare_entries(
+            expect_entries=_build_entries(expect_raw, set(), plan),
+            actual_entries=_build_entries(actual_raw, set(), plan),
             **kwargs,
         )
 
@@ -536,40 +536,40 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", True, RawReference(torch.ones(2, 2) + 0.5))]
         with self.assertRaises(Exception):
-            _check_tensors(
-                expect_tensors=expect, actual_tensors=actual, allow_quant_error=True
+            _compare_entries(
+                expect_entries=expect, actual_entries=actual, allow_quant_error=True
             )
 
 
 # ---------------------------------------------------------------------------
-# select_quantization_method
+# select_reference_weight
 # ---------------------------------------------------------------------------
 
 
-class TestSelectQuantizationMethod(CustomTestCase):
+class TestSelectReferenceWeight(CustomTestCase):
 
     def test_returns_none_when_not_a_quant_method(self):
-        self.assertIsNone(select_quantization_method(None))
+        self.assertIsNone(select_reference_weight(None))
 
     def test_returns_none_for_raw_safe_method(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         # unquantized / int4 / mxfp8 all route to raw (None).
         fake = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
-        self.assertIsNone(select_quantization_method(fake))
+        self.assertIsNone(select_reference_weight(fake))
 
     def test_raises_on_nvfp4(self):
         from sglang.srt.layers.quantization.modelopt_quant import (
             ModelOptFp4LinearMethod,
         )
 
-        # nvfp4 has no ReferenceWeight yet -> must raise, not silently raw-compare.
+        # nvfp4 has no ComparableWeight yet -> must raise, not silently raw-compare.
         fake = ModelOptFp4LinearMethod.__new__(ModelOptFp4LinearMethod)
         with self.assertRaises(NotImplementedError):
-            select_quantization_method(fake)
+            select_reference_weight(fake)
 
 
-class TestBuildQuantPlan(CustomTestCase):
+class TestBuildReferencePlan(CustomTestCase):
 
     def test_fp8_block_module_pairs_weight_and_scale(self):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -587,12 +587,12 @@ class TestBuildQuantPlan(CustomTestCase):
             "weight_scale_inv", nn.Parameter(torch.zeros(1, 1), requires_grad=False)
         )
         self.assertEqual(
-            _build_quant_plan(model),
+            _build_reference_plan(model),
             {"proj.weight": (Fp8BlockReference, "proj.weight_scale_inv")},
         )
 
     def test_no_quant_method_yields_empty_plan(self):
-        self.assertEqual(_build_quant_plan(_TinyModel()), {})
+        self.assertEqual(_build_reference_plan(_TinyModel()), {})
 
 
 # ---------------------------------------------------------------------------

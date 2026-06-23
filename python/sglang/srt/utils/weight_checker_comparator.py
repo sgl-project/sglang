@@ -16,8 +16,8 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 _CHUNK_NUMEL = 64 * 1024 * 1024
 
 
-class ReferenceWeight:
-    """Base class to get reference weight for all precisions."""
+class ComparableWeight:
+    """Base class: a weight in comparable (dequantized) form, for all precisions."""
 
     @staticmethod
     def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
@@ -38,7 +38,7 @@ class ReferenceWeight:
         raise NotImplementedError
 
 
-class Fp8BlockReference(ReferenceWeight):
+class Fp8BlockReference(ComparableWeight):
     """Deepseek-style FP8 quantization."""
 
     def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
@@ -55,7 +55,7 @@ class Fp8BlockReference(ReferenceWeight):
         return w_s.to(torch.float32)
 
     @staticmethod
-    def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
+    def _infer_block_size(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
         k, s_k = w_q.shape[-1], w_s.shape[-1]
         assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
         block = k // s_k
@@ -73,12 +73,12 @@ class Fp8BlockReference(ReferenceWeight):
                 r1 = min(r0 + rows, n)
                 yield q3[b, r0:r1], s3[b, r0 // block_n : -(-r1 // block_n)]
 
-    def _normalized(self):
+    def _scale_and_block_size(self):
         s = self._normalize_scale(self.w_q, self.w_s)
-        return s, self._block_size_of(self.w_q, s)
+        return s, self._infer_block_size(self.w_q, s)
 
     def iter_chunks(self):
-        s, block_size = self._normalized()
+        s, block_size = self._scale_and_block_size()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
             yield (
@@ -89,11 +89,11 @@ class Fp8BlockReference(ReferenceWeight):
             )
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-        s, block_size = self._normalized()
+        s, block_size = self._scale_and_block_size()
         return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
 
 
-class RawReference(ReferenceWeight):
+class RawReference(ComparableWeight):
     """Unquantized tensor: identity dequant, exact (no-tolerance) compare."""
 
     def __init__(self, tensor: torch.Tensor):
@@ -112,9 +112,9 @@ class RawReference(ReferenceWeight):
 
 
 def _compare_references(
-    expect: ReferenceWeight, actual: ReferenceWeight
+    expect: ComparableWeight, actual: ComparableWeight
 ) -> Tuple[bool, float, float, int]:
-    """Chunked compare of two ReferenceWeights in dequant space. Returns
+    """Chunked compare of two ComparableWeights in dequant space. Returns
     (equal, max_abs_err, mean_abs_err, num_exceed); num_exceed counts elements
     off by more than the combined per-side tolerance."""
     equal = True
@@ -140,14 +140,14 @@ def _compare_references(
     return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
 
 
-def select_quantization_method(quant_method) -> Optional[type]:
-    """Single router: map a module's quant_method to a comparison strategy.
+def select_reference_weight(quant_method) -> Optional[type]:
+    """Single router: map a module's quant_method to its ComparableWeight subclass.
 
     - fp8 block quant -> Fp8BlockReference: its scale is requantized to ue8m0 on
       load, so the same weight lands as two different fp8 encodings; compare in
       dequant space with ULP tolerance.
     - nvfp4 -> raise: e4m3 fractional block scale + max-recomputed global scale is
-      likewise non-bit-exact, but has no ReferenceWeight yet.
+      likewise non-bit-exact, but has no ComparableWeight yet.
     - everything else -> None (raw exact compare): int4 (fixed integer scale) and
       mxfp8/mxfp4 (e8m0, same quantizer on both sides, no load-time requant) all
       transfer bit-exact.
@@ -160,6 +160,6 @@ def select_quantization_method(quant_method) -> Optional[type]:
         return Fp8BlockReference
     if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
         raise NotImplementedError(
-            f"weight checker has no ReferenceWeight for {type(quant_method).__name__}"
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )
     return None
