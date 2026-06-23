@@ -351,9 +351,7 @@ class ModelRunner:
 
         self.init_remote_instance_weight_transport()
 
-        self.msprobe_debugger = None
-        if server_args.msprobe_dump_config is not None:
-            self.init_msprobe()
+        self.msprobe_debugger = create_msprobe_debugger(server_args)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
@@ -540,21 +538,6 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
-        )
-
-    def init_msprobe(self):
-        # Init the msprobe
-        try:
-            from msprobe.pytorch import PrecisionDebugger, seed_all
-        except ImportError:
-            logger.warning(
-                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
-                "see https://gitcode.com/Ascend/msprobe for details."
-            )
-            return
-        seed_all(mode=True)
-        self.msprobe_debugger = PrecisionDebugger(
-            config_path=self.server_args.msprobe_dump_config
         )
 
     def init_mindspore_runner(self):
@@ -1993,3 +1976,29 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+
+import logging
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+
+def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
+    if server_args.msprobe_dump_config is None:
+        return None
+
+    try:
+        from msprobe.pytorch import PrecisionDebugger, seed_all
+    except ImportError:
+        logger.warning(
+            "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+            "see https://gitcode.com/Ascend/msprobe for details."
+        )
+        return None
+
+    seed_all(mode=True)
+    return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
