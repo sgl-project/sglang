@@ -213,24 +213,13 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-_UNSET = object()
-
-
 def build_fixture(
     cfg: CacheConfig,
     *,
     enable_kv_cache_events: bool = False,
     tree_cls=UnifiedRadixCache,
-    tree_components=_UNSET,
 ):
-    """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
-
-    ``tree_cls`` selects the cache implementation (defaults to UnifiedRadixCache);
-    pass an alternate BasePrefixCache subclass to reuse this fixture for parity
-    tests. ``tree_components`` overrides the params field (pass ``None`` for
-    backends that derive components from sliding_window_size / the Mamba pool,
-    e.g. RustUnifiedRadixCache).
-    """
+    """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
     server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
@@ -341,7 +330,7 @@ def build_fixture(
         page_size=cfg.page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
-        tree_components=cfg.components if tree_components is _UNSET else tree_components,
+        tree_components=cfg.components if tree_cls is UnifiedRadixCache else None,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,

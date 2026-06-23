@@ -1,4 +1,4 @@
-//! Tree node component which maintains device FULL values.
+//! Tree node component for device FULL values.
 
 use super::{Component, IncLockRefResult, MatchValidator};
 use crate::component_type::ComponentType;
@@ -16,13 +16,10 @@ impl FullComponent {
 
 impl<K: ChildKeyType> Component<K> for FullComponent {
     fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>> {
-        // FULL has no boundary-gating; `None` lets the orchestrator skip the
-        // per-node validate() call and its allocation.
         None
     }
 
-    /// Walk from `node_idx` up to root (but not including) to bump each node's
-    /// lock_ref counter.
+    /// Bump each node's lock_ref counter from `node_idx` up to root.
     fn inc_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -40,8 +37,7 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         })
     }
 
-    /// Walk from `node_idx` up to root (but not including) to decrease each
-    /// node's lock_ref counter.
+    /// Decrease each node's lock_ref counter from `node_idx` up to root.
     fn dec_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -67,15 +63,12 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         }
     }
 
-    /// Bump device FULL LRU; a node-level bump is skipped when its value is
-    /// absent (not-in-list).
+    /// Bump device FULL LRU.
     fn bump_mru_walk(&self, pool: &mut TreeNodePool<K>, node_idx: NodeIdx) {
         FullLRUSlot::bump_mru_walk(pool, node_idx);
     }
 
-    /// Redistribute node values from `child_idx` to `new_parent_idx`
-    /// (`child_idx` was just structurally split into
-    /// `new_parent_idx -> child_idx` at `split_len`).
+    /// Redistribute node values from `child_idx` to `new_parent_idx` after a split.
     fn redistribute_on_node_split(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -83,7 +76,7 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         child_idx: NodeIdx,
         split_len: usize,
     ) {
-        // A device-only cache always has the value present, so require it.
+        // Device-only cache always has the value present.
         FullLRUSlot::redistribute_on_split(pool, new_parent_idx, child_idx, split_len, true);
     }
 }

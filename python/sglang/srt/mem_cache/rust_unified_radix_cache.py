@@ -11,16 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Python orchestrator over the Rust radix cache.
+"""Python orchestrator over the Rust radix cache."""
 
-The Rust RadixCache owns tree state and lock_ref accounting; Python keeps
-ownership of the ReqToTokenPool and KV-pool allocator. Supports full
-attention, SWA, Mamba, and EAGLE bigram keys with LRU eviction.
-
-Unsupported features raise `RadixCacheInfraPyError`: construction-time
-rejections fail fast at process start; per-call rejections fail the call
-without corrupting cache state.
-"""
+# TODO(Jialin): sanity_check() is a no-op stub — wire up a Rust-side LRU/tree
+# consistency check (the scheduler calls it on idle ticks).
 
 from __future__ import annotations
 
@@ -64,7 +58,7 @@ _NATIVE_SYMBOLS_LOADED = False
 
 
 def _load_native_symbols() -> None:
-    """Load the PyO3 extension only when the Rust backend is selected."""
+    """Load the PyO3 extension."""
     global ComponentType
     global RadixCacheInfraPyError
     global RadixCacheRuntimePyError
@@ -101,24 +95,19 @@ def _load_native_symbols() -> None:
     _NATIVE_SYMBOLS_LOADED = True
 
 
-# Initial capacity hint for the Rust tree node pool; grows on demand.
 _DEFAULT_INIT_NODE_CAPACITY = 1024
 RUST_UNIFIED_BACKEND_NAME = "rust_unified_tree"
 
 
 class RustUnifiedRadixCache(BasePrefixCache):
-    """Route tree ops to the Rust radix cache while keeping Python ownership
-    of `req_to_token_pool` and the allocator.
+    """Route tree ops to the Rust radix cache; Python owns the pools.
 
-    The `req.last_node` field carries an opaque integer (the Rust NodeIdx)
-    instead of a Python `TreeNode`, so external code reading `req.last_node.X`
-    attributes will break.
+    `req.last_node` carries an opaque Rust NodeIdx, not a Python `TreeNode`.
     """
 
     def __init__(self, params: CacheInitParams):
         _load_native_symbols()
 
-        # External code reads these directly (e.g. observability).
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -128,7 +117,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         server_args = get_global_server_args()
-        # Enable Mamba if the scheduler passed in a HybridReqToTokenPool.
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
             self.mamba_cache_chunk_size: Optional[int] = (
                 server_args.mamba_cache_chunk_size
@@ -144,11 +132,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
         device_str = self._device_to_rust_str(self.device)
-        # Both wrappers share an identical Python surface, so no per-method
-        # dispatch is needed downstream. The bigram wrapper builds `(t[i],
-        # t[i+1])` overlap pairs from the raw int64 keys and owns page-
-        # alignment in atom units; Python must not pre-trim in raw-token
-        # space or the EAGLE bigram count is corrupted.
         wrapper_cls = (
             RustBigramRadixCacheWrapper if self.is_eagle else RustPageRadixCacheWrapper
         )
@@ -159,7 +142,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             sliding_window_size=self.sliding_window_size,
             mamba_cache_chunk_size=self.mamba_cache_chunk_size,
         )
-        # Shared empty tensor for the disabled-cache path; must not be mutated.
+        # Shared disabled-path tensor; must not be mutated.
         self._empty_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def _reject_unsupported(self, params: CacheInitParams, server_args: Any) -> None:
@@ -187,10 +170,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
     @staticmethod
     def _device_to_rust_str(device: Any) -> str:
-        # Resolve unindexed cuda to "cuda:<current_device>" so per-rank
-        # processes (TP > 1) get the right index. Rust treats bare "cuda" as
-        # Cuda(0), which would put the rank-N cache on cuda:0 and mismatch the
-        # incoming KV-index tensors on cuda:N at first insert.
+        # Resolve bare "cuda" to the current device so TP>1 ranks pick the right index.
         def _resolve_cuda_index() -> str:
             try:
                 return f"cuda:{torch.cuda.current_device()}"
@@ -213,18 +193,12 @@ class RustUnifiedRadixCache(BasePrefixCache):
             return _resolve_cuda_index()
         return str(device)
 
-    # ----- BasePrefixCache contract: lifecycle -----
-
     def reset(self) -> None:
-        # Clears tree state only; the allocator is not cleared here. Callers
-        # that need to release in-tree slots must call the allocator's clear()
-        # separately.
+        # Clears tree state only; not the allocator.
         self._rust_radix.reset()
 
     def supports_fast_match_prefix(self) -> bool:
         return True
-
-    # ----- BasePrefixCache contract: lookup / insert / evict -----
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
@@ -233,8 +207,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         token_ids = params.key.raw_token_ids()
         rust_result = self._rust_radix.match_prefix(token_ids, params.key.extra_key)
 
-        # Device-only cache: `last_host_node` / `best_match_node` collapse onto
-        # `last_device_node`.
+        # Device-only cache: host / best-match nodes collapse onto the device node.
         last_device_node = rust_result.last_device_node_idx
         result = MatchResult(
             device_indices=rust_result.device_indices,
@@ -252,8 +225,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         result: MatchResult,
     ) -> MatchResult:
         """Per-component post-processing that requires Python-owned resources."""
-        # Mamba CoW: allocate a request-local slot and record the source index
-        # so the forward path can copy-on-write the SSM state before mutation.
+        # Mamba CoW: allocate a request-local slot from the matched state.
         if (
             self.supports_mamba()
             and params.cow_mamba
@@ -265,8 +237,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return result
 
     def _empty_match_result(self) -> MatchResult:
-        # Disabled-cache sentinel. `last_device_node=None` makes
-        # inc/dec_lock_ref short-circuit so callers don't need to branch.
+        # `last_device_node=None` makes inc/dec_lock_ref short-circuit.
         return MatchResult(
             device_indices=self._empty_indices,
             last_device_node=None,
@@ -290,8 +261,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
-        # TODO: reject non-aligned keys with a typed error instead of
-        # silently trimming in the Rust wrapper.
+        # TODO: reject non-aligned keys instead of trimming in the Rust wrapper.
         aligned_key = key.page_aligned(self.page_size)
         atom_count = len(aligned_key)
         token_ids = aligned_key.token_ids
@@ -312,7 +282,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
 
     def _process_insert_actions(self, deferred_actions: list[tuple]) -> None:
-        """Apply the insert-path emitted actions in the orchestration layer."""
+        """Apply the insert-path emitted actions."""
         if not deferred_actions or self.token_to_kv_pool_allocator is None:
             return
 
@@ -320,24 +290,24 @@ class RustUnifiedRadixCache(BasePrefixCache):
         swa_values: list[torch.Tensor] = []
         for action in deferred_actions:
             tag = action[0]
-            if tag == "FullDupFreed":
-                _, freed_indices = action
-                self.token_to_kv_pool_allocator.free(freed_indices)
+            if tag == "FullFree":
+                _, full_to_free = action
+                self.token_to_kv_pool_allocator.free(full_to_free)
             elif tag == "SwaRecover":
-                _, node_idx, freed_full, source_value = action
-                self.token_to_kv_pool_allocator.free(freed_full)
+                _, node_idx, old_full_to_free, new_full_value = action
+                self.token_to_kv_pool_allocator.free(old_full_to_free)
                 swa_node_indices.append(node_idx)
                 swa_values.append(
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        source_value
+                        new_full_value
                     )
                 )
             elif tag == "SwaStamp":
-                _, node_idx, source_value = action
+                _, node_idx, full_value = action
                 swa_node_indices.append(node_idx)
                 swa_values.append(
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        source_value
+                        full_value
                     )
                 )
             else:
@@ -363,11 +333,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
         if self.disable or (full_budget == 0 and swa_budget == 0 and mamba_budget == 0):
             return EvictResult(num_tokens_evicted=0)
 
-        # Single Rust call: the dispatcher iterates configured components
-        # forward (FULL -> SWA -> Mamba) with the per-component budget. FULL
-        # leaf-evict can cross-bump `freed[Swa]` via the cookie cascade, so we
-        # must release every freed bin below even when that component's budget
-        # is 0. Unconfigured components return empty bins (safe by shape).
+        # FULL eviction can cross-bump freed[Swa], so release every freed bin
+        # below even when that component's budget is 0.
         start_time = time.perf_counter()
         result = self._rust_radix.evict([full_budget, swa_budget, mamba_budget])
 
@@ -390,15 +357,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
             mamba_num_evicted=result.evicted[mamba_idx],
         )
 
-    # ----- BasePrefixCache contract: lock_ref -----
-
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        # `None` covers both empty match (no node to lock) and disabled cache.
         if self.disable or node is None:
             return IncLockRefResult(delta=0)
-        # Returns (delta, swa_uuid_for_lock): delta is the aggregated signed
-        # change to evictable_token_size; swa_uuid_for_lock is set when SWA
-        # stamped a window boundary, for symmetric release later.
         delta, swa_uuid_for_lock = self._rust_radix.inc_lock_ref(node)
         return IncLockRefResult(delta=delta, swa_uuid_for_lock=swa_uuid_for_lock)
 
@@ -409,13 +370,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable or node is None:
             return DecLockRefResult()
-        # `swa_uuid_for_lock` gates SWA's release walk to stop at the matching
-        # boundary; FULL's walk is unconditional. FULL-only configs pass None.
+        # `swa_uuid_for_lock` stops SWA's release walk at the matching boundary.
         swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
         self._rust_radix.dec_lock_ref(node, swa_uuid_for_lock)
         return DecLockRefResult()
-
-    # ----- BasePrefixCache contract: size accessors -----
 
     def evictable_size(self) -> int:
         return self._rust_radix.evictable_token_size()
@@ -424,12 +382,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return self._rust_radix.protected_token_size()
 
     def total_size(self) -> int:
-        # Total tokens (evictable + protected) across FULL and SWA components.
         return self._rust_radix.total_token_size()
-
-    # Per-component size accessors. The scheduler reads these directly when
-    # `is_hybrid_swa`; without the overrides the inherited defaults return 0
-    # and starve the hybrid capacity calculation.
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
@@ -462,23 +415,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_total_size(self) -> int:
-        # Mamba's unit is slots, not tokens, so this is separate from total_size().
+        # Mamba's unit is slots, not tokens.
         return self._rust_radix.mamba_total_size() if self.supports_mamba() else 0
 
-    # ----- BasePrefixCache contract: idle invariant check -----
-
     def sanity_check(self) -> None:
-        # No-op stub: the scheduler calls this on idle ticks for hybrid caches.
-        # TODO: add a Rust-side walker that rebuilds the LRU lists from the tree
-        # and asserts aggregate consistency.
+        # No-op stub (see the module-level TODO).
         return None
 
-    # ----- BasePrefixCache contract: SWA capability flag -----
-
     def supports_swa(self) -> bool:
-        # Gates decode-time SWA eviction and the schedule-policy paths that
-        # preserve `swa_uuid_for_lock` across steps. Without it, dec_lock_ref
-        # walks past the SWA boundary and underflows swa_lock_ref.
         return self.sliding_window_size is not None
 
     def supports_mamba(self) -> bool:
@@ -491,25 +435,16 @@ class RustUnifiedRadixCache(BasePrefixCache):
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._empty_indices
 
-    # ----- BasePrefixCache contract: features rejected in v1 -----
-
     def pretty_print(self):
         raise RadixCacheInfraPyError(
             "RustUnifiedRadixCache: pretty_print() not supported"
         )
 
     def take_events(self):
-        # `enable_kv_cache_events=True` is rejected at __init__, so the queue
-        # is always empty.
         return []
 
-    # ----- Per-request orchestration -----
-
     def cache_finished_req(self, req: "Req", is_insert: bool = True, **kwargs) -> None:
-        """Cache the prefix of a finished request and free its tail. The disabled
-        path frees everything; the inserting path inserts the page-aligned
-        prefix and frees only the duplicate slots that the tree already owned.
-        """
+        """Cache the prefix of a finished request and free its tail."""
         if self.disable_finished_insert:
             is_insert = False
 
@@ -529,7 +464,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Mamba extra_buffer mode: truncate the cache range to Mamba chunk aligned.
+        # extra_buffer mode: truncate to Mamba chunk aligned.
         if self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen or 0
             if cache_len != len(token_ids):
@@ -567,17 +502,11 @@ class RustUnifiedRadixCache(BasePrefixCache):
             # Skipped insert: caller still owns the Mamba slot.
             mamba_exist = mamba_value is not None
 
-        # Free everything past the aligned atom prefix. For bigram,
-        # this includes the trailing boundary token of the last cached
-        # pair as well as any unaligned bigram positions.
+        # Free everything past the aligned atom prefix.
         self.token_to_kv_pool_allocator.free(kv_indices[atom_len:])
 
-        # Mamba slot release.
-        # extra_buffer: primary is always orphaned (the tree took a ping-pong
-        # slot), so always free; `ping_pong_track_buffer_to_keep` spares the
-        # surviving ping-pong slot, or None on mamba_exist to free all three.
-        # no_buffer: primary IS the slot handed to the tree, so free only when
-        # the tree rejected it (mamba_exist=True).
+        # Mamba slot release. extra_buffer always frees the orphaned primary
+        # (keeping the surviving ping-pong slot); no_buffer frees only on reject.
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
         free_mamba_cache = self.enable_mamba_extra_buffer or mamba_exist
@@ -587,8 +516,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
 
-        # Release the prefill lock; `swa_uuid_for_lock` stops SWA's release walk
-        # at the right boundary (None for FULL-only configs).
+        # Release the prefill lock.
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
@@ -603,10 +531,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Mamba extra_buffer mode: truncate the cache range to Mamba chunk aligned.
+        # extra_buffer mode: truncate to Mamba chunk aligned.
         if self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
-            # No Mamba chunk-aligned boundary reached yet, skip caching.
+            # No chunk-aligned boundary yet, skip caching.
             if cache_len is None:
                 req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
                 return
@@ -618,7 +546,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         atom_len = len(radix_key)
         values = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
 
-        # Fork into a tree-owned slot so decode mutations don't alias the cached state.
+        # Fork so decode mutations don't alias the cached state.
         mamba_value_forked = None
         if self.supports_mamba() and req.mamba_pool_idx is not None:
             mamba_value_src, _ = self._extract_mamba_value(req)
@@ -638,21 +566,16 @@ class RustUnifiedRadixCache(BasePrefixCache):
             )
         )
 
-        # Mamba: release the forked slot when the cache didn't consume
-        # it (target already had a Mamba value).
+        # Release the forked slot when the cache didn't consume it.
         if mamba_value_forked is not None and insert_result.mamba_exist:
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
-        # Re-match: insert may have de-duplicated against an existing branch, so
-        # re-read the canonical tree-owned indices for this prefix. With SWA a
-        # rematch can legitimately return FEWER indices than the inserted atom
-        # count (path crosses an SWA tombstone), so the bookkeeping below keys
-        # off `len(new_indices)` rather than asserting it equals `atom_len`.
+        # Re-read the canonical tree-owned indices; insert may have de-duplicated.
+        # With SWA a rematch can return fewer indices than atom_len.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
-        # `cache_protected_len` must not extend past the last position the tree
-        # owns; the `+ page_size - 1` slack tolerates a trailing partial page.
+        # The `+ page_size - 1` slack tolerates a trailing partial page.
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ) and len(new_indices) <= atom_len, (
@@ -666,10 +589,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        # Lock-ref handoff: dec first, inc second so overlapping ancestors don't
-        # briefly hold a redundant +2 (safe because this is synchronous wrt
-        # eviction). `swa_uuid_for_lock` stops SWA's release walk at the acquire-
-        # time boundary; the new uuid is stored back on req afterward.
+        # Lock-ref handoff: dec the old node before inc the new one.
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
@@ -677,7 +597,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         inc_result = self.inc_lock_ref(new_last_node)
         req.swa_uuid_for_lock = inc_result.swa_uuid_for_lock
 
-        # Extend back kv indices after the last Mamba chunk or page-aligned boundary.
+        # Extend back kv indices past the aligned boundary.
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
@@ -686,8 +606,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.cache_protected_len = len(new_indices)
-        # Clear the chunk-aligned marker so the next call recomputes the
-        # boundary instead of reusing a stale one.
+        # Clear the chunk-aligned marker so the next call recomputes it.
         if self.supports_mamba():
             req.mamba_last_track_seqlen = None
 
@@ -700,8 +619,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             return None, None
         if not self.enable_mamba_extra_buffer:
             return req.mamba_pool_idx.unsqueeze(-1).clone(), None
-        # extra_buffer mode: include the ping-pong index of the
-        # returned value so the mamba pool can release the right slot later
+        # extra_buffer mode: also return the ping-pong index to release later.
         track_buffer_to_keep = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
             req.mamba_next_track_idx
         )
@@ -715,11 +633,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
         mamba_value: torch.Tensor,
         protect_node_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        """Fork `mamba_value` in the pool; only try to evict if direct
-        allocation failed.
+        """Fork `mamba_value` in the pool, evicting only if alloc fails.
 
-        TODO(Jialin): port this retry-with-alloc wrapper into
-        `MambaPool` so callers don't reimplement it.
+        TODO(Jialin): port this retry-with-alloc wrapper into `MambaPool`.
         """
         mamba_pool = self.req_to_token_pool.mamba_pool
         dst = mamba_pool.alloc(1)
@@ -747,12 +663,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             )
 
 def install_rust_radix_cache() -> None:
-    """Register Rust Unified Radix Cache.
-
-    The native extension is loaded by the factory, not during registration, so
-    importing the default registry path remains safe before the extension is
-    built.
-    """
+    """Register Rust Unified Radix Cache."""
     if get_radix_cache_factory(RUST_UNIFIED_BACKEND_NAME) is not None:
         return
 

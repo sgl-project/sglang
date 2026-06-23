@@ -1,4 +1,4 @@
-//! Python wrapper of Rust Radix Cache.
+//! PyO3 wrappers for the Rust radix cache.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
@@ -13,14 +13,6 @@ use crate::tree_node_lru::{EvictRequest, EvictResult};
 use crate::utils::parse_device;
 
 /// Per-component eviction outcome at the PyO3 boundary.
-///
-/// - `freed`: `list[list[torch.Tensor]]` indexed by `ComponentType`
-///   discriminant (FULL=0, SWA=1, MAMBA=2); each `freed[ct]` feeds that
-///   component's Python allocator free.
-/// - `evicted`: per-component token-count total (sum of `t.numel()`).
-///
-/// `freed` is built once as a `Py<PyList>` so getters are refcount bumps;
-/// `tch::Tensor` lacks `Clone`, ruling out the `#[pyo3(get)]` auto-getter.
 #[pyclass]
 pub struct RustEvictResult {
     freed: Py<PyList>,
@@ -28,31 +20,29 @@ pub struct RustEvictResult {
     deferred_actions: Py<PyList>,
 }
 
-/// Serialize any `DeferredAction` to a `PyObject`.
 fn deferred_action_to_py(py: Python<'_>, action: DeferredAction) -> PyObject {
     match action {
-        DeferredAction::FullDupFreed { freed_indices } => {
-            ("FullDupFreed", PyTensor(freed_indices).into_py(py)).into_py(py)
+        DeferredAction::FullFree { full_to_free } => {
+            ("FullFree", PyTensor(full_to_free).into_py(py)).into_py(py)
         }
         DeferredAction::SwaRecover {
             node_idx,
-            freed_full,
-            source_value,
+            old_full_to_free,
+            new_full_value,
         } => (
             "SwaRecover",
             node_idx,
-            PyTensor(freed_full).into_py(py),
-            PyTensor(source_value).into_py(py),
+            PyTensor(old_full_to_free).into_py(py),
+            PyTensor(new_full_value).into_py(py),
         )
             .into_py(py),
         DeferredAction::SwaStamp {
             node_idx,
-            source_value,
-        } => ("SwaStamp", node_idx, PyTensor(source_value).into_py(py)).into_py(py),
+            full_value,
+        } => ("SwaStamp", node_idx, PyTensor(full_value).into_py(py)).into_py(py),
     }
 }
 
-/// Serialize a list of `DeferredAction`s into a Python list.
 fn deferred_actions_to_py_list(py: Python<'_>, actions: Vec<DeferredAction>) -> Py<PyList> {
     let list = PyList::empty_bound(py);
     for action in actions {
@@ -67,8 +57,6 @@ fn deferred_actions_to_py_list(py: Python<'_>, actions: Vec<DeferredAction>) -> 
 }
 
 impl RustEvictResult {
-    /// Move a Rust-side `EvictResult` into the PyO3 boundary type, wrapping
-    /// the per-component freed tensors into nested Python lists.
     fn from_evict_result(py: Python<'_>, r: EvictResult) -> Self {
         let outer = PyList::empty_bound(py);
         for ct_freed in r.freed {
@@ -92,7 +80,7 @@ impl RustEvictResult {
 
 #[pymethods]
 impl RustEvictResult {
-    /// Per-component freed tensors to feed the matching Python allocator free.
+    /// Per-component freed tensors.
     #[getter]
     fn freed<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
         self.freed.bind(py).clone()
@@ -104,7 +92,6 @@ impl RustEvictResult {
         self.evicted
     }
 
-    /// Tagged tuples for the orchestrator to apply.
     #[getter]
     fn deferred_actions<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
         self.deferred_actions.bind(py).clone()
@@ -112,12 +99,6 @@ impl RustEvictResult {
 }
 
 /// Insert result at the PyO3 boundary.
-///
-/// `deferred_actions` is a flat Python list of tagged tuples the
-/// orchestrator pattern-matches on by string tag:
-///   - `("FullDupFreed", freed_indices_tensor)`
-///   - `("SwaRecover", node_idx, freed_full_tensor, source_value_tensor)`
-///   - `("SwaStamp", node_idx, source_value_tensor)`
 #[pyclass]
 pub struct RustInsertResult {
     prefix_len: usize,
@@ -207,9 +188,7 @@ impl RustMatchResult {
 
 /// Convert a Python int64 sequence to an owned `Vec<i64>`.
 fn py_array_to_vec_i64(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
-    // Special handling for empty keys, as empty pyarray might use
-    // a random address to represent empty buffer which
-    // non-deterministically violates alignment check
+    // Empty pyarray may use an unaligned dummy address; handle separately.
     if key.len().map(|n| n == 0).unwrap_or(false) {
         return Ok(Vec::new());
     }
@@ -262,49 +241,38 @@ impl RustPageRadixCacheWrapper {
         self.inner.active_tree_node_count()
     }
 
-    /// Sum of `key.len()` across nodes eligible for eviction
-    /// (lock_ref == 0 and value present).
     fn evictable_token_size(&self) -> usize {
         self.inner.evictable_token_size()
     }
 
-    /// Sum of `key.len()` across nodes locked by in-flight requests.
     fn protected_token_size(&self) -> usize {
         self.inner.protected_token_size()
     }
 
-    /// Total tokens held by the tree: evictable + protected.
     fn total_token_size(&self) -> usize {
         self.inner.total_token_size()
     }
 
-    /// Sum of `key.len()` across SWA-tracked + SWA-unlocked nodes. 0 for
-    /// FULL-only configs (no path credits SWA's aggregate).
     fn swa_evictable_token_size(&self) -> usize {
         self.inner.swa_evictable_token_size()
     }
 
-    /// Sum of `key.len()` across SWA-tracked + SWA-locked nodes.
     fn swa_protected_token_size(&self) -> usize {
         self.inner.swa_protected_token_size()
     }
 
-    /// Count of unlocked nodes with a Mamba value populated.
     fn mamba_evictable_token_size(&self) -> usize {
         self.inner.mamba_evictable_token_size()
     }
 
-    /// Count of locked nodes with a Mamba value populated.
     fn mamba_protected_token_size(&self) -> usize {
         self.inner.mamba_protected_token_size()
     }
 
-    /// Total Mamba slots tracked by the tree: evictable + protected.
     fn mamba_total_size(&self) -> usize {
         self.inner.mamba_total_size()
     }
 
-    /// Run prefix match of `key` on the tree.
     #[pyo3(signature = (key, extra_key = None))]
     fn match_prefix(
         &mut self,
@@ -317,12 +285,7 @@ impl RustPageRadixCacheWrapper {
         Ok(RustMatchResult::from_match_result(r))
     }
 
-    /// Insert `key`/`value`; the returned `prefix_len` is the count already
-    /// cached, whose slots the caller frees as redundant duplicates.
-    ///
-    /// `value` must be a 1-D `Int64` tensor with length >= aligned key length;
-    /// excess is silently truncated, shorter values raise `ValueError`. The
-    /// cache deep-copies the stored slice, so the caller may reuse its tensor.
+    /// Insert `key`/`value`; `prefix_len` counts the already-cached prefix.
     #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
@@ -350,48 +313,19 @@ impl RustPageRadixCacheWrapper {
         Ok(RustInsertResult::from_insert_result(py, r))
     }
 
-    /// Increment lock_ref on `node_idx` and ancestors per each component's
-    /// policy (FULL: to namespace root excl.; SWA: window-bounded walk),
-    /// protecting the matched prefix from eviction while a request is inflight.
-    ///
-    /// Returns `(delta, swa_uuid_for_lock)`:
-    ///   - `delta` — signed delta to `evictable_token_size`; FULL contributes
-    ///     negative (evictable -> protected), SWA contributes `0`.
-    ///   - `swa_uuid_for_lock` — `Some(uuid)` when SWA is configured and the
-    ///     window filled; `None` otherwise. Caller MUST pass it back to
-    ///     `dec_lock_ref` so SWA's release stops at the right boundary.
-    ///
-    /// `node_idx` is a raw pool index whose slot the freelist may recycle once
-    /// the node is evicted; call `inc_lock_ref` before yielding to any evicting
-    /// operation, and never reuse the idx past `dec_lock_ref` (stale use panics
-    /// or corrupts accounting via ABA).
-    ///
-    /// TODO(Jialin): [Safety] Replace the raw `usize` handle with a
-    /// generation-tagged token so stale uses raise a typed error instead of
-    /// panicking.
+    /// Lock `node_idx` and ancestors, protecting the prefix from eviction.
+    /// Returns `(delta, swa_uuid_for_lock)`; pass the uuid back to `dec_lock_ref`.
     fn inc_lock_ref(&mut self, node_idx: usize) -> (i64, Option<u64>) {
         let r = self.inner.inc_lock_ref(node_idx);
         (r.delta, r.swa_uuid_for_lock)
     }
-    /// Decrement lock_ref on `node_idx` per each component's policy; pair
-    /// exactly with `inc_lock_ref` (underflow panics). Returns the (positive)
-    /// delta to `evictable_token_size`.
-    ///
-    /// `swa_uuid_for_lock` MUST be the value from the matching `inc_lock_ref`;
-    /// `None` makes SWA's release walk to root (exclusive). Same `node_idx`
-    /// lifecycle caveat as `inc_lock_ref`.
+    /// Unlock `node_idx`; pair with `inc_lock_ref` and pass back its uuid.
     #[pyo3(signature = (node_idx, swa_uuid_for_lock = None))]
     fn dec_lock_ref(&mut self, node_idx: usize, swa_uuid_for_lock: Option<u64>) -> i64 {
         self.inner.dec_lock_ref(node_idx, swa_uuid_for_lock)
     }
 
-    /// Best-effort cascade evict of up to `num_tokens[ct]` tokens per component
-    /// (oldest first). Leaves free whole, so `evicted[ct]` may exceed the target
-    /// when the last leaf overshoots, or fall short under lock saturation; no
-    /// error is raised, so the caller compares to detect partial fulfillment.
-    ///
-    /// `num_tokens` is positional, indexed by `ComponentType` discriminant
-    /// (FULL=0, SWA=1, MAMBA=2): FULL-only callers pass `[N, 0, 0]`.
+    /// Best-effort cascade evict of up to `num_tokens[ct]` tokens per component.
     fn evict(
         &mut self,
         py: Python<'_>,
@@ -413,33 +347,10 @@ impl RustPageRadixCacheWrapper {
 }
 
 /// Python wrapper for the EAGLE bigram radix cache (children keyed by overlap
-/// bigram pairs `(t[i], t[i+1])`).
+/// bigram pairs `(t[i], t[i+1])`). Sizes report in atom (= pair) units.
 ///
-/// Mirrors `RustPageRadixCacheWrapper`'s API so the orchestrator can pick a
-/// wrapper by `params.is_eagle` without per-method dispatch. Two differences
-/// live inside the wrapper:
-///   1. Each key method takes a 1-D `int64` raw-token slice and builds the
-///      `Vec<(i64, i64)>` pair view Rust-side, so the pairs never cross PyO3.
-///   2. `value` is trimmed N -> N-1 (one slot per pair) so the cache's
-///      `value.len() >= key.len()` invariant holds in atom (= pair) units.
-///
-/// All sizes report in atom (= bigram-pair) units; raw-token translation
-/// happens in Python.
-///
-/// Page-align contract (CRITICAL): the orchestrator MUST pass raw token
-/// sequences untrimmed. The cache page-aligns internally in atom units
-/// `(N-1) // page_size * page_size`; a raw-token trim in Python would compound
-/// with the Rust trim and produce the wrong bigram count.
-///
-/// TODO(Jialin): [Refactor][Major] Consolidate this path back onto
-/// `RustPageRadixCacheWrapper` (`K = Vec<i64>`), retiring this wrapper and the
-/// `Vec<(i64, i64)>` `ChildKeyType` impl; the bigram tree branches at the same
-/// points as the raw-token tree, just shifted by one index. Done naively this
-/// hits subtle value-sizing, edge-label, hash-collision, and page-unit issues,
-/// so the explicit `Vec<(i64, i64)>` impl ships as the conservative option.
-/// Build overlap-bigram pairs `(t[i], t[i+1])` from a raw 1-D `int64`
-/// token slice. Returns an empty `Vec` for inputs shorter than 2
-/// tokens (no pairs possible).
+/// Callers MUST pass raw token sequences untrimmed; the cache page-aligns and
+/// trims value N -> N-1 internally.
 fn build_bigram_pairs(raw: &[i64]) -> Vec<(i64, i64)> {
     raw.windows(2).map(|w| (w[0], w[1])).collect()
 }
@@ -486,7 +397,6 @@ impl RustBigramRadixCacheWrapper {
         self.inner.active_tree_node_count()
     }
 
-    /// In atom (= bigram-pair) units: an N-token sequence reports up to N-1.
     fn evictable_token_size(&self) -> usize {
         self.inner.evictable_token_size()
     }
@@ -519,8 +429,6 @@ impl RustBigramRadixCacheWrapper {
         self.inner.mamba_total_size()
     }
 
-    /// Run prefix match of `key` on the bigram-keyed tree.
-    /// `last_device_node_idx` is in atom (= bigram-pair) units.
     #[pyo3(signature = (key, extra_key = None))]
     fn match_prefix(
         &mut self,
@@ -552,8 +460,7 @@ impl RustBigramRadixCacheWrapper {
         let mamba_tensor = mamba_value.map(|m| m.0);
         let r = py.allow_threads(move || {
             let pairs = build_bigram_pairs(&key_vec);
-            // Trim value N -> N-1 (one slot per bigram). If raw.len() < 2 the
-            // pair vec is empty and the cache early-returns without touching value.
+            // Trim value N -> N-1 (one slot per bigram).
             let trimmed_value = if pairs.is_empty() {
                 value.0.shallow_clone()
             } else {

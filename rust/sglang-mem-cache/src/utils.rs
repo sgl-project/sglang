@@ -4,12 +4,7 @@ use tch::Device;
 
 use crate::error::RadixCacheInitError;
 
-/// Parse a torch-style device string into a `tch::Device`.
-///
-/// Accepts exactly `"cpu"`, `"cuda"` (alias for `cuda:0`), or `"cuda:N"`
-/// where N is a non-negative integer. Anything else (including `"cuda0"`,
-/// `"cuda:abc"`, `"cudaXYZ"`, `"cuda:-1"`) returns
-/// `RadixCacheInitError::InvalidDevice` — no silent coercion.
+/// Parse tch::Device from torch-style device string (e.g. cpu, cuda, or cuda:N).
 pub fn parse_device(device: &str) -> Result<Device, RadixCacheInitError> {
     match device {
         "cpu" => Ok(Device::Cpu),

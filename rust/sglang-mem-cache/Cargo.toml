@@ -2,7 +2,7 @@
 name = "sglang-mem-cache"
 version = "0.1.0"
 edition = "2024"
-description = "Rust unified radix cache for SGLang (core logic + PyO3 wrapper)"
+description = "Rust unified radix cache for SGLang"
 license = "Apache-2.0"
 
 [lib]

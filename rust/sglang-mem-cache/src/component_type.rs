@@ -16,8 +16,7 @@ pub enum ComponentType {
 pub const NUM_COMPONENT_TYPES: usize = ComponentType::Mamba as usize + 1;
 
 const _: () = {
-    // Exhaustive match (no `_` arm): a new variant fails to compile here until
-    // its discriminant assertion below is added and the basis above is bumped.
+    // Static assert that NUM_COMPONENT_TYPES covers all component types.
     match ComponentType::Full {
         ComponentType::Full => {}
         ComponentType::Swa => {}

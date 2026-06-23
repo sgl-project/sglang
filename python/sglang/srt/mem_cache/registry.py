@@ -216,7 +216,8 @@ def _install_builtin_radix_cache_backends() -> None:
     """Self-register the built-in pluggable backends at import time.
 
     The factory loads its native extension lazily, so registration stays safe
-    even when the extension isn't built.
+    even when the extension isn't built. The Rust radix cache native core is
+    loaded only when `--radix-cache-backend=rust_unified_tree` is enabled.
     """
     from sglang.srt.mem_cache.rust_unified_radix_cache import install_rust_radix_cache
 

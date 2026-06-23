@@ -1,6 +1,5 @@
-//! Rust core logic and PyO3 wrapper for SGLang's unified radix cache.
+//! Rust unified radix cache with PyO3 bindings.
 
-// PyO3 proc macro generates Into<PyErr> conversions that clippy flags.
 #![allow(clippy::useless_conversion)]
 
 pub mod component_type;
@@ -17,8 +16,6 @@ pub mod utils;
 use pyo3::prelude::*;
 
 /// Native module imported by Python as `sglang.srt.mem_cache._mem_cache_core`.
-/// The `#[pymodule]` function name, `[lib].name` in Cargo.toml, and the
-/// `setuptools-rust` target's last component must all stay `_mem_cache_core`.
 #[pymodule]
 fn _mem_cache_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(

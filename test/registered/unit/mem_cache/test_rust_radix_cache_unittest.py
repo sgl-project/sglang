@@ -1,23 +1,14 @@
-"""Differential parity tests: RustUnifiedRadixCache vs the pure-Python
-UnifiedRadixCache reference.
+"""Parity tests: RustUnifiedRadixCache vs the Python UnifiedRadixCache."""
 
-Each test runs an identical RadixKey op sequence against both implementations on
-separate but identically-configured pools, then asserts the observable
-accounting matches: insert ``prefix_len``, ``match_prefix`` length, the
-evictable / protected / total size aggregates, and evict counts. The reference
-fixture is shared with ``test_unified_radix_cache_unittest`` so both suites build
-the exact same pools/config.
-
-Requires the ``sglang.srt.mem_cache._mem_cache_core`` native extension to be
-built (the Rust cache loads it lazily at construction).
-"""
-
-import os
-import sys
 import unittest
 from array import array
 
 import torch
+from test_unified_radix_cache_unittest import (
+    CacheConfig,
+    ComponentType,
+    build_fixture,
+)
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -31,23 +22,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Reuse the reference fixture/config from the sibling UnifiedRadixCache suite.
-# CI runs `python3 <file>`, so the file's own directory is on sys.path; inject it
-# explicitly so the import also resolves under unittest/pytest discovery.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_unified_radix_cache_unittest import (  # noqa: E402
-    CacheConfig,
-    ComponentType,
-    build_fixture,
-)
-
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
-# FULL at two page sizes, plus device-tier SWA and Mamba. SWA is restricted to
-# page_size=1 (the SWA allocator only supports single-token alloc in this
-# fixture). RustUnifiedRadixCache derives its components from
-# sliding_window_size / the Mamba pool, so it takes tree_components=None.
+# FULL at two page sizes, plus device-tier SWA and Mamba. SWA is page_size=1
+# only (the fixture's SWA allocator only supports single-token alloc).
 _CONFIGS = [
     CacheConfig(page_size=1),
     CacheConfig(page_size=16),
@@ -68,9 +47,7 @@ class RustParitySuite:
 
     def _build_pair(self):
         ref = build_fixture(self.cfg)
-        rust = build_fixture(
-            self.cfg, tree_cls=RustUnifiedRadixCache, tree_components=None
-        )
+        rust = build_fixture(self.cfg, tree_cls=RustUnifiedRadixCache)
         return ref, rust
 
     def _make_seq(self, start: int, num_pages: int) -> list[int]:

@@ -6,14 +6,13 @@ use crate::error::RadixCacheInitError;
 use crate::tree_node_lru::{EvictRequest, EvictResult, LRUSlot, MambaLRUSlot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
-/// Per-component shell that hosts Mamba-specific radix-tree logic.
+/// Mamba radix-tree component.
 pub struct MambaComponent {
-    /// Chunk granularity for Mamba SSM checkpoints; guaranteed >= `page_size`.
     #[allow(dead_code)]
     mamba_cache_chunk_size: usize,
 }
 
-/// Per-walk Mamba validator: approve iff the node has a Mamba value.
+/// Approves nodes that have a Mamba value.
 pub struct MambaMatchValidator;
 
 impl<K: ChildKeyType> MatchValidator<K> for MambaMatchValidator {
@@ -44,8 +43,6 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         Some(Box::new(MambaMatchValidator))
     }
 
-    /// Single-node update: bump Mamba's `lock_ref` only if the node
-    /// has a Mamba value populated.
     fn inc_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -62,8 +59,6 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         })
     }
 
-    /// Single-node update: decrement Mamba's `lock_ref` only if the
-    /// node has a Mamba value populated. `swa_uuid_for_lock` is ignored.
     fn dec_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -78,7 +73,6 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         Some(delta)
     }
 
-    /// Evict Mamba values and remove unreferenced leaves.
     fn evict(&self, pool: &mut TreeNodePool<K>, request: &EvictRequest, result: &mut EvictResult) {
         let ct = ComponentType::Mamba as usize;
         let target = request.num_tokens[ct];
@@ -92,7 +86,6 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         MambaLRUSlot::bump_mru_walk(pool, node_idx);
     }
 
-    /// Redistribute node values on split.
     fn redistribute_on_node_split(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -100,9 +93,7 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         child_idx: NodeIdx,
         _split_len: usize,
     ) {
-        // Mamba value and lock_ref both stay at the child: acquire targets the
-        // leaf only, and the split point carries no SSM state. The new parent is
-        // born a tombstone and absent from Mamba's LRU, so only bump the child.
+        // Mamba state stays at the child; the new parent has none.
         if MambaLRUSlot::has_value(pool.get(child_idx)) {
             MambaLRUSlot::bump_mru(pool, child_idx);
         }

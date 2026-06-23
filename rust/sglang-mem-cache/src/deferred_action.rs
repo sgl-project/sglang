@@ -2,24 +2,24 @@ use tch::Tensor;
 
 use crate::tree_node_pool::NodeIdx;
 
-/// Actions that coordinate the Python-owned KV-pool allocator with the Rust
-/// radix tree. The Python orchestrator applies each one after the radix-tree
-/// call returns.
+/// An action emitted by the Rust radix tree for the Python orchestrator to apply.
 #[derive(Debug)]
 pub enum DeferredAction {
     /// Free full-attention KV indices duplicated by an overlapping prefix.
-    FullDupFreed { freed_indices: Tensor },
+    FullFree { full_to_free: Tensor },
 
-    /// Recover an SWA tombstone node, replacing its FULL value with a new one.
+    /// Recover an SWA tombstone node, replacing its FULL value.
     SwaRecover {
         node_idx: NodeIdx,
-        freed_full: Tensor,
-        source_value: Tensor,
+        old_full_to_free: Tensor,
+        /// Full KV mapped (full->swa) into the node's SWA value.
+        new_full_value: Tensor,
     },
 
-    /// Stamp SWA value on a newly created leaf.
+    /// Stamp an SWA value on a newly created leaf.
     SwaStamp {
         node_idx: NodeIdx,
-        source_value: Tensor,
+        /// Full KV mapped (full->swa) into the node's SWA value.
+        full_value: Tensor,
     },
 }
