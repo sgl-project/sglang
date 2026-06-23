@@ -3217,11 +3217,9 @@ class Scheduler(
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
-                            # Run the result D2H on the dedicated copy_stream so
-                            # it overlaps the next iter's forward (copy engine vs
-                            # SMs) instead of serializing on forward_stream. The
-                            # copy is a leaf: nothing on forward_stream waits on
-                            # it; the output processor gates on copy_done.
+                            # Result D2H on copy_stream overlaps the next forward
+                            # instead of serializing on forward_stream; it's a leaf
+                            # gated by copy_done, so nothing on forward_stream waits.
                             self.copy_stream.wait_stream(self.forward_stream)
                             with self.copy_stream_ctx, torch.profiler.record_function(
                                 "copy_result_to_cpu"

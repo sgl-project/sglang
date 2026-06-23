@@ -23,14 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 def _async_d2h(t: torch.Tensor) -> torch.Tensor:
-    """Async device-to-host copy for overlap scheduling.
-
-    On CUDA the destination is pinned so the copy is genuinely async: a D2H to
-    pageable host memory blocks the calling (scheduler) thread until it
-    completes. The source is kept alive on the current stream via record_stream
-    so the caching allocator does not recycle it before this copy (which may run
-    on a separate copy stream) has drained. Non-CUDA falls back to a plain copy.
-    """
+    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
+    to pageable host memory blocks the caller until done) and record_stream keeps
+    the source alive until the copy stream drains, so the caching allocator can't
+    recycle it early. Non-CUDA falls back to a plain copy."""
     if not t.is_cuda:
         return t.to("cpu", non_blocking=True)
     cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
