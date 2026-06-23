@@ -14,7 +14,7 @@ If you don't specify `--attention-backend`, SGLang makes a best effort to automa
 
 ## Support Matrix
 
-The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
+The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#4-2-4-mla-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
 
 ### MHA Backends
 
@@ -245,6 +245,15 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**TokenSpeed MLA (Blackwell)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 or 64</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ (required)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**FA3 (FlashAttention 3)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>n/a</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -288,13 +297,8 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 </Note>
 
 <Note>
-- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
-- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32) for details.
+- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend) section and [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2) for details.
 </Note>
-
-<Warning>
-**FA4 on Hopper (SM90):** FA4 decode speed decreases as sequence length grows due to lack of SplitKV support. At batch=1 compared to FA3 on H100: ~-10% at 2K tokens, ~-18% at 4K, ~-31% at 8K, ~-49% at 16K. Larger batch sizes reduce the gap (e.g., batch=8: ~-2% at 2K, ~-8% at 4K). Blackwell (SM100) is not affected.
-</Warning>
 
 <Note>
 For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-backend to run. Except for trtllm_mha being incompatible with FA4, all other decode backends behave as shown in the table.
@@ -303,14 +307,6 @@ For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-back
 <Tip>
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 </Tip>
-
-<Note>
-**Speculative Decoding V2 (Spec V2):** Spec V2 uses overlap scheduling (`SGLANG_ENABLE_SPEC_V2=True`) that benefits various attention backends. Requires `--speculative-eagle-topk 1` and currently applies to EAGLE and EAGLE3.
-
-**Verified backends:** TRTLLM MLA, TRTLLM MHA, FA3, Ascend (NPU), Triton.
-
-**Limited support:** FlashInfer can run under Spec V2, but its plan stream (used for split-KV optimization) introduces a synchronization point that limits overlap benefits.
-</Note>
 
 <Tip>
 Page size controls how many tokens are grouped into a KV cache block. For the prefix cache to take effect, the number of tokens must fill at least one complete page. For example, if your prompt is only 32 tokens and `page_size = 64`, it won't fill a complete page and cannot be matched in the prefix cache (pages cannot be padded). With 65 tokens and `page_size = 64`, only the first page of 64 tokens will be cached and matched; the remaining 1 token is discarded. Use `page_size = 1` for maximum prefix reuse (token-level matching). Note that higher page sizes generally improve attention kernel performance, so prefer `page_size > 1` when prefix cache reuse is not critical.
@@ -324,6 +320,7 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ &#123;32, 64&#125;.
 - CuteDSL MLA: page_size ∈ &#123;32, 64&#125; (decode-only; prefill falls back to `trtllm_mla` when unset).
+- TokenSpeed MLA: page_size ∈ &#123;32, 64&#125; (Blackwell SM100/SM12x only; requires `--kv-cache-dtype fp8_e4m3`).
 
 ### GDN Attention Backends
 
@@ -414,31 +411,31 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>flashmla_sparse</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default prefill on Hopper and Blackwell (bf16)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default prefill on Hopper and Blackwell (BF16)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>flashmla_kv</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode for FP8 on Blackwell with DP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default for FP8 on Hopper (prefill + decode)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>flashmla_auto</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Picks flashmla_sparse or flashmla_kv by KV cache dtype</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>fa3</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode on Hopper (bf16)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode on Hopper (BF16)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>trtllm</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode on Blackwell (bf16); default for both on Blackwell without DP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode on Blackwell (BF16); default for FP8 on Blackwell (prefill + decode)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>tilelang</strong></td>
@@ -455,7 +452,7 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
   </tbody>
 </table>
 
-For deployment examples, see the [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32).
+For deployment examples, see the [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2).
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 

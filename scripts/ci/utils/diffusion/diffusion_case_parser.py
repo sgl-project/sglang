@@ -16,6 +16,7 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,6 +44,17 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 # Paths relative to repository root
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    BASELINE_REL_PATH = (
+        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    )
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+    }
 
 
 @dataclass
@@ -80,6 +92,30 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.cases: Dict[str, List[str]] = {}  # list_name -> [case_id, ...]
+        self.factory_case_ids: Dict[str, str] = {}
+
+    def visit_Module(self, node: ast.Module):
+        for stmt in node.body:
+            if not isinstance(stmt, ast.FunctionDef):
+                continue
+            case_id = self._extract_factory_case_id(stmt)
+            if case_id:
+                self.factory_case_ids[stmt.name] = case_id
+
+        self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr):
+        """Handle ``LIST.append(...)`` mutations at any nesting level.
+
+        Previously only module-top-level ``ast.Expr`` statements were scanned for
+        ``.append()`` calls, so cases registered under a platform guard such as
+        ``if not current_platform.is_hip(): ONE_GPU_CASES.append(...)`` (used by
+        ``hunyuan3d_shape_gen`` and ``turbo_wan2_1_t2v_1.3b``) were invisible to
+        the partition planner and therefore never scheduled in CI. Visiting every
+        ``Expr`` lets ``generic_visit`` reach appends inside ``if``/``else`` blocks.
+        """
+        self._process_expr(node.value)
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
         self._process_assignment(node.targets, node.value)
@@ -120,6 +156,26 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
 
         lhs_case_ids = self.cases.get(target.id, [])
         self.cases[target.id] = [*lhs_case_ids, *rhs_case_ids]
+
+    def _process_expr(self, node: ast.AST):
+        """Process list mutation calls such as `ONE_GPU_CASES.append(...)`."""
+        if not isinstance(node, ast.Call):
+            return
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr != "append":
+            return
+        if not isinstance(node.func.value, ast.Name):
+            return
+        list_name = node.func.value.id
+        if list_name not in CASE_LIST_TO_SUITE:
+            return
+        if len(node.args) != 1:
+            return
+
+        case_id = self._extract_case_id_from_call(node.args[0])
+        if case_id:
+            self.cases.setdefault(list_name, []).append(case_id)
 
     def _extract_case_ids(self, node: ast.AST) -> Optional[List[str]]:
         """Extract case IDs from a supported expression."""
@@ -167,7 +223,18 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         }:
             if node.args and isinstance(node.args[0], ast.Constant):
                 return node.args[0].value
+        if isinstance(node.func, ast.Name) and not node.args:
+            return self.factory_case_ids.get(node.func.id)
 
+        return None
+
+    def _extract_factory_case_id(self, node: ast.FunctionDef) -> Optional[str]:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            case_id = self._extract_case_id_from_call(child.value)
+            if case_id:
+                return case_id
         return None
 
 

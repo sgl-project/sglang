@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from packaging import version
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
+
 PAD_SLOT_ID = -1
 
 TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
@@ -159,7 +161,11 @@ def _selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -338,6 +344,9 @@ def _selective_scan_update_kernel(
             state_to_store = state.to(state_ptrs.dtype.element_ty)
         tl.store(state_ptrs, state_to_store, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def selective_state_update(
     state,
@@ -486,6 +495,8 @@ def selective_state_update(
         else None
     )
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
@@ -553,4 +564,5 @@ def selective_state_update(
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
             num_warps=num_warps,
+            **pdl_kwargs,
         )

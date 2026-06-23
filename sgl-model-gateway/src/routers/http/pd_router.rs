@@ -29,9 +29,9 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -790,6 +790,28 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    /// Builds the text used for cache-aware routing of a chat request.
+    ///
+    /// This must reflect the *full* conversation (system prompt, prior turns,
+    /// the current message and tool context) so that KV-cache prefix matching
+    /// routes to the worker that actually shares the most prefix. Using only the
+    /// first message ignores the conversation history that drives KV reuse in
+    /// multi-turn chats. See https://github.com/sgl-project/sglang/issues/26263.
+    ///
+    /// Returns `None` when the conversation has no text to route on, preserving
+    /// the prior behavior of not feeding an empty key into prefix matching.
+    fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
+        // `extract_text_for_routing` walks every message (system, prior turns,
+        // current message, tool content) and is the same routing text the regular
+        // (non-PD) router uses, keeping cache-aware routing consistent across both.
+        let text = body.extract_text_for_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -1422,18 +1444,7 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
+            Self::build_chat_request_text(body)
         } else {
             None
         };
@@ -1573,6 +1584,55 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_chat_request_text_uses_full_conversation() {
+        // Regression test for https://github.com/sgl-project/sglang/issues/26263
+        // Cache-aware routing must build its text from the full conversation, not
+        // just the first message, so that KV-cache prefix matching reflects what
+        // the worker will actually process in a multi-turn chat.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "First question about apples."},
+                {"role": "assistant", "content": "Apples are red."},
+                {"role": "user", "content": "Follow up question about oranges."}
+            ]
+        }))
+        .expect("valid chat request");
+
+        let text = PDRouter::build_chat_request_text(&body)
+            .expect("multi-message chat should produce routing text");
+
+        assert!(
+            text.contains("apples"),
+            "routing text must include earlier turns, got: {text:?}"
+        );
+        assert!(
+            text.contains("oranges"),
+            "routing text must include later turns (not only the first message), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_text_none_when_no_text() {
+        // When the conversation carries no text content, no routing text should
+        // be produced (None) rather than an empty string, preserving the prior
+        // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": ""}
+            ]
+        }))
+        .expect("valid chat request");
+
+        assert!(
+            PDRouter::build_chat_request_text(&body).is_none(),
+            "empty conversation text should produce None, not Some(\"\")"
+        );
     }
 
     #[tokio::test]
