@@ -253,6 +253,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "torch_npu",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -1612,6 +1613,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "torch_npu",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -5329,6 +5331,12 @@ class ServerArgs:
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if (self.moe_a2a_backend == "none" and is_npu():
+            self.moe_a2a_backend = "torch_npu"
+            logger.info(
+                    "Enable torch_npu as default backend on Ascend NPU."
+                )
 
         if self.moe_a2a_backend == "ascend_fuseep":
             self.ep_size = self.tp_size
