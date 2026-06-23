@@ -1,6 +1,3 @@
-"""Reference weights for the weight checker: a quantized weight in dequantized,
-encoding-invariant form. A new precision is a new ReferenceWeight subclass."""
-
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -19,12 +16,12 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 
-# Bound GPU memory: a full-size fp32 intermediate won't fit beside the KV-cache pool.
+# chunk to avoid too high GPU memory peak
 _CHUNK_NUMEL = 64 * 1024 * 1024
 
 
 class ReferenceWeight:
-    """A logical weight in encoding-invariant (dequantized) form."""
+    """Base class to get reference weight for all precisions."""
 
     @staticmethod
     def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
@@ -39,17 +36,15 @@ class ReferenceWeight:
         return binade * finfo.eps
 
     def iter_chunks(self) -> Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        """Yield (dequant, tolerance) cuda chunks bounded by _CHUNK_NUMEL. tolerance
-        is this side's per-element abs tolerance (ULP in dequant space), or None
-        when the format requires exact equality."""
         raise NotImplementedError
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-        """Full dequantized tensor, for checksum hashing."""
         raise NotImplementedError
 
 
 class Fp8BlockReference(ReferenceWeight):
+    """Deepseek-style FP8 quantization."""
+
     def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
         self.w_q = w_q
         self.w_s = w_s
@@ -107,7 +102,7 @@ def _compare_references(
 ) -> Tuple[bool, float, float, int]:
     """Chunked compare of two ReferenceWeights in dequant space. Returns
     (equal, max_abs_err, mean_abs_err, num_exceed); num_exceed counts elements
-    off by more than the combined per-side tolerance (NaN counts as exceeding)."""
+    off by more than the combined per-side tolerance."""
     equal = True
     max_abs_err = torch.zeros((), dtype=torch.float32)
     sum_abs_err = 0.0
@@ -122,9 +117,8 @@ def _compare_references(
         if torch.all(abs_diff == 0):
             continue
         equal = False
-        # Each side may deviate from the shared source weight by its own tolerance.
+        # |a_dq - e_dq| ≤ |a_dq - w| + |e_dq - w| ≤ a_tol + e_tol
         tol = 0.0 if e_tol is None or a_tol is None else e_tol + a_tol
-        # torch.maximum propagates NaN, unlike builtin max().
         max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
         sum_abs_err += abs_diff.sum().item()
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
@@ -133,8 +127,6 @@ def _compare_references(
 
 
 def select_quantization_method(quant_method) -> Optional[type]:
-    """Select the ReferenceWeight subclass for a module's quant_method: None if the
-    module is not a quantized weight layer, the subclass for a supported format."""
     if not isinstance(quant_method, (LinearMethodBase, FusedMoEMethodBase)):
         return None
     if isinstance(quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)):
