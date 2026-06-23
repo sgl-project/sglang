@@ -161,11 +161,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
-# PoC: in the MAX_LEN (equal per-rank padding) decode combine, replace the
-# MoE-internal post-experts all_reduce + dp_scatter with an equal-chunk
-# reduce_scatter implemented via aiter's custom (symmetric-memory) kernel.
-# Combines aiter-kernel speed with reduce_scatter's halved traffic. Default OFF.
-_AITER_RS = get_bool_env_var("SGLANG_USE_AITER_RS")
 _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
@@ -1597,7 +1592,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # combine traffic ~2x vs all_reduce. tp_size==attn_dp_size required so the
         # global buffer splits evenly into per-rank chunks.
         _use_aiter_rs = (
-            _AITER_RS
+            envs.SGLANG_USE_AITER_RS.get()
             and _use_tp_moe_gather
             and not _use_gatherv_pair
             and not should_use_dp_reduce_scatterv()

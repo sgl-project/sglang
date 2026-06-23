@@ -440,6 +440,9 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Aiter custom (symmetric-memory) reduce_scatter for the equal-chunk
+    # (MAX_LEN decode) DP-MoE combine; falls back to RCCL when unsupported.
+    SGLANG_USE_AITER_RS = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

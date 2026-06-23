@@ -51,7 +51,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -824,7 +823,7 @@ class GroupCoordinator:
         # for unsupported shape/size/topology so the caller uses RCCL.
         if not (
             is_hip()
-            and get_bool_env_var("SGLANG_USE_AITER_RS")
+            and envs.SGLANG_USE_AITER_RS.get()
             and self._has_aiter_custom_reduce_scatter()
             and input.is_contiguous()
             and output.is_contiguous()
