@@ -85,7 +85,7 @@ class TestHiSparseUnit(unittest.TestCase):
             torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
         cls.tp_group = torch.distributed.group.WORLD
 
-        from sglang.srt.mem_cache.memory_pool_host import (
+        from sglang.srt.mem_cache.pool_host.common import (
             ALLOC_MEMORY_FUNCS,
             alloc_with_pin_memory,
         )
@@ -154,7 +154,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        from sglang.srt.mem_cache.memory_pool_host import ALLOC_MEMORY_FUNCS
+        from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 
         ALLOC_MEMORY_FUNCS["cuda"] = cls._original_alloc
         if torch.distributed.is_initialized():
