@@ -557,13 +557,33 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
-        self.self_benchmark = (
-            SelfBenchmark(self) if self.server_args.benchmark_mode is not None else None
-        )
+        self.init_init_info_sender()
+
+        self.maybe_init_self_benchmark()
 
         maybe_revert_pr_fix()
 
         self.is_initializing = False
+
+    def init_init_info_sender(self) -> None:
+        self._init_info_pipe_writer = None
+        self._init_info_sent = False
+
+    def maybe_init_self_benchmark(self) -> None:
+        self.self_benchmark = None
+        if self.server_args.benchmark_mode is None:
+            return
+
+        if self.ps.pp_size > 1:
+            raise ValueError(
+                "--benchmark-mode is not supported with pipeline parallelism"
+            )
+        if self.enable_pdmux:
+            raise ValueError("--benchmark-mode is not supported with PD multiplexing")
+        if self.enable_overlap_mlx:
+            raise ValueError("--benchmark-mode is not supported with MLX overlap")
+
+        self.self_benchmark = SelfBenchmark(self)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -1507,6 +1527,23 @@ class Scheduler(
         }
 
         return result_dict
+
+    def register_init_info_pipe_writer(self, pipe_writer) -> None:
+        self._init_info_pipe_writer = pipe_writer
+
+    def should_defer_init_info(self) -> bool:
+        return self.self_benchmark is not None and self.self_benchmark.active
+
+    def send_init_info_once(self) -> None:
+        if self._init_info_sent:
+            return
+        if self._init_info_pipe_writer is None:
+            raise RuntimeError("Scheduler init-info pipe writer is not registered")
+        self._init_info_pipe_writer.send(self.get_init_info())
+        self._init_info_sent = True
+
+    def on_self_benchmark_finished(self) -> None:
+        self.send_init_info_once()
 
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
@@ -4444,8 +4481,12 @@ def run_scheduler_process(
             dp_rank,
         )
 
-        # Send initialization info back to the parent process
-        pipe_writer.send(scheduler.get_init_info())
+        # Send initialization info back to the parent process. Startup
+        # self-benchmarking is a readiness gate, so benchmark mode defers this
+        # until the sweep has completed and results are written.
+        scheduler.register_init_info_pipe_writer(pipe_writer)
+        if not scheduler.should_defer_init_info():
+            scheduler.send_init_info_once()
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
