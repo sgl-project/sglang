@@ -122,7 +122,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -171,7 +174,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -311,7 +317,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -360,7 +369,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -500,7 +512,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -549,7 +564,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi

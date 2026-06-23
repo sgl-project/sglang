@@ -21,6 +21,8 @@ This guide describes the best practice data for Qwen3-32B on the Ascend NPU.
 
 ## Optimal Configuration
 
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
+
 ### Qwen3-32B BF16 8P IN18K OUT4K 6ms
 
 **Model**: Qwen3-32B
@@ -212,8 +214,6 @@ python -m sglang.bench_serving \
     --num-prompts 400 \
     --random-range-ratio 1
 ```
-
-<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3-32B W8A8 2P IN3K5 OUT1K5 50ms
 
