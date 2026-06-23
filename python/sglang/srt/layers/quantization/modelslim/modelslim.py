@@ -177,6 +177,8 @@ class ModelSlimConfig(QuantizationConfig):
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
+            if layer.scheme is None:
+                return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
@@ -209,7 +211,7 @@ class ModelSlimConfig(QuantizationConfig):
             f"Unsupported Linear modelslim scheme: "
             f"{quant_schemes} in layer: {prefix}"
         )
-        return UnquantizedLinearMethod()
+        return None
 
     def get_moe_scheme(
         self,
