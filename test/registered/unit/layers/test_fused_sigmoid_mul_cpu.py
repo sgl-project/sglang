@@ -18,11 +18,7 @@ def _reference(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     hidden_dim = attn_output.shape[-1]
     attn_view = attn_output.reshape(-1, hidden_dim)
     gate_view = gate.reshape(-1, hidden_dim)
-    return (
-        (attn_view.float() * torch.sigmoid(gate_view.float()))
-        .to(dtype=attn_output.dtype)
-        .reshape_as(attn_output)
-    )
+    return (attn_view * torch.sigmoid(gate_view)).reshape_as(attn_output)
 
 
 class TestFusedSigmoidMulCPU(unittest.TestCase):
@@ -77,6 +73,7 @@ class TestFusedSigmoidMulCPU(unittest.TestCase):
             out = elementwise.fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         self.assertEqual(out.data_ptr(), input_ptr)
+        self.assertTrue(torch.equal(out, expected))
         torch.testing.assert_close(out, expected)
 
 
