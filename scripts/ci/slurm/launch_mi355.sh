@@ -25,6 +25,13 @@
 #                       container (default: /it-share/model_coverage)
 #   NODELIST          - explicit comma-separated nodelist (size must equal the
 #                       recipe's prefill_nodes + decode_nodes)
+#   SLURM_EXCLUDE_NODES - comma-separated nodes to keep the job off of
+#                       (default: mia1-p01-g20). g20's ionic (AMD Pollara)
+#                       RDMA driver ABI is currently out of sync with the
+#                       container userspace, so the NICs enumerate as 0 devices
+#                       inside the container. g09 + g29 are a natively-matching
+#                       clean pair; excluding g20 keeps PD jobs on good NICs
+#                       until the fleet driver/firmware stack is standardized.
 
 set -euo pipefail
 set -x
@@ -154,6 +161,14 @@ if [ -n "${NODELIST:-}" ]; then
     NODELIST_OPT=(--nodelist "$NODELIST")
 fi
 
+# Keep PD jobs off nodes with a known-bad in-container RDMA stack. g20's ionic
+# driver ABI is out of sync (0 NIC devices in-container); g09 + g29 are clean.
+EXCLUDE_OPT=()
+SLURM_EXCLUDE_NODES="${SLURM_EXCLUDE_NODES:-mia1-p01-g20}"
+if [ -n "$SLURM_EXCLUDE_NODES" ] && [ -z "${NODELIST:-}" ]; then
+    EXCLUDE_OPT=(--exclude "$SLURM_EXCLUDE_NODES")
+fi
+
 JOB_ID=$(sbatch --parsable \
     --exclusive \
     -N "$NNODES" -n "$NNODES" --ntasks-per-node=1 \
@@ -165,6 +180,7 @@ JOB_ID=$(sbatch --parsable \
     --output "$LOGS_DIR/slurm-%j.out" \
     --error "$LOGS_DIR/slurm-%j.err" \
     "${NODELIST_OPT[@]}" \
+    "${EXCLUDE_OPT[@]}" \
     --export=ALL,JOB_ENV="$JOB_ENV" \
     "$GITHUB_WORKSPACE/scripts/ci/slurm/mi355/pd_disagg.slurm")
 
