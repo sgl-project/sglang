@@ -71,6 +71,14 @@ Move that body into `FooManager` (its `__init__` or a factory) plus a `(maybe_)i
 
 When the residue outgrows pseudocode, that is the signal to extract a dedicated coordinator — not to keep inlining.
 
+### Pass what the collaborator needs, not the god object
+
+When you extract domain logic into a collaborator (a factory, an initializer, a pipeline) in its own module, give it the **specific values** it needs — `model_config`, `device`, the sizes — not the whole frozen object (`ModelRunner`, `Scheduler`). Passing the god object back into the collaborator re-creates the coupling the split was meant to remove: the module still reads dozens of attributes off it, can't be unit-tested without building the whole class, and every field rename ripples back in.
+
+- Default to **narrow, keyword args**. Reference shape: `layer_setup.resolve_layer_indices(*, model, model_config, is_draft_worker, spec_algorithm)`.
+- Return a small **frozen struct** and let the orchestrator assign it onto its own fields. The collaborator should not reach back in and mutate the god object.
+- If a leaf genuinely needs the live object — its constructor contract already takes the runner, or it reads state that mutates after init — confine that dependency to the **smallest leaf** and pass narrow args everywhere above it. Note why it can't be narrowed.
+
 ## 2. `__init__` style
 
 Apply when modifying the `__init__` of the three classes above.
