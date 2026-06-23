@@ -1139,7 +1139,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        self._load_kv_cache_scales()
+        ModelRunner.load_kv_cache_scales(model=self.model, server_args=self.server_args)
 
         self._resolve_sliding_window_size()
 
@@ -1331,22 +1331,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-    def _load_kv_cache_scales(self) -> None:
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if self.server_args.quantization_param_path is not None:
-                if callable(getattr(self.model, "load_kv_cache_scales", None)):
-                    self.model.load_kv_cache_scales(
-                        self.server_args.quantization_param_path
-                    )
+    @staticmethod
+    def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
+        if server_args.kv_cache_dtype == "fp8_e4m3":
+            if server_args.quantization_param_path is not None:
+                if callable(getattr(model, "load_kv_cache_scales", None)):
+                    model.load_kv_cache_scales(server_args.quantization_param_path)
                     logger.info(
                         "Loaded KV cache scaling factors from %s",
-                        self.server_args.quantization_param_path,
+                        server_args.quantization_param_path,
                     )
                 else:
                     raise RuntimeError(
                         "Using FP8 KV cache and scaling factors provided but "
                         "model %s does not support loading scaling factors.",
-                        self.model.__class__,
+                        model.__class__,
                     )
             else:
                 logger.warning(
