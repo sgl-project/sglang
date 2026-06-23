@@ -3051,16 +3051,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
-                category = (
-                    "target_verify"
-                    if forward_batch.forward_mode.is_target_verify()
-                    else "extend"
-                )
                 # TODO: device_timer.wrap is too broad here — it also includes
                 # load_batch time. Move timing into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 ctx = (
-                    self.device_timer.wrap(metadata={"category": category})
+                    self.device_timer.wrap(metadata={"category": "extend"})
                     if self.device_timer
                     else contextlib.nullcontext()
                 )
