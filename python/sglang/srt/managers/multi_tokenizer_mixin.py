@@ -163,6 +163,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -253,6 +256,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -678,16 +684,9 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID.
-
-    Supports override via SGLANG_GRANIAN_PARENT_PID for workers whose
-    multiprocessing parent PID differs from the shared-memory owner.
     """
-    from sglang.srt.environ import envs
-
-    override = envs.SGLANG_GRANIAN_PARENT_PID.get()
-    if override is not None:
-        return override
+    Get the main process ID.
+    """
     return multiprocessing.current_process()._parent_pid
 
 

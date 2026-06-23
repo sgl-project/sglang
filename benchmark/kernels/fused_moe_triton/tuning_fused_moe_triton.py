@@ -248,8 +248,10 @@ class BenchmarkWorker:
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
-        # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # on the respective GPU. Ray isolates each worker to a single visible
+        # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
+        # ROCm using the global ray gpu id here raises "invalid device ordinal".
+        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
