@@ -711,8 +711,7 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params",
-              "docs/basic_usage/aws_sagemaker"
+              "docs/basic_usage/sampling_params"
             ]
           },
           {
@@ -721,7 +720,6 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
-              "docs/advanced_features/object_storage",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
@@ -757,6 +755,8 @@
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
+              "docs/advanced_features/model_loading",
+              "docs/advanced_features/object_storage",
               "docs/advanced_features/checkpoint_engine",
               "docs/advanced_features/sglang_for_rl"
             ]
@@ -833,13 +833,14 @@
               "docs/references/production_metrics",
               "docs/references/production_request_trace",
               {
-                "group": "Multi-Node Deployment",
+                "group": "Deployment",
                 "pages": [
                   "docs/references/multi_node_deployment/multi_node_index",
                   "docs/references/multi_node_deployment/multi_node",
                   "docs/references/multi_node_deployment/deploy_on_k8s",
                   "docs/references/multi_node_deployment/lws_pd/lws_pd_deploy",
-                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd"
+                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd",
+                  "docs/basic_usage/aws_sagemaker"
                 ]
               },
               "docs/references/custom_chat_template",
