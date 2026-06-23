@@ -91,6 +91,10 @@ class DSGraphState:
     # served bf16/fp16 query is cast into this in place (copy_), so the absorbed
     # v_h build never calls queries.to(torch.float32) on the hot path.
     scratch_absorbed_q: Optional[torch.Tensor] = None
+    # scratch_qnorm: fp32 [max_bs, num_local_heads] — per (batch, head) query norm
+    # for the cosine denominator, L2-normed in place from scratch_absorbed_qsel
+    # (the weighted channel-gather) before the absorbed paged score kernel runs.
+    scratch_qnorm: Optional[torch.Tensor] = None
     # Scratch bundle for the sequence-aware deterministic radix top-k
     # (topk_kernel.select_topk_sequence_order_triton). When present, the
     # graph-safe selection replaces the two full-width torch.topk passes.
@@ -108,6 +112,9 @@ class DSGraphState:
     # copy_() into these views before calling retrieve_topk_graph_safe.
     scratch_req_pool_indices: Optional[torch.Tensor] = None  # int32 [max_bs]
     scratch_seq_lens: Optional[torch.Tensor] = None  # int32 [max_bs]
+    # Per-row current decode logical index (seq_len-1), built in place for the
+    # include_current_slot force-include scatter. int64 for scatter_'s index dtype.
+    scratch_cur_index: Optional[torch.Tensor] = None  # int64 [max_bs]
     # logical_to_physical's Triton kernel atomically accumulates the
     # bad-req_pool count here. Zeroed on every call.
     lp_error_scratch: Optional[torch.Tensor] = None  # int32 [1]
@@ -198,8 +205,10 @@ def allocate_graph_state(
     scratch_absorbed_qsel = None
     scratch_absorbed_sel_i64 = None
     scratch_absorbed_q = None
+    scratch_qnorm = None
     scratch_req_pool_indices = None
     scratch_seq_lens = None
+    scratch_cur_index = None
     lp_error_scratch = None
     scratch_topk_hist = None
     scratch_topk_key_prefix = None
@@ -265,6 +274,11 @@ def allocate_graph_state(
             dtype=torch.int32,
             device=device,
         )
+        scratch_cur_index = torch.zeros(
+            (max_bs,),
+            dtype=torch.int64,
+            device=device,
+        )
         lp_error_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
         if score_reduce_bf16:
             scratch_scores_bf16 = torch.zeros(
@@ -298,6 +312,13 @@ def allocate_graph_state(
             _q_width = qk_nope_head_dim if qk_nope_head_dim > 0 else label_dim
             scratch_absorbed_q = torch.zeros(
                 (max_bs, num_local_heads, _q_width),
+                dtype=torch.float32,
+                device=device,
+            )
+            # Per (batch, head) query norm for the cosine denominator — L2-normed
+            # in place from scratch_absorbed_qsel before the paged score kernel.
+            scratch_qnorm = torch.zeros(
+                (max_bs, num_local_heads),
                 dtype=torch.float32,
                 device=device,
             )
@@ -354,6 +375,7 @@ def allocate_graph_state(
         scratch_absorbed_qsel=scratch_absorbed_qsel,
         scratch_absorbed_sel_i64=scratch_absorbed_sel_i64,
         scratch_absorbed_q=scratch_absorbed_q,
+        scratch_qnorm=scratch_qnorm,
         scratch_topk_hist=scratch_topk_hist,
         scratch_topk_key_prefix=scratch_topk_key_prefix,
         scratch_topk_quota=scratch_topk_quota,
@@ -364,6 +386,7 @@ def allocate_graph_state(
         topk_block=topk_block,
         scratch_req_pool_indices=scratch_req_pool_indices,
         scratch_seq_lens=scratch_seq_lens,
+        scratch_cur_index=scratch_cur_index,
         lp_error_scratch=lp_error_scratch,
     )
 
@@ -398,6 +421,7 @@ def capture_decode_step(
     max_seq_len: int = 0,
     absorbed_latent_fp8: Optional[torch.Tensor] = None,
     absorbed_latent_scales: Optional[torch.Tensor] = None,
+    key_norm_cache: Optional[torch.Tensor] = None,
 ) -> Callable[[], Tuple[torch.Tensor, torch.Tensor]]:
     """Capture one ``retrieve_topk`` call and return a replayable closure.
 
@@ -526,6 +550,10 @@ def capture_decode_step(
                 head_agg=getattr(selector.config, "head_agg", "max"),
                 anchor_mode=getattr(selector.config, "anchor_mode", "off"),
                 anchor_budget=getattr(selector.config, "anchor_budget", 0),
+                include_current_slot=bool(
+                    getattr(selector.config, "include_current_slot", False)
+                ),
+                scratch_cur_index=state.scratch_cur_index,
                 absorbed_latent_fp8=absorbed_latent_fp8,
                 absorbed_latent_scales=absorbed_latent_scales,
                 absorbed_w_sel=getattr(selector, "absorbed_w_sel", None),
@@ -533,6 +561,8 @@ def capture_decode_step(
                 scratch_absorbed_qsel=state.scratch_absorbed_qsel,
                 scratch_absorbed_sel_i64=state.scratch_absorbed_sel_i64,
                 scratch_absorbed_q=state.scratch_absorbed_q,
+                key_norm_cache=key_norm_cache,
+                scratch_qnorm=state.scratch_qnorm,
             )
         else:
             out_idx, out_len = selector.retrieve_topk(
