@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -124,7 +125,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, mr: ModelRunner):
         # Determine effective number of layers for KV cache
-        if mambaish := mr.mambaish_config:
+        if mambaish := mambaish_config(mr.model_config):
             effective_layer_ids = [
                 i
                 for i in mambaish.full_attention_layer_ids
