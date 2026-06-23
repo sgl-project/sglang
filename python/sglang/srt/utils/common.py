@@ -539,11 +539,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
