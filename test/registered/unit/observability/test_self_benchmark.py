@@ -131,6 +131,32 @@ class TestSelfBenchmark(CustomTestCase):
                 output = json.load(f)
             self.assertIn("results", output)
 
+    def test_timeout_finishes_even_with_unfinished_current_point(self):
+        with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            scheduler = _make_scheduler(output_path)
+            calls = []
+            scheduler.on_self_benchmark_finished = lambda: calls.append("done")
+            benchmark = SelfBenchmark(scheduler)
+            point = BenchmarkPoint(point_type="prefill", isl=10)
+            benchmark.phase = BenchmarkPhase.SWEEP
+            benchmark._grid = [point]
+            benchmark._grid_index = 0
+            benchmark._current = BenchmarkPointResult(point=point)
+            benchmark._active_reqs = [_FakeReq(finished=False)]
+            benchmark._deadline_monotonic = 0
+
+            benchmark.maybe_schedule_next()
+
+            self.assertEqual(calls, ["done"])
+            self.assertFalse(benchmark.active)
+            self.assertIsNone(benchmark._current)
+            self.assertEqual(benchmark._active_reqs, [])
+            with open(output_path) as f:
+                output = json.load(f)
+            self.assertTrue(output["timed_out"])
+            self.assertEqual(output["results"], [])
+
     def test_decode_point_ignores_setup_prefill_until_decode_pass(self):
         benchmark = SelfBenchmark(_make_scheduler("/tmp/unused.json"))
         point = BenchmarkPoint(point_type="decode", context_length=8, batch_size=2)
