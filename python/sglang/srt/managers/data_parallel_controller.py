@@ -14,13 +14,14 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import psutil
 import setproctitle
@@ -69,6 +70,41 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
+def _fast_chain_hash(token_ids: List[int], start: int, end: int, prior: bytes) -> bytes:
+    """Deterministic chained hash: SHA256 on token repr bytes.
+
+    Unlike Python builtin hash(), SHA256 is consistent across processes.
+    Handles both int and tuple token IDs (e.g. EAGLE bigram mode).
+    """
+    h = hashlib.sha256()
+    if prior:
+        h.update(prior)
+    h.update(repr(list(token_ids[start:end])).encode())
+    return h.digest()
+
+
+def estimate_prefix_match(
+    token_ids: List[int],
+    digest_entries: Dict[bytes, int],
+    chunk_size: int,
+) -> int:
+    """Estimate prefix match length against a CacheDigest's prefix_entries.
+
+    Uses the same chained-hash scheme as RadixCache.build_cache_digest() so
+    the hashes are comparable.  Walks chunk-aligned boundaries until the
+    first miss.
+    """
+    matched_len = 0
+    chain_hash = b""
+    for end in range(chunk_size, len(token_ids) + 1, chunk_size):
+        chain_hash = _fast_chain_hash(token_ids, end - chunk_size, end, chain_hash)
+        if chain_hash in digest_entries:
+            matched_len = end
+        else:
+            break
+    return matched_len
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -76,6 +112,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    CACHE_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -92,6 +129,8 @@ class DPBudget:
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.max_total_tokens = [0] * dp_size
+        self.cache_digests: List[Optional[object]] = [None] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -103,6 +142,9 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_total_tokens[load.dp_rank] = load.max_total_num_tokens
+            if hasattr(load, "cache_digest") and load.cache_digest is not None:
+                self.cache_digests[load.dp_rank] = load.cache_digest
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -153,6 +195,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.CACHE_AWARE: self.cache_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -168,6 +211,10 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+
+        # Cache-aware routing params
+        self.dp_routing_digest_chunk_size = server_args.dp_routing_digest_chunk_size
+        self.dp_routing_max_extra_reqs = server_args.dp_routing_max_extra_reqs
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -642,6 +689,126 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         self.workers[target_worker].send_pyobj(req)
+
+    def _rank_available_tokens(self, rank: int) -> float:
+        max_tok = self.dp_budget.max_total_tokens[rank]
+        if max_tok <= 0:
+            return float("inf")
+        used = self.dp_budget.total_tokens[rank]
+        digest = self.dp_budget.cache_digests[rank]
+        evictable = digest.evictable_tokens if digest is not None else 0
+        return max_tok - used + evictable
+
+    def cache_aware_scheduler(self, req: Req):
+        """Dispatch considering both prefix cache affinity and request balance.
+
+        Logic:
+          1. Estimate cache match length on each active DP rank.
+          2. Pick the ranks with the longest match.
+          3. Among those, pick the one with fewest requests.
+          4. But if that rank already has more requests than the
+             least-loaded rank by >= max_extra_reqs, ignore cache
+             and pick the least-loaded rank instead.
+          5. If the chosen rank doesn't have enough capacity for the
+             request, pick the least-loaded rank that does.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        rid = getattr(req, "rid", "")
+        if isinstance(rid, str) and rid.startswith("HEALTH_CHECK_"):
+            self.round_robin_scheduler(req)
+            return
+
+        dp_size = len(self.workers)
+        chunk_size = self.dp_routing_digest_chunk_size
+        max_extra = self.dp_routing_max_extra_reqs
+
+        token_ids = getattr(req, "input_ids", None)
+        if token_ids is None:
+            token_ids = getattr(req, "origin_input_ids", None)
+
+        active_ranks = [i for i in range(dp_size) if self.status[i]]
+        if not active_ranks:
+            active_ranks = list(range(dp_size))
+
+        has_any_digest = any(
+            self.dp_budget.cache_digests[r] is not None for r in active_ranks
+        )
+        if not has_any_digest or not token_ids or len(token_ids) < chunk_size:
+            estimated_tokens = len(token_ids) if token_ids else 0
+            target = self.dp_budget.dispatch(
+                LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+            )
+            if target is None:
+                target = active_ranks[self.round_robin_counter % len(active_ranks)]
+                self.round_robin_counter += 1
+            self.workers[target].send_pyobj(req)
+            return
+
+        match_info: Dict[int, int] = {}
+        for rank in active_ranks:
+            digest = self.dp_budget.cache_digests[rank]
+            if digest is not None and digest.prefix_entries:
+                match_info[rank] = estimate_prefix_match(
+                    token_ids, digest.prefix_entries, chunk_size
+                )
+            else:
+                match_info[rank] = 0
+
+        best_match = max(match_info.values())
+        if best_match > 0:
+            candidates = [r for r in active_ranks if match_info[r] == best_match]
+        else:
+            candidates = active_ranks
+
+        best_rank = min(candidates, key=lambda r: self.dp_budget.total_requests[r])
+
+        min_reqs = min(self.dp_budget.total_requests[r] for r in active_ranks)
+        if self.dp_budget.total_requests[best_rank] - min_reqs >= max_extra:
+            best_rank = min(
+                active_ranks, key=lambda r: self.dp_budget.total_requests[r]
+            )
+
+        input_len = len(token_ids)
+        needed = input_len - match_info.get(best_rank, 0)
+        available = self._rank_available_tokens(best_rank)
+        if needed > available:
+            viable = [
+                r
+                for r in active_ranks
+                if r != best_rank
+                and self._rank_available_tokens(r) >= input_len - match_info.get(r, 0)
+            ]
+            if viable:
+                best_rank = min(viable, key=lambda r: self.dp_budget.total_requests[r])
+            else:
+                # No rank has enough capacity for this request.  Cache
+                # affinity is moot here, so fall back to the rank with the
+                # most free space (largest available - needed), breaking ties
+                # by fewest requests.  This keeps us from piling onto a rank
+                # we already know is over capacity.
+                best_rank = max(
+                    active_ranks,
+                    key=lambda r: (
+                        self._rank_available_tokens(r)
+                        - (input_len - match_info.get(r, 0)),
+                        -self.dp_budget.total_requests[r],
+                    ),
+                )
+
+        self.dp_budget.total_requests[best_rank] += 1
+        logger.debug(
+            "[CacheAware] req=%s input_len=%d -> rank=%d match=%d "
+            "matches=%s reqs=%s",
+            getattr(req, "rid", "?"),
+            len(token_ids),
+            best_rank,
+            match_info.get(best_rank, 0),
+            match_info,
+            {r: self.dp_budget.total_requests[r] for r in active_ranks},
+        )
+        self.workers[best_rank].send_pyobj(req)
 
     def event_loop(self):
         while True:

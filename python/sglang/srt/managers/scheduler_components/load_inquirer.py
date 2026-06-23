@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    CacheDigest,
     DisaggregationMetrics,
     GetLoadsReqInput,
     GetLoadsReqOutput,
@@ -51,6 +52,7 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    get_tree_cache: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -212,6 +214,34 @@ class SchedulerLoadInquirer:
                 retracted=self.get_stats().num_retracted_reqs,
             )
 
+        cache_digest = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.disaggregation_decode_enable_radix_cache
+        ):
+            tree_cache = self.get_tree_cache()
+            if hasattr(tree_cache, "build_cache_digest"):
+                dirty = getattr(tree_cache, "_digest_dirty", True)
+                # Only the expensive prefix_entries (a full tree walk) is
+                # cached behind _digest_dirty.  The capacity scalars below are
+                # cheap O(1) reads and MUST be re-sampled every snapshot;
+                # otherwise the DP controller does capacity checks against a
+                # stale evictable_tokens and can over- or under-commit a rank.
+                if dirty or not hasattr(tree_cache, "_cached_prefix_entries"):
+                    chunk_size = self.server_args.dp_routing_digest_chunk_size
+                    digest_data = tree_cache.build_cache_digest(
+                        chunk_size=chunk_size,
+                    )
+                    tree_cache._cached_prefix_entries = digest_data["prefix_entries"]
+                cache_digest = CacheDigest(
+                    dp_rank=self.ps.dp_rank,
+                    prefix_entries=tree_cache._cached_prefix_entries,
+                    total_cached_tokens=tree_cache.total_size(),
+                    evictable_tokens=tree_cache.evictable_size(),
+                    protected_tokens=tree_cache.protected_size(),
+                    timestamp=time.time(),
+                )
+
         return GetLoadsReqOutput(
             dp_rank=self.ps.dp_rank,
             timestamp=time.time(),
@@ -231,4 +261,5 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            cache_digest=cache_digest,
         )
