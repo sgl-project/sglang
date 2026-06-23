@@ -856,3 +856,36 @@ class LoRAManager:
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
+
+def _init_lora_cuda_graph_moe_buffers(
+    *,
+    server_args: ServerArgs,
+    model: torch.nn.Module,
+    lora_manager: LoRAManager,
+    dtype: torch.dtype,
+):
+    """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+
+    Must be called before init_memory_pool() so that memory profiling
+    sees the reduced available memory and sizes KV cache correctly.
+    All MoE LoRA layers share one set of buffers (managed by the
+    lora_backend) since they execute sequentially during forward.
+
+    Phase 2 (dense LoRA batch metadata) is handled later in
+    CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+    because it needs capture-time parameters (max_bs, num_tokens_per_req)
+    that are only available at that stage.
+    """
+    from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+    max_bs = server_args.cuda_graph_config.decode.max_bs
+    max_loras = server_args.max_loras_per_batch
+    for module in model.modules():
+        if isinstance(module, FusedMoEWithLoRA):
+            lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)
+            logger.info(
+                f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                f"(max_bs={max_bs}, max_loras={max_loras})"
+            )
+            break
