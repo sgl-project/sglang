@@ -53,7 +53,13 @@ class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
     def copy_to_cpu(self):
-        self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
+        # May run on a dedicated copy stream (overlap scheduling); record_stream
+        # keeps the GPU source alive until that stream drains the D2H so the
+        # allocator can't recycle it mid-copy.
+        src = self.eplb_balancedness
+        self.eplb_balancedness = src.to("cpu", non_blocking=True)
+        if src.is_cuda:
+            src.record_stream(torch.cuda.current_stream(src.device))
 
 
 class ExpertDistributionRecorder(ABC):

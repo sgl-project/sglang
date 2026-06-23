@@ -79,8 +79,8 @@ class BaseHostCache:
 @dataclasses.dataclass
 class TopkCaptureOutput:
     """Holds GPU tensors captured during forward for overlap scheduling.
-    Call copy_to_cpu() inside forward stream (before copy_done.record()),
-    then finalize() after copy_done.synchronize().
+    Call copy_to_cpu() before copy_done.record() (it may run on the dedicated
+    result-copy stream), then finalize() after copy_done.synchronize().
     """
 
     out_cache_loc: torch.Tensor
@@ -88,8 +88,18 @@ class TopkCaptureOutput:
     host_cache: BaseHostCache
 
     def copy_to_cpu(self):
-        self.out_cache_loc = self.out_cache_loc.to("cpu", non_blocking=True)
-        self.topk = self.topk.to("cpu", non_blocking=True)
+        # May run on a dedicated copy stream (overlap scheduling); record_stream
+        # keeps each GPU source alive until that stream drains the D2H so the
+        # allocator can't recycle it mid-copy. The copy stream must already wait
+        # on the producer stream (Scheduler.run_batch).
+        src = self.out_cache_loc
+        self.out_cache_loc = src.to("cpu", non_blocking=True)
+        if src.is_cuda:
+            src.record_stream(torch.cuda.current_stream(src.device))
+        src = self.topk
+        self.topk = src.to("cpu", non_blocking=True)
+        if src.is_cuda:
+            src.record_stream(torch.cuda.current_stream(src.device))
 
     def finalize(self):
         self.host_cache.buffer[self.out_cache_loc] = self.topk
