@@ -243,11 +243,8 @@ def _random_like(t: torch.Tensor):
 
 
 def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
-    """Apply the router across the model: {weight_name: (ComparableWeight subclass,
-    scale_name)} for each weight in a module routed to a ComparableWeight. Weights
-    absent from the set (int4, mxfp8, unquantized, ...) compare raw.
-    select_comparable_weight raises for an unsupported quant format (e.g. nvfp4).
-    """
+    """Run the router over the model: {weight_name: (ComparableWeight subclass,
+    scale_name)} for each quantized weight; weights absent from the set compare raw."""
     quantized_set = {}
     for module_name, module in model.named_modules():
         comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
@@ -267,8 +264,8 @@ def _build_entries(
     skip_compare_names: Set[str],
     quantized_set: Optional[Dict[str, Tuple[type, str]]] = None,
 ) -> Iterable[Tuple[str, bool, ComparableWeight]]:
-    """Yields (name, should_compare, ComparableWeight): quantized weights become a
-    dequant-aware comparable (consuming their scale), everything else is raw."""
+    """Yields (name, should_compare, ComparableWeight); quantized weights consume
+    their scale, everything else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
     scale_names = {scale for _, scale in quantized_set.values()}

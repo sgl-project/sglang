@@ -114,9 +114,8 @@ class RawComparable(ComparableWeight):
 def _compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
 ) -> Tuple[bool, float, float, int]:
-    """Chunked compare of two ComparableWeights in dequant space. Returns
-    (equal, max_abs_err, mean_abs_err, num_exceed); num_exceed counts elements
-    off by more than the combined per-side tolerance."""
+    """Chunked dequant-space compare; returns (equal, max_abs_err, mean_abs_err,
+    num_exceed), num_exceed counting elements past the combined per-side tolerance."""
     equal = True
     max_abs_err = torch.zeros((), dtype=torch.float32)
     sum_abs_err = 0.0
@@ -141,16 +140,11 @@ def _compare_weights(
 
 
 def select_comparable_weight(quant_method) -> Optional[type]:
-    """Single router: map a module's quant_method to its ComparableWeight subclass.
-
-    - fp8 block quant -> Fp8BlockComparable: its scale is requantized to ue8m0 on
-      load, so the same weight lands as two different fp8 encodings; compare in
-      dequant space with ULP tolerance.
-    - nvfp4 -> raise: e4m3 fractional block scale + max-recomputed global scale is
-      likewise non-bit-exact, but has no ComparableWeight yet.
-    - everything else -> None (raw exact compare): int4 (fixed integer scale) and
-      mxfp8/mxfp4 (e8m0, same quantizer on both sides, no load-time requant) all
-      transfer bit-exact.
+    """Map a module's quant_method to its ComparableWeight subclass; None means raw
+    (bit-exact) compare. fp8 block quant -> Fp8BlockComparable: load-time ue8m0
+    requant yields two valid fp8 encodings, so compare in dequant space with ULP
+    tolerance. nvfp4 -> raise (non-bit-exact, unsupported). int4/mxfp8/mxfp4 and
+    unquantized -> None.
     """
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
