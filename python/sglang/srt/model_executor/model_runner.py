@@ -147,6 +147,9 @@ from sglang.srt.model_executor.model_runner_components.msprobe import (
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
     MemoryPoolConfig,
 )
+from sglang.srt.model_executor.model_runner_components.pp_proxy import (
+    resolve_pp_proxy_topk_size,
+)
 from sglang.srt.model_executor.model_runner_components.quantization_checks import (
     check_quantized_moe_compatibility,
 )
@@ -1974,25 +1977,3 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
-
-
-from typing import TYPE_CHECKING, Optional
-
-from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
-
-if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
-
-
-def resolve_pp_proxy_topk_size(
-    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
-) -> Optional[int]:
-    hf_config = model_config.hf_text_config
-    if (
-        pp_size <= 1
-        or pp_rank == 0
-        or not is_deepseek_dsa(hf_config)
-        or not dsa_layer_skips_topk(hf_config, start_layer)
-    ):
-        return None
-    return getattr(hf_config, "index_topk", None)
