@@ -703,20 +703,22 @@ def _extract_legacy_suites(content):
     return out
 
 
-# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
-# instead of `runner_config=`, so they carry no runner metadata of their own.
+# Legacy single-string CUDA suites register with `suite=` instead of
+# `runner_config=`, so they carry no runner metadata of their own.
 # Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
-# matches the runner the nightly/weekly pipeline actually uses (see
-# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
-# dispatch a single nightly/weekly test. The runner label, install script,
-# timeout, grace_blackwell, and rdma_devices are then resolved from
-# runner_configs.yml as usual, keeping that file the single source of truth for
-# runner details.
+# matches the suite's pipeline, so /rerun-test can still dispatch a single test.
+# The runner label, install script, timeout, grace_blackwell, and rdma_devices are
+# then resolved from runner_configs.yml as usual, keeping that file the single
+# source of truth for runner details.
 #
 # Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
 # and non-CUDA suites (npu/amd) are intentionally absent and stay
 # non-dispatchable until a matching runner_config exists.
 _LEGACY_SUITE_TO_RUNNER_CONFIG = {
+    "base-b-kernel-unit-1-gpu-large": "1-gpu-large",
+    "base-b-kernel-unit-1-gpu-b200": "4-gpu-b200",
+    "base-b-kernel-unit-8-gpu-h200": "8-gpu-h200",
+    "base-b-kernel-benchmark-1-gpu-large": "1-gpu-large",
     "nightly-1-gpu": "1-gpu-large",
     "nightly-kernel-1-gpu": "1-gpu-large",
     "nightly-eval-text-2-gpu": "2-gpu-large",
@@ -801,8 +803,8 @@ def detect_suite(file_path_from_test):
     and rdma_devices are all resolved from scripts/ci/runner_configs.yml — the
     same single source of truth that drives the main PR test pipeline.
 
-    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
-    too: each suite name is mapped to the matching runner_config via
+    Legacy single-string CUDA suites are dispatchable too: each suite name is
+    mapped to the matching runner_config via
     _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
 
     CPU files yield a single-element list. A file with no recognised (or no
@@ -825,8 +827,8 @@ def detect_suite(file_path_from_test):
             results.append(_resolve_runner_config(rc, full_path, suite))
         return results
 
-    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
-    # runner_config. Map each mappable suite to its runner_config and resolve.
+    # Legacy single-string CUDA suites: `suite=`, no runner_config. Map each
+    # mappable suite to its runner_config and resolve.
     legacy_suites = _extract_legacy_suites(content)
     mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
     if mappable:
