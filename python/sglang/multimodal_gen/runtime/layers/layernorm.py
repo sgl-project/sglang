@@ -485,7 +485,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             weight=weight,
             bias=bias,
             eps=self.eps,
-            impl_mode=0
+            impl_mode=0,
         )
         return output.to(origin_dtype)
 
