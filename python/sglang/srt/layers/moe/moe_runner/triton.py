@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -55,6 +56,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     b13: Optional[torch.Tensor] = None
     b2: Optional[torch.Tensor] = None
+    use_mxfp8: bool = False
     use_fp8_w8a8: bool = False
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
@@ -81,6 +83,40 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
+        if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+                fused_experts_mxfp8,
+            )
+
+            out = fused_experts_mxfp8(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                b1=quant_info.b13,
+                b2=quant_info.b2,
+                activation=self.config.activation,
+                is_gated=self.config.is_gated,
+                no_combine=self.config.no_combine,
+                inplace=self.config.inplace,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+                routed_scaling_factor=self.config.routed_scaling_factor,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_limit=self.config.gemm1_clamp_limit,
+                swiglu_limit=self.config.swiglu_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
+            )
+            return TritonRunnerOutput(hidden_states=out)
+
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
+
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
         )
@@ -142,30 +178,66 @@ def fused_experts_none_to_triton(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    output = fused_experts(
-        hidden_states=dispatch_output.hidden_states,
-        w1=quant_info.w13_weight,
-        w2=quant_info.w2_weight,
-        topk_output=dispatch_output.topk_output,
-        moe_runner_config=runner_config,
-        b1=quant_info.b13,
-        b2=quant_info.b2,
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        per_channel_quant=quant_info.per_channel_quant,
-        w1_scale=quant_info.w13_scale,
-        w2_scale=quant_info.w2_scale,
-        w1_zp=quant_info.w13_zp,
-        w2_zp=quant_info.w2_zp,
-        a1_scale=quant_info.a13_scale,
-        a2_scale=quant_info.a2_scale,
-        block_shape=quant_info.block_shape,
-    )
+    if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+            fused_experts_mxfp8,
+        )
+
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        output = fused_experts_mxfp8(
+            hidden_states=dispatch_output.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            activation=runner_config.activation,
+            is_gated=runner_config.is_gated,
+            no_combine=runner_config.no_combine,
+            inplace=runner_config.inplace,
+            apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            gemm1_alpha=runner_config.gemm1_alpha,
+            gemm1_limit=runner_config.gemm1_clamp_limit,
+            swiglu_limit=runner_config.swiglu_limit,
+            gate_up_interleaved=runner_config.gate_up_interleaved,
+        )
+    else:
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            fused_experts,
+        )
+
+        output = fused_experts(
+            hidden_states=dispatch_output.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_output=dispatch_output.topk_output,
+            moe_runner_config=runner_config,
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            use_fp8_w8a8=quant_info.use_fp8_w8a8,
+            use_int8_w8a8=quant_info.use_int8_w8a8,
+            use_int8_w8a16=quant_info.use_int8_w8a16,
+            use_int4_w4a16=quant_info.use_int4_w4a16,
+            per_channel_quant=quant_info.per_channel_quant,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            w1_zp=quant_info.w13_zp,
+            w2_zp=quant_info.w2_zp,
+            a1_scale=quant_info.a13_scale,
+            a2_scale=quant_info.a2_scale,
+            block_shape=quant_info.block_shape,
+        )
 
     return StandardCombineInput(
         hidden_states=output,

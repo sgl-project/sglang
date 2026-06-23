@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -30,7 +29,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_cuda_version,
     is_blackwell,
+    is_flashinfer_available,
     is_hip,
     is_npu,
     load_json_config,
@@ -65,6 +66,15 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _is_mnnvl_fabric_supported() -> bool:
+    if not is_flashinfer_available():
+        return False
+
+    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+    return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -233,15 +243,27 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        cls._buffer = Buffer(
-            group,
-            num_nvl_bytes,
-            num_rdma_bytes,
+        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+        buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            allow_mnnvl=use_mnnvl_fabric,
         )
+        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
+        # support, so cross-pod GB200/GB300 EP groups use
+        # cuMemImportFromShareableHandle instead of the intra-node-only
+        # cudaIpcOpenMemHandle. The DeepEP build we ship is keyed on the CUDA major
+        # version:
+        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
+        #            pass it when the device advertises fabric support.
+        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
+        #            auto-enables fabric in C++ when supported, so we skip it:
+        #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
+        is_cu12 = get_cuda_version()[0] == 12
+        if not is_cu12 and use_mnnvl_fabric:
+            buffer_kwargs["use_fabric"] = True
+
+        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
 
     @classmethod
@@ -437,11 +459,8 @@ class _DeepEPDispatcherImplBase:
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
-        """Update the DEEP_NORMAL_MODE_USE_INT8_QUANT environment variable."""
-        if self.use_fp8:
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        else:
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+        """TODO adapt different quantization schemes for base model and draft model on NPU"""
+        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict

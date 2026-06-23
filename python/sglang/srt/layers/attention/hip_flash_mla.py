@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
 
@@ -10,11 +11,9 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
-        import os
-
-        backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
+        backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
     else:
-        import flash_mla
+        import sgl_kernel.flash_mla as flash_mla
 
     if backend == "comparison":
         pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
