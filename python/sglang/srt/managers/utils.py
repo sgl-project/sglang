@@ -22,6 +22,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _async_d2h(t: torch.Tensor) -> torch.Tensor:
+    """Async device-to-host copy for overlap scheduling.
+
+    On CUDA the destination is pinned so the copy is genuinely async: a D2H to
+    pageable host memory blocks the calling (scheduler) thread until it
+    completes. The source is kept alive on the current stream via record_stream
+    so the caching allocator does not recycle it before this copy (which may run
+    on a separate copy stream) has drained. Non-CUDA falls back to a plain copy.
+    """
+    if not t.is_cuda:
+        return t.to("cpu", non_blocking=True)
+    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    cpu_t.copy_(t, non_blocking=True)
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return cpu_t
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -79,36 +96,36 @@ class GenerationBatchResult:
         """
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = (
-                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.next_token_logprobs = _async_d2h(
+                    self.logits_output.next_token_logprobs
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.input_token_logprobs = _async_d2h(
+                    self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
                 self.logits_output.next_token_top_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_top_logprobs_val
                 ]
             if self.logits_output.next_token_top_logprobs_idx is not None:
                 self.logits_output.next_token_top_logprobs_idx = [
-                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                    _async_d2h(x) if torch.is_tensor(x) else x
                     for x in self.logits_output.next_token_top_logprobs_idx
                 ]
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
         if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
+            self.logits_output.hidden_states = _async_d2h(
+                self.logits_output.hidden_states
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _async_d2h(self.accept_lens)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()
