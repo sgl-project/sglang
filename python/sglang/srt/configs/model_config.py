@@ -1329,6 +1329,18 @@ class ModelConfig:
             # while for GLM-4.6v, it is 'glm4v_moe_vision'.
         )
         needs_tf_v5 = is_glm_46vmoe
+        # Older transformers lacks the native hrm_text config, so it silently
+        # falls back to TransformersForCausalLM and loads fused weights as junk.
+        architectures = getattr(self.hf_config, "architectures", []) or []
+        is_hrm_text = getattr(self.hf_config, "model_type", None) == "hrm_text" or (
+            "HrmTextForCausalLM" in architectures
+        )
+        if is_hrm_text and version.parse(tf_version_str) < version.parse("5.9.0"):
+            raise ValueError(
+                f"HRM-Text (model type {self.hf_config.model_type!r}) requires "
+                f"transformers >= 5.9.0, but {tf_version_str} is installed. "
+                "Please upgrade transformers."
+            )
 
         tf_version = version.parse(tf_version_str)
         required_version = version.parse("5.0.0dev0")

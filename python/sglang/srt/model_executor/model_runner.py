@@ -1010,10 +1010,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # forward writes direction-dependent KV into many slots. Force the
         # required settings here rather than rely on the user passing flags.
         hf_config = self.model_config.hf_config
-        is_prefix_lm_recurrent = (
-            getattr(hf_config, "model_type", None) == "hrm_text"
-            or "HrmTextForCausalLM" in getattr(hf_config, "architectures", [])
-        ) and getattr(hf_config, "prefix_lm", False)
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
         if is_prefix_lm_recurrent:
             if server_args.attention_backend not in (None, "triton"):
                 logger.warning(
