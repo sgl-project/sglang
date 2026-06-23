@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
-_PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
+_PENDING_BASELINE_DUMPS: dict[str, tuple[PerformanceSummary, bool]] = {}
 _OPENAI_REQUEST_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600")
 )
@@ -137,6 +137,22 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
+
+    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
+    # mesh-correctness and must NOT run the paint/texture stages, whose
+    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
+    # that the shape-only path never produces. Inject a pipeline-config override
+    # disabling paint for these cases.
+    if server_args.custom_validator == "mesh":
+        import json as _json
+        import tempfile as _tempfile
+
+        _paint_off_cfg = os.path.join(
+            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
+        )
+        with open(_paint_off_cfg, "w") as _f:
+            _json.dump({"paint_enable": False}, _f)
+        extra_args += f" --config {_paint_off_cfg}"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
@@ -518,7 +534,7 @@ class DiffusionServerBase:
     def _dump_baseline_for_testcase(
         self,
         case: DiffusionTestCase,
-        summary: "PerformanceSummary",
+        summary: PerformanceSummary,
         missing_scenario: bool = False,
         measured_full_time: float | None = None,
     ) -> None:
