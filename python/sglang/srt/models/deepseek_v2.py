@@ -893,7 +893,7 @@ class DeepseekV2MoE(nn.Module):
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
         with torch.cuda.stream(self.alt_stream):
@@ -977,7 +977,7 @@ class DeepseekV2MoE(nn.Module):
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1169,8 +1169,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if not self.is_nextn
+                    else None
                 ),
                 **topk_kwargs,
             )
@@ -1405,8 +1409,12 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
+                    expert_location_dispatch_info=(
+                        ExpertLocationDispatchInfo.init_new(
+                            layer_id=self.layer_id,
+                        )
+                        if not self.is_nextn
+                        else None
                     ),
                 )
         else:
