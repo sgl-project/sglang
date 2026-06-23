@@ -165,8 +165,6 @@ class TestDeepEPNPULowLatencyStatic(unittest.TestCase):
                 topk_ids,
                 topk_weights,
                 num_max_dispatch_tokens_per_rank=16,
-                num_experts=128,
-                use_fp8=False,
             )
             self.assertEqual(os.environ.get("MOE_ENABLE_TOPK_NEG_ONE"), "1")
 
@@ -182,11 +180,12 @@ class TestDeepEPNPULowLatencyStatic(unittest.TestCase):
 
         self.assertIn("torch.int32 if _is_npu else torch.int64", helper_source)
         self.assertIn("MOE_ENABLE_TOPK_NEG_ONE", helper_source)
-        self.assertIn("topk_min < -1", helper_source)
         self.assertIn("num_max_dispatch_tokens_per_rank", helper_source)
         self.assertIn("raise RuntimeError", helper_source)
         self.assertIn(".contiguous()", helper_source)
-        self.assertIn("SGLANG_DEEPEP_DEBUG_DISPATCH", helper_source)
+        self.assertNotIn("SGLANG_DEEPEP_DEBUG_DISPATCH", helper_source)
+        self.assertNotIn("logger.warning", helper_source)
+        self.assertNotIn(".item()", helper_source)
 
     def test_low_latency_dispatch_uses_prepared_inputs_before_runtime_call(self):
         source = _read_deepep_source()
