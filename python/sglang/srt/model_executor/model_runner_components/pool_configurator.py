@@ -474,7 +474,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.online_c128_mtp_max_draft_tokens = (
             mr.server_args.max_speculative_num_draft_tokens or 0
         )
-        if mr.enable_hisparse:
+        if mr.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
