@@ -511,9 +511,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier on shared GPU buffers (req_to_token_pool / SWA mapping).
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
