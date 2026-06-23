@@ -1281,7 +1281,7 @@ class Scheduler(
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.token_table
+            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
