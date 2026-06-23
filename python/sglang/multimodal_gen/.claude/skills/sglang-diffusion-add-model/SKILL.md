@@ -65,7 +65,7 @@ See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stage
 | Model/VAE/DiT configs | `python/sglang/multimodal_gen/configs/models/dits/`, `vaes/`, `encoders/` |
 | Central registry | `python/sglang/multimodal_gen/registry.py` |
 | Model component registry | `python/sglang/multimodal_gen/runtime/models/registry.py` |
-| Current support list | `docs/diffusion/compatibility_matrix.md` |
+| Current support list | `docs_new/docs/sglang-diffusion/compatibility_matrix.mdx` |
 
 ---
 
