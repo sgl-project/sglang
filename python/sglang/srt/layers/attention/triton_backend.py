@@ -1656,8 +1656,10 @@ class TritonAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
             q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
-            o_for_decode = q.new_empty(
-                (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim)
+            o_for_decode = torch.empty(
+                (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
+                dtype=torch.float32,
+                device=q.device,
             )
             self.forward_metadata.attn_lse.fill_(-float("inf"))
             self.decode_attention_fwd(
