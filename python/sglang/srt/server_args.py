@@ -4658,6 +4658,10 @@ class ServerArgs:
             )
             and not self.use_mla_backend()
             and is_sm100_supported()
+            # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
+            # CUTLASS kernel aborts on at page_size>1. That path only works at
+            # page_size==1, so skip the 128 auto-force for it and keep the default.
+            and (self.speculative_eagle_topk or 0) <= 1
         ):
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
