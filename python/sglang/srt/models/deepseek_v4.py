@@ -474,6 +474,8 @@ class MQALayer(nn.Module):
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
+        if is_dp_attention_enabled() and hasattr(self, "wo_b"):
+            self.wo_b.use_dp_attention_reduce = True
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -925,6 +927,9 @@ class MQALayer(nn.Module):
         x_quant=None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            assert (
+                not self.wo_b.reduce_results or self.wo_b.use_dp_attention_reduce
+            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = get_attn_backend()
