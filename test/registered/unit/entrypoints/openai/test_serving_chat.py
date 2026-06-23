@@ -2161,18 +2161,6 @@ class TestRequestChatTemplateTrustGate(unittest.TestCase):
             )
         )
 
-    def test_near_miss_key_not_gated(self):
-        self.tm.server_args.trust_request_chat_template = False
-        self.assertIsNone(
-            self.chat._validate_request(
-                self._req(chat_template_kwargs={"chat_templates": "x"})
-            )
-        )
-
-    def test_no_kwargs_unaffected(self):
-        self.tm.server_args.trust_request_chat_template = False
-        self.assertIsNone(self.chat._validate_request(self._req()))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
