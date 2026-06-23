@@ -2597,10 +2597,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the two narrower runners alongside the main one; the hybrid worker's
         # verify() swaps decode_cuda_graph_runner to the K-matching runner
         # before each verify forward (keyed on spec_info.draft_token_num).
+        #
+        # NOTE: the two narrower graphs share the SAME attention backend
+        # instance as the main runner. The upstream DSA backend sizes its
+        # cuda-graph metadata (e.g. flashmla num_splits) for ONE K (the main
+        # K_suffix); capturing a second runner at a different K overwrites /
+        # mismatches that buffer ("tensor a (N) must match tensor b (M)").
+        # Until the DSA backend keys cuda-graph metadata by (bs, K), the extra
+        # graphs are OFF by default: SUFFIX runs on the main K_suffix graph and
+        # MTP / NONE fall back to eager (verify()'s runner-swap finds them
+        # absent and keeps the main runner, whose width check then routes the
+        # narrower batch to eager). Opt in with ARCTIC_HYBRID_EXTRA_GRAPHS=1
+        # on backends that support multi-K metadata.
         self.short_chain_graph_runner = None
         self.baseline_chain_graph_runner = None
         if (
-            not self.is_draft_worker
+            os.environ.get("ARCTIC_HYBRID_EXTRA_GRAPHS", "0") == "1"
+            and not self.is_draft_worker
             and self.spec_algorithm.is_hybrid_suffix_mtp()
             and self.decode_cuda_graph_runner is not None
             and self.device == "cuda"
@@ -2616,17 +2629,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             sc_tic = time.perf_counter()
             sc_before = get_available_gpu_memory(self.device, self.gpu_id)
-            self.short_chain_graph_runner = HybridShortChainCudaGraphRunner(self)
-            self.baseline_chain_graph_runner = HybridBaselineCudaGraphRunner(self)
-            sc_after = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                "Capture HYBRID short-chain (K=%d) + baseline (K=1) cuda graphs "
-                "end. elapsed=%.2f s, mem usage=%.2f GB, avail mem=%.2f GB.",
-                self.server_args.speculative_num_steps + 1,
-                time.perf_counter() - sc_tic,
-                sc_before - sc_after,
-                sc_after,
-            )
+            try:
+                self.short_chain_graph_runner = HybridShortChainCudaGraphRunner(self)
+                self.baseline_chain_graph_runner = HybridBaselineCudaGraphRunner(self)
+                sc_after = get_available_gpu_memory(self.device, self.gpu_id)
+                logger.info(
+                    "Capture HYBRID short-chain (K=%d) + baseline (K=1) cuda "
+                    "graphs end. elapsed=%.2f s, mem usage=%.2f GB, avail "
+                    "mem=%.2f GB.",
+                    self.server_args.speculative_num_steps + 1,
+                    time.perf_counter() - sc_tic,
+                    sc_before - sc_after,
+                    sc_after,
+                )
+            except Exception as e:
+                self.short_chain_graph_runner = None
+                self.baseline_chain_graph_runner = None
+                logger.warning(
+                    "HYBRID extra cuda graphs (short-chain/baseline) failed to "
+                    "capture (%s); MTP / NONE paths will run eager. This is "
+                    "expected on attention backends whose cuda-graph metadata "
+                    "is not keyed by (bs, K).",
+                    repr(e),
+                )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""
