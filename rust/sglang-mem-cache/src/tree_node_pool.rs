@@ -245,38 +245,15 @@ impl<K: ChildKeyType> TreeNode<K> {
     pub fn match_key(&self, key: &[K::Atom], page_size: PageSize) -> usize {
         let ps = page_size.get();
         let max_pages = self.key.len().min(key.len()) / ps;
-        if max_pages == 0 {
-            return 0;
-        }
-
-        // Galloping + binary search over page-aligned chunks.
-        let mut matched_pages = 0usize;
-        let mut step_pages = 1usize;
+        let mut matched_pages = 0;
         while matched_pages < max_pages {
-            let hi_pages = matched_pages.saturating_add(step_pages).min(max_pages);
             let start = matched_pages * ps;
-            let end = hi_pages * ps;
-            if self.key[start..end] == key[start..end] {
-                matched_pages = hi_pages;
-                step_pages = step_pages.saturating_mul(2).max(1);
-                continue;
+            let end = start + ps;
+            if self.key[start..end] != key[start..end] {
+                break;
             }
-
-            let mut lo_pages = matched_pages;
-            let mut bad_pages = hi_pages;
-            while bad_pages - lo_pages > 1 {
-                let mid_pages = lo_pages + (bad_pages - lo_pages) / 2;
-                let start = lo_pages * ps;
-                let end = mid_pages * ps;
-                if self.key[start..end] == key[start..end] {
-                    lo_pages = mid_pages;
-                } else {
-                    bad_pages = mid_pages;
-                }
-            }
-            return lo_pages * ps;
+            matched_pages += 1;
         }
-
         matched_pages * ps
     }
 }
@@ -368,40 +345,8 @@ impl<K: ChildKeyType> TreeNodePool<K> {
     /// Mint the next SWA lock-walk uuid, always advancing the counter.
     pub(crate) fn acquire_next_swa_uuid_for_lock(&mut self) -> u64 {
         let id = self.next_swa_uuid_for_lock;
-        #[allow(
-            clippy::expect_used,
-            reason = "u64 overflow at 1.8e19 acquires; effectively impossible"
-        )]
-        let next = id.checked_add(1).expect(
-            "acquire_next_swa_uuid_for_lock: u64 counter would overflow — \
-             exhausted SWA uuid space (>1.8e19 acquires)",
-        );
-        self.next_swa_uuid_for_lock = next;
+        self.next_swa_uuid_for_lock += 1;
         id
-    }
-
-    /// Free a pool slot without parent cleanup.
-    pub(crate) fn free_slot(&mut self, idx: NodeIdx) {
-        assert!(
-            self.nodes[idx].is_some(),
-            "free_slot: double-free at idx {idx} (pool size {})",
-            self.nodes.len()
-        );
-        if FullLRUSlot::data(self.get(idx)).in_list {
-            // Snapshot value_len + lock_ref before the remove.
-            let node = self.get(idx);
-            let value_len = node.key().len();
-            let lock_ref = node.lock_ref();
-            FullLRUSlot::remove(self, idx);
-            let state = FullLRUSlot::pool_state_mut(self);
-            if lock_ref == 0 {
-                state.unlocked_size -= value_len;
-            } else {
-                state.locked_size -= value_len;
-            }
-        }
-        self.nodes[idx] = None;
-        self.evicted_indices.push(idx);
     }
 
     /// Allocate a node in the pool. Returns its index.
