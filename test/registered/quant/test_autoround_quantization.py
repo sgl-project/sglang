@@ -77,7 +77,16 @@ class TestAutoRoundQuantization(CustomTestCase):
             model_config=model_config,
             device_config=device_config,
         )
-        assert os.path.exists(os.path.join(self.output_dir, "config.json"))
+        # AutoRound saves the quantized checkpoint into a scheme-derived
+        # subfolder (e.g. "<model>-w8a8/") under the output dir
+        config_found = any(
+            "config.json" in files
+            for _, _, files in os.walk(self.output_dir)
+        )
+        self.assertTrue(
+            config_found,
+            f"No config.json written under {self.output_dir}",
+        )
 
 
 if __name__ == "__main__":
