@@ -80,6 +80,9 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
+                // TODO: Use Worker::effective_load() instead of raw load() so that
+                // heterogeneous workers (different weights) are compared fairly.
+                // See cache_aware policy for reference.
                 (worker1.load() as isize, worker2.load() as isize)
             }
         };

@@ -190,6 +190,9 @@ impl PrefixHashPolicy {
         }
 
         // Fallback: no ring or ring lookup failed, use least loaded worker
+        // TODO: Use Worker::effective_load() instead of raw load() so that
+        // heterogeneous workers (different weights) are compared fairly.
+        // See cache_aware policy for reference.
         let least_loaded = healthy_workers
             .iter()
             .min_by_key(|(_, w)| w.load())

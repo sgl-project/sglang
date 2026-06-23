@@ -99,24 +99,6 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
-/// Per-worker capacity-aware load metric.
-///
-/// `effective_load = load / weight`. A bigger machine (weight > 1.0) is treated
-/// as if it had a smaller queue than its raw `load()` count suggests, so the
-/// shortest-effective-load picks send proportionally more traffic there.
-///
-/// Returns `f32::INFINITY` for any non-positive weight so the worker is naturally
-/// deprioritized rather than blowing up the comparison.
-fn effective_load(worker: &dyn Worker) -> f32 {
-    let load = worker.load() as f32;
-    let weight = worker.weight();
-    if weight > 0.0 {
-        load / weight
-    } else {
-        f32::INFINITY
-    }
-}
-
 /// Pick the worker with the smallest `effective_load`. Stable: ties go to the
 /// lowest index in `healthy_indices`. Mirrors the behavior of the previous
 /// `min_by_key(|&&idx| workers[idx].load())` call so the default-weight case
@@ -126,8 +108,8 @@ fn min_effective_load_index(workers: &[Arc<dyn Worker>], healthy_indices: &[usiz
         .iter()
         .copied()
         .min_by(|&a, &b| {
-            effective_load(workers[a].as_ref())
-                .partial_cmp(&effective_load(workers[b].as_ref()))
+            workers[a].effective_load()
+                .partial_cmp(&workers[b].effective_load())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
 }
@@ -352,7 +334,7 @@ impl CacheAwarePolicy {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize, f32, f32)> = workers
                 .iter()
-                .map(|w| (w.url(), w.load(), w.weight(), effective_load(w.as_ref())))
+                .map(|w| (w.url(), w.load(), w.weight(), w.effective_load()))
                 .collect();
             debug!(
                 "Load balancing triggered | max_effective: {:.3} | min_effective: {:.3} | workers (url, load, weight, effective_load): {:?}",
@@ -428,16 +410,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let (min_load, max_load) = healthy_indices.iter().fold(
             (f32::INFINITY, 0.0f32),
             |(min, max), &idx| {
-                let eff = effective_load(workers[idx].as_ref());
+                let eff = workers[idx].effective_load();
                 (min.min(eff), max.max(eff))
             },
         );
         let min_load = if min_load.is_finite() { min_load } else { 0.0 };
 
-        // Check if load is imbalanced. `balance_abs_threshold` is still expressed
-        // in raw request units (its CLI / API meaning is unchanged); we compare
-        // against the effective-load delta so a 2× weighted worker carrying 2×
-        // the queue still counts as balanced.
+        // Check if load is imbalanced. `balance_abs_threshold` is compared against
+        // the effective-load delta (`load / weight`), not raw request counts.
+        // With heterogeneous weights, a threshold of N means "trigger rebalance when
+        // the largest capacity-adjusted queue exceeds the smallest by more than N
+        // effective-load units." For uniform-weight deployments (all weight=1.0),
+        // effective-load equals raw load, so the threshold's practical meaning is
+        // unchanged.
         let is_imbalanced = (max_load - min_load) > self.config.balance_abs_threshold as f32
             && max_load > min_load * self.config.balance_rel_threshold;
 
@@ -1765,5 +1750,114 @@ mod tests {
             .await
             .expect("a worker must be selected");
         assert_eq!(idx, 1, "uniform-weight path must agree with legacy min-load");
+    }
+
+    /// Cache-hit path: when match_rate > cache_threshold, the policy routes by
+    /// cached tenant URL and ignores weight. This is correct — the KV cache hit
+    /// savings outweigh load balancing. This test confirms that behavior.
+    #[tokio::test]
+    async fn test_cache_aware_cache_hit_ignores_weight() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.1,         // very low → almost everything is a "cache hit"
+            balance_abs_threshold: 1_000, // never imbalanced
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        let w1 = weighted_worker("http://w1:8000", 50, 1.0); // weight = 1.0
+        let w2 = weighted_worker("http://w2:8000", 100, 0.5); // weight = 4.0
+        let workers = vec![w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // First request seeds the cache on some worker
+        let first_idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world cache hit test"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Add heavy load to the cached worker so its effective load is much higher
+        for _ in 0..50 {
+            workers[first_idx].increment_load();
+        }
+
+        // Second identical request should still route to the same cached worker
+        // even though its effective load is now much higher
+        let second_idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world cache hit test"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_idx, second_idx,
+            "cache-hit path must route to cached tenant regardless of weight/load"
+        );
+    }
+
+    /// Three workers with weights 4:2:1 should receive load approximately in
+    /// that ratio when routed through the cache-miss (min-effective-load) path.
+    #[tokio::test]
+    async fn test_cache_aware_three_workers_different_weights() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.9,           // force cache-miss path
+            balance_abs_threshold: 1_000,   // never imbalanced
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // weight = priority/50 * 1.0/cost
+        let w0 = weighted_worker("http://big:8000", 100, 0.5);    // weight = 4.0
+        let w1 = weighted_worker("http://medium:8000", 100, 1.0); // weight = 2.0
+        let w2 = weighted_worker("http://small:8000", 50, 1.0);   // weight = 1.0
+        let workers = vec![w0.clone(), w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // Use truly unique prompts to avoid cache affinity
+        let unique_prompts: Vec<String> = (0..21).map(|i| format!("prompt-{}", i)).collect();
+
+        for prompt in &unique_prompts {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(prompt),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("a worker must be selected");
+            workers[idx].increment_load();
+        }
+
+        let l0 = w0.load() as f32;
+        let l1 = w1.load() as f32;
+        let l2 = w2.load() as f32;
+        assert_eq!(
+            (l0 + l1 + l2) as usize,
+            21,
+            "all 21 requests must land somewhere (got {l0} + {l1} + {l2})"
+        );
+        assert!(
+            l0 > l1,
+            "4x weight worker should carry more than 2x weight worker (got {l0} vs {l1})"
+        );
+        assert!(
+            l1 > l2,
+            "2x weight worker should carry more than 1x weight worker (got {l1} vs {l2})"
+        );
     }
 }
