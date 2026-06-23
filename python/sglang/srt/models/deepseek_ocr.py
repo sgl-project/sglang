@@ -1297,7 +1297,7 @@ class CustomQwen2Decoder(nn.Module):
                 min_dtype = torch.finfo(dtype).min
 
                 is_image = token_type_ids == 0  # [B, S]
-                is_text  = token_type_ids == 1  # [B, S]
+                is_text = token_type_ids == 1  # [B, S]
 
                 mask = torch.full(
                     (batch_size, sequence_length, sequence_length),
@@ -1312,8 +1312,8 @@ class CustomQwen2Decoder(nn.Module):
                 causal = idx.unsqueeze(0) <= idx.unsqueeze(1)  # [S, S]
 
                 text_causal = (
-                    is_text.unsqueeze(2)   # [B, S, 1]
-                    & is_text.unsqueeze(1) # [B, 1, S]
+                    is_text.unsqueeze(2)  # [B, S, 1]
+                    & is_text.unsqueeze(1)  # [B, 1, S]
                     & causal.unsqueeze(0)  # [1, S, S]
                 )  # [B, S, S]
 
