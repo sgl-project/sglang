@@ -50,6 +50,39 @@ class TestQwenVLPreprocessVideoNonBlocking(CustomTestCase):
         # ...and run it on a worker thread, not the event-loop thread.
         self.assertNotEqual(captured["thread_id"], loop_thread_id)
 
+    def test_combine_lock_serializes_concurrent_offloads(self):
+        # process_and_combine_mm_data is offloaded to a worker thread but
+        # touches the shared, non-reentrant HF tokenizer; _combine_lock() must
+        # serialize concurrent offloads so they never run in parallel (the Rust
+        # fast tokenizer raises "Already borrowed" otherwise). See issue #28247.
+        import time
+
+        proc = object.__new__(qwen_vl.QwenVLImageProcessor)
+        proc._mm_combine_lock = None
+
+        state = {"inside": 0, "max_inside": 0}
+
+        def fake_combine():
+            state["inside"] += 1
+            state["max_inside"] = max(state["max_inside"], state["inside"])
+            time.sleep(0.01)
+            state["inside"] -= 1
+            return "ok"
+
+        async def one_request():
+            async with proc._combine_lock():
+                return await asyncio.to_thread(fake_combine)
+
+        async def run():
+            return await asyncio.gather(*(one_request() for _ in range(16)))
+
+        results = asyncio.run(run())
+        self.assertEqual(results, ["ok"] * 16)
+        # Never more than one offloaded combine ran at a time.
+        self.assertEqual(state["max_inside"], 1)
+        # Lazy init produced a single shared asyncio.Lock.
+        self.assertIsInstance(proc._mm_combine_lock, asyncio.Lock)
+
 
 if __name__ == "__main__":
     import unittest

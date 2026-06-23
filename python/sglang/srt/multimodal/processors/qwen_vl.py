@@ -321,6 +321,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+        # process_and_combine_mm_data is offloaded to a worker thread, but it
+        # calls the shared HF tokenizer, whose Rust fast-tokenizer backend is
+        # not reentrant and raises "Already borrowed" when hit concurrently.
+        # Serialize those offloaded calls across requests. Created lazily so it
+        # binds to the running event loop. See issue #28247.
+        self._mm_combine_lock: asyncio.Lock | None = None
+
+    def _combine_lock(self) -> asyncio.Lock:
+        if self._mm_combine_lock is None:
+            self._mm_combine_lock = asyncio.Lock()
+        return self._mm_combine_lock
+
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
     ):
@@ -729,17 +741,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = await asyncio.to_thread(
-                self.process_and_combine_mm_data,
-                base_output,
-                self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
-            )
+            async with self._combine_lock():
+                mm_items, input_ids, ret = await asyncio.to_thread(
+                    self.process_and_combine_mm_data,
+                    base_output,
+                    self.mm_tokens,
+                    video_metadata=video_metadata,
+                    do_sample_frames=False,
+                )
         else:
-            mm_items, input_ids, ret = await asyncio.to_thread(
-                self.process_and_combine_mm_data, base_output, self.mm_tokens
-            )
+            async with self._combine_lock():
+                mm_items, input_ids, ret = await asyncio.to_thread(
+                    self.process_and_combine_mm_data, base_output, self.mm_tokens
+                )
 
         audio_feature_lengths = None
 
