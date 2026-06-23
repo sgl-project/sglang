@@ -101,10 +101,7 @@ class BaseTpWorker(ABC):
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        success, message = ModelRunner.update_weights_from_disk(
-            self.model_runner.weight_updater,
+        success, message = self.model_runner.weight_updater.update_weights_from_disk(
             recv_req.model_path,
             recv_req.load_format,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
