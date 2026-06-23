@@ -12,6 +12,7 @@ from sglang.srt.eplb.expert_location import (
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
 )
+from sglang.srt.eplb.expert_location_updater import update_expert_location_with_recovery
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -94,9 +95,7 @@ class EPLBManager:
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
-            from sglang.srt.model_executor.model_runner import ModelRunner
-
-            ModelRunner.update_expert_location_with_recovery(
+            update_expert_location_with_recovery(
                 expert_location_updater=self._model_runner.expert_location_updater,
                 model=self._model_runner.model,
                 new_expert_location_metadata=expert_location_metadata,
