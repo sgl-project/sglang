@@ -19,10 +19,12 @@ the key side is the fp8 latent the KV pool already stores. No separate signature
 store and no prefill label-write hook are needed; the score reads the resident
 latent directly (``scorer_norm="off"``).
 
-This module owns the production absorbed-latent scoring math (``scorer_norm="off"``
-only): the bind-time ``build_absorbed_projection`` and the per-step query-side
-``absorbed_latent_v`` build, plus CPU reference scorers used as the exact oracle
-for the Triton kernel.
+This module owns the production absorbed-latent scoring math: the bind-time
+``build_absorbed_projection`` and the per-step query-side ``absorbed_latent_v``
+build (the raw-dot ``scorer_norm="off"`` numerator), plus the resident-latent key
+norm (``key_norms_from_latent`` / ``key_norms_from_resident_fp8``) and the cosine
+reference (``absorbed_latent_cosine_logical`` / ``_fp8``, ``scorer_norm="cosine"``)
+— and the CPU reference scorers used as the exact oracle for the Triton kernel.
 """
 
 from __future__ import annotations
@@ -242,3 +244,174 @@ def absorbed_latent_score_logical(
         scores = scores.masked_fill(~written[safe_phys], float("-inf"))
     seq_len_mask = logical_positions < seq_lens.unsqueeze(1).to(device)
     return scores.masked_fill(~seq_len_mask, float("-inf"))
+
+
+def dequantize_resident_latent(
+    latent_fp8: torch.Tensor, latent_scales: torch.Tensor
+) -> torch.Tensor:
+    """fp8-e4m3 resident latent + per-block fp32 scales -> fp32 ``c_kv`` ``[T, lora]``.
+
+    The KV pool stores the MLA noPE latent as fp8 with one fp32 scale per
+    128-channel block. This reverses that exactly in fp32 — the dequant the cosine
+    reference and the key-norm populate both score against (the resident bytes the
+    score kernel reads, NOT the pre-quant ``k``). ``latent_fp8`` is ``[T, lora]``
+    viewed as ``float8_e4m3fn``; ``latent_scales`` is ``[T, nblk]`` fp32.
+    """
+    t, lora = latent_fp8.shape
+    nblk = latent_scales.shape[-1]
+    block = lora // nblk
+    deq = latent_fp8.to(torch.float32).view(t, nblk, block)
+    deq = deq * latent_scales.to(torch.float32).view(t, nblk, 1)
+    return deq.view(t, lora)
+
+
+def key_norms_from_latent(
+    w_sel: torch.Tensor,
+    c_kv: torch.Tensor,
+) -> torch.Tensor:
+    """Per-(token, head) key norm ``||K_label_h[t]|| = ||w_sel[h] @ c_kv[t]||`` for
+    the cosine scorer, computed from the resident dequantized latent ``c_kv``.
+
+    ``c_kv[t]`` must be the resident latent the score kernel actually reads
+    (fp8-dequantized on the FP8 KV path, or the bf16 ``k_nope`` as fp32 on the BF16
+    path) — NOT the pre-quant ``k`` — so the norm matches the absorbed raw-dot
+    numerator's denominator. ``K_label_h[t] = w_sel[h] @ c_kv[t]`` is the per-head
+    signature; its L2 norm over the ``label_dim`` axis is the per-head key norm.
+
+    Args:
+        w_sel: ``[H, label_dim, lora]`` fp32 — bind-time K-noPE ``W_UK`` rows.
+        c_kv: ``[T, lora]`` — the dequantized resident latent.
+
+    Returns:
+        ``[T, H]`` fp32 key norms.
+    """
+    w = w_sel.to(torch.float32)  # [H, label_dim, lora]
+    # K_label[t, h, d] = sum_l w[h, d, l] * c_kv[t, l]
+    k_label = torch.einsum("hdl,tl->thd", w, c_kv.to(torch.float32))  # [T, H, label_dim]
+    return k_label.norm(dim=-1)  # [T, H]
+
+
+def key_norms_from_resident_fp8(
+    w_sel: torch.Tensor,
+    latent_fp8: torch.Tensor,
+    latent_scales: torch.Tensor,
+) -> torch.Tensor:
+    """:func:`key_norms_from_latent` over the fp8-dequantized resident latent (the
+    FP8 KV path). The BF16-path analogue is :func:`key_norms_from_latent` called
+    with the bf16 ``k_nope`` (as fp32) directly.
+    """
+    return key_norms_from_latent(
+        w_sel, dequantize_resident_latent(latent_fp8, latent_scales)
+    )
+
+
+def absorbed_latent_cosine_logical(
+    queries: torch.Tensor,
+    c_kv: torch.Tensor,
+    w_sel: torch.Tensor,
+    channel_selection: torch.Tensor,
+    channel_weights: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    written: torch.Tensor = None,
+    head_agg: str = "max",
+    eps: float = 1e-6,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Direction-normalized (cosine) absorbed score oracle — the exact reference
+    the served cosine kernel must match (``scorer_norm="cosine"``).
+
+    Mirrors :func:`absorbed_latent_score_logical` (same paged walk through
+    ``req_to_token``, same ``written`` / ``seq_len`` masking) but divides each
+    per-head dot by the per-head query and key norms BEFORE the head aggregation::
+
+        score[b, t] = agg_h ( Q_label_h · K_label_h[t] )
+                            / ( ||Q_label_h|| · ||K_label_h[t]|| + eps )
+
+    where ``Q_label_h = w_c ⊙ q_{S_h}`` (the weighted query at the mask channels,
+    in label-dim space) and ``K_label_h[t] = w_sel[h] @ c_kv[t]``. The numerator is
+    exactly the raw-dot absorbed score; cosine adds only the per-head division,
+    taken AFTER the mask-channel gather (label-dim space, NOT lora space). With
+    ``normalize=False`` it returns the raw-dot numerator through this same path —
+    the materialized-raw control, which must equal
+    :func:`absorbed_latent_score_logical`. ``c_kv`` is the dequantized resident
+    latent (fp8-dequant on the FP8 path, bf16-as-fp32 on the BF16 path). fp32
+    throughout. Returns ``[bs, max_seq_len]`` fp32.
+    """
+    bs = queries.shape[0]
+    device = queries.device
+    if max_seq_len <= 0:
+        return torch.full((bs, 1), float("-inf"), dtype=torch.float32, device=device)
+    cs = channel_selection.long()
+    cw = channel_weights.to(torch.float32)
+    # Q_label_h = w_c ⊙ q_{S_h}  -> [bs, H, label_dim]
+    q_sel = torch.gather(
+        queries.to(torch.float32), 2, cs.unsqueeze(0).expand(bs, -1, -1)
+    ) * cw.unsqueeze(0)
+    q_norm = q_sel.norm(dim=-1)  # [bs, H]
+    safe_pool = req_pool_indices.clamp(0, max(req_to_token.shape[0] - 1, 0)).long()
+    logical_positions = (
+        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(bs, -1)
+    )
+    safe_positions = logical_positions.clamp(0, max(req_to_token.shape[1] - 1, 0))
+    pool_expanded = safe_pool.unsqueeze(1).expand(-1, max_seq_len)
+    physical_slots = req_to_token[pool_expanded, safe_positions.long()]  # [bs, S]
+    max_tokens = c_kv.shape[0]
+    safe_phys = physical_slots.long().clamp(0, max(max_tokens - 1, 0))
+    gathered = c_kv[safe_phys].to(torch.float32)  # [bs, S, lora]
+    w_sel_f = w_sel.to(torch.float32)  # [H, label_dim, lora]
+    # K_label[b,s,h,d] = w_sel[h,d,:]·gathered[b,s,:] -> [bs, S, H, label_dim]
+    k_label = torch.einsum("hdl,bsl->bshd", w_sel_f, gathered)
+    k_norm = k_label.norm(dim=-1)  # [bs, S, H]
+    dots = torch.einsum("bhd,bshd->bsh", q_sel, k_label)  # [bs, S, H]
+    if normalize:
+        per_head = dots / (q_norm.unsqueeze(1) * k_norm + eps)  # cosine [bs, S, H]
+    else:
+        per_head = dots  # materialized-raw control (cosine numerator, no division)
+    scores = per_head.mean(dim=-1) if head_agg == "mean" else per_head.amax(dim=-1)
+    if written is not None:
+        scores = scores.masked_fill(~written[safe_phys], float("-inf"))
+    seq_len_mask = logical_positions < seq_lens.unsqueeze(1).to(device)
+    return scores.masked_fill(~seq_len_mask, float("-inf"))
+
+
+def absorbed_latent_cosine_logical_fp8(
+    queries: torch.Tensor,
+    latent_fp8: torch.Tensor,
+    latent_scales: torch.Tensor,
+    w_sel: torch.Tensor,
+    channel_selection: torch.Tensor,
+    channel_weights: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    written: torch.Tensor = None,
+    head_agg: str = "max",
+    eps: float = 1e-6,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """:func:`absorbed_latent_cosine_logical` over the fp8-dequantized resident
+    latent (the FP8 KV path): dequantizes ``latent_fp8`` / ``latent_scales`` to
+    ``c_kv`` via :func:`dequantize_resident_latent`, then scores. The BF16-path
+    analogue is :func:`absorbed_latent_cosine_logical` called with the bf16
+    ``k_nope`` (as fp32) directly.
+    """
+    c_kv = dequantize_resident_latent(latent_fp8, latent_scales)
+    return absorbed_latent_cosine_logical(
+        queries,
+        c_kv,
+        w_sel,
+        channel_selection,
+        channel_weights,
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        max_seq_len,
+        written=written,
+        head_agg=head_agg,
+        eps=eps,
+        normalize=normalize,
+    )
