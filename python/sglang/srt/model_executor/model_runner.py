@@ -1673,7 +1673,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.expert_backup_client.update_weights(weight_name_filter)
             else:
                 # Load the missing weights from disk
-                self.update_weights_from_disk(
+                ModelRunner.update_weights_from_disk(
+                    self.weight_updater,
                     get_global_server_args().model_path,
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
@@ -1743,8 +1744,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
+    @staticmethod
     def update_weights_from_disk(
-        self,
+        self: WeightUpdater,
         model_path: str,
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
@@ -1753,22 +1755,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self._mr.device, self._mr.gpu_id, empty_cache=False):.2f} GB"
         )
 
-        target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
+        target_device = torch.device(self._mr.device)
+        self._mr.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
+        loader = get_model_loader(load_config, self._mr.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.model)
+                DefaultModelLoader.Source.init_new(config, self._mr.model)
             )
             if weight_name_filter is not None:
                 iter = (
@@ -1781,38 +1783,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
-        with set_default_torch_dtype(self.model_config.dtype):
+        with set_default_torch_dtype(self._mr.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = get_weight_iter(self._mr.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
-                model = model_load_weights(self.model, iter)
+                model = model_load_weights(self._mr.model, iter)
             except Exception as e:
                 message = (
                     f"Failed to update weights: {e}.\nRolling back to original weights."
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
+                iter = get_weight_iter(self._mr.model_config)
+                self._mr.model = model_load_weights(self._mr.model, iter)
                 return False, message
 
-        self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
-        self.load_config = load_config
+        self._mr.model = model
+        self._mr.server_args.model_path = model_path
+        self._mr.server_args.load_format = load_format
+        self._mr.load_config = load_config
 
         if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
+            self._mr.device == "cuda"
+            or self._mr.device == "musa"
             or (
                 current_platform.is_out_of_tree()
                 and current_platform.support_cuda_graph()
             )
         ):
-            self.init_decode_cuda_graph()
+            self._mr.init_decode_cuda_graph()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
