@@ -10,7 +10,7 @@ ARG HOPPER_SBO=0
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.3
+ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.3
 ARG USE_LATEST_SGLANG=0
@@ -244,7 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio --force-reinstall; \
+               torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -655,6 +655,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                  success=1 && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
+             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
+             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
+             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
+             if [ "$success" != "1" ]; then \
+                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
+                 success=1; \
+             fi; \
          fi; \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
