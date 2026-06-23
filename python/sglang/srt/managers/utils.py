@@ -123,14 +123,16 @@ class GenerationBatchResult:
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
 
-        if self.routed_experts_output is not None:
-            self.routed_experts_output.copy_to_cpu()
-
-        if self.indexer_topk_output is not None:
-            self.indexer_topk_output.copy_to_cpu()
-
-        if (x := self.expert_distribution_metrics) is not None:
-            x.copy_to_cpu()
+        # Sub-objects only declare their device fields; the single copy+safety
+        # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
+        # all device->host copying and lifetime safety lives in one place.
+        for holder in (
+            self.routed_experts_output,
+            self.indexer_topk_output,
+            self.expert_distribution_metrics,
+        ):
+            if holder is not None:
+                holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
 

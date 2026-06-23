@@ -52,14 +52,10 @@ _OutputMode = Literal["file", "object"]
 class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
-    def copy_to_cpu(self):
-        # May run on a dedicated copy stream (overlap scheduling); record_stream
-        # keeps the GPU source alive until that stream drains the D2H so the
-        # allocator can't recycle it mid-copy.
-        src = self.eplb_balancedness
-        self.eplb_balancedness = src.to("cpu", non_blocking=True)
-        if src.is_cuda:
-            src.record_stream(torch.cuda.current_stream(src.device))
+    def map_device_tensors(self, fn):
+        # Only declare device-tensor fields; the caller injects the single
+        # copy+safety primitive. See GenerationBatchResult.copy_to_cpu.
+        self.eplb_balancedness = fn(self.eplb_balancedness)
 
 
 class ExpertDistributionRecorder(ABC):
