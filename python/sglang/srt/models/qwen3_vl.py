@@ -94,10 +94,9 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-# Below this many images the per-image-loop pos-embed interpolation is faster than
-# the vectorized path (the latter has a fixed setup cost; measured crossover ~6 on
-# H20). The two paths are bit-exact, so this threshold only trades speed for speed.
-_VECTORIZED_POS_EMBED_MIN_IMAGES = 6
+# Below this image count the per-image loop beats the vectorized path (which has a
+# fixed setup cost; measured crossover ~6 on H20); both give the same result.
+_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -603,30 +602,21 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return torch.cat(outputs, dim=0)
 
     def _use_vectorized_pos_embed(self, num_images: int) -> bool:
-        """Whether to take the vectorized pos-embed path for ``num_images`` images.
+        """Use the vectorized path only past a few images.
 
-        The vectorized path drops the per-image Python loop but pays a fixed setup
-        cost, so it only wins past a handful of images. Both paths are bit-exact,
-        so this only trades speed -- it never changes the output.
+        It drops the per-image loop but has a fixed setup cost, so the loop is
+        faster for a handful of images. Both give the same result.
         """
         return (
             envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
-            and num_images >= _VECTORIZED_POS_EMBED_MIN_IMAGES
+            and num_images >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
         )
 
     def fast_pos_embed_interpolate_vectorized(self, grid_thw):
-        """Fully-vectorized bilinear position-embedding interpolation.
+        """Vectorized fast_pos_embed_interpolate_from_list (no per-image loop).
 
-        Numerically identical (bit-exact) to ``fast_pos_embed_interpolate_from_list``:
-        same ``linspace`` interpolation coordinates, the same bilinear-weight
-        arithmetic and ``[4, N, C]`` weighted sum, and an index gather/scatter that
-        reproduces the per-image ``.repeat(t)`` + ``view/permute/flatten`` reorder --
-        but with no Python per-image loop, so the cost is independent of the number
-        of images (the speedup grows with many images / video frames).
-
-        Like ``..._from_list`` this uses the ``linspace`` (align_corners=True)
-        coordinates and so ignores ``enable_precise_embedding_interpolation``; the
-        legacy ``fast_pos_embed_interpolate`` (numpy) path is the one that honors it.
+        Same result as the loop version; the cost no longer scales with the number
+        of images.
         """
         num_grid_per_side = self.num_grid_per_side
         m = self.spatial_merge_size
@@ -664,9 +654,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         row = base_local // w_of
         col = base_local % w_of
 
-        # Interpolation coords via a per-unique-size linspace LUT. linspace(0, N-1, h)
-        # is identical for every image with the same h, so this matches the per-image
-        # linspace in ..._from_list exactly while avoiding the Python loop.
+        # per-size linspace LUT (one entry per unique h/w), so images of the same
+        # size share coords without the per-image loop
         uniq_h, inv_h = torch.unique(
             torch.tensor(hs, device=device), return_inverse=True
         )
@@ -692,7 +681,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
         dh = h_idxs - h_floor
         dw = w_idxs - w_floor
-        # reuse-trick weights, identical to ..._from_list (w00=(1-dh)(1-dw), ...)
+        # bilinear weights (same form as ..._from_list)
         w11 = dh * dw
         w10 = dh - w11
         w01 = dw - w11
@@ -723,8 +712,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         local_idx = pos_in_image % hw_of_out
         patch = base_embeds[hw_off[out_image_id] + local_idx]  # [total_out, C]
 
-        # --- 3. spatial-merge reorder (scatter), reproducing the per-image
-        # reshape(h//m, m, w//m, m, C).permute(0, 2, 1, 3, 4).flatten ---
+        # --- 3. spatial-merge reorder (scatter) ---
         all_w = torch.tensor(ws, device=device)[out_image_id]
         rows = local_idx // all_w
         cols = local_idx % all_w

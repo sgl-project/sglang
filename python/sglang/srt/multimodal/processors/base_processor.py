@@ -537,19 +537,13 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
-                if not isinstance(img, torch.Tensor):
-                    # `img` is a PIL image, which decodes lazily: the pixel data is
-                    # only materialized on first access (e.g. inside pil_to_tensor's
-                    # tobytes() during processing). Without forcing it here, that
-                    # decode runs later on the main event-loop thread, serializing it
-                    # and blocking the loop. Force the decode now, in this io_executor
-                    # worker, so it is parallelized across workers and off the main
-                    # thread. (For JPEG, load_image already returns a CUDA tensor via
-                    # nvJPEG and skips this entirely.)
-                    if discard_alpha_channel and img.mode != "RGB":
-                        img = img.convert("RGB")  # convert() also forces the decode
-                    else:
-                        img.load()
+                if isinstance(img, torch.Tensor):
+                    return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
+                if discard_alpha_channel and img.mode != "RGB":
+                    return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)

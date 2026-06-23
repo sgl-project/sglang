@@ -50,10 +50,9 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
-# Below this many images the per-image-loop pos-embed interpolation is faster than
-# the vectorized path (fixed setup cost). Both are bit-exact, so this only trades
-# speed for speed, never output.
-_VECTORIZED_POS_EMBED_MIN_IMAGES = 6
+# Below this image count the per-image loop beats the vectorized path (which has a
+# fixed setup cost); both give the same result.
+_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 # ==================== Vision Components ====================
@@ -400,11 +399,11 @@ class MossVLVisionModel(nn.Module):
     def fast_pos_embed_interpolate_vectorized(
         self, grid_thw: torch.Tensor
     ) -> torch.Tensor:
-        """Vectorized equivalent of fast_pos_embed_interpolate (no per-image loop /
-        no per-image ``.item()`` sync). Bit-exact with the loop version: same
-        linspace coords, same direct-product bilinear weights and sequential
-        4-corner sum, and an index gather/scatter reproducing the per-image
-        ``.repeat(t)`` + ``view/permute/flatten`` reorder."""
+        """Vectorized fast_pos_embed_interpolate (no per-image loop).
+
+        Same result as the loop version; the cost no longer scales with the number
+        of images.
+        """
         num_grid_per_side = int(self.num_position_embeddings**0.5)
         m = self.spatial_merge_size
         device = self.pos_embed.weight.device
@@ -521,7 +520,7 @@ class MossVLVisionModel(nn.Module):
 
         if (
             envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
-            and grid_thw.shape[0] >= _VECTORIZED_POS_EMBED_MIN_IMAGES
+            and grid_thw.shape[0] >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
         ):
             pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw)
         else:
