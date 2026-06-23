@@ -21,7 +21,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_dequant,
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
@@ -35,6 +34,12 @@ from sglang.srt.utils.weight_checker import (
     _postprocess_tensors,
     _random_like,
 )
+from sglang.srt.utils.weight_checker_quant import (
+    Fp8BlockReference,
+    ReferenceWeight,
+    _compare_references,
+    select_quantization_method,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,24 +51,42 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 # ---------------------------------------------------------------------------
 
 
-Triple = Tuple[str, bool, torch.Tensor]
+Entry = Tuple[str, bool, Tuple]
 
 
-def _assert_triples_close(actual: Iterable[Triple], expected: Iterable[Triple]) -> None:
-    """Compare two streams of (name, should_compare, tensor); element-wise tensor close."""
-    actual_list: List[Triple] = list(actual)
-    expected_list: List[Triple] = list(expected)
+def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:
+    """Compare two streams of (name, should_compare, entry) where entry is
+    ("raw", tensor) or ("quant", Fp8BlockReference)."""
+    actual_list: List[Entry] = list(actual)
+    expected_list: List[Entry] = list(expected)
     assert len(actual_list) == len(
         expected_list
     ), f"length mismatch: actual={len(actual_list)} expected={len(expected_list)}"
-    for i, ((a_name, a_flag, a_t), (e_name, e_flag, e_t)) in enumerate(
+    for i, ((a_name, a_flag, a_entry), (e_name, e_flag, e_entry)) in enumerate(
         zip(actual_list, expected_list)
     ):
         assert a_name == e_name, f"[{i}] name: {a_name!r} != {e_name!r}"
         assert a_flag == e_flag, f"[{i}] should_compare: {a_flag} != {e_flag}"
-        torch.testing.assert_close(
-            a_t, e_t, msg=f"[{i}] tensor mismatch for {a_name!r}"
-        )
+        assert a_entry[0] == e_entry[0], f"[{i}] entry kind mismatch for {a_name!r}"
+        if a_entry[0] == "quant":
+            a_ref, e_ref = a_entry[1], e_entry[1]
+            torch.testing.assert_close(
+                a_ref.w_q, e_ref.w_q, msg=f"[{i}] w_q mismatch for {a_name!r}"
+            )
+            torch.testing.assert_close(
+                a_ref.w_s, e_ref.w_s, msg=f"[{i}] w_s mismatch for {a_name!r}"
+            )
+        else:
+            torch.testing.assert_close(
+                a_entry[1], e_entry[1], msg=f"[{i}] tensor mismatch for {a_name!r}"
+            )
+
+
+def _compare_quant_pair(expect_q, expect_s, actual_q, actual_s):
+    """Test shim: wrap fp8 (q, s) pairs as references and compare them."""
+    return _compare_references(
+        Fp8BlockReference(expect_q, expect_s), Fp8BlockReference(actual_q, actual_s)
+    )
 
 
 def _build_fp8_quant_pair(device: str = "cuda"):
@@ -173,6 +196,16 @@ class TestRandomLike(CustomTestCase):
         _random_like(t)
         torch.testing.assert_close(t, before)
 
+    def test_floating_point_chunked_generation(self):
+        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 8):
+            out = _random_like(torch.zeros(64, dtype=torch.bfloat16))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertEqual(out.shape, (64,))
+        self.assertGreater(out.unique().numel(), 8)
+        self.assertGreaterEqual(out.float().min().item(), 0.0)
+        # bf16 rounding may carry values just below 1.0 up to exactly 1.0
+        self.assertLessEqual(out.float().max().item(), 1.0)
+
 
 # ---------------------------------------------------------------------------
 # _postprocess_tensors
@@ -187,15 +220,17 @@ class TestPostprocessTensors(CustomTestCase):
         a = torch.randn(4)
         b = torch.randn(4)
         raw = {"a.weight": a, "b.bias": b}
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors(raw, set()),
-            [("a.weight", True, a), ("b.bias", True, b)],
+            [("a.weight", True, ("raw", a)), ("b.bias", True, ("raw", b))],
         )
 
     def test_weight_alone_without_scale_inv_does_not_trigger_dequant(self):
         w = torch.randn(4)
         raw = {"x.weight": w}
-        _assert_triples_close(_postprocess_tensors(raw, set()), [("x.weight", True, w)])
+        _assert_entries_close(
+            _postprocess_tensors(raw, set()), [("x.weight", True, ("raw", w))]
+        )
 
     # --- non-persistent buffer skip ---
 
@@ -206,69 +241,49 @@ class TestPostprocessTensors(CustomTestCase):
             "model.rotary_emb.cos_sin_cache": cache,
             "model.layers.0.weight": plain,
         }
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("model.rotary_emb.cos_sin_cache", False, cache),
-                ("model.layers.0.weight", True, plain),
+                ("model.rotary_emb.cos_sin_cache", False, ("raw", cache)),
+                ("model.layers.0.weight", True, ("raw", plain)),
             ],
         )
 
     def test_skips_inv_freq_substring(self):
         t = torch.randn(4)
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors({"model.rotary_emb.inv_freq": t}, set()),
-            [("model.rotary_emb.inv_freq", False, t)],
+            [("model.rotary_emb.inv_freq", False, ("raw", t))],
         )
 
     def test_skips_weight_fp32_substring(self):
         t = torch.randn(4)
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, t)],
+            [("model.layers.0.mlp.gate._weight_fp32", False, ("raw", t))],
         )
 
     def test_substring_match_not_endswith(self):
         # Pattern can appear anywhere in the name, not just at the end.
         t = torch.randn(4)
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors({"weird.cos_sin_cache.foo.bar": t}, set()),
-            [("weird.cos_sin_cache.foo.bar", False, t)],
+            [("weird.cos_sin_cache.foo.bar", False, ("raw", t))],
         )
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
-    def test_fp8_quant_pair_with_int32_scale_dequants_via_ue8m0(self):
+    def test_fp8_quant_pair_yields_lazy_pair(self):
         qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
 
-        # Reference: ue8m0 path inside _postprocess_tensors should eventually
-        # call block_quant_dequant with the unpacked fp32 scale.
-        expected_dequant = block_quant_dequant(
-            qweight, sf_fp32, block_size=[128, 128], dtype=torch.bfloat16
-        )
-        _assert_triples_close(
+        ref = Fp8BlockReference(qweight, sf_packed_int32)
+        _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("x.weight", True, expected_dequant),
-                ("x.weight", False, qweight),
-                ("x.weight_scale_inv", False, sf_packed_int32),
-            ],
-        )
-
-    def test_fp8_quant_pair_with_fp32_scale_dequants_directly(self):
-        qweight, sf_fp32, _ = _build_fp8_quant_pair()
-        raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
-
-        expected_dequant = block_quant_dequant(
-            qweight, sf_fp32, block_size=[128, 128], dtype=torch.bfloat16
-        )
-        _assert_triples_close(
-            _postprocess_tensors(raw, set()),
-            [
-                ("x.weight", True, expected_dequant),
-                ("x.weight", False, qweight),
-                ("x.weight_scale_inv", False, sf_fp32),
+                ("x.weight", True, ("quant", ref)),
+                ("x.weight", False, ("raw", qweight)),
+                ("x.weight_scale_inv", False, ("raw", sf_packed_int32)),
             ],
         )
 
@@ -280,17 +295,15 @@ class TestPostprocessTensors(CustomTestCase):
             "x.weight_scale_inv": sf_fp32,
             "y.bias": bias,
         }
-        expected_dequant = block_quant_dequant(
-            qweight, sf_fp32, block_size=[128, 128], dtype=torch.bfloat16
-        )
-        # All dequant entries come first, then a raw pass over every key.
-        _assert_triples_close(
+        # All quant entries come first, then a raw pass over every key.
+        ref = Fp8BlockReference(qweight, sf_fp32)
+        _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("x.weight", True, expected_dequant),
-                ("x.weight", False, qweight),
-                ("x.weight_scale_inv", False, sf_fp32),
-                ("y.bias", True, bias),
+                ("x.weight", True, ("quant", ref)),
+                ("x.weight", False, ("raw", qweight)),
+                ("x.weight_scale_inv", False, ("raw", sf_fp32)),
+                ("y.bias", True, ("raw", bias)),
             ],
         )
 
@@ -298,9 +311,9 @@ class TestPostprocessTensors(CustomTestCase):
         # Without the matching `.weight`, no quant pair forms; the scale_inv flows
         # through as a normal entry with should_compare=True.
         s = torch.zeros(1, 1, dtype=torch.int32)
-        _assert_triples_close(
+        _assert_entries_close(
             _postprocess_tensors({"x.weight_scale_inv": s}, set()),
-            [("x.weight_scale_inv", True, s)],
+            [("x.weight_scale_inv", True, ("raw", s))],
         )
 
 
@@ -313,13 +326,13 @@ class TestCheckTensors(CustomTestCase):
 
     def test_passes_when_all_equal(self):
         t = torch.ones(2, 2)
-        expect = [("a", True, t.clone()), ("b", True, t.clone())]
-        actual = [("a", True, t.clone()), ("b", True, t.clone())]
+        expect = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
+        actual = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
         _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_raises_when_should_compare_true_and_diff(self):
-        expect = [("a", True, torch.ones(2, 2))]
-        actual = [("a", True, torch.zeros(2, 2))]
+        expect = [("a", True, ("raw", torch.ones(2, 2)))]
+        actual = [("a", True, ("raw", torch.zeros(2, 2)))]
         with self.assertRaises(Exception) as ctx:
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
         msg = str(ctx.exception)
@@ -328,28 +341,217 @@ class TestCheckTensors(CustomTestCase):
 
     def test_passes_when_should_compare_false_even_if_diff(self):
         # should_compare=False -> diff is logged, not raised.
-        expect = [("a", False, torch.ones(2, 2))]
-        actual = [("a", False, torch.zeros(2, 2))]
+        expect = [("a", False, ("raw", torch.ones(2, 2)))]
+        actual = [("a", False, ("raw", torch.zeros(2, 2)))]
         _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_name_mismatch(self):
-        expect = [("a", True, torch.ones(2, 2))]
-        actual = [("b", True, torch.ones(2, 2))]
+        expect = [("a", True, ("raw", torch.ones(2, 2)))]
+        actual = [("b", True, ("raw", torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_should_compare_mismatch(self):
-        expect = [("a", True, torch.ones(2, 2))]
-        actual = [("a", False, torch.ones(2, 2))]
+        expect = [("a", True, ("raw", torch.ones(2, 2)))]
+        actual = [("a", False, ("raw", torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
+    def test_chunked_raw_stats_match_unchunked(self):
+        expect = [("a", True, ("raw", torch.zeros(10)))]
+        actual = [("a", True, ("raw", torch.arange(10.0)))]
+        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 3):
+            with self.assertRaises(Exception) as ctx:
+                _check_tensors(expect_tensors=expect, actual_tensors=actual)
+        self.assertIn("max_abs_err=9.0", str(ctx.exception))
+        self.assertIn("mean_abs_err=4.5", str(ctx.exception))
+
     def test_zip_strict_raises_on_length_mismatch(self):
         t = torch.ones(2, 2)
-        expect = [("a", True, t.clone()), ("b", True, t.clone())]
-        actual = [("a", True, t.clone())]
+        expect = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
+        actual = [("a", True, ("raw", t.clone()))]
         with self.assertRaises(ValueError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
+
+
+# ---------------------------------------------------------------------------
+# _quant_ulp + allow_quant_error
+# ---------------------------------------------------------------------------
+
+
+class TestQuantUlp(CustomTestCase):
+
+    def test_matches_bruteforce_spacing_for_fp8(self):
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            all_bits = torch.arange(256, dtype=torch.uint8).view(dtype)
+            vals = all_bits.to(torch.float32)
+            magnitudes = torch.unique(vals[torch.isfinite(vals) & (vals >= 0)])
+            # Brute-force ULP: spacing to the next representable magnitude
+            # (the largest magnitude reuses the spacing below it).
+            spacing = magnitudes[1:] - magnitudes[:-1]
+            expected = torch.cat([spacing, spacing[-1:]])
+            got = ReferenceWeight._quant_ulp(magnitudes.to(dtype))
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+class TestCompareQuantPair(CustomTestCase):
+    """Chunked dequantized-space comparison of block-quantized pairs."""
+
+    @staticmethod
+    def _quantize(weight: torch.Tensor, scale_margin: float):
+        """Blockwise 128x128 fp8 quantization with a tweakable scale convention."""
+        n, k = weight.shape
+        blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
+        scale = blocks.abs().amax(dim=(-1, -2)) / 448.0 * scale_margin
+        q = (blocks / scale[:, :, None, None]).to(torch.float8_e4m3fn)
+        q = q.permute(0, 2, 1, 3).reshape(n, k)
+        return q, scale
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.weight = torch.randn(256, 256, device="cuda") * 0.02
+        self.e_q, self.e_s = self._quantize(self.weight, 1.0)
+        self.a_q, self.a_s = self._quantize(self.weight, 1.001)
+
+    def test_identical_pair_is_equal(self):
+        equal, max_err, mean_err, num_exceed = _compare_quant_pair(
+            self.e_q, self.e_s, self.e_q.clone(), self.e_s.clone()
+        )
+        self.assertTrue(equal)
+        self.assertEqual((max_err, mean_err, num_exceed), (0.0, 0.0, 0))
+
+    def test_ue8m0_packed_scale_equals_unpacked_scale(self):
+        qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
+        equal, *_ = _compare_quant_pair(qweight, sf_packed_int32, qweight, sf_fp32)
+        self.assertTrue(equal)
+
+    def test_two_quantizations_stay_within_ulp_tolerance(self):
+        equal, max_err, mean_err, num_exceed = _compare_quant_pair(
+            self.e_q, self.e_s, self.a_q, self.a_s
+        )
+        self.assertFalse(equal)
+        self.assertGreater(max_err, 0.0)
+        self.assertEqual(num_exceed, 0)
+
+    def test_corruption_and_fp8_nan_exceed_tolerance(self):
+        bad_q = self.a_q.clone().view(torch.uint8)
+        bad_q[::50] += 8  # jumps a full binade; some bytes become fp8 NaN
+        equal, max_err, mean_err, num_exceed = _compare_quant_pair(
+            self.e_q, self.e_s, bad_q.view(torch.float8_e4m3fn), self.a_s
+        )
+        self.assertFalse(equal)
+        self.assertGreater(num_exceed, 0)
+
+    def test_chunked_result_matches_unchunked(self):
+        reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
+        with patch("sglang.srt.utils.weight_checker_quant._CHUNK_NUMEL", 128 * 128):
+            chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
+        self.assertEqual(chunked, reference)
+
+    @staticmethod
+    def _quantize_partial(weight: torch.Tensor, scale_margin: float):
+        """128x128 block quant where the last block per dim may be partial."""
+        n, k = weight.shape
+        s_n, s_k = -(-n // 128), -(-k // 128)
+        q = torch.empty(n, k, dtype=torch.float8_e4m3fn, device=weight.device)
+        scale = torch.empty(s_n, s_k, device=weight.device)
+        for i in range(s_n):
+            for j in range(s_k):
+                blk = weight[i * 128 : (i + 1) * 128, j * 128 : (j + 1) * 128].float()
+                s = blk.abs().amax() / 448.0 * scale_margin
+                s = s if s > 0 else weight.new_ones(())
+                scale[i, j] = s
+                q[i * 128 : (i + 1) * 128, j * 128 : (j + 1) * 128] = (blk / s).to(
+                    torch.float8_e4m3fn
+                )
+        return q, scale
+
+    def test_partial_last_block_infers_true_block_size(self):
+        # fused_qkv_a_proj_with_mqa out-dim is not a multiple of 128 (e.g. 2112 =
+        # 16*128 + 64), so the last row-block is partial. ceil(dim/num_blocks)
+        # would infer 125, misaligning scales; the true block size is 128.
+        n, k = 3 * 128 + 64, 256  # 448 rows = partial last block, 256 cols
+        weight = torch.randn(n, k, device="cuda") * 0.02
+        e_q, e_s = self._quantize_partial(weight, 1.0)
+        a_q, a_s = self._quantize_partial(weight, 1.001)
+        self.assertEqual(list(e_s.shape), [4, 2])  # ceil(448/128)=4, 256/128=2
+        self.assertEqual(Fp8BlockReference._block_size_of(e_q, e_s), [128, 128])
+        equal, _, _, num_exceed = _compare_quant_pair(e_q, e_s, a_q, a_s)
+        self.assertFalse(equal)
+        self.assertEqual(num_exceed, 0)
+
+    def test_3d_expert_tensor(self):
+        q3 = self.e_q.reshape(2, 128, 256).contiguous()
+        s3 = self.e_s.reshape(2, 1, 2)
+        equal, *_ = _compare_quant_pair(q3, s3, q3.clone(), s3.clone())
+        self.assertTrue(equal)
+
+
+class TestCheckTensorsAllowQuantError(CustomTestCase):
+
+    def setUp(self):
+        torch.manual_seed(0)
+        weight = torch.randn(256, 256, device="cuda") * 0.02
+        self.e_raw = self._as_raw(*TestCompareQuantPair._quantize(weight, 1.0))
+        self.a_raw = self._as_raw(*TestCompareQuantPair._quantize(weight, 1.001))
+
+    @staticmethod
+    def _as_raw(q, s):
+        return {"x.weight": q, "x.weight_scale_inv": s}
+
+    def _check(self, expect_raw, actual_raw, **kwargs):
+        _check_tensors(
+            expect_tensors=_postprocess_tensors(expect_raw, set()),
+            actual_tensors=_postprocess_tensors(actual_raw, set()),
+            **kwargs,
+        )
+
+    def test_within_tolerance_passes_with_flag(self):
+        self._check(self.e_raw, self.a_raw, allow_quant_error=True)
+
+    def test_within_tolerance_fails_without_flag(self):
+        with self.assertRaises(Exception) as ctx:
+            self._check(self.e_raw, self.a_raw)
+        self.assertIn("name=x.weight", str(ctx.exception))
+
+    def test_exceeding_tolerance_fails_with_flag(self):
+        bad_q = self.a_raw["x.weight"].clone().view(torch.uint8)
+        bad_q[::50] += 8
+        bad = self._as_raw(
+            bad_q.view(torch.float8_e4m3fn), self.a_raw["x.weight_scale_inv"]
+        )
+        with self.assertRaises(Exception) as ctx:
+            self._check(self.e_raw, bad, allow_quant_error=True)
+        self.assertIn("num_exceed_quant_ulp_tolerance", str(ctx.exception))
+
+    def test_flag_does_not_relax_non_quant_tensors(self):
+        expect = [("a", True, ("raw", torch.ones(2, 2)))]
+        actual = [("a", True, ("raw", torch.ones(2, 2) + 0.5))]
+        with self.assertRaises(Exception):
+            _check_tensors(
+                expect_tensors=expect, actual_tensors=actual, allow_quant_error=True
+            )
+
+
+# ---------------------------------------------------------------------------
+# select_quantization_method
+# ---------------------------------------------------------------------------
+
+
+class TestSelectQuantizationMethod(CustomTestCase):
+
+    def test_returns_none_when_not_a_quant_method(self):
+        self.assertIsNone(select_quantization_method(None))
+
+    def test_raises_on_unsupported_quant_method(self):
+        from sglang.srt.layers.quantization.base_config import LinearMethodBase
+
+        class _Unsupported(LinearMethodBase):
+            def apply(self, *args, **kwargs):
+                return None
+
+        with self.assertRaises(NotImplementedError):
+            select_quantization_method(_Unsupported())
 
 
 # ---------------------------------------------------------------------------
