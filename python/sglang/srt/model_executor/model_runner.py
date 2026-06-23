@@ -2598,21 +2598,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # verify() swaps decode_cuda_graph_runner to the K-matching runner
         # before each verify forward (keyed on spec_info.draft_token_num).
         #
-        # NOTE: the two narrower graphs share the SAME attention backend
-        # instance as the main runner. The upstream DSA backend sizes its
-        # cuda-graph metadata (e.g. flashmla num_splits) for ONE K (the main
-        # K_suffix); capturing a second runner at a different K overwrites /
-        # mismatches that buffer ("tensor a (N) must match tensor b (M)").
-        # Until the DSA backend keys cuda-graph metadata by (bs, K), the extra
-        # graphs are OFF by default: SUFFIX runs on the main K_suffix graph and
-        # MTP / NONE fall back to eager (verify()'s runner-swap finds them
-        # absent and keeps the main runner, whose width check then routes the
-        # narrower batch to eager). Opt in with ARCTIC_HYBRID_EXTRA_GRAPHS=1
-        # on backends that support multi-K metadata.
+        # The three graphs share the SAME attention backend instance as the
+        # main runner. The DSA backend keys its cuda-graph metadata by
+        # (bs, draft_token_num) and sizes its shared buffers grow-only (widest
+        # = main K_suffix, built first), so the K_mtp and K=1 graphs capture
+        # alongside the K_suffix one without clobbering it. Enabled by default;
+        # set ARCTIC_HYBRID_EXTRA_GRAPHS=0 to force MTP/NONE eager (the worker's
+        # verify() runner-swap then finds them absent and keeps the main runner).
         self.short_chain_graph_runner = None
         self.baseline_chain_graph_runner = None
         if (
-            os.environ.get("ARCTIC_HYBRID_EXTRA_GRAPHS", "0") == "1"
+            os.environ.get("ARCTIC_HYBRID_EXTRA_GRAPHS", "1") == "1"
             and not self.is_draft_worker
             and self.spec_algorithm.is_hybrid_suffix_mtp()
             and self.decode_cuda_graph_runner is not None
