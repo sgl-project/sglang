@@ -1250,13 +1250,11 @@ class ServerArgs:
         Optional[int],
         (
             "Opt-in delay trigger: hold new prefills until at least N request slots "
-            "have freed up, so they are admitted in one batch instead of one request "
-            "at a time. Useful when each admission is disproportionately expensive, "
-            "e.g. speculative decoding with a separate draft prefill pass. Bounded by "
-            "--prefill-delayer-max-delay-ms. Adaptively clamped via the DFlash "
-            "heuristic (disabled when max-running-requests < 8; capped to "
-            "min(4, max(2, (max-run + 5) // 6))). When unset, DFlash workloads "
-            "auto-enable with the legacy formula; other workloads stay disabled."
+            "have freed up, admitting them in one batch. Useful when each admission is "
+            "disproportionately expensive (e.g. speculative decoding with a separate "
+            "draft prefill pass). Bounded by --prefill-delayer-max-delay-ms and clamped "
+            "to the DFlash formula (see resolve_min_batch). Unset: DFlash auto-enables "
+            "with the legacy formula; other workloads stay disabled."
         ),
     ] = None
     prefill_delayer_max_delay_ms: A[

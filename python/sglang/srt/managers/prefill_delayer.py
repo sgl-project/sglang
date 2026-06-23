@@ -45,18 +45,12 @@ def resolve_min_batch(
     max_running_requests: int,
     is_dflash: bool = False,
 ) -> Optional[int]:
-    """Resolve the min-batch threshold.
+    """Resolve the min-batch threshold, capped to the DFlash formula.
 
-    When the user sets a value (>1), it is used but capped to the DFlash
-    formula so the trigger can never delay more aggressively than DFlash:
-        min(user_value, min(4, max(2, (max_run + 5) // 6)))
-
-    When unset, DFlash workloads fall back to the formula automatically
-    (matching the legacy always-on heuristic); other workloads stay disabled.
-
-    Disabled when the resolved value is None/<=1 or max_running_requests < 8.
+    Unset + DFlash → auto-enable with the legacy formula; otherwise disabled.
+    A user value (>1) wins, capped to min(value, formula). Disabled when
+    max_running_requests < 8.
     """
-    # DFlash auto-default: mirror the legacy heuristic when the user opts out.
     if user_value is None:
         user_value = (
             min(4, max(2, (max_running_requests + 5) // 6)) if is_dflash else None
@@ -190,9 +184,7 @@ class PrefillDelayer:
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
-        # Local view of the min-batch trigger: True when this rank's own
-        # allocatable slots are below threshold. Used directly (not gathered)
-        # since running-batch slots are private to each DP rank.
+        # Min-batch trigger local view (not gathered; see trigger below).
         local_allocatable_below = (
             self._min_batch is not None
             and num_allocatable_reqs is not None
@@ -276,11 +268,8 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Min-batch trigger: batch freed slots into one admission. Useful
-            # when each admission is expensive (e.g. draft prefill). Per-rank
-            # local judgment (mirrors the legacy DFlash heuristic): each rank
-            # decides independently based on its own allocatable slots, since
-            # running-batch slots are private to each DP rank.
+            # Min-batch trigger: per-rank local judgment (mirrors DFlash).
+            # Running-batch slots are private to each DP rank.
             allocatable_condition = running_batch > 0 and local_allocatable_below
 
             # Wall-clock cap on the adaptive triggers to bound worst-case TTFT.
