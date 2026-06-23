@@ -828,18 +828,10 @@ class ModelRunner:
             # would overwrite the target's process-global one.
             return
 
-        if not self.server_args.disable_shared_experts_fusion and hasattr(
-            self.model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = self.model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
-
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                model=self.model,
                 model_config=self.model_config,
-                num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
