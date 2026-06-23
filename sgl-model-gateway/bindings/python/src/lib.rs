@@ -390,6 +390,7 @@ struct Router {
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
     max_concurrent_requests: i32,
+    max_inflight_requests: i32,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
     retry_initial_backoff_ms: u64,
@@ -598,6 +599,7 @@ impl Router {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
+            .max_inflight_requests(self.max_inflight_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
@@ -711,6 +713,7 @@ impl Router {
         prefill_policy = None,
         decode_policy = None,
         max_concurrent_requests = -1,
+        max_inflight_requests = 0,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
         retry_initial_backoff_ms = 50,
@@ -803,6 +806,7 @@ impl Router {
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
         max_concurrent_requests: i32,
+        max_inflight_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
         retry_initial_backoff_ms: u64,
@@ -908,6 +912,7 @@ impl Router {
             prefill_policy,
             decode_policy,
             max_concurrent_requests,
+            max_inflight_requests,
             cors_allowed_origins,
             retry_max_retries,
             retry_initial_backoff_ms,

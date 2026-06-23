@@ -234,6 +234,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Hard cap on concurrently in-flight requests (true semaphore).
+    /// `0` or `-1` disables it. See [`RouterConfig::max_inflight_requests`].
+    pub fn max_inflight_requests(mut self, max: i32) -> Self {
+        self.config.max_inflight_requests = max;
+        self
+    }
+
     // ==================== Security & CORS ====================
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {

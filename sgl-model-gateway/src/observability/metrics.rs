@@ -430,6 +430,11 @@ pub mod metrics_labels {
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";
 
+    // Rate limit limiter sources (which gate fired)
+    pub const LIMITER_RATE: &str = "rate";
+    pub const LIMITER_INFLIGHT: &str = "inflight";
+    pub const LIMITER_MESH: &str = "mesh";
+
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";
     pub const CB_OPEN: &str = "open";
@@ -517,11 +522,14 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record rate limit decision.
-    pub fn record_http_rate_limit(result: &'static str) {
+    /// Record rate limit decision. `limiter` identifies which gate fired
+    /// ("rate", "inflight", or "mesh") so operators can tell a req/s 429 from
+    /// an in-flight-cap 429.
+    pub fn record_http_rate_limit(result: &'static str, limiter: &'static str) {
         counter!(
             "smg_http_rate_limit_total",
-            "result" => result
+            "result" => result,
+            "limiter" => limiter
         )
         .increment(1);
     }

@@ -306,6 +306,11 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         }
     };
 
+    let inflight_limiter = match config.max_inflight_requests {
+        n if n <= 0 => None,
+        n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
+    };
+
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
@@ -333,6 +338,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            .inflight_limiter(inflight_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
@@ -425,6 +431,11 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         }
     };
 
+    let inflight_limiter = match config.max_inflight_requests {
+        n if n <= 0 => None,
+        n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
+    };
+
     // Initialize registries
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -457,6 +468,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            .inflight_limiter(inflight_limiter)
             .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(reasoning_parser_factory)
             .tool_parser_factory(tool_parser_factory)
@@ -554,6 +566,11 @@ pub async fn create_test_context_with_mcp_config(
         }
     };
 
+    let inflight_limiter = match config.max_inflight_requests {
+        n if n <= 0 => None,
+        n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
+    };
+
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
@@ -581,6 +598,7 @@ pub async fn create_test_context_with_mcp_config(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            .inflight_limiter(inflight_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
