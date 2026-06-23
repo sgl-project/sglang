@@ -1838,8 +1838,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         current_platform.empty_cache()
         return success, message
 
+    @staticmethod
     def update_weights_from_distributed(
-        self,
+        self: WeightUpdater,
         names,
         dtypes,
         shapes,
@@ -1856,14 +1857,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
-        assert group_name in self.weight_updater._model_update_group, (
-            f"Group {group_name} not in {list(self.weight_updater._model_update_group.keys())}. "
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
 
         if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
+            return ModelRunner._update_bucketed_weights_from_distributed(
+                self, names, dtypes, shapes, group_name
             )
         try:
             weights = []
@@ -1872,12 +1873,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                weight = torch.empty(shape, dtype=target_dtype, device=self._mr.device)
                 handles.append(
                     torch.distributed.broadcast(
                         weight,
                         src=0,
-                        group=self.weight_updater._model_update_group[group_name],
+                        group=self._model_update_group[group_name],
                         async_op=True,
                     )
                 )
@@ -1885,7 +1886,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for handle in handles:
                 handle.wait()
 
-            self.model.load_weights(weights)
+            self._mr.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -1897,8 +1898,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
+    @staticmethod
     def _update_bucketed_weights_from_distributed(
-        self, names, dtypes, shapes, group_name
+        self: WeightUpdater, names, dtypes, shapes, group_name
     ):
         try:
             named_tensors = []
@@ -1907,17 +1909,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
                 named_tensors.append(
-                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                    (
+                        name,
+                        torch.empty(shape, dtype=target_dtype, device=self._mr.device),
+                    )
                 )
             bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             flattened_tensor = bucket.get_flattened_tensor()
             torch.distributed.broadcast(
                 flattened_tensor,
                 src=0,
-                group=self.weight_updater._model_update_group[group_name],
+                group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
+            self._mr.model.load_weights(reconstructed_tensors)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (

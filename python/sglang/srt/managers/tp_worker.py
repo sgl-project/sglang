@@ -155,7 +155,10 @@ class BaseTpWorker(ABC):
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
-        success, message = self.model_runner.update_weights_from_distributed(
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        success, message = ModelRunner.update_weights_from_distributed(
+            self.model_runner.weight_updater,
             recv_req.names,
             recv_req.dtypes,
             recv_req.shapes,
