@@ -1520,7 +1520,16 @@ class DeepseekSparseAttnBackend(
         """
         assert seq_lens_cpu is not None
 
-        if bs not in self.decode_cuda_graph_metadata:
+        # Decode metadata is stored under the DS selector-width variant key
+        # (``(bs, width)`` when DS width-keying is active), NOT the raw ``bs``
+        # (see the store at ``_build_forward_metadata_cuda_graph`` ->
+        # ``decode_cuda_graph_metadata[_ds_decode_metadata_key(bs)]``). Membership
+        # MUST be tested with that same key. Testing the raw ``bs`` never matches
+        # the tuple keys, so every DS replay re-ran _build and returned before the
+        # in-place refresh below — leaving the captured graph reading frozen
+        # capture-time seq_lens (decode degenerated after the first token).
+        metadata_key = self._ds_decode_metadata_key(bs)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1541,7 +1550,6 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata_key = self._ds_decode_metadata_key(bs)
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
         if metadata.ds_graph_state is not None:
             # Stamp the replay identity the selection-capture dump reads
