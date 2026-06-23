@@ -110,6 +110,7 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         _run_mtp_gsm8k(self)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35FP4MTPReplaySSM(ReasoningTokenUsageMixin, CustomTestCase):
     """MTP with the ReplaySSM spec-verify fold protocol.
 
