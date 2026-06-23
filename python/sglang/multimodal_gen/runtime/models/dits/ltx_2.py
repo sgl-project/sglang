@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -31,10 +32,17 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_npu = current_platform.is_npu()
 
 logger = init_logger(__name__)
 
@@ -389,10 +397,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)
 
         return cos_freqs.to(dtype=out_dtype), sin_freqs.to(dtype=out_dtype)
-
-
-def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
-    return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
 class LTX2TextProjection(nn.Module):
@@ -837,6 +841,7 @@ class LTX2TransformerBlock(nn.Module):
         super().__init__()
         self.idx = idx
         self.norm_eps = norm_eps
+        self.rms_norm = RMSNormNoWeight()
         # LTX2.3
         self.cross_attention_adaln = cross_attention_adaln
         self.use_local_av_cross_attention = use_local_av_cross_attention
@@ -1013,7 +1018,7 @@ class LTX2TransformerBlock(nn.Module):
             self.scale_shift_table, batch_size, temb, slice(0, 3)
         )
         norm_hidden_states = (
-            rms_norm(hidden_states, self.norm_eps) * (1 + vscale_msa) + vshift_msa
+            self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_msa) + vshift_msa
         )
         attn_hidden_states = self.attn1(
             norm_hidden_states,
@@ -1029,7 +1034,8 @@ class LTX2TransformerBlock(nn.Module):
             self.audio_scale_shift_table, batch_size, temb_audio, slice(0, 3)
         )
         norm_audio_hidden_states = (
-            rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa) + ashift_msa
+            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa)
+            + ashift_msa
         )
         attn_audio_hidden_states = self.audio_attn1(
             norm_audio_hidden_states,
@@ -1054,7 +1060,7 @@ class LTX2TransformerBlock(nn.Module):
                 self.prompt_scale_shift_table, batch_size, temb_prompt, slice(None)
             )
             norm_hidden_states = (
-                rms_norm(hidden_states, self.norm_eps) * (1 + vscale_q) + vshift_q
+                self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_q) + vshift_q
             )
             mod_encoder_hidden_states = (
                 encoder_hidden_states * (1 + v_prompt_scale) + v_prompt_shift
@@ -1076,7 +1082,8 @@ class LTX2TransformerBlock(nn.Module):
                 slice(None),
             )
             norm_audio_hidden_states = (
-                rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_q) + ashift_q
+                self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_q)
+                + ashift_q
             )
             mod_audio_encoder_hidden_states = (
                 audio_encoder_hidden_states * (1 + a_prompt_scale) + a_prompt_shift
@@ -1090,7 +1097,7 @@ class LTX2TransformerBlock(nn.Module):
                 audio_hidden_states + attn_audio_hidden_states * agate_q
             )
         else:
-            norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
+            norm_hidden_states = self.rms_norm(hidden_states, self.norm_eps)
             attn_hidden_states = self.attn2(
                 norm_hidden_states,
                 context=encoder_hidden_states,
@@ -1098,7 +1105,7 @@ class LTX2TransformerBlock(nn.Module):
             )
             hidden_states = hidden_states + attn_hidden_states
 
-            norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
+            norm_audio_hidden_states = self.rms_norm(audio_hidden_states, self.norm_eps)
             attn_audio_hidden_states = self.audio_attn2(
                 norm_audio_hidden_states,
                 context=audio_encoder_hidden_states,
@@ -1106,8 +1113,8 @@ class LTX2TransformerBlock(nn.Module):
             )
             audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
         # 3. Audio-to-Video and Video-to-Audio Cross-Attention
-        norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
-        norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
+        norm_hidden_states = self.rms_norm(hidden_states, self.norm_eps)
+        norm_audio_hidden_states = self.rms_norm(audio_hidden_states, self.norm_eps)
 
         # Compute combined ada params
         video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[
@@ -1219,7 +1226,7 @@ class LTX2TransformerBlock(nn.Module):
             self.scale_shift_table, batch_size, temb, slice(3, 6)
         )
         norm_hidden_states = (
-            rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+            self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
         )
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * vgate_mlp
@@ -1228,14 +1235,15 @@ class LTX2TransformerBlock(nn.Module):
             self.audio_scale_shift_table, batch_size, temb_audio, slice(3, 6)
         )
         norm_audio_hidden_states = (
-            rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp)
+            + ashift_mlp
         )
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
         audio_hidden_states = audio_hidden_states + audio_ff_output * agate_mlp
         return hidden_states, audio_hidden_states
 
 
-class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = LTX2ArchConfig()._fsdp_shard_conditions
     _compile_conditions = LTX2ArchConfig()._compile_conditions
     _supported_attention_backends = LTX2ArchConfig()._supported_attention_backends
@@ -1811,6 +1819,17 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             audio_encoder_hidden_states = self.audio_caption_projection(
                 audio_encoder_hidden_states
             )
+
+        if _is_npu:
+            # If the 'encoder_attention_mask' is provided and it is all ones,
+            # it can be set to 'None' to avoid the degradation of performance on the NPU side,
+            # where the mask, even though it has no affect,
+            # can lead to the introduction of multiple small operators.
+            if encoder_attention_mask is not None and torch.all(
+                encoder_attention_mask == 1
+            ):
+                encoder_attention_mask = None
+
         # 5. Run blocks
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())

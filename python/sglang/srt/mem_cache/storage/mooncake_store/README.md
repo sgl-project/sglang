@@ -289,12 +289,33 @@ You can enable it in any of the three supported configuration methods:
 
 > **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
 
+**Mooncake Group Semantics (`enable_group_semantics`):**
+
+When `enable_group_semantics` is set to `true`, SGLang passes Mooncake `group_ids` for physical objects derived from the same logical HiCache page. This allows Mooncake to apply group-aware metadata routing, lease refresh, and eviction behavior to related KV objects such as MHA K/V pairs, split-head shards, MLA objects, and supported sidecar objects.
+
+This option is disabled by default. It requires a Mooncake version that exposes `ReplicateConfig.group_ids`. If the installed Mooncake package does not support it, SGLang automatically falls back to the existing write path and prints a warning.
+
+Example:
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
+```
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
 
 
-Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.
+Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`,
+the regular Mooncake backend path still uses `page_first` or `page_first_direct`.
+When HiSparse provides an MLA host KV pool or DeepSeek V4 C4 side pool with
+layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
+APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
+each logical page across its per-layer buffers.
 
 ### Distributed Deployment
 

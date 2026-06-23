@@ -115,7 +115,10 @@ def create_mm_data_row(
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
         # Some tokenizers do not support list content; fall back to a placeholder in the text
-        prompt_str = f"<image>{text_prompt}"
+        if type(processor).__name__ == "MiniCPMOProcessor":
+            prompt_str = f"(<image>./</image>){text_prompt}"
+        else:
+            prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
     if type(processor).__name__ == "KimiK25Processor":
@@ -125,6 +128,19 @@ def create_mm_data_row(
             medias=medias,
             return_tensors="pt",
         )["input_ids"].numel()
+    elif type(processor).__name__ == "VLChatProcessor":
+        prompt_len = processor(
+            prompt=prompt_str,
+            images=images,
+            force_batchify=False,
+        )["input_ids"].numel()
+    elif type(processor).__name__ == "DeepseekVLV2Processor":
+        result = processor(
+            conversations=prompt_str,
+            images=images,
+            inference_mode=True,
+        )
+        prompt_len = result.input_ids.numel()
     else:
         prompt_len = processor(
             text=[prompt_str],
@@ -292,6 +308,20 @@ def sample_image_requests(
         )
     else:
         print(f"#Images per request: {image_count} (fixed)")
+
+    # Detailed token breakdown (derived from dataset + input_lens)
+    text_prompt_lens = np.array([r.text_prompt_len for r in dataset])
+    vision_prompt_lens = np.array([r.vision_prompt_len for r in dataset])
+    text_prompt_overheads = text_prompt_lens - input_lens
+    stat_fields = [
+        ("Raw text prompt tokens (without overhead)", input_lens),
+        ("Text prompt tokens (with chat template)", text_prompt_lens),
+        ("Text prompt overhead", text_prompt_overheads),
+        ("Vision tokens", vision_prompt_lens),
+    ]
+    print("\n=== Token Breakdown (per request avg / total) ===")
+    for label, vals in stat_fields:
+        print(f"  {label}: avg={np.mean(vals):.1f}, total={np.sum(vals)}")
 
     print(
         f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"

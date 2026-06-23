@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -41,7 +41,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
 # ===============================
 # Base image 950 and args
@@ -51,7 +51,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -61,7 +61,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
 # ===============================
 # Chosen arch and args
@@ -104,7 +104,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="96ffa169710f214e76e07abe5008d686fe54522b"
+ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -200,18 +200,25 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 
-# cherry pick b639cb6 commit for aiter_mhc_pre fix, may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
+# Keep the base image's Torch-compatible Triton by default. Override with
+# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
+# Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+# AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
+# block switching to commits that predate that rule (e.g. the current default
+# AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
+# `git clone` above, so there are no real user changes to preserve.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
- && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 \
+ && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
+     && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
@@ -296,7 +303,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir maturin \
+RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
            /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
@@ -562,7 +569,8 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && cd triton-custom \
      && git checkout ${TRITON_COMMIT} \
      && pip install -r python/requirements.txt \
-     && pip install -e .; \
+     && pip install -e . \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
 # -----------------------

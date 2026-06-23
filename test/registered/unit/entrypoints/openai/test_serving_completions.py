@@ -22,7 +22,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTemplateManager:
@@ -139,6 +139,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         # The schema should be converted to string by convert_json_schema_to_str
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
+
+    def test_response_format_json_schema_missing_schema(self):
+        """Test that json_schema response_format without a schema raises a ValueError."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate a JSON object:",
+            max_tokens=100,
+            response_format={"type": "json_schema"},
+        )
+        with self.assertRaises(ValueError):
+            self.sc._build_sampling_params(req)
 
     def test_response_format_structural_tag(self):
         """Test that response_format structural_tag is correctly processed in sampling params."""

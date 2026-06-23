@@ -1,17 +1,22 @@
 import ctypes
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _handle_numa_bind_failure,
     _is_numa_available,
+    _node_cpus,
+    _numactl_cpu_mem_args,
     _query_numa_node_for_gpu,
     get_numa_node_if_available,
+    numa_bind_to_node,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
-register_cuda_ci(est_time=10, stage="stage-c", runner_config="4-gpu-gb200")
-register_cuda_ci(est_time=10, stage="stage-c", runner_config="8-gpu-b200")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
@@ -26,63 +31,31 @@ class TestIsNumaAvailable(unittest.TestCase):
     def test_returns_false_when_no_numa_nodes(self, _mock_isdir):
         self.assertFalse(_is_numa_available())
 
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
-    @patch("os.path.isdir", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.psutil")
-    def test_returns_false_when_affinity_constrained(self, mock_psutil, _mock_isdir):
-        mock_process = MagicMock()
-        mock_process.cpu_affinity.return_value = [0, 1]
-        mock_psutil.Process.return_value = mock_process
-        mock_psutil.cpu_count.return_value = 128
-
-        self.assertFalse(_is_numa_available())
-
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
     @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.psutil")
-    def test_returns_true_on_numa_system_with_full_affinity(
-        self, mock_psutil, _mock_isdir, _mock_which, _mock_mempolicy
+    def test_returns_true_on_numa_system(
+        self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
-        all_cpus = list(range(128))
-        mock_process = MagicMock()
-        mock_process.cpu_affinity.return_value = all_cpus
-        mock_psutil.Process.return_value = mock_process
-        mock_psutil.cpu_count.return_value = 128
-
         self.assertTrue(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
     @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.psutil")
     def test_returns_false_when_mempolicy_not_permitted(
-        self, mock_psutil, _mock_isdir, _mock_which, _mock_mempolicy
+        self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
-        all_cpus = list(range(128))
-        mock_process = MagicMock()
-        mock_process.cpu_affinity.return_value = all_cpus
-        mock_psutil.Process.return_value = mock_process
-        mock_psutil.cpu_count.return_value = 128
-
         self.assertFalse(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
     @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.psutil")
     def test_isdir_called_with_node1_path(
-        self, mock_psutil, mock_isdir, _mock_which, _mock_mempolicy
+        self, mock_isdir, _mock_which, _mock_mempolicy
     ):
-        all_cpus = list(range(8))
-        mock_process = MagicMock()
-        mock_process.cpu_affinity.return_value = all_cpus
-        mock_psutil.Process.return_value = mock_process
-        mock_psutil.cpu_count.return_value = 8
-
         _is_numa_available()
         mock_isdir.assert_called_with("/sys/devices/system/node/node1")
 
@@ -249,36 +222,44 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         _mock_gpu.assert_not_called()
 
 
-def _get_gpu_name():
+def _get_gpu_info():
     try:
         import pynvml
 
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode()
+        count = pynvml.nvmlDeviceGetCount()
         pynvml.nvmlShutdown()
-        return name
+        return name, count
     except Exception:
-        return ""
+        return "", 0
 
 
-_gpu_name = _get_gpu_name()
+_gpu_name, _gpu_count = _get_gpu_info()
 
 
-@unittest.skipUnless("GB200" in _gpu_name, "Requires GB200 hardware")
-class TestGB200NumaTopology(unittest.TestCase):
-    """Hardware test validating expected NUMA topology on GB200 (2 NUMA nodes, 4 GPUs)."""
+def _query_single_numa_node_for_gpu(gpu_id: int):
+    nodes = _query_numa_node_for_gpu(gpu_id)
+    if len(nodes) != 1:
+        raise AssertionError(f"GPU {gpu_id}: expected one NUMA node, got {nodes}")
+    return nodes[0]
 
-    def _make_server_args(self):
-        args = MagicMock()
-        args.numa_node = None
-        return args
+
+@unittest.skipUnless(
+    ("GB200" in _gpu_name or "GB300" in _gpu_name) and _gpu_count == 4,
+    "Requires 4-GPU Grace Blackwell hardware",
+)
+class TestGraceBlackwellNumaTopology(unittest.TestCase):
+    """Hardware test validating expected NUMA topology on 4-GPU GB200/GB300."""
 
     def test_gpu_numa_mapping(self):
+        self.assertEqual(_gpu_count, 4)
         expected = {0: 0, 1: 0, 2: 1, 3: 1}
-        args = self._make_server_args()
         for gpu_id, expected_node in expected.items():
-            result = get_numa_node_if_available(args, gpu_id)
+            result = _query_single_numa_node_for_gpu(gpu_id)
             self.assertEqual(
                 result,
                 expected_node,
@@ -286,25 +267,103 @@ class TestGB200NumaTopology(unittest.TestCase):
             )
 
 
-@unittest.skipUnless("B200" in _gpu_name, "Requires B200 hardware")
+@unittest.skipUnless(
+    "B200" in _gpu_name and _gpu_count == 4,
+    "Requires 4-GPU B200 hardware",
+)
 class TestB200NumaTopology(unittest.TestCase):
-    """Hardware test validating expected NUMA topology on B200 (2 NUMA nodes, 8 GPUs)."""
-
-    def _make_server_args(self):
-        args = MagicMock()
-        args.numa_node = None
-        return args
+    """Hardware test validating expected NUMA topology on 4-GPU B200."""
 
     def test_gpu_numa_mapping(self):
-        expected = {0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1}
-        args = self._make_server_args()
-        for gpu_id, expected_node in expected.items():
-            result = get_numa_node_if_available(args, gpu_id)
-            self.assertEqual(
-                result,
-                expected_node,
-                f"GPU {gpu_id}: expected NUMA node {expected_node}, got {result}",
-            )
+        self.assertEqual(_gpu_count, 4)
+        numa_nodes = {
+            _query_single_numa_node_for_gpu(gpu_id) for gpu_id in range(_gpu_count)
+        }
+        self.assertEqual(
+            len(numa_nodes),
+            1,
+            f"Expected all visible 4-GPU B200 devices on one NUMA node, got {numa_nodes}",
+        )
+
+
+class TestNumaBindIntersection(unittest.TestCase):
+    """Tests for constraint-aware NUMA binding (node CPUs intersected with the
+    process's allowed CPUs)."""
+
+    @patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=None)
+    def test_node_cpus_no_libnuma_returns_empty(self, _mock_lib):
+        self.assertEqual(_node_cpus(0), set())
+
+    @patch("os.sched_getaffinity", return_value=set(range(72)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    def test_numactl_args_unconstrained_uses_cpunodebind(self, _cpus, _aff):
+        self.assertEqual(_numactl_cpu_mem_args(0, 0), "--cpunodebind=0 --membind=0")
+
+    @patch("os.sched_getaffinity", return_value={0} | set(range(21, 144)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    def test_numactl_args_constrained_uses_physcpubind(self, _cpus, _aff):
+        expected_cpus = ",".join(str(c) for c in [0] + list(range(21, 72)))
+        self.assertEqual(
+            _numactl_cpu_mem_args(0, 0),
+            f"--physcpubind={expected_cpus} --membind=0",
+        )
+
+    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    def test_numactl_args_empty_intersection_returns_none(self, _cpus, _aff):
+        self.assertIsNone(_numactl_cpu_mem_args(0, 0))
+
+    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"})
+    @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    def test_numactl_args_empty_intersection_crashes_when_enabled(self, _cpus, _aff):
+        with self.assertRaises(RuntimeError):
+            _numactl_cpu_mem_args(0, 0)
+
+    @patch("os.sched_setaffinity")
+    @patch("os.sched_getaffinity", return_value={0} | set(range(21, 144)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    def test_numa_bind_to_node_constrained_sets_intersection(
+        self, mock_libnuma, _cpus, _aff, mock_setaff
+    ):
+        lib = MagicMock()
+        lib.numa_available.return_value = 0
+        mock_libnuma.return_value = lib
+
+        numa_bind_to_node(0)
+
+        mock_setaff.assert_called_once_with(0, {0} | set(range(21, 72)))
+        lib.numa_set_preferred.assert_called_once()
+        lib.numa_run_on_node.assert_not_called()
+
+    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    @patch("os.sched_setaffinity")
+    @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    def test_numa_bind_to_node_empty_intersection_skips(
+        self, mock_libnuma, _cpus, _aff, mock_setaff
+    ):
+        lib = MagicMock()
+        lib.numa_available.return_value = 0
+        mock_libnuma.return_value = lib
+
+        numa_bind_to_node(0)
+
+        mock_setaff.assert_not_called()
+        lib.numa_set_preferred.assert_not_called()
+
+    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"})
+    def test_handle_failure_raises_when_enabled(self):
+        with self.assertRaises(RuntimeError):
+            _handle_numa_bind_failure(0, {72, 73})
+
+    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    def test_handle_failure_warns_when_disabled(self):
+        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING"):
+            _handle_numa_bind_failure(0, {72, 73})
 
 
 if __name__ == "__main__":

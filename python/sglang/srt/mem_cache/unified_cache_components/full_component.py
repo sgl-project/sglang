@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -9,10 +9,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -21,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedTreeNode,
     )
@@ -41,8 +47,15 @@ class FullComponent(TreeComponent):
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
-        # HiCache: evicted + backuped nodes are valid match boundaries
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
+        if match_device_only:
+            return (
+                lambda node: node.component_data[self.component_type].value is not None
+            )
+
+        # HiCache: evicted + backuped nodes are valid match boundaries.
         return lambda node: (
             node.component_data[self.component_type].value is not None or node.backuped
         )
@@ -58,7 +71,7 @@ class FullComponent(TreeComponent):
         # last_device_node, summing host_value lengths of evicted nodes.
         ct = self.component_type
         kv_host_hit = 0
-        node = result.last_host_node
+        node = result.best_match_node
         root_node = self.cache.root_node
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
@@ -120,8 +133,10 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
-        # Heap-based eviction from evictable_device_leaves, ordered by LRU.
-        heap = [(n.last_access_time, n) for n in self.cache.evictable_device_leaves]
+        heap = [
+            (self.cache.eviction_strategy.get_priority(n), n)
+            for n in self.cache.evictable_device_leaves
+        ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < request and heap:
@@ -130,13 +145,19 @@ class FullComponent(TreeComponent):
                 continue
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
-                heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+                heapq.heappush(
+                    heap,
+                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                )
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """Evict host leaves to free KV host pool space."""
-        heap = [(n.last_access_time, n) for n in self.cache.evictable_host_leaves]
+        heap = [
+            (self.cache.eviction_strategy.get_priority(n), n)
+            for n in self.cache.evictable_host_leaves
+        ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < num_tokens and heap:
@@ -145,12 +166,28 @@ class FullComponent(TreeComponent):
                 continue
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
-                heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+                heapq.heappush(
+                    heap,
+                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                )
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+
+        # Only the last host node needs to be protected.
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
         root = self.cache.root_node
         cur = node
 
@@ -178,9 +215,20 @@ class FullComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
@@ -204,7 +252,14 @@ class FullComponent(TreeComponent):
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -248,6 +303,9 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         ct = self.component_type
 

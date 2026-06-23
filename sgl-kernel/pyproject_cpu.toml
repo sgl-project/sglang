@@ -1,15 +1,15 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch==2.9.0",
+  "torch==2.12.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel-cpu"
-version = "0.4.2.post1"
-description = "Kernel Library for SGLang"
+version = "0.4.4"
+description = "CPU Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

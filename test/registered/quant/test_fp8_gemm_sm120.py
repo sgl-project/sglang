@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=146, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=146, stage="extra-a", runner_config="1-gpu-small")
 
 PERTENSOR_MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP8"
 BLOCKWISE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
@@ -33,7 +33,7 @@ class FP8GemmSM120Base:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
-            "--disable-piecewise-cuda-graph",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         if cls.quantization:
             other_args += ["--quantization", cls.quantization]

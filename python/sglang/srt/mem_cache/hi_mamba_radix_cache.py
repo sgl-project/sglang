@@ -46,7 +46,11 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -392,14 +396,15 @@ class HiMambaRadixCache(MambaRadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks because loading_check processes DMA completions
+        # independently (no cross-rank sync).
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if len(self.ongoing_write_through) > 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
@@ -422,17 +427,30 @@ class HiMambaRadixCache(MambaRadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        # Every rank must enter the all_reduce below; ongoing_load_back can
+        # diverge across ranks.
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
-                # the KV cache loading is still ongoing
                 break
             finish_count += 1
+
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        finish_count = int(queue_size.item())
+
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
@@ -504,7 +522,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if node.mamba_value is None:
             return 0
         mamba_num = len(node.mamba_value)
-        self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+        self.req_to_token_pool.mamba_allocator.free(node.mamba_value)
         if node.mamba_lock_ref > 0:
             self.mamba_protected_size_ -= mamba_num
             node.mamba_lock_ref = 0
@@ -793,7 +811,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 # Internal: free device mamba only, KV stays on device (tombstone)
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 mamba_num_evicted += len(x.mamba_value)
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                self.req_to_token_pool.mamba_allocator.free(x.mamba_value)
                 self.mamba_lru_list.remove_node(x)
                 self._tombstone_internal_node(x)
             else:
@@ -1037,25 +1055,20 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_host_hit = (
             1 if (last_host_node.mamba_evicted and last_host_node.mamba_backuped) else 0
         )
-        host_hit_length = max(kv_host_hit_length, mamba_host_hit)
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
                 dst_index = self._alloc_with_evict(
-                    self.req_to_token_pool.mamba_pool,
+                    self.req_to_token_pool.mamba_allocator,
                     1,
                     self.evict_mamba,
                     lock_node=mamba_node,
                     error_message="Can not alloc mamba cache",
                 )
-                src_index = mamba_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = mamba_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+            req.mamba_cow_src_index = mamba_node.mamba_value
+            req.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1069,7 +1082,8 @@ class HiMambaRadixCache(MambaRadixCache):
             last_host_node=last_host_node,
             # TODO(ispobock): use best_match_node as start node for load_back
             best_match_node=last_host_node,
-            host_hit_length=host_hit_length,
+            host_hit_length=kv_host_hit_length,
+            mamba_host_hit_length=mamba_host_hit,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
@@ -1256,7 +1270,14 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            from sglang.srt.server_args import get_global_server_args
+
+            storage_cls = resolve_collector_class(
+                get_global_server_args(),
+                STAT_LOGGER_ROLE_STORAGE,
+                StorageMetricsCollector,
+            )
+            storage_metrics_collector = storage_cls(labels=labels)
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
@@ -1655,6 +1676,9 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             return True
 
+        if completed and operation.pool_transfers and not operation.pool_transfers_done:
+            can_terminate = False
+
         operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
             states = torch.tensor(
@@ -1728,6 +1752,16 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_length,
             self.evict_host,
         )
+        if host_indices is None:
+            # truncate the prefetch length to the page-aligned available host size
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
+            if prefetch_length < self.prefetch_threshold:
+                self._release_host_node(last_host_node, release_mamba=False)
+                return
+            new_input_tokens = new_input_tokens[:prefetch_length]
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
         if host_indices is None:
             self._release_host_node(last_host_node, release_mamba=False)
             return
@@ -2065,7 +2099,7 @@ class HiMambaRadixCache(MambaRadixCache):
         ):
             if req.mamba_pool_idx is None:
                 req.mamba_pool_idx = self._alloc_with_evict(
-                    self.req_to_token_pool.mamba_pool,
+                    self.req_to_token_pool.mamba_allocator,
                     len(last_hit_node.mamba_host_value),
                     self.evict_mamba,
                     lock_node=last_hit_node,
