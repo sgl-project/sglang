@@ -1555,6 +1555,12 @@ class Scheduler(
 
             self._apply_war_barrier()
 
+            # Grammar result processing can finish and release requests, so it
+            # must happen before preparing the next spec decode batch.
+            if self._has_pending_spec_grammar_result():
+                pop_and_process()
+                self.last_batch = None
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1590,6 +1596,16 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _has_pending_spec_grammar_result(self) -> bool:
+        return (
+            self.last_batch is not None
+            and len(self.result_queue) > 0
+            and self.last_batch.spec_algorithm is not None
+            and not self.last_batch.spec_algorithm.is_none()
+            and self.last_batch.has_grammar
+            and self.last_batch.forward_mode.is_decode()
+        )
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
