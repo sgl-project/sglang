@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from typing import List, Optional
 
 import numpy as np
@@ -127,8 +128,14 @@ class NGRAMWorker(BaseSpecWorker):
         self._ngram_precompute_stats_forward_ct = 0
         self._bonus_prediction_hit_ct = 0
         self._bonus_prediction_total_ct = 0
+        self._bonus_prediction_all_hit_ct = 0
+        self._bonus_prediction_all_total_ct = 0
         self._precomputed_cache_hit_ct = 0
         self._precomputed_cache_total_ct = 0
+        self._precomputed_cache_all_hit_ct = 0
+        self._precomputed_cache_all_total_ct = 0
+        self._bonus_prediction_last1000 = deque(maxlen=1000)
+        self._precomputed_cache_last1000 = deque(maxlen=1000)
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -154,8 +161,14 @@ class NGRAMWorker(BaseSpecWorker):
         self._ngram_precompute_stats_forward_ct = 0
         self._bonus_prediction_hit_ct = 0
         self._bonus_prediction_total_ct = 0
+        self._bonus_prediction_all_hit_ct = 0
+        self._bonus_prediction_all_total_ct = 0
         self._precomputed_cache_hit_ct = 0
         self._precomputed_cache_total_ct = 0
+        self._precomputed_cache_all_hit_ct = 0
+        self._precomputed_cache_all_total_ct = 0
+        self._bonus_prediction_last1000.clear()
+        self._precomputed_cache_last1000.clear()
 
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
@@ -250,16 +263,30 @@ class NGRAMWorker(BaseSpecWorker):
             return 0.0
         return hit_ct / total_ct
 
+    @staticmethod
+    def _hit_rate_from_events(events) -> float:
+        if not events:
+            return 0.0
+        return sum(events) / len(events)
+
     def _record_bonus_prediction_stats(
         self, bonus_prediction_hits: list[bool], precomputed_cache_hits: list[bool]
     ) -> None:
+        bonus_prediction_hit_ct = sum(1 for hit in bonus_prediction_hits if hit)
+        precomputed_cache_hit_ct = sum(1 for hit in precomputed_cache_hits if hit)
+
         self._ngram_precompute_stats_forward_ct += 1
-        self._bonus_prediction_hit_ct += sum(1 for hit in bonus_prediction_hits if hit)
+        self._bonus_prediction_hit_ct += bonus_prediction_hit_ct
         self._bonus_prediction_total_ct += len(bonus_prediction_hits)
-        self._precomputed_cache_hit_ct += sum(
-            1 for hit in precomputed_cache_hits if hit
-        )
+        self._bonus_prediction_all_hit_ct += bonus_prediction_hit_ct
+        self._bonus_prediction_all_total_ct += len(bonus_prediction_hits)
+        self._bonus_prediction_last1000.extend(bonus_prediction_hits)
+
+        self._precomputed_cache_hit_ct += precomputed_cache_hit_ct
         self._precomputed_cache_total_ct += len(precomputed_cache_hits)
+        self._precomputed_cache_all_hit_ct += precomputed_cache_hit_ct
+        self._precomputed_cache_all_total_ct += len(precomputed_cache_hits)
+        self._precomputed_cache_last1000.extend(precomputed_cache_hits)
 
         if self._ngram_precompute_stats_interval <= 0:
             return
@@ -274,7 +301,11 @@ class NGRAMWorker(BaseSpecWorker):
         logger.info(
             "NGRAM precompute stats over %d forward steps: "
             "bonus_prediction_hit_rate=%.4f (%d/%d), "
-            "precomputed_cache_hit_rate=%.4f (%d/%d)",
+            "precomputed_cache_hit_rate=%.4f (%d/%d), "
+            "avg_bonus_prediction_hit_rate=%.4f (%d/%d), "
+            "avg_precomputed_cache_hit_rate=%.4f (%d/%d), "
+            "last1000_bonus_prediction_hit_rate=%.4f (%d samples), "
+            "last1000_precomputed_cache_hit_rate=%.4f (%d samples)",
             self._ngram_precompute_stats_interval,
             self._hit_rate(
                 self._bonus_prediction_hit_ct, self._bonus_prediction_total_ct
@@ -286,6 +317,22 @@ class NGRAMWorker(BaseSpecWorker):
             ),
             self._precomputed_cache_hit_ct,
             self._precomputed_cache_total_ct,
+            self._hit_rate(
+                self._bonus_prediction_all_hit_ct,
+                self._bonus_prediction_all_total_ct,
+            ),
+            self._bonus_prediction_all_hit_ct,
+            self._bonus_prediction_all_total_ct,
+            self._hit_rate(
+                self._precomputed_cache_all_hit_ct,
+                self._precomputed_cache_all_total_ct,
+            ),
+            self._precomputed_cache_all_hit_ct,
+            self._precomputed_cache_all_total_ct,
+            self._hit_rate_from_events(self._bonus_prediction_last1000),
+            len(self._bonus_prediction_last1000),
+            self._hit_rate_from_events(self._precomputed_cache_last1000),
+            len(self._precomputed_cache_last1000),
         )
         self._bonus_prediction_hit_ct = 0
         self._bonus_prediction_total_ct = 0
