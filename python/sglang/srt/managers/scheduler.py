@@ -1038,10 +1038,12 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    # DFlash-derived adaptive clamp: see resolve_min_batch.
+                    # DFlash workloads auto-enable with the legacy formula when
+                    # the user opts out; otherwise opt-in. See resolve_min_batch.
                     min_batch=resolve_min_batch(
                         self.server_args.prefill_delayer_min_batch,
                         self.max_running_requests,
+                        is_dflash=self.spec_algorithm.is_dflash(),
                     ),
                     device=self.tp_group.device,
                 )

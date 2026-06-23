@@ -512,10 +512,24 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 
 class TestResolveMinBatch(unittest.TestCase):
-    """Unit tests for resolve_min_batch's DFlash adaptive clamping."""
+    """Unit tests for resolve_min_batch's threshold resolution."""
 
-    def test_unset_disables(self):
-        self.assertIsNone(resolve_min_batch(None, 512))
+    def test_unset_non_dflash_disables(self):
+        # Unset + not DFlash → trigger stays disabled.
+        self.assertIsNone(resolve_min_batch(None, 512, is_dflash=False))
+
+    def test_unset_dflash_auto_enables(self):
+        # Unset + DFlash → falls back to the legacy formula (full mapping).
+        self.assertEqual(resolve_min_batch(None, 512, is_dflash=True), 4)
+        self.assertEqual(resolve_min_batch(None, 8, is_dflash=True), 2)
+
+    def test_unset_dflash_small_cluster_disables(self):
+        # DFlash auto-default still respects the < 8 guard.
+        self.assertIsNone(resolve_min_batch(None, 7, is_dflash=True))
+
+    def test_user_value_overrides_dflash_default(self):
+        # An explicit user value wins over the DFlash auto-default.
+        self.assertEqual(resolve_min_batch(3, 512, is_dflash=True), 3)
 
     def test_le_one_disables(self):
         # <= 1 can never batch, so it is a no-op.

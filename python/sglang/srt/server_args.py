@@ -1255,7 +1255,8 @@ class ServerArgs:
             "e.g. speculative decoding with a separate draft prefill pass. Bounded by "
             "--prefill-delayer-max-delay-ms. Adaptively clamped via the DFlash "
             "heuristic (disabled when max-running-requests < 8; capped to "
-            "min(4, max(2, (max-run + 5) // 6))). Unset (default) disables the trigger."
+            "min(4, max(2, (max-run + 5) // 6))). When unset, DFlash workloads "
+            "auto-enable with the legacy formula; other workloads stay disabled."
         ),
     ] = None
     prefill_delayer_max_delay_ms: A[

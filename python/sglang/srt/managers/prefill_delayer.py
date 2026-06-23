@@ -41,13 +41,27 @@ class _NegotiateOutput(NamedTuple):
 
 
 def resolve_min_batch(
-    user_value: Optional[int], max_running_requests: int
+    user_value: Optional[int],
+    max_running_requests: int,
+    is_dflash: bool = False,
 ) -> Optional[int]:
-    """Resolve the min-batch threshold with the DFlash adaptive clamping.
+    """Resolve the min-batch threshold.
 
-    Disabled when user_value is None/<=1 or max_running_requests < 8;
-    otherwise capped to min(user_value, min(4, max(2, (max_run + 5) // 6))).
+    When the user sets a value (>1), it is used but capped to the DFlash
+    formula so the trigger can never delay more aggressively than DFlash:
+        min(user_value, min(4, max(2, (max_run + 5) // 6)))
+
+    When unset, DFlash workloads fall back to the formula automatically
+    (matching the legacy always-on heuristic); other workloads stay disabled.
+
+    Disabled when the resolved value is None/<=1 or max_running_requests < 8.
     """
+    # DFlash auto-default: mirror the legacy heuristic when the user opts out.
+    if user_value is None:
+        user_value = (
+            min(4, max(2, (max_running_requests + 5) // 6)) if is_dflash else None
+        )
+
     if user_value is None or user_value <= 1:
         return None
 

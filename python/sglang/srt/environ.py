@@ -995,7 +995,8 @@ _warn_deprecated_env_to_cli_flag(
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET",
-    "Please use '--enable-prefill-delayer --prefill-delayer-min-batch' instead.",
+    "DFlash now auto-enables the prefill-delayer min-batch trigger; unset this "
+    "env. To override, use '--prefill-delayer-min-batch'.",
 )
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
