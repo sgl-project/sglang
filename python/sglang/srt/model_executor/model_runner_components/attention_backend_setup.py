@@ -60,55 +60,54 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     # "pass narrow params, not the god object"): the backend constructor contract
     # is ``ATTENTION_BACKENDS[str](model_runner)``, and backends retain a live
     # reference for forward-time reads of mutable runner state (KV pools).
-    mr = model_runner
-    server_args = mr.server_args
+    server_args = model_runner.server_args
 
     # device-specific pre-init. TODO: platform interface (separate PR).
-    if mr.device in ("cuda", "musa"):
+    if model_runner.device in ("cuda", "musa"):
         init_cublas()
 
     resolved = _resolve_attention_backend_strs(
-        server_args=server_args, is_draft_worker=mr.is_draft_worker
+        server_args=server_args, is_draft_worker=model_runner.is_draft_worker
     )
 
     if server_args.enable_pdmux:
         attn_backend = _build_resolved_backend(
-            model_runner=mr, resolved=resolved, init_new_workspace=True
+            model_runner=model_runner, resolved=resolved, init_new_workspace=True
         )
         decode_attn_backend_group = [
             _build_resolved_backend(
-                model_runner=mr, resolved=resolved, init_new_workspace=False
+                model_runner=model_runner, resolved=resolved, init_new_workspace=False
             )
             for _ in range(server_args.sm_group_num)
         ]
         decode_attn_backend = decode_attn_backend_group[0]
-    elif server_args.enable_two_batch_overlap and not mr.is_draft_worker:
+    elif server_args.enable_two_batch_overlap and not model_runner.is_draft_worker:
         attn_backend = TboAttnBackend.init_new(
             lambda: _build_resolved_backend(
-                model_runner=mr, resolved=resolved, init_new_workspace=False
+                model_runner=model_runner, resolved=resolved, init_new_workspace=False
             )
         )
         decode_attn_backend = None
         decode_attn_backend_group = []
     else:
         attn_backend = _build_resolved_backend(
-            model_runner=mr, resolved=resolved, init_new_workspace=False
+            model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
         decode_attn_backend = None
         decode_attn_backend_group = []
 
     # device-specific post-init. TODO: platform interface (separate PR).
     if (
-        mr.device == "npu"
+        model_runner.device == "npu"
         and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
-        and not mr.is_draft_worker
+        and not model_runner.is_draft_worker
     ):
         # lazy init for zbal with mix mode (before graph capture when enable_cuda_graph)
         from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
 
         lazy_init_zbal_gva_mem(
-            mr.device,
-            mr.gpu_id,
+            model_runner.device,
+            model_runner.gpu_id,
             get_world_group().rank_in_group,
             get_world_group().world_size,
             get_world_group().cpu_group,

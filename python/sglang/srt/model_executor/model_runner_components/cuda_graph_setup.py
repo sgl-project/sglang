@@ -64,7 +64,6 @@ def capture_cuda_graphs(
     capture_prefill_graph. Takes the whole runner as the documented leaf
     exception (every graph runner constructor eats it and keeps a live reference).
     """
-    mr = model_runner
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
     # backend so its __init__ can warm up kernels (run-once) and allocate the
@@ -73,21 +72,23 @@ def capture_cuda_graphs(
     # it. Always built: it serves both the fully-disabled case (decode/prefill
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
-    eager_runner = EagerRunner(mr)
+    eager_runner = EagerRunner(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
-    prefill_runner = capture_prefill_graph(model_runner=mr, eager_runner=eager_runner)
+    prefill_runner = capture_prefill_graph(
+        model_runner=model_runner, eager_runner=eager_runner
+    )
 
     decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
     if capture_decode_cuda_graph:
-        if mr.device in ("cuda", "musa", "cpu", "npu"):
-            decode = capture_decode_graph(model_runner=mr)
+        if model_runner.device in ("cuda", "musa", "cpu", "npu"):
+            decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
-            decode = capture_decode_graph(model_runner=mr)
+            decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
 
@@ -95,18 +96,20 @@ def capture_cuda_graphs(
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
     # hooks anyway).
-    if mr.server_args.forward_hooks:
-        register_forward_hooks(mr.model, mr.server_args.forward_hooks)
+    if model_runner.server_args.forward_hooks:
+        register_forward_hooks(
+            model_runner.model, model_runner.server_args.forward_hooks
+        )
 
     prealloc_symmetric_memory_pool(
-        is_draft_worker=mr.is_draft_worker,
-        enable_symm_mem=mr.server_args.enable_symm_mem,
-        device=mr.device,
-        forward_stream=mr.forward_stream,
+        is_draft_worker=model_runner.is_draft_worker,
+        enable_symm_mem=model_runner.server_args.enable_symm_mem,
+        device=model_runner.device,
+        forward_stream=model_runner.forward_stream,
     )
 
-    if mr.canary_manager is not None and not mr.is_draft_worker:
-        mr.canary_manager.mark_init_finished()
+    if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
+        model_runner.canary_manager.mark_init_finished()
 
     return CudaGraphsCapture(
         eager_runner=eager_runner, prefill_runner=prefill_runner, decode=decode
@@ -128,7 +131,6 @@ def capture_prefill_graph(
     read-only-god-object rule (PR #28978 e46665e84e); the single-arg constructor
     contract leaves no other way to hand them over.
     """
-    mr = model_runner
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -139,14 +141,14 @@ def capture_prefill_graph(
         # Prefill cuda graph disabled: route eager prefill through the
         # EagerRunner (its can_run_graph returns False, so _forward_raw's
         # extend branch falls through to the eager path).
-        if not mr.is_draft_worker:
+        if not model_runner.is_draft_worker:
             return eager_runner
         return None
 
     # Draft models skip here during __init__; the eagle worker calls
     # this method explicitly (force_for_draft_worker=True) after
     # init_lm_head so graphs capture the final embedding weights.
-    if mr.is_draft_worker and not force_for_draft_worker:
+    if model_runner.is_draft_worker and not force_for_draft_worker:
         return None
 
     # Skip prefill CG for EAGLE target on tc_piecewise: that backend
@@ -156,9 +158,9 @@ def capture_prefill_graph(
     # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
     # (restored from #25795), so it does NOT need this skip.
     if (
-        mr.spec_algorithm.is_eagle()
-        and not mr.is_draft_worker
-        and not mr.server_args.enable_return_hidden_states
+        model_runner.spec_algorithm.is_eagle()
+        and not model_runner.is_draft_worker
+        and not model_runner.server_args.enable_return_hidden_states
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
@@ -168,20 +170,20 @@ def capture_prefill_graph(
         return eager_runner
 
     # Disable prefill CUDA graph for non-language models
-    if not hasattr(mr.model, "model"):
+    if not hasattr(model_runner.model, "model"):
         logger.warning(
             "Disable prefill CUDA graph because the model is not a language model"
         )
         return None
 
     # Disable prefill CUDA graph for non capture size
-    if not mr.server_args.cuda_graph_config.prefill.bs:
+    if not model_runner.server_args.cuda_graph_config.prefill.bs:
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return None
 
     # Collect attention layers and moe layers from the model
-    mr.model.model = resolve_language_model(mr.model)
-    language_model = getattr(mr.model, "language_model", mr.model)
+    model_runner.model.model = resolve_language_model(model_runner.model)
+    language_model = getattr(model_runner.model, "language_model", model_runner.model)
 
     # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
     if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
@@ -195,13 +197,13 @@ def capture_prefill_graph(
         return None
 
     (
-        mr.attention_layers,
-        mr.moe_layers,
-        mr.moe_fusions,
-        mr.dsa_indexers,
+        model_runner.attention_layers,
+        model_runner.moe_layers,
+        model_runner.moe_fusions,
+        model_runner.dsa_indexers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    if len(mr.attention_layers) < mr.model_config.num_hidden_layers:
+    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,
@@ -210,20 +212,20 @@ def capture_prefill_graph(
         return None
 
     tic = time.perf_counter()
-    before_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
-    prefill_backend = mr.server_args.cuda_graph_config.prefill.backend
-    role = "draft" if mr.is_draft_worker else "target"
+    before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+    prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
+    role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
-    capture_num_tokens = sorted(mr.server_args.cuda_graph_config.prefill.bs)
+    capture_num_tokens = sorted(model_runner.server_args.cuda_graph_config.prefill.bs)
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "
         f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
         f"avail mem={before_mem:.2f} GB"
     )
 
-    prefill_runner = PrefillCudaGraphRunner(mr)
+    prefill_runner = PrefillCudaGraphRunner(model_runner)
 
-    after_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+    after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem
     logger.info(
         f"Capture {capture_name} CUDA graph end. "
@@ -235,21 +237,25 @@ def capture_prefill_graph(
 
 def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
     """Capture device decode graphs. Returns the runner + measured graph mem."""
-    mr = model_runner
     no_capture = DecodeGraphCapture(runner=None, graph_mem_usage=0)
 
-    if not mr.is_generation:
+    if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture
-    if mr.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+    if model_runner.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
-    if mr.device != "cpu" and check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+    if model_runner.device != "cpu" and check_cuda_graph_backend(
+        Phase.DECODE, Backend.DISABLED
+    ):
         return no_capture
-    if mr.device == "cpu" and not mr.server_args.enable_torch_compile:
+    if (
+        model_runner.device == "cpu"
+        and not model_runner.server_args.enable_torch_compile
+    ):
         return no_capture
 
     tic = time.perf_counter()
-    before_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+    before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_backend = defaultdict(
         lambda: f"{current_platform.device_name} graph",
         {
@@ -259,27 +265,29 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
             "npu": "NPU graph",
         },
     )
-    role = "draft" if mr.is_draft_worker else "target"
-    if mr.spec_algorithm.is_speculative():
+    role = "draft" if model_runner.is_draft_worker else "target"
+    if model_runner.spec_algorithm.is_speculative():
         capture_name = f"{role} verify"
-        num_tokens_per_bs = mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-            mr.server_args.speculative_num_draft_tokens,
-            mr.is_draft_worker,
+        num_tokens_per_bs = (
+            model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                model_runner.server_args.speculative_num_draft_tokens,
+                model_runner.is_draft_worker,
+            )
         )
     else:
         capture_name = f"{role} decode"
         num_tokens_per_bs = 1
-    capture_bs, _ = get_batch_sizes_to_capture(mr, num_tokens_per_bs)
-    decode_backend = mr.server_args.cuda_graph_config.decode.backend
+    capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_bs)
+    decode_backend = model_runner.server_args.cuda_graph_config.decode.backend
     logger.info(
-        f"Capture {capture_name} {graph_backend[mr.device]} begin. "
+        f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "
         f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
     if current_platform.is_out_of_tree():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(mr)
+        runner = GraphRunnerCls(model_runner)
     else:
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
@@ -292,12 +300,12 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
                 "npu": NPUGraphRunner,
             },
         )
-        runner = graph_runners[mr.device](mr)
+        runner = graph_runners[model_runner.device](model_runner)
 
-    after_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+    after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_mem_usage = before_mem - after_mem
     logger.info(
-        f"Capture {capture_name} {graph_backend[mr.device]} end. "
+        f"Capture {capture_name} {graph_backend[model_runner.device]} end. "
         f"elapsed={time.perf_counter() - tic:.2f} s, "
         f"mem usage={graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
     )
