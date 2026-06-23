@@ -76,6 +76,9 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        enforce_host_larger_than_device = not getattr(
+            self, "allow_host_pool_smaller_than_device", False
+        )
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
@@ -85,6 +88,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                enforce_host_larger_than_device=enforce_host_larger_than_device,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -97,6 +101,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                enforce_host_larger_than_device=enforce_host_larger_than_device,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")

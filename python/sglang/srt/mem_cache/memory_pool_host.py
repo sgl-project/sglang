@@ -251,6 +251,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        enforce_host_larger_than_device: bool = True,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -272,9 +273,10 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if enforce_host_larger_than_device:
+            assert (
+                self.size > device_pool.size
+            ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -402,6 +404,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        enforce_host_larger_than_device: bool = True,
     ):
         super().__init__(
             device_pool,
@@ -412,6 +415,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            enforce_host_larger_than_device=enforce_host_larger_than_device,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -1263,6 +1267,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        enforce_host_larger_than_device: bool = True,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -1274,6 +1279,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            enforce_host_larger_than_device=enforce_host_larger_than_device,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize

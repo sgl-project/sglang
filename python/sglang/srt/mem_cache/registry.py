@@ -139,6 +139,30 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return RadixCache(params)
 
 
+def _create_boundary_hicache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
+    if not ctx.enable_hierarchical_cache:
+        raise ValueError(
+            "--radix-cache-backend='boundary_hicache' requires HiCache to be enabled"
+        )
+    if ctx.is_hybrid_swa or ctx.is_hybrid_ssm:
+        raise ValueError(
+            "--radix-cache-backend='boundary_hicache' only supports non-hybrid HiCache"
+        )
+    if ctx.server_args.hicache_storage_backend is not None:
+        raise ValueError("BoundaryHiRadixCache does not support L3 storage")
+
+    from sglang.srt.mem_cache.boundary_hiradix_cache import BoundaryHiRadixCache
+
+    cache = BoundaryHiRadixCache(params=ctx.params, server_args=ctx.server_args)
+    ctx.tp_worker.register_hicache_layer_transfer_counter(
+        cache.cache_controller.layer_done_counter
+    )
+    return cache
+
+
+register_radix_cache_backend("boundary_hicache", _create_boundary_hicache)
+
+
 def _create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     server_args: ServerArgs,
