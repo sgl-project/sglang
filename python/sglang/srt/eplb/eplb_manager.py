@@ -6,6 +6,7 @@ import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_location_updater import update_expert_location_with_recovery
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -81,9 +82,7 @@ class EPLBManager:
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
-            from sglang.srt.model_executor.model_runner import ModelRunner
-
-            ModelRunner.update_expert_location_with_recovery(
+            update_expert_location_with_recovery(
                 expert_location_updater=self._model_runner.expert_location_updater,
                 model=self._model_runner.model,
                 new_expert_location_metadata=expert_location_metadata,
