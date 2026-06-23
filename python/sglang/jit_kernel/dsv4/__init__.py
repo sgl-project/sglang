@@ -10,6 +10,7 @@ from .compress import (
     compress_norm_rope_store,
 )
 from .compress_old import fused_norm_rope_inplace
+from .c128_cleanup import clear_unaccepted_c128_draft_states
 from .elementwise import (
     fused_k_norm_rope_flashmla,
     fused_q_indexer_rope_hadamard_fp4_quant,
@@ -34,6 +35,7 @@ __all__ = [
     "CompressorPrefillPlan",
     "compress_forward",
     "compress_norm_rope_store",
+    "clear_unaccepted_c128_draft_states",
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",

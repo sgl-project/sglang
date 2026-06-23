@@ -6,7 +6,11 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import (
+    clear_unaccepted_c128_draft_states,
+    fused_k_norm_rope_flashmla,
+    fused_store_cache,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -1029,25 +1033,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        device = req_pool_indices.device
-        seq_lens = seq_lens.to(device=device, dtype=torch.long)
-        accept_lens = accept_lens.to(device=device, dtype=torch.long)
-        offsets = torch.arange(num_draft_tokens, device=device, dtype=torch.long)
-        reject_mask = offsets.unsqueeze(0) >= accept_lens.unsqueeze(1)
-
-        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
+        bs = req_pool_indices.numel()
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
 
-            state = pool.kv_score_buffer.kv_score
-            slots = (seq_lens.unsqueeze(1) + offsets.unsqueeze(0)) % pool.ring_size
-            rows = req_pool_indices.unsqueeze(1) * pool.ring_size + slots
-            rows = rows[reject_mask]
-
-            half = state.shape[-1] // 2
-            state[rows, :half].zero_()
-            state[rows, half:].fill_(float("-inf"))
+            clear_unaccepted_c128_draft_states(
+                pool.kv_score_buffer.kv_score,
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                ring_size=pool.ring_size,
+                num_draft_tokens=num_draft_tokens,
+            )
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
