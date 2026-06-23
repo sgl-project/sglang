@@ -398,11 +398,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             port_args,
             caller="TokenizerManager",
         )
+        self._recv_from_detokenizer_endpoint = port_args.tokenizer_ipc_name
 
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
+        self._handle_loop = None
+        self._handle_loop_thread = None
+        self._handle_loop_future = None
+        self._handle_loop_zmq_context = None
         self.asyncio_tasks = set()
 
         # Health check
@@ -1802,10 +1807,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Create and start the handle_loop task
         loop = get_or_create_event_loop()
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.handle_loop))
-        )
         self.event_loop = loop
+
+        # The recv socket was created on the main thread during IPC setup.
+        # Recreate it on the dedicated loop before awaiting on it.
+        self._close_recv_from_detokenizer()
+
+        # Run recv_from_detokenizer on a dedicated loop so socket receive does
+        # not contend with request waiters and HTTP response coroutines.
+        self._handle_loop = asyncio.new_event_loop()
+        self._handle_loop_thread = threading.Thread(
+            target=_run_event_loop_forever,
+            args=(self._handle_loop,),
+            daemon=True,
+        )
+        self._handle_loop_thread.start()
+        self._handle_loop_future = asyncio.run_coroutine_threadsafe(
+            print_exception_wrapper(self.handle_loop),
+            self._handle_loop,
+        )
 
         # We only add signal handler when the tokenizer manager is in the main thread
         # due to the CPython limitation.
@@ -1823,9 +1843,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        self._create_recv_from_detokenizer()
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            dispatch_future = asyncio.run_coroutine_threadsafe(
+                self._dispatch_recv_obj(recv_obj), self.event_loop
+            )
+            await asyncio.wrap_future(dispatch_future)
+
+    async def _dispatch_recv_obj(self, recv_obj):
+        """Dispatch detokenizer outputs on the main request event loop."""
+        try:
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
@@ -1835,6 +1864,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
+        except Exception:
+            self.soft_watchdog.feed()
+            raise
+
+    def _close_recv_from_detokenizer(self):
+        endpoint = self.recv_from_detokenizer.get(zmq.LAST_ENDPOINT)
+        if endpoint:
+            self._recv_from_detokenizer_endpoint = endpoint.decode("utf-8")
+        self.recv_from_detokenizer.close(linger=0)
+        self.recv_from_detokenizer = None
+
+    def _create_recv_from_detokenizer(self):
+        self._handle_loop_zmq_context = zmq.asyncio.Context(1)
+        self.recv_from_detokenizer = get_zmq_socket(
+            self._handle_loop_zmq_context,
+            zmq.PULL,
+            self._recv_from_detokenizer_endpoint,
+            True,
+        )
 
     async def _handle_batch_output(
         self,
@@ -3038,6 +3086,11 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+def _run_event_loop_forever(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
 
 def _get_processor_wrapper(server_args):
