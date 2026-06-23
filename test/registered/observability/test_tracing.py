@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import requests
+import torch
 import zmq
 
 from sglang import Engine
@@ -139,6 +140,7 @@ def _subprocess_worker():
 # ============================================================================
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTracePackage(CustomTestCase):
     """Unit tests for tracing package API without server/engine."""
 
@@ -255,6 +257,7 @@ class TestTracePackage(CustomTestCase):
             context.term()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTraceServer(CustomTestCase):
     """Integration tests for tracing with server - starts server once for all tests."""
 
@@ -480,6 +483,7 @@ class TestTraceServer(CustomTestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTraceEngine(CustomTestCase):
     """Integration tests for tracing with Engine API - each test creates its own engine."""
 
