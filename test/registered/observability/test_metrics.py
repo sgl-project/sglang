@@ -177,6 +177,8 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:time_to_first_token_seconds",
             "sglang:inter_token_latency_seconds",
             "sglang:e2e_request_latency_seconds",
+            "sglang:http_requests_total",
+            "sglang:http_responses_total",
             "sglang:http_requests_active",
             "sglang:routing_keys_active",
             "sglang:num_unique_running_routing_keys",

@@ -1656,15 +1656,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        # Whether this abort targets a request still in flight on this worker.
+        # The create_abort_task safety net fires ~2s after a streaming response
+        # finishes, by which point the request has already left rid_to_state.
+        targets_inflight_request = abort_all or rid in self.rid_to_state
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
+            and not targets_inflight_request
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
-        if self.enable_metrics:
+        # Only count an abort that actually targets an in-flight request. In
+        # multi-tokenizer mode the early return above is skipped (aborts are
+        # forwarded unconditionally for cross-worker / disaggregation
+        # correctness), so without this guard every finished streaming request's
+        # safety-net abort would be miscounted as an aborted request.
+        if self.enable_metrics and targets_inflight_request:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels

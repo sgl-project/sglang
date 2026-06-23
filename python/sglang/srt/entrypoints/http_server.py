@@ -269,6 +269,17 @@ async def lifespan(fast_api_app: FastAPI):
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
+        # In multi-tokenizer mode each worker process re-imports `app` fresh, so the
+        # HTTP response-tracking middleware registered on the parent's `app` in
+        # _setup_and_run_http_server never reaches the workers that actually serve
+        # requests, and metrics like sglang:http_responses_total are never emitted.
+        # Register it here so every worker installs it. FastAPI builds the middleware
+        # stack on the first request and forbids adding middleware afterwards, so reset
+        # the stack to force a rebuild that includes this middleware. Single-tokenizer
+        # mode already registers it before startup, so skip it there.
+        if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
+            app.middleware_stack = None
+            add_prometheus_track_response_middleware(app)
         enable_func_timer()
 
     # Init tracing
@@ -2275,7 +2286,11 @@ def _setup_and_run_http_server(
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
-    if server_args.enable_metrics:
+    # Single-tokenizer mode registers the HTTP response-tracking middleware here,
+    # before the embedded server starts. In multi-tokenizer mode the worker processes
+    # re-import `app` and register it from the lifespan instead (see `lifespan`), since
+    # this parent-process `app` is not the one that serves requests.
+    if server_args.enable_metrics and server_args.tokenizer_worker_num == 1:
         add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
