@@ -1401,7 +1401,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
-        "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1495,7 +1494,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
-        "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1589,7 +1587,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
-        "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1683,7 +1680,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
-        "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1777,7 +1773,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
-        "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
