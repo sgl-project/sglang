@@ -53,6 +53,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -88,6 +89,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
@@ -319,6 +321,35 @@ class ModelRunner:
         self.attn_cp_size = server_args.attn_cp_size
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
+        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+            compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                self.tp_rank,
+                self.tp_size,
+                self.attn_dp_size,
+                self.attn_cp_size,
+            )
+        )
+        self.ps = ParallelState(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_rank=self.dp_rank,
+            dp_size=self.attn_dp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
+            attn_dp_rank=attn_dp_rank,
+            attn_dp_size=attn_dp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_rank=self.moe_dp_rank,
+            moe_dp_size=self.moe_dp_size,
+            dcp_size=self.dcp_size,
+            gpu_id=self.gpu_id,
+        )
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -377,16 +408,7 @@ class ModelRunner:
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            dp_size=self.attn_dp_size,
-            attn_cp_size=self.attn_cp_size,
-            moe_ep_size=self.moe_ep_size,
-            moe_dp_size=self.moe_dp_size,
-            dcp_size=self.dcp_size,
+            ps=self.ps,
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,

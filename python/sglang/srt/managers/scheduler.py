@@ -385,6 +385,7 @@ class Scheduler(
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
+            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
