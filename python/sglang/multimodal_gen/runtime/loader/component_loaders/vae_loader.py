@@ -6,6 +6,11 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.models import ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -22,6 +27,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -60,7 +66,9 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     return num_converted
 
 
-def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -> bool:
+def _should_use_channels_last_3d(
+    server_args: ServerArgs | None, component_name: str
+) -> bool:
     if component_name not in (
         "vae",
         "video_vae",
@@ -68,9 +76,21 @@ def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -
         return False
 
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
-    if override is None or override.strip().lower() == "auto":
+    if override is not None and override.strip().lower() != "auto":
+        return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
+
+    if server_args is None:
+        return False
+
+    pipeline_config = server_args.pipeline_config
+    if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
-    return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
+    if (
+        isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
+        and server_args.num_gpus == 1
+    ):
+        return True
+    return False
 
 
 class VAELoader(ComponentLoader):
@@ -108,6 +128,12 @@ class VAELoader(ComponentLoader):
             )
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
         vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
+        resolved_vae_dtype = resolve_component_precision(server_args, component_name)
+        vae_dtype = (
+            resolved_vae_dtype
+            if resolved_vae_dtype is not None
+            else PRECISION_TO_TYPE[vae_precision]
+        )
         vae_config.update_model_arch(config)
         if hasattr(vae_config, "post_init"):
             # NOTE: some post init logics are only available after updated with config
@@ -126,7 +152,6 @@ class VAELoader(ComponentLoader):
             custom_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(custom_module)
             vae_cls = getattr(custom_module, cls_name)
-            vae_dtype = PRECISION_TO_TYPE[vae_precision]
             with set_default_torch_dtype(vae_dtype):
                 vae = vae_cls.from_pretrained(
                     component_model_path,
@@ -145,7 +170,7 @@ class VAELoader(ComponentLoader):
 
         # Load from ModelRegistry (standard VAE classes)
         with (
-            set_default_torch_dtype(PRECISION_TO_TYPE[vae_precision]),
+            set_default_torch_dtype(vae_dtype),
             skip_init_modules(),
         ):
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)

@@ -4,7 +4,7 @@ Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
+Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -13,6 +13,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=370, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=370, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
@@ -41,6 +42,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP4H200(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -48,6 +50,8 @@ class TestDSV4FlashFP4H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 240
 
     @classmethod
     def setUpClass(cls):
@@ -87,6 +91,7 @@ class TestDSV4FlashFP4H200(
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
 )
 class TestDSV4FlashFP4H200FlashInferCutlass(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -99,6 +104,8 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
     """
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 230
 
     @classmethod
     def setUpClass(cls):

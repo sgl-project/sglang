@@ -1,0 +1,297 @@
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+from sglang.srt.lora.trtllm_lora_temp.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
+from sglang.srt.lora.utils import LoRABatchInfo
+
+# Minimum max_len (longest segment) for the single-adapter cuBLAS path; below
+# this the Triton kernel is faster (measured crossover at the smallest
+# realistic N=768, where cuBLAS is weakest).
+_CUBLAS_MIN_MAX_LEN = 8
+
+
+@triton.jit
+def _qkv_lora_b_kernel(
+    # Pointers to matrices
+    x,
+    weights,
+    output,
+    # Parameters of size
+    K,  # K = R
+    max_qkv_out_dim,  # max(output_q_dim, output_kv_dim)
+    # Strides
+    x_stride_0,
+    x_stride_1,
+    w_stride_0,
+    w_stride_1,
+    w_stride_2,
+    output_stride_0,
+    output_stride_1,
+    # Information on sequence lengths and weight id
+    seg_lens,
+    seg_indptr,
+    weight_indices,
+    lora_ranks,
+    # Offsets of q/k/v slice on output dimension
+    n_offs,
+    sorted_token_ids,
+    # Meta parameters
+    SORTED_BY_ADAPTER: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    # For fused output scaling
+    scalings,
+    ENABLE_PDL: tl.constexpr = False,
+    STORE_WRITEBACK: tl.constexpr = False,
+):
+    """
+    This kernel packs 3 sgemms (q/k/v) into a single kernel. The multiplication
+    results are accumulated into the output tensor.
+
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (Tensor): The input tensor, which is the result of the LoRA A projection.
+            Shape: (s, 3 * K), where s is the sum of all sequence lengths in the
+            batch and K is the maximum LoRA rank. The second dimension is partitioned
+            for Q, K, and V.
+        weights (Tensor): The LoRA B weights for all adapters.
+            Shape: (num_lora, N_Q + 2 * N_KV, K).
+        output (Tensor): The output tensor where the result is stored.
+            Shape: (s, N_Q + 2 * N_KV).
+    """
+
+    # Current block computes sequence with batch_id,
+    # which starts from row seg_start of x with length seg_len.
+    # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
+    batch_id = tl.program_id(axis=2)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel is a no-op.
+    if rank == 0:
+        return
+
+    qkv_id = tl.program_id(axis=1)
+    pid = tl.program_id(axis=0)
+    seg_len = tl.load(seg_lens + batch_id)
+    if seg_len == 0:
+        return
+    seg_start = tl.load(seg_indptr + batch_id)
+    n_start = tl.load(n_offs + qkv_id)
+    n_size = tl.load(n_offs + qkv_id + 1) - n_start
+    scaling = tl.load(scalings + w_index)
+    # Adjust K (rank) according to the specific LoRA adapter.
+    K = tl.minimum(K, rank)
+
+    # The tile in output matrix will have (pid_s, pid_n) as id
+    num_pid_n = tl.cdiv(max_qkv_out_dim, BLOCK_N)
+    pid_s = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    if pid_s * BLOCK_S >= seg_len:
+        return
+
+    # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
+    # The pointers will be advanced as we move in the K direction
+    # and accumulate
+    s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
+    n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+    k_offset = tl.arange(0, BLOCK_K)
+
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
+    )
+    x_ptrs = (
+        x
+        + (qkv_id * K) * x_stride_1
+        + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
+    )
+    w_ptrs = (weights + w_index * w_stride_0 + n_start * w_stride_1) + (
+        k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
+    )
+
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    n_mask = n_offset[None, :] < n_size
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & n_mask,
+        other=0.0,
+    )
+    # cast fused: the split-K shrink returns fp32, plain path bf16 (no-op)
+    partial_sum = tl.dot(x_tile.to(w_tile.dtype), w_tile)
+
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Store result to output matrix (cast to the OUTPUT dtype: x may be the fp32
+    # split-K shrink accumulator while base_output is bf16)
+    partial_sum *= scaling
+    partial_sum = partial_sum.to(output.dtype.element_ty)
+    output_ptr = (
+        output
+        + n_start * output_stride_1
+        + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
+    )
+    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
+    if STORE_WRITEBACK:
+        # The expand-add output tiles are disjoint across all programs in this launch
+        # (distinct s-rows / n-cols / slice / segment), so each element is RMW'd by
+        # exactly one program -- a plain read-add-write is correct and avoids the bf16
+        # narrow-tile atomic (the dominant decode cost). base_output is a same-stream
+        # data dependency (base GEMM before apply_lora), not a concurrent writer.
+        partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
+        tl.store(output_ptr, partial_sum, mask=output_mask)
+    else:
+        tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+
+
+def _qkv_lora_b_cublas(
+    x: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    output_offset_cpu: torch.Tensor,
+    base_output: Optional[torch.Tensor],
+    n_slices: int,
+) -> torch.Tensor:
+    """Single-adapter dense path: one cuBLAS addmm_ per q/k/v slice.
+
+    The LoRA-A output is rank-packed (slice i at columns [i*rank, (i+1)*rank)),
+    matching the Triton kernel's K = min(K, rank) slice stride. Slice offsets
+    come from the pinned CPU copy (no GPU sync); slices are disjoint output
+    regions, so in-place addmm_ writes never collide.
+    """
+    r = qkv_lora_b.shape[-1]
+    if base_output is None:
+        base_output = torch.zeros(
+            (x.shape[0], qkv_lora_b.shape[-2]), device=x.device, dtype=x.dtype
+        )
+    w = qkv_lora_b[0]
+    x_scaled = x[:, : n_slices * r] * batch_info.scalings[0]
+    offsets = output_offset_cpu.tolist()
+    for i in range(n_slices):
+        lo, hi = offsets[i], offsets[i + 1]
+        base_output[:, lo:hi].addmm_(x_scaled[:, i * r : (i + 1) * r], w[lo:hi, :r].t())
+    return base_output
+
+
+def qkv_lora_b_fwd(
+    x: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    output_offset: torch.Tensor,
+    max_qkv_out_dim: int,
+    base_output: torch.Tensor = None,
+    n_slices: int = 3,
+    output_offset_cpu: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+
+    # x: (s, n_slices * r)
+    # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+    # output_offset = [0, output_dim_q, output_dim_q + output_dim_kv,
+    #                     output_dim_q + 2 * output_dim_kv]  (length n_slices + 1)
+    # max_qkv_out_dim = max(output_dim_q, output_dim_kv)
+    # output: (s, output_dim_q + 2 * output_dim_kv)
+
+    # Compute lora_output with shape (s, output_dim) as follows:
+    # lora_output[:, :output_dim_q] = sgemm(x[:, :r], qkv_lora_b[:, :outptu_dim_q, :])
+    # lora_output[:, output_dim_q: output_dim_q + output_dim_kv]
+    #      = sgemm(x[:, r: 2 * r], qkv_lora_b[:, outptu_dim_q: output_dim_q + output_dim_kv, :])
+    # lora_output[:, output_dim_q + output_dim_kv: ]
+    #      = sgemm(x[:, 2 * r: , qkv_lora_b[:, output_dim_q + output_dim_kv: , :])
+
+    # Get dims
+    s = x.shape[0]
+    input_dim = x.shape[1]
+    r = qkv_lora_b.shape[-1]
+    output_dim = qkv_lora_b.shape[-2]
+    assert input_dim == n_slices * r
+    assert output_offset.shape[0] == n_slices + 1
+
+    if (
+        output_offset_cpu is not None
+        and (
+            lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
+            or lora_envs.SGLANG_OPT_LORA_CUBLAS_QKV.get()
+        )
+        and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
+        and qkv_lora_b.shape[0]
+        == 1  # single-adapter fast path: only valid with one resident slot
+    ):
+        return _qkv_lora_b_cublas(
+            x, qkv_lora_b, batch_info, output_offset_cpu, base_output, n_slices
+        )
+
+    BLOCK_S = 16
+    BLOCK_R = triton.next_power_of_2(r)
+    # BLOCK_OUT stays 64: with the 1-adapter cuBLAS dispatch the Triton path
+    # only runs for decode-sized batches, where 128 halves the grid (96->48
+    # programs on Kimi r16 bs64) and slows the kernel ~60% (11.4->18.5us, B200).
+    # Re-swept for the store path on GB200: 32 vs 64 is within noise (one preset
+    # marginally each way), so the single value is kept for both writebacks.
+    BLOCK_OUT = 64
+
+    grid_b = (
+        triton.cdiv(batch_info.max_len, BLOCK_S)
+        * triton.cdiv(max_qkv_out_dim, BLOCK_OUT),
+        n_slices,
+        batch_info.bs,
+    )
+
+    if base_output is None:
+        output = torch.zeros((s, output_dim), device=x.device, dtype=x.dtype)
+    else:
+        output = base_output
+
+    sorted_by_adapter = batch_info.permutation is not None
+    store_writeback = lora_envs.SGLANG_OPT_LORA_QKV_B_STORE.get()
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
+    _qkv_lora_b_kernel[grid_b](
+        x,
+        qkv_lora_b,
+        output,
+        r,
+        max_qkv_out_dim,
+        x.stride(0),
+        x.stride(1),
+        qkv_lora_b.stride(0),
+        qkv_lora_b.stride(1),
+        qkv_lora_b.stride(2),
+        output.stride(0),
+        output.stride(1),
+        batch_info.seg_lens,
+        batch_info.seg_indptr,
+        batch_info.weight_indices,
+        batch_info.lora_ranks,
+        output_offset,
+        batch_info.permutation,
+        sorted_by_adapter,
+        BLOCK_S,
+        BLOCK_OUT,
+        BLOCK_R,
+        batch_info.scalings,
+        ENABLE_PDL=enable_pdl,
+        STORE_WRITEBACK=store_writeback,
+        **pdl_kwargs,
+    )
+
+    return output

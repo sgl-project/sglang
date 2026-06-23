@@ -34,8 +34,8 @@ class StageDedupMixin:
 
     def run_grouped_requests(
         self,
-        batches: list["Req"],
-        server_args: "ServerArgs",
+        batches: list[Req],
+        server_args: ServerArgs,
     ) -> list[Any]:
         """Run this stage for a group of independent requests.
 
@@ -63,7 +63,7 @@ class StageDedupMixin:
             or cls.deduplicated_extra_tensor_tree_output_keys
         )
 
-    def build_dedup_fingerprint(self, batch: "Req", server_args: "ServerArgs") -> Any:
+    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> Any:
         """Return this stage's semantic input fingerprint for grouped dedup.
 
         A fingerprint is the stage-local set of input values that fully
@@ -79,10 +79,10 @@ class StageDedupMixin:
 
     def run_deduplicated_group(
         self,
-        batches: list["Req"],
-        server_args: "ServerArgs",
+        batches: list[Req],
+        server_args: ServerArgs,
         copy_outputs=None,
-    ) -> list["Req"]:
+    ) -> list[Req]:
         """Run full-stage-equivalent requests once and fan out stage outputs."""
         if copy_outputs is None:
             copy_outputs = self.copy_deduplicated_outputs
@@ -102,7 +102,7 @@ class StageDedupMixin:
 
         return [result for result in results if result is not None]
 
-    def copy_deduplicated_outputs(self, src: "Req", dst: "Req") -> None:
+    def copy_deduplicated_outputs(self, src: Req, dst: Req) -> None:
         """Copy declared stage outputs from a computed request to a duplicate.
 
         ``deduplicated_output_fields`` uses shallow container copies and shares
@@ -175,11 +175,11 @@ class StageDedupMixin:
 
     @staticmethod
     def _group_requests_by_fingerprint(
-        batches: list["Req"],
+        batches: list[Req],
         fingerprint_fn,
-    ) -> list[tuple[Any, list[tuple[int, "Req"]]]]:
+    ) -> list[tuple[Any, list[tuple[int, Req]]]]:
         """Group requests by a stage-local fingerprint while preserving order."""
-        groups: dict[Any, list[tuple[int, "Req"]]] = {}
+        groups: dict[Any, list[tuple[int, Req]]] = {}
         for index, batch in enumerate(batches):
             fingerprint = fingerprint_fn(batch)
             groups.setdefault(fingerprint, []).append((index, batch))
