@@ -53,7 +53,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -173,40 +172,6 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_data_mem_kinds = ["VRAM"] * len(kv_data_ptrs)
-        kv_args.kv_page_index_mapper = None
-        if self.scheduler.enable_hisparse and isinstance(
-            self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
-        ):
-            index_mapping = (
-                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
-            )
-            page_size = self.token_to_kv_pool.page_size
-
-            def _map_hisparse_page_indices(page_indices):
-                if page_indices.size == 0:
-                    return page_indices
-                logical_token_indices = (
-                    torch.as_tensor(
-                        page_indices, dtype=torch.int64, device=index_mapping.device
-                    )
-                    * page_size
-                )
-                physical_token_indices = index_mapping[logical_token_indices]
-                if torch.any(physical_token_indices <= 0):
-                    raise RuntimeError(
-                        "HiSparse NIXL source page mapping contains unmapped indices"
-                    )
-                if page_size > 1 and torch.any(physical_token_indices % page_size != 0):
-                    raise RuntimeError(
-                        "HiSparse NIXL source page mapping is not page-aligned"
-                    )
-                physical_page_indices = torch.div(
-                    physical_token_indices, page_size, rounding_mode="floor"
-                )
-                return physical_page_indices.to(device="cpu", dtype=torch.int32).numpy()
-
-            kv_args.kv_page_index_mapper = _map_hisparse_page_indices
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

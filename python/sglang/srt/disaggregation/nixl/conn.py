@@ -1210,23 +1210,22 @@ class NixlKVManager(CommonKVManager):
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
-        for mem_kind in ("VRAM", "DRAM"):
-            kv_addrs = []
-            for kv_data_ptr, kv_data_len, kv_mem_kind in zip(
-                self.kv_args.kv_data_ptrs,
-                self.kv_args.kv_data_lens,
-                self.kv_args.kv_data_mem_kinds,
-            ):
-                if kv_mem_kind != mem_kind:
-                    continue
-                kv_addrs.append(
-                    (
-                        kv_data_ptr,
-                        kv_data_len,
-                        _nixl_device_id(mem_kind, self.kv_args.gpu_id),
-                        "",
-                    )
+        kv_addrs_by_mem_kind = {"VRAM": [], "DRAM": []}
+        for kv_data_ptr, kv_data_len, kv_mem_kind in zip(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.kv_data_lens,
+            self.kv_args.kv_data_mem_kinds,
+        ):
+            kv_addrs_by_mem_kind[kv_mem_kind].append(
+                (
+                    kv_data_ptr,
+                    kv_data_len,
+                    _nixl_device_id(kv_mem_kind, self.kv_args.gpu_id),
+                    "",
                 )
+            )
+        for mem_kind in ("VRAM", "DRAM"):
+            kv_addrs = kv_addrs_by_mem_kind[mem_kind]
             if not kv_addrs:
                 continue
             kv_descs = self.agent.register_memory(kv_addrs, mem_kind)

@@ -530,6 +530,33 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
+        agent = StagingFakeAgent(register_result=["desc"])
+        mgr = self._make_manager(agent)
+        mgr.kv_args.kv_data_ptrs = [0x1000, 0x2000, 0x3000]
+        mgr.kv_args.kv_data_lens = [64, 128, 256]
+        mgr.kv_args.kv_data_mem_kinds = ["VRAM", "DRAM", "VRAM"]
+        mgr.kv_args.aux_data_ptrs = [0x4000]
+        mgr.kv_args.aux_data_lens = [32]
+        mgr.kv_args.state_data_ptrs = []
+        mgr.kv_args.state_data_lens = []
+
+        mgr.register_buffer_to_engine()
+
+        self.assertEqual(
+            agent.register_memory_calls,
+            [
+                (
+                    [(0x1000, 64, 1, ""), (0x3000, 256, 1, "")],
+                    "VRAM",
+                ),
+                ([(0x2000, 128, 0, "")], "DRAM"),
+                ([(0x4000, 32, 0, "")], "DRAM"),
+            ],
+        )
+        self.assertEqual(mgr.kv_descs, [["desc"], ["desc"]])
+        self.assertEqual(mgr.aux_descs, ["desc"])
+
     def test_register_staging_memory_uses_vram_and_fails_on_empty_descs(self):
         agent = StagingFakeAgent(register_result=["staging"])
         mgr = self._make_manager(agent)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -37,10 +37,6 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
-    kv_data_mem_kinds: List[str]
-    kv_page_index_mapper: Optional[
-        Callable[[npt.NDArray[np.int32]], npt.NDArray[np.int32]]
-    ]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
