@@ -19,6 +19,7 @@ from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     ScheduledRequestMetrics,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeForwardMode:
@@ -41,6 +42,7 @@ def _make_scheduler(output_path: str):
         server_args=types.SimpleNamespace(
             benchmark_mode="agg",
             benchmark_prefill_granularity=2,
+            benchmark_prefill_kv_read_granularity=1,
             benchmark_decode_length_granularity=2,
             benchmark_decode_batch_granularity=2,
             benchmark_warmup_iterations=0,
@@ -61,6 +63,7 @@ def _make_scheduler(output_path: str):
         waiting_queue=[],
         running_batch=None,
         chunked_req=None,
+        tree_cache=types.SimpleNamespace(disable=True),
     )
 
 
@@ -72,7 +75,7 @@ class _FakeReq:
         return self._finished
 
 
-class TestSelfBenchmark(unittest.TestCase):
+class TestSelfBenchmark(CustomTestCase):
     def test_prefill_point_collects_fpm_and_writes_output(self):
         with TemporaryDirectory() as tmpdir:
             output_path = f"{tmpdir}/benchmark.json"
@@ -228,6 +231,106 @@ class TestSelfBenchmark(unittest.TestCase):
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
         self.assertGreater(len(prefill_points), 0)
         self.assertEqual(max(p.isl for p in prefill_points), 62)
+        self.assertTrue(all(p.kv_read_tokens == 0 for p in prefill_points))
+
+    def test_prefill_kv_read_grid_crosses_with_isl(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.benchmark_prefill_kv_read_granularity = 3
+
+        benchmark = SelfBenchmark(scheduler)
+
+        prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
+        self.assertEqual(
+            [(p.isl, p.kv_read_tokens) for p in prefill_points],
+            [
+                (10, 0),
+                (10, 4),
+                (10, 9),
+                (15, 0),
+                (15, 7),
+                (15, 14),
+            ],
+        )
+
+    def test_prefill_kv_read_grid_aligns_to_page_size(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.page_size = 8
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.benchmark_prefill_kv_read_granularity = 4
+        scheduler.max_req_input_len = 40
+
+        benchmark = SelfBenchmark(scheduler)
+
+        prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
+        self.assertTrue(all(p.kv_read_tokens % 8 == 0 for p in prefill_points))
+        self.assertTrue(all(p.kv_read_tokens <= p.isl - 1 for p in prefill_points))
+        self.assertIn(
+            BenchmarkPoint(point_type="prefill", isl=39, kv_read_tokens=32),
+            prefill_points,
+        )
+
+    def test_prefill_kv_read_point_seeds_then_measures_with_same_extra_key(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "prefill"
+        benchmark = SelfBenchmark(scheduler)
+        point = BenchmarkPoint(point_type="prefill", isl=16, kv_read_tokens=8)
+        calls = []
+
+        def fake_inject_requests(**kwargs):
+            calls.append(kwargs)
+            return 1
+
+        benchmark.phase = BenchmarkPhase.SWEEP
+        benchmark._grid = [point]
+        benchmark._grid_index = 0
+        benchmark._inject_requests = fake_inject_requests
+        benchmark._cached_kv_read_tokens_for_point = (
+            lambda cached_point, _extra_key: cached_point.kv_read_tokens
+        )
+
+        benchmark.maybe_schedule_next()
+
+        self.assertIsNone(benchmark._current)
+        self.assertIs(benchmark._pending_seed_point, point)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["prompt_len"], 8)
+        self.assertEqual(calls[0]["max_tokens"], 0)
+        self.assertFalse(calls[0]["track_active"])
+
+        benchmark.maybe_schedule_next()
+
+        self.assertIsNotNone(benchmark._current)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["prompt_len"], 16)
+        self.assertEqual(calls[1]["max_tokens"], 1)
+        self.assertTrue(calls[1]["track_active"])
+        self.assertEqual(calls[0]["extra_key"], calls[1]["extra_key"])
+
+    def test_prefill_kv_read_point_skips_when_seed_validation_misses(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "prefill"
+        benchmark = SelfBenchmark(scheduler)
+        point = BenchmarkPoint(point_type="prefill", isl=16, kv_read_tokens=8)
+        calls = []
+
+        def fake_inject_requests(**kwargs):
+            calls.append(kwargs)
+            return 1
+
+        benchmark.phase = BenchmarkPhase.SWEEP
+        benchmark._grid = [point]
+        benchmark._grid_index = 0
+        benchmark._inject_requests = fake_inject_requests
+        benchmark._cached_kv_read_tokens_for_point = lambda _point, _extra_key: 0
+
+        benchmark.maybe_schedule_next()
+        benchmark.maybe_schedule_next()
+
+        self.assertIsNone(benchmark._current)
+        self.assertIsNone(benchmark._pending_seed_point)
+        self.assertEqual(benchmark._grid_index, 1)
+        self.assertEqual(len(calls), 1)
 
     def test_chunked_prefill_request_counts_as_inflight_work(self):
         scheduler = _make_scheduler("/tmp/unused.json")
