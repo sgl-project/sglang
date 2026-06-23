@@ -155,6 +155,7 @@ class TestDSV4FlashFP4NonSpecB200(
             kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4BreakableCudaGraphB200(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):

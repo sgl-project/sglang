@@ -14,6 +14,7 @@ import unittest
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
 from sglang.srt.observability.req_time_stats import RequestStage
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 register_cuda_ci(est_time=65, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTraceDisaggregation(CustomTestCase):
     """Test tracing in PD disaggregation mode."""
 
