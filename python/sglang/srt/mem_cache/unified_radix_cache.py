@@ -2194,7 +2194,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         if insert_result.inserted_host_node is not None:
-            self.prefetch_loaded_nodes_by_reqid[req_id] = insert_result.inserted_host_node
+            self.prefetch_loaded_nodes_by_reqid[req_id] = (
+                insert_result.inserted_host_node
+            )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,

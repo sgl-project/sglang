@@ -275,9 +275,9 @@ class DecodeHiCacheTransferMixin:
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
         dr.hicache_restored_node = restored_node
-        dr.hicache_restored_lock_params = (
-            self.tree_cache.inc_lock_ref(restored_node).to_dec_params()
-        )
+        dr.hicache_restored_lock_params = self.tree_cache.inc_lock_ref(
+            restored_node
+        ).to_dec_params()
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.

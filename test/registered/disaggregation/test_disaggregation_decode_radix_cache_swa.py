@@ -12,13 +12,13 @@ import tempfile
 import unittest
 
 import requests
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
     _has_nixl,
 )
 
+from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.cache_hit_kit import async_request_sglang_generate, gen_payload
 from sglang.test.server_fixtures.disaggregation_fixture import (
