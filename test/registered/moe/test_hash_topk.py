@@ -54,12 +54,13 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         num_physical_experts=256,
     )
 
-    output = topk(
-        hidden_states=torch.empty(2, 4),
-        router_logits=torch.ones(2, 256),
-        input_ids=torch.tensor([0, 1], dtype=torch.int64),
-        expert_location_dispatch_info=info,
-    )
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        output = topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 256),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+            expert_location_dispatch_info=info,
+        )
 
     # Physical layout for EP=4 has 64 routed slots per rank plus one local
     # shared slot: [0..63, shared, 64..127, shared, ...].
