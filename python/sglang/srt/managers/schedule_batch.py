@@ -68,6 +68,9 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_evict_dsv4_state,
+)
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -1420,13 +1423,17 @@ class Req(ReqDllmMixin):
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
-
+        # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
+        # Stop string beats EOS/stop-token matched in the same step (speculative
+        # decoding can accept >1 token): token-based would trim only the last
+        # token and leak the stop string.
         if self._check_str_based_finish(new_accepted_len):
+            return
+
+        if self._check_token_based_finish(new_accepted_tokens):
             return
 
     def reset_for_retract(self):
@@ -1743,6 +1750,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
+    # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
+    out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2620,7 +2630,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
@@ -2688,7 +2699,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
+            # Filter out all requests. Stale tensors are left as-is: is_empty()
+            # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
             return
 
@@ -2847,23 +2859,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
 
-            # Eviction_interval: trade-off between SWA token waste and eviction overhead
-            page_size = self.tree_cache.page_size
-            eviction_interval = max(
-                page_size,
-                int(
-                    sliding_window_size
-                    * envs.SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER.get()
-                ),
-            )
-            eviction_interval = (eviction_interval // page_size) * page_size
+            eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    # 2. Evict swa every eviction_interval iterations to reduce the overhead.
+                    if swa_maintenance_step and req.decode_batch_idx >= 1:
                         self._evict_swa(req, req.seqlen - 1)
+
+                    # DSV4-NPU only (no-op elsewhere): the small paged compress-state
+                    # pool must drain every decode step, independent of SWA cadence.
+                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
@@ -2905,6 +2913,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             page_size=self.tree_cache.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            drop_page_margin=self.tree_cache.is_chunk_cache(),
         )
 
     def __str__(self):

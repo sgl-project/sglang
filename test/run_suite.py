@@ -43,14 +43,20 @@ PER_COMMIT_SUITES = {
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
-        # extra-a: label-gated PR opt-in suite in pr-test-amd-extra.yml
+        # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
-        # dispatch when the PR carries the `run-ci-extra` label). Only the
-        # 1-gpu-small mock-model / kv_canary *unit* tests are onboarded so
-        # far; the canary *e2e* tests (1-/2-gpu-large) need the canary JIT
-        # kernel ported to ROCm first, so those suites are intentionally
-        # not yet registered for AMD.
+        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # carries the mock-model / kv_canary unit + single-GPU canary e2e
+        # tests; 1-gpu-large carries the subset of model e2e tests validated
+        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
+        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
+        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
+        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
+        # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
         "extra-a-test-1-gpu-small-amd",
+        "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -117,7 +123,7 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x B200 NVL4) nightly suite
+        # GB300 (4x GB300 NVL4) nightly suite
         "nightly-4-gpu-gb300",
         # Nightly precision regression (per-layer hidden state comparison)
         "nightly-precision-8-gpu-h200",
@@ -125,6 +131,7 @@ NIGHTLY_SUITES = {
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",

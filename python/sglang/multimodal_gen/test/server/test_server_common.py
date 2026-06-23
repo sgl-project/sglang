@@ -138,6 +138,22 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
 
+    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
+    # mesh-correctness and must NOT run the paint/texture stages, whose
+    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
+    # that the shape-only path never produces. Inject a pipeline-config override
+    # disabling paint for these cases.
+    if server_args.custom_validator == "mesh":
+        import json as _json
+        import tempfile as _tempfile
+
+        _paint_off_cfg = os.path.join(
+            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
+        )
+        with open(_paint_off_cfg, "w") as _f:
+            _json.dump({"paint_enable": False}, _f)
+        extra_args += f" --config {_paint_off_cfg}"
+
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
