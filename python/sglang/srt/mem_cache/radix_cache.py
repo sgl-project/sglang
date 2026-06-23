@@ -239,6 +239,11 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # ref-aware tiered eviction counters (RefAwareHiRadixCache)
+        self.high_ref = 0
+        self.low_ref = 0
+        self.tracked_rids: set = set()
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -679,6 +684,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        new_node.high_ref = child.high_ref
+        new_node.low_ref = child.low_ref
+        new_node.tracked_rids = set(child.tracked_rids)
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
         child.parent = new_node

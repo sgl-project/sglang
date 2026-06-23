@@ -1937,6 +1937,15 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    # Ref-aware KV cache eviction (requires hierarchical cache)
+    enable_ref_aware_kv_buffer: A[
+        bool,
+        "Enable ref-aware KV cache eviction with two-tier priority. Requires --enable-hierarchical-cache.",
+    ] = False
+    high_priority_threshold: A[
+        int,
+        "Requests with priority >= this threshold are high-priority for ref-aware eviction.",
+    ] = 1
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -6216,6 +6225,22 @@ class ServerArgs:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if self.enable_ref_aware_kv_buffer and not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-ref-aware-kv-buffer requires --enable-hierarchical-cache"
+            )
+
+        if (
+            self.enable_ref_aware_kv_buffer
+            and self.enable_priority_scheduling
+            and self.schedule_low_priority_values_first
+        ):
+            raise ValueError(
+                "--enable-ref-aware-kv-buffer with --enable-priority-scheduling assumes "
+                "larger priority value == higher priority, so it is incompatible with "
+                "--schedule-low-priority-values-first."
             )
 
         if self.disaggregation_decode_enable_offload_kvcache:

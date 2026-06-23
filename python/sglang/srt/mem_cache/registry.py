@@ -108,9 +108,17 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             # HybridModel launches HiCache via UnifiedRadixCache by default.
             return _create_unified_radix_cache(ctx, server_args, params)
         else:
-            from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+            if server_args.enable_ref_aware_kv_buffer:
+                # TODO (zhangmj): support ref-aware HiRadixCache in UnifiedRadixCache for hybrid SSM/SWA.
+                from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                    RefAwareHiRadixCache,
+                )
 
-            cache = HiRadixCache(params=params, server_args=server_args)
+                cache = RefAwareHiRadixCache(params=params, server_args=server_args)
+            else:
+                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                cache = HiRadixCache(params=params, server_args=server_args)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )

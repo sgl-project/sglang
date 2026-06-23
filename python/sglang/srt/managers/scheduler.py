@@ -126,9 +126,13 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     RpcReqInput,
     RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -350,6 +354,8 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_ref_aware_kv_buffer = server_args.enable_ref_aware_kv_buffer
+        self.high_priority_threshold = server_args.high_priority_threshold
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -455,6 +461,22 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # Reconcile: only keep the flag if tree_cache is actually RefAwareHiRadixCache.
+        # This handles cases where enable_ref_aware_kv_buffer is set but tree_cache
+        # ends up as a different type (e.g. UnifiedRadixCache for hybrid SSM/SWA).
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                RefAwareHiRadixCache,
+            )
+
+            if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+                logger.warning(
+                    "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
+                    "disabling ref-aware KV buffer.",
+                    type(self.tree_cache).__name__,
+                )
+                self.enable_ref_aware_kv_buffer = False
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -669,6 +691,38 @@ class Scheduler(
 
     def handle_get_loads_req(self, req: GetLoadsReqInput):
         return self.load_inquirer.get_loads(req)
+
+    def handle_release_ref(self, recv_req: ReleaseRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                success, msg = self.tree_cache.release_ref(recv_req.rid)
+                return ReleaseRefReqOutput(success=success, message=msg)
+        return ReleaseRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+
+    def handle_update_ref(self, recv_req: UpdateRefReqInput):
+        if not self.enable_ref_aware_kv_buffer:
+            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+
+        rid = recv_req.rid
+        new_priority = recv_req.new_priority
+        for req in getattr(self.running_batch, "reqs", []) or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        for req in self.waiting_queue or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and getattr(chunked, "rid", None) == rid:
+            chunked.priority = new_priority
+
+        success, msg = self.tree_cache.update_ref(rid, new_priority)
+        return UpdateRefReqOutput(success=success, message=msg)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1429,6 +1483,8 @@ class Scheduler(
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadsReqInput, self.handle_get_loads_req),
+                (ReleaseRefReqInput, self.handle_release_ref),
+                (UpdateRefReqInput, self.handle_update_ref),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -2811,10 +2867,23 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
+            high_priority_threshold=self.high_priority_threshold,
         )
 
+        deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+
+        chunk_deferred = False
+        if self.enable_ref_aware_kv_buffer and self.chunked_req is not None:
+            chunk_is_high = self.tree_cache.is_high_priority(self.chunked_req.priority or 0)
+            if not chunk_is_high:
+                chunk_deferred = True
+                deferred_chunked_req = self.chunked_req
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        elif self.chunked_req is not None:
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2864,6 +2933,23 @@ class Scheduler(
                     req.rid
                 )
 
+            # At the HP->LP boundary, try to insert the deferred LP chunk
+            if chunk_deferred and deferred_chunked_req is not None:
+                req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+                if not req_is_high:
+                    # We've reached the LP boundary; try to add the deferred chunk now
+                    result_chunk = adder.add_chunked_req(deferred_chunked_req)
+                    if result_chunk is not None:
+                        # Budget insufficient: release KV cache and retract
+                        release_kv_cache(deferred_chunked_req, self.tree_cache, is_insert=False)
+                        deferred_chunked_req.reset_for_retract()
+                        self._add_request_to_queue(deferred_chunked_req)
+                        self.chunked_req = None
+                    else:
+                        self.chunked_req = None
+                    deferred_chunked_req = None
+                    chunk_deferred = False
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2898,6 +2984,19 @@ class Scheduler(
                     )
                     req.mamba_pool_idx = None
                 break
+
+        # If the queue was exhausted without inserting the deferred chunk, handle it
+        if chunk_deferred and deferred_chunked_req is not None:
+            result_chunk = adder.add_chunked_req(deferred_chunked_req)
+            if result_chunk is not None:
+                # Budget insufficient: release KV cache and retract
+                release_kv_cache(deferred_chunked_req, self.tree_cache, is_insert=False)
+                deferred_chunked_req.reset_for_retract()
+                self._add_request_to_queue(deferred_chunked_req)
+                self.chunked_req = None
+            else:
+                self.chunked_req = None
+            deferred_chunked_req = None
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
