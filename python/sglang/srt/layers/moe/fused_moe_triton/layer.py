@@ -86,10 +86,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    print(a2a_backend)
     if (a2a_backend.is_none() and is_npu()):
         return TorchNpuDispatcher(moe_runner_config)
-    if (
+    elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()
@@ -128,8 +127,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
         )
-    if a2a_backend.is_torch_npu():
-        return TorchNpuDispatcher(moe_runner_config)
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 
