@@ -1838,20 +1838,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         current_platform.empty_cache()
         return success, message
 
+    @staticmethod
     def update_weights_from_tensor(
-        self,
+        self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
+            return ModelRunner._update_weights_from_flattened_bucket(
+                self, flattened_tensor_bucket_dict=named_tensors
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
+        device_module = torch.get_device_module(self._mr.device)
         infered_device = device_module.current_device()
 
         named_tensors = [
@@ -1859,18 +1860,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
+            _model_load_weights_direct(self._mr.model, named_tensors)
+        elif load_format in self._mr.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
+            custom_loader(self._mr.model, named_tensors)
         elif load_format is None:
-            self.model.load_weights(named_tensors)
+            self._mr.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
+    @staticmethod
     def _update_weights_from_flattened_bucket(
-        self,
+        self: WeightUpdater,
         flattened_tensor_bucket_dict,
     ):
         """Handle flattened bucket format for weight updates"""
@@ -1897,7 +1899,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
+        self._mr.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
 

@@ -2748,6 +2748,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
