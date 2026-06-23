@@ -16,7 +16,7 @@ The capital of the United States is Washington, D.C.
 ========== Prompt 1 ==========
 prefill logits (final) tensor([-8.9062, -9.0156,  4.1484,  ..., -4.9922, -4.4961, -4.0742],
        device='cuda:0')
-<s> The capital of the United Kindom is London.
+<s> The capital of the United Kingdom is London.
 The capital of the United Kingdom is London.
 The capital of
 
@@ -124,7 +124,7 @@ def normal_text(args):
 
     prompts = [
         "The capital of France is",
-        "The capital of the United Kindom is",
+        "The capital of the United Kingdom is",
         "Today is a sunny day and I like",
     ]
     max_new_tokens = args.max_new_tokens
