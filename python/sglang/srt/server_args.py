@@ -970,6 +970,10 @@ class ServerArgs:
         bool,
         "Enable streaming session mode and StreamingSession wrapper.",
     ] = False
+    enable_session_radix_cache: A[
+        bool,
+        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Constrained decoding
@@ -2075,7 +2079,17 @@ class ServerArgs:
     flashinfer_allreduce_fusion_backend: A[
         Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
-            help="Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.",
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Defaults to auto. "
+                "'auto': choose trtllm on single-node systems and mnnvl on "
+                "SM100/SM103 multi-node systems. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
         ),
     ] = None
     enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
@@ -2484,6 +2498,10 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
+            raise ValueError(
+                "--enable-session-radix-cache requires --radix-eviction-policy priority"
+            )
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
@@ -3284,12 +3302,9 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
-            effective_chunked_prefill_size = self.chunked_prefill_size // (
-                self.dp_size if self.enable_dp_attention and self.dp_size > 1 else 1
-            )
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
-                reserved_mem += max(effective_chunked_prefill_size, 2048) * 1.5
+                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
@@ -4312,13 +4327,10 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). SM90 is not
-        # auto-enabled because auto resolves to mnnvl, which requires a working
-        # NVLink multicast fabric that SM90 nodes do not reliably have; SM90
-        # users can opt in explicitly via
-        # --flashinfer-allreduce-fusion-backend.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
+        # single-node systems and mnnvl on Blackwell multi-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -4340,14 +4352,15 @@ class ServerArgs:
                 "NemotronHForCausalLM",
                 "NemotronHPuzzleForCausalLM",
             ]
-            and is_sm100_supported()
+            and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
             and not self.enable_dp_attention
+            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
             self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments

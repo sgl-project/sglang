@@ -279,6 +279,8 @@ class Envs:
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # Physical KV-page checks: committed<=allocated + no page alias.
+    SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
 
     # Load snapshot backend
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
