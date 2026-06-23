@@ -72,7 +72,7 @@ help:
 	@echo "  build           - Build binary (release mode)"
 	@echo "  build-dev       - Build binary (debug mode)"
 	@echo "  test            - Run tests"
-	@echo "  e2e             - Run end-to-end test with bench_serving.py"
+	@echo "  e2e             - Run end-to-end test with sglang.benchmark.serving"
 	@echo "  run             - Run the server (development)"
 	@echo "  stream          - Run streaming example"
 	@echo "  clean           - Clean build artifacts"
@@ -149,21 +149,21 @@ check-server:
 # Find sglang project root (4 levels up from oai_server)
 SGLANG_ROOT := $(shell cd $(ROOT_DIR)/../../../../.. && pwd)
 
-# Run end-to-end test with bench_serving.py
+# Run end-to-end test with sglang.benchmark.serving
 e2e: check-server
-	@echo "Checking if bench_serving.py is available..."
-	@if python -m sglang.bench_serving --help > /dev/null 2>&1; then \
-		echo "✓ Using installed bench_serving.py module"; \
+	@echo "Checking if sglang.benchmark.serving is available..."
+	@if python -m sglang.benchmark.serving --help > /dev/null 2>&1; then \
+		echo "✓ Using installed sglang.benchmark.serving module"; \
 		USE_SGLANG_ROOT=false; \
-	elif [ -f "$(SGLANG_ROOT)/python/sglang/bench_serving.py" ]; then \
-		echo "✓ Using bench_serving.py from $(SGLANG_ROOT)"; \
+	elif [ -f "$(SGLANG_ROOT)/python/sglang/benchmark/serving.py" ]; then \
+		echo "✓ Using benchmark/serving.py from $(SGLANG_ROOT)"; \
 		USE_SGLANG_ROOT=true; \
 	else \
-		echo "✗ bench_serving.py is not available"; \
+		echo "✗ sglang.benchmark.serving is not available"; \
 		echo "  Install dependencies: pip install aiohttp numpy datasets transformers tqdm pillow pybase64"; \
 		exit 1; \
 	fi
-	@echo "Running end-to-end test with bench_serving.py..."
+	@echo "Running end-to-end test with sglang.benchmark.serving..."
 	@echo "Configuration:"
 	@echo "  Server: $(E2E_BASE_URL)"
 	@if [ "$(E2E_MODEL)" != "default" ]; then \
@@ -188,7 +188,7 @@ e2e: check-server
 		TOKENIZER_ARG=""; \
 	fi; \
 	if [ "$$USE_SGLANG_ROOT" = "true" ]; then \
-		cd $(SGLANG_ROOT) && PYTHONPATH=$(SGLANG_ROOT)/python:$$PYTHONPATH python python/sglang/bench_serving.py \
+		cd $(SGLANG_ROOT) && PYTHONPATH=$(SGLANG_ROOT)/python:$$PYTHONPATH python python/sglang/benchmark/serving.py \
 			--backend sglang-oai-chat \
 			--base-url $(E2E_BASE_URL) \
 			$$([ "$(E2E_MODEL)" != "default" ] && echo "--model $(E2E_MODEL)") \
@@ -202,7 +202,7 @@ e2e: check-server
 			--warmup-requests 5 \
 			--disable-tqdm || (echo "✗ E2E test failed"; exit 1); \
 	else \
-		python -m sglang.bench_serving \
+		python -m sglang.benchmark.serving \
 			--backend sglang-oai-chat \
 			--base-url $(E2E_BASE_URL) \
 			$$([ "$(E2E_MODEL)" != "default" ] && echo "--model $(E2E_MODEL)") \

@@ -414,7 +414,7 @@ python3 -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 5000 \

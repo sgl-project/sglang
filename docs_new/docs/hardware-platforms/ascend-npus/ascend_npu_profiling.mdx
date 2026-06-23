@@ -186,7 +186,7 @@ calls needed.
 
 ```bash Command
 # With --profile-steps: auto-stops after N steps and generates output
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \
   --model /path/to/your/model \
@@ -200,7 +200,7 @@ python -m sglang.bench_serving \
   --profile-output-dir ./sglang_profile
 
 # Without --profile-steps: /stop_profile sent automatically after benchmark
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \
   --model /path/to/your/model \
@@ -272,7 +272,7 @@ A simpler and more reliable approach is to use `bench_serving --profile`, which
 handles both steps automatically:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \
   --model /path/to/your/model \

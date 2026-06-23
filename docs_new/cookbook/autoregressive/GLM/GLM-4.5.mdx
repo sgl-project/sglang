@@ -358,7 +358,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -371,7 +371,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency (Balanced)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -384,7 +384,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency (Throughput-Optimized)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -400,7 +400,7 @@ python -m sglang.bench_serving \
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -413,7 +413,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -426,7 +426,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -441,7 +441,7 @@ python -m sglang.bench_serving \
 
 - Low Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -454,7 +454,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -467,7 +467,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \

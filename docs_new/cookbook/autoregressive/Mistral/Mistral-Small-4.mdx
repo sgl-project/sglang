@@ -359,7 +359,7 @@ TODO
 #### Latency (Low Concurrency)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --num-prompts 10 \
   --max-concurrency 1 \
@@ -377,7 +377,7 @@ TODO
 #### Throughput (High Concurrency)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --num-prompts 1000 \
   --max-concurrency 100 \

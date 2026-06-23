@@ -282,13 +282,13 @@ I'll check the current weather in Tokyo for you.
 - Hardware: NVIDIA H200 (1×H200 for TP=1, 4×H200 for TP=4)
 - Model: `poolside/Laguna-XS.2` (BF16)
 - SGLang Version: `0.5.12.dev20260509+g096ad02b0` (nightly wheel containing the #24204 merge commit; same code path as the original PR runs)
-- Workload: `sglang.bench_serving --backend sglang --dataset-name random` (defaults: `--random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.0`)
+- Workload: `sglang.benchmark.serving --backend sglang --dataset-name random` (defaults: `--random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.0`)
 - Server flags identical to the accuracy runs above.
 
 #### 5.2.1 Latency Benchmark (10 prompts, concurrency = 1)
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -305,7 +305,7 @@ python3 -m sglang.bench_serving --backend sglang \
 #### 5.2.2 Throughput Benchmark (1000 prompts, concurrency = 100)
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
