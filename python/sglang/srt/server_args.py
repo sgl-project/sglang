@@ -1261,6 +1261,22 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # Min free slots delay (prefill refill batching)
+    # -------------------------------------------------------------------------
+    min_free_slots_delay: A[
+        Optional[int],
+        (
+            "Hold new prefills until at least N running-request slots have freed "
+            "up, so they are admitted in one batch instead of one at a time. "
+            "Useful when each admission is disproportionately expensive, e.g. "
+            "speculative decoding with a separate draft prefill pass. Capped to "
+            "the DFlash formula (disabled when max-running-requests < 8; "
+            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
+            "this with the formula when unset; other workloads stay disabled."
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LoRA
     # -------------------------------------------------------------------------
     enable_lora: A[
