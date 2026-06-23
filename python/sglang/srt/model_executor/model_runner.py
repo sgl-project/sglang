@@ -216,6 +216,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
+    disable_routed_experts_capture_for_draft,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -729,10 +730,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
-            from sglang.srt.state_capturer.routed_experts import (
-                disable_routed_experts_capture_for_draft,
-            )
-
             disable_routed_experts_capture_for_draft(self.model)
 
         # Load the expert backup client
@@ -984,8 +981,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
-            # Target-only: a draft worker shares the process and is built after
-            # its target, so installing one here would replace the target's.
+            # Capture is target-only. The draft worker runs in the same process
+            # as its target and inits after it, so installing a capturer here
+            # would overwrite the target's process-global one.
             return
 
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -3667,8 +3665,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        # Target-only: a draft forward must not finalize on_forward_end, which
-        # would write the target's capture cache keyed by the draft's batch.
         if not self.is_draft_worker and (
             experts_capturer := get_global_experts_capturer()
         ) is not None:

@@ -220,10 +220,10 @@ class ForwardFinalizeGateTripwireTest(unittest.TestCase):
 
 class InitializeOrderingTripwireTest(unittest.TestCase):
     """Source-level tripwire on `ModelRunner.initialize()`: the draft branch
-    must import and call `disable_routed_experts_capture_for_draft` after
-    `_prepare_moe_topk` and inside the `if self.is_draft_worker:` branch, and
-    before any backend/graph/memory init. A full `initialize()` needs GPU +
-    weights, so this asserts against source text instead of executing it."""
+    must call `disable_routed_experts_capture_for_draft` after `_prepare_moe_topk`,
+    inside the `if self.is_draft_worker:` branch, and before any
+    backend/graph/memory init. A full `initialize()` needs GPU + weights, so this
+    asserts against source text instead of executing it."""
 
     def _initialize_source(self) -> str:
         from sglang.srt.model_executor import model_runner as mr
@@ -305,22 +305,6 @@ class InitializeOrderingTripwireTest(unittest.TestCase):
             f"found {offenders!r} in the between-region. The draft opt-out must "
             "run BEFORE any graph/backend/memory init records the (default-True) "
             "capture decision",
-        )
-
-    def test_disable_helper_imported_in_draft_branch(self):
-        source = self._initialize_source()
-        self._require_index(source, "disable_routed_experts_capture_for_draft,")
-        import_idx = self._require_index(
-            source, "from sglang.srt.state_capturer.routed_experts import"
-        )
-        call_idx = self._require_index(
-            source, "disable_routed_experts_capture_for_draft(self.model)"
-        )
-        self.assertLess(
-            import_idx,
-            call_idx,
-            "the draft branch must import disable_routed_experts_capture_for_draft "
-            "before calling it",
         )
 
 
