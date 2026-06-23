@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1600, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=1000, stage="extra-b", runner_config="deepep-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LOADER_CONFIG = '{"enable_multithread_load": true, "num_threads": 64}'
@@ -35,10 +35,22 @@ def _has_nixl():
     return True
 
 
-class _DSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
+class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+
+        cls.model = try_cached_model(DSV4_FLASH_MODEL)
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -124,7 +136,7 @@ class _DSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
     is_in_ci() or _has_nixl(),
     "NIXL is required for DSV4 HiSparse disaggregation coverage.",
 )
-class TestDisaggregationDSV4HiSparseNixl(_DSV4HiSparseBase):
+class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
     @classmethod
     def setUpClass(cls):
         PDDisaggregationServerBase.setUpClass.__func__(cls)

@@ -625,21 +625,6 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def _map_src_kv_indices(
-        self, prefill_kv_indices: npt.NDArray[np.int32]
-    ) -> npt.NDArray[np.int32]:
-        mapper = getattr(self.kv_args, "kv_page_index_mapper", None)
-        if mapper is None or prefill_kv_indices.size == 0:
-            return prefill_kv_indices
-
-        mapped = np.asarray(mapper(prefill_kv_indices), dtype=np.int32)
-        if mapped.shape != prefill_kv_indices.shape:
-            raise RuntimeError(
-                "NIXL KV source page mapper changed index shape: "
-                f"{prefill_kv_indices.shape} -> {mapped.shape}"
-            )
-        return mapped
-
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -1039,9 +1024,7 @@ class NixlKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
-                        src_prefill_kv_indices = self._map_src_kv_indices(
-                            kv_chunk.prefill_kv_indices
-                        )
+                        src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
                         notif = (
                             f"{req.room}_kv_{kv_chunk.chunk_id}"

@@ -1,3 +1,5 @@
+import unittest
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -10,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1600, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=500, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -121,3 +123,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             other_args=decode_args,
             env=DSV4_FLASH_ENV,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
