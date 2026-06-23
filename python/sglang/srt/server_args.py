@@ -5332,7 +5332,7 @@ class ServerArgs:
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if (self.moe_a2a_backend == "none" and is_npu()) or self.moe_a2a_backend = "torch_npu":
+        if (self.moe_a2a_backend == "none" and is_npu()) or self.moe_a2a_backend == "torch_npu":
             # FIXME (OrangeRedeng): for some reasons if pass "torch_npu" accuracy drops to zero
             self.moe_a2a_backend = "none"
 
