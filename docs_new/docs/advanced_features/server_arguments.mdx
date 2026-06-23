@@ -231,6 +231,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uds`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bind the public HTTP request-intake listener to a Unix domain socket at the given path instead of a TCP host/port. Useful when integrating with orchestrators that proxy inference requests over UDS, such as [Docker Model Runner](https://github.com/docker/model-runner). Mutually exclusive with `--host` / `--port` (defaults are tolerated; any explicit non-default value alongside `--uds` is a configuration error). Linux and macOS only. Works with both the default uvicorn server and `--enable-http2` (Granian). Internal SGLang services (gRPC bootstrap, ZMQ, NCCL, disaggregation, DP controller) continue to use TCP on `127.0.0.1` regardless of `--uds`. A stale socket file at the requested path is removed automatically; a non-socket file or a currently-bound socket at the same path is refused with a clear error. Example: `sglang serve --model-path Qwen/Qwen2.5-7B-Instruct --uds /run/sglang/sglang.sock`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--fastapi-root-path`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>App is behind a path based routing proxy.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`""`</td>

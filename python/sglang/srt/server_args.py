@@ -26,6 +26,7 @@ import math
 import os
 import random
 import socket
+import sys
 import tempfile
 import uuid
 from functools import cached_property
@@ -527,6 +528,10 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
+    uds: A[
+        Optional[str],
+        "Bind the public HTTP server to this Unix domain socket path instead of host/port. Mutually exclusive with --host / --port. Linux/macOS only.",
+    ] = None
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
     grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
@@ -2447,6 +2452,63 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.uds is not None:
+            if self.uds == "":
+                raise ValueError(
+                    "--uds must be a non-empty path; received an empty string"
+                )
+            if not os.path.isabs(self.uds):
+                raise ValueError(
+                    f"--uds must be an absolute path; received {self.uds!r}. "
+                    "Relative paths bind relative to the process working "
+                    "directory, which is service-launcher-dependent and "
+                    "surprising for operators."
+                )
+            if sys.platform == "win32":
+                raise ValueError(
+                    "--uds is only supported on Linux and macOS; "
+                    f"current platform: {sys.platform}"
+                )
+            if self.grpc_mode:
+                raise ValueError(
+                    "--uds is not supported in --grpc-mode; the gRPC server "
+                    "binds via its own listener and does not consult --uds. "
+                    "Drop one of --uds or --grpc-mode."
+                )
+            if self.ssl_certfile or self.ssl_keyfile:
+                raise ValueError(
+                    "--uds combined with --ssl-certfile / --ssl-keyfile is "
+                    "not supported: uvicorn wraps the UDS listener in TLS "
+                    "but the in-process warmup self-call goes over plain "
+                    "HTTP and would fail the TLS handshake, killing the "
+                    "server at startup. Drop the SSL flags (UDS is local-only "
+                    "so TLS provides little additional protection) or drop "
+                    "--uds."
+                )
+            # Compare against dataclass defaults to detect "user explicitly set
+            # --host or --port alongside --uds". Argparse cannot distinguish
+            # `--host 127.0.0.1` (user typed the default explicitly) from
+            # `--host` omitted, so a user-supplied default value is silently
+            # tolerated here. That is intentional: internal services use these
+            # field values regardless of whether the user typed them.
+            uds_field_defaults = {
+                "host": ServerArgs.__dataclass_fields__["host"].default,
+                "port": ServerArgs.__dataclass_fields__["port"].default,
+            }
+            mismatches = []
+            if self.host != uds_field_defaults["host"]:
+                mismatches.append(f"--host={self.host}")
+            if self.port != uds_field_defaults["port"]:
+                mismatches.append(f"--port={self.port}")
+            if mismatches:
+                raise ValueError(
+                    "--uds is mutually exclusive with --host / --port; "
+                    f"received --uds={self.uds} together with "
+                    f"{' '.join(mismatches)}. "
+                    "Drop --host/--port (defaults are kept for internal "
+                    "TCP services) or drop --uds."
+                )
 
         self._maybe_download_model_for_runai()
 

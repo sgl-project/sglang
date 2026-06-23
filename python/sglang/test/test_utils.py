@@ -821,23 +821,59 @@ def _launch_server_process(
     )
 
 
+def _uds_health_probe(uds_path: str, headers: dict, timeout: float) -> int:
+    """Probe ``/health_generate`` over an AF_UNIX socket; return HTTP status.
+
+    Uses stdlib ``http.client`` so we don't need an extra
+    ``requests-unixsocket`` dependency just for the health check.
+    """
+    import http.client
+    import socket as _socket
+
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(uds_path)
+    except BaseException:
+        # Failure before ownership transfers to HTTPConnection -- close the
+        # fd explicitly rather than rely on CPython refcount timing.
+        sock.close()
+        raise
+    conn = http.client.HTTPConnection("localhost", timeout=timeout)
+    conn.sock = sock
+    try:
+        conn.request("GET", "/health_generate", headers=headers)
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
 def _wait_for_server_health(
     proc: subprocess.Popen,
-    base_url: str,
+    base_url: Optional[str],
     api_key: Optional[str],
     timeout_duration: float,
+    uds_path: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Wait for server health check to pass.
 
+    Exactly one of ``base_url`` or ``uds_path`` must be provided.
+
     Args:
         proc: Server subprocess
-        base_url: Base URL for health check
+        base_url: Base URL for HTTP health check (mutually exclusive with uds_path)
         api_key: Optional API key for authorization
         timeout_duration: Maximum wait time in seconds
+        uds_path: Unix domain socket path to probe instead of base_url
 
     Returns:
         Tuple of (success, error_message)
     """
+    if (base_url is None) == (uds_path is None):
+        raise ValueError(
+            "_wait_for_server_health requires exactly one of base_url or uds_path"
+        )
+
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout_duration:
@@ -850,14 +886,21 @@ def _wait_for_server_health(
                     "Content-Type": "application/json; charset=utf-8",
                     "Authorization": f"Bearer {api_key}",
                 }
-                response = session.get(
-                    f"{base_url}/health_generate",
-                    headers=headers,
-                    timeout=5,
-                )
-                if response.status_code == 200:
+                if uds_path is not None:
+                    status_code = _uds_health_probe(uds_path, headers, timeout=5)
+                else:
+                    response = session.get(
+                        f"{base_url}/health_generate",
+                        headers=headers,
+                        timeout=5,
+                    )
+                    status_code = response.status_code
+                if status_code == 200:
                     return True, None
-            except requests.RequestException:
+            except (requests.RequestException, OSError):
+                # OSError covers UDS connect failures while the server is
+                # still binding (ConnectionRefusedError, FileNotFoundError,
+                # etc.) without needing a separate handler.
                 pass
 
             return_code = proc.poll()
@@ -871,7 +914,7 @@ def _wait_for_server_health(
 
 def popen_launch_server(
     model: str,
-    base_url: str,
+    base_url: Optional[str],
     timeout: float,
     api_key: Optional[str] = None,
     other_args: Optional[list[str]] = None,
@@ -880,12 +923,13 @@ def popen_launch_server(
     device: str = "auto",
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
+    uds_path: Optional[str] = None,
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
     Args:
         model: Model path or identifier
-        base_url: Base URL for the server
+        base_url: Base URL for the server (mutually exclusive with uds_path)
         timeout: Timeout for server startup
         api_key: Optional API key for authentication
         other_args: Additional command line arguments
@@ -894,10 +938,30 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
+        uds_path: Unix domain socket path. When set, the server is launched
+            with ``--uds`` instead of ``--host``/``--port`` and the health
+            probe runs over the UDS. ``base_url`` must be ``None`` in this
+            mode, and the PD-separated / mixed-replica modes are not
+            supported.
 
     Returns:
         Started subprocess.Popen object
     """
+    if uds_path is not None:
+        if base_url is not None:
+            raise ValueError(
+                "popen_launch_server: base_url must be None when uds_path is set"
+            )
+        if pd_separated or num_replicas is not None:
+            raise ValueError(
+                "popen_launch_server: uds_path is not compatible with "
+                "pd_separated or num_replicas"
+            )
+    elif base_url is None:
+        raise ValueError(
+            "popen_launch_server requires exactly one of base_url or uds_path"
+        )
+
     other_args = other_args or []
 
     # Auto-detect device if needed
@@ -927,9 +991,6 @@ def popen_launch_server(
         print(f"CI cache validation failed (non-fatal): {e}")
 
     # Build server command
-    _, host, port = base_url.split(":")
-    host = host[2:]
-
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
         command = [
@@ -949,10 +1010,15 @@ def popen_launch_server(
             *[str(x) for x in other_args],
         ]
 
-    if pd_separated or use_mixed_pd_engine:
-        command.extend(["--lb-host", host, "--lb-port", port])
+    if uds_path is not None:
+        command.extend(["--uds", uds_path])
     else:
-        command.extend(["--host", host, "--port", port])
+        _, host, port = base_url.split(":")
+        host = host[2:]
+        if pd_separated or use_mixed_pd_engine:
+            command.extend(["--lb-host", host, "--lb-port", port])
+        else:
+            command.extend(["--host", host, "--port", port])
 
     if use_mixed_pd_engine:
         command.extend(["--mixed", "--num-replicas", str(num_replicas)])
@@ -967,7 +1033,9 @@ def popen_launch_server(
 
     # First launch attempt
     process = _launch_server_process(command, env, return_stdout_stderr, model)
-    success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
+    success, error_msg = _wait_for_server_health(
+        process, base_url, api_key, timeout, uds_path=uds_path
+    )
 
     # If offline launch failed and offline was enabled, retry with online mode
     if not success and offline_enabled:
@@ -996,7 +1064,7 @@ def popen_launch_server(
         env["HF_HUB_OFFLINE"] = "0"
         process = _launch_server_process(command, env, return_stdout_stderr, model)
         success, error_msg = _wait_for_server_health(
-            process, base_url, api_key, timeout
+            process, base_url, api_key, timeout, uds_path=uds_path
         )
 
         if success:
