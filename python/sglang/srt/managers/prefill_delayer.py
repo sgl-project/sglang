@@ -49,7 +49,7 @@ class PrefillDelayer:
         server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
-        min_allocatable_reqs: Optional[int] = None,
+        min_batch: Optional[int] = None,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
         device_group=None,
@@ -59,12 +59,8 @@ class PrefillDelayer:
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
-        # Allocatable-slots trigger is opt-in too; a threshold of 0/1 is a no-op.
-        self._min_allocatable_reqs = (
-            min_allocatable_reqs
-            if min_allocatable_reqs is not None and min_allocatable_reqs > 1
-            else None
-        )
+        # Min-batch trigger is opt-in too; a threshold of 0/1 is a no-op.
+        self._min_batch = min_batch if min_batch is not None and min_batch > 1 else None
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
         self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
@@ -76,7 +72,7 @@ class PrefillDelayer:
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
-            f"min_allocatable_reqs={self._min_allocatable_reqs} "
+            f"min_batch={self._min_batch} "
             f"max_delay_ms={self._max_delay_ms} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
@@ -164,9 +160,9 @@ class PrefillDelayer:
         # rank where it doesn't apply (chunked prefill in flight, or no count
         # provided) contributes False without a numeric sentinel.
         local_allocatable_below = (
-            self._min_allocatable_reqs is not None
+            self._min_batch is not None
             and num_allocatable_reqs is not None
-            and num_allocatable_reqs < self._min_allocatable_reqs
+            and num_allocatable_reqs < self._min_batch
         )
 
         # Gather global states
@@ -248,9 +244,9 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Allocatable-slots trigger: delay prefill until at least
-            # min_allocatable_reqs slots are free, batching freed slots into one
-            # admission. Targets workloads where each admission is expensive
+            # Min-batch trigger: delay prefill until at least min_batch free
+            # slots are gathered, batching freed slots into one admission.
+            # Targets workloads where each admission is expensive
             # (e.g. speculative decoding with a separate draft prefill pass).
             # Fires when any rank is below threshold (min < t == any i < t).
             allocatable_condition = (

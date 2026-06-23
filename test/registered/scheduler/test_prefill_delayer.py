@@ -67,8 +67,8 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
-    # Allocatable-slots trigger knob; None keeps the trigger disabled.
-    min_allocatable_reqs: Optional[int] = None
+    # Min-batch trigger knob; None keeps the trigger disabled.
+    min_batch: Optional[int] = None
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
@@ -92,7 +92,7 @@ def _run_negotiate_test(rank, test_cases):
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
-            min_allocatable_reqs=case.min_allocatable_reqs,
+            min_batch=case.min_batch,
         )
 
         for call in case.calls:
@@ -377,13 +377,13 @@ _NEGOTIATE_TEST_CASES = [
         # One queue-trigger delay was recorded before the wall-clock release.
         expected_wait_forward_passes=1,
     ),
-    # Allocatable-slots trigger: the most-constrained rank has 2 allocatable
-    # slots, below min_allocatable_reqs=4, so prefill must wait for more to free.
+    # Min-batch trigger: the most-constrained rank has 2 free slots,
+    # below min_batch=4, so prefill must wait for more to free.
     NegotiateTestCase(
         name="allocatable_trigger_delay",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        min_allocatable_reqs=4,
+        min_batch=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -411,7 +411,7 @@ _NEGOTIATE_TEST_CASES = [
         name="allocatable_trigger_enough_slots",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        min_allocatable_reqs=4,
+        min_batch=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -430,7 +430,7 @@ _NEGOTIATE_TEST_CASES = [
         name="allocatable_trigger_idle_running_batch",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        min_allocatable_reqs=4,
+        min_batch=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -450,7 +450,7 @@ _NEGOTIATE_TEST_CASES = [
         name="allocatable_trigger_na_when_not_provided",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        min_allocatable_reqs=4,
+        min_batch=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -469,7 +469,7 @@ _NEGOTIATE_TEST_CASES = [
         name="allocatable_trigger_wall_clock_timeout",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        min_allocatable_reqs=4,
+        min_batch=4,
         max_delay_ms=50,
         calls=[
             NegotiateCall(

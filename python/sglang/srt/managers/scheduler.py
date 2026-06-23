@@ -1039,10 +1039,9 @@ class Scheduler(
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
                     # Cap at max_running_requests: a larger threshold could
                     # never be reached and would always delay until the time cap.
-                    min_allocatable_reqs=(
+                    min_batch=(
                         min(x, self.max_running_requests)
-                        if (x := self.server_args.prefill_delayer_min_allocatable_reqs)
-                        is not None
+                        if (x := self.server_args.prefill_delayer_min_batch) is not None
                         else None
                     ),
                     device=self.tp_group.device,
