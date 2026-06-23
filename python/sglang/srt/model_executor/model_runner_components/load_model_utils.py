@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import socket
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -81,3 +81,19 @@ def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
                 "provided. Defaulting to scaling factors of 1.0. "
                 "This may lead to less accurate results!"
             )
+
+
+def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
+    # Parse other args
+    sliding_window_size = None
+    if hasattr(model, "get_attention_sliding_window_size"):
+        sliding_window_size = model.get_attention_sliding_window_size()
+    elif model_config.is_hybrid_swa and model_config.sliding_window_size is not None:
+        # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
+        sliding_window_size = model_config.sliding_window_size
+    elif model_config.attention_chunk_size is not None:
+        sliding_window_size = model_config.attention_chunk_size
+        logger.info(
+            f"Setting sliding_window_size to be attention_chunk_size: {sliding_window_size}"
+        )
+    return sliding_window_size

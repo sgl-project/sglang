@@ -131,6 +131,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_trigger_remote_instance_nccl_send_group,
+    resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
@@ -1142,7 +1143,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         load_kv_cache_scales(model=self.model, server_args=self.server_args)
 
-        self.sliding_window_size = ModelRunner.resolve_sliding_window_size(
+        self.sliding_window_size = resolve_sliding_window_size(
             self.model, self.model_config
         )
 
@@ -1333,24 +1334,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
-
-    @staticmethod
-    def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
-        # Parse other args
-        sliding_window_size = None
-        if hasattr(model, "get_attention_sliding_window_size"):
-            sliding_window_size = model.get_attention_sliding_window_size()
-        elif (
-            model_config.is_hybrid_swa and model_config.sliding_window_size is not None
-        ):
-            # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
-            sliding_window_size = model_config.sliding_window_size
-        elif model_config.attention_chunk_size is not None:
-            sliding_window_size = model_config.attention_chunk_size
-            logger.info(
-                f"Setting sliding_window_size to be attention_chunk_size: {sliding_window_size}"
-            )
-        return sliding_window_size
 
     def _maybe_register_debug_tensor_dump_hook(self) -> None:
         if self.server_args.debug_tensor_dump_output_folder is not None:
