@@ -93,6 +93,8 @@ if _HAS_TRITON:
         rtt_ptr,  # [num_pools, max_pool_len] int32
         sl_ptr,  # [bs] int32
         out_ptr,  # [bs, max_seq_len] fp32 (pre-allocated)
+        q_norm_ptr,  # [bs, H] fp32 — per (batch, head) query norm (COSINE only)
+        k_norm_ptr,  # [max_tokens, H] fp32 — per (slot, head) key norm (COSINE only)
         num_heads: tl.constexpr,
         max_seq_len: tl.constexpr,
         lora: tl.constexpr,
@@ -105,11 +107,16 @@ if _HAS_TRITON:
         scale_stride_t: tl.constexpr,
         rtt_stride_p: tl.constexpr,
         out_stride_b: tl.constexpr,
+        qn_stride_b: tl.constexpr,
+        kn_stride_t: tl.constexpr,
+        kn_stride_h: tl.constexpr,
+        eps: tl.constexpr,
         TOKEN_BLOCK: tl.constexpr,
         H_POW2: tl.constexpr,
         HEAD_AGG_MEAN: tl.constexpr,
         STORE_DEAD_NEG_INF: tl.constexpr,
         HAS_WRITTEN: tl.constexpr,
+        COSINE: tl.constexpr,
         WORKERS: tl.constexpr,
     ):
         # Persistent-worker layout: static (bs, WORKERS) grid; each worker
@@ -197,6 +204,29 @@ if _HAS_TRITON:
                     ).to(tl.float32)
                     acc += partial * sc_blk[:, None]
 
+                if COSINE:
+                    # Direction-normalize each per-head dot into a cosine score
+                    # BEFORE the head reduce: acc[t,h] /= (|Q_label_h|·|K_label_h[t]|
+                    # + eps). q_norm is per (batch, head); k_norm is per (physical
+                    # slot, head), gathered with the SAME safe_phys physical-slot
+                    # index the latent uses. Pad heads (h >= num_heads) load 1.0 so
+                    # their already-zero dot stays 0 before the h_mask reduce. This
+                    # is the only difference from the raw dot — COSINE=False elides
+                    # the whole block, so scorer_norm="off" stays byte-identical.
+                    qn = tl.load(
+                        q_norm_ptr + batch_id * qn_stride_b + h_offs,
+                        mask=h_mask,
+                        other=1.0,
+                    ).to(tl.float32)
+                    kn = tl.load(
+                        k_norm_ptr
+                        + safe_phys[:, None] * kn_stride_t
+                        + h_offs[None, :] * kn_stride_h,
+                        mask=in_range[:, None] & h_mask[None, :],
+                        other=1.0,
+                    ).to(tl.float32)
+                    acc = acc / (qn[None, :] * kn + eps)
+
                 if HEAD_AGG_MEAN:
                     acc = tl.where(h_mask[None, :], acc, 0.0)
                     score = tl.sum(acc, axis=1) / num_heads
@@ -233,6 +263,10 @@ def absorbed_score_paged_fp8(
     num_stages: int = 2,
     head_agg: str = "max",
     out: Optional[torch.Tensor] = None,
+    q_norm: Optional[torch.Tensor] = None,
+    key_norm_cache: Optional[torch.Tensor] = None,
+    cosine: bool = False,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Paged absorbed score from the resident fp8 latent — GPU.
 
@@ -290,6 +324,28 @@ def absorbed_score_paged_fp8(
     num_workers = max(1, min(int(workers), num_token_blocks))
     grid = (bs, num_workers)
 
+    # Cosine division tensors. When cosine, q_norm is [bs, H] and key_norm_cache is
+    # the layer's [max_tokens, H] resident key-norm cache (gathered by physical
+    # slot). When off, pass v as a harmless non-null pointer (COSINE=False makes the
+    # kernel never dereference it) and zero strides, so the raw-dot launch is
+    # byte-identical.
+    if cosine:
+        assert q_norm is not None and key_norm_cache is not None, (
+            "cosine absorbed score requires q_norm [bs, H] and key_norm_cache "
+            "[max_tokens, H]; one is None."
+        )
+        q_norm_ptr = q_norm
+        k_norm_ptr = key_norm_cache
+        qn_stride_b = q_norm.stride(0)
+        kn_stride_t = key_norm_cache.stride(0)
+        kn_stride_h = key_norm_cache.stride(1)
+    else:
+        q_norm_ptr = v
+        k_norm_ptr = v
+        qn_stride_b = 0
+        kn_stride_t = 0
+        kn_stride_h = 0
+
     _absorbed_score_kernel[grid](
         v,
         latent_fp8,
@@ -299,6 +355,8 @@ def absorbed_score_paged_fp8(
         req_to_token,
         seq_lens,
         out,
+        q_norm_ptr,
+        k_norm_ptr,
         num_heads=num_heads,
         max_seq_len=max_seq_len,
         lora=lora,
@@ -311,11 +369,16 @@ def absorbed_score_paged_fp8(
         scale_stride_t=latent_scales.stride(0),
         rtt_stride_p=req_to_token.stride(0),
         out_stride_b=out.stride(0),
+        qn_stride_b=qn_stride_b,
+        kn_stride_t=kn_stride_t,
+        kn_stride_h=kn_stride_h,
+        eps=eps,
         TOKEN_BLOCK=token_block_pow2,
         H_POW2=h_pow2,
         HEAD_AGG_MEAN=head_agg == "mean",
         STORE_DEAD_NEG_INF=True,
         HAS_WRITTEN=has_written,
+        COSINE=cosine,
         WORKERS=num_workers,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -344,6 +407,10 @@ def absorbed_latent_score_logical_paged(
     scratch_qsel: Optional[torch.Tensor] = None,
     channel_selection_i64: Optional[torch.Tensor] = None,
     scratch_q: Optional[torch.Tensor] = None,
+    cosine: bool = False,
+    key_norm_cache: Optional[torch.Tensor] = None,
+    scratch_qnorm: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """GPU equivalent of ``absorbed_latent.absorbed_latent_score_logical`` reading
     the paged fp8 latent. Builds ``v_h`` host-side then launches the paged kernel.
@@ -354,6 +421,7 @@ def absorbed_latent_score_logical_paged(
     ``v_h`` allocation-free, and ``out`` receives the score in place — so after
     warmup the call grows no caching-allocator counter.
     """
+    q_norm = None
     if (
         scratch_v is not None
         and scratch_qsel is not None
@@ -371,9 +439,31 @@ def absorbed_latent_score_logical_paged(
             scratch_qsel=scratch_qsel,
             scratch_q=scratch_q,
         )
+        if cosine:
+            # Cosine denominator's query side: q_norm = ||q_sel|| over the label-dim
+            # axis. absorbed_latent_v_into just wrote q_sel (the weighted channel
+            # gather) into scratch_qsel[:bs, :, :label_dim], so norm it in place
+            # (out=) into scratch_qnorm — 0-alloc, exactly the reference's
+            # q_sel.norm(dim=-1). The kernel reads q_norm during the same launch.
+            assert scratch_qnorm is not None and key_norm_cache is not None, (
+                "cosine graph-safe score requires scratch_qnorm and the layer's "
+                "key_norm_cache; one is None."
+            )
+            bs = queries.shape[0]
+            label_dim = int(channel_selection_i64.shape[1])
+            q_norm = scratch_qnorm[:bs]
+            torch.linalg.vector_norm(
+                scratch_qsel[:bs, :, :label_dim], dim=-1, out=q_norm
+            )
     else:
         from .absorbed_latent import absorbed_latent_v
 
+        if cosine:
+            raise NotImplementedError(
+                "cosine absorbed score requires the graph-safe scratch path "
+                "(scratch_v/scratch_qsel/scratch_q/channel_selection_i64); the "
+                "eager fallback does not expose q_sel for the query norm."
+            )
         v = absorbed_latent_v(queries, w_sel, channel_selection, channel_weights)
     return absorbed_score_paged_fp8(
         v,
@@ -388,4 +478,8 @@ def absorbed_latent_score_logical_paged(
         token_block=token_block,
         head_agg=head_agg,
         out=out,
+        q_norm=q_norm,
+        key_norm_cache=key_norm_cache,
+        cosine=cosine,
+        eps=eps,
     )
