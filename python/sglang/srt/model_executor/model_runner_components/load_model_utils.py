@@ -54,3 +54,26 @@ def maybe_trigger_remote_instance_nccl_send_group(
                 ),
             )
             t.start()
+
+
+def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
+    if server_args.kv_cache_dtype == "fp8_e4m3":
+        if server_args.quantization_param_path is not None:
+            if callable(getattr(model, "load_kv_cache_scales", None)):
+                model.load_kv_cache_scales(server_args.quantization_param_path)
+                logger.info(
+                    "Loaded KV cache scaling factors from %s",
+                    server_args.quantization_param_path,
+                )
+            else:
+                raise RuntimeError(
+                    "Using FP8 KV cache and scaling factors provided but "
+                    "model %s does not support loading scaling factors.",
+                    model.__class__,
+                )
+        else:
+            logger.warning(
+                "Using FP8 KV cache but no scaling factors "
+                "provided. Defaulting to scaling factors of 1.0. "
+                "This may lead to less accurate results!"
+            )
