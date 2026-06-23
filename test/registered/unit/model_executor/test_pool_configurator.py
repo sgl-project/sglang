@@ -96,6 +96,7 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config.get_text_config = lambda: mc.hf_config
     mr.model_config = mc
 
     mr.kv_cache_dtype = "fake_bf16"

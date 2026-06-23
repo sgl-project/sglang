@@ -2,6 +2,13 @@ import logging
 import warnings
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    hybrid_lightning_config,
+    kimi_linear_config,
+    mamba2_config,
+    mambaish_config,
+)
 from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
@@ -255,10 +262,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     need to change the code of the original attention backend.
     """
     assert not (
-        runner.hybrid_gdn_config is not None and runner.use_mla_backend
+        hybrid_gdn_config(runner.model_config) is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
-    if cfg := runner.mambaish_config:
+    if cfg := mambaish_config(runner.model_config):
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
@@ -288,7 +295,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
-        if runner.hybrid_gdn_config is not None:
+        if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
@@ -302,11 +309,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
-        elif runner.mamba2_config is not None:
+        elif mamba2_config(runner.model_config) is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
-        elif runner.kimi_linear_config is not None:
+        elif kimi_linear_config(runner.model_config) is not None:
             linear_attn_backend = KDAAttnBackend(runner)
-        elif runner.hybrid_lightning_config is not None:
+        elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
