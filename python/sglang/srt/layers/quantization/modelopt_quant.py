@@ -2491,7 +2491,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
-            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+            if (
+                DispatchOutputChecker.format_is_flashinfer(dispatch_output)
+                and dispatch_output.moe_output is not None
+            ):
                 symm_output = dispatch_output.moe_output
             else:
                 # If x_sf is not None, x is FP4 packed (half size), so we need * 2
