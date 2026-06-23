@@ -207,7 +207,6 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_cpu_ids_by_node,
     init_cublas,
     init_custom_process_group,
     is_hip,
@@ -221,6 +220,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -540,7 +540,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
-            self.local_omp_cpuid = ModelRunner.init_threads_binding(
+            self.local_omp_cpuid = init_threads_binding(
                 tp_rank=self.tp_rank, tp_size=self.tp_size
             )
 
@@ -2772,46 +2772,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
-
-    @staticmethod
-    def init_threads_binding(
-        *,
-        tp_rank: int,
-        tp_size: int,
-    ):
-        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
-        if omp_cpuids == "all":
-            assert tp_size <= n_numa_node, (
-                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-                f"tp_size {tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
-                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
-                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
-            )
-            if tp_size < n_numa_node:
-                logger.warning(
-                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {tp_size}, so only {tp_size} numa nodes are used."
-                )
-            local_omp_cpuid = cpu_ids_by_node[tp_rank]
-        else:
-            threads_bind_list = omp_cpuids.split("|")
-            assert tp_size == len(threads_bind_list), (
-                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({tp_size}). "
-                f"Please double check your settings."
-            )
-            local_omp_cpuid = threads_bind_list[tp_rank]
-            if tp_size > n_numa_node:
-                logger.warning(
-                    f"TP size ({tp_size})is larger than numa node number ({n_numa_node}), "
-                    f"in this case the available memory amount of each rank cannot be determined in prior. "
-                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
-                )
-        return local_omp_cpuid
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
