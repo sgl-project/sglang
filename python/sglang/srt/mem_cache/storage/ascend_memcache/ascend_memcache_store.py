@@ -61,7 +61,7 @@ class AscendMemcacheConfig:
     @staticmethod
     def from_sources(
         storage_config: Optional[HiCacheStorageConfig],
-    ) -> "AscendMemcacheConfig":
+    ) -> AscendMemcacheConfig:
         merged: dict = {}
         if envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.is_set():
             path = envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
