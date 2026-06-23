@@ -454,8 +454,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 or (
                     not is_decode_tbo_enabled()
                     and (
-                        forward_batch.forward_mode.is_decode()
-                        or forward_batch.forward_mode.is_target_verify()
+                        self.capture_forward_mode.is_decode()
+                        or self.capture_forward_mode.is_target_verify()
                     )
                 )
             )
