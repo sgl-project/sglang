@@ -13,30 +13,24 @@
 # ==============================================================================
 """Inference-only HRM-Text (Hierarchical Reasoning Model -- Text) model.
 
-Reference HuggingFace implementation:
-    transformers/models/hrm_text/modeling_hrm_text.py  (transformers >= 5.9.0)
+Reference: transformers/models/hrm_text (transformers >= 5.9.0).
 
-The model runs a hierarchical recurrent forward over two transformer stacks
-(``H`` slow, ``L`` fast) inside nested loops. Each recurrence step gets its own
-KV cache slot via a unique ``RadixAttention(layer_id=...)``; the global layer
-index for a given ``(step, layer_in_stack)`` is
-``step * num_layers_per_stack + layer_in_stack`` -- the same ``cycle_offset``
-formula used by the HF reference. The total KV slot count is
-``num_layers_per_stack * H_cycles * (L_cycles + 1)`` (==
-``config.num_hidden_layers`` after the HF config ``__post_init__`` inflation),
-which ``ModelConfig`` exposes as ``num_attention_layers``.
+HRM-Text runs a hierarchical recurrent forward over two transformer stacks
+(``H`` slow, ``L`` fast) in nested loops. Each recurrence step gets its own KV
+cache slot via a unique ``RadixAttention(layer_id=...)``; the global index for
+``(step, layer)`` is ``step * num_layers_per_stack + layer``. The total slot
+count ``num_layers_per_stack * H_cycles * (L_cycles + 1)`` equals the HF config
+``num_hidden_layers`` after ``__post_init__`` inflation, exposed by
+``ModelConfig`` as ``num_attention_layers``.
 
-PrefixLM attention (prompt bidirectional during prefill, completion causal at
-decode) is expressed with ``attn_type=AttentionType.DECODER_BIDIRECTIONAL``.
-That mode is only honored by the Triton attention backend and only when
-``--disable-cuda-graph`` and ``--chunked-prefill-size=-1`` are set;
-``ModelRunner.model_specific_adjustment`` forces those settings (plus
-``--disable-radix-cache``) for this model.
+PrefixLM (prompt bidirectional at prefill, causal at decode) uses
+``AttentionType.DECODER_BIDIRECTIONAL``, which only the Triton backend honors
+and only with cuda graph / chunked prefill / radix cache off --
+``ModelRunner.model_specific_adjustment`` forces those for this model.
 
-The on-disk attention weight ``attn.gqkv_proj.weight`` is a single tensor with
-rows concatenated as ``[gate | q | k | v]`` along dim 0; ``mlp.gate_up_proj``
-is ``[gate | up]``. Both are loaded directly by ``MergedColumnParallelLinear``'s
-fused-on-disk auto-split path (``loaded_shard_id=None``).
+On-disk ``attn.gqkv_proj.weight`` is fused ``[gate | q | k | v]`` rows and
+``mlp.gate_up_proj`` is ``[gate | up]``; both load directly via
+``MergedColumnParallelLinear``'s fused-on-disk auto-split path.
 """
 
 import logging
@@ -71,10 +65,9 @@ logger = logging.getLogger(__name__)
 def _num_layers_per_stack(config: PretrainedConfig) -> int:
     """Layers in one (H or L) stack.
 
-    With a native transformers >= 5.9.0 config, ``__post_init__`` rewrites
-    ``num_hidden_layers`` to ``num_layers_per_stack * H_cycles * (L_cycles + 1)``
-    and stores the per-stack count in ``num_layers_per_stack``. Fall back to
-    deriving it if the attribute is absent.
+    Native configs store this in ``num_layers_per_stack`` after ``__post_init__``
+    rewrites ``num_hidden_layers`` to the inflated total; fall back to deriving
+    it for non-native configs.
     """
     nlps = getattr(config, "num_layers_per_stack", None)
     if nlps is not None:
@@ -83,11 +76,10 @@ def _num_layers_per_stack(config: PretrainedConfig) -> int:
 
 
 def _steps_used(config: PretrainedConfig, stack_kind: str) -> list[int]:
-    """Recurrence steps at which a given stack runs.
+    """Recurrence steps at which a stack runs.
 
-    L runs at ``{h*(L+1)+l : 0 <= h < H, 0 <= l < L}``; H runs at the trailing
-    ``{h*(L+1)+L : 0 <= h < H}``. The two sets are disjoint, so each
-    ``(step, layer_in_stack)`` maps to a unique global KV layer index.
+    L runs at ``h*(L+1)+l`` (``0<=h<H, 0<=l<L``); H runs at the trailing
+    ``h*(L+1)+L``. Disjoint, so each ``(step, layer)`` maps to a unique KV index.
     """
     H_cycles = config.H_cycles
     L_cycles = config.L_cycles
@@ -114,7 +106,6 @@ class HrmTextMLP(nn.Module):
             raise ValueError(
                 f"HrmTextMLP only supports hidden_act='silu', got {hidden_act!r}"
             )
-        # Fused [gate | up] matching the on-disk `mlp.gate_up_proj.weight`.
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -139,10 +130,9 @@ class HrmTextMLP(nn.Module):
 
 
 class HrmTextAttention(nn.Module):
-    """One self-attention block; projection weights shared across recurrence
-    steps. The per-step KV cache slots are realized by the (weightless)
-    ``RadixAttention`` instances in ``self.attn``, keyed by recurrence step.
-    """
+    """Self-attention block; projection weights are shared across recurrence
+    steps, while per-step KV slots come from weightless ``RadixAttention``
+    instances keyed by step in ``self.attn``."""
 
     def __init__(
         self,
@@ -161,7 +151,7 @@ class HrmTextAttention(nn.Module):
             f"num_attention_heads={self.total_num_heads} must be divisible "
             f"by tp_size={tp_size}"
         )
-        # HF main hardcodes MHA (num_key_value_groups=1). We follow.
+        # HF hardcodes MHA (kv heads == q heads); no GQA.
         self.total_num_kv_heads = config.num_attention_heads
         self.num_heads = self.total_num_heads // tp_size
         self.num_kv_heads = self.total_num_kv_heads // tp_size
@@ -172,11 +162,8 @@ class HrmTextAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        # gqkv_proj: 4-way fused [gate | q | k | v] matching the on-disk
-        # `attn.gqkv_proj.weight` row layout. The weight_loader auto-splits the
-        # fused disk tensor along the output dim by `output_sizes` (the
-        # `loaded_shard_id is None` path). MHA only: GQA would need
-        # QKVParallelLinear semantics for q/k/v shard replication.
+        # Fused [gate | q | k | v] on disk; MHA only (GQA would need
+        # QKVParallelLinear's q/k/v shard replication).
         per_head_size = self.total_num_heads * self.head_dim
         self.gqkv_proj = MergedColumnParallelLinear(
             self.hidden_size,
@@ -193,9 +180,7 @@ class HrmTextAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # HF 5.9.0 stores rope params in `config.rope_parameters`
-        # (e.g. {"rope_theta": 10000.0, "rope_type": "default"}); older/flat
-        # configs may expose `rope_theta` directly. Support both.
+        # rope_parameters (HF 5.9.0) or flat rope_theta for older configs.
         rope_parameters = getattr(config, "rope_parameters", None) or {}
         rope_theta = rope_parameters.get("rope_theta", None)
         if rope_theta is None:
@@ -212,9 +197,8 @@ class HrmTextAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        # One RadixAttention per recurrence step this stack runs at. Each gets a
-        # unique `layer_id` (== global KV slot) so the recurrent forward writes
-        # to disjoint cache slots. These modules hold no parameters.
+        # One weightless RadixAttention per step, each with a unique layer_id
+        # (= global KV slot) so the recurrent forward writes disjoint slots.
         num_layers_per_stack = _num_layers_per_stack(config)
         self.attn = nn.ModuleDict()
         for step in _steps_used(config, stack_kind):
@@ -288,7 +272,6 @@ class HrmTextDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         current_step: int,
     ) -> torch.Tensor:
-        # Pre-norm residual; norm a copy and add residual outside (matches HF).
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -477,17 +460,14 @@ class HrmTextForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # On-disk attention weights use `.attn.`; our modules use `.self_attn.`
-        # (the per-step RadixAttention modules under `.self_attn.attn.{step}`
-        # hold no parameters, so they never receive weights). Disk tensors are
-        # already fused -- gqkv_proj / gate_up_proj load via the fused-on-disk
-        # auto-split path, so no stacked_params_mapping is needed.
+        # Disk keys use `.attn.`; rename to our `.self_attn.`. The per-step
+        # RadixAttention modules hold no params, and disk tensors are already
+        # fused so no stacked_params_mapping is needed.
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if ".attn." in name:
                 name = name.replace(".attn.", ".self_attn.", 1)
             if name not in params_dict:
-                # e.g. parameterless final_norm has no disk weight; skip strays.
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

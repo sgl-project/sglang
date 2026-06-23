@@ -1002,13 +1002,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        # HRM-Text (and any prefix-LM recurrent model) needs bidirectional
-        # attention over the prompt during prefill. That is only honored by the
-        # Triton backend, and only when CUDA graphs and chunked prefill are off
-        # (see TritonAttnBackend.allow_bidirectional_attention_in_extend). Cross-
-        # request prefix (radix) caching is also unsafe because the recurrent
-        # forward writes direction-dependent KV into many slots. Force the
-        # required settings here rather than rely on the user passing flags.
+        # HRM-Text needs bidirectional prompt attention (prefill), which only the
+        # Triton backend honors and only with cuda graph / chunked prefill off
+        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
+        # is also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
         hf_config = self.model_config.hf_config
         is_hrm_text = getattr(
             hf_config, "model_type", None

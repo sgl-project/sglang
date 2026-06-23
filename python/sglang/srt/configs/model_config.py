@@ -793,13 +793,9 @@ class ModelConfig:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
         if "HrmTextForCausalLM" in self.hf_config.architectures:
-            # HRM-Text unrolls two transformer stacks across nested H/L cycles;
-            # each recurrence step occupies its own KV cache slot. The total is
-            # num_layers_per_stack * H_cycles * (L_cycles + 1). A native
-            # transformers >= 5.9.0 config already inflates num_hidden_layers to
-            # this value in __post_init__, but compute it explicitly so KV
-            # allocation is correct even if num_hidden_layers carries the raw
-            # per-stack count.
+            # Compute KV slot count explicitly: native 5.9.0 configs inflate
+            # num_hidden_layers to this in __post_init__, but non-native ones
+            # may carry the raw per-stack count.
             H_cycles = self.hf_text_config.H_cycles
             L_cycles = self.hf_text_config.L_cycles
             num_layers_per_stack = (
