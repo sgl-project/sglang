@@ -134,9 +134,6 @@ class BaseKVSender(ABC):
     def pop_decode_prefix_len(self) -> int:
         return 0
 
-    def pop_transfer_input_len(self) -> Optional[int]:
-        return None
-
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
@@ -187,7 +184,6 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
-        transfer_input_len: Optional[int] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

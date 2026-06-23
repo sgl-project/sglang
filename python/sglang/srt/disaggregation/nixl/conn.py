@@ -69,7 +69,6 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
-    transfer_input_len: Optional[int] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -101,9 +100,6 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
-            transfer_input_len=(
-                int(msg[9].decode("ascii")) if len(msg) > 9 and msg[9] != b"" else None
-            ),
         )
 
 
@@ -874,7 +870,6 @@ class NixlKVManager(CommonKVManager):
                     # transfer_worker; staging prefetch sets are NIXL-only).
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
-                    self.req_to_transfer_input_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
                         self._staging_ctx.prefetch_requested = {
@@ -1628,7 +1623,11 @@ class NixlKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
-                if st == StateType.C128_STATE and len(dst_indices) == 0:
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices) == 0
+                ):
                     continue
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
@@ -1892,16 +1891,6 @@ class NixlKVManager(CommonKVManager):
                         ),
                         0,
                     )
-                    transfer_input_len = next(
-                        (
-                            info.transfer_input_len
-                            for info in self.transfer_infos[room].values()
-                            if info.transfer_input_len is not None
-                        ),
-                        None,
-                    )
-                    if transfer_input_len is not None:
-                        self.req_to_transfer_input_len[room] = transfer_input_len
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -2023,7 +2012,6 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
-        transfer_input_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -2071,7 +2059,6 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
-                        str(transfer_input_len or 0).encode("ascii"),
                     ]
                 )
 

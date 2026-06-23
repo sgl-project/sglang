@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -272,11 +273,7 @@ class PrefillBootstrapQueue:
 
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        transfer_input_len = req.disagg_kv_sender.pop_transfer_input_len()
-        if transfer_input_len is None:
-            transfer_input_len = getattr(
-                req, "disagg_transfer_input_len", len(req.origin_input_ids)
-            )
+        transfer_input_len = len(req.origin_input_ids)
         req.disagg_transfer_input_len = transfer_input_len
         num_kv_indices = transfer_input_len
         req.start_send_idx = decode_prefix_len
@@ -977,9 +974,7 @@ class SchedulerDisaggregationPrefillMixin:
             req, "disagg_transfer_input_len", len(req.origin_input_ids)
         )
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.fill_len, transfer_input_len)
+            end_idx if end_idx is not None else min(req.fill_len, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1004,13 +999,12 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            # fill_ids includes the token sampled during prefill, but decode
-            # registers state pages over origin_input_ids (DecodePreallocQueue)
-            # and the main pool send is clamped to end_idx above. Matching that
-            # length here avoids emitting an extra state page when the sampled
-            # token crosses a page boundary, which mismatched src/dst lengths in
-            # group_concurrent_contiguous.
+            # Most state payloads read token-pool rows and should match the KV
+            # range actually materialized on prefill. C128 state is request
+            # scoped, so its transfer index must use the logical input length
+            # that decode used to register the destination row.
             seq_len = min(req.fill_len, transfer_input_len)
+            c128_seq_len = transfer_input_len
 
             def _mamba_payload():
                 return [
@@ -1057,7 +1051,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                online = is_dsv4_c128_online_enabled()
                 ring_size = (
                     1
                     if online
@@ -1067,7 +1061,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return get_dsv4_c128_state_indices(
                     int(req.req_pool_idx),
-                    seq_len,
+                    c128_seq_len,
                     online=online,
                     ring_size=ring_size,
                 )

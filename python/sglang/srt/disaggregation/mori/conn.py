@@ -124,7 +124,6 @@ class TransferInfo:
     # populate this field (older receiver or radix-cache feature off) -> treat
     # as 0 (no prefix hit, full send) for backward compatibility.
     decode_prefix_len: Optional[int] = None
-    transfer_input_len: Optional[int] = None
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -157,11 +156,6 @@ class TransferInfo:
         else:
             decode_prefix_len = None
 
-        if len(payload) > 9 and payload[9]:
-            transfer_input_len: Optional[int] = int(payload[9].decode("ascii"))
-        else:
-            transfer_input_len = None
-
         # A transfer is "dummy" only when the receiver does not need any
         # kv/aux/state delivered. When decode_prefix_len > 0 and the delta is
         # exactly zero (full prefix hit), dst_kv_indices is empty but aux is
@@ -180,7 +174,6 @@ class TransferInfo:
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
             decode_prefix_len=decode_prefix_len,
-            transfer_input_len=transfer_input_len,
         )
 
 
@@ -528,18 +521,6 @@ class MoriKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len[transfer_info.room] = (
                         chosen_prefix_len
                     )
-                    transfer_input_len = next(
-                        (
-                            info.transfer_input_len
-                            for info in infos.values()
-                            if info.transfer_input_len is not None
-                        ),
-                        None,
-                    )
-                    if transfer_input_len is not None:
-                        self.req_to_transfer_input_len[transfer_info.room] = (
-                            transfer_input_len
-                        )
                     if chosen_prefix_len > 0:
                         # Surface incremental KV transfer at INFO so it's
                         # visible without bumping the global log level.
@@ -1240,6 +1221,13 @@ class MoriKVManager(CommonKVManager):
             )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
+        if (
+            state_type == "c128_state"
+            and common_len == 0
+            and src_state_indices.size == 0
+            and dst_state_indices.size == 0
+        ):
+            return []
         if common_len == 0 and max(src_state_indices.size, dst_state_indices.size) > 0:
             raise RuntimeError(
                 f"No overlapping state indices for state_type={state_type}"
@@ -1689,7 +1677,6 @@ class MoriKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
-        transfer_input_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1703,11 +1690,6 @@ class MoriKVReceiver(CommonKVReceiver):
         decode_prefix_bytes = (
             str(int(decode_prefix_len)).encode("ascii")
             if decode_prefix_len is not None and decode_prefix_len > 0
-            else b""
-        )
-        transfer_input_len_bytes = (
-            str(int(transfer_input_len)).encode("ascii")
-            if transfer_input_len is not None and transfer_input_len > 0
             else b""
         )
 
@@ -1731,7 +1713,6 @@ class MoriKVReceiver(CommonKVReceiver):
                         state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
                         decode_prefix_bytes,
-                        transfer_input_len_bytes,
                     ]
                 )
         self.init_time = time.time()

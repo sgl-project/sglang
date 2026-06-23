@@ -175,7 +175,6 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
-            self.req_to_transfer_input_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -839,9 +838,6 @@ class CommonKVSender(BaseKVSender):
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
-    def pop_transfer_input_len(self) -> Optional[int]:
-        return self.kv_mgr.req_to_transfer_input_len.pop(self.bootstrap_room, None)
-
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
@@ -930,8 +926,6 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_transfer_input_len"):
-            self.kv_mgr.req_to_transfer_input_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
@@ -1143,7 +1137,6 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
-        transfer_input_len: Optional[int] = None,
     ):
         raise NotImplementedError
 

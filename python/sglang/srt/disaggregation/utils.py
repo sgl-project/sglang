@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -30,6 +30,12 @@ if TYPE_CHECKING:
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+_IS_HIP = is_hip()
+
+
+def is_dsv4_c128_online_enabled() -> bool:
+    """Return whether DSV4 C128 uses request-scoped online state."""
+    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_dsv4_c128_state_indices(

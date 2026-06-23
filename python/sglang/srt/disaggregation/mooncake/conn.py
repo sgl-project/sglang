@@ -76,7 +76,6 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
-    transfer_input_len: Optional[int] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -104,9 +103,6 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
-            ),
-            transfer_input_len=(
-                int(msg[9].decode("ascii")) if len(msg) > 9 and msg[9] != b"" else None
             ),
         )
 
@@ -1018,12 +1014,11 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if st == StateType.C128_STATE and len(dst_indices_local) == 0:
-                    # Decode decides whether a request has a partial C128 state
-                    # to receive. At 128-aligned boundaries it intentionally
-                    # registers no C128 dst row and clears the request-scoped
-                    # state locally; a stale prefill-side source row must not
-                    # keep the transfer thread alive or corrupt the next request.
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices_local) == 0
+                ):
                     continue
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
@@ -1402,7 +1397,6 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
-                    self.req_to_transfer_input_len.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1504,16 +1498,6 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
-                        transfer_input_len = next(
-                            (
-                                info.transfer_input_len
-                                for info in self.transfer_infos[room].values()
-                                if info.transfer_input_len is not None
-                            ),
-                            None,
-                        )
-                        if transfer_input_len is not None:
-                            self.req_to_transfer_input_len[room] = transfer_input_len
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1859,7 +1843,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
-        transfer_input_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1898,7 +1881,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
-                        str(transfer_input_len or 0).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

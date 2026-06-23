@@ -202,9 +202,7 @@ class TestDSV4C128RadixState(unittest.TestCase):
         old_online_c128 = dsv4_memory_pool.ONLINE_C128
         dsv4_memory_pool.ONLINE_C128 = False
         try:
-            snapshot = kv_pool.snapshot_c128_radix_state(req_pool_idx=1, seq_len=130)[
-                0
-            ]
+            snapshot = kv_pool.snapshot_c128_radix_state(req_pool_idx=1, seq_len=130)[0]
         finally:
             dsv4_memory_pool.ONLINE_C128 = old_online_c128
 
