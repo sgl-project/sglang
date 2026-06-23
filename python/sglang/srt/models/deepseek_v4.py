@@ -128,6 +128,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_device,
     is_gfx95_supported,
     log_info_on_rank0,
     make_layers,
@@ -2445,14 +2446,17 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
     # The dequant itself is a trivially parallel elementwise multiply that runs
-    # orders of magnitude faster on the GPU. Checkpoint tensors are loaded on
-    # the host, so running this on the CPU makes weight loading CPU-bound and
-    # very slow for large models (e.g. DeepSeek-V4). Offload the math to the
-    # current CUDA device when one is available, then move the result back to
-    # the input device so downstream weight-loading behavior is unchanged.
+    # orders of magnitude faster on the accelerator. Checkpoint tensors are
+    # loaded on the host, so running this on the CPU makes weight loading
+    # CPU-bound and very slow for large models (e.g. DeepSeek-V4). Offload host
+    # tensors to the current accelerator and move the result back to the input
+    # device so downstream weight-loading behavior is unchanged.
+    # get_device() is device-agnostic (CUDA/HIP/NPU/XPU/...) and resolves to the
+    # current rank's device under tensor parallelism; on a CPU-only host it
+    # returns "cpu", making the move a no-op.
     src_device = weight.device
-    if src_device.type != "cuda" and torch.cuda.is_available():
-        compute_device = torch.device("cuda", torch.cuda.current_device())
+    if src_device.type == "cpu":
+        compute_device = get_device()
         weight = weight.to(compute_device)
         scale = scale.to(compute_device)
 
