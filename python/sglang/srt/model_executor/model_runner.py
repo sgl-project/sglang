@@ -159,10 +159,12 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
