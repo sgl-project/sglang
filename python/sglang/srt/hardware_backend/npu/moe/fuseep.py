@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
@@ -56,7 +58,7 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=envs.SGLANG_NPU_FUSED_MOE_MODE.get(),
+        fuse_mode=get_global_server_args().fuseep_mode,
     )
     return hidden_states
 
@@ -125,7 +127,7 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
 
     Invoked by ``maybe_apply_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
     """
-    if envs.SGLANG_NPU_FUSED_MOE_MODE.get() == FusedMoEMode.DISPATCH_FFN_COMBINE.value:
+    if get_global_server_args().fuseep_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value:
         # -- branch 1: DISPATCH_FFN_COMBINE ---------------------------------
         if weight_prefix == "w13":
             w13_weight = _release_weight_cache(layer.w13_weight)
