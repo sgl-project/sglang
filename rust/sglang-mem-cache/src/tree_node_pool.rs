@@ -530,11 +530,11 @@ impl<K: ChildKeyType> TreeNodePool<K> {
 
         // SWA/Mamba LRU unlink + bookkeeping update.
         if swa_was_in_list {
-            SwaSlot::remove(self, idx);
+            SwaSlot::lru_remove(self, idx);
             SwaSlot::pool_state_mut(self).unlocked_size -= swa_value_len;
         }
         if mamba_was_in_list {
-            MambaSlot::remove(self, idx);
+            MambaSlot::lru_remove(self, idx);
             MambaSlot::pool_state_mut(self).unlocked_size -= mamba_value_len;
         }
 

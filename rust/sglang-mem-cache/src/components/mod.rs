@@ -3,7 +3,7 @@
 mod full;
 mod mamba;
 mod swa;
-mod utils;
+mod evict_utils;
 
 use tch::Tensor;
 
@@ -120,7 +120,7 @@ pub trait Component<K: ChildKeyType>: Send {
 pub use full::{FullComponent, FullSlot};
 pub use mamba::{MambaComponent, MambaSlot};
 pub use swa::{SwaComponent, SwaSlot};
-pub(crate) use utils::{evict_full, evict_full_value, evict_non_full};
+pub(crate) use evict_utils::{evict_full, evict_full_value, evict_non_full};
 
 /// Per-component eviction budget, indexed by `ct as usize`.
 #[derive(Default, Clone, Copy)]
@@ -322,7 +322,7 @@ pub trait Slot: Sized {
     /// Move `idx` to the MRU end, inserting it if not already in the list.
     fn bump_mru<K: ChildKeyType>(pool: &mut TreeNodePool<K>, idx: NodeIdx) {
         if Self::data(pool.get(idx)).in_list {
-            Self::remove(pool, idx);
+            Self::lru_remove(pool, idx);
         }
         let head = Self::head_sentinel(pool);
         let first_real = Self::data(pool.get(head)).next;
@@ -332,7 +332,7 @@ pub trait Slot: Sized {
     }
 
     /// Unlink `idx` from the list, marking it not-in-list.
-    fn remove<K: ChildKeyType>(pool: &mut TreeNodePool<K>, idx: NodeIdx) {
+    fn lru_remove<K: ChildKeyType>(pool: &mut TreeNodePool<K>, idx: NodeIdx) {
         let data = Self::data_mut(pool.get_mut(idx));
         let prev = data.prev;
         let next = data.next;
@@ -390,7 +390,7 @@ pub trait Slot: Sized {
                 cur = parent;
                 continue;
             }
-            Self::remove(pool, cur);
+            Self::lru_remove(pool, cur);
             match chain_last {
                 Some(prev_last) => Self::connect::<K>(pool, prev_last, cur),
                 None => chain_first = Some(cur),

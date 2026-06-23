@@ -23,7 +23,7 @@ pub(crate) fn evict_full_value<K: ChildKeyType>(
             .expect("evict_full_value never runs on the root");
         FullSlot::postprocess_take_value(pool, parent_idx);
     }
-    FullSlot::remove(pool, idx);
+    FullSlot::lru_remove(pool, idx);
     FullSlot::pool_state_mut(pool).unlocked_size -= value_len;
     value
 }
@@ -102,7 +102,7 @@ pub(crate) fn evict_non_full<K: ChildKeyType, S: Slot>(
         let is_leaf = node.is_leaf();
 
         S::take_value(pool.get_mut(idx), result);
-        S::remove(pool, idx);
+        S::lru_remove(pool, idx);
         S::pool_state_mut(pool).unlocked_size -= delta;
 
         if is_leaf {
