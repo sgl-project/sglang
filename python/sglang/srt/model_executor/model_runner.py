@@ -780,7 +780,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable_batch_invariant_mode()
 
         # Deduce KV cache dtype
-        self.configure_kv_cache_dtype()
+        self.server_args.kv_cache_dtype, self.kv_cache_dtype = (
+            ModelRunner.configure_kv_cache_dtype(
+                server_args=self.server_args,
+                model=self.model,
+                model_dtype=self.dtype,
+            )
+        )
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
@@ -2326,51 +2332,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
-    def configure_kv_cache_dtype(self):
-        if self.server_args.kv_cache_dtype == "auto":
-            quant_config = getattr(self.model, "quant_config", None)
+    @staticmethod
+    def configure_kv_cache_dtype(
+        *,
+        server_args: ServerArgs,
+        model: nn.Module,
+        model_dtype: torch.dtype,
+    ) -> tuple[str, torch.dtype]:
+        server_args_kv_cache_dtype = server_args.kv_cache_dtype
+        if server_args_kv_cache_dtype == "auto":
+            quant_config = getattr(model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
             if (
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
                 if _is_hip:
-                    self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
+                    kv_cache_dtype = fp8_dtype
+                    server_args_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        kv_cache_dtype
                     ]
                 else:
-                    self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
+                    kv_cache_dtype = torch.float8_e4m3fn
+                    server_args_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        kv_cache_dtype
                     ]
             else:
-                self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+                kv_cache_dtype = model_dtype
+        elif server_args_kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = fp8_dtype
+                kv_cache_dtype = fp8_dtype
             else:
-                self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+                kv_cache_dtype = torch.float8_e5m2
+        elif server_args_kv_cache_dtype == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = fp8_dtype
+                kv_cache_dtype = fp8_dtype
             else:
-                self.kv_cache_dtype = torch.float8_e4m3fn
-        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
-            self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+                kv_cache_dtype = torch.float8_e4m3fn
+        elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
+            kv_cache_dtype = torch.bfloat16
+        elif server_args_kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
-                self.kv_cache_dtype = torch.float4_e2m1fn_x2
+                kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
                 logger.warning(
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
-                self.kv_cache_dtype = self.dtype
+                kv_cache_dtype = model_dtype
         else:
             raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+                f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}."
             )
+        return server_args_kv_cache_dtype, kv_cache_dtype
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
