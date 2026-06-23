@@ -117,11 +117,6 @@ repos:
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
-      # Opt-in docs_new link check. language: system + stages:[manual] mean it
-      # NEVER runs on a normal commit and does NOT install mint — it only runs
-      # when explicitly invoked (`pre-commit run mint-broken-links --hook-stage
-      # manual`) by someone who already has `mint` on PATH. Mirrors the lychee
-      # hook's opt-in pattern. CI is the enforcing gate (see .github/workflows/lint.yml).
       - id: mint-broken-links
         name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
         entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'
