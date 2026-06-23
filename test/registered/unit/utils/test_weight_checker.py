@@ -28,13 +28,14 @@ from sglang.srt.utils.weight_checker import (
     ChecksumInfo,
     ParallelismInfo,
     WeightChecker,
+    _build_quant_plan,
     _check_tensors,
     _hash_tensor,
     _is_non_persistent_buffer_name,
     _postprocess_tensors,
     _random_like,
 )
-from sglang.srt.utils.weight_checker_quant import (
+from sglang.srt.utils.weight_checker_comparator import (
     Fp8BlockReference,
     ReferenceWeight,
     _compare_references,
@@ -278,8 +279,9 @@ class TestPostprocessTensors(CustomTestCase):
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
 
         ref = Fp8BlockReference(qweight, sf_packed_int32)
+        plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
-            _postprocess_tensors(raw, set()),
+            _postprocess_tensors(raw, set(), plan),
             [
                 ("x.weight", True, ("quant", ref)),
                 ("x.weight", False, ("raw", qweight)),
@@ -297,8 +299,9 @@ class TestPostprocessTensors(CustomTestCase):
         }
         # All quant entries come first, then a raw pass over every key.
         ref = Fp8BlockReference(qweight, sf_fp32)
+        plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
-            _postprocess_tensors(raw, set()),
+            _postprocess_tensors(raw, set(), plan),
             [
                 ("x.weight", True, ("quant", ref)),
                 ("x.weight", False, ("raw", qweight)),
@@ -360,7 +363,7 @@ class TestCheckTensors(CustomTestCase):
     def test_chunked_raw_stats_match_unchunked(self):
         expect = [("a", True, ("raw", torch.zeros(10)))]
         actual = [("a", True, ("raw", torch.arange(10.0)))]
-        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 3):
+        with patch("sglang.srt.utils.weight_checker_comparator._CHUNK_NUMEL", 3):
             with self.assertRaises(Exception) as ctx:
                 _check_tensors(expect_tensors=expect, actual_tensors=actual)
         self.assertIn("max_abs_err=9.0", str(ctx.exception))
@@ -444,7 +447,9 @@ class TestCompareQuantPair(CustomTestCase):
 
     def test_chunked_result_matches_unchunked(self):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        with patch("sglang.srt.utils.weight_checker_quant._CHUNK_NUMEL", 128 * 128):
+        with patch(
+            "sglang.srt.utils.weight_checker_comparator._CHUNK_NUMEL", 128 * 128
+        ):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         self.assertEqual(chunked, reference)
 
@@ -500,9 +505,10 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
         return {"x.weight": q, "x.weight_scale_inv": s}
 
     def _check(self, expect_raw, actual_raw, **kwargs):
+        plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _check_tensors(
-            expect_tensors=_postprocess_tensors(expect_raw, set()),
-            actual_tensors=_postprocess_tensors(actual_raw, set()),
+            expect_tensors=_postprocess_tensors(expect_raw, set(), plan),
+            actual_tensors=_postprocess_tensors(actual_raw, set(), plan),
             **kwargs,
         )
 
@@ -543,15 +549,48 @@ class TestSelectQuantizationMethod(CustomTestCase):
     def test_returns_none_when_not_a_quant_method(self):
         self.assertIsNone(select_quantization_method(None))
 
-    def test_raises_on_unsupported_quant_method(self):
-        from sglang.srt.layers.quantization.base_config import LinearMethodBase
+    def test_returns_none_for_raw_safe_method(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-        class _Unsupported(LinearMethodBase):
-            def apply(self, *args, **kwargs):
-                return None
+        # unquantized / int4 / mxfp8 all route to raw (None).
+        fake = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+        self.assertIsNone(select_quantization_method(fake))
 
+    def test_raises_on_nvfp4(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp4LinearMethod,
+        )
+
+        # nvfp4 has no ReferenceWeight yet -> must raise, not silently raw-compare.
+        fake = ModelOptFp4LinearMethod.__new__(ModelOptFp4LinearMethod)
         with self.assertRaises(NotImplementedError):
-            select_quantization_method(_Unsupported())
+            select_quantization_method(fake)
+
+
+class TestBuildQuantPlan(CustomTestCase):
+
+    def test_fp8_block_module_pairs_weight_and_scale(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        method.block_quant = True
+        method.use_mxfp8 = False
+        model = nn.Module()
+        model.proj = nn.Module()
+        model.proj.quant_method = method
+        model.proj.register_parameter(
+            "weight", nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+        )
+        model.proj.register_parameter(
+            "weight_scale_inv", nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+        )
+        self.assertEqual(
+            _build_quant_plan(model),
+            {"proj.weight": (Fp8BlockReference, "proj.weight_scale_inv")},
+        )
+
+    def test_no_quant_method_yields_empty_plan(self):
+        self.assertEqual(_build_quant_plan(_TinyModel()), {})
 
 
 # ---------------------------------------------------------------------------
