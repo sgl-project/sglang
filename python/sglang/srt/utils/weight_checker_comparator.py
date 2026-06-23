@@ -93,6 +93,24 @@ class Fp8BlockReference(ReferenceWeight):
         return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
 
 
+class RawReference(ReferenceWeight):
+    """Unquantized tensor: identity dequant, exact (no-tolerance) compare."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+    def __repr__(self) -> str:
+        return f"raw(shape={tuple(self.tensor.shape)} dtype={self.tensor.dtype})"
+
+    def iter_chunks(self):
+        flat = self.tensor.reshape(-1)
+        for start in range(0, flat.numel(), _CHUNK_NUMEL):
+            yield flat[start : start + _CHUNK_NUMEL].cuda(), None
+
+    def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return self.tensor
+
+
 def _compare_references(
     expect: ReferenceWeight, actual: ReferenceWeight
 ) -> Tuple[bool, float, float, int]:
@@ -120,33 +138,6 @@ def _compare_references(
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
         num_exceed += int((~(abs_diff <= tol)).sum())
     return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
-
-
-def _compare_raw_pair(
-    expect: torch.Tensor, actual: torch.Tensor, compute_stats: bool
-) -> Tuple[bool, float, float]:
-    """Chunked exact-compare of two raw tensors, optionally accumulating
-    abs-diff stats. Returns (equal, max_abs_err, mean_abs_err)."""
-    assert expect.shape == actual.shape, f"{expect.shape=} {actual.shape=}"
-    expect_flat = expect.reshape(-1)
-    actual_flat = actual.reshape(-1)
-
-    equal = True
-    max_abs_err = torch.zeros((), dtype=torch.float32)
-    sum_abs_err = 0.0
-    for start in range(0, expect_flat.numel(), _CHUNK_NUMEL):
-        e = expect_flat[start : start + _CHUNK_NUMEL].cuda()
-        a = actual_flat[start : start + _CHUNK_NUMEL].cuda()
-        if torch.all(e == a):
-            continue
-        equal = False
-        if not compute_stats:
-            break
-        abs_diff = (a.float() - e.float()).abs()
-        # torch.maximum propagates NaN, unlike builtin max().
-        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
-        sum_abs_err += abs_diff.sum().item()
-    return equal, max_abs_err.item(), sum_abs_err / max(expect_flat.numel(), 1)
 
 
 def select_quantization_method(quant_method) -> Optional[type]:
