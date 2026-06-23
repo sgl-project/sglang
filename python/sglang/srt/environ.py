@@ -653,7 +653,7 @@ class Envs:
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
-    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(True)
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -825,6 +825,13 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+
+    # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
+    SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
+    SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+    SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

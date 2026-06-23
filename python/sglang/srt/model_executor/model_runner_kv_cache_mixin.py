@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -100,9 +101,20 @@ class ModelRunnerKVCacheMixin:
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
+            minimum_mem_fraction_static = (
+                1 - available_gpu_memory / pre_model_load_memory
+            )
+            suggested_mem_fraction_static = (
+                math.ceil(minimum_mem_fraction_static * 1000) / 1000
+            )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={self.mem_fraction_static}."
+                f"--mem-fraction-static={self.mem_fraction_static}. "
+                f"Raise --mem-fraction-static above "
+                f"{suggested_mem_fraction_static:.3f} "
+                f"(minimum viable = 1 - available/pre = "
+                f"{minimum_mem_fraction_static:.4f}). If using speculative "
+                f"decoding, draft weights are now counted."
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
