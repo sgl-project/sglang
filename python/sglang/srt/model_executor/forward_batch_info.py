@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -1190,7 +1191,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Mamba-hybrid families need the fabricated-row idle conversion
             # below; this includes their MTP draft workers, whose mamba-less
             # "*E" pattern makes mambaish_config return None.
-            hybrid_ssm = model_runner.mambaish_config is not None or (
+            hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
                 model_runner.is_draft_worker
                 and getattr(
                     model_runner.model_config.hf_config,
