@@ -3223,7 +3223,9 @@ class Scheduler(
                             # copy is a leaf: nothing on forward_stream waits on
                             # it; the output processor gates on copy_done.
                             self.copy_stream.wait_stream(self.forward_stream)
-                            with self.copy_stream_ctx:
+                            with self.copy_stream_ctx, torch.profiler.record_function(
+                                "copy_result_to_cpu"
+                            ):
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
