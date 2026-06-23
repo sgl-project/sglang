@@ -2687,6 +2687,11 @@ class ServerArgs:
         """Validate --uds and its mutually-exclusive combinations."""
         if self.uds is None:
             return
+        if sys.platform == "win32":
+            raise ValueError(
+                "--uds is only supported on Linux and macOS; "
+                f"current platform: {sys.platform}"
+            )
         if self.uds == "":
             raise ValueError("--uds must be a non-empty path; received an empty string")
         if not os.path.isabs(self.uds):
@@ -2696,10 +2701,28 @@ class ServerArgs:
                 "directory, which is service-launcher-dependent and "
                 "surprising for operators."
             )
-        if sys.platform == "win32":
+        # AF_UNIX sun_path is 108 bytes on Linux, 104 on macOS (including
+        # the null terminator). Use the conservative cross-platform limit
+        # so the operator gets a clear error instead of ENAMETOOLONG from
+        # bind().
+        sun_path_max = 103
+        uds_bytes = len(os.fsencode(self.uds))
+        if uds_bytes > sun_path_max:
             raise ValueError(
-                "--uds is only supported on Linux and macOS; "
-                f"current platform: {sys.platform}"
+                f"--uds path is {uds_bytes} bytes which exceeds the AF_UNIX "
+                f"sun_path limit ({sun_path_max} usable bytes). "
+                "Shorten the path or place the socket in a shorter parent "
+                "directory (e.g. /run/sglang/ instead of "
+                "/var/lib/sglang/data/sockets/)."
+            )
+        # Parent directory must exist; bind() does not create it. Pre-check
+        # so the operator sees the dir name rather than a bare ENOENT.
+        uds_parent = os.path.dirname(self.uds)
+        if uds_parent and not os.path.isdir(uds_parent):
+            raise ValueError(
+                f"--uds parent directory does not exist: {uds_parent}. "
+                "Create the directory (e.g. via systemd RuntimeDirectory "
+                "or `mkdir -p`) before starting the server."
             )
         if self.grpc_mode:
             raise ValueError(

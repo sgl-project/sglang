@@ -72,6 +72,24 @@ class TestServerArgsUDSValidation(unittest.TestCase):
             ServerArgs(model_path="dummy", uds="sglang.sock")
         self.assertIn("absolute path", str(cm.exception))
 
+    def test_path_too_long_rejected(self):
+        # AF_UNIX sun_path is ~104 bytes (macOS) / 108 bytes (Linux). A
+        # too-long path otherwise fails with cryptic ENAMETOOLONG from bind.
+        long_path = "/tmp/" + "x" * 200 + ".sock"
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(model_path="dummy", uds=long_path)
+        self.assertIn("sun_path", str(cm.exception))
+
+    def test_parent_dir_missing_rejected(self):
+        # bind() does not create the parent directory; pre-check so the
+        # operator sees a clear error instead of a bare ENOENT.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(
+                model_path="dummy",
+                uds="/nonexistent-uds-parent-12345/sglang.sock",
+            )
+        self.assertIn("parent directory", str(cm.exception))
+
     def test_grpc_mode_rejected(self):
         # gRPC server binds via its own listener and never reads server_args.uds.
         with self.assertRaises(ValueError) as cm:
@@ -133,8 +151,8 @@ class TestBindHelpers(unittest.TestCase):
         self.assertEqual(format_listen_addr(args), f"{args.host}:{args.port}")
 
     def test_format_listen_addr_uds(self):
-        args = ServerArgs(model_path="dummy", uds="/run/sglang.sock")
-        self.assertEqual(format_listen_addr(args), "unix:/run/sglang.sock")
+        args = ServerArgs(model_path="dummy", uds="/tmp/sglang.sock")
+        self.assertEqual(format_listen_addr(args), "unix:/tmp/sglang.sock")
 
 
 class TestPrepareUdsPath(unittest.TestCase):
