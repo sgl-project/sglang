@@ -1485,6 +1485,22 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    def _apply_war_barrier(self):
+        # Wait for the prev forward to finish reading the shared buffers this
+        # iter's schedule will overwrite. Fast path: wait on the read-done event
+        # the forward published after its snapshot (non-spec: decode graph;
+        # spec: draft_extend), then clear it. Else fall back to whole-forward
+        # wait_stream.
+        if not self._war_barrier_enabled:
+            return
+        runner = self.model_worker.war_fastpath_runner
+        ev = runner.war_fastpath_read_done_event
+        if ev is not None:
+            self.schedule_stream.wait_event(ev)
+            runner.war_fastpath_read_done_event = None
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1537,9 +1553,7 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
