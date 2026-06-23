@@ -206,7 +206,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
-            num_splits=0,
         )
 
     def forward(

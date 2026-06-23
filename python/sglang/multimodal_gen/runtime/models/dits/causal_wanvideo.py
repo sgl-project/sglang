@@ -113,7 +113,6 @@ class CausalWanSelfAttention(nn.Module):
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
-            num_splits=0,
         )
 
     def forward(
