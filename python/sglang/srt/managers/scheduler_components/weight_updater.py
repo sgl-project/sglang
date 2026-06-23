@@ -300,17 +300,26 @@ class SchedulerWeightUpdaterManager:
     def save_remote_model(self, params):
         url = params["url"]
 
-        self.tp_worker.model_runner.save_remote_model(url)
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        ModelRunner.save_remote_model(self.tp_worker.model_runner.weight_exporter, url)
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
-            self.draft_worker.model_runner.save_remote_model(draft_url)
+            from sglang.srt.model_executor.model_runner import ModelRunner
+
+            ModelRunner.save_remote_model(
+                self.draft_worker.model_runner.weight_exporter, draft_url
+            )
 
     def save_sharded_model(self, params):
-        self.tp_worker.model_runner.save_sharded_model(
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        ModelRunner.save_sharded_model(
+            self.tp_worker.model_runner.weight_exporter,
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],
