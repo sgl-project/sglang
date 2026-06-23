@@ -30,7 +30,6 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    get_num_indexer_layers,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -762,26 +761,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_server_args().enable_return_indexer_topk
-        # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
-        # path); other backends would create a capturer but never feed it.
-        if enable and self.device != "cuda":
-            logger.warning(
-                "indexer-topk capture is CUDA-only; %s backend not yet wired. "
-                "Disabling capturer.",
-                self.device,
-            )
-            set_global_indexer_capturer(None)
-            return
-
-        hf_text_config = self.model_config.hf_text_config
-        num_indexer_layers = get_num_indexer_layers(hf_text_config)
-        index_topk = getattr(hf_text_config, "index_topk", 0)
         set_global_indexer_capturer(
             create_indexer_capturer(
-                enable=enable,
-                num_indexer_layers=num_indexer_layers,
-                index_topk=index_topk,
+                model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
