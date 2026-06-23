@@ -27,15 +27,18 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
-def truncate_grammar_for_log(grammar: str, limit: int = 256) -> str:
+def truncate_grammar_for_log(grammar: Optional[str], limit: int = 256) -> str:
     """Bound a user-supplied grammar/schema before logging.
 
     A request's grammar (json_schema/regex/ebnf/structural_tag) has no size cap,
     so logging it verbatim on a compile failure can dump a large blob per failure.
     """
-    if len(grammar) <= limit:
-        return grammar
-    return f"{grammar[:limit]}... ({len(grammar)} chars total)"
+    if grammar is None:
+        return ""
+    grammar_str = str(grammar)
+    if len(grammar_str) <= limit:
+        return grammar_str
+    return f"{grammar_str[:limit]}... ({len(grammar_str)} chars total)"
 
 
 @dataclass
