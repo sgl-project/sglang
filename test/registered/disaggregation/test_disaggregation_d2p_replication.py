@@ -266,21 +266,21 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
                     f"{out.ttft:>8.4f}s"
                 )
 
-                # if rnd == 0:
-                #     self.assertEqual(
-                #         out.disagg_prefill_prefix_len, 0,
-                #         f"Round 0 client {i}: cold start, prefill prefix should be 0",
-                #     )
-                # else:
-                #     prev_history_len = out.prompt_len - question_len
-                #     expected_min = prev_history_len - 2
-                #     self.assertGreaterEqual(
-                #         out.disagg_prefill_prefix_len,
-                #         expected_min,
-                #         f"Round {rnd} client {i}: disagg_prefill_prefix_len="
-                #         f"{out.disagg_prefill_prefix_len} < {expected_min}. "
-                #         f"D2P should have replicated prior conversation to prefill.",
-                #     )
+                if rnd == 0:
+                    self.assertEqual(
+                        out.disagg_prefill_prefix_len, 0,
+                        f"Round 0 client {i}: cold start, prefill prefix should be 0",
+                    )
+                else:
+                    prev_history_len = out.prompt_len - question_len
+                    expected_min = prev_history_len - 2
+                    self.assertGreaterEqual(
+                        out.disagg_prefill_prefix_len,
+                        expected_min,
+                        f"Round {rnd} client {i}: disagg_prefill_prefix_len="
+                        f"{out.disagg_prefill_prefix_len} < {expected_min}. "
+                        f"D2P should have replicated prior conversation to prefill.",
+                    )
 
                 histories[i].extend(out.output_ids)
 
