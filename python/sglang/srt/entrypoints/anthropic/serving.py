@@ -412,22 +412,6 @@ class AnthropicServing:
                 {"role": "system", "content": "\n".join(system_parts)}
             )
 
-        def _emit_user_message(parts: list[dict]) -> None:
-            """Append accumulated parts as a user message, then clear them.
-
-            Used to flush content collected BEFORE a tool_result so the
-            wire order stays user(pre) → tool → user(post). Without this
-            flush, text/image parts that appeared before a tool_result
-            block would be moved AFTER the tool message at end of loop.
-            """
-            if not parts:
-                return
-            if len(parts) == 1 and parts[0]["type"] == "text":
-                openai_messages.append({"role": "user", "content": parts[0]["text"]})
-            else:
-                openai_messages.append({"role": "user", "content": list(parts)})
-            parts.clear()
-
         # Convert messages
         for msg in anthropic_request.messages:
             if msg.role == "system" and self._merge_inline_system:
@@ -491,12 +475,11 @@ class AnthropicServing:
                     # Use tool_use_id (per spec) with fallback to id
                     tool_call_id = block.tool_use_id or block.id or ""
 
-                    # Tool results from user become separate tool messages.
-                    # Flush any pending text/image first so the wire order
-                    # is preserved (a tool_result that arrived AFTER a text
-                    # block must come AFTER that text in OpenAI form too).
+                    # Emit the tool message immediately so the result stays
+                    # adjacent to the assistant tool_call it answers (same-turn
+                    # text flushes after). A user message between a tool_call
+                    # and its result is out-of-distribution for tool models.
                     if msg.role == "user":
-                        _emit_user_message(content_parts)
                         openai_messages.append(
                             {
                                 "role": "tool",
