@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import triton
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -47,6 +48,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
+    set_kv_buffer_prefix_valid_tiled,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -86,6 +88,26 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+
+def conv_window_dedup_enabled(
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+) -> bool:
+    """Whether the deduplicated sliding-window conv-intermediate layout is safe.
+
+    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
+    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
+    the overlapping physical columns hold identical values. Under EAGLE *tree*
+    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
+    columns can need different values from different parent chains -> fall back to
+    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
+    contiguous per-step windows). See ``MambaPool.__init__``.
+    """
+    return (
+        not is_npu
+        and not is_cpu
+        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+    )
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -129,7 +151,7 @@ def _set_kv_buffer_impl(
             row_dim,
         )
 
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner import get_is_capture_mode
 
     if get_is_capture_mode() and alt_stream is not None:
         current_stream = device_module.current_stream()
@@ -141,6 +163,67 @@ def _set_kv_buffer_impl(
     else:  # fallback to naive implementation
         k_cache[indices] = k
         v_cache[indices] = v
+
+
+def _set_kv_buffer_prefix_valid_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    store_dtype: torch.dtype,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    row_bytes = row_dim * store_dtype.itemsize
+    if row_bytes <= 0:
+        return
+
+    if row_bytes >= 8192:
+        bytes_per_tile = 512
+        num_warps = 8
+    elif row_bytes >= 4096:
+        bytes_per_tile = 256
+        num_warps = 4
+    else:
+        bytes_per_tile = 128
+        num_warps = 4
+
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_bytes, bytes_per_tile),
+    )
+
+    set_kv_buffer_prefix_valid_tiled[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        int(k.stride(0) * k.element_size()),
+        int(v.stride(0) * v.element_size()),
+        int(k_cache.stride(0) * k_cache.element_size()),
+        int(v_cache.stride(0) * v_cache.element_size()),
+        int(loc_2d.shape[1]),
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+    )
 
 
 class ReqToTokenPool:
@@ -253,6 +336,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -330,22 +414,86 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            conv_shape[0],
-                            conv_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device="cuda",
-                    )
-                    for conv_shape in conv_state_shape
-                ]
+                # Cache intermediate conv windows (last K-1 inputs) per draft token
+                # during target verify.
+                #
+                # On CUDA (Triton conv kernel + Triton scatter) we use a
+                # *deduplicated sliding-window* layout: consecutive draft tokens'
+                # (K-1)-wide windows overlap by (K-2), so instead of D separate
+                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
+                # (layer, slot) and expose an overlapping `as_strided` view of
+                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
+                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
+                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
+                # with no numerical change: both the conv kernel write (idempotent
+                # overlapping stores) and `fused_conv_window_scatter_with_mask`
+                # consume the view through its strides.
+                #
+                # Dedup the sliding-window conv-intermediate only when it is safe:
+                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
+                # verify (topk > 1) keep the dense layout -- see
+                # `conv_window_dedup_enabled` for the full rationale. The
+                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
+                # so the dense fallback reads correctly through the same code path.
+                dedup_conv_window = conv_window_dedup_enabled(
+                    _is_npu, _is_cpu, speculative_eagle_topk
+                )
+                self._intermediate_conv_window_phys = []
+                if dedup_conv_window:
+                    intermediate_conv_window_cache = []
+                    for conv_shape in conv_state_shape:
+                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
+                        shared_win = (
+                            speculative_num_draft_tokens + win - 1
+                        )  # D + (K-1) - 1
+                        phys = torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                conv_dim,
+                                shared_win,
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
+                        view = phys.as_strided(
+                            (
+                                phys.shape[0],
+                                phys.shape[1],
+                                speculative_num_draft_tokens,
+                                conv_dim,
+                                win,
+                            ),
+                            (
+                                phys.stride(0),
+                                phys.stride(1),
+                                phys.stride(3),  # step -> shared-win axis (stride 1)
+                                phys.stride(2),  # dim
+                                phys.stride(3),  # win -> shared-win axis (stride 1)
+                            ),
+                        )
+                        self._intermediate_conv_window_phys.append(phys)
+                        intermediate_conv_window_cache.append(view)
+                else:
+                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                    # [dim, K-1] window per draft token.
+                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    intermediate_conv_window_cache = [
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                speculative_num_draft_tokens,
+                                conv_shape[0],
+                                conv_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -358,7 +506,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    # Report the deduplicated PHYSICAL conv-window buffers (the view
+                    # over-reports its logical, un-deduplicated size).
+                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -368,7 +518,19 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
+            mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
+            if isinstance(self.mamba_cache, self.SpeculativeState):
+                # `intermediate_conv_window` is an as_strided view whose logical
+                # shape over-reports its real footprint; charge the physical buffers
+                # instead. No-op for the dense layout, where the view and the
+                # physical tensors coincide.
+                mem_usage_bytes -= get_tensor_size_bytes(
+                    self.mamba_cache.intermediate_conv_window
+                )
+                mem_usage_bytes += get_tensor_size_bytes(
+                    self._intermediate_conv_window_phys
+                )
+            self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
@@ -498,6 +660,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -522,6 +685,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def _init_mamba_pool(
@@ -533,6 +697,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -542,12 +707,27 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
             device=device,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+
+        # Optional int8 checkpoint pool: the radix caches states here (int8) instead
+        # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
+        # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_int8_mamba_checkpoint_pool,
+        )
+
+        self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
+            mamba_size=mamba_size,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=device,
+        )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
@@ -563,14 +743,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 )
             )
 
-    def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
-    ):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
@@ -632,7 +810,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
-    def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
+    def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state.
 
         In lazy mode the valid state stays at next_track_idx (no eager swap).
@@ -642,7 +820,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return req.mamba_next_track_idx
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
-    def _alloc_ping_pong_buffer(self, req: "Req"):
+    def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
 
         Lazy mode allocates 1 slot with the second set to -1 (allocated
@@ -668,7 +846,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
 
-    def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
+    def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
 
         The req holds the authoritative buffer; this keeps the
@@ -681,7 +859,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
     def donate_mamba_ping_pong_slot(
-        self, req: "Req", new_slot: torch.Tensor
+        self, req: Req, new_slot: torch.Tensor
     ) -> torch.Tensor:
         """Donate the tracked-state ping-pong slot to the radix cache.
 
@@ -704,7 +882,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return mamba_value_donated
 
     def free_mamba_cache(
-        self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
+        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
@@ -760,9 +938,35 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        # The int8 checkpoint pool holds radix-cached states in its own slots; a
+        # flush/reset drops the radix tree, so its slots must be released too,
+        # otherwise the (now unreferenced) slots leak and break the int8-pool
+        # invariant (int8_available + radix_cached != int8_total).
+        if self.mamba_ckpt_pool is not None:
+            self.mamba_ckpt_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+
+
+@dataclass
+class KVWriteLoc:
+    """Write target(s) for ``KVCache.set_kv_buffer``.
+
+    ``loc`` is the full-pool write location; ``swa_loc`` is the pre-translated
+    full->SWA location for hybrid SWA pools (``None`` otherwise). Bundling them
+    lets a backend issue one ``set_kv_buffer`` call regardless of pool type.
+    """
+
+    loc: torch.Tensor
+    swa_loc: Optional[torch.Tensor] = None
+
+
+def unwrap_write_loc(loc_info):
+    """Return ``(loc, swa_loc)`` from a ``KVWriteLoc`` or a bare loc tensor."""
+    if isinstance(loc_info, KVWriteLoc):
+        return loc_info.loc, loc_info.swa_loc
+    return loc_info, None
 
 
 class KVCache(abc.ABC):
@@ -782,7 +986,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1199,13 +1403,14 @@ class MHATokenToKVPool(KVCache):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -1261,6 +1466,91 @@ class MHATokenToKVPool(KVCache):
             size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
+        )
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError(
+                "commit_lens must match loc_2d batch size: "
+                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        num_rows = int(loc_2d.numel())
+        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+            raise ValueError(
+                "dense KV rows must match loc_2d size: "
+                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
+
+        if loc_2d.device != self.k_buffer[0].device:
+            loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
+        if commit_lens.device != self.k_buffer[0].device:
+            commit_lens = commit_lens.to(
+                device=self.k_buffer[0].device, non_blocking=True
+            )
+        if loc_2d.dtype != torch.int64:
+            loc_2d = loc_2d.to(torch.int64)
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+
+        if not (_is_cuda or _is_hip):
+            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                loc_2d.reshape(-1).index_select(0, valid_idx),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id,
+            )
+            return
+
+        _set_kv_buffer_prefix_valid_impl(
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc_2d,
+            commit_lens,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -1496,9 +1786,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -1512,9 +1804,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_v_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
@@ -1523,15 +1817,16 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -1543,10 +1838,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
+            cache_v, cache_v_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -1690,9 +1987,7 @@ class HybridLinearKVPool(KVCache):
             )
         return self.full_attention_layer_id_mapping[layer_id]
 
-    def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
-    ):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
         # The layer-wise wait logic is executed at the Hybrid LinearPool level;
         # no additional wait is needed in the full_kv_pool
@@ -1919,10 +2214,11 @@ class MLATokenToKVPool(KVCache):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
@@ -2101,9 +2397,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -2113,17 +2411,23 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
+        loc, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            cache_k_fp4, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+                cache_k
+            )
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -2157,14 +2461,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
-                    KVFP4QuantizeUtil,
+                    BlockFP4KVQuantizeUtil,
                 )
 
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
                 )
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_rope)
                 )
 
             if self.store_dtype != self.dtype:
@@ -2360,13 +2664,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
         # DSA attention reads garbage at those token positions.
-        kv_cache_cpu = super().get_cpu_copy(indices)
+        kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
         page_indices = indices[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
@@ -2385,8 +2689,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
-        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+        super().load_cpu_copy(
+            kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
+        )
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
