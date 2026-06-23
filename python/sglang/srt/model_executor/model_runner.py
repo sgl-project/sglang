@@ -80,7 +80,7 @@ from sglang.srt.distributed import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
+    prealloc_symmetric_memory_pool,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -946,7 +946,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.forward_hooks:
             register_forward_hooks(self.model, self.server_args.forward_hooks)
 
-        ModelRunner.prealloc_symmetric_memory_pool(
+        prealloc_symmetric_memory_pool(
             is_draft_worker=self.is_draft_worker,
             enable_symm_mem=self.server_args.enable_symm_mem,
             device=self.device,
@@ -3183,36 +3183,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
-
-    @staticmethod
-    def prealloc_symmetric_memory_pool(
-        *,
-        is_draft_worker: bool,
-        enable_symm_mem: bool,
-        device: str,
-        forward_stream: torch.cuda.Stream,
-    ):
-        # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
-        if (
-            is_draft_worker
-            or not enable_symm_mem
-            or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
-        ):
-            return
-
-        from sglang.srt.distributed import get_tp_group
-
-        # Memory allocation is tied to a cuda stream, use the forward stream
-        with torch.get_device_module(device).stream(forward_stream):
-            logger.info(
-                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
-            )
-            with use_symmetric_memory(get_tp_group()):
-                torch.empty(
-                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
-                    dtype=torch.uint8,
-                    device=device,
-                )
 
     def _maybe_rebalance_after_rank_fault(
         self,
