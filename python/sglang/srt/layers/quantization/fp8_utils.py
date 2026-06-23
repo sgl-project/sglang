@@ -249,6 +249,42 @@ if is_blackwell_supported() and is_flashinfer_available():
 
     from sglang.srt.utils.custom_op import register_custom_op
 
+    def _patch_flashinfer_cudnn_fp8_libcudart_guard() -> None:
+        import functools
+
+        import flashinfer.gemm.gemm_base as fi_gemm
+
+        factory = getattr(fi_gemm, "_cudnn_gemm_fp8_runner", None)
+        if factory is None or getattr(factory, "_sgl_libcudart_guard", False):
+            return
+
+        @functools.wraps(factory)
+        def patched_factory(*args, **kwargs):
+            runner = factory(*args, **kwargs)
+            orig_get_valid_tactics = runner.get_valid_tactics
+
+            def get_valid_tactics(*a, **k):
+                try:
+                    return orig_get_valid_tactics(*a, **k)
+                except RuntimeError as e:
+                    if "Multiple libcudart libraries" not in str(e):
+                        raise
+                    logger.warning_once(
+                        "FlashInfer cuDNN FP8 GEMM tactic disabled: cuDNN's "
+                        "libcudart guard tripped (%s). Falling back to "
+                        "cutlass/cublas tactics.",
+                        e,
+                    )
+                    return []
+
+            runner.get_valid_tactics = get_valid_tactics
+            return runner
+
+        patched_factory._sgl_libcudart_guard = True
+        fi_gemm._cudnn_gemm_fp8_runner = patched_factory
+
+    _patch_flashinfer_cudnn_fp8_libcudart_guard()
+
     @register_custom_op(
         op_name="flashinfer_bmm_fp8",
         mutates_args=[],
