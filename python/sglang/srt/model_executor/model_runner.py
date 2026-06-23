@@ -881,7 +881,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_aux_hidden_state_capture()
 
         if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
+            ModelRunner.init_cublas()
             self.init_attention_backend()
         elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
@@ -2433,7 +2433,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             self.kv_cache_dtype = self.dtype
 
-    def init_cublas(self):
+    @staticmethod
+    def init_cublas():
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
         device = "cuda"
