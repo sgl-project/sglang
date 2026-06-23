@@ -23,48 +23,20 @@ from sglang.srt.layers.quantization.unquant import (
 _CHUNK_NUMEL = 64 * 1024 * 1024
 
 
-def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
-    """Per-element ULP of w_q in its own dtype."""
-    finfo = torch.finfo(w_q.dtype)
-    x = w_q.to(torch.float32).abs()
-    # frexp: x = m * 2^e, m in [0.5, 1), so 2^(e-1) is x's binade base.
-    _, exponent = torch.frexp(x)
-    binade = torch.exp2((exponent - 1).to(torch.float32))
-    # Zeros and subnormals share the spacing of the smallest normal binade.
-    binade = binade.masked_fill(x < finfo.smallest_normal, finfo.smallest_normal)
-    return binade * finfo.eps
-
-
-def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
-    if w_s.dtype == torch.int32:
-        # UE8M0 packed format (Blackwell DeepGEMM)
-        w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
-    return w_s.to(torch.float32)
-
-
-def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
-    # Square blocks. The row dim may have a partial last block (so n//s_n is wrong),
-    # but the K dim is block-aligned, so k//s_k recovers the true block size exactly.
-    k, s_k = w_q.shape[-1], w_s.shape[-1]
-    assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
-    block = k // s_k
-    return [block, block]
-
-
-def _iter_quant_chunks(w_q: torch.Tensor, w_s: torch.Tensor, block_n: int):
-    """Yields block-row-aligned (q_slice, s_slice) pairs of bounded size."""
-    q3 = w_q.reshape(-1, *w_q.shape[-2:])
-    s3 = w_s.reshape(-1, *w_s.shape[-2:])
-    n, k = q3.shape[-2:]
-    rows = max(block_n, _CHUNK_NUMEL // k // block_n * block_n)
-    for b in range(q3.shape[0]):
-        for r0 in range(0, n, rows):
-            r1 = min(r0 + rows, n)
-            yield q3[b, r0:r1], s3[b, r0 // block_n : -(-r1 // block_n)]
-
-
 class ReferenceWeight:
     """A logical weight in encoding-invariant (dequantized) form."""
+
+    @staticmethod
+    def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
+        """Per-element ULP of w_q in its own dtype."""
+        finfo = torch.finfo(w_q.dtype)
+        x = w_q.to(torch.float32).abs()
+        # frexp: x = m * 2^e, m in [0.5, 1), so 2^(e-1) is x's binade base.
+        _, exponent = torch.frexp(x)
+        binade = torch.exp2((exponent - 1).to(torch.float32))
+        # Zeros and subnormals share the spacing of the smallest normal binade.
+        binade = binade.masked_fill(x < finfo.smallest_normal, finfo.smallest_normal)
+        return binade * finfo.eps
 
     def iter_chunks(self) -> Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Yield (dequant, tolerance) cuda chunks bounded by _CHUNK_NUMEL. tolerance
@@ -88,18 +60,46 @@ class Fp8BlockReference(ReferenceWeight):
     def __repr__(self) -> str:
         return f"fp8_block(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype})"
 
+    @staticmethod
+    def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
+        if w_s.dtype == torch.int32:
+            # UE8M0 packed format (Blackwell DeepGEMM)
+            w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+        return w_s.to(torch.float32)
+
+    @staticmethod
+    def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
+        # Square blocks. The row dim may have a partial last block (so n//s_n is wrong),
+        # but the K dim is block-aligned, so k//s_k recovers the true block size exactly.
+        k, s_k = w_q.shape[-1], w_s.shape[-1]
+        assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
+        block = k // s_k
+        return [block, block]
+
+    @staticmethod
+    def _iter_quant_chunks(w_q: torch.Tensor, w_s: torch.Tensor, block_n: int):
+        """Yields block-row-aligned (q_slice, s_slice) pairs of bounded size."""
+        q3 = w_q.reshape(-1, *w_q.shape[-2:])
+        s3 = w_s.reshape(-1, *w_s.shape[-2:])
+        n, k = q3.shape[-2:]
+        rows = max(block_n, _CHUNK_NUMEL // k // block_n * block_n)
+        for b in range(q3.shape[0]):
+            for r0 in range(0, n, rows):
+                r1 = min(r0 + rows, n)
+                yield q3[b, r0:r1], s3[b, r0 // block_n : -(-r1 // block_n)]
+
     def _normalized(self):
-        s = _normalize_scale(self.w_q, self.w_s)
-        return s, _block_size_of(self.w_q, s)
+        s = self._normalize_scale(self.w_q, self.w_s)
+        return s, self._block_size_of(self.w_q, s)
 
     def iter_chunks(self):
         s, block_size = self._normalized()
-        for q, s_chunk in _iter_quant_chunks(self.w_q, s, block_size[0]):
+        for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
             yield (
                 block_quant_dequant(q, s_chunk, block_size, dtype=torch.bfloat16),
                 block_quant_dequant(
-                    _quant_ulp(q), s_chunk, block_size, dtype=torch.float32
+                    self._quant_ulp(q), s_chunk, block_size, dtype=torch.float32
                 ),
             )
 

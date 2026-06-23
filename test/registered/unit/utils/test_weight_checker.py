@@ -36,9 +36,8 @@ from sglang.srt.utils.weight_checker import (
 )
 from sglang.srt.utils.weight_checker_quant import (
     Fp8BlockReference,
-    _block_size_of,
+    ReferenceWeight,
     _compare_references,
-    _quant_ulp,
     select_quantization_method,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -391,7 +390,7 @@ class TestQuantUlp(CustomTestCase):
             # (the largest magnitude reuses the spacing below it).
             spacing = magnitudes[1:] - magnitudes[:-1]
             expected = torch.cat([spacing, spacing[-1:]])
-            got = _quant_ulp(magnitudes.to(dtype))
+            got = ReferenceWeight._quant_ulp(magnitudes.to(dtype))
             torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
@@ -476,7 +475,7 @@ class TestCompareQuantPair(CustomTestCase):
         e_q, e_s = self._quantize_partial(weight, 1.0)
         a_q, a_s = self._quantize_partial(weight, 1.001)
         self.assertEqual(list(e_s.shape), [4, 2])  # ceil(448/128)=4, 256/128=2
-        self.assertEqual(_block_size_of(e_q, e_s), [128, 128])
+        self.assertEqual(Fp8BlockReference._block_size_of(e_q, e_s), [128, 128])
         equal, _, _, num_exceed = _compare_quant_pair(e_q, e_s, a_q, a_s)
         self.assertFalse(equal)
         self.assertEqual(num_exceed, 0)
