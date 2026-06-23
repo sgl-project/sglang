@@ -425,9 +425,9 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             dtype=dtype,
         )
         self._forward_method = self.dispatch_forward()
-        
+
         try:
-            import attentions # noqa: F401
+            import attentions  # noqa: F401
         except ImportError:
             self._forward_method = self.forward_native
 
@@ -480,14 +480,15 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
 
         output, _, _ = torch.ops.attentions.layernorm(
-                input=inputs,
-                normalized_shape=list(self.normalized_shape),
-                weight=weight,
-                bias=bias,
-                eps=self.eps,
-                impl_mode = 0
-            )
+            input=inputs,
+            normalized_shape=list(self.normalized_shape),
+            weight=weight,
+            bias=bias,
+            eps=self.eps,
+            impl_mode = 0
+        )
         return output.to(origin_dtype)
+
 
 ################################################################################
 # Fused norm kernel
