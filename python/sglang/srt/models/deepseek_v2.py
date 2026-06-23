@@ -2639,17 +2639,31 @@ class DeepseekV2AttentionMLA(
                     setattr(forward_batch, "ds_topk_indices_out", ds_out)
                 elif ds_out.shape[0] != bs:
                     ds_out = ds_out[:bs]
-                # Publish LOGICAL token positions — the native NSA-indexer
-                # convention. The shared decode path then runs
-                # transform_index_page_table_decode, which gathers
-                # page_table[topk_indices] (i.e. it does logical->physical
-                # itself). Pre-mapping to physical here made that gather a SECOND
-                # logical->physical mapping (page_table[physical_slot]), reading
-                # wrong KV slots and producing garbage output.
-                mtk = selected_indices.shape[1]
-                ds_out[:, :mtk].copy_(selected_indices)
-                if mtk < ds_out.shape[1]:
-                    ds_out[:, mtk:].fill_(-1)
+                # Publish PHYSICAL KV-cache slot indices. The default decode
+                # path is SGLANG_DSA_FUSE_TOPK=True, which feeds topk_indices
+                # straight to the kernel as page_table_1 with NO downstream
+                # transform_index_page_table_decode, so the logical->physical
+                # conversion MUST happen here (req_to_token gather). Publishing
+                # logical positions made the kernel read KV at logical offsets
+                # instead of physical slots, degenerating decode whenever
+                # logical != physical (i.e. after any KV-slot reuse). Mirrors the
+                # working native-DSA reference.
+                _rpi = getattr(forward_batch, "req_pool_indices", None)
+                if req_to_token is not None and _rpi is not None:
+                    _lp_err = (
+                        _ds_graph_state.lp_error_scratch
+                        if _ds_graph_state is not None
+                        else None
+                    )
+                    logical_to_physical(
+                        selected_indices=selected_indices,
+                        req_pool_indices=_rpi,
+                        req_to_token=req_to_token,
+                        out=ds_out,
+                        error_scratch=_lp_err,
+                    )
+                else:
+                    ds_out.fill_(-1)
                 # Skip the per-request CPU-side summary while CUDA capture
                 # is recording the stream; the host syncs (.to('cpu') and
                 # .item()) inside _publish_ds_request_summary are illegal
