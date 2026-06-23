@@ -103,16 +103,9 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
-MIMO_V2_MODEL_ARCHS = (
-    "MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM",
-)
-LLAMA4_MODEL_ARCHS = (
-    "Llama4ForConditionalGeneration",
-    "Llama4ForCausalLM",
-)
-
+# This section holds constants (mostly lists/tuples of choices) that out-of-tree
+# code may need to extend or override. Keep it for values external code depends on;
+# do not dump arbitrary module-local constants here.
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
@@ -1019,9 +1012,7 @@ class ServerArgs:
             help="Exclude uvicorn access logs whose request path starts with any of these prefixes. Defaults to empty (disabled). Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
             nargs="*",
         ),
-    ] = dataclasses.field(
-        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
-    )
+    ] = dataclasses.field(default_factory=list)
     crash_dump_folder: A[
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
@@ -3929,7 +3920,7 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif model_arch in MIMO_V2_MODEL_ARCHS:
+        elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
             if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
@@ -4002,7 +3993,10 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
                 )
-        elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
+        elif (
+            model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
+            and self.device != "cpu"
+        ):
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
                 if is_sm100_supported():
