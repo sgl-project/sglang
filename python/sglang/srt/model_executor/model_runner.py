@@ -25,6 +25,10 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mambaish_config,
+)
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -92,6 +96,9 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -453,6 +460,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
         )
 
+    def init_kv_cache_configurator(self):
+        self.kv_cache_configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            kv_cache_dtype=self.kv_cache_dtype,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            mambaish_config=mambaish_config(self.model_config),
+            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            num_effective_layers=self.layer_info.num_effective_layers,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+        )
+
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -615,6 +645,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        self.init_kv_cache_configurator()
         self.init_memory_pool(self.pre_model_load_memory)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
