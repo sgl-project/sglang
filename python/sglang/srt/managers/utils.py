@@ -85,6 +85,7 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
@@ -258,6 +259,7 @@ class EmbeddingBatchResult:
     def can_run_cuda_graph(self) -> bool:
         return False
 
+    @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
         """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
         if isinstance(self.embeddings, torch.Tensor):
