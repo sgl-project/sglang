@@ -20,8 +20,6 @@ import datetime
 import inspect
 import logging
 import os
-import socket
-import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -35,7 +33,7 @@ from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     mambaish_config,
 )
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -139,6 +137,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_trigger_remote_instance_nccl_send_group,
 )
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
     MemoryPoolConfig,
@@ -158,9 +157,6 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_loader.loader import get_model_loader
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    trigger_init_weights_send_group_for_remote_instance_request,
-)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -198,7 +194,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -1173,7 +1169,7 @@ class ModelRunner:
                 self.model_config, self.load_config, self.tp_size
             )
 
-        ModelRunner.maybe_trigger_remote_instance_nccl_send_group(
+        maybe_trigger_remote_instance_nccl_send_group(
             server_args=self.server_args, tp_rank=self.tp_rank
         )
 
@@ -1348,28 +1344,6 @@ class ModelRunner:
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
         )
-
-    @staticmethod
-    def maybe_trigger_remote_instance_nccl_send_group(
-        *, server_args: ServerArgs, tp_rank: int
-    ) -> None:
-        if (
-            server_args.load_format == LoadFormat.REMOTE_INSTANCE
-            and server_args.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.NCCL
-        ):
-            if tp_rank == 0:
-                instance_ip = NetworkAddress.resolve_host(socket.gethostname())
-                t = threading.Thread(
-                    target=trigger_init_weights_send_group_for_remote_instance_request,
-                    args=(
-                        server_args.remote_instance_weight_loader_seed_instance_ip,
-                        server_args.remote_instance_weight_loader_seed_instance_service_port,
-                        server_args.remote_instance_weight_loader_send_weights_group_ports,
-                        instance_ip,
-                    ),
-                )
-                t.start()
 
     def _load_model_with_memory_saver(self) -> None:
         # Load the model
