@@ -74,6 +74,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.cache = MagicMock()
         req.rid = str(rid)
         req.priority = priority
         req.extend_input_len = 0
