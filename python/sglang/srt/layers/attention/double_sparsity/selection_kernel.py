@@ -82,7 +82,12 @@ def ds_scorer_is_graph_safe(config) -> bool:
     None require ``--disable-cuda-graph``. Retained as the single guard predicate
     so a future non-graph-safe variant can re-introduce a gate here.
     """
-    return True
+    if config is None:
+        return True
+    scorer_norm = getattr(config, "scorer_norm", "off")
+    # off (raw dot) and cosine (in-kernel division + resident key-norm cache) are
+    # both graph-safe; any other value fails closed.
+    return scorer_norm in ("off", "cosine")
 
 
 _score_reduce_fallback_logged = False
@@ -607,6 +612,7 @@ def absorbed_topk_select(
     reduce_ca=None,
     score_reduce_bf16: bool = False,
     head_agg: str = "max",
+    scorer_norm: str = "off",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Selection: score → all-reduce → per-request mask → top-K → ascend,
     from the resident MLA latent.
@@ -622,6 +628,16 @@ def absorbed_topk_select(
     on the CPU reference path. Returns ``(selected_indices, valid_lengths)`` —
     sequence-ascending int32, ``-1`` padded.
     """
+    if scorer_norm != "off":
+        # Only the raw channel-dot ("off") absorbed identity is implemented on this
+        # eager path. Cosine is accepted by config but its key-norm division is
+        # built only on the graph-safe retrieve_topk_graph_safe path, so fail
+        # loudly rather than silently returning a raw-dot selection under cosine.
+        raise NotImplementedError(
+            f"Double Sparsity eager absorbed_topk_select supports scorer_norm="
+            f"'off' only; got {scorer_norm!r} (the cosine key-norm path is the "
+            f"graph-safe retrieve_topk_graph_safe)."
+        )
     if absorbed_latent_fp8 is not None and absorbed_latent_scales is not None:
         from sglang.srt.layers.attention.double_sparsity.absorbed_latent_kernel import (
             absorbed_latent_score_logical_paged,
@@ -725,6 +741,10 @@ def retrieve_topk_graph_safe(
     scratch_absorbed_qsel: Optional[torch.Tensor] = None,  # fp32 [max_bs, H, label_dim]
     scratch_absorbed_sel_i64: Optional[torch.Tensor] = None,  # int64 [H, label_dim]
     scratch_absorbed_q: Optional[torch.Tensor] = None,  # fp32 [max_bs, H, nope_dim]
+    include_current_slot: bool = False,
+    scratch_cur_index: Optional[torch.Tensor] = None,  # int64 [max_bs]
+    key_norm_cache: Optional[torch.Tensor] = None,  # fp32 [L, max_tokens, H] (cosine)
+    scratch_qnorm: Optional[torch.Tensor] = None,  # fp32 [max_bs, H] (cosine)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe selection that writes results into caller-owned buffers.
 
@@ -754,10 +774,15 @@ def retrieve_topk_graph_safe(
     bs = req_pool_indices.shape[0]
     device = queries.device
 
-    assert scorer_norm == "off", (
-        "Double Sparsity selection requires scorer_norm='off' (the absorbed-latent "
-        f"identity only holds there); got {scorer_norm!r}."
+    # scorer_norm="off" is the raw absorbed dot (the absorbed-latent identity);
+    # "cosine" divides each per-head dot by the query/key norms in the same kernel
+    # (the numerator IS the raw dot, so the identity still holds). Both are served
+    # on this graph-safe path. Any other value is unsupported.
+    assert scorer_norm in ("off", "cosine"), (
+        "Double Sparsity selection supports scorer_norm in ('off', 'cosine'); "
+        f"got {scorer_norm!r}."
     )
+    cosine = scorer_norm == "cosine"
     assert absorbed_w_sel is not None, (
         "Double Sparsity selection requires absorbed_w_sel (the bind-time K-noPE "
         "W_UK projection)."
@@ -800,6 +825,7 @@ def retrieve_topk_graph_safe(
             reduce_ca=reduce_ca,
             score_reduce_bf16=score_reduce_bf16,
             head_agg=head_agg,
+            scorer_norm=scorer_norm,
         )
         mtk = indices.shape[1]
         out_indices[:bs, :mtk].copy_(indices)
@@ -871,6 +897,18 @@ def retrieve_topk_graph_safe(
 
     scratch_absorbed_sel_i64.copy_(sel_layer)
     sel_i64 = scratch_absorbed_sel_i64
+    # Cosine denominator inputs: this layer's key-norm cache slice ([max_tokens, H])
+    # and the query-norm scratch. Fail closed — cosine without them would silently
+    # route as raw dot. The cache slice is a cheap host-side view (constant offset),
+    # like channel_selection[layer_id] above; 0-alloc and graph-safe.
+    if cosine:
+        assert key_norm_cache is not None and scratch_qnorm is not None, (
+            "Double Sparsity cosine selection requires key_norm_cache "
+            "[L, max_tokens, H] and scratch_qnorm [max_bs, H]; one is None."
+        )
+        k_norm_cache_layer = key_norm_cache[layer_id]
+    else:
+        k_norm_cache_layer = None
     torch.cuda.nvtx.range_push("ds_absorbed_score")
     absorbed_latent_score_logical_paged(
         queries,
@@ -890,6 +928,9 @@ def retrieve_topk_graph_safe(
         scratch_qsel=scratch_absorbed_qsel,
         channel_selection_i64=sel_i64,
         scratch_q=scratch_absorbed_q,
+        cosine=cosine,
+        key_norm_cache=k_norm_cache_layer,
+        scratch_qnorm=scratch_qnorm,
     )
     torch.cuda.nvtx.range_pop()
 
@@ -934,6 +975,26 @@ def retrieve_topk_graph_safe(
         # Masks the AUTHORITATIVE buffer: bf16(-inf) upcasts to fp32(-inf),
         # so the masked selection is identical on either dtype.
         topk_scores.masked_fill_(pv_view, float("-inf"))
+
+    # Force-include the current decode slot (logical position seq_len-1) in its
+    # own selected set. The slot-validity bitmap masks the freshly-allocated slot
+    # to -inf during scoring (a reused physical slot must not be picked on its
+    # stale latent), but the current token's own KV IS valid at attention time.
+    # Re-include it by overriding its score to +inf AFTER the validity mask and
+    # BEFORE the top-k, writing the AUTHORITATIVE buffer (bf16(+inf) upcasts to
+    # fp32(+inf), so the selection is identical on either dtype). Only seq_len-1
+    # is touched, so every other reused slot stays -inf-masked — the stale-slot
+    # hazard is not reopened. In-place / fixed-shape / 0-alloc: the per-row index
+    # is built into scratch_cur_index (int64) and scattered with a scalar +inf.
+    if include_current_slot and max_seq_len > 0:
+        assert scratch_cur_index is not None, (
+            "include_current_slot requires scratch_cur_index in graph-safe path"
+        )
+        cur_index = scratch_cur_index[:bs]
+        cur_index.copy_(seq_lens)  # int32 seq_lens -> int64 index, in place
+        cur_index.sub_(1)  # current logical position = seq_len - 1
+        cur_index.clamp_(min=0, max=max_seq_len - 1)  # range-guard the scatter
+        topk_scores.scatter_(1, cur_index.unsqueeze(1), float("inf"))
 
     torch.cuda.nvtx.range_push("ds_topk_select")
     if radix_topk_scratch is not None:
