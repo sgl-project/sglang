@@ -13,13 +13,13 @@ Conventions for SGLang's three large classes:
 
 ## 1. Frozen Code
 
-Some core files are **frozen** while they are being decomposed: their internal logic must not grow. A frozen file may be touched only to construct, wire, and delegate to a collaborator — never to add logic.
+Some core files are **frozen**: they have been decomposed into a thin orchestrator over collaborator classes and must stay that way. A frozen file may be touched only to construct, wire, and delegate to a collaborator — never to add logic.
 
 ### Why
 
-- The file is a god class being decomposed; freezing stops it accumulating more logic while that work is in flight.
-- Forcing new logic into collaborator classes (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
-- Without a freeze, features land in the god class faster than it can be split, so it never shrinks.
+- The file is a thin orchestrator over collaborator classes; freezing keeps it that way and stops it growing back into a god class.
+- Keeping logic in collaborators (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
+- So any non-trivial edit to a frozen file is a smell — the logic belongs in a collaborator, not here.
 
 ### Frozen files
 
