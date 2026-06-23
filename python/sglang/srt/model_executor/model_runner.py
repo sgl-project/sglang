@@ -702,7 +702,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_weight_transport.weight_info = register_memory_region(
                 self.model, self.remote_instance_weight_transport.engine
             )
-            self._register_to_engine_info_bootstrap()
+            ModelRunner._register_to_engine_info_bootstrap(
+                self.remote_instance_weight_transport
+            )
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1010,7 +1012,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
-    def _register_to_engine_info_bootstrap(self):
+    @staticmethod
+    def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransport):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
         The bootstrap server runs on node_rank==0. For multi-node setups, the
@@ -1034,8 +1037,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         payload = {
             "tp_rank": self.tp_rank,
             "transfer_engine_info": {
-                "session_id": self.remote_instance_weight_transport.session_id,
-                "weights_info_dict": self.remote_instance_weight_transport.weight_info,
+                "session_id": self.session_id,
+                "weights_info_dict": self.weight_info,
             },
         }
 
