@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
-from sglang.multimodal_gen.runtime.managers.memory_occupation_controller import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
