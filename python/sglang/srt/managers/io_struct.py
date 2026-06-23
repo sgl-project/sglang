@@ -783,9 +783,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return sparse output-token support from top-k/top-p/min-p
     # sampling. See GenerateReqInput.return_sampling_mask for the returned
     # meta_info fields and logprob semantics.
-    return_sampling_mask: bool
+    return_sampling_mask: bool = False
     # Whether to stream output
-    stream: bool
+    stream: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False

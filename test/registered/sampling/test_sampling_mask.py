@@ -143,7 +143,11 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls._launch_server(("--enable-deterministic-inference",))
+        # This test validates sampler/output determinism, not backend selection.
+        # Pin Triton so the same deterministic path runs on CUDA and ROCm CI.
+        cls._launch_server(
+            ("--enable-deterministic-inference", "--attention-backend", "triton")
+        )
 
     def test_return_sampling_mask_preserves_deterministic_sampling(self):
         sampling_params = {
