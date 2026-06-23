@@ -436,7 +436,7 @@ impl RustPageRadixCacheWrapper {
     /// shorter values are rejected with `ValueError`. The cache deep-copies
     /// the value slice it stores, so callers may mutate or drop their tensor
     /// after this call returns.
-    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None))]
+    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None, chunked = false))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
@@ -447,6 +447,7 @@ impl RustPageRadixCacheWrapper {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         mamba_value: Option<PyTensor>,
+        chunked: bool,
     ) -> PyResult<RustInsertResult> {
         let key_vec = py_array_to_vec_i64(py, key)?;
         let mamba_tensor = mamba_value.map(|m| m.0);
@@ -458,6 +459,7 @@ impl RustPageRadixCacheWrapper {
                 prev_prefix_len,
                 swa_evicted_seqlen,
                 mamba_tensor,
+                chunked,
             )
         })?;
         Ok(RustInsertResult::from_insert_result(py, r))
@@ -771,7 +773,7 @@ impl RustBigramRadixCacheWrapper {
         ))
     }
 
-    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None))]
+    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None, chunked = false))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
@@ -782,6 +784,7 @@ impl RustBigramRadixCacheWrapper {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         mamba_value: Option<PyTensor>,
+        chunked: bool,
     ) -> PyResult<RustInsertResult> {
         let key_vec = py_array_to_vec_i64(py, key)?;
         let mamba_tensor = mamba_value.map(|m| m.0);
@@ -801,6 +804,7 @@ impl RustBigramRadixCacheWrapper {
                 prev_prefix_len,
                 swa_evicted_seqlen,
                 mamba_tensor,
+                chunked,
             )
         })?;
         Ok(RustInsertResult::from_insert_result(py, r))

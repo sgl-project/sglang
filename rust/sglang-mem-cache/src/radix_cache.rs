@@ -495,6 +495,7 @@ impl<K: ChildKeyType> RadixCache<K> {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         mamba_value: Option<Tensor>,
+        chunked: bool,
     ) -> Result<InsertResult, RadixCacheRuntimeError> {
         self.validate_insert_value(key.len(), value, mamba_value.as_ref())?;
         let aligned_key = match PageAlignedQueryKey::new(key, self.page_size) {
@@ -517,6 +518,7 @@ impl<K: ChildKeyType> RadixCache<K> {
             prev_prefix_len,
             swa_evicted_seqlen,
             mamba_value,
+            chunked,
         )
     }
 
@@ -679,8 +681,8 @@ impl<K: ChildKeyType> RadixCache<K> {
 
     /// Bump the node's hit count; once it reaches the write-through
     /// threshold, emit a backup of the device value to host.
-    fn inc_hit_count(&mut self, node_idx: NodeIdx, deferred: &mut Vec<DeferredAction>) {
-        if !self.enable_hicache {
+    fn inc_hit_count(&mut self, node_idx: NodeIdx, chunked: bool, deferred: &mut Vec<DeferredAction>) {
+        if !self.enable_hicache || chunked {
             return;
         }
         // Write-back is triggered by eviction, not a hit-count threshold, so no
@@ -750,6 +752,7 @@ impl<K: ChildKeyType> RadixCache<K> {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         mamba_value: Option<Tensor>,
+        chunked: bool,
     ) -> Result<InsertResult, RadixCacheRuntimeError> {
         let key = key.as_slice();
         let key_len = key.len();
@@ -821,7 +824,7 @@ impl<K: ChildKeyType> RadixCache<K> {
             }
 
             // Bump reuse on the extended node; back up to host at threshold.
-            self.inc_hit_count(current_node_idx, &mut deferred);
+            self.inc_hit_count(current_node_idx, chunked, &mut deferred);
 
             consumed += step_len;
             node_idx = current_node_idx;
@@ -863,7 +866,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                 );
 
                 // Bump hit on the new leaf; back up to host if needed
-                self.inc_hit_count(leaf_idx, &mut deferred);
+                self.inc_hit_count(leaf_idx, chunked, &mut deferred);
 
                 node_idx = leaf_idx;
                 new_leaf_created = true;
