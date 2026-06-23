@@ -1173,7 +1173,9 @@ class ModelRunner:
                 self.model_config, self.load_config, self.tp_size
             )
 
-        self._maybe_trigger_remote_instance_nccl_send_group()
+        ModelRunner.maybe_trigger_remote_instance_nccl_send_group(
+            server_args=self.server_args, tp_rank=self.tp_rank
+        )
 
         self._load_model_with_memory_saver()
 
@@ -1347,20 +1349,23 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
 
-    def _maybe_trigger_remote_instance_nccl_send_group(self) -> None:
+    @staticmethod
+    def maybe_trigger_remote_instance_nccl_send_group(
+        *, server_args: ServerArgs, tp_rank: int
+    ) -> None:
         if (
-            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
-            and self.server_args.remote_instance_weight_loader_backend
+            server_args.load_format == LoadFormat.REMOTE_INSTANCE
+            and server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
-            if self.tp_rank == 0:
+            if tp_rank == 0:
                 instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
-                        self.server_args.remote_instance_weight_loader_seed_instance_ip,
-                        self.server_args.remote_instance_weight_loader_seed_instance_service_port,
-                        self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+                        server_args.remote_instance_weight_loader_seed_instance_ip,
+                        server_args.remote_instance_weight_loader_seed_instance_service_port,
+                        server_args.remote_instance_weight_loader_send_weights_group_ports,
                         instance_ip,
                     ),
                 )
