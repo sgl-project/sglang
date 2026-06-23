@@ -37,6 +37,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     PPLX = "pplx"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -78,6 +79,9 @@ class MoeA2ABackend(Enum):
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
@@ -104,6 +108,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
@@ -148,6 +153,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeRunnerBackend.FLASHINFER_MEGAMOE
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
@@ -551,6 +559,11 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     if get_moe_a2a_backend().is_pplx():
         # pplx's AllToAll.combine already sums each token's expert outputs back
         # to the source rank
+        return True
+    if get_moe_a2a_backend().is_flashinfer_megamoe():
+        # The mega kernel does its EP all-to-all + combine internally and
+        # returns per-rank outputs, so any further EP/TP all-reduce would
+        # double-count. Same opt-in as the flashinfer a2a dispatcher.
         return True
     return False
 

@@ -257,6 +257,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
@@ -276,6 +277,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
     "pplx",
     "ascend_tp",
+    "flashinfer_megamoe",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -2286,6 +2288,8 @@ class ServerArgs:
             "flashinfer",
             "megamoe",
             "pplx",
+            "ascend_tp",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -6735,6 +6739,21 @@ class ServerArgs:
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+
+        if a2a_backend == "flashinfer_megamoe":
+            assert (
+                self.enable_dp_attention and self.dp_size == self.tp_size
+            ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+            self.ep_size = self.tp_size
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_megamoe"
+            assert (
+                self.moe_runner_backend == "flashinfer_megamoe"
+            ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+            logger.info(
+                f"FlashInfer MegaMOE is enabled. The expert parallel size is "
+                f"adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
