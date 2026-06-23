@@ -209,6 +209,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Class default so subclasses that skip this __init__ (e.g. the EAGLE draft
+    # runner) still have the Double Sparsity selector-width keying inert rather
+    # than hitting AttributeError in the shared capture/replay path. The Decode
+    # __init__ below recomputes the real value per instance.
+    use_ds_selector_width_keys = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
