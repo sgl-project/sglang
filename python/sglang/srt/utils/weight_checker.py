@@ -96,11 +96,11 @@ class WeightChecker:
             for name, param in self._model_state()
             if getattr(param, "_skip_weight_check", False)
         }
-        _compare_entries(
-            expect_entries=_build_entries(
+        _check_tensors(
+            expect_tensors=_build_entries(
                 self._snapshot_tensors, skip_compare_names, reference_plan
             ),
-            actual_entries=_build_entries(
+            actual_tensors=_build_entries(
                 dict(self._model_state()), skip_compare_names, reference_plan
             ),
             allow_quant_error=allow_quant_error,
@@ -167,9 +167,9 @@ def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
 
 
-def _compare_entries(
-    expect_entries: Iterable[Tuple[str, bool, ComparableWeight]],
-    actual_entries: Iterable[Tuple[str, bool, ComparableWeight]],
+def _check_tensors(
+    expect_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
+    actual_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
     allow_quant_error: bool = False,
 ):
     good_names = []
@@ -180,7 +180,7 @@ def _compare_entries(
         actual_name,
         actual_should_compare,
         actual_ref,
-    ) in zip(expect_entries, actual_entries, strict=True):
+    ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             should_compare == actual_should_compare
