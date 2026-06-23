@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -17,7 +18,27 @@ if TYPE_CHECKING:
 
 
 def npu_swiglu_oai(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
-    """MiniMax SwigluOAI activation for NPU MoE paths."""
+    """MiniMax SwigluOAI activation for NPU MoE paths.
+
+    ``(up + 1) * gate * sigmoid(gate * alpha)`` with gate/up clamped by ``limit``.
+    ``x`` is the concatenated ``[gate | up]`` tensor (last dim = 2 * intermediate).
+
+    When ``SGLANG_NPU_FUSED_SWIGLU_OAI=1`` and the input lives on an NPU, a single
+    fused triton kernel (fp32 internal, bf16/fp16 out) replaces the ~6 separate
+    elementwise kernels of the reference path below. Default off; numerically
+    >= as accurate as the bf16 reference (verified by test_swiglu_oai_fused.py).
+    """
+    if (
+        x.device.type == "npu"
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.numel() > 0
+    ):
+        from sglang_npu_port_main.sglang.python.sglang.srt.layers.triton_ops.npu_swiglu_oai_triton import (
+            npu_swiglu_oai_fused,
+        )
+
+        return npu_swiglu_oai_fused(x, alpha, limit)
+
     d = x.shape[-1] // 2
     gate = x[..., :d].clamp(max=limit)
     up = x[..., d:].clamp(min=-limit, max=limit)

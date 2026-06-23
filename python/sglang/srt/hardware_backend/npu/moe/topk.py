@@ -16,6 +16,53 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
 
 
+def _mask_padded_tokens(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> None:
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+    if isinstance(num_token_non_padded, torch.Tensor):
+        num_token_non_padded = num_token_non_padded.to(device=topk_ids.device)
+    # NOTE: boolean-index assignment (topk_ids[mask, :] = v) lowers to
+    # aclnnNonzeroV2 on Ascend, which has a data-dependent output shape and
+    # cannot be captured by NPU graph capture (broke decode cuda-graph init).
+    # Use in-place masked_fill_ instead: same semantics, graph-safe (elementwise).
+    padding_mask = (indices >= num_token_non_padded).unsqueeze(-1)
+    topk_ids.masked_fill_(padding_mask, -1)
+    topk_weights.masked_fill_(padding_mask, 0.0)
+
+def _biased_sigmoid_topk_torch_npu(
+    router_logits: torch.Tensor,
+    topk_config: "TopKConfig",
+    num_token_non_padded: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = router_logits.to(torch.float32).sigmoid()
+    scores_for_choice = scores + topk_config.correction_bias.to(torch.float32)
+    _, topk_ids = torch.topk(
+        scores_for_choice,
+        k=topk_config.top_k,
+        dim=-1,
+        sorted=False,
+    )
+    topk_weights = scores.gather(1, topk_ids)
+
+    if topk_config.renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if topk_config.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * (
+                topk_config.routed_scaling_factor
+                if topk_config.routed_scaling_factor is not None
+                else 1.0
+            )
+
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+    return topk_weights, topk_ids
+
+
 def _apply_routed_scaling_after_renorm(
     topk_weights: torch.Tensor,
     topk_config: "TopKConfig",
