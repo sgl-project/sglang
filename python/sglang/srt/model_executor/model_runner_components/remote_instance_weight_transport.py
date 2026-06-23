@@ -47,3 +47,49 @@ class RemoteInstanceWeightTransport:
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
+
+    def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransport):
+        """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
+
+        The bootstrap server runs on node_rank==0. For multi-node setups, the
+        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
+        """
+        import requests as http_requests
+
+        if self.server_args.dist_init_addr:
+            # Multi-node: bootstrap server is on the head node (node_rank==0).
+            # Derive host from dist_init_addr (shared across all nodes).
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
+        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "transfer_engine_info": {
+                "session_id": self.session_id,
+                "weights_info_dict": self.weight_info,
+            },
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_na}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+            )
