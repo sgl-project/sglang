@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
     HiddenStatesDynamicQuant,
 )
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -675,10 +676,14 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUWUnquantMoEMethod
+# NPUUnquantMoEMethod
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
-    """Unquant MoE – all computations in BF16, no quantization."""
+    """
+    Unquant MoE – all computations in BF16 by default, with optional
+    online dynamic quantization when server_args.online_quantization
+    is set (and not to "ascend_w8a8").
+    """
 
     def __init__(self):
         super().__init__(quant_config=None)
@@ -688,24 +693,49 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
-
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
+    
+        weight_name = f"{weight_prefix}_weight"
+        server_args = get_global_server_args()
+    
+        if server_args and server_args.online_quantization != "ascend_w8a8":
+            # Dynamic int8 quantisation path
+            self._apply_online_quantization(layer, weight_prefix, weight_name)
+        else:
+            # Pure BF16 path
+            weight: torch.Tensor = getattr(layer, weight_name)
+            formatted_weight = npu_format_cast(weight.data.transpose(1, 2))
+            layer.__setattr__(
+                weight_name,
+                torch.nn.Parameter(formatted_weight, requires_grad=False),
+            )
+            if weight_prefix == "w13":
+                self._set_dispatcher_output_dtype(layer, "bf16")
+    
+    def _apply_online_quantization(
+        self, layer: torch.nn.Module, weight_prefix: str, weight_name: str
+    ) -> None:
+        weight_fp = getattr(layer, weight_name)
+        qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
+        qw_npu = npu_format_cast(qw.transpose(-2, -1))
+    
+        setattr(layer, weight_name, torch.nn.Parameter(qw_npu, requires_grad=False))
+        layer.register_parameter(
+            f"{weight_name}_scale",
+            torch.nn.Parameter(weight_scale, requires_grad=False),
         )
-
+        torch.npu.empty_cache()
+    
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_dispatcher_output_dtype(layer, "int8")
+    
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
     def apply(
         self,
         quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,  # ignored
+        pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
