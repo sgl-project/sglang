@@ -512,36 +512,33 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 
 class TestResolveMinBatch(unittest.TestCase):
-    """Unit tests for the DFlash-derived adaptive clamping in resolve_min_batch."""
+    """Unit tests for resolve_min_batch's DFlash adaptive clamping."""
 
     def test_unset_disables(self):
-        # No user value → trigger stays disabled regardless of cluster size.
         self.assertIsNone(resolve_min_batch(None, 512))
 
     def test_le_one_disables(self):
-        # A threshold of 1 or below is a no-op (can never batch fewer than 1).
+        # <= 1 can never batch, so it is a no-op.
         self.assertIsNone(resolve_min_batch(1, 512))
         self.assertIsNone(resolve_min_batch(0, 512))
 
     def test_small_cluster_disables(self):
-        # max_running_requests < 8 must disable, matching the original DFlash
-        # heuristic that never delayed on small clusters.
+        # max_running_requests < 8 disables, matching DFlash.
         self.assertIsNone(resolve_min_batch(4, 7))
         self.assertIsNone(resolve_min_batch(4, 0))
 
     def test_caps_to_formula(self):
-        # On a large cluster the formula caps at 4; a user value above it is
-        # clamped down so the trigger never delays more aggressively than DFlash.
+        # Capped down so it never delays more aggressively than DFlash.
         self.assertEqual(resolve_min_batch(10, 512), 4)
         self.assertEqual(resolve_min_batch(10, 8), 2)  # (8+5)//6 = 2
 
     def test_respects_smaller_user_value(self):
-        # A user value below the formula cap is taken as-is.
+        # Below the formula cap is taken as-is.
         self.assertEqual(resolve_min_batch(3, 512), 3)
         self.assertEqual(resolve_min_batch(2, 8), 2)
 
     def test_boundary_max_running_8(self):
-        # Exactly 8 is the smallest cluster where the trigger may fire.
+        # 8 is the smallest cluster where the trigger may fire.
         self.assertEqual(resolve_min_batch(4, 8), 2)
 
 

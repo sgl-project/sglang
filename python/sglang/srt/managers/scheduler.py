@@ -1038,11 +1038,7 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    # Clamp to the DFlash-derived adaptive cap so the trigger
-                    # can never delay more aggressively than the original
-                    # always-on heuristic: disabled on small clusters
-                    # (max_running_requests < 8) and capped to a scale-relative
-                    # target otherwise. See resolve_min_batch for the formula.
+                    # DFlash-derived adaptive clamp: see resolve_min_batch.
                     min_batch=resolve_min_batch(
                         self.server_args.prefill_delayer_min_batch,
                         self.max_running_requests,

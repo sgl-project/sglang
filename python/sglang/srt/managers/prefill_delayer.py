@@ -43,20 +43,10 @@ class _NegotiateOutput(NamedTuple):
 def resolve_min_batch(
     user_value: Optional[int], max_running_requests: int
 ) -> Optional[int]:
-    """Resolve the min-batch trigger threshold, mirroring the DFlash heuristic.
+    """Resolve the min-batch threshold with the DFlash adaptive clamping.
 
-    The original DFlash prefill-refill heuristic was always-on and derived its
-    target adaptively from ``max_running_requests``. We preserve that safety
-    boundary here so the opt-in trigger can never delay *more aggressively*
-    than DFlash did:
-
-    * ``max_running_requests < 8`` → disabled (returns ``None``). Small clusters
-      rarely benefit from batched admission; the cost is pure TTFT regression.
-    * Otherwise the threshold is capped at ``min(user_value, formula)``, where
-      ``formula = min(4, max(2, (max_run + 5) // 6))`` scales the target down
-      as the cluster grows, keeping the worst-case wait short.
-
-    A ``user_value`` of ``None`` or ``<= 1`` keeps the trigger disabled.
+    Disabled when user_value is None/<=1 or max_running_requests < 8;
+    otherwise capped to min(user_value, min(4, max(2, (max_run + 5) // 6))).
     """
     if user_value is None or user_value <= 1:
         return None
@@ -185,9 +175,8 @@ class PrefillDelayer:
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
-        # Local view of the allocatable-slots trigger; gathered as a bool so a
-        # rank where it doesn't apply (chunked prefill in flight, or no count
-        # provided) contributes False without a numeric sentinel.
+        # Gathered as a bool so a rank where it doesn't apply (chunked prefill
+        # in flight, or no count provided) contributes False.
         local_allocatable_below = (
             self._min_batch is not None
             and num_allocatable_reqs is not None
@@ -273,11 +262,9 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Min-batch trigger: delay prefill until at least min_batch free
-            # slots are gathered, batching freed slots into one admission.
-            # Targets workloads where each admission is expensive
-            # (e.g. speculative decoding with a separate draft prefill pass).
-            # Fires when any rank is below threshold (min < t == any i < t).
+            # Min-batch trigger: batch freed slots into one admission. Useful
+            # when each admission is expensive (e.g. draft prefill). Fires when
+            # any rank is below threshold (min < t == any i < t).
             allocatable_condition = (
                 global_running_batch_max > 0
                 and global_allocatable_below.max().item() > 0
