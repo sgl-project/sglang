@@ -12,12 +12,16 @@ from sglang.srt.utils import cached_triton_kernel
 @cached_triton_kernel(
     lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
 )
-@triton.jit(do_not_specialize=["num_segs"])
+@triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
     x,
     weights,
     output,
+    # Output strides may differ from OUTPUT_DIM when compact LoRA output is
+    # accumulated into a wider base projection.
+    output_stride_0,
+    output_stride_1,
     # Information on sequence lengths and weight id
     seg_indptr,
     weight_indices,
@@ -50,10 +54,8 @@ def _chunked_lora_expand_kernel(
         weights (Tensor): The LoRA B weights for all adapters.
             Shape: (num_lora, output_dim, K).
         output (Tensor): The output tensor where the result is stored.
-            Shape: (s, output_dim).
+            Shape: (s, output_dim) or a wider base output.
     """
-    tl.static_assert(NUM_SLICES <= 3)
-
     x_stride_0: tl.constexpr = NUM_SLICES * MAX_RANK
     x_stride_1: tl.constexpr = 1
 
@@ -61,11 +63,13 @@ def _chunked_lora_expand_kernel(
     w_stride_1: tl.constexpr = MAX_RANK
     w_stride_2: tl.constexpr = 1
 
-    output_stride_0: tl.constexpr = OUTPUT_DIM
-    output_stride_1: tl.constexpr = 1
-
     pid_s = tl.program_id(axis=2)
     if pid_s >= num_segs:
+        return
+
+    seg_start = tl.load(seg_indptr + pid_s)
+    seg_end = tl.load(seg_indptr + pid_s + 1)
+    if seg_start == seg_end:
         return
 
     # Current block computes sequence with batch_id,
@@ -78,9 +82,6 @@ def _chunked_lora_expand_kernel(
     if cur_rank == 0:
         return
 
-    seg_start = tl.load(seg_indptr + pid_s)
-    seg_end = tl.load(seg_indptr + pid_s + 1)
-
     slice_id = tl.program_id(axis=1)
     slice_start = tl.load(slice_offsets + slice_id)
     slice_end = tl.load(slice_offsets + slice_id + 1)
@@ -92,7 +93,7 @@ def _chunked_lora_expand_kernel(
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
+        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
     )
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
@@ -185,11 +186,16 @@ def chunked_sgmv_lora_expand_forward(
     BLOCK_N = config["BLOCK_N"]
 
     num_segments = batch_info.num_segments
+    segment_grid = (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else num_segments
+    )
 
     grid = (
         triton.cdiv(max_slice_size, BLOCK_N),
         num_slices,  # number of slices in the input/output
-        batch_info.bs if batch_info.use_cuda_graph else num_segments,
+        segment_grid,
     )
 
     if base_output is None:
@@ -210,11 +216,13 @@ def chunked_sgmv_lora_expand_forward(
         x=x,
         weights=weights,
         output=output,
+        output_stride_0=output.stride(0),
+        output_stride_1=output.stride(1),
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=num_segments,
+        num_segs=segment_grid,
         scalings=batch_info.scalings,
         slice_offsets=slice_offsets,
         # constants

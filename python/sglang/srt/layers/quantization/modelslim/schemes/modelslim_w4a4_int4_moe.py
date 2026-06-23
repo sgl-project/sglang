@@ -109,15 +109,15 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply_weights(
         self,
         layer,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
@@ -129,7 +129,15 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         group_list,
         output_dtype,
     ):
-        # FIXME W4A4 MoE does not work with DeepEP
-        raise NotImplementedError(
-            f"DeepEP currently does not support quantization in int4, please disable --moe-a2a-backend deepep"
+        logger.warning_once(
+            "Warning: Performance may be reduced, because DeepEP Dispatcher does not support 4-bit quantization, "
+            "switching to the bf16 dispatcher, quantization will be performed separately..."
+        )
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
         )

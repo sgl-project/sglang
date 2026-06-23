@@ -1,9 +1,12 @@
 import pickle
+import time
 from typing import Any
 
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -75,15 +78,23 @@ class SchedulerClient:
             f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
 
-    def forward(self, batch: Any) -> Any:
+    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
+        previous_timeout_ms = None
+        if timeout_ms is not None:
+            previous_timeout_ms = self.scheduler_socket.getsockopt(zmq.RCVTIMEO)
+            self.scheduler_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         try:
             self.scheduler_socket.send_pyobj(batch)
             output_batch = self.scheduler_socket.recv_pyobj()
+            _materialize_output_batch_file_refs(output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
+        finally:
+            if previous_timeout_ms is not None and self.scheduler_socket is not None:
+                self.scheduler_socket.setsockopt(zmq.RCVTIMEO, previous_timeout_ms)
 
     def ping(self) -> bool:
         """
@@ -162,7 +173,9 @@ class AsyncSchedulerClient:
         try:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
-            return pickle.loads(payload)
+            output_batch = pickle.loads(payload)
+            _materialize_output_batch_file_refs(output_batch)
+            return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
@@ -203,3 +216,16 @@ class AsyncSchedulerClient:
 # Singleton instances for easy access
 async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()
+
+
+def _materialize_output_batch_file_refs(output_batch: Any) -> None:
+    if not isinstance(output_batch, OutputBatch):
+        return
+
+    start_time = time.perf_counter()
+    output_batch.output = materialize_file_refs(output_batch.output)
+    if output_batch.metrics is not None:
+        output_batch.metrics.record_stage(
+            "SchedulerClient.materialize_file_refs",
+            time.perf_counter() - start_time,
+        )

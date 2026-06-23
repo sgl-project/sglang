@@ -136,40 +136,17 @@ def _ensure_gguf_version():
 
 
 def _patch_rope_parameters_validation():
-    """Fix rope_parameters validation for unregistered model types.
+    """Guard ``standardize_rope_params()`` against missing
+    ``max_position_embeddings``.
 
-    For unregistered model types (e.g. ``deepseek_v32``), the generic
-    ``PretrainedConfig`` lacks a ``rope_parameters`` field so the conversion
-    that injects ``rope_theta`` from the top-level config is skipped.
-    Additionally, ``standardize_rope_params()`` accesses
+    For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
     ``self.max_position_embeddings`` during ``__post_init__`` before extra
     kwargs are set as attributes, causing ``AttributeError``.
 
-    Fix: (1) patch ``from_dict`` to inject ``rope_theta`` into
-    ``rope_scaling``, (2) guard ``standardize_rope_params`` against missing
+    Fix: guard ``standardize_rope_params`` against missing
     ``max_position_embeddings``.
-
-    TODO(upstream): remove once unregistered model types handle rope
-    standardization correctly in transformers.
     """
     from transformers import PretrainedConfig
-
-    original = PretrainedConfig.from_dict.__func__
-
-    @classmethod  # type: ignore[misc]
-    def patched(cls, config_dict, **kwargs):
-        rope_scaling = config_dict.get("rope_scaling")
-        rope_theta = config_dict.get("rope_theta")
-        if (
-            isinstance(rope_scaling, dict)
-            and rope_theta is not None
-            and "rope_theta" not in rope_scaling
-        ):
-            config_dict = config_dict.copy()
-            config_dict["rope_scaling"] = {**rope_scaling, "rope_theta": rope_theta}
-        return original(cls, config_dict, **kwargs)
-
-    PretrainedConfig.from_dict = patched
 
     # standardize_rope_params accesses self.max_position_embeddings before
     # __post_init__ sets extra kwargs — skip when the attribute is absent.
@@ -222,7 +199,19 @@ def _patch_removed_symbols():
     """
     # LlamaFlashAttention2
     try:
-        from transformers.models.llama import modeling_llama
+        import logging
+
+        # Importing modeling_llama triggers a deep import chain:
+        #   modeling_llama -> modeling_utils -> quantizers -> torchao
+        # torchao emits a noisy warning about incompatible torch versions
+        # that is irrelevant here — suppress it during this import.
+        _torchao_logger = logging.getLogger("torchao")
+        _prev_level = _torchao_logger.level
+        _torchao_logger.setLevel(logging.ERROR)
+        try:
+            from transformers.models.llama import modeling_llama
+        finally:
+            _torchao_logger.setLevel(_prev_level)
 
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):

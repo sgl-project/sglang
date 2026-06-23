@@ -29,7 +29,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
-from fastapi import Request
+from fastapi import Request, WebSocket
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -42,9 +42,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
+from sglang.srt.entrypoints.openai.realtime import (
+    handle_realtime_transcription,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    needs_space,
+    process_asr_chunk,
     split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
@@ -65,6 +70,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._adapter = resolve_adapter(
             getattr(model_config.hf_config, "architectures", [])
         )
+        # Cap concurrent /v1/realtime sessions. The Semaphore is bound to the
+        # event loop on first acquire (uvicorn's loop in normal serving).
+        self._session_semaphore = asyncio.Semaphore(
+            tokenizer_manager.server_args.asr_max_concurrent_sessions
+        )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -80,7 +90,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
-        sampling_params = self._adapter.build_sampling_params(request)
+        if getattr(request, "_fused_autodetect", False):
+            sampling_params = self._adapter.build_fused_autodetect_params(request)
+        else:
+            sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
             text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
             audio_data=request.audio_data,
@@ -125,6 +138,22 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
 
+        # When language is not specified and the adapter supports detection,
+        # use a single fused request: SGLang's structured generation (regex)
+        # constrains the first 3 decode tokens to the forced prefix while
+        # allowing free transcription afterwards — one encoder pass, no
+        # extra round-trip. The adapter picks the regex variant based on
+        # whether timestamps were requested, so fused covers all four
+        # combinations of (stream, timestamp_granularities):
+        #   * non-streaming:     parse_fused_output strips the prefix and
+        #                        scrubs trailing/embedded special tokens.
+        #   * streaming:         the handler buffers until the sentinel,
+        #                        re-anchors, and scrubs each delta via
+        #                        adapter.strip_special_tokens.
+        # verbose_json segment timing still comes from _parse_segments
+        # over output_ids, which is unaffected by the string-level scrub.
+        use_fused = language is None and self._adapter.supports_language_detection
+
         # Build request
         request = TranscriptionRequest(
             audio_data=audio_data,
@@ -136,6 +165,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
             stream=stream,
             audio_duration_s=audio_duration_s,
         )
+        if use_fused:
+            request._fused_autodetect = True
+            # Stash the variant alongside the flag so the adapter dispatch in
+            # parse_fused_output and the build_fused_autodetect_params regex
+            # selection see the same boolean — and we don't recompute it on
+            # every cumulative-text snapshot in streaming.
+            request._fused_ts_variant = bool(timestamp_granularities)
 
         # Use the base class handle_request pattern
         return await self.handle_request(request, raw_request)
@@ -161,6 +197,27 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = self._adapter.postprocess_text(ret.get("text", ""))
+
+        # For fused auto-detect, parse_fused_output returns the scrubbed
+        # user-visible text. On parse failure (FSM abort, truncation) it
+        # returns (None, None) and we fall back to strip_special_tokens —
+        # the language stays unset rather than reporting a bogus detection.
+        if getattr(request, "_fused_autodetect", False):
+            lang, visible = self._adapter.parse_fused_output(
+                text, ts_variant=getattr(request, "_fused_ts_variant", False)
+            )
+            if visible is None:
+                logger.warning(
+                    "Fused auto-detect parse failed on non-streaming response; "
+                    "falling back to raw-text scrub."
+                )
+                text = self._adapter.strip_special_tokens(text)
+            else:
+                text = visible
+                if lang is not None:
+                    request.language = lang
+                    logger.info("Auto-detected language: '%s'", lang)
+
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
@@ -204,11 +261,33 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request: TranscriptionRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
-        """Generate streaming transcription response."""
+        """Generate streaming transcription response.
+
+        In fused auto-detect mode, each cumulative-text snapshot is passed
+        through ``parse_fused_output`` — which returns ``(None, None)``
+        while the forced prefix is still arriving and ``(lang, visible)``
+        once it's in. ``visible`` is already stripped of the prefix and
+        scrubbed of embedded special tokens, and it grows monotonically
+        across snapshots, so deltas are a plain suffix slice.
+        """
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
-        stream_buffer = ""
+        visible_buffer = ""
+
+        fused_mode = getattr(request, "_fused_autodetect", False)
+        ts_variant = getattr(request, "_fused_ts_variant", False)
+        # When ``incremental_streaming_output`` is enabled, each chunk's
+        # ``content["text"]`` is the new delta from the detokenizer, not
+        # the cumulative text. Always reconstruct cumulative text locally
+        # so the rest of the loop (prefix parse + visible-buffer slice)
+        # works uniformly under either mode.
+        incremental = getattr(
+            self.tokenizer_manager.server_args,
+            "incremental_streaming_output",
+            False,
+        )
+        cumulative_text = ""
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -217,10 +296,44 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                # Calculate delta (new text since last chunk)
-                current_text = content.get("text", "")
-                delta = current_text[len(stream_buffer) :]
-                stream_buffer = current_text
+                chunk_text = content.get("text", "")
+                if incremental:
+                    cumulative_text += chunk_text
+                else:
+                    cumulative_text = chunk_text
+
+                if fused_mode:
+                    lang, visible = self._adapter.parse_fused_output(
+                        cumulative_text, ts_variant=ts_variant
+                    )
+                    if visible is None:
+                        # Prefix not yet locatable. Keep buffering until the
+                        # stream ends.
+                        if not finish_reason_type:
+                            continue
+                        # Stream ended before the forced prefix was parseable —
+                        # emit an SSE error frame so the client can distinguish
+                        # this from "silent audio, zero transcription" and raise
+                        # a real error instead of quietly succeeding.
+                        logger.warning(
+                            "Fused auto-detect stream finished before prefix "
+                            "was parseable; returning detection-failed error."
+                        )
+                        error = self.create_streaming_error_response(
+                            "language auto-detect failed: forced-prefix sentinel "
+                            "was not produced before stream end"
+                        )
+                        yield f"data: {error}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    if lang is not None and request.language is None:
+                        request.language = lang
+                        logger.info("Auto-detected language: '%s'", lang)
+                else:
+                    visible = cumulative_text
+
+                delta = visible[len(visible_buffer) :]
+                visible_buffer = visible
 
                 # Send content delta if there's new text
                 if delta:
@@ -272,13 +385,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
         - Token-level streaming within chunks (stream=True)
         - Encoder window caching across chunks
         - Cross-chunk KV cache reuse
-        - WebSocket endpoint for real-time audio input
         """
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
         state = StreamingASRState(**self._adapter.chunked_streaming_config)
-        first_word = True
+        # Track only the trailing char of the cumulative emit; `needs_space`
+        # uses prev[-1] / cur[0] so we don't need to keep the full buffer.
+        last_char = ""
 
         try:
             chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
@@ -288,49 +402,24 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     logger.info("[streaming_asr] client disconnected, stopping")
                     break
                 is_last = i == len(chunks) - 1
-                prompt = self._adapter.prompt_template + state.get_prefix_text()
 
-                chunk_request = GenerateReqInput(
-                    text=prompt,
+                delta = await process_asr_chunk(
+                    tokenizer_manager=self.tokenizer_manager,
+                    adapter=self._adapter,
+                    state=state,
                     audio_data=chunk_audio,
                     sampling_params=adapted_request.sampling_params,
-                    stream=False,
-                    modalities=["audio"],
+                    is_last=is_last,
+                    raw_request=raw_request,
                     routing_key=self.extract_routing_key(raw_request),
                 )
-
-                try:
-                    ret = None
-                    async for ret in self.tokenizer_manager.generate_request(
-                        chunk_request, raw_request
-                    ):
-                        break
-                except asyncio.CancelledError:
-                    raise
-                except ValueError as e:
-                    logger.warning(
-                        "[streaming_asr] chunk %d failed with ValueError: %s", i, e
-                    )
-                    continue
-
-                if ret is None:
-                    logger.warning("[streaming_asr] empty response for chunk %d", i)
-                    continue
-
-                text = self._adapter.postprocess_text(ret.get("text", ""))
-
-                if is_last:
-                    state.full_transcript = text
-                    delta = state.finalize()
-                else:
-                    delta = state.update(text)
 
                 if delta:
                     for word in delta.split(" "):
                         if not word:
                             continue
-                        content = word if first_word else " " + word
-                        first_word = False
+                        content = f" {word}" if needs_space(last_char, word) else word
+                        last_char = content[-1]
                         chunk_resp = TranscriptionStreamResponse(
                             id=request_id,
                             created=created_time,
@@ -366,3 +455,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
+
+    async def handle_websocket(self, websocket: WebSocket) -> None:
+        await handle_realtime_transcription(
+            websocket,
+            tokenizer_manager=self.tokenizer_manager,
+            adapter=self._adapter,
+            server_args=self.tokenizer_manager.server_args,
+            session_semaphore=self._session_semaphore,
+        )

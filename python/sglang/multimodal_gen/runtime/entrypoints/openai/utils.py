@@ -1,7 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-import base64
+import asyncio
+import inspect
+import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -9,7 +10,7 @@ from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
 
 import httpx
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -27,11 +28,14 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import parse_size
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -50,6 +54,47 @@ DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
 
 
+def _bad_request(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=message)
+
+
+def _parse_size_or_raise(size: str) -> tuple[int, int]:
+    width, height = parse_size(size)
+    if width is None or height is None or width <= 0 or height <= 0:
+        raise _bad_request("size must be formatted as positive WIDTHxHEIGHT")
+    return width, height
+
+
+def _validate_positive_int(kwargs: dict[str, Any], name: str) -> None:
+    value = kwargs.get(name)
+    if value is not None and int(value) <= 0:
+        raise _bad_request(f"{name} must be positive")
+
+
+def flatten_extra_params(payload: Any) -> dict[str, Any]:
+    """Promote vLLM-Omni-style extra_params into regular request fields."""
+    if not isinstance(payload, dict):
+        return {}
+
+    extra_params = payload.pop("extra_params", None)
+    if isinstance(extra_params, str):
+        try:
+            extra_params = json.loads(extra_params)
+        except Exception:
+            extra_params = None
+    if not isinstance(extra_params, dict):
+        if "guardrails" in payload:
+            payload.setdefault("use_guardrails", payload["guardrails"])
+        return payload
+
+    for key, value in extra_params.items():
+        payload.setdefault(key, value)
+    if "guardrails" in extra_params:
+        payload.setdefault("use_guardrails", extra_params["guardrails"])
+
+    return payload
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,
@@ -65,17 +110,6 @@ def temp_dir_if_disabled(
             yield tmp
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
-    try:
-        parts = size.lower().replace(" ", "").split("x")
-        if len(parts) != 2:
-            raise ValueError
-        w, h = int(parts[0]), int(parts[1])
-        return w, h
-    except Exception:
-        return None, None
 
 
 def choose_output_image_ext(
@@ -107,13 +141,21 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
     if size:
-        w, h = _parse_size(size)
-        if w is not None:
-            # treat None dimensions as unset so parsed size can fill them
-            if kwargs.get("width") is None:
-                kwargs["width"] = w
-            if kwargs.get("height") is None:
-                kwargs["height"] = h
+        w, h = _parse_size_or_raise(size)
+        # treat None dimensions as unset so parsed size can fill them
+        if kwargs.get("width") is None:
+            kwargs["width"] = w
+        if kwargs.get("height") is None:
+            kwargs["height"] = h
+
+    for name in (
+        "width",
+        "height",
+        "num_frames",
+        "num_inference_steps",
+        "num_outputs_per_prompt",
+    ):
+        _validate_positive_int(kwargs, name)
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -137,33 +179,69 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+async def save_image_to_path(
+    image: Union[UploadFile, bytes, str],
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str:
+    input_path = await _maybe_url_image(
+        image, target_path, prefer_remote_source=prefer_remote_source
+    )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
     return input_path
 
 
 # Helpers
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+async def _save_upload_to_path(
+    upload: Union[UploadFile, bytes], target_path: str
+) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    content = await upload.read()
+    if isinstance(upload, bytes):
+        content = upload
+    elif isinstance(upload, (bytearray, memoryview)):
+        content = bytes(upload)
+    else:
+        read = getattr(upload, "read", None)
+        if not callable(read):
+            raise TypeError(f"Unsupported image upload type: {type(upload).__name__}")
+        content = read()
+        if inspect.isawaitable(content):
+            content = await content
+        if isinstance(content, (bytearray, memoryview)):
+            content = bytes(content)
+        if not isinstance(content, bytes):
+            raise TypeError(
+                f"Image upload read() returned {type(content).__name__}, expected bytes"
+            )
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
+        # Only bypass persistence when the caller explicitly disables input saves.
+        # Otherwise keep the prefetch outside the measured server stages.
+        if prefer_remote_source:
+            return img_url
+        # download image from URL and persist on disk
         input_path = await _save_url_image_to_path(img_url, target_path)
         return input_path
     elif img_url.startswith("data:image"):
-        # encode image base64 url
-        input_path = await _save_base64_image_to_path(img_url, target_path)
+        if prefer_remote_source:
+            return img_url
+        # encode image base64 url and persist on disk
+        input_path = save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
         raise ValueError("Unsupported image url format")
@@ -172,87 +250,92 @@ async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
 async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     """Download image from URL and save to target path."""
 
+    def _is_retryable_download_error(error: Exception) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            status_code = error.response.status_code
+            # Retry on rate limit and transient server-side failures.
+            return status_code == 429 or 500 <= status_code < 600
+        # Retry on transient network/protocol issues.
+        return isinstance(
+            error,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ),
+        )
+
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    max_attempts = 3
+    backoff_seconds = 0.2
+    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await client.get(image_url, timeout=10.0)
+                    response.raise_for_status()
 
-            # Determine file extension from content type or URL after downloading
-            if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "").lower()
+                    # Determine file extension from content type or URL after downloading
+                    if not os.path.splitext(target_path)[1]:
+                        content_type = response.headers.get("content-type", "").lower()
 
-                url_path = image_url.split("?")[0]
-                _, url_ext = os.path.splitext(url_path)
-                url_ext = url_ext.lower()
+                        url_path = image_url.split("?")[0]
+                        _, url_ext = os.path.splitext(url_path)
+                        url_ext = url_ext.lower()
 
-                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
-                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                elif content_type.startswith("image/"):
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "png" in content_type:
-                        ext = ".png"
-                    elif "webp" in content_type:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"  # Default to jpg
-                elif content_type == "application/octet-stream":
-                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                    ext = ".jpg"
-                else:
-                    raise ValueError(
-                        f"URL does not point to an image. Content-Type: {content_type}"
+                        if url_ext in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".webp",
+                            ".gif",
+                            ".bmp",
+                        }:
+                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                        elif content_type.startswith("image/"):
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            else:
+                                ext = ".jpg"  # Default to jpg
+                        elif content_type == "application/octet-stream":
+                            # for octet-stream, if we couldn't get it from URL, default to jpg
+                            ext = ".jpg"
+                        else:
+                            raise ValueError(
+                                f"URL does not point to an image. Content-Type: {content_type}"
+                            )
+                        target_path = f"{target_path}{ext}"
+
+                    with open(target_path, "wb") as f:
+                        f.write(response.content)
+
+                    return target_path
+                except Exception as e:
+                    last_error = e
+                    if attempt == max_attempts or not _is_retryable_download_error(e):
+                        raise
+                    wait_s = backoff_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
+                        attempt,
+                        max_attempts,
+                        image_url,
+                        wait_s,
+                        e,
                     )
-                target_path = f"{target_path}{ext}"
-
-            with open(target_path, "wb") as f:
-                f.write(response.content)
-
-            return target_path
+                    await asyncio.sleep(wait_s)
     except Exception as e:
-        raise Exception(f"Failed to download image from URL: {str(e)}")
-
-
-async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
-    """Decode base64 image data and save to target path."""
-
-    _B64_FMT_HINT = (
-        "Failed to decode base64 image. "
-        "Expected format: `data:[<media-type>];base64,<data>`"
-    )
-
-    # split `data:[<media-type>][;base64],<data>` to media-type base64 data
-    pattern = r"data:(.*?)(;base64)?,(.*)"
-    match = re.match(pattern, base64_data)
-    if not match:
-        raise ValueError(_B64_FMT_HINT)
-    media_type = match.group(1)
-    is_base64 = match.group(2)
-    if not is_base64:
-        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
-    data = match.group(3)
-    if not data:
-        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
-    # get ext from url
-    if media_type.startswith("image/"):
-        ext = media_type.split("/")[-1].lower()
-        if ext == "jpeg":
-            ext = "jpg"
-    else:
-        ext = "jpg"
-    target_path = f"{target_path}.{ext}"
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-    try:
-        image_data = base64.b64decode(data)
-        with open(target_path, "wb") as f:
-            f.write(image_data)
-
-        return target_path
-    except Exception as e:
-        raise Exception(f"Failed to decode base64 image: {str(e)}")
+        final_error = last_error or e
+        raise Exception(
+            f"Failed to download image from URL {image_url}: {str(final_error)}"
+        )
 
 
 async def process_generation_batch(
@@ -260,18 +343,23 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    with log_generation_timer(logger, batch.prompt):
+    with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
-        if result.output is None and result.output_file_paths is None:
+        if (
+            result.output is None
+            and result.output_file_paths is None
+            and result.raw_frame_batches is None
+        ):
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
 
+        save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-        else:
+        elif result.output is not None:
             num_outputs = len(result.output)
             save_file_path_list = save_outputs(
                 result.output,
@@ -292,7 +380,12 @@ async def process_generation_batch(
             )
 
     total_time = time.perf_counter() - total_start_time
-    log_batch_completion(logger, 1, total_time)
+    if get_global_server_args().batching_max_size > 1:
+        log_batch_completion(
+            logger,
+            len(save_file_path_list),
+            total_time,
+        )
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")

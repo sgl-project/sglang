@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=60, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class TestCpuMonitor(unittest.TestCase):

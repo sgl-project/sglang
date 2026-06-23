@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -30,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -44,9 +43,12 @@ if TYPE_CHECKING:
 
 
 try:
-    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
     from flashinfer import (
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+    )
+
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
     fp4_quantize_flashinfer = None
@@ -85,26 +87,31 @@ class StandardDispatcher(BaseDispatcher):
 
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
-        # FlashInfer CUTLASS and CuteDSL handle EP internally with global expert IDs.
-        # Skip local expert mapping so topk_ids stay in global space.
+        self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
+        self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
+        # Skip local expert mapping when the backend handles EP with global expert IDs:
+        # - cutlass / cutedsl / trtllm_routed handle EP internally
+        # - mxfp4 dispatcher mapping is already global
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm()
+            or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
-        )
-        self.enable_flashinfer_trtllm_routed_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            or self.enable_flashinfer_mxfp4_moe
         )
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
-            moe_runner_config.num_local_experts - self.num_local_shared_experts
+            self.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
+        self.expert_mask_gpu = None
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -187,13 +194,23 @@ class StandardDispatcher(BaseDispatcher):
                         )
                     )
 
-        if self.local_expert_mapping is not None and not _use_aiter:
-            if TopKOutputChecker.format_is_standard(topk_output):
-                topk_output = topk_output._replace(
-                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+        if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
+            if _use_aiter:
+                self.expert_mask_gpu = (
+                    (
+                        (self.local_expert_mapping >= 0)
+                        & (self.local_expert_mapping < self.num_local_experts)
+                    )
+                    .to(torch.int32)
+                    .to(device="cuda")
                 )
-            elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                raise NotImplementedError()
+            else:
+                if TopKOutputChecker.format_is_standard(topk_output):
+                    topk_output = topk_output._replace(
+                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+                    )
+                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
+                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,
@@ -204,7 +221,10 @@ class StandardDispatcher(BaseDispatcher):
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,

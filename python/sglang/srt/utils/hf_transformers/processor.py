@@ -35,6 +35,7 @@ from .common import (
     attach_additional_stop_token_ids,
     download_from_hf,
     get_tokenizer_from_processor,
+    resolve_runai_obj_uri,
 )
 from .mistral_utils import (
     is_mistral_model,
@@ -141,14 +142,30 @@ def get_processor(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     use_fast: Optional[bool] = True,
+    tokenizer_backend: str = "huggingface",
+    model_name: Optional[str] = None,
     **kwargs,
 ):
+    if tokenizer_backend == "fastokens":
+        from .tokenizer import _ensure_fastokens_patched
+
+        _ensure_fastokens_patched()
+
     revision = kwargs.pop("revision", tokenizer_revision)
+    tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
             revision=revision,
+        )
+    elif model_name is not None:
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
         )
     else:
         config = AutoConfig.from_pretrained(
@@ -266,6 +283,7 @@ def get_processor(
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=revision,
+            tokenizer_backend=tokenizer_backend,
         )
         if isinstance(processor, PreTrainedTokenizerBase):
             processor = tokenizer

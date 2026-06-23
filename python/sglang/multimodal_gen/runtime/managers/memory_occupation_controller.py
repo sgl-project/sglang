@@ -4,9 +4,13 @@ import gc
 
 import torch
 
-from sglang.multimodal_gen.runtime.loader.weights_updater import get_updatable_modules
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+    get_updatable_modules,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -57,9 +61,7 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
 
 
 def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
-    if not isinstance(module, OffloadableDiTMixin):
-        return False
-    return any(manager.enabled for manager in module.layerwise_offload_managers)
+    return is_layerwise_offloaded_module(module)
 
 
 class MemoryOccupationController:

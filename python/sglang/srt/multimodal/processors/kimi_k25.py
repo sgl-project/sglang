@@ -82,6 +82,32 @@ def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).cuda()
 
 
+def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
+    """Coerce an already-decoded (C, H, W) image tensor to 3-channel RGB.
+
+    PIL inputs are RGB-normalized by _pil_to_cuda_chw, but pre-decoded
+    tensor inputs (e.g. nvJPEG / cached CUDA tensors) keep their native
+    channel count. Grayscale (1ch) or RGBA (4ch) images then break the
+    downstream torch.cat over a batch of images, which requires a
+    consistent channel dimension. Normalize every tensor to 3 channels.
+
+    Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
+    input does not trip a device mismatch against the CUDA image_mean /
+    image_std_inv normalization constants downstream. No-op if already on
+    the device.
+    """
+    image = image.cuda()
+    if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
+        image = image.unsqueeze(0)
+    c = image.shape[0]
+    if c == 3:
+        return image
+    if c == 1:
+        return image.repeat(3, 1, 1)
+    # RGBA or other multi-channel layouts: keep the first 3 channels.
+    return image[:3]
+
+
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
@@ -92,6 +118,8 @@ def _process_single_image(
     """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
     if isinstance(image, Image.Image):
         image = _pil_to_cuda_chw(image)
+    else:
+        image = _ensure_chw_rgb(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     pad_h, pad_w = config["pad_height"], config["pad_width"]
@@ -158,6 +186,8 @@ def _gpu_preprocess_images(
             for _, image, _ in group:
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
+                else:
+                    image = _ensure_chw_rgb(image)
                 tensors.append(image.unsqueeze(0).float())
 
             resized = []
@@ -233,7 +263,7 @@ class KimiGPUProcessorWrapper:
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
-        # - image_processor: checked via isinstance(..., BaseImageProcessorFast)
+        # - image_processor: checked via isinstance(..., BaseImageProcessor)
         # - tokenizer: used for tokenization
         # - media_processor: used by CPU fallback path
         self.image_processor = hf_processor.image_processor
@@ -312,7 +342,11 @@ class KimiGPUProcessorWrapper:
             # Convert to medias format for Kimi's HF processor
             kwargs["medias"] = [{"type": "image", "image": img} for img in images]
 
-        return self._hf_processor(text=[input_text], **kwargs)
+        out = self._hf_processor(text=[input_text], **kwargs)
+        grid_thws = out.pop("grid_thws", None)
+        if grid_thws is not None:
+            out["image_grid_thw"] = grid_thws
+        return out
 
     def _get_gpu_norm_tensors(self, device="cuda"):
         if self._gpu_norm_tensors is None:
@@ -369,7 +403,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

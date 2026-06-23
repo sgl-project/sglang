@@ -27,7 +27,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
@@ -38,8 +37,6 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -71,8 +68,15 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu, round_up
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    is_npu,
+    round_up,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
@@ -86,6 +90,9 @@ if _is_npu:
 
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -101,8 +108,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -169,6 +176,7 @@ class Qwen3_VisionBlock(nn.Module):
         dim: int,
         num_heads: int,
         intermediate_dim: int,
+        head_size: Optional[int] = None,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -185,7 +193,8 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            head_size=head_size,
+            projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -240,6 +249,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        padded_context_dim: int,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
@@ -249,6 +259,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
 
@@ -257,11 +268,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
-            self.hidden_size,
+            self.padded_context_dim,
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
@@ -270,7 +281,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
-            self.hidden_size,
+            self.padded_context_dim,
             dim,
             bias=True,
             quant_config=quant_config,
@@ -335,8 +346,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = self.hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
             rotary_dim=head_dim // 2,
@@ -363,6 +382,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
                     intermediate_dim=vision_config.intermediate_size,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -376,6 +396,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
+            padded_context_dim=self.num_heads * head_dim,
             norm_layer=norm_layer,
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
@@ -388,6 +409,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
+                    padded_context_dim=self.num_heads * head_dim,
                     spatial_merge_size=self.spatial_merge_size,
                     use_postshuffle_norm=True,
                     norm_layer=norm_layer,
@@ -399,9 +421,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
@@ -737,7 +757,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
@@ -919,7 +939,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         torch.Tensor,
     ]:
         # patchify
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
@@ -1108,7 +1128,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 prefix=add_prefix("model.language_model", prefix),
             )
             if self.pp_group.is_last_rank:
-                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                if (
+                    self.pp_group.world_size == 1
+                    and self.config.tie_word_embeddings
+                    and not (_is_cpu and _is_cpu_amx_available)
+                ):
                     self.lm_head = self.model.embed_tokens
                 else:
                     self.lm_head = ParallelLMHead(
