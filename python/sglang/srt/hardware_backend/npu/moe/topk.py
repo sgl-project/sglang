@@ -23,10 +23,13 @@ def _mask_padded_tokens(
     indices = torch.arange(topk_ids.shape[0], device=topk_ids.device)
     if isinstance(num_token_non_padded, torch.Tensor):
         num_token_non_padded = num_token_non_padded.to(device=topk_ids.device)
-    padding_mask = indices >= num_token_non_padded
-    topk_ids[padding_mask, :] = -1
-    topk_weights[padding_mask, :] = 0.0
-
+    # NOTE: boolean-index assignment (topk_ids[mask, :] = v) lowers to
+    # aclnnNonzeroV2 on Ascend, which has a data-dependent output shape and
+    # cannot be captured by NPU graph capture (broke decode cuda-graph init).
+    # Use in-place masked_fill_ instead: same semantics, graph-safe (elementwise).
+    padding_mask = (indices >= num_token_non_padded).unsqueeze(-1)
+    topk_ids.masked_fill_(padding_mask, -1)
+    topk_weights.masked_fill_(padding_mask, 0.0)
 
 def _biased_sigmoid_topk_torch_npu(
     router_logits: torch.Tensor,
