@@ -33,7 +33,7 @@ def npu_swiglu_oai(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.numel() > 0
     ):
-        from sglang_npu_port_main.sglang.python.sglang.srt.layers.triton_ops.npu_swiglu_oai_triton import (
+        from sglang.srt.layers.triton_ops.npu_swiglu_oai_triton import (
             npu_swiglu_oai_fused,
         )
 
