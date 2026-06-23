@@ -740,7 +740,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # profiling accounts for them. The buffers are reused by
                 # any captured graph (decode today; widen here so any
                 # future prefill capture path also picks them up).
-                self._init_lora_cuda_graph_moe_buffers()
+                ModelRunner._init_lora_cuda_graph_moe_buffers(
+                    server_args=self.server_args,
+                    model=self.model,
+                    lora_manager=self.lora_manager,
+                    dtype=self.dtype,
+                )
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
@@ -1693,7 +1698,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
 
-    def _init_lora_cuda_graph_moe_buffers(self):
+    @staticmethod
+    def _init_lora_cuda_graph_moe_buffers(
+        *,
+        server_args: ServerArgs,
+        model: torch.nn.Module,
+        lora_manager: LoRAManager,
+        dtype: torch.dtype,
+    ):
         """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
 
         Must be called before init_memory_pool() so that memory profiling
@@ -1708,12 +1720,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-        max_bs = self.server_args.cuda_graph_config.decode.max_bs
-        max_loras = self.server_args.max_loras_per_batch
-        for module in self.model.modules():
+        max_bs = server_args.cuda_graph_config.decode.max_bs
+        max_loras = server_args.max_loras_per_batch
+        for module in model.modules():
             if isinstance(module, FusedMoEWithLoRA):
-                self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
+                lora_manager.init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, dtype, module
                 )
                 logger.info(
                     f"Pre-allocated shared MoE LoRA CUDA graph buffers "
