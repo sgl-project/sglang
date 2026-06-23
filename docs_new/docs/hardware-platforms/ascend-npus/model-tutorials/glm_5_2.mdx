@@ -64,6 +64,11 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
+<Note>
+The GLM-5.2 images below use daily build tags because 0Day support was released before the related code was merged into
+the main branch. These tags will be switched to stable release images after the support lands in a stable release.
+</Note>
+
 <Tabs>
   <Tab title="Atlas 800I A3">
 
@@ -156,6 +161,11 @@ Quantized model `GLM-5.2-w8a8` can be deployed on one Atlas 800I A3 node or one 
 Run the following script to execute online inference.
 
 ```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -215,6 +225,11 @@ python3 -m sglang.launch_server \
 Run the following script to execute online inference.
 
 ```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
 export SGLANG_SET_CPU_AFFINITY=1
 
 unset https_proxy
@@ -273,6 +288,15 @@ Quantized model `GLM-5.2-w8a8` can be deployed on two Atlas 800I A3 nodes.
 Modify the IP addresses of the two nodes, then run the same script on both nodes.
 
 ```shell
+# ============================================================
+# Before running, update the following variables:
+#   IPS: IP addresses of each node in the cluster
+#   IP_MASTER: rank 0 node IP address with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -350,6 +374,16 @@ PD disaggregation splits the prefill and decode stages onto separate nodes, redu
 throughput for high-concurrency scenarios.
 
 ```shell
+# ============================================================
+# Before running, update the following variables:
+#   ASCEND_MF_STORE_URL: prefill master IP address with port
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -457,6 +491,12 @@ exit 1
 Launch the router after the prefill and decode services are ready.
 
 ```shell
+# ============================================================
+# Before running, replace the following placeholders:
+#   {P_MASTER_IP}: prefill master IP address
+#   {D_MASTER_IP}: decode master IP address
+# ============================================================
+
 python3 -m sglang_router.launch_router \
 --pd-disaggregation \
 --policy round_robin \
