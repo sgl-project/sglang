@@ -5,9 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-if TYPE_CHECKING:
-    pass
-
 __all__ = ["BaseLinearScheme", "BaseMoEScheme"]
 
 
