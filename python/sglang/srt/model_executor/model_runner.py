@@ -264,21 +264,9 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.tp_rank = ps.tp_rank
-        self.tp_size = ps.tp_size
         self.dcp_size = server_args.dcp_size
         self.dcp_rank = ps.tp_rank % self.dcp_size
         self.ps = ps
-        self.moe_ep_rank = ps.moe_ep_rank
-        self.moe_ep_size = ps.moe_ep_size
-        self.dp_rank = ps.dp_rank
-        self.attn_dp_size = ps.attn_dp_size
-        self.pp_rank = ps.pp_rank
-        self.pp_size = ps.pp_size
-        self.attn_cp_rank = ps.attn_cp_rank
-        self.attn_cp_size = ps.attn_cp_size
-        self.moe_dp_rank = ps.moe_dp_rank
-        self.moe_dp_size = ps.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -395,7 +383,7 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."
@@ -409,7 +397,7 @@ class ModelRunner:
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             device=self.device,
             gpu_id=self.gpu_id,
             model_config=self.model_config,
@@ -432,8 +420,8 @@ class ModelRunner:
 
     def init_weight_exporter(self):
         self.weight_exporter = WeightExporter(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
             gpu_id=self.gpu_id,
             get_model_path=lambda: self.model_config.model_path,
             get_model=lambda: self.model,
@@ -443,7 +431,7 @@ class ModelRunner:
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             server_args=self.server_args,
             get_model=lambda: self.model,
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -492,8 +480,8 @@ class ModelRunner:
             from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
 
             init_ms_distributed(
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=self.ps.tp_size * self.ps.pp_size,
+                rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 local_rank=self.gpu_id,
                 server_args=self.server_args,
                 port=self.dist_port,
@@ -514,10 +502,10 @@ class ModelRunner:
                 compute_initial_expert_location_metadata(
                     server_args=server_args,
                     model_config=self.model_config,
-                    moe_ep_rank=self.moe_ep_rank,
+                    moe_ep_rank=self.ps.moe_ep_rank,
                 )
             )
-            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
+            if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     "Initial expert_location_metadata:\n%s",
                     format_expert_location_layout(
@@ -529,7 +517,7 @@ class ModelRunner:
                 ExpertDistributionRecorder.init_new(
                     server_args,
                     get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
+                    rank=self.ps.tp_rank,
                 )
             )
 
@@ -557,8 +545,8 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             server_args=self.server_args,
-            moe_ep_size=self.moe_ep_size,
-            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_ep_rank=self.ps.moe_ep_rank,
         )
 
         # Must run before backend/graph init so no draft graph records a
@@ -600,7 +588,7 @@ class ModelRunner:
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
+        if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
         # Init lora
@@ -618,8 +606,8 @@ class ModelRunner:
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
-            pp_size=self.pp_size,
-            pp_rank=self.pp_rank,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
@@ -864,9 +852,9 @@ class ModelRunner:
     def check_quantized_moe_compatibility(self):
         check_quantized_moe_compatibility(
             model_config=self.model_config,
-            tp_size=self.tp_size,
-            moe_ep_size=self.moe_ep_size,
-            moe_dp_size=self.moe_dp_size,
+            tp_size=self.ps.tp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_dp_size=self.ps.moe_dp_size,
         )
 
     def init_torch_distributed(self):
@@ -908,18 +896,18 @@ class ModelRunner:
 
         self.load_config = build_load_config(
             server_args=self.server_args,
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
-                self.model_config, self.load_config, self.tp_size
+                self.model_config, self.load_config, self.ps.tp_size
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args, tp_rank=self.tp_rank
+            server_args=self.server_args, tp_rank=self.ps.tp_rank
         )
 
         loaded = load_model_with_memory_saver(
@@ -981,9 +969,9 @@ class ModelRunner:
             server_args=self.server_args,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
+            tp_size=self.ps.tp_size,
+            tp_rank=self.ps.tp_rank,
+            pp_rank=self.ps.pp_rank,
         )
 
         if dumper.may_enable:
@@ -1000,7 +988,7 @@ class ModelRunner:
 
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
         )
 
     def maybe_recover_ep_ranks(self):
@@ -1053,8 +1041,8 @@ class ModelRunner:
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=self.server_args.lora_backend,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            tp_size=self.ps.tp_size,
+            tp_rank=self.ps.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
@@ -1401,12 +1389,12 @@ class ModelRunner:
 
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
-            tp_rank=self.tp_rank, tp_size=self.tp_size
+            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
         )
 
     def apply_torch_tp(self):
         model_parallel.apply_torch_tp(
-            model=self.model, device=self.device, tp_size=self.tp_size
+            model=self.model, device=self.device, tp_size=self.ps.tp_size
         )
 
     def update_decode_attn_backend(self, stream_idx: int):
@@ -1523,7 +1511,7 @@ class ModelRunner:
         if self.msprobe_debugger is not None:
             rank_id = (
                 self.gpu_id
-                if self.attn_dp_size is not None and self.attn_dp_size > 1
+                if self.ps.attn_dp_size is not None and self.ps.attn_dp_size > 1
                 else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)

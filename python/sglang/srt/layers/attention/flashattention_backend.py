@@ -262,7 +262,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
@@ -342,10 +342,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
+            // model_runner.ps.tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            model_runner.ps.tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
