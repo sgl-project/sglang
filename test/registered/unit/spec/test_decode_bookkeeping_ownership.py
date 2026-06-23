@@ -55,16 +55,11 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
-    # spec v2: pre-claim in the scheduler-driven mixin, settle in resolve
+    # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
-    (*_MIXIN, "kv_committed_len"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,
-    # 3rd resolve mutation: DFLASH settles its full commit_lens here (no
-    # pre-claim in prepare_for_decode, unlike the EAGLE mixin).
-    # Spec grammar truncation commits only the retained (pre-termination) length
-    # here, so the dropped suffix is never over-committed (no later rollback).
-    (*_RESOLVE, "kv_committed_len"): 3,
+    (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     (
         "speculative/dflash_info_v2.py",
@@ -92,6 +87,8 @@ _OWNER_SITES = {
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
+    # Inherit the authoritative finished length (not the lagging req clock).
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
 }
 
 

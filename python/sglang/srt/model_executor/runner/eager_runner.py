@@ -190,6 +190,11 @@ class EagerRunner(BaseRunner):
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (rows, hidden_size), dtype=mr.dtype, device=mr.device
                 )
+            pp_proxy_topk_size = mr.get_pp_proxy_topk_size()
+            if pp_proxy_topk_size is not None:
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (rows, pp_proxy_topk_size), dtype=torch.int32, device=mr.device
+                )
 
         adapter = SimpleNamespace(
             input_ids=_slot("input_ids"),
