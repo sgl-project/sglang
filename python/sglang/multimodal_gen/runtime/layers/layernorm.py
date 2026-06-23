@@ -40,7 +40,7 @@ if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
-    import attentions # noqa: F401
+    import attentions  # noqa: F401
     import torch_npu
     from sgl_kernel_npu.norm.rmsnorm_without_weight import (
         fused_rmsnorm_without_weight,
@@ -485,7 +485,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             weight=weight,
             bias=bias,
             eps=self.eps,
-            impl_mode = 0
+            impl_mode=0
         )
         return output.to(origin_dtype)
 
