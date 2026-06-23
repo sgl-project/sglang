@@ -368,65 +368,11 @@ class LightVAEEncoder(nn.Module):
             persistent=False,
         )
 
-        # Native FP8 lazy state (no work at init — model may be on CPU).
-        self._fp8_state_path = fp8_state_path
-        self._fp8_required = bool(fp8_required)
-        self._fp8_enabled = fp8_state_path is not None
-        self._native_ext: Any = None
-        self._native_handle: Any = None
-        self._native_device: torch.device | None = None
+        # FP8 state path kept for backward compat; native CUDA removed.
+        # Always uses PyTorch eager path (encode is ~5% of total time).
 
     def enable_tiling(self, *args, **kwargs) -> None:  # encode/decode-stage no-op
         return None
-
-    # ------------------------------------------------------------------ #
-    # Native FP8 encode backend (sm_120 / CUDA only)                     #
-    # ------------------------------------------------------------------ #
-    def _get_native_handle(self, device: torch.device) -> Any:
-        """Lazy-build the native FP8 encoder handle, cached per device.
-
-        Mirrors FlashDreams ``_get_native_encoder``. Returns the handle or
-        ``None`` when the native ext / state is unavailable. After a failed
-        attempt the encoder permanently falls back to the PyTorch path (unless
-        ``fp8_required`` is set, in which case the error propagates).
-        """
-        if not self._fp8_enabled:
-            return None
-        if self._native_handle is not None and self._native_device == device:
-            return self._native_handle
-        try:
-            from sglang.multimodal_gen.native import load_extension
-            from sglang.multimodal_gen.native.singleview_loader import (
-                load_python_module,
-            )
-
-            ext = self._native_ext or load_extension()
-            if ext is None:
-                raise RuntimeError("native ext unavailable (sm_120 build required)")
-            status = ext.omnidreams_vae_backend_status("vae_encoder", "fp8")
-            if not bool(status.get("available", False)):
-                raise RuntimeError(
-                    f"native vae_encoder fp8 unavailable: {status.get('reason')}"
-                )
-            vae_weights = load_python_module("vae_weights")
-            fp8_state = vae_weights.load_lightvae_fp8_state(self._fp8_state_path)
-            staged = vae_weights.build_lightvae_encoder_fp8_staged_state(
-                self, fp8_state, ext
-            )
-            handle = ext.omnidreams_vae_create_wan_encoder_fp8(staged)
-            self._native_ext = ext
-            self._native_handle = handle
-            self._native_device = device
-            return handle
-        except Exception as e:  # noqa: BLE001
-            if self._fp8_required:
-                raise
-            logger.warning(
-                "OmniDreams LightVAE FP8 native unavailable (%s); "
-                "using PyTorch encode (will retry on next call).",
-                e,
-            )
-            return None
 
     def initialize_ar_encode_cache(self) -> WanVAEEncCache:
         """Allocate a fresh per-rollout VAE encode cache.
@@ -441,56 +387,6 @@ class LightVAEEncoder(nn.Module):
         """
         return WanVAEEncCache()
 
-    def _encode_native(
-        self, handle: Any, x: torch.Tensor, reset: bool = True
-    ) -> torch.Tensor:
-        """Run a streaming FP8 encode pass → de-normalized raw mu.
-
-        The native kernel returns **normalized** latents
-        (``lightvae_fp8_extract_mu_normalize_tin16``), but the public
-        ``encode()`` contract is **raw** mu (the stage
-        ``_vae_encode_normalized`` re-applies ``(z - mean) / std``). We
-        therefore de-normalize here so the contract is identical for both
-        backends.
-
-        ``reset`` drops the native streaming tail caches (call it on the
-        first chunk of a rollout; pass ``False`` to continue an in-progress
-        per-chunk stream so causal context flows across chunks).
-        """
-        ext = self._native_ext
-        if reset:
-            ext.omnidreams_vae_reset_wan_encoder_fp8(handle)  # fresh stream
-        xf = x.to(torch.float16).contiguous()  # [1,3,T,H,W] cuda fp16
-        outs: list[torch.Tensor] = []
-        if reset:
-            # First chunk: 1-frame causal seed, then 4-frame body chunks.
-            outs.append(ext.omnidreams_vae_encode_wan_fp8(handle, xf[:, :, :1], True))
-            xf = xf[:, :, 1:]
-        # else: continuation chunk — no re-seed; T must be a multiple of the
-        # 4-frame window so the causal left-context from the previous chunk
-        # flows in and no short tail reaches the deepest downsample.
-        t = xf.shape[2]
-        body = (t // TEMPORAL_WINDOW) * TEMPORAL_WINDOW
-        for i in range(0, body, TEMPORAL_WINDOW):
-            outs.append(
-                ext.omnidreams_vae_encode_wan_fp8(
-                    handle, xf[:, :, i : i + TEMPORAL_WINDOW], True
-                )
-            )
-        if body < t:
-            outs.append(
-                ext.omnidreams_vae_encode_wan_fp8(handle, xf[:, :, body:], True)
-            )
-        z_norm = (
-            outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
-        )  # [1,16,Tl,h,w] normalized
-        # de-normalize → raw mu
-        mean = self.mean.to(z_norm.device, z_norm.dtype).view(1, -1, 1, 1, 1)
-        std = (1.0 / self.inv_std).to(z_norm.device, z_norm.dtype).view(
-            1, -1, 1, 1, 1
-        )
-        return z_norm * std + mean
-
     @torch.inference_mode()
     def encode(
         self,
@@ -500,12 +396,6 @@ class LightVAEEncoder(nn.Module):
     ) -> _LatentDist:
         """``[B, 3, T, H, W]`` pixels -> raw latent mean ``[B, z_dim, Tl, H/8, W/8]``.
 
-        Routes through the native FP8 encoder when the calibrated state is
-        loaded, the native ext is built, and the input is on CUDA with
-        batch=1; otherwise falls back to the PyTorch streaming path. On a
-        native failure with ``fp8_required=False``, the encoder permanently
-        falls back to PyTorch (will retry on next call).
-
         For autoregressive per-chunk HD-map encoding, pass a *persistent*
         ``cache`` (from :meth:`initialize_ar_encode_cache`) and set
         ``is_first_chunk=True`` only on chunk 0. The causal conv left-context
@@ -514,25 +404,6 @@ class LightVAEEncoder(nn.Module):
         triggers on later chunks' short tails. When ``cache`` is ``None`` a
         fresh one-shot cache is allocated (single-call path).
         """
-        # ---- native FP8 path ----
-        if self._fp8_enabled and x.is_cuda and x.shape[0] == 1:
-            handle = self._get_native_handle(x.device)
-            if handle is not None:
-                try:
-                    return _LatentDist(
-                        self._encode_native(handle, x, reset=is_first_chunk)
-                    )
-                except Exception as e:  # noqa: BLE001
-                    if self._fp8_required:
-                        raise
-                    logger.warning(
-                        "OmniDreams LightVAE FP8 native encode failed (%s); "
-                        "falling back to PyTorch.",
-                        e,
-                    )
-                    # fall through to PyTorch path (will retry FP8 on next call)
-
-        # ---- existing PyTorch streaming path ----
         x = x.to(self.conv1.weight.dtype)
         if cache is None:
             cache = WanVAEEncCache()

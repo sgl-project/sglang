@@ -31,7 +31,7 @@ from typing import Literal, Protocol, get_args
 
 from loguru import logger
 
-NativeAccelerationMode = Literal["auto", "disabled", "required"]
+NativeAccelerationMode = Literal["auto", "disabled", "required", "weight_only_fp8"]
 NATIVE_EXTENSION_SYNC_COMMAND = (
     "uv run --package flashdreams-omnidreams python "
     "integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync"

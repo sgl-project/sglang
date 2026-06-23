@@ -1024,7 +1024,62 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         if envs.SGLANG_OMNIDREAMS_FP8_DIT:
             mode = "required"  # env forces required mode
 
-        if mode != "disabled":
+        if mode == "weight_only_fp8":
+            # ---- Weight-only FP8: dequantize FP8→bf16, use eager PyTorch path ----
+            if cuda_graph_runner is not None:
+                logger.warning(
+                    "OmniDreams: weight_only_fp8 mode disables CUDA graph "
+                    "(uses standard PyTorch eager forward)."
+                )
+                cuda_graph_runner = None
+            # Resolve fp8_prepared_path
+            model_path = server_args.model_path
+            fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
+            if fp8_prepared_path is None:
+                if os.path.isfile(model_path):
+                    ckpt_dir = os.path.dirname(model_path)
+                else:
+                    ckpt_dir = model_path
+                fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
+            # Cache: skip reload if weights already dequantized on a prior call.
+            already_loaded = getattr(self.transformer, "_weight_only_fp8_applied", False)
+            if already_loaded:
+                logger.debug("OmniDreams: weight_only_fp8 weights already loaded, skipping.")
+            elif fp8_prepared_path and os.path.exists(fp8_prepared_path):
+                from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+                    dequantize_fp8_weights_to_bf16,
+                )
+                payload = torch.load(
+                    fp8_prepared_path, map_location="cpu", weights_only=True
+                )
+                bf16_weights = dequantize_fp8_weights_to_bf16(payload["weights"])
+                del payload  # free the 5.7GB FP8 dict immediately
+                # Filter to only keys the model actually has.
+                model_keys = set(self.transformer.state_dict().keys())
+                matched = {k: v for k, v in bf16_weights.items() if k in model_keys}
+                del bf16_weights
+                device = next(self.transformer.parameters()).device
+                self.transformer.load_state_dict(
+                    {k: v.to(device=device) for k, v in matched.items()},
+                    strict=False,
+                )
+                n = len(matched)
+                del matched
+                self.transformer._weight_only_fp8_applied = True
+                logger.info(
+                    "OmniDreams: loaded dequantized FP8 weights into DiT "
+                    "(weight_only_fp8 mode, %d keys). Caching for reuse.",
+                    n,
+                )
+            else:
+                logger.warning(
+                    "OmniDreams: weight_only_fp8 mode but FP8 prepared weights "
+                    "not found at %s; using raw bf16 checkpoint.",
+                    fp8_prepared_path,
+                )
+            fp8_dit = None  # fall through to eager PyTorch path below
+
+        elif mode != "disabled":
             if cuda_graph_runner is not None:
                 logger.warning(
                     "OmniDreams: native_dit_acceleration overrides enable_cuda_graph "

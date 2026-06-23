@@ -81,6 +81,70 @@ def prepare_fp8_dit_weights(
 
 
 # --------------------------------------------------------------------------- #
+# FP8 → bf16 dequantization (weight-only FP8, Ideogram 4 style)               #
+# --------------------------------------------------------------------------- #
+_WEIGHT_SUFFIX = ".weight"
+_SCALE_SUFFIX = ".weight_scale"
+
+
+def dequantize_fp8_weights_to_bf16(
+    fp8_weights: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Dequantize FP8 quantized weights back to bf16 for standard PyTorch inference.
+
+    The FP8 artifact stores each quantized linear weight as:
+      - ``K.weight``: raw E4M3 bytes (torch.uint8, [out, in])
+      - ``K.weight_scale``: per-output-channel scale (float16, [out])
+
+    This function reverses the quantization:
+      weight_bf16 = weight.view(float8_e4m3fn).to(float32) * scale.unsqueeze(1)
+
+    Returns a dict mapping original ``.weight`` keys to dequantized bf16 tensors,
+    suitable for ``model.load_state_dict(strict=False)``.
+    """
+    result: dict[str, torch.Tensor] = {}
+    dequant_count = 0
+
+    for key, value in fp8_weights.items():
+        # Already dequantized or not a weight — pass through
+        if key.endswith(_SCALE_SUFFIX):
+            continue  # scales consumed by their weight key
+        if key.endswith(".weight") and value.dtype == torch.uint8:
+            # FP8 raw E4M3 bytes — dequantize
+            scale_key = key + "_scale"
+            if scale_key in fp8_weights:
+                scale = fp8_weights[scale_key]
+                weight_f32 = value.view(torch.float8_e4m3fn).to(torch.float32)
+                dequant = (weight_f32 * scale.to(torch.float32).unsqueeze(1)).to(
+                    torch.bfloat16
+                )
+                result[key] = dequant.contiguous()
+                dequant_count += 1
+            else:
+                logger.warning("FP8 weight %s has no scale %s; skipping", key, scale_key)
+        elif key.endswith(".weight_prepared"):
+            # bf16 transposed prepared weight — skip (model uses .weight layout)
+            continue
+        elif key.endswith("_fp8_prepared"):
+            # FP8 prepared alias — skip (base .weight key covers it)
+            continue
+        elif key.endswith("_fp8_prepared_scale"):
+            # FP8 prepared alias scale — skip
+            continue
+        else:
+            # Non-FP8 key (biases, norms, embeddings, bf16 weights) — pass through
+            if key not in result:
+                result[key] = value
+
+    logger.info(
+        "Dequantized %d FP8 weight pairs to bf16 (%d total keys in result)",
+        dequant_count,
+        len(result),
+    )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Adapter: present SGLang's OmniDreamsDiT to the vendored executor            #
 # --------------------------------------------------------------------------- #
 class _NetCfg:
