@@ -3,6 +3,7 @@ import os
 from typing import Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
 
 logger = logging.getLogger(__name__)
 
@@ -171,45 +172,60 @@ class NixlBackendSelection:
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
-    def __init__(self, base_dir: str, use_direct_io: bool = True):
+    def __init__(self, base_dir: "list[str] | str", use_direct_io: bool = True):
         """
         Initialize file manager.
         Args:
-            base_dir: Base directory for storing tensor files
+            base_dir: Base directory or ordered base directories for tensor files.
             use_direct_io: If True, open files with O_DIRECT (bypasses OS page cache).
                 Falls back to buffered I/O with a warning when O_DIRECT is unavailable.
         """
-        self.base_dir = base_dir
+        if isinstance(base_dir, str):
+            self.base_dirs = [base_dir] if base_dir else []
+        else:
+            self.base_dirs = [d for d in base_dir if d]
         self.use_direct_io = use_direct_io
-        if base_dir == "":
+        self._created_bucket_dirs: set[str] = set()
+        if not self.base_dirs:
             logger.debug(
                 f"Initialized file manager without a base directory. Direct I/O: {use_direct_io}"
             )
         else:
-            os.makedirs(base_dir, exist_ok=True)
+            for base in self.base_dirs:
+                os.makedirs(base, exist_ok=True)
             logger.debug(
-                f"Initialized file manager with base directory: {base_dir}. Direct I/O: {use_direct_io}"
+                f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
 
     def clear(self) -> None:
-        """Clear all files in the base directory."""
-        if self.base_dir == "":
-            logger.warning("Base directory is empty, skipping clear operation")
+        """Clear all files below every configured base directory."""
+        if not self.base_dirs:
+            logger.warning("Base directories are empty, skipping clear operation")
             return
 
-        try:
-            for root, dirs, files in os.walk(self.base_dir):
-                for file in files:
-                    os.remove(os.path.join(root, file))
-            logger.debug(f"Cleared all files in base directory: {self.base_dir}")
-        except Exception as e:
-            logger.error(
-                f"Failed to clear files in base directory {self.base_dir}: {e}"
-            )
+        for base in self.base_dirs:
+            try:
+                for root, _dirs, files in os.walk(base):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        try:
+                            os.remove(file_path)
+                        except OSError as e:
+                            logger.warning(f"Failed to remove file {file_path}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to clear base directory {base}: {e}")
+        logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
+
+    def iter_all_base_dirs(self) -> list[str]:
+        """Return base directories that may contain NIXL FILE cache entries."""
+        return list(self.base_dirs)
 
     def get_file_path(self, key: str) -> str:
         """Get full file path for a given key."""
-        return os.path.join(self.base_dir, key)
+        if not self.base_dirs:
+            return key
+        disk_idx, bucket = route_key(key, len(self.base_dirs))
+        return os.path.join(self.base_dirs[disk_idx], bucket, key)
 
     def open_file(self, file_path: str, create: bool = False) -> Optional[int]:
         """Open a file and return its file descriptor.
@@ -230,6 +246,11 @@ class NixlFileManager:
                     "this system. Falling back to buffered I/O."
                 )
         try:
+            if create:
+                parent = os.path.dirname(file_path)
+                if parent and parent not in self._created_bucket_dirs:
+                    os.makedirs(parent, exist_ok=True)
+                    self._created_bucket_dirs.add(parent)
             return os.open(file_path, flags, 0o644)
         except Exception as e:
             logger.error(f"Failed to open file {file_path}: {e}")

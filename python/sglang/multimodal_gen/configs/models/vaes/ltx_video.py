@@ -62,3 +62,7 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
 @dataclass
 class LTXVideoVAEConfig(VAEConfig):
     arch_config: LTXVideoVAEArchConfig = field(default_factory=LTXVideoVAEArchConfig)
+    auto_parallel_decode_min_latent_elements_per_rank: int = 1024
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return True

@@ -12,7 +12,21 @@ from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbedding
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelConv3d,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    split_height_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 @lru_cache(maxsize=128)
@@ -216,6 +230,29 @@ class LTX2VideoCausalConv3d(nn.Module):
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
+
+
+def _make_spatial_parallel_conv3d(conv: nn.Conv3d) -> SpatialParallelConv3d:
+    spatial_conv = SpatialParallelConv3d(
+        in_channels=conv.in_channels,
+        out_channels=conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+    )
+    spatial_conv.weight = conv.weight
+    spatial_conv.bias = conv.bias
+    return spatial_conv
+
+
+def _enable_ltx_decoder_spatial_parallel(decoder: nn.Module) -> None:
+    for module in decoder.modules():
+        if isinstance(module, LTX2VideoCausalConv3d) and type(module.conv) is nn.Conv3d:
+            module.conv = _make_spatial_parallel_conv3d(module.conv)
 
 
 # Like LTXVideoResnetBlock3d, but uses new causal Conv3d, normal Conv3d for the conv_shortcut, and the spatial padding
@@ -1683,6 +1720,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         latents_std = torch.ones((latent_channels,), requires_grad=False)
         self.register_buffer("latents_mean", latents_mean, persistent=True)
         self.register_buffer("latents_std", latents_std, persistent=True)
+        self._spatial_parallel_decode_enabled = False
+        if can_install_spatial_shard_parallel_decode(self.config):
+            _enable_ltx_decoder_spatial_parallel(self.decoder)
+            self._spatial_parallel_decode_enabled = True
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
         # to perform decoding of a single video latent at a time.
@@ -1713,6 +1754,12 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         self.tile_sample_stride_height = 448
         self.tile_sample_stride_width = 448
         self.tile_sample_stride_num_frames = 8
+
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def enable_tiling(
         self,
@@ -1829,7 +1876,24 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         ):
             return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
-        dec = self.decoder(z, temb, causal=causal)
+        if self._should_use_spatial_parallel_decode(z):
+            expected_height = (
+                z.shape[-2] * self.config.arch_config.spatial_compression_ratio
+            )
+            z, expected_height = split_height_for_parallel_decode(
+                z,
+                expected_height=expected_height,
+                world_size=get_decode_parallel_world_size(),
+                rank=get_decode_parallel_rank(),
+            )
+            dec = gather_and_trim_height(
+                self.decoder(z, temb, causal=causal), expected_height
+            )
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z, temb, causal=causal)
+        else:
+            dec = self.decoder(z, temb, causal=causal)
 
         if not return_dict:
             return (dec,)

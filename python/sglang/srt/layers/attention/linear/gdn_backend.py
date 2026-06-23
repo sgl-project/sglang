@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -26,7 +26,7 @@ if not is_cpu():
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
-if is_cuda():
+if is_cuda() or is_hip():
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
@@ -269,6 +269,8 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = (
@@ -451,7 +453,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if is_cuda() and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
