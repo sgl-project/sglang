@@ -513,7 +513,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            self._init_lplb_solvers()
+            init_lplb_solvers(model_config=self.model_config)
 
         # Expert parallelism
         self.eplb_manager = (
@@ -1051,14 +1051,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tp_rank=self.tp_rank,
         )
 
-    def _init_lplb_solvers(self):
+    @staticmethod
+    def init_lplb_solvers(*, model_config: ModelConfig) -> None:
         """Initialize per-layer LPLB solvers from current expert location metadata."""
         from sglang.srt.distributed import get_moe_ep_group
 
         # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
         # don't participate in the EP all-reduce (would deadlock under DP-
         # attention). Failure here happens before any forward pass.
-        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        architectures = getattr(model_config.hf_config, "architectures", None)
         if architectures:
             assert_lplb_supported_model(architectures[0])
 

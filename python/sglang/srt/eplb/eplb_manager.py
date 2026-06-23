@@ -107,7 +107,9 @@ class EPLBManager:
                 expert_backup_client=self._model_runner.expert_backup_client,
                 update_weights_from_disk_callable=self._model_runner.weight_updater.update_weights_from_disk,
                 ep_dispatch_algorithm=self._model_runner.server_args.ep_dispatch_algorithm,
-                init_lplb_solvers_callable=self._model_runner._init_lplb_solvers,
+                init_lplb_solvers_callable=lambda: self._model_runner.init_lplb_solvers(
+                    model_config=self._model_runner.model_config
+                ),
             )
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
