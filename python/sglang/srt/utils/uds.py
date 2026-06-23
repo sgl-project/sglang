@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _UDSResponseShim:
+class _UDSResponseWrapper:
     """Mimic the subset of ``requests.Response`` used by warmup code."""
 
     def __init__(self, status_code: int, body: bytes):
@@ -48,11 +48,7 @@ class _UDSResponseShim:
 
 
 def uvicorn_bind_kwargs(server_args: ServerArgs) -> dict:
-    """Return the bind kwargs for uvicorn.Config / uvicorn.run.
-
-    UDS and host/port are mutually exclusive (enforced in ServerArgs); we
-    only ever return one shape or the other.
-    """
+    """UDS and host/port are mutually exclusive (enforced in ServerArgs)."""
     if server_args.uds:
         return {"uds": server_args.uds}
     return {"host": server_args.host, "port": server_args.port}
@@ -154,7 +150,7 @@ def uds_request(
     headers: dict,
     timeout: float,
     json_data=None,
-) -> _UDSResponseShim:
+) -> _UDSResponseWrapper:
     """Send a single HTTP request over a Unix domain socket.
 
     Speaks plain HTTP/1.1 via stdlib ``http.client``. ``json_data`` is
@@ -179,7 +175,7 @@ def uds_request(
             request_headers.setdefault("Content-Type", "application/json")
         conn.request(method, path, body=body, headers=request_headers)
         resp = conn.getresponse()
-        return _UDSResponseShim(resp.status, resp.read())
+        return _UDSResponseWrapper(resp.status, resp.read())
     finally:
         conn.close()
 
