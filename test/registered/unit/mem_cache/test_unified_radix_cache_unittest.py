@@ -1027,6 +1027,47 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        evicted_len = 4
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.kv_committed_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = evicted_len
+
+        tree.cache_unfinished_req(req)
+
+        first = next(iter(tree.root_node.children.values()))
+        self.assertEqual(len(first.key), evicted_len)
+        self.assertIsNone(first.component_data[ComponentType.SWA].value)
+        live = next(iter(first.children.values()))
+        self.assertEqual(len(live.key), len(tokens) - evicted_len)
+        self.assertIsNotNone(live.component_data[ComponentType.SWA].value)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(m.device_indices), len(tokens))
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
     def test_diagnostics(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(1, 2))
