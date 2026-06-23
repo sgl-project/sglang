@@ -334,6 +334,7 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
 # --- Debug mode for symmetric memory validation ---
 
 _symm_mem_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 _debug_seen_traces: set = set()
 
 
