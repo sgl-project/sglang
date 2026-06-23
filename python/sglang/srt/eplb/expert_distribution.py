@@ -53,8 +53,8 @@ class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
     def map_device_tensors(self, fn):
-        # Only declare device-tensor fields; the caller injects the single
-        # copy+safety primitive. See GenerationBatchResult.copy_to_cpu.
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
         self.eplb_balancedness = fn(self.eplb_balancedness)
 
 

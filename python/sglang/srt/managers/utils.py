@@ -262,26 +262,22 @@ class EmbeddingBatchResult:
         """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
         if isinstance(self.embeddings, torch.Tensor):
             self.copy_done = torch.get_device_module(self.embeddings.device).Event()
-            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+            self.embeddings = _async_d2h(self.embeddings)
         else:
             assert isinstance(self.embeddings, list)
             if len(self.embeddings) == 0:
                 return
 
             self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
-            self.embeddings = [
-                emb.to("cpu", non_blocking=True) for emb in self.embeddings
-            ]
+            self.embeddings = [_async_d2h(emb) for emb in self.embeddings]
 
         if self.pooled_hidden_states is not None:
             if isinstance(self.pooled_hidden_states, list):
                 self.pooled_hidden_states = [
-                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
+                    _async_d2h(t) for t in self.pooled_hidden_states
                 ]
             else:
-                self.pooled_hidden_states = self.pooled_hidden_states.to(
-                    "cpu", non_blocking=True
-                )
+                self.pooled_hidden_states = _async_d2h(self.pooled_hidden_states)
 
         self.copy_done.record()
 

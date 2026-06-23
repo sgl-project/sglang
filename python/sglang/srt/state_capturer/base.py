@@ -88,9 +88,8 @@ class TopkCaptureOutput:
     host_cache: BaseHostCache
 
     def map_device_tensors(self, fn):
-        # Only declare this struct's device-tensor fields; the caller injects the
-        # single copy+safety primitive (D2H + record_stream). See
-        # GenerationBatchResult.copy_to_cpu.
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
         self.out_cache_loc = fn(self.out_cache_loc)
         self.topk = fn(self.topk)
 
