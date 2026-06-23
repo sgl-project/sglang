@@ -49,7 +49,6 @@ class _ModelWithSibling(nn.Module):
         super().__init__()
         self._topks = nn.ModuleList(topks)
         self.sibling = nn.Linear(2, 2)
-        # A bystander attribute with the same name the pass flips on TopK.
         self.sibling.allow_routed_experts_capture = True
 
 
@@ -62,19 +61,16 @@ class DisableRoutedExpertsCaptureForDraftTest(unittest.TestCase):
         ]
 
     def test_all_default_true_topk_flipped_false(self):
-        """Several default-True TopK -> every one is False after the pass."""
         model = _FakeDraftModel(_make_topk(True), _make_topk(True), _make_topk(True))
         disable_routed_experts_capture_for_draft(model)
         self.assertEqual(self._flags(model), [False, False, False])
 
     def test_dense_model_zero_topk_is_noop(self):
-        """A dense draft (zero TopK) -> no-op, no exception."""
         model = _FakeDraftModel()
         disable_routed_experts_capture_for_draft(model)
         self.assertEqual(self._flags(model), [])
 
     def test_idempotent(self):
-        """Calling twice keeps every TopK False with no error."""
         model = _FakeDraftModel(_make_topk(True), _make_topk(False))
         disable_routed_experts_capture_for_draft(model)
         disable_routed_experts_capture_for_draft(model)
@@ -90,15 +86,10 @@ class DisableRoutedExpertsCaptureForDraftTest(unittest.TestCase):
 
 
 class CapturerGuardTripwireTest(unittest.TestCase):
-    """Source-level tripwire on `ModelRunner.init_routed_experts_capturer()`:
-    a draft worker must early-return before `set_global_experts_capturer(`.
-
-    R3 routed-experts capture is target-only. A draft worker shares the
-    process with its target and is constructed after it, so it must never
-    replace the target's process-global capturer. This pins the guard
-    (`if self.is_draft_worker:` followed by `return`) ahead of the first
-    `set_global_experts_capturer(` call. A full call needs GPU + weights,
-    so this asserts against source text instead of executing it."""
+    """Source-level tripwire: `init_routed_experts_capturer()` must early-return
+    for a draft worker before `set_global_experts_capturer(`. Asserted on source
+    text because a real call needs GPU + weights.
+    """
 
     def _capturer_source(self) -> str:
         from sglang.srt.model_executor import model_runner as mr
@@ -151,21 +142,12 @@ class CapturerGuardTripwireTest(unittest.TestCase):
 
 
 class ForwardFinalizeGateTripwireTest(unittest.TestCase):
-    """Source-level tripwire on `ModelRunner.forward()`: the
-    routed-experts capturer finalization must be gated on
-    `not self.is_draft_worker`.
-
-    R3 routed-experts capture is target-only. A draft worker shares the
-    process and reads the target's process-global capturer, so a draft
-    forward must never call `experts_capturer.on_forward_end(...)` — that
-    would finalize device->host copies into the target's R3 host cache
-    keyed by the draft's batch. This pins `not self.is_draft_worker` into
-    the same `if` that guards `get_global_experts_capturer()`, ahead of the
-    `on_forward_end(` finalization. A full forward needs GPU + weights, so
-    this asserts against source text instead of executing it.
-
-    NOTE: the sibling `indexer_capturer` finalization is intentionally NOT
-    gated this way and is out of scope for this tripwire."""
+    """Source-level tripwire: `forward()` must gate the routed-experts
+    `on_forward_end(` finalization on `not self.is_draft_worker`, in the same
+    `if` as `get_global_experts_capturer()`. Asserted on source text because a
+    real forward needs GPU + weights. The sibling `indexer_capturer` is
+    intentionally not gated this way and is out of scope here.
+    """
 
     def _forward_source(self) -> str:
         from sglang.srt.model_executor import model_runner as mr
@@ -223,10 +205,9 @@ class ForwardFinalizeGateTripwireTest(unittest.TestCase):
             "the finalization for a draft worker",
         )
 
-        # The guard, the getter, and the finalization must be close together
-        # (one contiguous gated block), not the draft guard from some earlier
-        # unrelated statement. The whole routed-experts gate spans well under
-        # 400 chars; a far-away match would mean the gate is not on this `if`.
+        # Guard, getter, and finalization must form one contiguous gated block,
+        # not a match from an earlier unrelated statement. The gate spans well
+        # under 400 chars, so a far-away match means it isn't on this `if`.
         self.assertLess(
             finalize_idx - guard_idx,
             400,
@@ -290,18 +271,11 @@ class InitializeOrderingTripwireTest(unittest.TestCase):
         )
 
     def test_no_backend_or_graph_init_before_disable(self):
-        """The disable pass must run before ANY backend/graph/memory init so
-        no captured graph or backend records the (default-True) capture
-        decision before the draft TopK modules are opted out. Assert the
-        region between `_prepare_moe_topk(` and the disable call contains no
-        backend/graph/memory init call.
-
-        First discovers the actual init-call names present in the
-        initialize() source, then asserts the between-region contains none of
-        them. (`init_memory_pool` appears only later in initialize(), and only
-        inside a comment, so it is legitimately absent from this region — its
-        absence here still proves the disable pass runs ahead of memory-pool
-        init.)"""
+        """The disable pass must run before any backend/graph/memory init, so no
+        captured graph records the default-True capture decision before the draft
+        TopK modules are opted out. Checks that no init-call token appears between
+        `_prepare_moe_topk(` and the disable call.
+        """
         source = self._initialize_source()
         prepare_idx = self._require_index(source, "_prepare_moe_topk(")
         disable_idx = self._require_index(
@@ -336,7 +310,6 @@ class InitializeOrderingTripwireTest(unittest.TestCase):
     def test_disable_helper_imported_in_draft_branch(self):
         source = self._initialize_source()
         self._require_index(source, "disable_routed_experts_capture_for_draft,")
-        # The import must sit ahead of the call site.
         import_idx = self._require_index(
             source, "from sglang.srt.state_capturer.routed_experts import"
         )

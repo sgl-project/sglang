@@ -213,9 +213,8 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
-    # When False, RoutedExpertsCapturer.capture() is skipped at this layer's
-    # MoE topk site. Default True keeps target-model behavior; draft-side MoE
-    # blocks (NextN / MTP / EAGLE-MoE) set this to False at construction.
+    # Draft-side MoE blocks set this False so they never write the target's
+    # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
 
 
@@ -1529,13 +1528,10 @@ def capture_routed_experts_if_allowed(
     layer_id: Optional[int],
     topk_ids: torch.Tensor,
 ) -> None:
-    """Single chokepoint that backends call after producing routed top-k ids.
+    """Single capture site for every backend, gated by the per-config opt-out.
 
-    Reads `topk_config.allow_routed_experts_capture` and the process-global
-    `RoutedExpertsCapturer`; calls `capture(...)` only when both consent.
-    Centralizing the gate means a future capture-aware backend cannot
-    accidentally bypass the per-`TopKConfig` opt-out used by draft MoE
-    layers (NextN / MTP / EAGLE-MoE).
+    Routing all backends through here keeps the draft-side opt-out from being
+    bypassed by an inlined capturer call.
     """
     if not topk_config.allow_routed_experts_capture:
         return

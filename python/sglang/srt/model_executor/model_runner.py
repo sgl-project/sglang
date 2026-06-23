@@ -726,11 +726,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
-        # R3 routed-experts capture is target-only: opt every draft-side MoE
-        # TopK out so a draft can never write the target's capture buffer. Runs
-        # before backend/graph init, regardless of whether capture is enabled.
-        # HashTopK is intentionally untouched -- no topk_config, never calls the
-        # R3 capturer.
+        # Must run before backend/graph init so no draft graph records a
+        # routed-experts capture-write kernel.
         if self.is_draft_worker:
             from sglang.srt.state_capturer.routed_experts import (
                 disable_routed_experts_capture_for_draft,
@@ -987,11 +984,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
-            # R3 routed-experts capture is target-only. A draft worker shares
-            # the process with its target and is constructed after it, so it
-            # must not replace the target's global capturer (which is sized
-            # from the target model_config). In a draft-only process the
-            # global stays None, which is correct for target-only capture.
+            # Target-only: a draft worker shares the process and is built after
+            # its target, so installing one here would replace the target's.
             return
 
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -3673,10 +3667,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        # R3 routed-experts capture is target-only: a draft worker shares the
-        # process and reads the target's global capturer, so it must not run
-        # on_forward_end (that would finalize device->host copies into the
-        # target's R3 host cache keyed by the draft's batch).
+        # Target-only: a draft forward must not finalize on_forward_end, which
+        # would write the target's capture cache keyed by the draft's batch.
         if not self.is_draft_worker and (
             experts_capturer := get_global_experts_capturer()
         ) is not None:

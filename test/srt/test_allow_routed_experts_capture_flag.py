@@ -1,17 +1,11 @@
 """Tests for the per-config `allow_routed_experts_capture` opt-out.
 
-Two layers of coverage:
+Behavior tests patch the global capturer and check the gate decision in
+`capture_routed_experts_if_allowed`. Structural tests assert at source level
+that the CUDA/NPU sites and the BYPASS custom-op all route through the helper,
+so a later refactor can't inline a capture call and skip the opt-out.
 
-1. **Behavior tests** (primary): patch the global capturer and exercise the
-   gate decision through `capture_routed_experts_if_allowed` and the default-True
-   target case. These prove the runtime contract.
-2. **Structural tests** (supplementary tripwires): source-level assertions
-   that the helper is wired into both CUDA and NPU sites and that the
-   BYPASS custom-op signature carries the flag. These guard against a
-   future refactor that inlines a capture call and bypasses the helper.
-
-End-to-end runtime correctness against a real MTP target (Frozen-KV MTP
-+ overlap + cuda-graph + BYPASS variant) is covered by
+End-to-end correctness against a real MTP target lives in
 `test/registered/rl/test_return_routed_experts_mtp.py`.
 """
 
@@ -32,7 +26,7 @@ from sglang.srt.layers.moe.topk import (
 
 
 class _FakeCapturer:
-    """Records each `capture(...)` invocation. Stateless beyond a call log."""
+    """Records each `capture(...)` invocation."""
 
     def __init__(self) -> None:
         self.calls: List[dict] = []
@@ -49,8 +43,8 @@ class _InstallGlobalCapturer:
         self._old = None
 
     def __enter__(self):
-        # Patch the module-level getter so callers see our fake without
-        # touching the real `_global_expert_capturer` singleton state.
+        # Patch the getter, not the singleton, so the real capturer state is
+        # left untouched.
         self._old = topk_module.get_global_experts_capturer
         topk_module.get_global_experts_capturer = lambda: self._new
         return self._new
@@ -65,15 +59,10 @@ class _InstallGlobalCapturer:
 
 
 class CaptureRoutedExpertsIfAllowedBehaviorTest(unittest.TestCase):
-    """AC-1 (CUDA + NPU share this helper) + AC-7 (default True still captures)."""
-
     def _topk_ids(self) -> torch.Tensor:
         return torch.zeros(2, 4, dtype=torch.int32)
 
     def test_default_true_invokes_capture(self):
-        """AC-7: default behavior must still record routed experts on the
-        target path. Proves the dataclass default doesn't accidentally
-        suppress capture."""
         cfg = TopKConfig(top_k=8)
         self.assertTrue(cfg.allow_routed_experts_capture)
         fake = _FakeCapturer()
@@ -85,8 +74,6 @@ class CaptureRoutedExpertsIfAllowedBehaviorTest(unittest.TestCase):
         self.assertEqual(fake.calls[0]["layer_id"], 3)
 
     def test_explicit_false_skips_capture(self):
-        """AC-1: draft-side MoE layers (`allow_routed_experts_capture=False`)
-        must not call into the capturer."""
         cfg = TopKConfig(top_k=8, allow_routed_experts_capture=False)
         fake = _FakeCapturer()
         with _InstallGlobalCapturer(fake):
@@ -96,11 +83,8 @@ class CaptureRoutedExpertsIfAllowedBehaviorTest(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_no_global_capturer_is_safe(self):
-        """When no capturer is installed (e.g. when
-        `--enable-return-routed-experts` is off), the gate must short-
-        circuit cleanly without raising."""
+        """With no capturer installed (capture disabled), the gate must not raise."""
         cfg = TopKConfig(top_k=8)
-        # No global capturer installed.
         old = topk_module.get_global_experts_capturer
         topk_module.get_global_experts_capturer = lambda: None
         try:
@@ -112,8 +96,7 @@ class CaptureRoutedExpertsIfAllowedBehaviorTest(unittest.TestCase):
 
 
 class PostProcessTopkIdsGateTest(unittest.TestCase):
-    """AC-1 (CUDA path): the production capture site
-    `_post_process_topk_ids` must consult the helper."""
+    """The CUDA capture site `_post_process_topk_ids` must consult the helper."""
 
     def _drive(self, allow_flag: bool):
         topk_ids = torch.zeros(2, 4, dtype=torch.int32)
@@ -131,9 +114,8 @@ class PostProcessTopkIdsGateTest(unittest.TestCase):
                     layer_id=0,
                 )
             except Exception:
-                # The gate decision happens before any downstream CUDA
-                # branch could fail on a CPU-only host; ignoring the
-                # downstream failure does not invalidate the gate check.
+                # The gate runs before any downstream CUDA branch that would
+                # fail on a CPU-only host, so the gate check still holds.
                 pass
         return fake
 
@@ -162,8 +144,6 @@ class PostProcessTopkIdsGateTest(unittest.TestCase):
 
 
 class TopKConfigStructuralTest(unittest.TestCase):
-    """AC-1: dataclass + TopK construction propagation."""
-
     def test_dataclass_default_is_true(self):
         cfg = TopKConfig(top_k=8)
         self.assertTrue(cfg.allow_routed_experts_capture)
@@ -222,7 +202,7 @@ class CaptureSiteRoutingStructuralTest(unittest.TestCase):
 
 
 class BypassPathStructuralTest(unittest.TestCase):
-    """AC-2 structural tripwires."""
+    """The BYPASS piecewise-cuda-graph path must thread the flag end to end."""
 
     def test_caller_decomposes_allow_flag(self):
         source = inspect.getsource(fmt_layer)
