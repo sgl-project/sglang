@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -80,10 +81,11 @@ def _deepep_precompile_tp_barrier() -> None:
 def _prepare_low_latency_dispatch_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
     num_max_dispatch_tokens_per_rank: int,
     num_experts: int,
     use_fp8: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = hidden_states.shape[0]
     if num_max_dispatch_tokens_per_rank <= 0:
         raise RuntimeError(
@@ -101,15 +103,27 @@ def _prepare_low_latency_dispatch_inputs(
             "concurrency/speculative tokens."
         )
 
+    if _is_npu:
+        os.environ["MOE_ENABLE_TOPK_NEG_ONE"] = "1"
+
     hidden_was_contiguous = hidden_states.is_contiguous()
     topk_was_contiguous = topk_ids.is_contiguous()
     topk_dtype_before = topk_ids.dtype
 
     hidden_states = hidden_states.contiguous()
+    topk_weights = topk_weights.contiguous()
     topk_dtype = torch.int32 if _is_npu else torch.int64
     topk_ids = topk_ids.to(topk_dtype).contiguous()
 
     if get_bool_env_var("SGLANG_DEEPEP_DEBUG_DISPATCH"):
+        invalid_topk_count = None
+        if topk_ids.numel() > 0:
+            invalid_topk_count = int((topk_ids == -1).sum().item())
+        if _is_npu:
+            logger.warning(
+                "DeepEP NPU low_latency dispatch requires "
+                "MOE_ENABLE_TOPK_NEG_ONE=1 to pass active_mask for -1 topk slots."
+            )
         topk_min = topk_max = None
         if topk_ids.numel() > 0:
             topk_min = int(topk_ids.min().item())
@@ -125,7 +139,7 @@ def _prepare_low_latency_dispatch_inputs(
             "topk_shape=%s, topk_dtype_before=%s, topk_dtype=%s, "
             "topk_stride=%s, topk_contiguous_before=%s, topk_min=%s, "
             "topk_max=%s, num_experts=%s, "
-            "num_max_dispatch_tokens_per_rank=%s, use_fp8=%s",
+            "invalid_topk_count=%s, num_max_dispatch_tokens_per_rank=%s, use_fp8=%s",
             tuple(hidden_states.shape),
             hidden_states.dtype,
             hidden_states.stride(),
@@ -138,11 +152,12 @@ def _prepare_low_latency_dispatch_inputs(
             topk_min,
             topk_max,
             num_experts,
+            invalid_topk_count,
             num_max_dispatch_tokens_per_rank,
             use_fp8,
         )
 
-    return hidden_states, topk_ids
+    return hidden_states, topk_ids, topk_weights
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -714,6 +729,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        hidden_states, topk_ids, topk_weights = _prepare_low_latency_dispatch_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            self.use_fp8,
+        )
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
@@ -785,13 +808,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
-        hidden_states, topk_ids = _prepare_low_latency_dispatch_inputs(
-            hidden_states,
-            topk_ids,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
-            self.use_fp8,
-        )
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
