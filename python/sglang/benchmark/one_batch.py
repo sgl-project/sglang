@@ -1000,7 +1000,7 @@ def main(server_args, bench_args):
         proc.terminate()
 
 
-if __name__ == "__main__":
+def cli_main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -1018,3 +1018,7 @@ if __name__ == "__main__":
     finally:
         if server_args.tp_size != 1:
             kill_process_tree(os.getpid(), include_parent=False)
+
+
+if __name__ == "__main__":
+    cli_main()
