@@ -375,41 +375,44 @@ def get_rope_cpu(
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
-
-    assert rope_scaling is not None
-    scaling_type = rope_scaling["rope_type"]
-    assert (
-        scaling_type == "deepseek_yarn"
-    ), "Only deepseek_yarn is supported for CPU for now"
-
-    scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
-    original_max_position = _get_rope_param(
-        rope_scaling, "original_max_position_embeddings", max_position, scaling_type
-    )
-    extra_kwargs = {
-        k: v
-        for k, v in rope_scaling.items()
-        if k
-        in (
-            "extrapolation_factor",
-            "attn_factor",
-            "beta_fast",
-            "beta_slow",
-            "mscale",
-            "mscale_all_dim",
+    if rope_scaling is None:
+        rotary_emb = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
-    }
-    extra_kwargs["device"] = device
-    rotary_emb = DeepseekScalingRotaryEmbedding(
-        head_size,
-        rotary_dim,
-        original_max_position,
-        base,
-        is_neox_style,
-        scaling_factor,
-        dtype,
-        **extra_kwargs,
-    )
+    else:
+        scaling_type = rope_scaling["rope_type"]
+        assert (
+            scaling_type == "deepseek_yarn"
+        ), "Only deepseek_yarn is supported for CPU for now"
+
+        scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+        original_max_position = _get_rope_param(
+            rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+        )
+        extra_kwargs = {
+            k: v
+            for k, v in rope_scaling.items()
+            if k
+            in (
+                "extrapolation_factor",
+                "attn_factor",
+                "beta_fast",
+                "beta_slow",
+                "mscale",
+                "mscale_all_dim",
+            )
+        }
+        extra_kwargs["device"] = device
+        rotary_emb = DeepseekScalingRotaryEmbedding(
+            head_size,
+            rotary_dim,
+            original_max_position,
+            base,
+            is_neox_style,
+            scaling_factor,
+            dtype,
+            **extra_kwargs,
+        )
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 

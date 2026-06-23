@@ -1838,7 +1838,7 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu() and not is_cpu():  # CUDA or ROCm GPU
                     if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
