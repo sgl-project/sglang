@@ -16,15 +16,11 @@ from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(
-    est_time=180, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True
-)
+register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 # Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range
 # (_BS_AXIS_CI/_SEQ_LEN_AXIS_CI via get_benchmark_range), same as CUDA nightly.
-register_amd_ci(
-    est_time=180, stage="nightly-amd-kernel", runner_config="1-gpu", nightly=True
-)
+register_amd_ci(est_time=180, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _BS_AXIS_FULL: list[int] = [1, 8, 64, 256]

@@ -111,8 +111,8 @@ Defined in `python/sglang/test/test_utils.py`:
 Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
 
 - `nightly-1-gpu` (CUDA)
-- `nightly-kernel-test-1-gpu-large` (CUDA, JIT kernel full grids)
-- `nightly-kernel-test-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
+- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
+- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -360,12 +360,12 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-
 # Benchmarks in test/registered/jit/benchmark/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
-# Optional nightly registration
-register_cuda_ci(est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True)
-register_cuda_ci(est_time=120, stage="nightly-kernel", runner_config="8-gpu-h200", nightly=True)
+# Optional nightly registration — nightly suites use the legacy single-string suite=
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
 ```
 
-Keep `est_time`, `stage`, and `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing
+Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing
 
 ---
 

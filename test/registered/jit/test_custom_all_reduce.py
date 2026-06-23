@@ -51,8 +51,7 @@ register_cuda_ci(
 )
 register_cuda_ci(
     est_time=300,
-    stage="nightly-kernel",
-    runner_config="8-gpu-h200",
+    suite="nightly-kernel-8-gpu-h200",
     nightly=True,
 )
 

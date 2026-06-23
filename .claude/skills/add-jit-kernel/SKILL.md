@@ -436,7 +436,7 @@ if torch.cuda.get_device_capability()[0] < 9:
 JIT kernel correctness tests and benchmarks live under `test/registered/jit/` and `test/registered/jit/benchmark/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
 - **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
-- **Nightly kernel suite**: `nightly-kernel-test-1-gpu-large` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-test-1-gpu-large --nightly --continue-on-error`).
+- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
 
@@ -447,10 +447,11 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Optional B200/SM100 registration for tests that cover Blackwell-specific code paths
 # register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Optional second registration: same file also listed under the nightly kernel suite
-# register_cuda_ci(est_time=120, stage="nightly-kernel", runner_config="1-gpu-large", nightly=True)
+# (nightly suites use the legacy single-string suite=, not stage/runner_config)
+# register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 ```
 
-Keep `est_time`, `stage`, and `runner_config` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
+Keep `est_time`, `stage`, `runner_config`, and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
 
 Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but should be skipped in CI (e.g. multi-GPU only).
 
