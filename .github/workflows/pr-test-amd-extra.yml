@@ -83,8 +83,12 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  group: pr-test-amd-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.ref || 'all' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Mirror pr-test-amd.yml: schedule/dispatch runs key on run_id (unique group,
+  # never cancel each other); PR runs share a per-branch group so pushes cancel
+  # stale runs. (In a reusable workflow github.event_name is the originating
+  # event, never workflow_call, so the guard keys off the real events.)
+  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   actions: write
