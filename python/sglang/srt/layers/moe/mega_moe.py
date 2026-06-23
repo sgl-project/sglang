@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
-_MEGA_MOE_SYMM_MEM_BACKEND_APPLIED = False
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -58,36 +57,6 @@ def _apply_mega_moe_dg_env() -> None:
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
-def _apply_mega_moe_symm_mem_backend() -> None:
-    global _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED
-    if _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED:
-        return
-
-    backend = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND.get().strip().upper()
-    if not backend and torch.cuda.is_available():
-        try:
-            if torch.cuda.get_device_capability()[0] >= 10:
-                backend = "NCCL"
-        except RuntimeError:
-            pass
-
-    if backend:
-        if backend not in ("NCCL", "NVSHMEM"):
-            raise ValueError(
-                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_SYMM_MEM_BACKEND must be one of "
-                f"NCCL, NVSHMEM, or empty; got {backend!r}"
-            )
-        if backend == "NCCL":
-            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
-
-        import torch.distributed._symmetric_memory as symm_mem
-
-        symm_mem.set_backend(backend)
-
-    _MEGA_MOE_SYMM_MEM_BACKEND_APPLIED = True
-
-
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -99,7 +68,6 @@ def _get_mega_moe_symm_buffer(
     import deep_gemm
 
     _apply_mega_moe_dg_env()
-    _apply_mega_moe_symm_mem_backend()
 
     key = (
         id(group),
