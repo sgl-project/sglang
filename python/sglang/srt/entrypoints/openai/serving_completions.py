@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -37,8 +36,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-logger = logging.getLogger(__name__)
-
 
 class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for /v1/completion requests"""
@@ -68,12 +65,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
-        # NOTE: with openai API, the prompt's logprobs are always not computed
-        if request.echo and request.logprobs:
-            logger.warning(
-                "Echo is not compatible with logprobs. "
-                "To compute logprobs of input prompt, please use the native /generate API."
-            )
+        # When echo + logprobs are both requested, compute logprobs for the
+        # prompt too (logprob_start_len=0); otherwise only output logprobs
+        # are computed (logprob_start_len=-1).
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
