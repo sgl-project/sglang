@@ -92,8 +92,8 @@ sgl-eval run gpqa \\
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
-    mi350x: "aigmkt/minimax-m3-sglang-rocm700-mi35x",
-    mi355x: "aigmkt/minimax-m3-sglang-rocm700-mi35x",
+    mi350x: "aigmkt/minimax-m3-sglang-rocm720-mi35x",
+    mi355x: "aigmkt/minimax-m3-sglang-rocm720-mi35x",
   },
 
   github: {
