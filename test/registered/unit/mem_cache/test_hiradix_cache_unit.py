@@ -3,12 +3,17 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -88,6 +93,15 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         self.assertIsNot(match.last_device_node, cache.root_node)
         return match.last_device_node
 
+    def _tag(self, cache, tokens, session_id):
+        leaf = self._leaf_for(cache, tokens)
+        cache._tag_session_leaf(
+            SimpleNamespace(session_id=session_id),
+            RadixKey(array("q", tokens)),
+            node=leaf,
+        )
+        return leaf
+
     def _stored_cpu_events(self, cache):
         return [
             e
@@ -118,6 +132,89 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_session_survives_hicache_eviction_and_release(self):
+        cache, allocator = self._build_cache()
+        first_turn = list(range(12))
+        second_turn = list(range(24))
+        result = self._insert(cache, allocator, first_turn)
+        self.assertIs(result.last_device_node, self._leaf_for(cache, first_turn))
+        self._tag(cache, first_turn, "S")
+        self._insert(cache, allocator, second_turn)
+        leaf = self._tag(cache, second_turn, "S")
+
+        cache.cache_controller.write_policy = "write_back"
+        self.assertEqual(
+            cache.evict(EvictParams(num_tokens=len(second_turn))).num_tokens_evicted,
+            len(second_turn),
+        )
+        self.assertTrue(leaf.evicted)
+        self.assertTrue(leaf.backuped)
+
+        device_indices = cache.load_back(leaf)
+        self.assertEqual(len(device_indices), len(second_turn))
+        consumer = cache.ready_to_load_host_cache()
+        cache.cache_controller.layer_done_counter.events[
+            consumer
+        ].finish_event.synchronize()
+        cache.loading_check()
+        self.assertFalse(leaf.evicted)
+        self.assertEqual(cache.release_session("S"), 2)
+        self.assertNotIn("S", cache._session_leaves)
+
+    def test_session_shared_leaf_kept_until_last_holder(self):
+        cache, allocator = self._build_cache()
+        tokens = list(range(12))
+        self._insert(cache, allocator, tokens)
+        leaf = self._tag(cache, tokens, "A")
+        self._tag(cache, tokens, "B")
+
+        cache.cache_controller.write_policy = "write_back"
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        self.assertEqual(cache.release_session("A"), 0)
+        self.assertEqual(leaf.session_ids, {"B"})
+        self.assertEqual(cache.release_session("B"), 1)
+        self.assertNotIn(leaf, cache.evictable_host_leaves)
+
+    def test_locked_session_release_retries_after_unlock(self):
+        cache, allocator = self._build_cache()
+        tokens = list(range(12))
+        self._insert(cache, allocator, tokens)
+        leaf = self._tag(cache, tokens, "S")
+        cache.inc_lock_ref(leaf)
+
+        self.assertEqual(cache.release_session("S"), 0)
+        self.assertIn("S", cache._pending_session_releases)
+        cache.dec_lock_ref(leaf)
+        cache.check_hicache_events()
+        self.assertNotIn("S", cache._pending_session_releases)
+        self.assertNotIn("S", cache._session_leaves)
+
+    def test_reopen_cancels_pending_release(self):
+        cache, allocator = self._build_cache()
+        tokens = list(range(12))
+        self._insert(cache, allocator, tokens)
+        leaf = self._tag(cache, tokens, "S")
+        cache.inc_lock_ref(leaf)
+        cache.release_session("S")
+
+        cache.register_session("S")
+        cache.dec_lock_ref(leaf)
+        cache.check_hicache_events()
+        self.assertNotIn("S", cache._pending_session_releases)
+        self.assertIn(leaf, cache._session_leaves["S"])
+
+    def test_host_eviction_discards_session_index(self):
+        cache, allocator = self._build_cache()
+        tokens = list(range(12))
+        self._insert(cache, allocator, tokens)
+        leaf = self._tag(cache, tokens, "S")
+        cache.cache_controller.write_policy = "write_back"
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+
+        cache.evict_host(len(tokens))
+        self.assertNotIn("S", cache._session_leaves)
+        self.assertFalse(hasattr(leaf, "session_ids"))
 
 
 if __name__ == "__main__":

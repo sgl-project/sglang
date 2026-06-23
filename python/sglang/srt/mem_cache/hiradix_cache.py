@@ -708,6 +708,7 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self._pending_session_releases = set()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -1132,6 +1133,7 @@ class HiRadixCache(RadixCache):
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
+            self._discard_session_leaf(x)
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -1211,6 +1213,79 @@ class HiRadixCache(RadixCache):
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return device_indices
+
+    def register_session(self, session_id: str) -> None:
+        self._pending_session_releases.discard(session_id)
+        super().register_session(session_id)
+
+    def release_session(self, session_id: str) -> int:
+        """Free a session's last-holder nodes from both device and host."""
+        self._ensure_session_radix_state()
+        self._remember_closed_session(session_id)
+        self._pending_session_releases.discard(session_id)
+        indexed = self._session_leaves.pop(session_id, set())
+        deferred = set()
+        freed = 0
+
+        for leaf in sorted(indexed, key=lambda node: node.id, reverse=True):
+            if session_id not in getattr(leaf, "session_ids", ()):
+                continue
+            node = leaf
+            while True:
+                if node is self.root_node:
+                    break
+                if node.lock_ref != 0 or node.host_ref_counter != 0:
+                    if session_id in getattr(leaf, "session_ids", ()):
+                        deferred.add(leaf)
+                    break
+                session_ids = getattr(node, "session_ids", None)
+                if session_ids is not None:
+                    session_ids.discard(session_id)
+                    if not session_ids:
+                        delattr(node, "session_ids")
+                if (
+                    len(node.children) != 0
+                    or getattr(node, "session_ids", None)
+                    or (
+                        node not in self.evictable_leaves
+                        and node not in self.evictable_host_leaves
+                    )
+                ):
+                    break
+
+                parent = node.parent
+                if node.host_value is not None:
+                    self._record_remove_event(node, medium=StorageMedium.CPU)
+                    self.cache_controller.evict_host(node.host_value)
+                    node.host_value = None
+                    self.evictable_host_leaves.discard(node)
+
+                if node.value is not None:
+                    self._record_remove_event(node, medium=StorageMedium.GPU)
+                    self.cache_controller.mem_pool_device_allocator.free(node.value)
+                    self._delete_leaf(node)
+                else:
+                    key = node.key.child_key(self.page_size)
+                    popped = parent.children.pop(key, None)
+                    assert popped is node, "release_session: parent missing child"
+                    self._discard_session_leaf(node)
+                    self.evictable_host_leaves.discard(node)
+                    self._update_leaf_status(parent)
+                    self._update_host_leaf_status(parent)
+                freed += 1
+                node = parent
+
+        if deferred:
+            self._session_leaves[session_id].update(deferred)
+            self._pending_session_releases.add(session_id)
+        logger.info(
+            "release_session %s: indexed %d leaves, freed %d nodes, deferred %d",
+            session_id,
+            len(indexed),
+            freed,
+            len(deferred),
+        )
+        return freed
 
     def init_load_back(
         self,
@@ -1296,6 +1371,8 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        for session_id in tuple(self._pending_session_releases):
+            self.release_session(session_id)
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1721,7 +1798,11 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return InsertResult(prefix_len=total_prefix_length)
+            node = new_node
+        return InsertResult(
+            prefix_len=total_prefix_length,
+            last_device_node=node,
+        )
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
