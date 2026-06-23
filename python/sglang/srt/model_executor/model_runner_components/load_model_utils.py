@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import threading
 from typing import TYPE_CHECKING, Optional
@@ -8,6 +9,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadFormat
+from sglang.srt.debug_utils.tensor_dump_forward_hook import (
+    register_forward_hook_for_model,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
@@ -17,6 +21,7 @@ from sglang.srt.utils.network import NetworkAddress
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +102,28 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[in
             f"Setting sliding_window_size to be attention_chunk_size: {sliding_window_size}"
         )
     return sliding_window_size
+
+
+def maybe_register_debug_tensor_dump_hook(
+    *,
+    model,
+    server_args: ServerArgs,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+    tp_size: int,
+    tp_rank: int,
+    pp_rank: int,
+) -> None:
+    if server_args.debug_tensor_dump_output_folder is not None:
+        dump_folder = server_args.debug_tensor_dump_output_folder
+        if spec_algorithm.is_eagle():
+            role = "draft" if is_draft_worker else "target"
+            dump_folder = os.path.join(dump_folder, role)
+        register_forward_hook_for_model(
+            model,
+            dump_folder,
+            server_args.debug_tensor_dump_layers,
+            tp_size,
+            tp_rank,
+            pp_rank,
+        )
