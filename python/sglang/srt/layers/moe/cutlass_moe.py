@@ -345,6 +345,75 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
 
+def _prepare_fp4_moe_input(
+    topk_ids: torch.Tensor,
+    params: CutlassMoEParams,
+    num_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
+    flat_topk_ids = topk_ids.reshape(-1)
+    invalid_topk_ids = (flat_topk_ids < 0) | (flat_topk_ids >= params.num_experts)
+    has_invalid = bool(invalid_topk_ids.any().item())
+    device = topk_ids.device
+
+    if not has_invalid:
+        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        prepare_moe_input(
+            topk_ids,
+            params.expert_offsets,
+            params.problem_sizes1,
+            params.problem_sizes2,
+            a_map,
+            c_map,
+            params.num_experts,
+            params.intermediate_size_per_partition,
+            params.hidden_size,
+            params.blockscale_offsets,
+        )
+        return a_map, c_map, None
+
+    valid_topk_ids = ~invalid_topk_ids
+    valid_route_indices = torch.nonzero(valid_topk_ids, as_tuple=False).flatten()
+    c_map = torch.zeros((topk_ids.numel(),), dtype=torch.int32, device=device)
+    active = {
+        "compact_source_rows": torch.div(
+            valid_route_indices, num_topk, rounding_mode="floor"
+        ),
+        "valid_route_indices": valid_route_indices,
+        "valid_topk_ids": valid_topk_ids.view_as(topk_ids),
+    }
+
+    if valid_route_indices.numel() == 0:
+        params.expert_offsets.zero_()
+        params.problem_sizes1.zero_()
+        params.problem_sizes2.zero_()
+        if params.blockscale_offsets is not None:
+            params.blockscale_offsets.zero_()
+        a_map = torch.empty((0,), dtype=torch.int32, device=device)
+        return a_map, c_map, active
+
+    compact_topk_ids = flat_topk_ids.index_select(0, valid_route_indices).view(-1, 1)
+    a_map = torch.empty((valid_route_indices.numel(),), dtype=torch.int32, device=device)
+    compact_c_map = torch.empty(
+        (valid_route_indices.numel(),), dtype=torch.int32, device=device
+    )
+    prepare_moe_input(
+        compact_topk_ids,
+        params.expert_offsets,
+        params.problem_sizes1,
+        params.problem_sizes2,
+        a_map,
+        compact_c_map,
+        params.num_experts,
+        params.intermediate_size_per_partition,
+        params.hidden_size,
+        params.blockscale_offsets,
+    )
+    c_map.scatter_(0, valid_route_indices, compact_c_map)
+
+    return a_map, c_map, active
+
+
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -434,69 +503,107 @@ def cutlass_moe_fp4(
     out_dtype = a.dtype
     num_topk = topk_ids.shape[1]
     device = a.device
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    prepare_moe_input(
-        topk_ids,
-        params.expert_offsets,
-        params.problem_sizes1,
-        params.problem_sizes2,
-        a_map,
-        c_map,
-        params.num_experts,
-        params.intermediate_size_per_partition,
-        params.hidden_size,
-        params.blockscale_offsets,
-    )
+    a_map, c_map, active = _prepare_fp4_moe_input(topk_ids, params, num_topk)
 
-    rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
-        a,
-        a1_gscale,
-        params.expert_offsets,
-        params.blockscale_offsets,
-        num_topk,
-        expert_map=a_map,
-    )
-    c1 = cutlass_fp4_group_mm(
-        rep_a_fp4,
-        w1_fp4,
-        rep_a_blockscale,
-        w1_blockscale,
-        w1_alphas,
-        out_dtype,
-        params.to_gemm1_args(),
-    )
-    del rep_a_fp4, rep_a_blockscale
+    if active is None:
+        rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
+            a,
+            a1_gscale,
+            params.expert_offsets,
+            params.blockscale_offsets,
+            num_topk,
+            expert_map=a_map,
+        )
+    elif active["valid_route_indices"].numel() == 0:
+        rep_a_fp4 = torch.empty(
+            (0, params.hidden_size // 2), device=device, dtype=torch.uint8
+        )
+        rep_a_blockscale = None
+    else:
+        compact_a = a.index_select(0, active["compact_source_rows"].to(torch.int64))
+        compact_a = compact_a.index_select(0, a_map.to(torch.int64))
+        rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
+            compact_a,
+            a1_gscale,
+            params.expert_offsets,
+            params.blockscale_offsets,
+            num_topk,
+        )
 
-    # hidden size dimension is split to one half sized tensor.
-    intermediate = torch.empty(
-        (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
-    )
-    silu_and_mul(c1, intermediate)
+    if rep_a_fp4.shape[0] == 0:
+        c2 = torch.zeros((1, params.hidden_size), device=device, dtype=out_dtype)
+    else:
+        c1 = cutlass_fp4_group_mm(
+            rep_a_fp4,
+            w1_fp4,
+            rep_a_blockscale,
+            w1_blockscale,
+            w1_alphas,
+            out_dtype,
+            params.to_gemm1_args(),
+        )
+        del rep_a_fp4, rep_a_blockscale
 
-    int_fp4, int_blockscale = scaled_fp4_experts_quant(
-        intermediate,
-        a2_gscale,
-        params.expert_offsets,
-        params.blockscale_offsets,
-        num_topk,
-    )
-    c2 = cutlass_fp4_group_mm(
-        int_fp4,
-        w2_fp4,
-        int_blockscale,
-        w2_blockscale,
-        w2_alphas,
-        out_dtype,
-        params.to_gemm2_args(),
-    )
-    del int_fp4, int_blockscale
+        # hidden size dimension is split to one half sized tensor.
+        intermediate = torch.empty(
+            (c1.shape[0], w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
+        )
+        silu_and_mul(c1, intermediate)
+
+        int_fp4, int_blockscale = scaled_fp4_experts_quant(
+            intermediate,
+            a2_gscale,
+            params.expert_offsets,
+            params.blockscale_offsets,
+            num_topk,
+        )
+        c2 = cutlass_fp4_group_mm(
+            int_fp4,
+            w2_fp4,
+            int_blockscale,
+            w2_blockscale,
+            w2_alphas,
+            out_dtype,
+            params.to_gemm2_args(),
+        )
+        del int_fp4, int_blockscale
 
     if no_combine:
-        c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+        if active is None:
+            c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+        else:
+            c2_full = torch.zeros(
+                (m_a * num_topk, params.hidden_size),
+                device=device,
+                dtype=out_dtype,
+            )
+            if active["valid_route_indices"].numel() > 0:
+                c2_full[active["valid_route_indices"].to(torch.int64)] = (
+                    c2.index_select(
+                        0,
+                        c_map.index_select(0, active["valid_route_indices"]).to(
+                            torch.int64
+                        ),
+                    )
+                )
+            c2 = c2_full
         c2 = c2.view(m_a, num_topk, params.hidden_size)
         return c2.to(out_dtype)
     output = torch.empty((m_a, k_a), device=device, dtype=out_dtype)
-    weights = topk_weights.to(out_dtype) if not apply_router_weight_on_input else None
+    weights = topk_weights
+    if active is not None and not apply_router_weight_on_input:
+        weights = weights.masked_fill(~active["valid_topk_ids"], 0)
+    if active is not None and apply_router_weight_on_input:
+        c2_full = torch.zeros(
+            (m_a * num_topk, params.hidden_size), device=device, dtype=out_dtype
+        )
+        if active["valid_route_indices"].numel() > 0:
+            c2_full[active["valid_route_indices"].to(torch.int64)] = c2.index_select(
+                0,
+                c_map.index_select(0, active["valid_route_indices"]).to(torch.int64),
+            )
+        c2 = c2_full
+        c_map = torch.arange(m_a * num_topk, dtype=torch.int32, device=device)
+    weights = weights.to(out_dtype) if not apply_router_weight_on_input else None
     apply_shuffle_mul_sum(c2, output, c_map, weights)
     return output

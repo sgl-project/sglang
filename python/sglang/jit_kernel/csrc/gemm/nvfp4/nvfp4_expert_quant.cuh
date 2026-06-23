@@ -342,9 +342,8 @@ cvt_fp16_to_fp4(
   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
   extern __shared__ uint32_t shared_input_offsets[];
 
-  // Load input offsets into shared memory.
-  // If n_experts is larger than 4, use vectorized int4 to save instructions.
-  // If n_experts is smaller than 4, read directly.
+  // Load input offsets into shared memory. The vectorized int4 path reads
+  // chunks of 16 experts, so it is only selected for 16-aligned expert counts.
   if constexpr (SMALL_NUM_EXPERTS) {
     for (int i = threadIdx.x; i < n_experts + 1; i += blockDim.x) {
       shared_input_offsets[i] = input_offset_by_experts[i];
@@ -477,7 +476,7 @@ void quant_impl(
   int const blockRepeat = (totalWorkSize + block.x * grid.x - 1) / (block.x * grid.x);
   if (blockRepeat > 1) {
     size_t shared_mem_size = (n_experts + 1) * sizeof(uint32_t);
-    if (n_experts >= 4) {
+    if (n_experts % 16 == 0) {
       cvt_fp16_to_fp4<T, false, false><<<grid, block, shared_mem_size, stream>>>(
           m_topk,
           k,
@@ -503,7 +502,7 @@ void quant_impl(
           n_experts);
     }
   } else {
-    if (n_experts >= 16) {
+    if (n_experts % 16 == 0) {
       cvt_fp16_to_fp4<T, false, false><<<grid, block, 0, stream>>>(
           m_topk,
           k,

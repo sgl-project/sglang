@@ -257,7 +257,10 @@ def check_moe(
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
     quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
+
+    def round_up(x, y):
+        return (x + y - 1) // y * y
+
     sf_w1_2n = round_up(2 * n, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
     w1_blockscale = torch.empty(
@@ -410,6 +413,95 @@ def test_cutlass_fp4_moe_no_graph(
         )
 
     check_moe(m, n, k, e, topk, dtype, cutlass_moe_impl, flip_w13=False)
+
+
+@torch.inference_mode()
+def test_cutlass_fp4_moe_ignores_invalid_routes():
+    torch.manual_seed(7)
+    m, n, k, e, topk = 17, 1024, 1024, 36, 8
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    a = torch.randn((m, k), device=device, dtype=dtype) / 10
+    quant_blocksize = 16
+
+    def round_up(x, y):
+        return (x + y - 1) // y * y
+
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=dtype) / 10
+    w1_q = torch.empty((e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w1_blockscale = torch.empty(
+        (e, round_up(2 * n, 128), round_up(k // quant_blocksize, 4)),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    w1_gs = torch.empty((e,), device=device, dtype=torch.float32)
+
+    w2 = torch.randn((e, k, n), device=device, dtype=dtype) / 10
+    w2_q = torch.empty((e, k, n // 2), device=device, dtype=torch.uint8)
+    w2_blockscale = torch.empty(
+        (e, round_up(k, 128), round_up(n // quant_blocksize, 4)),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    w2_gs = torch.empty((e,), device=device, dtype=torch.float32)
+
+    for expert in range(e):
+        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / torch.abs(
+            w1[expert]
+        ).max().to(torch.float32)
+        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / torch.abs(
+            w2[expert]
+        ).max().to(torch.float32)
+        w1_q[expert], w1_blockscale[expert] = scaled_fp4_quant(
+            w1[expert], w1_gs[expert]
+        )
+        w2_q[expert], w2_blockscale[expert] = scaled_fp4_quant(
+            w2[expert], w2_gs[expert]
+        )
+
+    topk_ids = torch.randint(0, e, (m, topk), device=device, dtype=torch.int32)
+    topk_weights = torch.softmax(
+        torch.randn((m, topk), device=device, dtype=torch.float32), dim=-1
+    )
+    invalid_mask = torch.zeros_like(topk_ids, dtype=torch.bool)
+    invalid_mask[::2, -1] = True
+    invalid_mask[1::3, 0] = True
+
+    invalid_topk_ids = topk_ids.masked_fill(invalid_mask, -1)
+    expected_topk_ids = invalid_topk_ids.clamp_min(0)
+    expected_topk_weights = topk_weights.masked_fill(invalid_mask, 0)
+
+    def run_moe(ids, weights):
+        params = CutlassMoEParams(
+            CutlassMoEType.BlockscaledFP4,
+            device=a.device,
+            num_experts=e,
+            intermediate_size_per_partition=n,
+            hidden_size=k,
+        )
+        return cutlass_moe_fp4(
+            a=a,
+            a1_gscale=torch.ones((e,), device=device, dtype=torch.float32),
+            w1_fp4=w1_q,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=(1 / w1_gs),
+            a2_gscale=torch.ones((e,), device=device, dtype=torch.float32),
+            w2_fp4=w2_q,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=(1 / w2_gs),
+            topk_weights=weights,
+            topk_ids=ids,
+            params=params,
+            apply_router_weight_on_input=False,
+        )
+
+    torch.testing.assert_close(
+        run_moe(invalid_topk_ids, topk_weights),
+        run_moe(expected_topk_ids, expected_topk_weights),
+        atol=1e-1,
+        rtol=1e-1,
+    )
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)

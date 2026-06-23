@@ -1055,8 +1055,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             from sglang.srt.layers.moe.utils import RoutingMethodType
 
-            topk_config = topk_output.topk_config
-
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 get_activation_type,
             )
@@ -1320,9 +1318,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        if quant_method not in ["FP8", "NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1756,6 +1754,24 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _slice_nvfp4_moe_input_scales_for_local_experts(
+    layer: torch.nn.Module,
+    w13_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if layer.num_local_experts == layer.num_experts:
+        return w13_input_scale, w2_input_scale
+
+    local_start = layer.moe_ep_rank * layer.num_local_experts
+    local_end = local_start + layer.num_local_experts
+
+    if w13_input_scale.dim() > 0 and w13_input_scale.shape[0] == layer.num_experts:
+        w13_input_scale = w13_input_scale[local_start:local_end]
+    if w2_input_scale.dim() > 0 and w2_input_scale.shape[0] == layer.num_experts:
+        w2_input_scale = w2_input_scale[local_start:local_end]
+    return w13_input_scale, w2_input_scale
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2061,6 +2077,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
+            w13_input_scale, w2_input_scale = (
+                _slice_nvfp4_moe_input_scales_for_local_experts(
+                    layer, w13_input_scale, w2_input_scale
+                )
+            )
 
         if self.quant_config.use_per_token_activation:
             # FlashInfer computes activation scales dynamically per token, so
@@ -2284,10 +2305,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             inter_size = layer.w2_weight.shape[2] * 2
             hidden_size = layer.w13_weight.shape[2] * 2
             existing_params = getattr(layer, "cutlass_moe_params", None)
+            num_cutlass_experts = layer.w13_weight.shape[0]
             if (
                 existing_params is None
                 or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
-                or existing_params.num_experts != layer.num_experts
+                or existing_params.num_experts != num_cutlass_experts
                 or existing_params.intermediate_size_per_partition != inter_size
                 or existing_params.hidden_size != hidden_size
                 or existing_params.device != device
@@ -2295,7 +2317,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.cutlass_moe_params = CutlassMoEParams(
                     CutlassMoEType.BlockscaledFP4,
                     device,
-                    num_experts=layer.num_experts,  # global num experts
+                    num_experts=num_cutlass_experts,
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
