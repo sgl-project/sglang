@@ -659,6 +659,11 @@ void chunk_local_cumsum_kernel_impl(
   });
 }
 
+#define DECL_BUF(type, name, size_expr) alignas(64) type name[(size_expr)]
+#define DECL_ZERO_BUF(type, name, size_expr) \
+  DECL_BUF(type, name, size_expr);           \
+  fill_stub<type, (size_expr)>(name, 0.f)
+
 // w : [B, T, Hv, D]
 // u : [B, T, Hv, Dv]
 // d : [B, NT, Hv, C, C]
@@ -705,17 +710,11 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
     data_index_init(begin, nt, NT, h, H);
 
     // thread local temp buffer
-    alignas(64) scalar_t tmp[CHUNK_SIZE * D], tmp2[CHUNK_SIZE * D];
-    alignas(64) float attn[CHUNK_SIZE * CHUNK_SIZE];
-    alignas(64) scalar_t attn2[CHUNK_SIZE * CHUNK_SIZE];
-    alignas(64) float tmp3[CHUNK_SIZE * D];
-
-    // init temp buffer just once for each thread to prevent NaN
-    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp, 0.f);
-    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp2, 0.f);
-    fill_stub<float, CHUNK_SIZE * CHUNK_SIZE>(attn, 0.f);
-    fill_stub<scalar_t, CHUNK_SIZE * CHUNK_SIZE>(attn2, 0.f);
-    fill_stub<float, CHUNK_SIZE * D>(tmp3, 0.f);
+    DECL_ZERO_BUF(scalar_t, tmp, CHUNK_SIZE * D);
+    DECL_ZERO_BUF(scalar_t, tmp2, CHUNK_SIZE * D);
+    DECL_ZERO_BUF(float, attn, CHUNK_SIZE* CHUNK_SIZE);
+    DECL_ZERO_BUF(scalar_t, attn2, CHUNK_SIZE * CHUNK_SIZE);
+    DECL_ZERO_BUF(float, tmp3, CHUNK_SIZE* D);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
@@ -899,20 +898,12 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
     data_index_init(begin, bs, num_seqs, hv, Hv);
 
     // thread local temp buffer
-    alignas(64) scalar_t tmp[CHUNK_SIZE * D];
-    alignas(64) scalar_t tmp2[D * D];
-    alignas(64) float tmp3[CHUNK_SIZE * D];
-    alignas(64) scalar_t tmp4[CHUNK_SIZE * D];
-    alignas(64) float attn[CHUNK_SIZE * CHUNK_SIZE];
-    alignas(64) scalar_t attn2[CHUNK_SIZE * CHUNK_SIZE];
-
-    // init temp buffer just once for each thread to prevent NaN
-    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp, 0.f);
-    fill_stub<scalar_t, D * D>(tmp2, 0.f);
-    fill_stub<float, CHUNK_SIZE * D>(tmp3, 0.f);
-    fill_stub<scalar_t, CHUNK_SIZE * D>(tmp4, 0.f);
-    fill_stub<float, CHUNK_SIZE * CHUNK_SIZE>(attn, 0.f);
-    fill_stub<scalar_t, CHUNK_SIZE * CHUNK_SIZE>(attn2, 0.f);
+    DECL_ZERO_BUF(scalar_t, tmp, CHUNK_SIZE * D);
+    DECL_ZERO_BUF(scalar_t, tmp2, D * D);
+    DECL_ZERO_BUF(float, tmp3, CHUNK_SIZE* D);
+    DECL_ZERO_BUF(scalar_t, tmp4, CHUNK_SIZE * D);
+    DECL_ZERO_BUF(float, attn, CHUNK_SIZE* CHUNK_SIZE);
+    DECL_ZERO_BUF(scalar_t, attn2, CHUNK_SIZE * CHUNK_SIZE);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
@@ -1370,6 +1361,21 @@ std::tuple<at::Tensor, at::Tensor> prepare_chunk_indices(const at::Tensor& cu_se
   return std::make_tuple(chunk_indices, chunk_offsets);
 }
 
+#define DISPATCH_HEAD_DIM_CASE(launch_macro, hd) \
+  case hd: {                                     \
+    launch_macro(hd);                            \
+    break;                                       \
+  }
+
+// [NB]: add new head_dim support here
+#define DISPATCH_HEAD_DIM(dim, launch_macro)                 \
+  switch (dim) {                                             \
+    DISPATCH_HEAD_DIM_CASE(launch_macro, 64)                 \
+    DISPATCH_HEAD_DIM_CASE(launch_macro, 128)                \
+    default:                                                 \
+      TORCH_CHECK(false, "Unexpected head dim size, ", dim); \
+  }
+
 #define LAUNCH_L2NORM_KERNEL(HD)        \
   l2norm_fwd_kernel_impl<scalar_t, HD>( \
       query_norm.data_ptr<scalar_t>(),  \
@@ -1393,18 +1399,8 @@ std::tuple<at::Tensor, at::Tensor> l2norm_fwd(const at::Tensor& query, const at:
   at::Tensor query_norm = at::empty_like(query);
   at::Tensor key_norm = at::empty_like(key);
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "l2norm_fwd", [&] {
-    switch (D) {
-      case 64:
-        LAUNCH_L2NORM_KERNEL(64);
-        break;
-      case 128:
-        LAUNCH_L2NORM_KERNEL(128);
-        break;
-      default:
-        TORCH_CHECK(false, "Unexpected head dim size, ", D);
-    }
-  });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(
+      query.scalar_type(), "l2norm_fwd", [&] { DISPATCH_HEAD_DIM(D, LAUNCH_L2NORM_KERNEL); });
 
   return std::make_tuple(query_norm, key_norm);
 }
@@ -1469,16 +1465,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   at::Tensor u = at::empty({B, T, Hv, Dv}, k.options());                                // BFloat16
   at::Tensor decay_mask = at::empty({B, NT, Hv, CHUNK_SIZE, CHUNK_SIZE}, g.options());  // Float
   AT_DISPATCH_REDUCED_FLOATING_TYPES(k.scalar_type(), "chunk_gated_delta_rule_fwd_intra", [&] {
-    switch (D) {
-      case 64:
-        LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL(64);
-        break;
-      case 128:
-        LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL(128);
-        break;
-      default:
-        TORCH_CHECK(false, "Unexpected head dim size, ", D);
-    }
+    DISPATCH_HEAD_DIM(D, LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL);
   });
 
   return std::make_tuple(w, u, decay_mask);
@@ -1526,16 +1513,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
 
   at::Tensor o = at::empty({B, T, Hv, Dv}, q.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "chunk_gated_delta_rule_fwd_inter", [&] {
-    switch (D) {
-      case 64:
-        LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTER_KERNEL(64);
-        break;
-      case 128:
-        LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTER_KERNEL(128);
-        break;
-      default:
-        TORCH_CHECK(false, "Unexpected head dim size, ", D);
-    }
+    DISPATCH_HEAD_DIM(D, LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTER_KERNEL);
   });
 
   return std::make_tuple(o, initial_state);
