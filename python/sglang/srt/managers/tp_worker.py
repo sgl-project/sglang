@@ -338,9 +338,14 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
+        pool_tokens = (
+            self.model_runner.full_max_total_num_tokens
+            if self.model_runner.is_hybrid_swa
+            else self.model_runner.max_total_num_tokens
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            pool_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -449,9 +454,14 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        pool_tokens = (
+            self.model_runner.full_max_total_num_tokens
+            if self.model_runner.is_hybrid_swa
+            else self.model_runner.max_total_num_tokens
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            pool_tokens - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,
