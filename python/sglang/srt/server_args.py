@@ -1561,11 +1561,33 @@ class ServerArgs:
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
-    decoupled_spec_bind_endpoint: Optional[str] = None
-    decoupled_spec_connect_endpoints: Optional[List[str]] = None
-    decoupled_spec_rank: Optional[int] = None
-    decoupled_spec_role: Literal["null", "verifier", "drafter"] = "null"
-    spec_trace_dir: Optional[str] = None
+    decoupled_spec_bind_endpoint: A[
+        Optional[str],
+        "ZMQ endpoint this engine binds for its inbound channel in decoupled "
+        "speculative decoding (verifier: result PULL; drafter: control PULL).",
+    ] = None
+    decoupled_spec_connect_endpoints: A[
+        Optional[List[str]],
+        Arg(
+            help="Peer inbound (bind) endpoints to connect to, ordered by peer "
+            "rank, for decoupled speculative decoding.",
+            type_parser=json_list_type,
+        ),
+    ] = None
+    decoupled_spec_rank: A[
+        Optional[int],
+        "This engine's rank within its own role space (verifier-rank or "
+        "drafter-rank) for decoupled speculative decoding.",
+    ] = None
+    decoupled_spec_role: A[
+        Literal["null", "verifier", "drafter"],
+        "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
+        "runs the target/verify half, 'drafter' runs the draft half.",
+    ] = "null"
+    spec_trace_dir: A[
+        Optional[str],
+        "Directory to write decoupled speculative decoding trace files.",
+    ] = None
 
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
