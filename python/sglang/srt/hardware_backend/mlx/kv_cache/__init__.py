@@ -33,6 +33,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache.model_patching import (
     get_num_layers,
     patch_model_attention,
 )
+from sglang.srt.hardware_backend.mlx.kv_cache.paged_metadata import (
+    MLXPagedAttentionMetadata,
+    build_decode_paged_metadata,
+)
 
 __all__ = [
     "BatchedDecodeContext",
@@ -52,8 +56,10 @@ __all__ = [
     "MlxAuxiliaryStatePool",
     "MlxAuxiliaryStateReqToTokenPool",
     "MlxModelCacheLayout",
+    "MLXPagedAttentionMetadata",
     "patch_model_attention",
     "PoolBackedAttentionKVCache",
+    "build_decode_paged_metadata",
     "set_context",
     "uses_sliding_window_attention",
 ]

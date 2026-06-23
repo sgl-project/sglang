@@ -102,6 +102,7 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list[list[Any]]
+    pool_synced_offsets: dict[str, int] | None = None
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -1113,7 +1114,7 @@ class MlxModelRunner:
         caches: list[list[Any]],
         batched_input: mx.array,
         req_ids: list[str],
-    ) -> mx.array:
+    ) -> tuple[mx.array, dict[str, int] | None]:
         ctx = self._build_batched_decode_context(caches, req_ids)
         seq_lens = ctx.seq_lens
         set_context(ctx)
@@ -1125,7 +1126,13 @@ class MlxModelRunner:
             ]
             model_output = self.model(batched_input, cache=shim_cache)
             logits = self._extract_logits(model_output)
-            return mx.argmax(logits[:, -1, :], axis=-1)
+            pool_synced_offsets = None
+            if ctx.aot.rope is not None and ctx.aot.rope.new_token_slots is not None:
+                pool_synced_offsets = {
+                    rid: self._first_attention_cache(cache).offset
+                    for rid, cache in zip(req_ids, caches)
+                }
+            return mx.argmax(logits[:, -1, :], axis=-1), pool_synced_offsets
         finally:
             clear_context()
 
@@ -1163,8 +1170,9 @@ class MlxModelRunner:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
+            pool_synced_offsets = None
         else:
-            lazy_tokens = self._decode_with_batched_attention(
+            lazy_tokens, pool_synced_offsets = self._decode_with_batched_attention(
                 caches, batched_input, list(req_ids)
             )
 
@@ -1172,6 +1180,7 @@ class MlxModelRunner:
             lazy_tokens=lazy_tokens,
             req_ids=list(req_ids),
             caches=caches,
+            pool_synced_offsets=pool_synced_offsets,
         )
 
     def decode_batch_start_chained(
@@ -1212,8 +1221,9 @@ class MlxModelRunner:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, prev.req_ids
             )
+            pool_synced_offsets = None
         else:
-            lazy_tokens = self._decode_with_batched_attention(
+            lazy_tokens, pool_synced_offsets = self._decode_with_batched_attention(
                 caches, batched_input, prev.req_ids
             )
 
@@ -1221,6 +1231,7 @@ class MlxModelRunner:
             lazy_tokens=lazy_tokens,
             req_ids=prev.req_ids,
             caches=caches,
+            pool_synced_offsets=pool_synced_offsets,
         )
 
     def decode_batch_finalize(
@@ -1243,6 +1254,8 @@ class MlxModelRunner:
 
         for i, rid in enumerate(pending.req_ids):
             self._req_token_ids[rid].append(next_tokens[i])
+            if pending.pool_synced_offsets is not None:
+                self._req_synced_offset[rid] = pending.pool_synced_offsets[rid]
 
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:
@@ -1276,3 +1289,5 @@ class MlxModelRunner:
         self._req_synced_offset.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()
+
+
