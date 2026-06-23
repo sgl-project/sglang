@@ -359,10 +359,6 @@ class ModelRunner:
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
