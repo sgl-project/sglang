@@ -536,10 +536,17 @@ class DeepseekSparseAttnBackend(
                 self._ds_key_norm_nan = torch.full(
                     (), float("nan"), dtype=torch.float32, device=self.device
                 )
-                # Preallocated scratch for the 0-alloc decode populate (T <= max_app).
+                # Preallocated scratch for the 0-alloc populate (T <= max_app). On
+                # this 0.4.4 base PREFILL is CUDA-graph-captured and the populate runs
+                # inside the captured _write_token_labels, so the eager (allocating)
+                # fallback must NEVER be reached under capture. Size for BOTH decode
+                # (T = bs <= cuda_graph_max_bs) AND the prefill-captured per-chunk
+                # token count (bounded by chunked_prefill_size), so the 0-alloc path
+                # always handles capture.
                 _max_app = max(
                     256,
                     int(getattr(model_runner.server_args, "cuda_graph_max_bs", 0) or 0),
+                    int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
                 )
                 self._knorm_max_app = _max_app
                 _lora = self._knorm_lora
@@ -1952,8 +1959,17 @@ class DeepseekSparseAttnBackend(
             cache[layer_id].index_copy_(0, slots, out)  # in-place, 0-alloc
             return
 
-        # Eager fallback (extend / non-fp8 KV): correctness over 0-alloc (prefill is
-        # not graph-captured, so a per-call allocation here is acceptable).
+        # Eager fallback (non-fp8 KV, or T beyond the preallocated scratch):
+        # correctness over 0-alloc. This allocates, so it must NEVER run under
+        # CUDA-graph capture — on this 0.4.4 base prefill IS captured and the
+        # populate runs inside it, so _knorm_max_app is sized for the captured
+        # decode + prefill token counts and the 0-alloc path above handles capture.
+        # Fail loud if that invariant ever breaks.
+        assert not torch.cuda.is_current_stream_capturing(), (
+            f"Double Sparsity key-norm populate hit the allocating eager fallback "
+            f"under CUDA-graph capture (T={T} > scratch {self._knorm_max_app}); "
+            f"_knorm_max_app must cover the prefill-captured token count."
+        )
         from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
             dequantize_resident_latent,
         )
