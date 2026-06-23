@@ -212,16 +212,19 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return cache
 
 
-def _install_builtin_radix_cache_backends() -> None:
-    """Self-register the built-in pluggable backends at import time.
+def _rust_unified_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
+    # Imported here so selecting another backend never imports the Rust
+    # orchestrator or its native extension.
+    from sglang.srt.mem_cache.rust_unified_radix_cache import (
+        RadixCacheInfraPyError,
+        RustUnifiedRadixCache,
+    )
 
-    The factory loads its native extension lazily, so registration stays safe
-    even when the extension isn't built. The Rust radix cache native core is
-    loaded only when `--radix-cache-backend=rust_unified_tree` is enabled.
-    """
-    from sglang.srt.mem_cache.rust_unified_radix_cache import install_rust_radix_cache
-
-    install_rust_radix_cache()
+    if ctx.enable_hierarchical_cache:
+        raise RadixCacheInfraPyError(
+            "RustUnifiedRadixCache: hierarchical cache (HiCache) not supported"
+        )
+    return RustUnifiedRadixCache(ctx.params)
 
 
-_install_builtin_radix_cache_backends()
+register_radix_cache_backend("rust_unified_tree", _rust_unified_radix_cache_factory)

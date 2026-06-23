@@ -325,32 +325,33 @@ class TestRustUnifiedRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
     BACKEND = "rust_unified_tree"
 
     def test_backend_is_registered(self):
-        # Importing the registry runs `_install_builtin_radix_cache_backends()`,
-        # which registers the backend without loading the native extension.
+        # Importing the registry registers the backend as a lazy factory that
+        # imports the native extension only when the backend is selected.
         self.assertIn(self.BACKEND, registered_radix_cache_backends())
         self.assertIsNotNone(get_radix_cache_factory(self.BACKEND))
 
     def test_factory_rejects_hierarchical_cache(self):
-        import sglang.srt.mem_cache.rust_unified_radix_cache as ru
+        # The factory imports the orchestrator (and native ext) on use, so this
+        # path needs the built extension.
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RadixCacheInfraPyError,
+            )
+        except ModuleNotFoundError:
+            self.skipTest("native extension not built; cannot import the backend")
 
         factory = get_radix_cache_factory(self.BACKEND)
-        # Skip the native-extension load and stand a real exception class in for
-        # the otherwise lazily-loaded typed error.
-        with (
-            patch.object(ru, "_load_native_symbols"),
-            patch.object(ru, "RadixCacheInfraPyError", RuntimeError),
-        ):
-            with self.assertRaises(RuntimeError):
-                factory(
-                    _make_ctx(backend=self.BACKEND, enable_hierarchical_cache=True)
-                )
+        with self.assertRaises(RadixCacheInfraPyError):
+            factory(_make_ctx(backend=self.BACKEND, enable_hierarchical_cache=True))
 
     def test_factory_without_extension_raises_helpful_error(self):
         # Without the built native extension, selecting the backend should fail
-        # with a clear, actionable message rather than a bare ImportError.
-        import sglang.srt.mem_cache.rust_unified_radix_cache as ru
-
-        if ru._NATIVE_SYMBOLS_LOADED:
+        # with a ModuleNotFoundError that names the missing extension.
+        try:
+            import sglang.srt.mem_cache._mem_cache_core  # noqa: F401
+        except ModuleNotFoundError:
+            pass
+        else:
             self.skipTest("native extension is built; missing-extension path n/a")
         factory = get_radix_cache_factory(self.BACKEND)
         with self.assertRaises(ModuleNotFoundError) as cm:

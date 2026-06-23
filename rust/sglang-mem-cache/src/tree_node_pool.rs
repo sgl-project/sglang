@@ -11,10 +11,6 @@ use crate::tree_node_lru::{
     evict_full_value,
 };
 
-// TODO(Jialin): reuse evicted nodes by clearing fields in place instead of dropping.
-// TODO(Jialin): preallocate children HashMap via with_capacity(n).
-// TODO(Jialin): switch to hashbrown/ahash for faster hashing.
-
 /// Validated page size for the radix cache.
 #[derive(Debug, Clone, Copy)]
 pub struct PageSize(usize);
@@ -70,8 +66,10 @@ impl ChildKeyType for Vec<(i64, i64)> {
     }
 }
 
-/// Index into a `TreeNodePool`. Do not hold outside the pool: the freelist
-/// recycles indices (ABA).
+/// Index of a node inside a `TreeNodePool`.
+///
+/// TODO(Jialin): extend with a generation tag to avoid ABA on the recycling
+/// freelist and improve debuggability.
 pub type NodeIdx = usize;
 
 /// Per-component per-node state. One entry per `ComponentType`.
@@ -95,6 +93,9 @@ pub struct TreeNode<K: ChildKeyType> {
     /// Children keyed by child key, values are indices into the pool.
     children: HashMap<K, NodeIdx>,
     /// Device-tier per-component node-level state.
+    ///
+    /// TODO(Jialin): explore dynamic vs this static allocation, trading off
+    /// perf against memory.
     pub(crate) components: [ComponentNodeState; NUM_COMPONENT_TYPES],
     /// SWA's lock-walk boundary marker.
     pub(crate) swa_uuid_for_lock: Option<u64>,

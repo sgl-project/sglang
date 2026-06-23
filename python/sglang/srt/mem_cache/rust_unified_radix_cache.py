@@ -23,6 +23,13 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+from sglang.srt.mem_cache._mem_cache_core import (
+    ComponentType,
+    RadixCacheInfraPyError,
+    RadixCacheRuntimePyError,
+    RustBigramRadixCacheWrapper,
+    RustPageRadixCacheWrapper,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -38,10 +45,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.registry import (
-    get_radix_cache_factory,
-    register_radix_cache_backend,
-)
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -49,54 +52,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ComponentType: Any = None
-RadixCacheInfraPyError: Any = None
-RadixCacheRuntimePyError: Any = None
-RustBigramRadixCacheWrapper: Any = None
-RustPageRadixCacheWrapper: Any = None
-_NATIVE_SYMBOLS_LOADED = False
-
-
-def _load_native_symbols() -> None:
-    """Load the PyO3 extension."""
-    global ComponentType
-    global RadixCacheInfraPyError
-    global RadixCacheRuntimePyError
-    global RustBigramRadixCacheWrapper
-    global RustPageRadixCacheWrapper
-    global _NATIVE_SYMBOLS_LOADED
-
-    if _NATIVE_SYMBOLS_LOADED:
-        return
-
-    try:
-        from sglang.srt.mem_cache._mem_cache_core import (
-            ComponentType as NativeComponentType,
-            RadixCacheInfraPyError as NativeRadixCacheInfraPyError,
-            RadixCacheRuntimePyError as NativeRadixCacheRuntimePyError,
-            RustBigramRadixCacheWrapper as NativeRustBigramRadixCacheWrapper,
-            RustPageRadixCacheWrapper as NativeRustPageRadixCacheWrapper,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name == "sglang.srt.mem_cache._mem_cache_core":
-            raise ModuleNotFoundError(
-                "RustUnifiedRadixCache requires native extension "
-                "sglang.srt.mem_cache._mem_cache_core. Install SGLang with "
-                "`python -m pip install -e python` or build the package before "
-                "using `--radix-cache-backend rust_unified`."
-            ) from exc
-        raise
-
-    ComponentType = NativeComponentType
-    RadixCacheInfraPyError = NativeRadixCacheInfraPyError
-    RadixCacheRuntimePyError = NativeRadixCacheRuntimePyError
-    RustBigramRadixCacheWrapper = NativeRustBigramRadixCacheWrapper
-    RustPageRadixCacheWrapper = NativeRustPageRadixCacheWrapper
-    _NATIVE_SYMBOLS_LOADED = True
-
-
 _DEFAULT_INIT_NODE_CAPACITY = 1024
-RUST_UNIFIED_BACKEND_NAME = "rust_unified_tree"
 
 
 class RustUnifiedRadixCache(BasePrefixCache):
@@ -106,8 +62,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
     """
 
     def __init__(self, params: CacheInitParams):
-        _load_native_symbols()
-
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -661,18 +615,3 @@ class RustUnifiedRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.copy_from(
                 src_index, req.mamba_pool_idx.unsqueeze(0)
             )
-
-def install_rust_radix_cache() -> None:
-    """Register Rust Unified Radix Cache."""
-    if get_radix_cache_factory(RUST_UNIFIED_BACKEND_NAME) is not None:
-        return
-
-    def factory(ctx):
-        _load_native_symbols()
-        if ctx.enable_hierarchical_cache:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: hierarchical cache (HiCache) not supported"
-            )
-        return RustUnifiedRadixCache(ctx.params)
-
-    register_radix_cache_backend(RUST_UNIFIED_BACKEND_NAME, factory)
