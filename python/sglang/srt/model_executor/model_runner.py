@@ -130,6 +130,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -789,9 +790,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
-            ModelRunner.apply_torch_tp(
-                model=self.model, device=self.device, tp_size=self.tp_size
-            )
+            apply_torch_tp(model=self.model, device=self.device, tp_size=self.tp_size)
 
         # Init lora
         if server_args.enable_lora:
@@ -2805,17 +2804,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"in this case the available memory amount of each rank cannot be determined in prior. "
                     f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
                 )
-
-    @staticmethod
-    def apply_torch_tp(
-        *,
-        model: nn.Module,
-        device: str,
-        tp_size: int,
-    ):
-        logger.info(f"Enabling torch tensor parallelism on {tp_size} devices.")
-        device_mesh = torch.distributed.init_device_mesh(device, (tp_size,))
-        tensor_parallel(model, device_mesh)
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
