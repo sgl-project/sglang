@@ -1159,16 +1159,30 @@ class Scheduler(
             self.server_args.disaggregation_enable_d2p_kv_replication
             and self.transfer_backend == TransferBackend.MOONCAKE
         ):
-            from sglang.srt.disaggregation.d2p_replication import (
-                DecodeToPrefillKVReplicator,
-                PrefillD2PReceiver,
+            from sglang.srt.disaggregation.mooncake.d2p import (
+                D2PKVManager,
+                _build_reverse_kv_args,
             )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.d2p_replicator = DecodeToPrefillKVReplicator(self)
+                kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
+                kv_args = _build_reverse_kv_args(self, kv_mgr)
+                d2p_mgr = D2PKVManager(
+                    kv_args, DisaggregationMode.PREFILL,
+                    self.server_args, kv_mgr.is_mla_backend,
+                )
+                d2p_mgr.init_d2p_sender(self, kv_mgr)
+                self.d2p_replicator = d2p_mgr
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.d2p_receiver = PrefillD2PReceiver(self)
-                self._register_d2p_endpoint()
+                kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                kv_args = _build_reverse_kv_args(self, kv_mgr)
+                d2p_mgr = D2PKVManager(
+                    kv_args, DisaggregationMode.DECODE,
+                    self.server_args, kv_mgr.is_mla_backend,
+                )
+                d2p_mgr.init_d2p_receiver(self, kv_mgr)
+                kv_mgr._d2p_receiver = d2p_mgr
+                self.d2p_receiver = d2p_mgr
 
         # Init mm receiver for EPD disaggregation mode
         if (

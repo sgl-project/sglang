@@ -71,7 +71,7 @@ class TransferInfo:
     dst_port: int
     mooncake_session_id: str
     dst_kv_indices: npt.NDArray[np.int32]
-    dst_aux_index: int
+    dst_aux_index: Optional[int]
     dst_state_indices: List[List[int]]  # parallel to receiver's state_types
     required_dst_info_num: int
     is_dummy: bool
@@ -88,7 +88,12 @@ class TransferInfo:
             dst_state_indices = []
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
-            dst_aux_index = int(msg[5].decode("ascii"))
+            dst_aux_index_bytes = msg[5]
+            dst_aux_index = (
+                None
+                if dst_aux_index_bytes in (b"", b"None")
+                else int(dst_aux_index_bytes.decode("ascii"))
+            )
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
         return cls(
@@ -163,6 +168,7 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        self._d2p_receiver = None
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1324,12 +1330,14 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            if kv_chunk.prefill_aux_index is not None:
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
+                            else:
+                                ret = 0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1445,6 +1453,9 @@ class MooncakeKVManager(CommonKVManager):
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
                         )
                     continue
+                if room == "D2P_REQ":
+                    if self._d2p_receiver is not None:
+                        self._d2p_receiver.handle_d2p_request(waiting_req_bytes)
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
@@ -1565,7 +1576,6 @@ class MooncakeKVManager(CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1853,7 +1863,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
+                        (
+                            str(aux_index).encode("ascii")
+                            if not is_dummy and aux_index is not None
+                            else b""
+                        ),
                         (
                             pack_int_lists(state_indices, "i")
                             if not is_dummy and state_indices
