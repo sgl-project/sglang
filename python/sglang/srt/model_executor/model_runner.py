@@ -159,10 +159,12 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
@@ -380,7 +382,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
-        self.attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self.attn_dp_size = (
+            server_args.dp_size if server_args.enable_dp_attention else 1
+        )
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank
@@ -2928,7 +2932,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
-                self.gpu_id if self.attn_dp_size is not None and self.attn_dp_size > 1 else None
+                self.gpu_id
+                if self.attn_dp_size is not None and self.attn_dp_size > 1
+                else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 

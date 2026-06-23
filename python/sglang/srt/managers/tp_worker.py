@@ -41,7 +41,9 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -55,7 +57,9 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 logger = logging.getLogger(__name__)
 

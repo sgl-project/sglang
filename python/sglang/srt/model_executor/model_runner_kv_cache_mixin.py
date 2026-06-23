@@ -50,7 +50,9 @@ from sglang.srt.utils.common import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 
 # the ratio of mamba cache pool size to max_running_requests
@@ -1056,7 +1058,7 @@ class ModelRunnerKVCacheMixin:
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
-        from sglang.srt.model_executor.pool_configurator import (
+        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
             create_memory_pool_configurator,
         )
 

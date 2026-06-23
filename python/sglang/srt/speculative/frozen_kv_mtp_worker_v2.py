@@ -39,7 +39,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
