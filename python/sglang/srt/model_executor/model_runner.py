@@ -589,15 +589,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        hf_config = self.model_config.hf_text_config
-        if (
-            self.pp_size <= 1
-            or self.pp_rank == 0
-            or not is_deepseek_dsa(hf_config)
-            or not dsa_layer_skips_topk(hf_config, self.layer_info.start_layer)
-        ):
-            return None
-        return getattr(hf_config, "index_topk", None)
+        return resolve_pp_proxy_topk_size(
+            model_config=self.model_config,
+            pp_size=self.pp_size,
+            pp_rank=self.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
 
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
@@ -2020,3 +2017,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+def resolve_pp_proxy_topk_size(
+    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+) -> Optional[int]:
+    hf_config = model_config.hf_text_config
+    if (
+        pp_size <= 1
+        or pp_rank == 0
+        or not is_deepseek_dsa(hf_config)
+        or not dsa_layer_skips_topk(hf_config, start_layer)
+    ):
+        return None
+    return getattr(hf_config, "index_topk", None)
