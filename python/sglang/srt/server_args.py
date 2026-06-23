@@ -2057,7 +2057,17 @@ class ServerArgs:
     flashinfer_allreduce_fusion_backend: A[
         Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
-            help="Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.",
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Defaults to auto. "
+                "'auto': choose trtllm on single-node systems and mnnvl on "
+                "SM100/SM103 multi-node systems. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
         ),
     ] = None
     enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
@@ -4291,13 +4301,10 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). SM90 is not
-        # auto-enabled because auto resolves to mnnvl, which requires a working
-        # NVLink multicast fabric that SM90 nodes do not reliably have; SM90
-        # users can opt in explicitly via
-        # --flashinfer-allreduce-fusion-backend.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
+        # single-node systems and mnnvl on Blackwell multi-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -4319,14 +4326,15 @@ class ServerArgs:
                 "NemotronHForCausalLM",
                 "NemotronHPuzzleForCausalLM",
             ]
-            and is_sm100_supported()
+            and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
             and not self.enable_dp_attention
+            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
             self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
