@@ -403,7 +403,34 @@ class LayerNorm(CustomOp):
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
-class FP32LayerNorm(nn.LayerNorm):
+@CustomOp.register("fp32_layer_norm")
+class FP32LayerNorm(CustomOp, nn.LayerNorm):
+
+    def __init__(
+        self,
+        normalized_shape,
+        eps=1e-5,
+        elementwise_affine=True,
+        bias=True,
+        device=None,
+        dtype=None,
+    ):
+        nn.LayerNorm.__init__(
+            self,
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+        self._forward_method = self.dispatch_forward()
+        
+        try:
+            import attentions
+        except:
+            self._forward_method = self.forward_native
+
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
     ) -> torch.Tensor | None:
@@ -430,18 +457,7 @@ class FP32LayerNorm(nn.LayerNorm):
         self.__dict__[attr] = (key, fp32_param)
         return fp32_param
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if _is_npu:
-            output, _, _ = torch.ops.attentions.layernorm(
-                input=inputs,
-                normalized_shape=list(self.normalized_shape),
-                weight=self.weight,
-                bias=self.bias,
-                eps=self.eps,
-                impl_mode = 0 # 0 - high precision, 1 - high perfomance, 2 - float16.
-            )
-            return output
-        
+    def forward_native(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         device = inputs.device
         weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
@@ -454,6 +470,24 @@ class FP32LayerNorm(nn.LayerNorm):
             self.eps,
         ).to(origin_dtype)
 
+    def forward_cuda(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(inputs)
+
+    def forward_npu(self, inputs: torch.Tensor) -> torch.Tensor:
+        origin_dtype = inputs.dtype
+        device = inputs.device
+        weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
+        bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
+
+        output, _, _ = torch.ops.attentions.layernorm(
+                input=inputs,
+                normalized_shape=list(self.normalized_shape),
+                weight=weight,
+                bias=bias,
+                eps=self.eps,
+                impl_mode = 0 # 0 - high precision, 1 - high perfomance, 2 - fp16.
+            )
+        return output.to(origin_dtype)
 
 ################################################################################
 # Fused norm kernel
