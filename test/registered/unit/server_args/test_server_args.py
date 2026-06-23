@@ -965,6 +965,54 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDecoupledSpecArgs(CustomTestCase):
+    """Decoupled speculative-decoding CLI flags.
+
+    These flags are auto-derived from the ``A[...]`` field metadata on
+    ``ServerArgs``; a bare annotation is silently skipped by
+    ``add_cli_args_from_dataclass``. This guards against the regression where
+    the flags went missing (e.g. after rebasing onto the auto-gen
+    ``add_cli_args``), which the direct-attribute ``PortArgs`` tests cannot
+    catch because they never exercise the CLI.
+    """
+
+    def test_decoupled_spec_cli_flags_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--decoupled-spec-role",
+                "verifier",
+                "--decoupled-spec-bind-endpoint",
+                "ipc:///tmp/v",
+                "--decoupled-spec-connect-endpoints",
+                '["ipc:///tmp/d"]',
+                "--decoupled-spec-rank",
+                "0",
+                "--spec-trace-dir",
+                "/tmp/tr",
+            ]
+        )
+        self.assertEqual(server_args.decoupled_spec_role, "verifier")
+        self.assertEqual(server_args.decoupled_spec_bind_endpoint, "ipc:///tmp/v")
+        self.assertEqual(server_args.decoupled_spec_connect_endpoints, ["ipc:///tmp/d"])
+        self.assertEqual(server_args.decoupled_spec_rank, 0)
+        self.assertEqual(server_args.spec_trace_dir, "/tmp/tr")
+
+    def test_decoupled_spec_role_defaults_to_null(self):
+        server_args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(server_args.decoupled_spec_role, "null")
+        self.assertIsNone(server_args.decoupled_spec_bind_endpoint)
+        self.assertIsNone(server_args.decoupled_spec_connect_endpoints)
+        self.assertIsNone(server_args.decoupled_spec_rank)
+
+    def test_decoupled_spec_role_rejects_invalid_choice(self):
+        with self.assertRaises(SystemExit):
+            prepare_server_args(
+                ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
+            )
+
+
 class TestAdaptiveSpecArgs(CustomTestCase):
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
