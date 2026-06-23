@@ -13,49 +13,63 @@ Conventions for SGLang's three large classes:
 
 ## 1. Frozen Code
 
-Some core files are **frozen**: they have been decomposed into a thin orchestrator over collaborator classes and must stay that way. A frozen file may be touched only to construct, wire, and delegate to a collaborator — never to add logic.
+Some core files are **frozen**: they are *orchestration-only* — a thin composition root that constructs collaborators, wires them, delegates to them, and coordinates the calls. They must stay that way. **Domain logic does not belong in a frozen file**; it lives in a collaborator class in its own module.
 
 ### Why
 
 - The file is a thin orchestrator over collaborator classes; freezing keeps it that way and stops it growing back into a god class.
-- Keeping logic in collaborators (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
-- So any non-trivial edit to a frozen file is a smell — the logic belongs in a collaborator, not here.
+- Keeping domain logic in collaborators (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
+- The orchestrator is the composition root: it may know about every collaborator, because wiring and sequencing them is its job. Coordination stays here — domain logic does not.
 
 ### Frozen files
 
 - `python/sglang/srt/model_executor/model_runner.py`
 
-### Allowed edits
+### Allowed: orchestration
 
-Put any new logic in a **collaborator class in its own module**. The frozen file then references it in only these three ways:
+Every statement refers to a collaborator and is one of:
 
-1. **Construct** — a short `init_<thing>` helper whose body is essentially a single construction (follows §2); use `maybe_init_<thing>` with a one-line gate when construction is conditional.
+1. **Construct** — a short `init_<thing>` helper whose body is essentially a single construction (follows §2); use `maybe_init_<thing>` with a one-line gate when conditional.
 2. **Wire** — a short call that runs the helper from the orchestrator (e.g. in `__init__`).
-3. **Delegate** — short calls to the collaborator's methods at the necessary call sites (`self.foo.bar(...)`), with no new surrounding logic.
+3. **Delegate** — calls to a collaborator's methods at the necessary call sites (`self.foo.run(...)`).
+4. **Coordinate** — the minimal control flow that *selects or orders* the above: an `if` choosing whether / which collaborator to wire or call, the order of calls, threading one call's result into the next.
+
+Heuristic: a statement is allowed only if it constructs, wires, delegates, or selects/orders those — never if it *computes or transforms* a value beyond passing arguments and results through.
 
 ```python
-# In model_runner.py — the only edits allowed: construct, wire, delegate.
-def init_foo(self):                                              # construct
+# model_runner.py — orchestration only.
+def init_foo(self):                        # construct
     self.foo = FooManager(server_args=self.server_args, device=self.device)
 
-self.init_foo()                                                  # wire (in __init__)
+self.init_foo()                            # wire (in __init__)
 
-self.foo.bar(forward_batch)                                      # delegate (at the call site)
+if self.server_args.enable_bar:            # coordinate: select
+    self.bar.prepare(forward_batch)        # delegate
+out = self.foo.run(forward_batch)          # delegate
+self.baz.consume(out)                      # coordinate: thread result into next delegate
 ```
 
-### Not allowed
+### Not allowed: domain logic
 
-Anything beyond construct / wire / delegate — config building, branching, loops, warmup orchestration, post-processing. That logic lives in the collaborator, not the frozen file.
+Config building, data transformation, algorithm bodies, math, post-processing — any branch or loop that *computes* rather than *coordinates*. It belongs in the collaborator.
 
 ```python
-# NOT allowed in a frozen file: construction / logic inlined instead of delegated.
+# NOT allowed in a frozen file: domain logic inlined.
 self.foo = None
 if self.server_args.enable_foo:
     config = build_foo_config(self.model_config, self.device)   # config logic in frozen file
     self.foo = FooManager(config)                               # inline construction, not via (maybe_)init_foo
+    out = [step(x) for x in batch]                              # computation, not coordination
 ```
 
-Move that body into `FooManager` (its `__init__` or a factory) plus a `(maybe_)init_foo` helper; the frozen file keeps only construct + wire + delegate.
+Move that body into `FooManager` (its `__init__` or a factory) plus a `(maybe_)init_foo` helper.
+
+### Where coordination logic goes
+
+1. **Default: extract.** Pull cohesive coordination into a low-coupling collaborator (an initializer, a forward pipeline) and delegate to it.
+2. **Residue stays.** Coordination that can't be cohesively extracted may remain — but only the minimal **Coordinate** form above, kept pseudocode-readable. This is the explicit exception, not a fallback; note why it stays.
+
+When the residue outgrows pseudocode, that is the signal to extract a dedicated coordinator — not to keep inlining.
 
 ## 2. `__init__` style
 
