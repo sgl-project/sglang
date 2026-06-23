@@ -947,6 +947,11 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
+    # FlashInfer MegaMOE (generic moe_ep_v2.MoEEpMegaLayer backend). Sizes the
+    # per-rank symmetric workspace; must be >= the largest padded per-rank batch
+    # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
+    SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)

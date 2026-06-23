@@ -1559,6 +1559,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
+                if get_moe_a2a_backend().is_flashinfer_megamoe():
+                    from sglang.srt.layers.moe.flashinfer_megamoe import (
+                        build_flashinfer_megamoe_layer,
+                    )
+
+                    build_flashinfer_megamoe_layer(layer)
+                    return
+
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 
@@ -2156,6 +2164,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                run_flashinfer_megamoe,
+            )
+
+            return run_flashinfer_megamoe(layer, dispatch_output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
