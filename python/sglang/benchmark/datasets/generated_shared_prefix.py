@@ -51,6 +51,9 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     ordered: bool
     group_distribution: str = "uniform"
     zipf_alpha: Optional[float] = None
+    turn_gap_short_s: float = 0.0
+    turn_gap_long_s: float = 0.0
+    turn_gap_long_prob: float = 0.0
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
@@ -83,6 +86,20 @@ class GeneratedSharedPrefixDataset(BaseDataset):
                 "or set --gsp-group-distribution=zipf"
             )
 
+        turn_gap_short_s = getattr(args, "gsp_turn_gap_short_s", 0.0)
+        turn_gap_long_s = getattr(args, "gsp_turn_gap_long_s", 0.0)
+        turn_gap_long_prob = getattr(args, "gsp_turn_gap_long_prob", 0.0)
+        if turn_gap_short_s < 0 or turn_gap_long_s < 0:
+            raise ValueError(
+                f"turn gaps must be >= 0, got --gsp-turn-gap-short-s="
+                f"{turn_gap_short_s!r} --gsp-turn-gap-long-s={turn_gap_long_s!r}"
+            )
+        if not 0.0 <= turn_gap_long_prob <= 1.0:
+            raise ValueError(
+                f"--gsp-turn-gap-long-prob must be in [0, 1], "
+                f"got {turn_gap_long_prob!r}"
+            )
+
         return cls(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -97,6 +114,9 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=getattr(args, "gsp_ordered", False),
             group_distribution=group_distribution,
             zipf_alpha=zipf_alpha,
+            turn_gap_short_s=turn_gap_short_s,
+            turn_gap_long_s=turn_gap_long_s,
+            turn_gap_long_prob=turn_gap_long_prob,
         )
 
     def load(
@@ -117,6 +137,9 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=self.ordered,
             group_distribution=self.group_distribution,
             zipf_alpha=self.zipf_alpha,
+            turn_gap_short_s=self.turn_gap_short_s,
+            turn_gap_long_s=self.turn_gap_long_s,
+            turn_gap_long_prob=self.turn_gap_long_prob,
         )
 
 
@@ -166,6 +189,9 @@ def sample_generated_shared_prefix_requests(
     ordered: bool = False,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    turn_gap_short_s: float = 0.0,
+    turn_gap_long_s: float = 0.0,
+    turn_gap_long_prob: float = 0.0,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching.
 
@@ -263,6 +289,18 @@ def sample_generated_shared_prefix_requests(
         probs = _zipf_group_probs(num_groups, zipf_alpha)
         assignment = rng.choice(num_groups, size=total_slots, replace=True, p=probs)
 
+    # Per-turn client-side gaps (tool-call / think-time pauses before each
+    # round after the first). Sampled from an isolated RNG stream (seed, 1) so
+    # enabling gaps never perturbs the group assignment above (seeded with the
+    # bare seed) or the module-level random/numpy state the prompt pool uses.
+    gaps_enabled = num_turns > 1 and (
+        turn_gap_short_s > 0 or (turn_gap_long_s > 0 and turn_gap_long_prob > 0)
+    )
+    if gaps_enabled:
+        gap_rng = np.random.default_rng([seed, 1])
+        is_long = gap_rng.random(size=(total_slots, num_turns - 1)) < turn_gap_long_prob
+        slot_turn_gaps = np.where(is_long, turn_gap_long_s, turn_gap_short_s)
+
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
@@ -286,12 +324,19 @@ def sample_generated_shared_prefix_requests(
         prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
         output_len_val = int(output_lens[src_g, src_p])
 
+        turn_gaps_s = (
+            [0.0] + [float(g) for g in slot_turn_gaps[slot_idx]]
+            if gaps_enabled
+            else None
+        )
+
         input_requests.append(
             DatasetRow(
                 prompt=full_prompt,
                 prompt_len=prompt_len,
                 output_len=output_len_val,
                 routing_key=routing_key,
+                turn_gaps_s=turn_gaps_s,
             )
         )
         total_input_tokens += prompt_len
