@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
     _CHUNK_NUMEL,
-    _compare_raw_pair,
+    RawReference,
+    ReferenceWeight,
     _compare_references,
     select_quantization_method,
 )
@@ -116,20 +117,14 @@ class WeightChecker:
             if getattr(param, "_skip_weight_check", False)
         }
 
-        # Reuse the snapshot/compare postprocess pipeline so fp8 weights are
-        # dequantized to bf16 before hashing — two (qweight, scale) pairs that
-        # produce the same bf16 must produce the same checksum.
+        # Hash the dequantized weight so two (qweight, scale) pairs with the same
+        # bf16 hash equal.
         checksums = {}
-        for name, should_compare, entry in _postprocess_tensors(
+        for name, should_compare, ref in _postprocess_tensors(
             dict(self._model_state()), skip_compare_names, quant_plan
         ):
-            if not should_compare:
-                continue
-            if entry[0] == "quant":
-                tensor = entry[1].dequantize(dtype=torch.bfloat16)
-            else:
-                tensor = entry[1]
-            checksums[name] = _hash_tensor(tensor.data)
+            if should_compare:
+                checksums[name] = _hash_tensor(ref.dequantize().data)
 
         h = hashlib.sha256()
         for name in sorted(checksums):
@@ -173,78 +168,50 @@ def _hash_tensor(t: torch.Tensor) -> str:
 
 
 def _check_tensors(
-    expect_tensors: Iterable[Tuple[str, bool, Tuple]],
-    actual_tensors: Iterable[Tuple[str, bool, Tuple]],
+    expect_tensors: Iterable[Tuple[str, bool, ReferenceWeight]],
+    actual_tensors: Iterable[Tuple[str, bool, ReferenceWeight]],
     allow_quant_error: bool = False,
 ):
     good_names = []
     error_messages = []
     info_messages = []
 
-    for (expect_name, expect_should_compare, expect_entry), (
+    for (expect_name, should_compare, expect_ref), (
         actual_name,
         actual_should_compare,
-        actual_entry,
+        actual_ref,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
-            expect_should_compare == actual_should_compare
-        ), f"{expect_should_compare=} {actual_should_compare=}"
-        assert expect_entry[0] == actual_entry[0]
+            should_compare == actual_should_compare
+        ), f"{should_compare=} {actual_should_compare=}"
         name = expect_name
-        should_compare = expect_should_compare
 
-        if expect_entry[0] == "quant":
-            expect_ref, actual_ref = expect_entry[1], actual_entry[1]
-            try:
-                equal, max_abs_err, mean_abs_err, num_exceed = _compare_references(
-                    expect_ref, actual_ref
-                )
-            except Exception as e:
-                e.add_note(
-                    f"when handling {name=} expect={expect_ref!r} actual={actual_ref!r}"
-                )
-                raise
-            if equal:
-                good_names.append(name)
-                continue
-            msg = (
-                f"name={name} "
-                f"max_abs_err={max_abs_err} "
-                f"mean_abs_err={mean_abs_err} "
-                f"num_exceed_quant_ulp_tolerance={num_exceed} "
-                f"expect={expect_ref!r} actual={actual_ref!r} "
+        try:
+            equal, max_abs_err, mean_abs_err, num_exceed = _compare_references(
+                expect_ref, actual_ref
             )
-            if not should_compare:
-                info_messages.append(msg)
-            elif allow_quant_error and num_exceed == 0:
-                info_messages.append(msg + "(within quantization ULP tolerance)")
-            else:
-                error_messages.append(msg)
-            continue
-
-        expect = expect_entry[1]
-        actual = actual_entry[1]
-        equal, max_abs_err, mean_abs_err = _compare_raw_pair(
-            expect, actual, compute_stats=should_compare
-        )
+        except Exception as e:
+            e.add_note(
+                f"when handling {name=} expect={expect_ref!r} actual={actual_ref!r}"
+            )
+            raise
         if equal:
             good_names.append(name)
-        elif not should_compare:
-            info_messages.append(
-                f"name={name} differs (not compared) "
-                f"shape={tuple(actual.shape)} dtype={actual.dtype} "
-            )
+            continue
+        msg = (
+            f"name={name} "
+            f"max_abs_err={max_abs_err} "
+            f"mean_abs_err={mean_abs_err} "
+            f"num_exceed={num_exceed} "
+            f"expect={expect_ref!r} actual={actual_ref!r} "
+        )
+        if not should_compare:
+            info_messages.append(msg)
+        elif allow_quant_error and num_exceed == 0:
+            info_messages.append(msg + "(within quantization ULP tolerance)")
         else:
-            error_messages.append(
-                f"name={name} "
-                f"max_abs_err={max_abs_err} "
-                f"mean_abs_err={mean_abs_err} "
-                f"shape={tuple(actual.shape)} "
-                f"expect_dtype={expect.dtype} actual_dtype={actual.dtype} "
-                f"expect_head={expect.reshape(-1)[:5].float().tolist()} "
-                f"actual_head={actual.reshape(-1)[:5].float().tolist()} "
-            )
+            error_messages.append(msg)
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
     if len(info_messages) > 0:
@@ -299,23 +266,21 @@ def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
     quant_plan: Optional[Dict[str, Tuple[type, str]]] = None,
-) -> Iterable[Tuple[str, bool, Tuple]]:
-    """Yields (name, should_compare, entry); entry is ("quant", ReferenceWeight)
-    for the weight pairs in quant_plan (empty => all raw) or ("raw", tensor)."""
+) -> Iterable[Tuple[str, bool, ReferenceWeight]]:
+    """Yields (name, should_compare, ReferenceWeight): quant_plan weights become a
+    dequant-aware reference (consuming their scale), everything else is raw."""
     skip_compare_names = set(skip_compare_names)
     quant_plan = quant_plan or {}
+    scale_names = {scale for _, scale in quant_plan.values()}
 
-    # Skip non-persistent buffers (registered with persistent=False; recomputed
-    # after weight load and not part of the synced payload).
-    for name in raw:
-        if _is_non_persistent_buffer_name(name):
-            skip_compare_names.add(name)
-            logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
-
-    for w_name, (rw_cls, s_name) in quant_plan.items():
-        skip_compare_names.update((w_name, s_name))
-        yield w_name, True, ("quant", rw_cls(raw[w_name], raw[s_name]))
-
-    for name in raw:
-        should_compare = name not in skip_compare_names
-        yield name, should_compare, ("raw", raw[name])
+    for name, tensor in raw.items():
+        if name in scale_names:
+            continue  # compared via its weight's reference
+        if name in quant_plan:
+            rw_cls, s_name = quant_plan[name]
+            yield name, True, rw_cls(tensor, raw[s_name])
+        else:
+            should_compare = name not in skip_compare_names and (
+                not _is_non_persistent_buffer_name(name)
+            )
+            yield name, should_compare, RawReference(tensor)

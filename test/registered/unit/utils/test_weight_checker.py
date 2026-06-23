@@ -37,6 +37,7 @@ from sglang.srt.utils.weight_checker import (
 )
 from sglang.srt.utils.weight_checker_comparator import (
     Fp8BlockReference,
+    RawReference,
     ReferenceWeight,
     _compare_references,
     select_quantization_method,
@@ -52,34 +53,32 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 # ---------------------------------------------------------------------------
 
 
-Entry = Tuple[str, bool, Tuple]
+Entry = Tuple[str, bool, ReferenceWeight]
 
 
 def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:
-    """Compare two streams of (name, should_compare, entry) where entry is
-    ("raw", tensor) or ("quant", Fp8BlockReference)."""
+    """Compare two streams of (name, should_compare, ReferenceWeight)."""
     actual_list: List[Entry] = list(actual)
     expected_list: List[Entry] = list(expected)
     assert len(actual_list) == len(
         expected_list
     ), f"length mismatch: actual={len(actual_list)} expected={len(expected_list)}"
-    for i, ((a_name, a_flag, a_entry), (e_name, e_flag, e_entry)) in enumerate(
+    for i, ((a_name, a_flag, a_ref), (e_name, e_flag, e_ref)) in enumerate(
         zip(actual_list, expected_list)
     ):
         assert a_name == e_name, f"[{i}] name: {a_name!r} != {e_name!r}"
         assert a_flag == e_flag, f"[{i}] should_compare: {a_flag} != {e_flag}"
-        assert a_entry[0] == e_entry[0], f"[{i}] entry kind mismatch for {a_name!r}"
-        if a_entry[0] == "quant":
-            a_ref, e_ref = a_entry[1], e_entry[1]
+        assert type(a_ref) is type(e_ref), f"[{i}] kind mismatch for {a_name!r}"
+        if isinstance(a_ref, Fp8BlockReference):
             torch.testing.assert_close(
-                a_ref.w_q, e_ref.w_q, msg=f"[{i}] w_q mismatch for {a_name!r}"
+                a_ref.w_q, e_ref.w_q, msg=f"[{i}] w_q {a_name!r}"
             )
             torch.testing.assert_close(
-                a_ref.w_s, e_ref.w_s, msg=f"[{i}] w_s mismatch for {a_name!r}"
+                a_ref.w_s, e_ref.w_s, msg=f"[{i}] w_s {a_name!r}"
             )
         else:
             torch.testing.assert_close(
-                a_entry[1], e_entry[1], msg=f"[{i}] tensor mismatch for {a_name!r}"
+                a_ref.tensor, e_ref.tensor, msg=f"[{i}] tensor {a_name!r}"
             )
 
 
@@ -223,14 +222,14 @@ class TestPostprocessTensors(CustomTestCase):
         raw = {"a.weight": a, "b.bias": b}
         _assert_entries_close(
             _postprocess_tensors(raw, set()),
-            [("a.weight", True, ("raw", a)), ("b.bias", True, ("raw", b))],
+            [("a.weight", True, RawReference(a)), ("b.bias", True, RawReference(b))],
         )
 
     def test_weight_alone_without_scale_inv_does_not_trigger_dequant(self):
         w = torch.randn(4)
         raw = {"x.weight": w}
         _assert_entries_close(
-            _postprocess_tensors(raw, set()), [("x.weight", True, ("raw", w))]
+            _postprocess_tensors(raw, set()), [("x.weight", True, RawReference(w))]
         )
 
     # --- non-persistent buffer skip ---
@@ -245,8 +244,8 @@ class TestPostprocessTensors(CustomTestCase):
         _assert_entries_close(
             _postprocess_tensors(raw, set()),
             [
-                ("model.rotary_emb.cos_sin_cache", False, ("raw", cache)),
-                ("model.layers.0.weight", True, ("raw", plain)),
+                ("model.rotary_emb.cos_sin_cache", False, RawReference(cache)),
+                ("model.layers.0.weight", True, RawReference(plain)),
             ],
         )
 
@@ -254,14 +253,14 @@ class TestPostprocessTensors(CustomTestCase):
         t = torch.randn(4)
         _assert_entries_close(
             _postprocess_tensors({"model.rotary_emb.inv_freq": t}, set()),
-            [("model.rotary_emb.inv_freq", False, ("raw", t))],
+            [("model.rotary_emb.inv_freq", False, RawReference(t))],
         )
 
     def test_skips_weight_fp32_substring(self):
         t = torch.randn(4)
         _assert_entries_close(
             _postprocess_tensors({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, ("raw", t))],
+            [("model.layers.0.mlp.gate._weight_fp32", False, RawReference(t))],
         )
 
     def test_substring_match_not_endswith(self):
@@ -269,7 +268,7 @@ class TestPostprocessTensors(CustomTestCase):
         t = torch.randn(4)
         _assert_entries_close(
             _postprocess_tensors({"weird.cos_sin_cache.foo.bar": t}, set()),
-            [("weird.cos_sin_cache.foo.bar", False, ("raw", t))],
+            [("weird.cos_sin_cache.foo.bar", False, RawReference(t))],
         )
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
@@ -282,11 +281,7 @@ class TestPostprocessTensors(CustomTestCase):
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
             _postprocess_tensors(raw, set(), plan),
-            [
-                ("x.weight", True, ("quant", ref)),
-                ("x.weight", False, ("raw", qweight)),
-                ("x.weight_scale_inv", False, ("raw", sf_packed_int32)),
-            ],
+            [("x.weight", True, ref)],
         )
 
     def test_fp8_quant_pair_yield_order_alongside_other_entries(self):
@@ -297,16 +292,14 @@ class TestPostprocessTensors(CustomTestCase):
             "x.weight_scale_inv": sf_fp32,
             "y.bias": bias,
         }
-        # All quant entries come first, then a raw pass over every key.
+        # scale_inv is consumed by its weight's reference; y.bias stays raw.
         ref = Fp8BlockReference(qweight, sf_fp32)
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
         _assert_entries_close(
             _postprocess_tensors(raw, set(), plan),
             [
-                ("x.weight", True, ("quant", ref)),
-                ("x.weight", False, ("raw", qweight)),
-                ("x.weight_scale_inv", False, ("raw", sf_fp32)),
-                ("y.bias", True, ("raw", bias)),
+                ("x.weight", True, ref),
+                ("y.bias", True, RawReference(bias)),
             ],
         )
 
@@ -316,7 +309,7 @@ class TestPostprocessTensors(CustomTestCase):
         s = torch.zeros(1, 1, dtype=torch.int32)
         _assert_entries_close(
             _postprocess_tensors({"x.weight_scale_inv": s}, set()),
-            [("x.weight_scale_inv", True, ("raw", s))],
+            [("x.weight_scale_inv", True, RawReference(s))],
         )
 
 
@@ -329,13 +322,19 @@ class TestCheckTensors(CustomTestCase):
 
     def test_passes_when_all_equal(self):
         t = torch.ones(2, 2)
-        expect = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
-        actual = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
+        expect = [
+            ("a", True, RawReference(t.clone())),
+            ("b", True, RawReference(t.clone())),
+        ]
+        actual = [
+            ("a", True, RawReference(t.clone())),
+            ("b", True, RawReference(t.clone())),
+        ]
         _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_raises_when_should_compare_true_and_diff(self):
-        expect = [("a", True, ("raw", torch.ones(2, 2)))]
-        actual = [("a", True, ("raw", torch.zeros(2, 2)))]
+        expect = [("a", True, RawReference(torch.ones(2, 2)))]
+        actual = [("a", True, RawReference(torch.zeros(2, 2)))]
         with self.assertRaises(Exception) as ctx:
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
         msg = str(ctx.exception)
@@ -344,25 +343,25 @@ class TestCheckTensors(CustomTestCase):
 
     def test_passes_when_should_compare_false_even_if_diff(self):
         # should_compare=False -> diff is logged, not raised.
-        expect = [("a", False, ("raw", torch.ones(2, 2)))]
-        actual = [("a", False, ("raw", torch.zeros(2, 2)))]
+        expect = [("a", False, RawReference(torch.ones(2, 2)))]
+        actual = [("a", False, RawReference(torch.zeros(2, 2)))]
         _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_name_mismatch(self):
-        expect = [("a", True, ("raw", torch.ones(2, 2)))]
-        actual = [("b", True, ("raw", torch.ones(2, 2)))]
+        expect = [("a", True, RawReference(torch.ones(2, 2)))]
+        actual = [("b", True, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_should_compare_mismatch(self):
-        expect = [("a", True, ("raw", torch.ones(2, 2)))]
-        actual = [("a", False, ("raw", torch.ones(2, 2)))]
+        expect = [("a", True, RawReference(torch.ones(2, 2)))]
+        actual = [("a", False, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_chunked_raw_stats_match_unchunked(self):
-        expect = [("a", True, ("raw", torch.zeros(10)))]
-        actual = [("a", True, ("raw", torch.arange(10.0)))]
+        expect = [("a", True, RawReference(torch.zeros(10)))]
+        actual = [("a", True, RawReference(torch.arange(10.0)))]
         with patch("sglang.srt.utils.weight_checker_comparator._CHUNK_NUMEL", 3):
             with self.assertRaises(Exception) as ctx:
                 _check_tensors(expect_tensors=expect, actual_tensors=actual)
@@ -371,8 +370,11 @@ class TestCheckTensors(CustomTestCase):
 
     def test_zip_strict_raises_on_length_mismatch(self):
         t = torch.ones(2, 2)
-        expect = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]
-        actual = [("a", True, ("raw", t.clone()))]
+        expect = [
+            ("a", True, RawReference(t.clone())),
+            ("b", True, RawReference(t.clone())),
+        ]
+        actual = [("a", True, RawReference(t.clone()))]
         with self.assertRaises(ValueError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
@@ -528,11 +530,11 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
         )
         with self.assertRaises(Exception) as ctx:
             self._check(self.e_raw, bad, allow_quant_error=True)
-        self.assertIn("num_exceed_quant_ulp_tolerance", str(ctx.exception))
+        self.assertIn("num_exceed", str(ctx.exception))
 
     def test_flag_does_not_relax_non_quant_tensors(self):
-        expect = [("a", True, ("raw", torch.ones(2, 2)))]
-        actual = [("a", True, ("raw", torch.ones(2, 2) + 0.5))]
+        expect = [("a", True, RawReference(torch.ones(2, 2)))]
+        actual = [("a", True, RawReference(torch.ones(2, 2) + 0.5))]
         with self.assertRaises(Exception):
             _check_tensors(
                 expect_tensors=expect, actual_tensors=actual, allow_quant_error=True
