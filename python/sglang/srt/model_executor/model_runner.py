@@ -132,6 +132,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.model_parallel import tensor_parallel
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
@@ -292,6 +293,17 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+
+
+def apply_torch_tp(
+    *,
+    model: nn.Module,
+    device: str,
+    tp_size: int,
+):
+    logger.info(f"Enabling torch tensor parallelism on {tp_size} devices.")
+    device_mesh = torch.distributed.init_device_mesh(device, (tp_size,))
+    tensor_parallel(model, device_mesh)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -2844,11 +2856,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def apply_torch_tp(self):
-        logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.layers.model_parallel import tensor_parallel
-
-        device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
-        tensor_parallel(self.model, device_mesh)
+        apply_torch_tp(model=self.model, device=self.device, tp_size=self.tp_size)
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
