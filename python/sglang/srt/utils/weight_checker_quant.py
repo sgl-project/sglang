@@ -50,9 +50,6 @@ class ReferenceWeight:
 
 
 class Fp8BlockReference(ReferenceWeight):
-    """fp8 block quant: a (weight, weight_scale_inv) pair, scale optionally
-    UE8M0-packed. Square blocks with a possibly-partial last row block."""
-
     def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
         self.w_q = w_q
         self.w_s = w_s
@@ -63,14 +60,11 @@ class Fp8BlockReference(ReferenceWeight):
     @staticmethod
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
         if w_s.dtype == torch.int32:
-            # UE8M0 packed format (Blackwell DeepGEMM)
             w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
         return w_s.to(torch.float32)
 
     @staticmethod
     def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
-        # Square blocks. The row dim may have a partial last block (so n//s_n is wrong),
-        # but the K dim is block-aligned, so k//s_k recovers the true block size exactly.
         k, s_k = w_q.shape[-1], w_s.shape[-1]
         assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
         block = k // s_k
@@ -140,15 +134,11 @@ def _compare_references(
 
 def select_quantization_method(quant_method) -> Optional[type]:
     """Select the ReferenceWeight subclass for a module's quant_method: None if the
-    module is not a quantized weight layer, the subclass for a supported format,
-    else raise. Dispatching on quant_method (not param names) is robust to
-    swizzled scales and per-format naming."""
+    module is not a quantized weight layer, the subclass for a supported format."""
     if not isinstance(quant_method, (LinearMethodBase, FusedMoEMethodBase)):
         return None
     if isinstance(quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)):
         return None
-    # fp8 block quant has square blocks; mxfp8 ([1, 32]) is non-square and
-    # per-tensor fp8 has no block scale, so neither is supported.
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
         and quant_method.block_quant
