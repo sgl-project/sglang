@@ -1156,7 +1156,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
         # See DeepseekV2MoE.forward. Gates only the simple (non-SBO) shared-expert
-        # alt-stream overlap; the SBO overlap path is governed by enable_sbo_overlap.
+        # alt-stream overlap; SBO follows the existing hook conditions.
         allow_alt_stream_overlap: bool = True,
     ) -> torch.Tensor:
         shared_output = None
@@ -1167,7 +1167,6 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
-        enable_sbo_overlap = self.alt_stream is not None
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -1210,7 +1209,7 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
 
-        if sbo_overlap_dispatch_flag and enable_sbo_overlap:
+        if sbo_overlap_dispatch_flag:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
@@ -1255,7 +1254,7 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        elif sbo_overlap_combine_flag and enable_sbo_overlap:
+        elif sbo_overlap_combine_flag:
             shared_output = None
 
             def _post_dispatch_hook(
@@ -1311,10 +1310,7 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
-        elif (
-            envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
-            and enable_sbo_overlap
-        ):
+        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
             # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
 
             def _post_dispatch_hook(
