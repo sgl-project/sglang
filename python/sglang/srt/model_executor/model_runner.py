@@ -1749,8 +1749,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
+    @staticmethod
     def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
+        self: WeightExporter, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
@@ -1759,8 +1760,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         # TODO: (chenyang) Add support for Qwen models.
         try:
-            return self.model.get_weights_by_name(
-                name, truncate_size, tp_size=self.tp_size
+            return self._mr.model.get_weights_by_name(
+                name, truncate_size, tp_size=self._mr.tp_size
             )
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
@@ -2685,21 +2686,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.token_ids_logprobs,
         )
 
-    def save_remote_model(self, url: str):
+    @staticmethod
+    def save_remote_model(self: WeightExporter, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
-        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
+        RemoteModelLoader.save_model(
+            self._mr.model, self._mr.model_config.model_path, url
+        )
 
+    @staticmethod
     def save_sharded_model(
-        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
+        self: WeightExporter,
+        path: str,
+        pattern: Optional[str] = None,
+        max_size: Optional[int] = None,
     ):
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
         logger.info(
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
-        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+        ShardedStateLoader.save_model(self._mr.model, path, pattern, max_size)
 
     def check_weights(self, action: str):
         return self._weight_checker.handle(action=action)
