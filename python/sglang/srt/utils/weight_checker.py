@@ -11,8 +11,8 @@ from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
     _CHUNK_NUMEL,
     ComparableWeight,
-    RawReference,
-    _compare_references,
+    RawComparable,
+    _compare_weights,
     select_comparable_weight,
 )
 
@@ -90,7 +90,7 @@ class WeightChecker:
     def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
 
-        reference_plan = _build_reference_plan(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._model_runner.model)
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -98,10 +98,10 @@ class WeightChecker:
         }
         _check_tensors(
             expect_tensors=_build_entries(
-                self._snapshot_tensors, skip_compare_names, reference_plan
+                self._snapshot_tensors, skip_compare_names, quantized_set
             ),
             actual_tensors=_build_entries(
-                dict(self._model_state()), skip_compare_names, reference_plan
+                dict(self._model_state()), skip_compare_names, quantized_set
             ),
             allow_quant_error=allow_quant_error,
         )
@@ -110,7 +110,7 @@ class WeightChecker:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        reference_plan = _build_reference_plan(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._model_runner.model)
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -121,7 +121,7 @@ class WeightChecker:
         # bf16 hash equal.
         checksums = {}
         for name, should_compare, ref in _build_entries(
-            dict(self._model_state()), skip_compare_names, reference_plan
+            dict(self._model_state()), skip_compare_names, quantized_set
         ):
             if should_compare:
                 checksums[name] = _hash_tensor(ref.dequantize().data)
@@ -188,7 +188,7 @@ def _check_tensors(
         name = expect_name
 
         try:
-            equal, max_abs_err, mean_abs_err, num_exceed = _compare_references(
+            equal, max_abs_err, mean_abs_err, num_exceed = _compare_weights(
                 expect_ref, actual_ref
             )
         except Exception as e:
@@ -242,45 +242,45 @@ def _random_like(t: torch.Tensor):
     )
 
 
-def _build_reference_plan(model) -> Dict[str, Tuple[type, str]]:
+def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
     """Apply the router across the model: {weight_name: (ComparableWeight subclass,
     scale_name)} for each weight in a module routed to a ComparableWeight. Weights
-    absent from the plan (int4, mxfp8, unquantized, ...) compare raw.
+    absent from the set (int4, mxfp8, unquantized, ...) compare raw.
     select_comparable_weight raises for an unsupported quant format (e.g. nvfp4).
     """
-    plan = {}
+    quantized_set = {}
     for module_name, module in model.named_modules():
-        rw_cls = select_comparable_weight(getattr(module, "quant_method", None))
-        if rw_cls is None:
+        comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
+        if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
         own = {name for name, _ in module.named_parameters(recurse=False)}
         for name in own:
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
-                plan[prefix + name] = (rw_cls, prefix + scale)
-    return plan
+                quantized_set[prefix + name] = (comparable_cls, prefix + scale)
+    return quantized_set
 
 
 def _build_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-    reference_plan: Optional[Dict[str, Tuple[type, str]]] = None,
+    quantized_set: Optional[Dict[str, Tuple[type, str]]] = None,
 ) -> Iterable[Tuple[str, bool, ComparableWeight]]:
-    """Yields (name, should_compare, ComparableWeight): planned weights become a
-    dequant-aware reference (consuming their scale), everything else is raw."""
+    """Yields (name, should_compare, ComparableWeight): quantized weights become a
+    dequant-aware comparable (consuming their scale), everything else is raw."""
     skip_compare_names = set(skip_compare_names)
-    reference_plan = reference_plan or {}
-    scale_names = {scale for _, scale in reference_plan.values()}
+    quantized_set = quantized_set or {}
+    scale_names = {scale for _, scale in quantized_set.values()}
 
     for name, tensor in raw.items():
         if name in scale_names:
-            continue  # compared via its weight's reference
-        if name in reference_plan:
-            rw_cls, s_name = reference_plan[name]
-            yield name, True, rw_cls(tensor, raw[s_name])
+            continue  # compared via its weight's comparable
+        if name in quantized_set:
+            comparable_cls, s_name = quantized_set[name]
+            yield name, True, comparable_cls(tensor, raw[s_name])
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)
             )
-            yield name, should_compare, RawReference(tensor)
+            yield name, should_compare, RawComparable(tensor)

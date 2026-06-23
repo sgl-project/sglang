@@ -38,7 +38,7 @@ class ComparableWeight:
         raise NotImplementedError
 
 
-class Fp8BlockReference(ComparableWeight):
+class Fp8BlockComparable(ComparableWeight):
     """Deepseek-style FP8 quantization."""
 
     def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
@@ -93,7 +93,7 @@ class Fp8BlockReference(ComparableWeight):
         return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
 
 
-class RawReference(ComparableWeight):
+class RawComparable(ComparableWeight):
     """Unquantized tensor: identity dequant, exact (no-tolerance) compare."""
 
     def __init__(self, tensor: torch.Tensor):
@@ -111,7 +111,7 @@ class RawReference(ComparableWeight):
         return self.tensor
 
 
-def _compare_references(
+def _compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
 ) -> Tuple[bool, float, float, int]:
     """Chunked compare of two ComparableWeights in dequant space. Returns
@@ -143,7 +143,7 @@ def _compare_references(
 def select_comparable_weight(quant_method) -> Optional[type]:
     """Single router: map a module's quant_method to its ComparableWeight subclass.
 
-    - fp8 block quant -> Fp8BlockReference: its scale is requantized to ue8m0 on
+    - fp8 block quant -> Fp8BlockComparable: its scale is requantized to ue8m0 on
       load, so the same weight lands as two different fp8 encodings; compare in
       dequant space with ULP tolerance.
     - nvfp4 -> raise: e4m3 fractional block scale + max-recomputed global scale is
@@ -157,7 +157,7 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and quant_method.block_quant
         and not quant_method.use_mxfp8
     ):
-        return Fp8BlockReference
+        return Fp8BlockComparable
     if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
