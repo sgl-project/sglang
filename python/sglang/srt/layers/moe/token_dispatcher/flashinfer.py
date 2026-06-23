@@ -183,12 +183,8 @@ class FlashinferDispatcher(BaseDispatcher):
                 x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
             else:
                 x_col = x.shape[1]
-                x = torch.zeros(
-                    0, x_col // 2, dtype=torch.uint8, device=x.device
-                )
-                x_sf = torch.zeros(
-                    0, x_col // 16, dtype=torch.uint8, device=x.device
-                )
+                x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
+                x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
 
         payloads = []
         payloads.append(x)
