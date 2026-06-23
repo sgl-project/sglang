@@ -770,11 +770,15 @@ def _force_include_current_slot(
     req_pool_indices: Optional[torch.Tensor],  # int32 [bs] (cosine)
     req_to_token: Optional[torch.Tensor],  # int32 [num_pool, max_ctx] (cosine)
 ) -> None:
-    """Fail-closed, finite-norm-gated current-slot +inf force-include (AC-7).
+    """Fail-closed current-slot +inf force-include.
 
     0-alloc / graph-safe: a single Triton program per row reads the existing
-    buffers and writes +inf in place only for a width-covered current slot whose
-    (cosine) q/k norms are finite. No clamp-to-wrong-token fallback.
+    buffers and writes +inf in place only for a width-covered current slot
+    (no clamp-to-wrong-token fallback) whose row q-norm is finite (cosine).
+    The current slot's OWN key-norm is NOT gated: the current decode token's KV
+    is valid by construction. The ``key_norm_cache``/``req_pool_indices``/
+    ``req_to_token`` args are reserved for re-enabling that gate once the
+    current-slot key-norm-cache populate timing is fixed (see the kernel note).
     """
     if bs <= 0 or max_seq_len <= 0:
         return
@@ -1114,11 +1118,11 @@ def retrieve_topk_graph_safe(
     # BEFORE the top-k, writing the AUTHORITATIVE buffer (bf16(+inf) upcasts to
     # fp32(+inf), so the selection is identical on either dtype). Only seq_len-1
     # is touched, so every other reused slot stays -inf-masked — the stale-slot
-    # hazard is not reopened (AC-4). FAIL-CLOSED (AC-7): the helper writes +inf
-    # only for a width-covered seq_len-1 (NO clamp to a different token on a
-    # selector-width miss) and, for cosine, only when the row's q-norm and the
-    # current physical slot's k-norm are finite (AC-5: a NaN/inf norm can never
-    # be force-selected). 0-alloc / graph-safe Triton helper.
+    # hazard is not reopened. FAIL-CLOSED: the helper writes +inf only for a
+    # width-covered seq_len-1 (NO clamp to a different token on a selector-width
+    # miss) and, for cosine, only when the row's q-norm is finite. The current
+    # slot's own key-norm is not gated (the current token's KV is valid by
+    # construction). 0-alloc / graph-safe Triton helper.
     if include_current_slot and max_seq_len > 0:
         _force_include_current_slot(
             topk_scores,
