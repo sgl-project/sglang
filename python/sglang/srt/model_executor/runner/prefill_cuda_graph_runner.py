@@ -192,9 +192,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            # Graph replay must preserve input_embeds=None for text-only requests.
-            # A zero static tensor makes multimodal models skip token embeddings.
-            register_input_embeds=False,
+            # tc_piecewise compiles the inner language model; the outer
+            # multimodal wrapper computes input_embeds and passes them as an
+            # argument, so replay needs a stable graph buffer. Breakable
+            # captures the inner embedding path directly and can preserve
+            # input_embeds=None for text-only requests.
+            register_input_embeds=_prefill_backend_name == Backend.TC_PIECEWISE,
             source=self.buffers,
         )
 
