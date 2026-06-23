@@ -157,6 +157,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
+    resolve_min_batch,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1037,12 +1038,14 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    # Cap at max_running_requests: a larger threshold could
-                    # never be reached and would always delay until the time cap.
-                    min_batch=(
-                        min(x, self.max_running_requests)
-                        if (x := self.server_args.prefill_delayer_min_batch) is not None
-                        else None
+                    # Clamp to the DFlash-derived adaptive cap so the trigger
+                    # can never delay more aggressively than the original
+                    # always-on heuristic: disabled on small clusters
+                    # (max_running_requests < 8) and capped to a scale-relative
+                    # target otherwise. See resolve_min_batch for the formula.
+                    min_batch=resolve_min_batch(
+                        self.server_args.prefill_delayer_min_batch,
+                        self.max_running_requests,
                     ),
                     device=self.tp_group.device,
                 )

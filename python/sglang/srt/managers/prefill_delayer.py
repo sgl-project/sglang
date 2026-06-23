@@ -40,6 +40,35 @@ class _NegotiateOutput(NamedTuple):
     wait_seconds: float = 0.0
 
 
+def resolve_min_batch(
+    user_value: Optional[int], max_running_requests: int
+) -> Optional[int]:
+    """Resolve the min-batch trigger threshold, mirroring the DFlash heuristic.
+
+    The original DFlash prefill-refill heuristic was always-on and derived its
+    target adaptively from ``max_running_requests``. We preserve that safety
+    boundary here so the opt-in trigger can never delay *more aggressively*
+    than DFlash did:
+
+    * ``max_running_requests < 8`` → disabled (returns ``None``). Small clusters
+      rarely benefit from batched admission; the cost is pure TTFT regression.
+    * Otherwise the threshold is capped at ``min(user_value, formula)``, where
+      ``formula = min(4, max(2, (max_run + 5) // 6))`` scales the target down
+      as the cluster grows, keeping the worst-case wait short.
+
+    A ``user_value`` of ``None`` or ``<= 1`` keeps the trigger disabled.
+    """
+    if user_value is None or user_value <= 1:
+        return None
+
+    max_running_requests = max(0, int(max_running_requests))
+    if max_running_requests < 8:
+        return None
+
+    formula = min(4, max(2, (max_running_requests + 5) // 6))
+    return min(user_value, formula)
+
+
 class PrefillDelayer:
     def __init__(
         self,
