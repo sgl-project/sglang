@@ -117,6 +117,29 @@ class HostKVCache(abc.ABC):
     def get_size_per_token(self):
         raise NotImplementedError()
 
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(getattr(device_pool, "layer_shard_enabled", False))
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        if not self._is_device_layer_sharded(device_pool):
+            return True
+        return device_pool._is_layer_owned(
+            getattr(device_pool, "start_layer", 0) + layer_id
+        )
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        layer_num = getattr(device_pool, "layer_num", None)
+        if layer_num is None:
+            layer_num = getattr(self, "layer_num")
+        if not self._is_device_layer_sharded(device_pool):
+            return list(range(layer_num))
+        return [
+            layer_id
+            for layer_id in range(layer_num)
+            if self._is_device_layer_owned(device_pool, layer_id)
+        ]
+
     @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()

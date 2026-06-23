@@ -74,6 +74,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    enable_dsa_cache_layer_split: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -93,6 +94,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
 
 
 @dataclasses.dataclass
@@ -117,6 +119,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
+        self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -138,8 +141,18 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        hybrid_mla_needs_all_cp_ranks = self.is_hybrid_mla_backend and (
+            self.attn_cp_size > 1 or disaggregation_mode == DisaggregationMode.DECODE
+        )
+        
+        layer_split_needs_all_cp_ranks = (
+            getattr(server_args, "enable_dsa_cache_layer_split", False)
+            and self.attn_cp_size > 1
+        )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or hybrid_mla_needs_all_cp_ranks
+            or layer_split_needs_all_cp_ranks
         )
 
         # bind zmq socket
@@ -287,7 +300,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         elif self.attn_tp_size > info.attn_tp_size:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
@@ -298,7 +311,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         else:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
@@ -332,7 +345,11 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            if not self.enable_all_cp_ranks_for_transfer:
+            pull_from_all_cp_ranks = (
+                self.enable_all_cp_ranks_for_transfer
+                or getattr(info, "enable_dsa_cache_layer_split", False)
+            )
+            if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
@@ -418,6 +435,9 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "enable_dsa_cache_layer_split": getattr(
+                self.server_args, "enable_dsa_cache_layer_split", False
+            ),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -862,7 +882,10 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
@@ -1214,6 +1237,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1305,6 +1329,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        if self.enable_dsa_cache_layer_split is None:
+            self.enable_dsa_cache_layer_split = bool(
+                data.get("enable_dsa_cache_layer_split", False)
+            )
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -1367,6 +1396,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
                     else True
+                ),
+                enable_dsa_cache_layer_split=bool(
+                    self.enable_dsa_cache_layer_split
                 ),
             )
             return web.json_response(dataclasses.asdict(info), status=200)

@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -47,6 +48,20 @@ def dsa_enable_prefill_cp():
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
     return is_dsa_enable_prefill_cp()
+
+
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: ForwardBatch,
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_full_attention_kv = getattr(
+        get_token_to_kv_pool(), "prefetch_full_attention_kv_buffer", None
+    )
+    if prefetch_full_attention_kv is not None:
+        prefetch_full_attention_kv(next_full_attention_layer_id)
 
 
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
@@ -116,6 +131,15 @@ class DSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
 

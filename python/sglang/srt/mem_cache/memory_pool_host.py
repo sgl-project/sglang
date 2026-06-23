@@ -1112,6 +1112,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1192,9 +1195,74 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.kv_buffer[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=device_pool.kv_buffer[layer_id],
+                        dst=self.kv_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.data_refs[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded MLA HiCache backup with page_first layout "
+                        "requires the JIT one-layer kernel."
+                    )
+            else:
+                raise ValueError(
+                    f"Layer-sharded HiCache backup does not support layout: {self.layout}"
+                )
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.kv_buffer[layer_id]],
+                    dst_layers=[self.kv_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(
+                    "Layer-sharded direct HiCache backup only supports "
+                    f"layer_first layout, got {self.layout}"
+                )
+        else:
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -3103,6 +3171,9 @@ class DSAIndexerPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3151,9 +3222,56 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if use_kernel:
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=device_pool.index_k_with_scale_buffer[layer_id],
+                    dst=self.index_k_with_scale_buffer[layer_id],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
+            elif self.layout == "page_first":
+                raise ValueError(
+                    "Layer-sharded DSA indexer HiCache backup with page_first "
+                    "layout is not supported without a per-layer LF->PF kernel."
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    "Layer-sharded direct DSA indexer backup only supports "
+                    f"layer_first layout, got {self.layout}"
+                )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
