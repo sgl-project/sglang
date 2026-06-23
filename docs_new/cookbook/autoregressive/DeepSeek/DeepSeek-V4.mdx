@@ -49,13 +49,14 @@ docker run --gpus all \
 
 **AMD GPUs (ROCm)**
 
-AMD uses the daily-updated `lmsysorg/sglang-rocm` images:
+AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260615`
+For example:
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615
+docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615 \
+    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623 \
     sglang serve <use args below>
 ```
 
