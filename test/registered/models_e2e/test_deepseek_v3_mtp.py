@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -34,6 +36,7 @@ if not is_in_amd_ci():
     _OTHER_ARGS += ["--mem-frac", "0.85"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):
     model = FULL_DEEPSEEK_V3_MODEL_PATH
     other_args = _OTHER_ARGS
