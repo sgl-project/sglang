@@ -239,9 +239,7 @@ def dequantize_k_cache_paged(
     # scales) so dim_quant == kv_lora_rank + qk_rope_head_dim (512 + 64 = 576),
     # unlike the CUDA 656B layout (512 fp8 + 16 scale + 128 bf16 rope).
     if dim_quant == 576:
-        return _dequantize_k_cache_paged_hip_raw(
-            quant_k_cache, page_table_1_flattened
-        )
+        return _dequantize_k_cache_paged_hip_raw(quant_k_cache, page_table_1_flattened)
     assert (
         dim_quant == 656
     ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
