@@ -57,3 +57,57 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         raise NotImplementedError("populated in kvc-migrate-method-bodies")
+
+
+def calculate_mla_kv_cache_dim(
+    *,
+    model_config: ModelConfig,
+    kv_cache_dtype: torch.dtype,
+    server_args: ServerArgs,
+) -> int:
+    is_dsa_model = is_deepseek_dsa(model_config.hf_config)
+    kv_cache_dtype = kv_cache_dtype
+    kv_lora_rank = model_config.kv_lora_rank
+    qk_rope_head_dim = model_config.qk_rope_head_dim
+    kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
+
+    # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+    if not is_dsa_model:
+        return kv_cache_dim
+
+    # TRTLLM backend does not override kv_cache_dim for MLA kv cache
+    # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,
+    # since it is not compatible for trtllm and other mla attn backend due to the different
+    # kv cache layout.
+    if (
+        server_args.dsa_prefill_backend == "trtllm"
+        or server_args.dsa_decode_backend == "trtllm"
+    ):
+        return kv_cache_dim
+
+    # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
+    # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+    if _is_hip and (
+        server_args.dsa_prefill_backend in ("tilelang", "aiter")
+        or server_args.dsa_decode_backend in ("tilelang", "aiter")
+    ):
+        return kv_cache_dim
+
+    quant_block_size = DSATokenToKVPool.quant_block_size
+    rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
+    # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
+    # (excluding TRTLLM and HIP raw-layout kernels).
+    # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+    # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        assert (
+            kv_lora_rank % quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+
+        return (
+            kv_lora_rank
+            + kv_lora_rank // quant_block_size * 4
+            + qk_rope_head_dim * rope_storage_dtype.itemsize
+        )
+
+    return kv_cache_dim
