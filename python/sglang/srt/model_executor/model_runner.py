@@ -114,7 +114,10 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_manager import (
+    LoRAManager,
+    _init_lora_cuda_graph_moe_buffers,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -749,7 +752,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # profiling accounts for them. The buffers are reused by
                 # any captured graph (decode today; widen here so any
                 # future prefill capture path also picks them up).
-                ModelRunner._init_lora_cuda_graph_moe_buffers(
+                _init_lora_cuda_graph_moe_buffers(
                     server_args=self.server_args,
                     model=self.model,
                     lora_manager=self.lora_manager,
@@ -1699,41 +1702,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
         )
-
-    @staticmethod
-    def _init_lora_cuda_graph_moe_buffers(
-        *,
-        server_args: ServerArgs,
-        model: torch.nn.Module,
-        lora_manager: LoRAManager,
-        dtype: torch.dtype,
-    ):
-        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
-
-        Must be called before init_memory_pool() so that memory profiling
-        sees the reduced available memory and sizes KV cache correctly.
-        All MoE LoRA layers share one set of buffers (managed by the
-        lora_backend) since they execute sequentially during forward.
-
-        Phase 2 (dense LoRA batch metadata) is handled later in
-        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
-        that are only available at that stage.
-        """
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-
-        max_bs = server_args.cuda_graph_config.decode.max_bs
-        max_loras = server_args.max_loras_per_batch
-        for module in model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
-                lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, dtype, module
-                )
-                logger.info(
-                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
-                )
-                break
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
