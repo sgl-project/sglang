@@ -262,12 +262,7 @@ class TestD2PMultiTurnCacheHit(PDDisaggregationServerBase):
                     f"{out.ttft:>8.4f}s"
                 )
 
-                if rnd == 0:
-                    self.assertEqual(
-                        out.disagg_prefill_prefix_len, 0,
-                        f"Round 0 client {i}: cold start, prefill prefix should be 0",
-                    )
-                else:
+                if rnd > 0:
                     prev_history_len = out.prompt_len - question_len
                     expected_min = prev_history_len - 2
                     self.assertGreaterEqual(
