@@ -181,7 +181,7 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
-        return None
+        return UnquantizedLinearMethod()
 
     def get_linear_scheme(
         self, layer: torch.nn.Module, prefix: Optional[str] = None
