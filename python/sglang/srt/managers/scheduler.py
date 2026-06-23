@@ -894,10 +894,8 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        # Min-free-slots delay: batch freed running-request slots into one
-        # admission. DFlash workloads auto-enable the legacy adaptive formula;
-        # other workloads opt in via --min-free-slots-delay. Built independently
-        # of the prefill delayer (no shared state).
+        # DFlash auto-enables the legacy formula; other workloads opt in via
+        # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
@@ -2771,8 +2769,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Skipped while a chunked prefill is in flight: that pass must proceed,
-        # and the trigger only batches fresh admissions anyway.
+        # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
