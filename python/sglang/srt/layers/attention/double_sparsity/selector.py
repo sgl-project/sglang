@@ -266,6 +266,7 @@ class DoubleSparsitySelector:
                     getattr(self.config, "score_reduce_dtype", "bf16") == "bf16"
                 ),
                 head_agg=getattr(self.config, "head_agg", "max"),
+                scorer_norm=getattr(self.config, "scorer_norm", "off"),
             )
 
         batch_size = req_pool_indices.shape[0]

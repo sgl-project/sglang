@@ -2342,6 +2342,18 @@ class DeepseekV2AttentionMLA(
                         _slot_written[layer_id, _out_cache_loc.long()] = (
                             _slot_false if _slot_false is not None else False
                         )
+                    # Cosine: NaN-reset the key-norm cache for the SAME reused slots
+                    # (before their fresh KV write repopulates them), so a written-bit
+                    # race can never read a stale key norm. Device NaN scalar keeps the
+                    # indexed write a pure device-side copy (graph-safe). Only the
+                    # reused seq slots are touched; the +inf current-slot re-include
+                    # is a separate score override at selection time.
+                    _kn_cache = getattr(_sw_backend, "_ds_key_norm_cache", None)
+                    if _kn_cache is not None:
+                        _kn_nan = getattr(_sw_backend, "_ds_key_norm_nan", None)
+                        _kn_cache[layer_id, _out_cache_loc.long()] = (
+                            _kn_nan if _kn_nan is not None else float("nan")
+                        )
                 # Use projected Q-noPE for DS selector when available; fall back
                 # to latent q_lora only for the placeholder path (unit tests).
                 queries_for_ds = q_nope if q_nope is not None else q_lora
@@ -2563,6 +2575,16 @@ class DeepseekV2AttentionMLA(
                         scratch_absorbed_q=getattr(
                             _ds_graph_state, "scratch_absorbed_q", None
                         ),
+                        include_current_slot=bool(
+                            getattr(_selector.config, "include_current_slot", False)
+                        ),
+                        scratch_cur_index=getattr(
+                            _ds_graph_state, "scratch_cur_index", None
+                        ),
+                        key_norm_cache=getattr(
+                            _sw_backend, "_ds_key_norm_cache", None
+                        ),
+                        scratch_qnorm=getattr(_ds_graph_state, "scratch_qnorm", None),
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]
                     valid_lengths = _ds_graph_state.valid_lengths[:_bs]

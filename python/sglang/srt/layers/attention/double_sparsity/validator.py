@@ -116,6 +116,23 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             "capture. Re-run with --disable-cuda-graph, or use the default selector."
         )
 
+    # include_current_slot (the current-decode-slot force-include) is defined for
+    # single-token decode only — it force-includes exactly logical seq_len-1 per
+    # row. Speculative / MTP / multi-token-accept decode advances several tokens
+    # per step, so the single seq_len-1 rule would force-include the wrong slot.
+    # Fail closed at startup rather than silently mis-select.
+    if getattr(config, "include_current_slot", False) and (
+        getattr(server_args, "speculative_algorithm", None) is not None
+    ):
+        raise ValueError(
+            "Double Sparsity 'include_current_slot' (the current-decode-slot "
+            "force-include) is single-token-decode only and is not supported with "
+            "speculative/MTP decoding (speculative_algorithm="
+            f"{getattr(server_args, 'speculative_algorithm', None)!r}); a "
+            "multi-token-accept step would force-include the wrong slot. Disable "
+            "speculative decoding or set 'include_current_slot' to false."
+        )
+
     # Page size pairing (config vs server) + supported set.
     server_page_size = getattr(server_args, "page_size", None)
     if config.page_size not in _SUPPORTED_PAGE_SIZES:
