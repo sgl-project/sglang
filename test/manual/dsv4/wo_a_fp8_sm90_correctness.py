@@ -85,7 +85,9 @@ def check(case: WoACase, args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     o = (
-        torch.randn(case.tokens, case.groups, case.k, device=device, dtype=torch.bfloat16)
+        torch.randn(
+            case.tokens, case.groups, case.k, device=device, dtype=torch.bfloat16
+        )
         * 0.1
     )
     weight = (
@@ -95,7 +97,9 @@ def check(case: WoACase, args: argparse.Namespace) -> None:
     weight_fp8, weight_scale = quantize_weight_by_group(weight)
 
     out = run_wo_a_einsum(o, weight_fp8, weight_scale)
-    bf16_ref = torch.einsum("tgd,grd->tgr", o.float(), weight.float()).to(torch.bfloat16)
+    bf16_ref = torch.einsum("tgd,grd->tgr", o.float(), weight.float()).to(
+        torch.bfloat16
+    )
     torch.cuda.synchronize()
 
     cb = cosine(out, bf16_ref)
