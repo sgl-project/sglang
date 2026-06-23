@@ -239,6 +239,7 @@ from sglang.srt.speculative.dflash_utils import (
     should_delay_dflash_prefill_for_batching,
     validate_dflash_request,
 )
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -1098,6 +1099,17 @@ class Scheduler(
         if model_config is None:
             model_config = self.model_config
 
+        if self.spec_algorithm.carries_draft_hidden_states():
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            disagg_hidden_size = get_draft_input_from_target_hidden_dim(draft_runner)
+            disagg_hidden_states_dtype = model_config.dtype
+        else:
+            disagg_hidden_size = 16  # minimal padding size for RDMA
+            disagg_hidden_states_dtype = torch.float32
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1107,16 +1119,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1160,16 +1164,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 

@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -177,11 +178,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                model_runner
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_bs, _hidden_size),
-                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None

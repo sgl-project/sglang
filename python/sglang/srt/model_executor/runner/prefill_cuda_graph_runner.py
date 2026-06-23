@@ -176,6 +176,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            # Graph replay must preserve input_embeds=None for text-only requests.
+            # A zero static tensor makes multimodal models skip token embeddings.
+            register_input_embeds=False,
             source=self.buffers,
         )
 
@@ -336,15 +339,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
-        ), set_tc_piecewise_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            dsa_indexers=self.dsa_indexers,
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_tc_piecewise_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ),
         ):
             if self.layer_model is not None:
                 return self.layer_model.forward(
@@ -811,17 +817,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
                 try:
-                    with forward_context(
-                        ForwardContext(attn_backend=self.model_runner.attn_backend)
-                    ), set_tc_piecewise_forward_context(
-                        static_forward_batch,
-                        self.attention_layers,
-                        self.quant_config,
-                        self.moe_layers,
-                        self.moe_fusions,
-                        dsa_indexers=self.dsa_indexers,
-                        num_tokens=static_num_tokens,
-                        raw_num_tokens=raw_num_tokens,
+                    with (
+                        forward_context(
+                            ForwardContext(attn_backend=self.model_runner.attn_backend)
+                        ),
+                        set_tc_piecewise_forward_context(
+                            static_forward_batch,
+                            self.attention_layers,
+                            self.quant_config,
+                            self.moe_layers,
+                            self.moe_fusions,
+                            dsa_indexers=self.dsa_indexers,
+                            num_tokens=static_num_tokens,
+                            raw_num_tokens=raw_num_tokens,
+                        ),
                     ):
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
@@ -835,17 +844,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # TC_PIECEWISE path. backend.replay calls the compiled
                 # outer model.forward directly (torch.compile handles
                 # multi-req via bs-invariant FX-traced kernels).
-                with forward_context(
-                    ForwardContext(attn_backend=self.model_runner.attn_backend)
-                ), set_tc_piecewise_forward_context(
-                    static_forward_batch,
-                    self.attention_layers,
-                    self.quant_config,
-                    self.moe_layers,
-                    self.moe_fusions,
-                    dsa_indexers=self.dsa_indexers,
-                    num_tokens=static_num_tokens,
-                    raw_num_tokens=raw_num_tokens,
+                with (
+                    forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend)
+                    ),
+                    set_tc_piecewise_forward_context(
+                        static_forward_batch,
+                        self.attention_layers,
+                        self.quant_config,
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                        num_tokens=static_num_tokens,
+                        raw_num_tokens=raw_num_tokens,
+                    ),
                 ):
                     output = self.backend.replay(
                         self._static_num_tokens, static_forward_batch, **kwargs

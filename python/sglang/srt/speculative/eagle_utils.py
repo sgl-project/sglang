@@ -261,21 +261,47 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
+def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     """Derive the hidden dimension of target hidden states fed to the draft model."""
     hf_config = model_runner.model_config.hf_config
-    eagle_config = getattr(hf_config, "eagle_config", {})
-    use_aux = eagle_config.get("use_aux_hidden_state", False)
+    eagle_config = getattr(hf_config, "eagle_config", None) or {}
+    get_eagle_config = (
+        eagle_config.get
+        if isinstance(eagle_config, dict)
+        else lambda key, default=None: getattr(eagle_config, key, default)
+    )
+    use_aux = get_eagle_config("use_aux_hidden_state", True)
     spec_algorithm = model_runner.spec_algorithm
 
     if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
+        model = getattr(model_runner, "model", None)
+        if model is not None:
+            inner = getattr(model, "model", model)
+            for projection_name in ("fc_cat_hidden", "fc"):
+                projection = getattr(inner, projection_name, None)
+                if projection is not None and hasattr(projection, "in_features"):
+                    return projection.in_features
+
         base = getattr(hf_config, "target_hidden_size", None)
         if base is None:
             base = model_runner.model_config.hidden_size
-        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
-        num_aux = max(len(layer_ids), 1)
+        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+        if num_aux is None:
+            layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+            if layer_ids is None:
+                layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+            num_aux = len(layer_ids) if layer_ids else 3
         return base * num_aux
     return model_runner.model_config.spec_hidden_size
+
+
+def get_draft_recurrent_hidden_state_spec(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 
 def eagle_prepare_for_verify(

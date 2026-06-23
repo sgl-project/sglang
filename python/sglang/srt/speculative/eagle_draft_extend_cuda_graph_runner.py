@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
@@ -152,11 +153,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            _hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
+            target_dtype = (
+                self.eagle_worker.target_worker.model_runner.model_config.dtype
+            )
+            _hidden_size = (
+                None
+                if self.eagle_worker.speculative_algorithm.is_standalone()
+                else get_draft_input_from_target_hidden_dim(model_runner)
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_num_token, _hidden_size),
-                    dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+                    dtype=target_dtype,
                 )
                 if _hidden_size is not None
                 else None
