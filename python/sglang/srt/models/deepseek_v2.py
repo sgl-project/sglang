@@ -1153,7 +1153,7 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
-        enable_sbo_overlap = enable_alt_stream and self.alt_stream is not None
+        enable_sbo_overlap = self.alt_stream is not None
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
