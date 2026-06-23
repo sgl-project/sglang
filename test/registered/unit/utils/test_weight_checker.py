@@ -30,7 +30,7 @@ from sglang.srt.utils.weight_checker import (
     WeightChecker,
     _build_entries,
     _build_reference_plan,
-    _compare_entries,
+    _check_tensors,
     _hash_tensor,
     _is_non_persistent_buffer_name,
     _random_like,
@@ -314,7 +314,7 @@ class TestPostprocessTensors(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _compare_entries  (implementation moves both sides via .cuda())
+# _check_tensors  (implementation moves both sides via .cuda())
 # ---------------------------------------------------------------------------
 
 
@@ -330,13 +330,13 @@ class TestCheckTensors(CustomTestCase):
             ("a", True, RawReference(t.clone())),
             ("b", True, RawReference(t.clone())),
         ]
-        _compare_entries(expect_entries=expect, actual_entries=actual)
+        _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_raises_when_should_compare_true_and_diff(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", True, RawReference(torch.zeros(2, 2)))]
         with self.assertRaises(Exception) as ctx:
-            _compare_entries(expect_entries=expect, actual_entries=actual)
+            _check_tensors(expect_tensors=expect, actual_tensors=actual)
         msg = str(ctx.exception)
         self.assertIn("name=a", msg)
         self.assertIn("max_abs_err", msg)
@@ -345,26 +345,26 @@ class TestCheckTensors(CustomTestCase):
         # should_compare=False -> diff is logged, not raised.
         expect = [("a", False, RawReference(torch.ones(2, 2)))]
         actual = [("a", False, RawReference(torch.zeros(2, 2)))]
-        _compare_entries(expect_entries=expect, actual_entries=actual)
+        _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_name_mismatch(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("b", True, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
-            _compare_entries(expect_entries=expect, actual_entries=actual)
+            _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_asserts_on_should_compare_mismatch(self):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", False, RawReference(torch.ones(2, 2)))]
         with self.assertRaises(AssertionError):
-            _compare_entries(expect_entries=expect, actual_entries=actual)
+            _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
     def test_chunked_raw_stats_match_unchunked(self):
         expect = [("a", True, RawReference(torch.zeros(10)))]
         actual = [("a", True, RawReference(torch.arange(10.0)))]
         with patch("sglang.srt.utils.weight_checker_comparator._CHUNK_NUMEL", 3):
             with self.assertRaises(Exception) as ctx:
-                _compare_entries(expect_entries=expect, actual_entries=actual)
+                _check_tensors(expect_tensors=expect, actual_tensors=actual)
         self.assertIn("max_abs_err=9.0", str(ctx.exception))
         self.assertIn("mean_abs_err=4.5", str(ctx.exception))
 
@@ -376,7 +376,7 @@ class TestCheckTensors(CustomTestCase):
         ]
         actual = [("a", True, RawReference(t.clone()))]
         with self.assertRaises(ValueError):
-            _compare_entries(expect_entries=expect, actual_entries=actual)
+            _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
 
 # ---------------------------------------------------------------------------
@@ -508,9 +508,9 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
 
     def _check(self, expect_raw, actual_raw, **kwargs):
         plan = {"x.weight": (Fp8BlockReference, "x.weight_scale_inv")}
-        _compare_entries(
-            expect_entries=_build_entries(expect_raw, set(), plan),
-            actual_entries=_build_entries(actual_raw, set(), plan),
+        _check_tensors(
+            expect_tensors=_build_entries(expect_raw, set(), plan),
+            actual_tensors=_build_entries(actual_raw, set(), plan),
             **kwargs,
         )
 
@@ -536,8 +536,8 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
         expect = [("a", True, RawReference(torch.ones(2, 2)))]
         actual = [("a", True, RawReference(torch.ones(2, 2) + 0.5))]
         with self.assertRaises(Exception):
-            _compare_entries(
-                expect_entries=expect, actual_entries=actual, allow_quant_error=True
+            _check_tensors(
+                expect_tensors=expect, actual_tensors=actual, allow_quant_error=True
             )
 
 
