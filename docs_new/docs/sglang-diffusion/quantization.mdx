@@ -93,9 +93,9 @@ backend.
     </tr>
     <tr>
       <td><code>modelopt-nvfp4</code></td>
-      <td>Mixed transformer directory/repo with <code>config.json</code>, or raw NVFP4 safetensors export/repo</td>
-      <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports</td>
-      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512</td>
+      <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
+      <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
+      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
       <td>None</td>
       <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
     </tr>
@@ -172,23 +172,16 @@ Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the nine published diffusion
-ModelOpt checkpoints plus the locally validated Qwen-Image NVFP4 exports
-currently wired up in SGLang docs and validation coverage.
+This section is the canonical support matrix for the thirteen published
+diffusion ModelOpt checkpoints currently wired up in SGLang docs and validation
+coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Eight of the nine published repos live under `lmsys/*`. The FLUX.2 NVFP4 entry
-keeps the official `black-forest-labs/FLUX.2-dev-NVFP4` repo, and the
-Qwen-Image NVFP4 entry uses the ModelOpt `nvidia/Qwen-Image-NVFP4` layout once
-that repo is published. Qwen-Image-2512 has been validated from a local
-ModelOpt export with the same loader path. Qwen-Image-Edit,
-Qwen-Image-Edit-2509, and Qwen-Image-Edit-2511 were also validated from local
-ModelOpt exports, but the active ModelOpt PR currently exposes them through a
-local wrapper over the `qwen-image` model type rather than a separate public
-CLI model type.
+Twelve of the thirteen repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps
+the official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -284,19 +277,43 @@ CLI model type.
     </tr>
     <tr>
       <td><code>NVFP4</code></td>
-      <td><code>Qwen/Qwen-Image</code>, <code>Qwen/Qwen-Image-2512</code>, and local <code>Qwen-Image-Edit*</code> exports</td>
+      <td><code>Qwen/Qwen-Image</code></td>
       <td><code>--model-path</code></td>
-      <td><code>nvidia/Qwen-Image-NVFP4</code> for the base model once published, or a local ModelOpt export</td>
-      <td>full-model NVFP4 local repo load + T2I/TI2I generation</td>
-      <td>full diffusers repo loaded directly; export keeps <code>img_mod</code>/<code>txt_mod</code> (and blocks 0/1/58/59 plus <code>img_in</code>/<code>txt_in</code>/<code>time_text_embed</code>/<code>norm_out</code>/<code>proj_out</code>) in BF16; on B200, <code>flashinfer_cutlass</code> is the faster FP4 backend at high resolutions such as 2048x2048. Qwen-Image-Edit-2509 required a BFloat16 ModelOpt export to avoid FP16 multi-image calibration NaNs. Qwen-Image-Layered is not included in this row because its CLI smoke currently fails output-count/grouped-request validation after denoising.</td>
+      <td><code>lmsys/qwen-image-modelopt-nvfp4-sglang</code></td>
+      <td>full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison</td>
+      <td>full repo loaded directly; exported with ModelOpt PR #1706 SVDQuant NVFP4 (<code>--format fp4</code>, max calibration, block size 16) and BF16 fallbacks for attention-sensitive modules plus first/last transformer blocks</td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>Qwen/Qwen-Image-2512</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>lmsys/qwen-image-2512-modelopt-nvfp4-sglang</code></td>
+      <td>full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison, B200 CI case</td>
+      <td>same full-repo loader path as Qwen Image; this is the Qwen Image NVFP4 representative in <code>multimodal-gen-test-1-b200</code></td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>Qwen/Qwen-Image-Edit</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>lmsys/qwen-image-edit-modelopt-nvfp4-sglang</code></td>
+      <td>TI2I edit full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison</td>
+      <td>full repo loaded directly with normal image-edit inputs; exported with the same ModelOpt PR #1706 NVFP4 recipe</td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>Qwen/Qwen-Image-Edit-2511</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>lmsys/qwen-image-edit-2511-modelopt-nvfp4-sglang</code></td>
+      <td>TI2I edit full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison</td>
+      <td>full repo loaded directly with normal image-edit inputs; exported with the same ModelOpt PR #1706 NVFP4 recipe</td>
     </tr>
   </tbody>
 </table>
 
-The published NVFP4 checkpoints are used by the B200 diffusion CI job
-(`multimodal-gen-test-1-b200`). The Qwen-Image NVFP4 row was validated on B200
-from local ModelOpt exports and should be added there after hosted checkpoints
-are visible to CI.
+These thirteen checkpoints are the intended ModelOpt documentation support
+set. The B200 diffusion CI job (`multimodal-gen-test-1-b200`) uses a
+representative NVFP4 subset and includes
+`lmsys/qwen-image-2512-modelopt-nvfp4-sglang` for Qwen Image coverage.
 
 ## ModelOpt FP8
 
@@ -416,13 +433,11 @@ sglang generate \
   --save-output
 ```
 
-For Qwen-Image and Qwen-Image-2512, the NVFP4 export is a full-model repo loaded
-directly. The same command works with a local ModelOpt export directory while
-the NVIDIA-hosted base Qwen-Image repo is not yet visible:
+For full Qwen Image NVFP4 exports, load the published repo directly:
 
 ```bash
 sglang generate \
-  --model-path nvidia/Qwen-Image-NVFP4 \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
   --prompt "A tiny astronaut reading a book under a glass greenhouse" \
   --save-output
 ```
@@ -433,7 +448,7 @@ CUTLASS FP4 GEMM backend can be faster than the default TensorRT-LLM backend:
 ```bash
 SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass \
 sglang generate \
-  --model-path /path/to/qwen-image-nvfp4-export \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
   --width 2048 --height 2048 \
   --prompt "A tiny astronaut reading a book under a glass greenhouse" \
   --save-output
@@ -451,14 +466,15 @@ sglang generate \
   intentionally want a non-default `transformer_2`.
 - On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
   TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
-- The `Qwen/Qwen-Image` and `Qwen/Qwen-Image-2512` local NVFP4 exports keep the
-  `img_mod`/`txt_mod` modulation projections and blocks 0/1/58/59 in BF16.
+- The published Qwen Image NVFP4 exports keep the `img_mod`/`txt_mod`
+  modulation projections and first/last transformer blocks in BF16.
 - Qwen-Image NVFP4 does not always improve latency at 1024x1024. On B200, the
-  validated local ModelOpt exports were faster than BF16 at 2048x2048 with
+  validated ModelOpt exports were faster than BF16 at 2048x2048 with
   `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass`, while 1024x1024
   remained BF16-faster.
-- Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
-  repos or local directories.
+- Direct `--model-path` loading is the canonical path for full Qwen Image
+  ModelOpt NVFP4 repos and a compatibility path for FLUX.2 NVFP4-style repos
+  or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then

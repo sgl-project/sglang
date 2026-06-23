@@ -47,7 +47,7 @@ backend.
 | `fp8` / `mxfp4` (online quantization)  | Unquantized checkpoint (offline via AMD Quark coming soon) | `--quantization {fp8,mxfp4}` | Z-Image-Turbo (validated), others likely work. More support coming soon. | MXFP4: `aiter` on ROCm | MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to `fp8` / `mxfp4` dynamically. |
 | `fp8` (offline quantization) | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path`                   | ALL                                     | None                                  | Component-folder and single-file flows are both supported                                                                              |
 | `modelopt-fp8`    | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-path`                                                    | FLUX.1, FLUX.2, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit | None                                  | Serialized config stays `quant_method=modelopt` with `quant_algo=FP8`; `dit_layerwise_offload` is supported and `dit_cpu_offload` stays disabled |
-| `modelopt-nvfp4`  | Mixed transformer directory/repo with `config.json`, or raw NVFP4 safetensors export/repo | `--transformer-path` for mixed overrides; `--transformer-weights-path` for raw exports | FLUX.1, FLUX.2, Wan2.2                  | None                                  | Mixed override repos keep the base model separate; raw exports such as `black-forest-labs/FLUX.2-dev-NVFP4` still use the weights-path flow |
+| `modelopt-nvfp4`  | Mixed transformer directory/repo with `config.json`, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo | `--transformer-path` for mixed overrides; `--transformer-weights-path` for raw exports; `--model-path` for full repos | FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511 | None | Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as `--model-path`; raw exports such as `black-forest-labs/FLUX.2-dev-NVFP4` still use the weights-path flow |
 | `nunchaku-svdq`   | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                                           | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                                             |
 | `msmodelslim`     | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                                         | Wan2.2 family                           | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                                               |
 
@@ -105,15 +105,16 @@ Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the nine diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and validation coverage.
+This section is the canonical support matrix for the thirteen published
+diffusion ModelOpt checkpoints currently wired up in SGLang docs and validation
+coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Eight of the nine repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
-official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
+Twelve of the thirteen repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps
+the official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 | Quant Algo | Base Model | Preferred CLI | HF Repo | Current Scope | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -126,9 +127,15 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 | `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
 | `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint; the default FP4 GEMM backend is `flashinfer_trtllm` |
+| `NVFP4` | `Qwen/Qwen-Image` | `--model-path` | `lmsys/qwen-image-modelopt-nvfp4-sglang` | full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison | full repo loaded directly; exported with ModelOpt PR #1706 SVDQuant NVFP4 (`--format fp4`, max calibration, block size 16) and BF16 fallbacks for attention-sensitive modules plus first/last transformer blocks |
+| `NVFP4` | `Qwen/Qwen-Image-2512` | `--model-path` | `lmsys/qwen-image-2512-modelopt-nvfp4-sglang` | full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison, B200 CI case | same full-repo loader path as Qwen Image; this is the Qwen Image NVFP4 representative in `multimodal-gen-test-1-b200` |
+| `NVFP4` | `Qwen/Qwen-Image-Edit` | `--model-path` | `lmsys/qwen-image-edit-modelopt-nvfp4-sglang` | TI2I edit full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison | full repo loaded directly with normal image-edit inputs; exported with the same ModelOpt PR #1706 NVFP4 recipe |
+| `NVFP4` | `Qwen/Qwen-Image-Edit-2511` | `--model-path` | `lmsys/qwen-image-edit-2511-modelopt-nvfp4-sglang` | TI2I edit full ModelOpt NVFP4 Diffusers repo, BF16-vs-NVFP4 B200 image comparison | full repo loaded directly with normal image-edit inputs; exported with the same ModelOpt PR #1706 NVFP4 recipe |
 
-These nine checkpoints are also the intended case set for the B200 diffusion
-CI job (`multimodal-gen-test-1-b200`).
+These thirteen checkpoints are the intended ModelOpt documentation support
+set. The B200 diffusion CI job (`multimodal-gen-test-1-b200`) uses a
+representative NVFP4 subset and includes
+`lmsys/qwen-image-2512-modelopt-nvfp4-sglang` for Qwen Image coverage.
 
 ## ModelOpt FP8
 
@@ -268,6 +275,15 @@ sglang generate \
   --save-output
 ```
 
+For full Qwen Image NVFP4 exports, load the published repo directly:
+
+```bash
+sglang generate \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
 ### Notes
 
 - Use `--transformer-path` for mixed ModelOpt NVFP4 transformer repos or local
@@ -280,8 +296,9 @@ sglang generate \
   intentionally want a non-default `transformer_2`.
 - On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
   TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
-- Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
-  repos or local directories.
+- Direct `--model-path` loading is the canonical path for full Qwen Image
+  ModelOpt NVFP4 repos and a compatibility path for FLUX.2 NVFP4-style repos
+  or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
