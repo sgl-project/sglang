@@ -104,19 +104,12 @@ class CustomAllReduceV2:
         if self.disabled:
             yield
             return
+        self.obj.set_cuda_graph_register_inputs(not self.tms_cudagraph)
         try:
-            self.obj.set_cuda_graph_register_inputs(not self.tms_cudagraph)
             self.obj.set_cuda_graph_capture(True)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
-            self.obj.set_cuda_graph_register_inputs(True)
-        if self.tms_cudagraph:
-            log_info_on_rank0(
-                logger, "Registering 0 cuda graph addresses because tms is used"
-            )
-            return
-        # cannot call when graph is capturing
         assert (
             not torch.cuda.is_current_stream_capturing()
         ), "Cannot register graph inputs while capturing CUDA graph"
