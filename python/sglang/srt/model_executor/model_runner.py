@@ -465,7 +465,9 @@ class ModelRunner:
             enable_show_time_cost()
 
         # Model-specific adjustment
-        self.model_specific_adjustment()
+        ModelRunner.model_specific_adjustment(
+            server_args=self.server_args, model_config=self.model_config
+        )
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -1003,19 +1005,25 @@ class ModelRunner:
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
-    def model_specific_adjustment(self):
-        server_args = self.server_args
+    @staticmethod
+    def model_specific_adjustment(
+        *, server_args: ServerArgs, model_config: ModelConfig
+    ) -> None:
+        from sglang.srt.model_executor.model_runner import (
+            CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+        )
 
-        if self.is_multimodal:
-            if not self.is_multimodal_chunked_prefill_supported:
+        if model_config.is_multimodal:
+            if not model_config.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
                     f"Automatically turn off --chunked-prefill-size as it is not supported for "
-                    f"{self.model_config.hf_config.model_type}"
+                    f"{model_config.hf_config.model_type}"
                 )
 
+        use_mla_backend = model_config.attention_arch == AttentionArch.MLA
         if (
-            not self.use_mla_backend
+            not use_mla_backend
             or server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
         ):
