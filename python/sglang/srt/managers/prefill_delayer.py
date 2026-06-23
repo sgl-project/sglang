@@ -47,7 +47,7 @@ def resolve_min_batch(
 ) -> Optional[int]:
     """Resolve the min-batch threshold, capped to the DFlash formula.
 
-    Unset + DFlash → auto-enable with the legacy formula; otherwise disabled.
+    Unset + DFlash: auto-enable with the legacy formula; otherwise disabled.
     A user value (>1) wins, capped to min(value, formula). Disabled when
     max_running_requests < 8.
     """
