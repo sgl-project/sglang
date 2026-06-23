@@ -123,27 +123,14 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         self.K_suffix: int = K_suffix
         self.K_mtp: int = K_mtp
 
-        # Multi-K target caveat (DSA / DSv4): when K_suffix != K_mtp the target
-        # must verify at two widths, but the DSA attention backend sizes its
-        # cuda-graph metadata + deep_gemm paged-MQA schedule for ONE K (the main
-        # K_suffix). A K_mtp-width forward (incl. the spec warmup) then trips
-        # `deep_gemm ... _batch_size == batch_size`. Until DSA keys that metadata
-        # by (bs, K), run HYBRID with K_suffix == K_mtp (i.e.
-        # --speculative-num-draft-tokens == --speculative-num-steps + 1) on DSA
-        # backends; the selector still mixes SUFFIX / MTP / NONE at uniform K.
-        if K_suffix != K_mtp:
-            logging.getLogger("sglang.spec.hybrid_v2").warning(
-                "HYBRID_SUFFIX_MTP started with K_suffix=%d != K_mtp=%d. On the "
-                "DSA/DSv4 attention backend the target can only verify at a "
-                "single K, so the wide-SUFFIX path will crash at warmup "
-                "(deep_gemm _batch_size assert). Set "
-                "--speculative-num-draft-tokens to %d (= --speculative-num-steps "
-                "+ 1) for uniform-K HYBRID, or use a backend whose cuda-graph "
-                "metadata is keyed by (bs, K).",
-                K_suffix,
-                K_mtp,
-                K_mtp,
-            )
+        # Multi-K on DSA: the target verifies at K_suffix (SUFFIX backend) and
+        # K_mtp (MTP backend) on the SAME model. The DSA attention backend
+        # derives its per-forward verify/draft-extend width from the batch's
+        # spec_info (see dsa_backend.init_forward_metadata), so both widths
+        # coexist. The K_suffix verify runs on the captured cuda graph; the
+        # K_mtp (MTP) verify runs eager unless ARCTIC_HYBRID_EXTRA_GRAPHS=1
+        # captures a K_mtp graph (which needs the DSA cuda-graph metadata dict
+        # keyed by (bs, K) — not yet wired).
         # Aliases for code paths that read self.K.
         self.K = K_suffix
         self.K_minus_1 = K_suffix - 1

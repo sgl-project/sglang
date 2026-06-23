@@ -623,7 +623,16 @@ class DeepseekSparseAttnBackend(
         device = forward_batch.seq_lens.device
 
         if forward_batch.forward_mode.is_target_verify():
-            draft_token_num = self.speculative_num_draft_tokens
+            # Per-forward verify width. HYBRID_SUFFIX_MTP verifies at K_suffix
+            # for the SUFFIX backend and K_mtp (= num_steps + 1) for the MTP
+            # backend on the SAME target, so the metadata width must come from
+            # the batch's spec_info, not the static config. Falls back to the
+            # config value for builtin EAGLE/NGRAM (whose spec_info carries the
+            # same number).
+            draft_token_num = (
+                getattr(forward_batch.spec_info, "draft_token_num", None)
+                or self.speculative_num_draft_tokens
+            )
         else:
             draft_token_num = 0
 
@@ -672,22 +681,22 @@ class DeepseekSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
-                batch_size * self.speculative_num_draft_tokens + 1,
+                batch_size * draft_token_num + 1,
                 1,
                 dtype=torch.int32,
                 device=device,
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            extend_seq_lens_cpu = [draft_token_num] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             seqlens_expanded = seqlens_expand_triton(
                 torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
                 cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens,
+                draft_token_num * batch_size,
+                draft_token_num,
             )
             page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                page_table, repeats=draft_token_num, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
@@ -708,18 +717,28 @@ class DeepseekSparseAttnBackend(
                 device=device,
             )
 
+            # Per-forward draft-extend width. HYBRID_SUFFIX_MTP's MTP backend
+            # draft-extends by K_mtp (= num_steps + 1) while the target backend's
+            # static speculative_num_draft_tokens is K_suffix, so the metadata
+            # width must come from the batch, not the config. For builtin EAGLE
+            # V2 these are equal, so behaviour is unchanged.
+            draft_extend_width = (
+                forward_batch.extend_num_tokens // batch_size
+                if batch_size > 0
+                else self.speculative_num_draft_tokens
+            )
             seqlens_expanded = seqlens_expand_triton(
                 forward_batch.extend_seq_lens,
                 cache_seqlens_int32,
                 sum(extend_seq_lens_cpu),
-                self.speculative_num_draft_tokens,
+                draft_extend_width,
             )
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
-                # tokens upfront. All requests extend by the same fixed
-                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
+                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL
+                # speculated tokens upfront; all requests extend by the same
+                # fixed width (draft_extend_width above).
                 page_table = torch.repeat_interleave(
-                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                    page_table, repeats=draft_extend_width, dim=0
                 )
             else:
                 # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
