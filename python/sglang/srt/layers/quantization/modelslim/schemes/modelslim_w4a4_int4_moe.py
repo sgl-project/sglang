@@ -12,9 +12,6 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
 from sglang.srt.utils import set_weight_attrs
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 
 __all__ = [
