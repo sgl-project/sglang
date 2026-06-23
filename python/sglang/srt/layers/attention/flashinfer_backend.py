@@ -219,12 +219,12 @@ def fast_prefill_plan(
     is identical to plan()'s.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
-    assert getattr(self, "_backend", None) == "fa2", (
-        "fast_prefill_plan supports the fa2 backend only"
-    )
-    assert getattr(self, "_cached_module", None) is not None, (
-        "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
-    )
+    assert (
+        getattr(self, "_backend", None) == "fa2"
+    ), "fast_prefill_plan supports the fa2 backend only"
+    assert (
+        getattr(self, "_cached_module", None) is not None
+    ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
 
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -1785,12 +1785,12 @@ class FlashInferIndicesUpdaterPrefill:
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
-            assert seq_lens_cpu is not None, (
-                "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
-            )
-            assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
-                f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            )
+            assert (
+                seq_lens_cpu is not None
+            ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+            assert (
+                num_tokens_per_req is not None and num_tokens_per_req > 0
+            ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,

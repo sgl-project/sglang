@@ -15,8 +15,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     BaseMultiStepDraftBackend,
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
