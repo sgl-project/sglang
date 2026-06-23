@@ -387,6 +387,7 @@ class Scheduler(
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
+            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
@@ -747,12 +748,7 @@ class Scheduler(
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
-            pp_rank=self.ps.pp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
-            dp_rank=self.ps.dp_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
         )
 
@@ -776,13 +772,9 @@ class Scheduler(
         draft_worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            dp_rank=self.ps.dp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
