@@ -2489,12 +2489,20 @@ class DeepseekV2AttentionMLA(
                             ]
                             _lora = int(_selector.absorbed_w_sel.shape[-1])
                             _nblk = _lora // 128
-                            _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora].view(
-                                torch.float8_e4m3fn
-                            )
-                            _absorbed_latent_scales = _nope_u8[
-                                :, 0, _lora : _lora + _nblk * 4
-                            ].view(torch.float32)
+                            if _nope_u8.dtype == torch.bfloat16:
+                                # BF16 KV cache: the resident latent IS the
+                                # dequantized k_nope (no fp8 bytes / per-block
+                                # scales). Pass the bf16 k_nope directly; the score
+                                # kernel's BF16_LATENT branch skips the fp8 scale.
+                                _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora]
+                                _absorbed_latent_scales = None
+                            else:
+                                _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora].view(
+                                    torch.float8_e4m3fn
+                                )
+                                _absorbed_latent_scales = _nope_u8[
+                                    :, 0, _lora : _lora + _nblk * 4
+                                ].view(torch.float32)
 
                     # The validity `written` arg is the slot_written bitmap [L, T]
                     # (the absorbed kernel masks unwritten slots to -inf via its

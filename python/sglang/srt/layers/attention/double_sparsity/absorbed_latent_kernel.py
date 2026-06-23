@@ -117,6 +117,7 @@ if _HAS_TRITON:
         STORE_DEAD_NEG_INF: tl.constexpr,
         HAS_WRITTEN: tl.constexpr,
         COSINE: tl.constexpr,
+        BF16_LATENT: tl.constexpr,
         WORKERS: tl.constexpr,
     ):
         # Persistent-worker layout: static (bs, WORKERS) grid; each worker
@@ -197,12 +198,17 @@ if _HAS_TRITON:
                         tl.float32
                     )  # [block_size, H_POW2]
                     partial = tl.dot(lat_blk, v_blk_t, allow_tf32=True)  # [TB, H_POW2]
-                    sc_blk = tl.load(
-                        scale_ptr + safe_phys * scale_stride_t + blk,
-                        mask=in_range,
-                        other=0.0,
-                    ).to(tl.float32)
-                    acc += partial * sc_blk[:, None]
+                    if BF16_LATENT:
+                        # bf16 resident k_nope is already the dequantized latent
+                        # value — no per-128-block fp8 scale to reapply.
+                        acc += partial
+                    else:
+                        sc_blk = tl.load(
+                            scale_ptr + safe_phys * scale_stride_t + blk,
+                            mask=in_range,
+                            other=0.0,
+                        ).to(tl.float32)
+                        acc += partial * sc_blk[:, None]
 
                 if COSINE:
                     # Direction-normalize each per-head dot into a cosine score
@@ -298,10 +304,14 @@ def absorbed_score_paged_fp8(
     max_tokens = latent_fp8.shape[0]
     assert lora % block_size == 0, f"lora {lora} not a multiple of block {block_size}"
     nblk = lora // block_size
-    assert latent_scales.shape == (
-        max_tokens,
-        nblk,
-    ), f"scales {tuple(latent_scales.shape)} != {(max_tokens, nblk)}"
+    # BF16 resident path: the latent IS the dequantized k_nope, so there is no
+    # per-128-block fp8 scale (latent_scales is a harmless unused dummy).
+    bf16_latent = latent_fp8.dtype == torch.bfloat16
+    if not bf16_latent:
+        assert latent_scales.shape == (
+            max_tokens,
+            nblk,
+        ), f"scales {tuple(latent_scales.shape)} != {(max_tokens, nblk)}"
     device = v.device
     if max_seq_len <= 0:
         return torch.full((bs, 1), float("-inf"), dtype=torch.float32, device=device)
@@ -346,10 +356,13 @@ def absorbed_score_paged_fp8(
         kn_stride_t = 0
         kn_stride_h = 0
 
+    # For bf16 the scale pointer is never dereferenced (BF16_LATENT branch); pass
+    # the latent itself as a harmless non-null pointer when scales are absent.
+    scale_arg = latent_fp8 if (bf16_latent or latent_scales is None) else latent_scales
     _absorbed_score_kernel[grid](
         v,
         latent_fp8,
-        latent_scales,
+        scale_arg,
         written_ptr,
         req_pool_indices,
         req_to_token,
@@ -366,7 +379,7 @@ def absorbed_score_paged_fp8(
         v_stride_b=v.stride(0),
         v_stride_h=v.stride(1),
         fp8_stride_t=latent_fp8.stride(0),
-        scale_stride_t=latent_scales.stride(0),
+        scale_stride_t=(0 if bf16_latent else latent_scales.stride(0)),
         rtt_stride_p=req_to_token.stride(0),
         out_stride_b=out.stride(0),
         qn_stride_b=qn_stride_b,
@@ -379,6 +392,7 @@ def absorbed_score_paged_fp8(
         STORE_DEAD_NEG_INF=True,
         HAS_WRITTEN=has_written,
         COSINE=cosine,
+        BF16_LATENT=bf16_latent,
         WORKERS=num_workers,
         num_warps=num_warps,
         num_stages=num_stages,

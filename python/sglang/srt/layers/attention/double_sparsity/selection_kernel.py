@@ -1006,10 +1006,17 @@ def retrieve_topk_graph_safe(
     # allocation-free, then the paged absorbed kernel writes the score; from here
     # the path is reduce + radix top-k. The absorbed paged kernel always stores
     # -inf over dead positions, matching _store_dead's full-width consumers.
-    assert absorbed_latent_fp8 is not None and absorbed_latent_scales is not None, (
-        "Double Sparsity graph-safe selection requires the resident fp8 latent "
-        "(absorbed_latent_fp8, absorbed_latent_scales)."
+    # The resident latent is required. Scales are required only for the fp8 path;
+    # the bf16 KV path passes the dequantized k_nope directly (scales=None), and
+    # the score kernel's BF16_LATENT branch skips the per-block fp8 scale.
+    assert absorbed_latent_fp8 is not None, (
+        "Double Sparsity graph-safe selection requires the resident latent "
+        "(absorbed_latent_fp8)."
     )
+    assert (
+        absorbed_latent_scales is not None
+        or absorbed_latent_fp8.dtype == torch.bfloat16
+    ), "fp8 resident latent requires absorbed_latent_scales."
     # Fail closed: the absorbed scratch MUST be present before the CUDA fast
     # path runs. A None here would make absorbed_latent_score_logical_paged
     # fall back to the ALLOCATING absorbed_latent_v (breaking the graph-safe

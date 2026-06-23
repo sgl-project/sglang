@@ -2320,6 +2320,59 @@ class TestCalibrateMethod1(unittest.TestCase):
         self.assertIn("label-dim", str(ctx.exception))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "bf16 resident score is a Triton kernel")
+class TestBf16ResidentCosine(unittest.TestCase):
+    """AC-8: the absorbed paged score reads a BF16 resident latent (k_nope)
+    directly — no fp8 per-128-block scale — and matches a torch reference. The
+    fp8 path is unaffected (separate BF16_LATENT=False constexpr branch)."""
+
+    def test_bf16_resident_raw_dot_matches_reference(self):
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent_kernel import (
+            absorbed_score_paged_fp8,
+        )
+
+        dev = torch.device("cuda")
+        torch.manual_seed(0)
+        bs, H, lora, max_seq_len, max_tokens = 2, 2, 256, 4, 8
+        v = (torch.randn(bs, H, lora, device=dev) * 0.1).to(torch.float32)
+        latent_bf16 = (torch.randn(max_tokens, lora, device=dev) * 0.1).to(
+            torch.bfloat16
+        )
+        req_pool = torch.tensor([0, 0], dtype=torch.int32, device=dev)
+        # logical t -> physical slot (a non-identity permutation to exercise paging)
+        rtt = torch.tensor(
+            [[5, 2, 7, 1, 0, 0, 0, 0]], dtype=torch.int32, device=dev
+        )
+        seq_lens = torch.tensor([max_seq_len, max_seq_len], dtype=torch.int32, device=dev)
+
+        scores = absorbed_score_paged_fp8(
+            v,
+            latent_bf16,  # bf16 latent -> BF16_LATENT path (auto-detected)
+            None,  # no scales
+            req_pool,
+            rtt,
+            seq_lens,
+            max_seq_len,
+            written=None,
+            head_agg="max",
+            cosine=False,
+        )
+
+        # Reference: score[b,t] = max_h Σ_l v[b,h,l] * latent_fp32[phys(t), l]
+        lat_f32 = latent_bf16.to(torch.float32)
+        ref = torch.full((bs, max_seq_len), float("-inf"), device=dev)
+        for b in range(bs):
+            pool = int(req_pool[b])
+            for t in range(max_seq_len):
+                phys = int(rtt[pool, t])
+                dots = (v[b] * lat_f32[phys].unsqueeze(0)).sum(dim=1)  # [H]
+                ref[b, t] = dots.max()
+        # bf16 latent + tf32 MMA: loose tolerance on small-magnitude scores.
+        torch.testing.assert_close(
+            scores.float(), ref.float(), rtol=2e-2, atol=2e-2
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "current-slot force-include is a Triton kernel")
 class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
     """AC-7/AC-5/AC-4: the current-slot +inf force-include fails closed on a
