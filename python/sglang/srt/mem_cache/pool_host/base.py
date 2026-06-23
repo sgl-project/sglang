@@ -10,9 +10,16 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.pool_host.common import get_allocator_from_storage
+from sglang.srt.mem_cache.pool_host.common import (
+    _cuda_host_unregister,
+    get_allocator_from_storage,
+)
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
@@ -85,6 +92,26 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        """Unregister pinned host buffers in userspace before process exit.
+
+        Large cudaHostRegister'd buffers are otherwise unpinned by the kernel
+        during SIGKILL reclaim, which can stall teardown in uninterruptible
+        sleep for tens of seconds. Idempotent. (Only the host_register path
+        needs this; npu/musa pin_memory buffers are freed by torch.)
+        """
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        buffers = getattr(self, "kv_buffer", None)
+        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+            if not isinstance(buffers, (list, tuple)):
+                buffers = [buffers]
+            for buf in buffers:
+                if buf is not None:
+                    _cuda_host_unregister(buf)
+        self.kv_buffer = None
 
     @abc.abstractmethod
     def get_size_per_token(self):

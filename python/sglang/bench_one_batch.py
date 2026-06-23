@@ -324,7 +324,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     else:
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
-        model_runner.init_backends()
+        model_runner.init_attention_backends()
+        model_runner.init_cuda_graphs()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
