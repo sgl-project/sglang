@@ -2707,6 +2707,14 @@ class ServerArgs:
                 "binds via its own listener and does not consult --uds. "
                 "Drop one of --uds or --grpc-mode."
             )
+        if self.tokenizer_worker_num > 1:
+            raise ValueError(
+                "--uds is only supported in single-tokenizer mode; "
+                f"received --tokenizer-worker-num={self.tokenizer_worker_num}. "
+                "Multi-tokenizer mode binds host/port independently per "
+                "worker; UDS would be silently ignored. Drop one of --uds "
+                "or --tokenizer-worker-num."
+            )
         if self.ssl_certfile or self.ssl_keyfile:
             raise ValueError(
                 "--uds combined with --ssl-certfile / --ssl-keyfile is "

@@ -78,6 +78,13 @@ class TestServerArgsUDSValidation(unittest.TestCase):
             ServerArgs(model_path="dummy", uds="/tmp/x.sock", grpc_mode=True)
         self.assertIn("--grpc-mode", str(cm.exception))
 
+    def test_multi_tokenizer_rejected(self):
+        # Multi-tokenizer mode binds host/port per worker; UDS would be
+        # silently ignored. Reject the combination at config-parse time.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(model_path="dummy", uds="/tmp/x.sock", tokenizer_worker_num=4)
+        self.assertIn("--tokenizer-worker-num", str(cm.exception))
+
     def test_ssl_rejected(self):
         # uvicorn wraps the UDS listener in TLS but the in-process warmup
         # self-call speaks plain HTTP and would fail the TLS handshake.
@@ -274,6 +281,27 @@ class TestPrepareUdsPath(unittest.TestCase):
         self.assertIn("stale UDS file", str(cm.exception))
         self.assertIsInstance(cm.exception.__cause__, PermissionError)
         self.assertTrue(os.path.exists(self.path))
+
+    def test_unlink_race_tolerated(self):
+        # A concurrent process can win the unlink race after our liveness
+        # probe says "stale". Treat that FileNotFoundError as success.
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()
+
+        original_unlink = os.unlink
+
+        def _vanishing_unlink(p):
+            if p == self.path:
+                # Pretend a peer process already removed it.
+                original_unlink(p)
+                raise FileNotFoundError(errno.ENOENT, "no such file", p)
+            return original_unlink(p)
+
+        with patch("sglang.srt.utils.uds.os.unlink", side_effect=_vanishing_unlink):
+            prepare_uds_path(self.path)
+
+        self.assertFalse(os.path.exists(self.path))
 
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
