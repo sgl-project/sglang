@@ -2429,6 +2429,23 @@ class ServerArgs:
         "Keep multimodal feature tensors on device after processing to save D2H copy.",
     ] = False
 
+    weight_cache_mode: A[
+        str,
+        Arg(
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "'client': connect to existing daemon and load via IPC.",
+            choices=["off", "daemon", "client"],
+        ),
+    ] = "off"
+    weight_cache_socket: A[
+        Optional[str],
+        Arg(
+            help="Unix socket path for weight cache daemon (client mode)."
+            "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
+        ),
+    ] = None
+
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
     # -------------------------------------------------------------------------
