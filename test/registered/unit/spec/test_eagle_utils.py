@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -207,3 +208,7 @@ def test_get_draft_recurrent_hidden_state_spec(spec_algorithm, expected):
     )
 
     assert get_draft_recurrent_hidden_state_spec(model_runner) == expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
