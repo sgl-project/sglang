@@ -777,21 +777,14 @@ class Glm4vForConditionalGeneration(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-                    if name not in params_dict:
-                        continue
+                if name not in params_dict:
+                    continue
 
-                    param = params_dict[name]
-                except KeyError:
-                    logger.error(
-                        f"Weight '{name}' not found in params_dict "
-                        f"({len(params_dict)} params; sample: {list(params_dict)[:10]})"
-                    )
-                    raise
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:
