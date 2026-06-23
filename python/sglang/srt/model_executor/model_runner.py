@@ -389,7 +389,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and server_args.speculative_draft_model_path
         ):
             # Load draft config to get layer count for KV cache sizing
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=server_args.speculative_draft_model_path,
                 model_revision=server_args.speculative_draft_model_revision,
@@ -426,7 +426,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building draft context features.
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -587,16 +587,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-
-    def _build_model_config(
-        self, server_args, model_path=None, model_revision=None, is_draft_model=False
-    ):
-        return ModelConfig.from_server_args(
-            server_args,
-            model_path=model_path,
-            model_revision=model_revision,
-            is_draft_model=is_draft_model,
-        )
 
     def init_msprobe(self):
         # Init the msprobe
