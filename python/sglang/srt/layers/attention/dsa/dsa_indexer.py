@@ -116,7 +116,7 @@ GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
-  
+
 
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
