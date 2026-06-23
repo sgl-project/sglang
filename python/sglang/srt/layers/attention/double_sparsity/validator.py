@@ -98,11 +98,12 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Production-path selector-variant safety (future-proof guard). All
-    # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) and
-    # anchor_mode (recency/global/strided) — are graph-safe, so
-    # ds_scorer_is_graph_safe() is True and this guard does not fire. It remains as
-    # the single startup gate so any future non-graph-safe variant can re-enable it.
+    # Production-path selector-variant safety (startup gate). This
+    # ds_scorer_is_graph_safe() guard covers any non-graph-safe variant: raw-dot
+    # "off", cosine (the in-kernel per-head division + resident key-norm cache, on
+    # both the FP8 and BF16 KV paths), head_agg (mean), and anchor_mode
+    # (recency/global/strided) are all graph-safe so it does not fire for them; it
+    # remains the single startup gate so a future non-graph-safe variant can re-enable it.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
         ds_scorer_is_graph_safe,
     )

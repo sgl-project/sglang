@@ -74,12 +74,13 @@ def ds_scorer_is_graph_safe(config) -> bool:
     """``True`` iff the configured selector variants are all on the graph-safe
     path, so the selector can run under CUDA-graph capture.
 
-    All non-learned variants are graph-safe: ``head_agg`` (mean) lives in the
-    absorbed paged score kernel, and ``anchor_mode`` (recency/global/strided) is
-    a tensorized fixed-shape post-topK force-include in
-    ``retrieve_topk_graph_safe``. None require ``--disable-cuda-graph``.
-    Retained as the single guard predicate so a future non-graph-safe variant
-    can re-introduce a gate here.
+    All supported variants are graph-safe: ``scorer_norm`` ("cosine" = the
+    in-kernel per-head division by the query/key norms with a resident key-norm
+    cache; "off" = raw channel-dot), ``head_agg`` (mean) lives in the absorbed
+    paged score kernel, and ``anchor_mode`` (recency/global/strided) is a
+    tensorized fixed-shape post-topK force-include in ``retrieve_topk_graph_safe``.
+    None require ``--disable-cuda-graph``. Retained as the single guard predicate
+    so a future non-graph-safe variant can re-introduce a gate here.
     """
     return True
 

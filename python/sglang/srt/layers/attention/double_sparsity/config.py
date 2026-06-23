@@ -29,24 +29,35 @@ _ALLOWED_FIELDS = {
     "selector_width_buckets",
     "selector_width_overflow_policy",
     "score_reduce_dtype",
+    "include_current_slot",
     "extra",
 }
 
 # Flag-gated non-learned selector variants (config-borne, not env, so they reach
-# the TP worker processes that run the selector). Each is independent and
-# defaults to the production behaviour (byte-identical when all are at default).
+# the TP worker processes that run the selector). The served default is cosine +
+# current-slot inclusion (the two restored fixes); "off" (raw channel-dot) and
+# current-excluded stay reachable by explicit config for bisection.
 #
-# scorer_norm: only "off" (raw channel-dot) is supported. The absorbed-latent
-#   selection identity (score = max_h v_h · c_kv) holds only for the raw dot;
-#   direction-only norms would operate on a materialized per-head signature the
-#   selector never builds.
+# scorer_norm: "cosine" (direction-normalized) is the default served scorer (the
+#   restored Fix B) and is graph-safe: it divides each per-head dot by the query/key
+#   norms — the key norm gathered from a resident-latent cache, the query norm
+#   computed allocation-free per step — on top of the SAME raw-dot numerator. "off"
+#   (raw channel-dot) is the explicit bisection control. The absorbed-latent identity
+#   (score = max_h v_h · c_kv) is the numerator both share; cosine adds the per-head
+#   norm division, and ds_scorer_is_graph_safe() returns True for both.
 # head_agg: cross-head score reduction, "max" (default) or "mean".
 # anchor_mode: which deterministic positions to always force-include in the
 #   selection — "off" (default, none), "recency" (most-recent), "global"
 #   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
 # anchor_budget: how many anchor positions to force-include; 0 disables.
-_ALLOWED_SCORER_NORM = ("off",)
-_DEFAULT_SCORER_NORM = "off"
+_ALLOWED_SCORER_NORM = ("off", "cosine")
+# The served default is the restored cosine scorer (the Fix-B direction normalization);
+# "off" (raw channel-dot) stays reachable by explicit config for bisection. A config that
+# omits scorer_norm now serves cosine.
+_DEFAULT_SCORER_NORM = "cosine"
+# The served default also force-includes the current decode slot (the Fix-A current-slot
+# inclusion); explicit `false` keeps the current-excluded raw behavior for bisection.
+_DEFAULT_INCLUDE_CURRENT_SLOT = True
 _ALLOWED_HEAD_AGG = ("max", "mean")
 _DEFAULT_HEAD_AGG = "max"
 _ALLOWED_ANCHOR_MODE = ("off", "recency", "global", "strided")
@@ -84,14 +95,21 @@ class DoubleSparsityConfig:
     )
     selector_width_overflow_policy: str = _DEFAULT_OVERFLOW_POLICY
     score_reduce_dtype: str = "bf16"
+    # include_current_slot: served fix for the current-decode-slot exclusion. When
+    # on, the production graph-safe selector force-includes the current decode
+    # token's own logical slot (seq_len-1) in its selected set, overriding the
+    # slot-validity -inf mask for THAT slot only (every other reused slot stays
+    # masked, so the stale-slot hazard is not reopened). ON by default (the served
+    # Fix A); explicit `false` keeps the current-excluded raw behavior for bisection.
+    include_current_slot: bool = _DEFAULT_INCLUDE_CURRENT_SLOT
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.scorer_norm not in _ALLOWED_SCORER_NORM:
             raise ValueError(
-                f"Double Sparsity 'scorer_norm' must be 'off' (the absorbed-latent "
-                f"selection identity only holds for the raw channel-dot score), got "
-                f"{self.scorer_norm!r}."
+                f"Double Sparsity 'scorer_norm' must be one of "
+                f"{list(_ALLOWED_SCORER_NORM)} ('off' = raw channel-dot; 'cosine' = "
+                f"direction-normalized absorbed score), got {self.scorer_norm!r}."
             )
         if self.head_agg not in _ALLOWED_HEAD_AGG:
             raise ValueError(
@@ -136,6 +154,11 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'score_reduce_dtype' must be one of "
                 f"['fp32', 'bf16'], got {self.score_reduce_dtype!r}."
+            )
+        if not isinstance(self.include_current_slot, bool):
+            raise ValueError(
+                f"Double Sparsity 'include_current_slot' must be a boolean, "
+                f"got {self.include_current_slot!r}."
             )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
@@ -231,5 +254,8 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
             data.get("selector_width_overflow_policy", _DEFAULT_OVERFLOW_POLICY)
         ),
         score_reduce_dtype=str(data.get("score_reduce_dtype", "bf16")),
+        include_current_slot=data.get(
+            "include_current_slot", _DEFAULT_INCLUDE_CURRENT_SLOT
+        ),
         extra=data.get("extra", {}),
     )
