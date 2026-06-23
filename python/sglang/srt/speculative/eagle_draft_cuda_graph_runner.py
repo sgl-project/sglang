@@ -564,11 +564,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
+        # Save the raw seq_lens_sum; it is restored after replay. While the graph
+        # runs it must reflect the padded fake rows (set below), since draft decode
+        # backends read seq_lens_sum to size/slice kv_indices.
+        raw_seq_lens_sum = forward_batch.seq_lens_sum
+
         if bs != raw_bs:
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            if raw_seq_lens_sum is not None:
+                forward_batch.seq_lens_sum = (
+                    raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+                )
             if buffers.rids_int is not None and forward_batch.rids_int is not None:
                 forward_batch.rids_int = buffers.rids_int[:bs]
             if (
@@ -617,5 +626,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 ]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+            forward_batch.seq_lens_sum = raw_seq_lens_sum
 
         return out
