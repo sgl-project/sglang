@@ -140,7 +140,7 @@ def _compare_references(
     return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
 
 
-def select_reference_weight(quant_method) -> Optional[type]:
+def select_comparable_weight(quant_method) -> Optional[type]:
     """Single router: map a module's quant_method to its ComparableWeight subclass.
 
     - fp8 block quant -> Fp8BlockReference: its scale is requantized to ue8m0 on

@@ -13,7 +13,7 @@ from sglang.srt.utils.weight_checker_comparator import (
     ComparableWeight,
     RawReference,
     _compare_references,
-    select_reference_weight,
+    select_comparable_weight,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,11 +246,11 @@ def _build_reference_plan(model) -> Dict[str, Tuple[type, str]]:
     """Apply the router across the model: {weight_name: (ComparableWeight subclass,
     scale_name)} for each weight in a module routed to a ComparableWeight. Weights
     absent from the plan (int4, mxfp8, unquantized, ...) compare raw.
-    select_reference_weight raises for an unsupported quant format (e.g. nvfp4).
+    select_comparable_weight raises for an unsupported quant format (e.g. nvfp4).
     """
     plan = {}
     for module_name, module in model.named_modules():
-        rw_cls = select_reference_weight(getattr(module, "quant_method", None))
+        rw_cls = select_comparable_weight(getattr(module, "quant_method", None))
         if rw_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
