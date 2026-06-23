@@ -29,6 +29,7 @@ from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -1649,24 +1650,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_global_lplb_solver(lid, solver)
         logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
-    def update_expert_location(
-        self,
+    @staticmethod
+    def update_expert_location_with_recovery(
+        *,
+        expert_location_updater: ExpertLocationUpdater,
+        model: nn.Module,
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
+        nnodes: int,
+        tp_rank: int,
+        expert_backup_client,
+        update_weights_from_disk_callable,
+        ep_dispatch_algorithm: str,
+        init_lplb_solvers_callable,
     ):
-        p2p_missing_logical_experts = self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
+        p2p_missing_logical_experts = expert_location_updater.update(
+            model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
-            nnodes=self.server_args.nnodes,
-            rank=self.tp_rank,
+            nnodes=nnodes,
+            rank=tp_rank,
         )
 
         if len(p2p_missing_logical_experts) > 0:
             # Load the missing expert weights from disk
-            if callable(getattr(self.model, "generate_weight_name_filter", None)):
+            if callable(getattr(model, "generate_weight_name_filter", None)):
                 # Filter and load only missing expert weights
-                weight_name_filter = self.model.generate_weight_name_filter(
+                weight_name_filter = model.generate_weight_name_filter(
                     p2p_missing_logical_experts
                 )
             else:
@@ -1677,23 +1687,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 weight_name_filter = None
 
-            if (
-                self.expert_backup_client is not None
-                and self.expert_backup_client.use_backup
-            ):
+            if expert_backup_client is not None and expert_backup_client.use_backup:
                 # Load the missing weights from the DRAM backup
-                self.expert_backup_client.update_weights(weight_name_filter)
+                expert_backup_client.update_weights(weight_name_filter)
             else:
                 # Load the missing weights from disk
-                self.weight_updater.update_weights_from_disk(
+                update_weights_from_disk_callable(
                     get_server_args().model_path,
                     get_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
 
         # Re-init LPLB solvers after expert location update
-        if self.server_args.ep_dispatch_algorithm == "lp":
-            self._init_lplb_solvers()
+        if ep_dispatch_algorithm == "lp":
+            init_lplb_solvers_callable()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
