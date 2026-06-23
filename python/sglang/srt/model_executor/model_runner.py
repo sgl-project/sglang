@@ -43,6 +43,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -242,17 +243,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        moe_ep_rank: int,
-        moe_ep_size: int,
-        pp_rank: int,
-        pp_size: int,
+        ps: ParallelState,
         nccl_port: int,
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        attn_cp_rank: Optional[int] = None,
-        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -267,22 +260,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
+        self.tp_rank = ps.tp_rank
+        self.tp_size = ps.tp_size
         self.dcp_size = server_args.dcp_size
-        self.dcp_rank = self.tp_rank % self.dcp_size
-        self.moe_ep_rank = moe_ep_rank
-        self.moe_ep_size = moe_ep_size
-        self.dp_rank = dp_rank
-        self.attn_dp_size = (
-            server_args.dp_size if server_args.enable_dp_attention else 1
-        )
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dp_rank = moe_dp_rank
-        self.moe_dp_size = server_args.moe_dp_size
+        self.dcp_rank = ps.tp_rank % self.dcp_size
+        self.ps = ps
+        self.moe_ep_rank = ps.moe_ep_rank
+        self.moe_ep_size = ps.moe_ep_size
+        self.dp_rank = ps.dp_rank
+        self.attn_dp_size = ps.attn_dp_size
+        self.pp_rank = ps.pp_rank
+        self.pp_size = ps.pp_size
+        self.attn_cp_rank = ps.attn_cp_rank
+        self.attn_cp_size = ps.attn_cp_size
+        self.moe_dp_rank = ps.moe_dp_rank
+        self.moe_dp_size = ps.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -356,7 +348,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        set_offloader(
+            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
+        )
 
         self._weight_checker = WeightChecker(model_runner=self)
 
@@ -813,16 +807,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            dp_size=self.attn_dp_size,
-            attn_cp_size=self.attn_cp_size,
-            moe_ep_size=self.moe_ep_size,
-            moe_dp_size=self.moe_dp_size,
-            dcp_size=self.dcp_size,
+            ps=self.ps,
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
