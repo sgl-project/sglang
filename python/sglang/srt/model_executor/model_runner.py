@@ -1223,7 +1223,15 @@ class ModelRunner:
                 f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
             )
 
-        self._maybe_register_debug_tensor_dump_hook()
+        ModelRunner.maybe_register_debug_tensor_dump_hook(
+            model=self.model,
+            server_args=self.server_args,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
+        )
 
         if dumper.may_enable:
             dumper.apply_source_patches()
@@ -1379,19 +1387,29 @@ class ModelRunner:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-    def _maybe_register_debug_tensor_dump_hook(self) -> None:
-        if self.server_args.debug_tensor_dump_output_folder is not None:
-            dump_folder = self.server_args.debug_tensor_dump_output_folder
-            if self.spec_algorithm.is_eagle():
-                role = "draft" if self.is_draft_worker else "target"
+    @staticmethod
+    def maybe_register_debug_tensor_dump_hook(
+        *,
+        model,
+        server_args: ServerArgs,
+        spec_algorithm: SpeculativeAlgorithm,
+        is_draft_worker: bool,
+        tp_size: int,
+        tp_rank: int,
+        pp_rank: int,
+    ) -> None:
+        if server_args.debug_tensor_dump_output_folder is not None:
+            dump_folder = server_args.debug_tensor_dump_output_folder
+            if spec_algorithm.is_eagle():
+                role = "draft" if is_draft_worker else "target"
                 dump_folder = os.path.join(dump_folder, role)
             register_forward_hook_for_model(
-                self.model,
+                model,
                 dump_folder,
-                self.server_args.debug_tensor_dump_layers,
-                self.tp_size,
-                self.tp_rank,
-                self.pp_rank,
+                server_args.debug_tensor_dump_layers,
+                tp_size,
+                tp_rank,
+                pp_rank,
             )
 
     def _dist_barrier_after_load(self) -> None:
