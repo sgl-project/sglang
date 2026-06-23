@@ -8,12 +8,18 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls
-from sglang.srt.distributed import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
-from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
+from sglang.srt.distributed.device_communicators.custom_all_reduce_vmm_utils import (
+    VmmGraphInputManager,
+    is_vmm_pointer,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +71,14 @@ class CustomAllReduceV2:
             max_pull_blocks=max_pull_blocks,
             max_push_blocks=max_push_blocks,
         )
+        self._vmm_graph_input_manager = VmmGraphInputManager(
+            obj=self.obj,
+            group=self.group,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
         self._post_init_obj()
         self.disabled = False
-        log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -95,10 +106,21 @@ class CustomAllReduceV2:
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
-        # cannot call when graph is capturing
         assert (
-            torch.cuda.is_current_stream_capturing() == False
+            not torch.cuda.is_current_stream_capturing()
         ), "Cannot register graph inputs while capturing CUDA graph"
+        raw_ptrs = self.obj.get_graph_capture_ptrs()
+        if raw_ptrs and is_vmm_pointer(raw_ptrs[0]):
+            self._vmm_graph_input_manager.register_graph_inputs()
+        else:
+            self._register_graph_inputs_ipc()
+
+    def _register_graph_inputs_ipc(self):
+        """Register graph capture inputs via cudaIpcGetMemHandle.
+
+        This is the fast path for cudaMalloc-backed allocations. Fails
+        on VMM pointers (expandable_segments).
+        """
         pairs = self.obj.share_graph_inputs()
         handles = [handle for _, handle in pairs]
         offsets = [offset for offset, _ in pairs]
@@ -106,7 +128,6 @@ class CustomAllReduceV2:
         offsets_all = self._share_list(offsets)
         result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
         self.obj.register_inputs(result)
-        log_info_on_rank0(logger, f"Registering {len(pairs)} cuda graph addresses")
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
@@ -121,7 +142,7 @@ class CustomAllReduceV2:
         return inp_size <= self.max_size
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
-        if is_in_piecewise_cuda_graph():  # disable inplace optimization
+        if is_in_tc_piecewise_cuda_graph():  # disable inplace optimization
             try:
                 self.obj.set_cuda_graph_capture(False)
                 return self._all_reduce(input)
@@ -132,6 +153,8 @@ class CustomAllReduceV2:
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
             self.obj.free(self.group)
+        if hasattr(self, "_vmm_graph_input_manager"):
+            self._vmm_graph_input_manager.close()
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""

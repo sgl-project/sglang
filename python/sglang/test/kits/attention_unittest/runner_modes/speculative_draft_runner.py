@@ -8,13 +8,15 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
+from sglang.srt.model_executor.runner import set_global_graph_memory_pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -186,6 +188,15 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
     @property
     def draft_model_runner(self):
@@ -296,7 +307,12 @@ def _configure_runner_for_eagle_draft(
     server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
-        "cuda_graph_bs": [settings.capture_batch_size],
+        "cuda_graph_config": CudaGraphConfig(
+            decode=PhaseConfig(
+                bs=[settings.capture_batch_size],
+                max_bs=settings.capture_batch_size,
+            ),
+        ),
         "debug_cuda_graph": False,
         "decode_attention_backend": case.backend,
         "disable_cuda_graph_padding": False,
@@ -424,21 +440,18 @@ def _capture_eagle_draft_graph_runner(
 ) -> EAGLEDraftCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -453,21 +466,18 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -534,8 +544,8 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -580,8 +590,8 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -1855,7 +1865,7 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
 #   1. Multi-query-per-request: `num_input_tokens = sum(input_lens)`.
 #   2. Routes through `forward_extend` rather than `forward_decode`.
 #      Production picks `dsa_decode_impl` (default `flashmla_kv`)
-#      because `is_draft_extend(include_v2=True)` is in the
+#      because `is_draft_extend_v2()` is in the
 #      decode-impl branch (`dsa_backend.py:1352-1358`).
 #   3. DraftBackendFactory returns a single `DeepseekSparseAttnBackend`
 #      (not a multi-step wrapper) via `_create_dsa_prefill_backend`.
