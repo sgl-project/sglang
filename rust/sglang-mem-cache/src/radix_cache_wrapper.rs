@@ -9,7 +9,7 @@ use crate::py_interop::PyTensor;
 use crate::component_type::NUM_COMPONENT_TYPES;
 use crate::deferred_action::DeferredAction;
 use crate::radix_cache::{BigramRadixCache, InsertResult, MatchResult, PageRadixCache};
-use crate::tree_node_lru::{EvictRequest, EvictResult};
+use crate::components::{EvictRequest, EvictResult};
 use crate::utils::parse_device;
 
 /// Per-component eviction outcome at the PyO3 boundary.

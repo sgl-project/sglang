@@ -9,7 +9,6 @@ pub mod error;
 pub mod py_interop;
 pub mod radix_cache;
 pub mod radix_cache_wrapper;
-pub mod tree_node_lru;
 pub mod tree_node_pool;
 pub mod utils;
 

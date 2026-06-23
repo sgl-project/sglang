@@ -3,7 +3,7 @@
 use super::{Component, IncLockRefResult, MatchValidator};
 use crate::component_type::ComponentType;
 use crate::error::RadixCacheInitError;
-use crate::tree_node_lru::{EvictRequest, EvictResult, LRUSlot, MambaLRUSlot, evict_non_full};
+use super::{EvictRequest, EvictResult, Slot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Mamba radix-tree component.
@@ -17,7 +17,7 @@ pub struct MambaMatchValidator;
 
 impl<K: ChildKeyType> MatchValidator<K> for MambaMatchValidator {
     fn validate(&mut self, n: &TreeNode<K>) -> bool {
-        MambaLRUSlot::has_value(n)
+        MambaSlot::has_value(n)
     }
 }
 
@@ -48,8 +48,8 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         pool: &mut TreeNodePool<K>,
         node_idx: NodeIdx,
     ) -> Option<IncLockRefResult> {
-        let delta = if MambaLRUSlot::has_value(pool.get(node_idx)) {
-            MambaLRUSlot::inc_lock_ref(pool, node_idx)
+        let delta = if MambaSlot::has_value(pool.get(node_idx)) {
+            MambaSlot::inc_lock_ref(pool, node_idx)
         } else {
             0
         };
@@ -65,8 +65,8 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         node_idx: NodeIdx,
         _swa_uuid_for_lock: Option<u64>,
     ) -> Option<i64> {
-        let delta = if MambaLRUSlot::has_value(pool.get(node_idx)) {
-            MambaLRUSlot::dec_lock_ref(pool, node_idx)
+        let delta = if MambaSlot::has_value(pool.get(node_idx)) {
+            MambaSlot::dec_lock_ref(pool, node_idx)
         } else {
             0
         };
@@ -78,12 +78,12 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         let target = request.num_tokens[ct];
         let already = result.evicted[ct];
         if already < target {
-            evict_non_full::<K, MambaLRUSlot>(pool, target - already, result);
+            evict_non_full::<K, MambaSlot>(pool, target - already, result);
         }
     }
 
     fn bump_mru_walk(&self, pool: &mut TreeNodePool<K>, node_idx: NodeIdx) {
-        MambaLRUSlot::bump_mru_walk(pool, node_idx);
+        MambaSlot::bump_mru_walk(pool, node_idx);
     }
 
     fn redistribute_on_node_split(
@@ -94,8 +94,29 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         _split_len: usize,
     ) {
         // Mamba state stays at the child; the new parent has none.
-        if MambaLRUSlot::has_value(pool.get(child_idx)) {
-            MambaLRUSlot::bump_mru(pool, child_idx);
+        if MambaSlot::has_value(pool.get(child_idx)) {
+            MambaSlot::bump_mru(pool, child_idx);
         }
+    }
+}
+
+/// LRU for Mamba values.
+pub struct MambaSlot;
+
+impl Slot for MambaSlot {
+    const COMPONENT: ComponentType = ComponentType::Mamba;
+    const NAME: &'static str = "Mamba";
+
+    /// 1 SSM state per TreeNode.
+    fn value_len<K: ChildKeyType>(_node: &TreeNode<K>) -> usize {
+        1
+    }
+
+    fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ true)
+    }
+
+    fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::dec_lock_ref_non_full(pool, node_idx)
     }
 }

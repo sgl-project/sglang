@@ -6,8 +6,8 @@ use tch::Tensor;
 
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::error::RadixCacheInitError;
-use crate::tree_node_lru::{
-    ComponentPoolState, EvictResult, FullLRUSlot, LRUData, LRUSlot, MambaLRUSlot, SwaLRUSlot,
+use crate::components::{
+    ComponentPoolState, EvictResult, FullSlot, LRUData, Slot, MambaSlot, SwaSlot,
     evict_full_value,
 };
 
@@ -319,9 +319,9 @@ impl<K: ChildKeyType> TreeNodePool<K> {
             has_swa_component,
             has_mamba_component,
         };
-        FullLRUSlot::init::<K>(&mut pool);
-        SwaLRUSlot::init::<K>(&mut pool);
-        MambaLRUSlot::init::<K>(&mut pool);
+        FullSlot::init::<K>(&mut pool);
+        SwaSlot::init::<K>(&mut pool);
+        MambaSlot::init::<K>(&mut pool);
         pool
     }
 
@@ -372,10 +372,10 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         self.get_mut(parent_idx)
             .insert_child(child_key_owned, child_idx);
         let value_len = self.get(child_idx).key().len();
-        FullLRUSlot::bump_mru(self, child_idx);
-        FullLRUSlot::pool_state_mut(self).unlocked_size += value_len;
-        if FullLRUSlot::has_value(self.get(child_idx)) {
-            FullLRUSlot::postprocess_set_value(self, parent_idx);
+        FullSlot::bump_mru(self, child_idx);
+        FullSlot::pool_state_mut(self).unlocked_size += value_len;
+        if FullSlot::has_value(self.get(child_idx)) {
+            FullSlot::postprocess_set_value(self, parent_idx);
         }
         child_idx
     }
@@ -452,7 +452,7 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         // New intermediate's full-device-child count: 1 iff its only child kept
         // a FULL device value.
         self.get_mut(new_node_idx).num_children_with_device_full =
-            u32::from(FullLRUSlot::has_value(self.get(node_idx)));
+            u32::from(FullSlot::has_value(self.get(node_idx)));
 
         new_node_idx
     }
@@ -496,12 +496,12 @@ impl<K: ChildKeyType> TreeNodePool<K> {
             );
             (
                 parent_idx,
-                SwaLRUSlot::data(node).in_list,
-                SwaLRUSlot::has_value(node),
-                MambaLRUSlot::data(node).in_list,
-                MambaLRUSlot::has_value(node),
-                SwaLRUSlot::value_len(node),
-                MambaLRUSlot::value_len(node),
+                SwaSlot::data(node).in_list,
+                SwaSlot::has_value(node),
+                MambaSlot::data(node).in_list,
+                MambaSlot::has_value(node),
+                SwaSlot::value_len(node),
+                MambaSlot::value_len(node),
             )
         };
         assert_eq!(
@@ -519,23 +519,23 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         // FULL value.
         {
             let node = self.get_mut(idx);
-            MambaLRUSlot::take_value(node, result);
-            SwaLRUSlot::take_value(node, result);
+            MambaSlot::take_value(node, result);
+            SwaSlot::take_value(node, result);
         }
 
         // FULL value drain.
         if let Some(full_value) = evict_full_value(self, idx, result) {
-            result.freed[FullLRUSlot::COMPONENT as usize].push(full_value);
+            result.freed[FullSlot::COMPONENT as usize].push(full_value);
         }
 
         // SWA/Mamba LRU unlink + bookkeeping update.
         if swa_was_in_list {
-            SwaLRUSlot::remove(self, idx);
-            SwaLRUSlot::pool_state_mut(self).unlocked_size -= swa_value_len;
+            SwaSlot::remove(self, idx);
+            SwaSlot::pool_state_mut(self).unlocked_size -= swa_value_len;
         }
         if mamba_was_in_list {
-            MambaLRUSlot::remove(self, idx);
-            MambaLRUSlot::pool_state_mut(self).unlocked_size -= mamba_value_len;
+            MambaSlot::remove(self, idx);
+            MambaSlot::pool_state_mut(self).unlocked_size -= mamba_value_len;
         }
 
         // Tree mutation: detach from parent, free the pool slot.

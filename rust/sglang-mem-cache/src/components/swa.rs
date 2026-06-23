@@ -6,9 +6,7 @@ use super::{Component, IncLockRefResult, MatchValidator};
 use crate::component_type::ComponentType;
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
-use crate::tree_node_lru::{
-    EvictRequest, EvictResult, FullLRUSlot, LRUSlot, SwaLRUSlot, evict_non_full,
-};
+use super::{EvictRequest, EvictResult, FullSlot, Slot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, NodeSplit, TreeNode, TreeNodePool};
 
 pub struct SwaComponent {
@@ -49,7 +47,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         let mut current = node_idx;
         while let Some(parent) = pool.get(current).parent() {
             let key_len = pool.get(current).key().len();
-            delta += SwaLRUSlot::inc_lock_ref(pool, current);
+            delta += SwaSlot::inc_lock_ref(pool, current);
             accumulated_token_count += key_len;
             if accumulated_token_count >= self.sliding_window_size {
                 swa_uuid_for_lock = Some(pool.lazy_acquire_swa_uuid_for_lock(current));
@@ -76,7 +74,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         let mut current = node_idx;
         while let Some(parent) = pool.get(current).parent() {
             let this_uuid = pool.get(current).swa_uuid_for_lock();
-            delta += SwaLRUSlot::dec_lock_ref(pool, current);
+            delta += SwaSlot::dec_lock_ref(pool, current);
             // `is_some()` rules out the (None, None) match (walk to root).
             if this_uuid.is_some() && this_uuid == swa_uuid_for_lock {
                 break;
@@ -92,7 +90,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         let target = request.num_tokens[ct];
         let already = result.evicted[ct];
         if already < target {
-            evict_non_full::<K, SwaLRUSlot>(pool, target - already, result);
+            evict_non_full::<K, SwaSlot>(pool, target - already, result);
         }
     }
 
@@ -118,12 +116,12 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         }
 
         // Not a tombstone: nothing to recover.
-        if SwaLRUSlot::has_value(pool.get(child_idx)) {
+        if SwaSlot::has_value(pool.get(child_idx)) {
             return Ok(node_key_len);
         }
 
         assert_eq!(
-            SwaLRUSlot::lock_ref(pool.get(child_idx)),
+            SwaSlot::lock_ref(pool.get(child_idx)),
             0,
             "SWA tombstone at node_idx={child_idx} has non-zero lock_ref"
         );
@@ -134,11 +132,11 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
                 clippy::expect_used,
                 reason = "tombstone invariant: FULL value retained"
             )]
-            let old_full = FullLRUSlot::value(pool.get(child_idx))
+            let old_full = FullSlot::value(pool.get(child_idx))
                 .expect("tombstone node must have FULL value")
                 .shallow_clone();
             let new_full = value_slice.copy();
-            FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
+            FullSlot::replace_value(pool, child_idx, new_full.shallow_clone());
             deferred.push(DeferredAction::SwaRecover {
                 node_idx: child_idx,
                 old_full_to_free: old_full,
@@ -157,13 +155,13 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
                 clippy::expect_used,
                 reason = "split_node narrows but preserves FULL value"
             )]
-            let old_full = FullLRUSlot::value(pool.get(child_idx))
+            let old_full = FullSlot::value(pool.get(child_idx))
                 .expect("split suffix must have FULL value")
                 .shallow_clone();
             let new_full = value_slice
                 .narrow(0, start_idx as i64, (node_key_len - start_idx) as i64)
                 .copy();
-            FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
+            FullSlot::replace_value(pool, child_idx, new_full.shallow_clone());
             deferred.push(DeferredAction::SwaRecover {
                 node_idx: child_idx,
                 old_full_to_free: old_full,
@@ -228,7 +226,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
             clippy::expect_used,
             reason = "in-window leaf invariant: FULL value populated"
         )]
-        let full_value = FullLRUSlot::value(pool.get(leaf_idx))
+        let full_value = FullSlot::value(pool.get(leaf_idx))
             .expect("in-window leaf must have FULL value")
             .shallow_clone();
         deferred.push(DeferredAction::SwaStamp {
@@ -239,7 +237,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
 
     /// Bump SWA LRU recency from `node_idx` up through ancestors.
     fn bump_mru_walk(&self, pool: &mut TreeNodePool<K>, node_idx: NodeIdx) {
-        SwaLRUSlot::bump_mru_walk(pool, node_idx);
+        SwaSlot::bump_mru_walk(pool, node_idx);
     }
 
     /// SWA-side redistribution after a node split: lock_ref copy,
@@ -253,8 +251,8 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         split_len: usize,
     ) {
         // 1. Copy SWA lock_ref so an in-flight release walk can pass through.
-        let child_swa_lock_ref = SwaLRUSlot::lock_ref(pool.get(child_idx));
-        SwaLRUSlot::set_lock_ref(pool.get_mut(new_parent_idx), child_swa_lock_ref);
+        let child_swa_lock_ref = SwaSlot::lock_ref(pool.get(child_idx));
+        SwaSlot::set_lock_ref(pool.get_mut(new_parent_idx), child_swa_lock_ref);
 
         // 2. Transfer the SWA uuid (boundary marker) to the parent slice.
         let transferred_uuid = pool.get_mut(child_idx).swa_uuid_for_lock.take();
@@ -262,7 +260,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
             .set_swa_uuid_for_lock(transferred_uuid);
 
         // 3. Slice SWA value across the boundary if present (else tombstone).
-        let Some(child_swa) = SwaLRUSlot::value(pool.get(child_idx)) else {
+        let Some(child_swa) = SwaSlot::value(pool.get(child_idx)) else {
             return;
         };
         let child_swa = child_swa.shallow_clone();
@@ -270,11 +268,11 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         let parent_part = child_swa.narrow(0, 0, split_len as i64);
         let child_part = child_swa.narrow(0, split_len as i64, total_len - split_len as i64);
 
-        SwaLRUSlot::replace_value(pool, new_parent_idx, parent_part);
-        SwaLRUSlot::replace_value(pool, child_idx, child_part);
+        SwaSlot::replace_value(pool, new_parent_idx, parent_part);
+        SwaSlot::replace_value(pool, child_idx, child_part);
 
         // 4. Insert both halves into SWA's LRU, child more recent than parent.
-        SwaLRUSlot::bump_mru_split(pool, new_parent_idx, child_idx);
+        SwaSlot::bump_mru_split(pool, new_parent_idx, child_idx);
     }
 }
 
@@ -299,12 +297,40 @@ impl SwaMatchValidator {
 
 impl<K: ChildKeyType> MatchValidator<K> for SwaMatchValidator {
     fn validate(&mut self, n: &TreeNode<K>) -> bool {
-        if !SwaLRUSlot::has_value(n) {
+        if !SwaSlot::has_value(n) {
             self.seen_tombstone = true;
             self.current_match_len = 0;
             return false;
         }
         self.current_match_len += n.key().len();
         !self.seen_tombstone || self.current_match_len >= self.sliding_window_size
+    }
+}
+
+/// LRU for SWA values.
+pub struct SwaSlot;
+
+impl Slot for SwaSlot {
+    const COMPONENT: ComponentType = ComponentType::Swa;
+    const NAME: &'static str = "Swa";
+
+    /// SWA's freed handle is a clone of FULL's value, not SWA's own value.
+    fn take_value<K: ChildKeyType>(node: &mut TreeNode<K>, result: &mut EvictResult) {
+        let ct = Self::COMPONENT as usize;
+        if node.components[ct].value.take().is_some() {
+            if let Some(full) = node.components[ComponentType::Full as usize].value.as_ref() {
+                let cloned = full.shallow_clone();
+                result.evicted[ct] += cloned.size()[0] as usize;
+                result.freed[ct].push(cloned);
+            }
+        }
+    }
+
+    fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ true)
+    }
+
+    fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::dec_lock_ref_non_full(pool, node_idx)
     }
 }

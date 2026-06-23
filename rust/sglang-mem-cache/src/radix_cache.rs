@@ -5,8 +5,8 @@ use tch::{Device, Kind, Tensor};
 use crate::components::{Component, FullComponent, IncLockRefResult, MambaComponent, SwaComponent};
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
-use crate::tree_node_lru::{
-    EvictRequest, EvictResult, FullLRUSlot, LRUSlot, MambaLRUSlot, SwaLRUSlot,
+use crate::components::{
+    EvictRequest, EvictResult, FullSlot, Slot, MambaSlot, SwaSlot,
 };
 use crate::tree_node_pool::{
     ChildKeyType, MatchChildResult, NodeIdx, PageSize, TreeNode, TreeNodePool,
@@ -282,7 +282,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                 } else {
                     None
                 };
-                let mv = MambaLRUSlot::value(self.tree_node_pool.get(last_matched_node_idx))
+                let mv = MambaSlot::value(self.tree_node_pool.get(last_matched_node_idx))
                     .map(|t| t.shallow_clone());
                 (branching_seqlen, mv)
             }
@@ -558,11 +558,11 @@ impl<K: ChildKeyType> RadixCache<K> {
                 !leaf_creation_skipped,
                 "leaf_creation_skipped is unreachable for Mamba",
             );
-            if new_leaf_created || !MambaLRUSlot::has_value(self.tree_node_pool.get(node_idx)) {
-                MambaLRUSlot::set_value(&mut self.tree_node_pool, node_idx, mv)?;
-                let delta = MambaLRUSlot::value_len(self.tree_node_pool.get(node_idx));
-                MambaLRUSlot::bump_mru(&mut self.tree_node_pool, node_idx);
-                MambaLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += delta;
+            if new_leaf_created || !MambaSlot::has_value(self.tree_node_pool.get(node_idx)) {
+                MambaSlot::set_value(&mut self.tree_node_pool, node_idx, mv)?;
+                let delta = MambaSlot::value_len(self.tree_node_pool.get(node_idx));
+                MambaSlot::bump_mru(&mut self.tree_node_pool, node_idx);
+                MambaSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += delta;
                 false
             } else {
                 true
@@ -593,19 +593,19 @@ impl<K: ChildKeyType> RadixCache<K> {
 
     /// Sum of `key.len()` across FULL device-value unreferenced nodes.
     pub fn evictable_token_size(&self) -> usize {
-        FullLRUSlot::unlocked_size(&self.tree_node_pool)
+        FullSlot::unlocked_size(&self.tree_node_pool)
     }
 
     /// Sum of `key.len()` across FULL device-value referenced nodes.
     pub fn protected_token_size(&self) -> usize {
-        FullLRUSlot::locked_size(&self.tree_node_pool)
+        FullSlot::locked_size(&self.tree_node_pool)
     }
 
     /// Total tokens (evictable + protected) across FULL and SWA components.
     pub fn total_token_size(&self) -> usize {
-        let mut total = FullLRUSlot::total_size(&self.tree_node_pool);
+        let mut total = FullSlot::total_size(&self.tree_node_pool);
         if self.has_swa_component {
-            total += SwaLRUSlot::total_size(&self.tree_node_pool);
+            total += SwaSlot::total_size(&self.tree_node_pool);
         }
         total
     }
@@ -613,7 +613,7 @@ impl<K: ChildKeyType> RadixCache<K> {
     /// Total Mamba slots (evictable + protected).
     pub fn mamba_total_size(&self) -> usize {
         if self.has_mamba_component {
-            MambaLRUSlot::total_size(&self.tree_node_pool)
+            MambaSlot::total_size(&self.tree_node_pool)
         } else {
             0
         }
@@ -621,22 +621,22 @@ impl<K: ChildKeyType> RadixCache<K> {
 
     /// Sum of `key.len()` across SWA device-value unreferenced nodes.
     pub fn swa_evictable_token_size(&self) -> usize {
-        SwaLRUSlot::unlocked_size(&self.tree_node_pool)
+        SwaSlot::unlocked_size(&self.tree_node_pool)
     }
 
     /// Sum of `key.len()` across SWA device-value referenced nodes.
     pub fn swa_protected_token_size(&self) -> usize {
-        SwaLRUSlot::locked_size(&self.tree_node_pool)
+        SwaSlot::locked_size(&self.tree_node_pool)
     }
 
     /// Count of unlocked nodes with a Mamba value populated.
     pub fn mamba_evictable_token_size(&self) -> usize {
-        MambaLRUSlot::unlocked_size(&self.tree_node_pool)
+        MambaSlot::unlocked_size(&self.tree_node_pool)
     }
 
     /// Count of locked nodes with a Mamba value populated.
     pub fn mamba_protected_token_size(&self) -> usize {
-        MambaLRUSlot::locked_size(&self.tree_node_pool)
+        MambaSlot::locked_size(&self.tree_node_pool)
     }
 
     /// Acquire: dispatch to each component's `inc_lock_ref` (FULL first, then
@@ -696,8 +696,8 @@ impl<K: ChildKeyType> RadixCache<K> {
         for (idx, value) in node_indices.into_iter().zip(swa_values) {
             // Snapshot pre-mutation state.
             let node = self.tree_node_pool.get(idx);
-            let in_list_at_entry = SwaLRUSlot::data(node).in_list;
-            let value_present_at_entry = SwaLRUSlot::has_value(node);
+            let in_list_at_entry = SwaSlot::data(node).in_list;
+            let value_present_at_entry = SwaSlot::has_value(node);
             let key_len = node.key().len();
             // SWA value existence must match SWA LRU membership.
             assert_eq!(
@@ -706,14 +706,14 @@ impl<K: ChildKeyType> RadixCache<K> {
                  in_list ({in_list_at_entry}) != value.is_some() ({value_present_at_entry})",
             );
 
-            SwaLRUSlot::replace_value(&mut self.tree_node_pool, idx, value);
+            SwaSlot::replace_value(&mut self.tree_node_pool, idx, value);
 
-            SwaLRUSlot::bump_mru(&mut self.tree_node_pool, idx);
+            SwaSlot::bump_mru(&mut self.tree_node_pool, idx);
             if !in_list_at_entry {
                 evictable_size_credit += key_len;
             }
         }
-        SwaLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += evictable_size_credit;
+        SwaSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += evictable_size_credit;
         Ok(())
     }
 }
