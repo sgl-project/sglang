@@ -734,18 +734,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-            if not cuda_graph_fully_disabled():
-                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
-                # intermediate buffers before init_memory_pool() so memory
-                # profiling accounts for them. The buffers are reused by
-                # any captured graph (decode today; widen here so any
-                # future prefill capture path also picks them up).
-                _init_lora_cuda_graph_moe_buffers(
-                    server_args=self.server_args,
-                    model=self.model,
-                    lora_manager=self.lora_manager,
-                    dtype=self.dtype,
-                )
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
@@ -1697,6 +1685,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
         )
+        if not cuda_graph_fully_disabled():
+            _init_lora_cuda_graph_moe_buffers(
+                server_args=self.server_args,
+                model=self.model,
+                lora_manager=self.lora_manager,
+                dtype=self.dtype,
+            )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
