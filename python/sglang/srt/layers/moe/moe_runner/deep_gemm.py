@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
+    _moe_output_buf,
     register_post_permute,
     register_pre_permute,
 )
@@ -275,11 +276,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del down_input
 
-        down_output = torch.empty(
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        _provided = _moe_output_buf.get()
+        if (
+            _provided is not None
+            and _provided.shape == (all_tokens, K)
+            and _provided.dtype == torch.bfloat16
+            and _provided.device == hidden_states_device
+        ):
+            down_output = _provided
+        else:
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
@@ -345,11 +355,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
-        down_output = torch.empty(
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        _provided = _moe_output_buf.get()
+        if (
+            _provided is not None
+            and _provided.shape == (all_tokens, K)
+            and _provided.dtype == torch.bfloat16
+            and _provided.device == hidden_states_device
+        ):
+            down_output = _provided
+        else:
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             down_input,
             w2_weight,
@@ -458,9 +477,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        _provided = _moe_output_buf.get()
+        if (
+            _provided is not None
+            and _provided.shape == (num_groups, m, n)
+            and _provided.dtype == torch.bfloat16
+            and _provided.device == hidden_states_device
+        ):
+            down_output = _provided
+        else:
+            down_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None:
@@ -545,9 +573,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        _provided = _moe_output_buf.get()
+        if (
+            _provided is not None
+            and _provided.shape == (num_groups, m, n)
+            and _provided.dtype == torch.bfloat16
+            and _provided.device == hidden_states_device
+        ):
+            down_output = _provided
+        else:
+            down_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
             down_input,
             w2_weight,
@@ -638,9 +675,18 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    output = torch.empty(
-        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-    )
+    _provided = _moe_output_buf.get()
+    if (
+        _provided is not None
+        and _provided.shape == hidden_states_shape
+        and _provided.dtype == hidden_states_dtype
+        and _provided.device == hidden_states_device
+    ):
+        output = _provided
+    else:
+        output = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
     post_reorder_triton_kernel[(hidden_states_shape[0],)](
         runner_output.hidden_states,
         output,
