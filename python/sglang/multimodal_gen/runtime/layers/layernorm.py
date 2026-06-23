@@ -428,7 +428,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         
         try:
             import attentions
-        except:
+        except ImportError:
             self._forward_method = self.forward_native
 
     def _cached_fp32_param(
