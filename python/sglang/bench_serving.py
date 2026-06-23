@@ -90,6 +90,8 @@ class RequestFuncInput:
     lora_name: str
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
+    video_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
 
@@ -265,6 +267,8 @@ async def async_request_openai_completions(
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -323,7 +327,8 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices", [])
+                            if choices and choices[0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -332,13 +337,11 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(choices[0]["text"])
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choices[0]["text"]
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
@@ -385,6 +388,7 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    content_items = []
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
         rid = str(uuid.uuid4())
@@ -397,15 +401,33 @@ async def async_request_openai_chat_completions(
 
     if isinstance(request_func_input.prompt, list):
         messages = request_func_input.prompt
-    elif request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data
-        ]
+    else:
+        content_items = []
+        if request_func_input.image_data:
+            content_items += [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": img_url},
+                }
+                for img_url in request_func_input.image_data
+            ]
+        if request_func_input.video_data:
+            content_items += [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": video_url},
+                }
+                for video_url in request_func_input.video_data
+            ]
+        if request_func_input.audio_data:
+            content_items += [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_url},
+                }
+                for audio_url in request_func_input.audio_data
+            ]
+
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
             {
@@ -413,8 +435,6 @@ async def async_request_openai_chat_completions(
                 "content": content_items,
             },
         ]
-    else:
-        messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
         # Build payload with defaults that can be overridden by extra_request_body
@@ -424,6 +444,8 @@ async def async_request_openai_chat_completions(
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -598,7 +620,8 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices", [])
+                            if choices and choices[0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -610,7 +633,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choices[0]["text"]
 
                     output.generated_text = generated_text
                     output.success = True
@@ -1477,6 +1500,8 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            video_data=getattr(request, "video_data", None),
+            audio_data=getattr(request, "audio_data", None),
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -2168,6 +2193,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "multimodal",
             "longbench_v2",
             "speed-bench",
         ],
