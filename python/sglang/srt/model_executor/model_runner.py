@@ -30,7 +30,6 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs import (
@@ -179,7 +178,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.utils import (
+    resolve_language_model,
+    set_default_torch_dtype,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
@@ -272,17 +274,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
-
-
-def resolve_language_model(model: nn.Module) -> nn.Module:
-    model_cls_name = model.__class__.__name__
-    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
-        return model.thinker.model
-    if hasattr(model, "model"):
-        return model.model
-    if hasattr(model, "language_model"):
-        return model.language_model
-    return model.model
 
 
 @dataclass
