@@ -20,6 +20,14 @@ torch.manual_seed(1234)
 
 PAD_SLOT_ID = -1
 
+try:
+    CPU_VARLEN_CAUSAL_CONV_SUPPORTED = (
+        torch.backends.cpu.get_cpu_capability() == "AVX512"
+        and torch.cpu._is_avx512_bf16_supported()
+    )
+except Exception:
+    CPU_VARLEN_CAUSAL_CONV_SUPPORTED = False
+
 
 def causal_conv1d_ref(
     x: torch.Tensor,
@@ -193,9 +201,9 @@ class TestCausalConv1d(CustomTestCase):
         final_states = torch.randn(total_entries, dim, width - 1, dtype=dtype)
         final_states_ref = final_states.clone()
 
-        has_initial_states = torch.randint(0, 2, (batch,), dtype=torch.bool).fill_(
-            False
-        )
+        has_initial_states = (torch.arange(batch) % 2 == 0).to(dtype=torch.bool)
+        has_initial_states[-2] = True
+        has_initial_states[-1] = False
         state_indices = torch.randperm(total_entries, dtype=torch.int32)[:batch]
 
         out_ref = []
@@ -242,6 +250,65 @@ class TestCausalConv1d(CustomTestCase):
         atol = rtol = precision[dtype]
         torch.testing.assert_close(out_ref_tensor, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(final_states_ref, final_states, atol=atol, rtol=rtol)
+
+    @unittest.skipUnless(
+        CPU_VARLEN_CAUSAL_CONV_SUPPORTED,
+        "CPU causal-conv varlen split regression requires AVX512 BF16 support.",
+    )
+    def test_causal_conv1d_varlen_split_handoff(
+        self, has_bias=False, dtype=torch.bfloat16, prepack=False
+    ):
+        dim = 96
+        width = 4
+        split = 5
+        seqlen = 7
+
+        x = torch.randn(seqlen, dim, dtype=dtype).transpose_(-1, -2)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype) if has_bias else None
+
+        out_ref, final_states_ref = causal_conv1d_ref(
+            x.unsqueeze(0),
+            weight,
+            bias,
+            return_final_states=True,
+            activation=self.activation,
+        )
+
+        conv_states = torch.randn(1, dim, width - 1, dtype=dtype)
+        out_first = causal_conv1d_fwd(
+            x[:, :split],
+            weight,
+            bias,
+            conv_states,
+            torch.tensor([0, split], dtype=torch.int32),
+            None,
+            torch.tensor([False], dtype=torch.bool),
+            self.activation in ["silu"],
+            PAD_SLOT_ID,
+            prepack,
+        )
+        out_second = causal_conv1d_fwd(
+            x[:, split:],
+            weight,
+            bias,
+            conv_states,
+            torch.tensor([0, seqlen - split], dtype=torch.int32),
+            None,
+            torch.tensor([True], dtype=torch.bool),
+            self.activation in ["silu"],
+            PAD_SLOT_ID,
+            prepack,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(
+            torch.cat([out_first, out_second], dim=1),
+            out_ref.squeeze(0),
+            atol=atol,
+            rtol=rtol,
+        )
+        torch.testing.assert_close(conv_states, final_states_ref, atol=atol, rtol=rtol)
 
     @parametrize(
         batch=[11],
