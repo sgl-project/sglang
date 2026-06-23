@@ -265,6 +265,39 @@ def dequantize_resident_latent(
     return deq.view(t, lora)
 
 
+def assert_resident_fp8_layout(
+    *, kv_lora_rank: int, kv_cache_dim: int, rope_bytes: int
+) -> int:
+    """Fail-closed check that the resident fp8 KV slot layout is exactly what the
+    cosine key-norm populate and the score kernel read, asserted branch-locally at
+    init for this ``0.4.4`` base.
+
+    The per-slot ``uint8`` row is ``[fp8 lora (kv_lora_rank bytes) | per-128-block
+    fp32 scales (lora//128 * 4 bytes) | rope (rope_bytes)]``. Raises on any
+    mismatch — a wrong ``kv_lora_rank`` (not a multiple of 128), a scale-count or
+    rope-byte mismatch, or a total ``kv_cache_dim`` that does not add up — so a
+    wrong-byte read fails closed at init rather than silently scoring garbage.
+
+    Returns the validated number of 128-channel scale blocks (``lora // 128``).
+    """
+    lora = int(kv_lora_rank)
+    if lora % 128 != 0:
+        raise ValueError(
+            f"Double Sparsity cosine: kv_lora_rank {lora} must be a multiple of 128 "
+            f"(the resident fp8 latent carries one fp32 scale per 128-channel block)."
+        )
+    nblk = lora // 128
+    expected_dim = lora + nblk * 4 + int(rope_bytes)
+    if int(kv_cache_dim) != expected_dim:
+        raise ValueError(
+            f"Double Sparsity cosine: resident fp8 kv_cache_dim {int(kv_cache_dim)} "
+            f"!= [fp8 lora {lora} | {nblk} fp32 scales {nblk * 4}B | rope "
+            f"{int(rope_bytes)}B] = {expected_dim}B. The key-norm populate reads "
+            f"these exact bytes; a layout drift would score the wrong slot data."
+        )
+    return nblk
+
+
 def key_norms_from_latent(
     w_sel: torch.Tensor,
     c_kv: torch.Tensor,
