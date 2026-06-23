@@ -11,10 +11,12 @@ backends decided by ``HybridBackendSelector``:
     ``K = speculative_num_steps + 1``.
   - **NONE** — plain target decode, no spec, ``K = 1``.
 
-All three backends produce different verify input widths; dispatch to
-three captured cuda graphs (main K_suffix, short_chain K_mtp, baseline
-K=1) is handled transparently by ``ModelRunner._forward_raw`` via each
-runner's width-based ``can_run``.
+All three backends produce different verify input widths. The three
+captured cuda graphs (main K_suffix, short_chain K_mtp, baseline K=1)
+live on the target ``model_runner``; ``verify()`` swaps
+``model_runner.decode_cuda_graph_runner`` to the K-matching runner
+(keyed on ``spec_info.draft_token_num``) immediately before the verify
+forward and restores the main runner afterward.
 
 SUFFIX backend per-step flow:
   1. Pull current tokens per req (``req.origin_input_ids +
@@ -130,6 +132,22 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         # the attention backend).
         self._max_context_len = int(target_worker.model_runner.model_config.context_len)
 
+        # Three target-side cuda-graph runners (captured in the target
+        # model_runner's init_decode_cuda_graph, which already ran during
+        # target_worker construction):
+        #   - main  decode_cuda_graph_runner       — K_suffix (SUFFIX path)
+        #   - short_chain_graph_runner             — K_mtp    (MTP path)
+        #   - baseline_chain_graph_runner          — K=1      (NONE path)
+        # verify() swaps target_model_runner.decode_cuda_graph_runner to the
+        # K-matching runner (keyed on spec_info.draft_token_num) immediately
+        # before the verify forward, then restores the main runner. When
+        # K_suffix == K_mtp the narrower runners are absent (None); the main
+        # runner serves both and the swap is a no-op.
+        _tmr = target_worker.model_runner
+        self._main_decode_runner = _tmr.decode_cuda_graph_runner
+        self._short_chain_runner = getattr(_tmr, "short_chain_graph_runner", None)
+        self._baseline_runner = getattr(_tmr, "baseline_chain_graph_runner", None)
+
         # PD prefill instance: the MTP/EAGLE side stays fully alive (its draft
         # extend produces the draft KV that PD transfers to the decode
         # instance), but the SUFFIX side never speculates there — skip the
@@ -166,6 +184,14 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         # only needs server_args, and choose() infers bs from len(suffix_scores).
         # ARCTIC_HYBRID_FORCE_BACKEND env var pins one backend for A/B testing.
         self.selector = HybridBackendSelector(server_args)
+
+        # Run the MTP keep-up forward after every SUFFIX step so a later
+        # MTP-picked step starts with warm draft state. Off by default (extra
+        # compute per SUFFIX step); when off, MTP picks are promoted to SUFFIX
+        # by the cold-start guard, so HYBRID effectively mixes SUFFIX + NONE.
+        self._always_warm = bool(
+            getattr(server_args, "speculative_hybrid_mtp_always_warm", False)
+        )
 
         # Cache of the current step's arctic query, populated by
         # _peek_suffix_scores and consumed by _decode_step_suffix to avoid
@@ -367,6 +393,46 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
 
         return result
 
+    def verify(self, batch: ScheduleBatch):
+        """Route the verify forward to the K-matching target cuda-graph runner.
+
+        All three backends funnel through here: SUFFIX / NONE call ``self.verify``
+        directly; the MTP path reaches it via ``super().forward_batch_generation``
+        (dynamic dispatch). The parent ``EAGLEWorkerV2.verify`` hardcodes the
+        verify width to ``speculative_num_steps + 1`` (= K_mtp) and drives
+        ``model_runner.decode_cuda_graph_runner`` — both correct only for the MTP
+        path. Here we (a) swap the target decode runner to the graph captured at
+        the batch's actual width and (b) temporarily align
+        ``speculative_num_steps`` / ``speculative_num_draft_tokens`` to that
+        width, then restore both. Width is read from ``spec_info.draft_token_num``
+        (set by the SUFFIX/NONE converter and by the MTP draft path).
+        """
+        verify_input = batch.spec_info
+        K = getattr(verify_input, "draft_token_num", None)
+        tmr = self.target_worker.model_runner
+        prev_runner = tmr.decode_cuda_graph_runner
+        prev_steps = self.speculative_num_steps
+        prev_ndt = self.speculative_num_draft_tokens
+
+        if K is not None:
+            if K == self.K_mtp and self._short_chain_runner is not None:
+                tmr.decode_cuda_graph_runner = self._short_chain_runner
+            elif K == 1 and self._baseline_runner is not None:
+                tmr.decode_cuda_graph_runner = self._baseline_runner
+            else:
+                # K_suffix (or any unmatched width): the main runner. If no
+                # captured graph matches the width, can_run_graph's ngram width
+                # check fails and verify falls back to eager — correct, slower.
+                tmr.decode_cuda_graph_runner = self._main_decode_runner
+            self.speculative_num_steps = K - 1
+            self.speculative_num_draft_tokens = K
+        try:
+            return super().verify(batch)
+        finally:
+            tmr.decode_cuda_graph_runner = prev_runner
+            self.speculative_num_steps = prev_steps
+            self.speculative_num_draft_tokens = prev_ndt
+
     def _selector_uses_scores(self) -> bool:
         """Mirror V1's check — skip the peek when force/debug knobs short-circuit
         the choice anyway."""
@@ -562,13 +628,16 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         if on_publish is not None and batch_output.new_seq_lens is not None:
             on_publish(batch_output.new_seq_lens)
 
-        # 5. MTP keep-up. V2 path: slice predict/hidden/out_cache_loc to
-        # K_target per req, call super's _draft_extend_for_decode which
-        # uses uniform K_target chains. V1's variable-length flat-accept
-        # approach doesn't fit V2's DSv4 kernel signatures (the fused
-        # K-norm-rope kernel binds B from kv.size(0) and requires positions /
-        # out_loc to share that B).
-        self._run_keepup_after_suffix_v2(mwb, batch_output)
+        # 5. MTP keep-up (gated by --speculative-hybrid-mtp-always-warm). V2
+        # path: slice predict/hidden/out_cache_loc to K_target per req, call
+        # super's _draft_extend_for_decode which uses uniform K_target chains.
+        # V1's variable-length flat-accept approach doesn't fit V2's DSv4 kernel
+        # signatures (the fused K-norm-rope kernel binds B from kv.size(0) and
+        # requires positions / out_loc to share that B). When disabled, MTP
+        # draft state stays cold and the cold-start guard in
+        # forward_batch_generation promotes any MTP pick back to SUFFIX.
+        if self._always_warm:
+            self._run_keepup_after_suffix_v2(mwb, batch_output)
         ndi = batch_output.next_draft_input
         if ndi.topk_p is None:
             # Fallback: keep-up didn't run or failed silently. Fill placeholder
@@ -668,9 +737,9 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         exceeds savings (typically at large bs).
 
         Builds an EagleVerifyInput with K=1 (just bonus, no spec slots).
-        super.verify(mwb) dispatches to model_runner._forward_raw whose
-        width-based runner pick lands on the baseline_chain runner
-        (captured at K=1). accept_lens is always 1 (only bonus accepted).
+        self.verify(mwb) swaps in the baseline_chain runner (captured at
+        K=1, keyed on draft_token_num==1) for the verify forward.
+        accept_lens is always 1 (only bonus accepted).
 
         No MTP keep-up — NONE means we're skipping spec for this step. If
         the next step's selector picks MTP it sees no warm Eagle state and

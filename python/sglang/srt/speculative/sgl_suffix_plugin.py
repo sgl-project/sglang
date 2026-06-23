@@ -1,4 +1,10 @@
-"""Register the SUFFIX speculative-decoding algorithm.
+"""Register the SUFFIX and HYBRID_SUFFIX_MTP speculative-decoding algorithms.
+
+HYBRID_SUFFIX_MTP (``_HybridLike`` / ``HybridSuffixMTPWorkerV2``) dispatches
+per batch among SUFFIX (NGRAM-style), MTP (EAGLE-style), and NONE (plain
+decode); it reports both ``is_ngram()`` and ``is_eagle()`` True so every
+builtin dispatch branch triggers, and swaps the matching cuda-graph runner
+before each verify.
 
 SUFFIX is registered as a *plugin* algorithm (``SpeculativeAlgorithm.register``)
 rather than a builtin enum value. ``_SuffixLike.is_ngram()`` returns ``True`` so
@@ -82,6 +88,55 @@ def _suffix_factory(server_args: ServerArgs) -> Type:
     return SuffixWorker
 
 
+class _HybridLike(CustomSpecAlgo):
+    """HYBRID_SUFFIX_MTP dispatches per-batch among SUFFIX (NGRAM-style),
+    MTP (EAGLE-style), and NONE (plain decode). It returns ``True`` for both
+    ``is_ngram()`` and ``is_eagle()`` so existing builtin-only branches still
+    trigger; the worker (``HybridSuffixMTPWorkerV2``) chooses the backend per
+    batch via :class:`HybridBackendSelector` and swaps the matching cuda-graph
+    runner before each verify.
+    """
+
+    def is_ngram(self) -> bool:
+        return True
+
+    def is_eagle(self) -> bool:
+        return True
+
+    def is_hybrid_suffix_mtp(self) -> bool:
+        return True
+
+    def has_draft_kv(self) -> bool:
+        # The MTP path writes a real EAGLE draft KV chain, so the draft KV pool
+        # must be allocated (unlike pure SUFFIX/NGRAM). The kv_cache_builder /
+        # overlap-FutureMap ngram short-circuits are exempted for HYBRID via
+        # ``is_ngram() and not is_hybrid_suffix_mtp()``.
+        return True
+
+    def carries_draft_hidden_states(self) -> bool:
+        # MTP keep-up carries draft hidden states (EAGLE-family). Only consulted
+        # in PD-disagg (out of scope here), but keep it EAGLE-consistent.
+        return True
+
+    def create_future_map(
+        self,
+        device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+    ):
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+
+def _hybrid_factory(server_args: ServerArgs) -> Type:
+    from sglang.srt.speculative.hybrid_suffix_mtp_worker_v2 import (
+        HybridSuffixMTPWorkerV2,
+    )
+
+    return HybridSuffixMTPWorkerV2
+
+
 def _validate_suffix_args(server_args: ServerArgs) -> None:
     required = (
         "speculative_suffix_max_tree_depth",
@@ -100,3 +155,10 @@ SpeculativeAlgorithm.register(
     validate_server_args=_validate_suffix_args,
     spec_class=_SuffixLike,
 )(_suffix_factory)
+
+SpeculativeAlgorithm.register(
+    "HYBRID_SUFFIX_MTP",
+    supports_overlap=True,
+    validate_server_args=_validate_suffix_args,
+    spec_class=_HybridLike,
+)(_hybrid_factory)

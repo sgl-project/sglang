@@ -1606,6 +1606,14 @@ class ServerArgs:
         "SUFFIX minimum per-token probability for a draft token to be proposed.",
     ] = 0.1
 
+    # HYBRID_SUFFIX_MTP (per-batch SUFFIX / MTP / NONE dispatch)
+    speculative_hybrid_mtp_always_warm: A[
+        bool,
+        "HYBRID_SUFFIX_MTP: after a SUFFIX-backed step, also run the MTP draft "
+        "keep-up forward so a subsequent MTP-picked step starts with warm draft "
+        "state (extra compute per SUFFIX step; off by default).",
+    ] = False
+
     # -------------------------------------------------------------------------
     # Expert parallelism
     # -------------------------------------------------------------------------

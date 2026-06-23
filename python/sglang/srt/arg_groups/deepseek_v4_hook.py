@@ -48,8 +48,9 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if server_args.speculative_algorithm is not None:
-        # DSv4 supports EAGLE (spec-v2) and SUFFIX (model-free, NGRAMWorker family).
-        _allowed = {"EAGLE", "SUFFIX"}
+        # DSv4 supports EAGLE (spec-v2), SUFFIX (model-free, NGRAMWorker
+        # family), and HYBRID_SUFFIX_MTP (per-batch SUFFIX/MTP/NONE dispatch).
+        _allowed = {"EAGLE", "SUFFIX", "HYBRID_SUFFIX_MTP"}
         assert (
             server_args.speculative_algorithm in _allowed
         ), f"Speculative algorithm {server_args.speculative_algorithm} not supported for {model_arch}; allowed: {sorted(_allowed)}"

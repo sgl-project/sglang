@@ -115,6 +115,13 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_hybrid_suffix_mtp(self) -> bool:
+        # HYBRID_SUFFIX_MTP is a plugin algorithm (see sgl_suffix_plugin.py),
+        # never a builtin enum member; the stub keeps the duck-typed interface
+        # uniform so ``is_ngram() and not is_hybrid_suffix_mtp()`` style guards
+        # resolve on builtin enum values too.
+        return False
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
