@@ -11,8 +11,17 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.utils import is_xpu
 
 PAD_SLOT_ID = -1
+
+# On Intel XPU, inductor wraps these @triton.jit kernels with a 3D-grid launcher
+# that the Intel Triton backend cannot invoke at runtime
+# (TypeError: launcher() missing 1 required positional argument: '_grid_2').
+# This is a runtime failure in the compiled artifact, so torch._dynamo
+# suppress_errors (a compile-time fallback) cannot catch it. Keep these kernels
+# out of the compiled region and run them eagerly instead.
+_disable_compile_on_xpu = torch.compiler.disable if is_xpu() else (lambda f: f)
 
 
 @triton.jit()
@@ -988,6 +997,7 @@ def _causal_conv1d_update_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@_disable_compile_on_xpu
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
