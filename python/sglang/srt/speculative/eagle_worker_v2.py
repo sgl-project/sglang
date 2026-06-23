@@ -1460,7 +1460,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             if (
                 _is_npu
-                and self._target_worker.model_runner.model_is_mrope
+                and self._target_worker.model_runner.model_config.model_is_mrope
                 and batch.spec_info is not None
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
