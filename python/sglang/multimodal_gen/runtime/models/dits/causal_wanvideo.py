@@ -183,6 +183,9 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
+            if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                return self.attn(roped_query, roped_key, v)
+
             cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=v,
