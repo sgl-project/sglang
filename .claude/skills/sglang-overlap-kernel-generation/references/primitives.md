@@ -327,6 +327,91 @@ if flat_tid == 0:
 
 > **Note on naming**: an older variant `barrier_all_intra_node_atomic_cas_block_symm_mem` (with `(rank, num_ranks, symm_flag_ptr, peer_barrier_ptrs)` signature, using Python-level `while atomic_cas(...) != 0` spin-loops) appeared in earlier drafts. It is superseded by the function above — same semantics, faster spin-loop, fewer arguments. Always emit the canonical form.
 
+### 5.4 Host-side cross-rank barrier: `symm_mem_hdl.barrier()`
+
+When a kernel does **not** have a subsequent in-kernel phase after communication (i.e., the kernel exits once the communication phase is done), use **host-side** `symm_mem_hdl.barrier()` instead of the in-kernel `barrier_all_intra_node_atomic_cas_block`. This is the standard PyTorch symmetric memory barrier and is the correct choice for **inter-sm** and **without-sm** modes.
+
+`symm_mem_hdl` is obtained via `symm_mem.rendezvous(<symm_mem_tensor>, group=<communication_group>)`:
+
+```python
+import torch.distributed._symmetric_memory as symm_mem
+
+buf = symm_mem.empty(shape, dtype=dtype, device=device)       # allocate symmetric memory
+symm_mem_hdl = symm_mem.rendezvous(buf, group=dist.group.WORLD)  # get the handler
+```
+
+The handler provides `barrier()`, `get_buffer()`, `get_signal_pad()`, and other symmetric memory APIs.
+
+**Underlying implementation** (from PyTorch's `CUDASymmetricMemory.cu`):
+
+```cuda
+static __global__ void barrier_kernel(
+    uint32_t** signal_pads, int channel, int rank, int world_size, size_t timeout_ms) {
+    if (threadIdx.x < world_size) {
+        auto target_rank = threadIdx.x;
+        if (target_rank == rank) return;
+        // Signal target_rank (release)
+        try_put_signal<memory_order_release>(
+            signal_pads[target_rank] + world_size * channel + rank, timeout_ms);
+        // Wait for target_rank's signal (acquire)
+        try_wait_signal<memory_order_acquire>(
+            signal_pads[rank] + world_size * channel + target_rank, timeout_ms);
+    }
+}
+```
+
+It launches a small CUDA kernel (1 block, `world_size` threads) that performs pairwise signal/wait on the symmetric memory signal pads. This is a **host-side API** — you call it from Python, and it launches + synchronizes internally.
+
+**Key characteristics:**
+
+| Property | `symm_mem_hdl.barrier()` | `barrier_all_intra_node_atomic_cas_block` |
+|---|---|---|
+| **Where it runs** | Host side (launches a CUDA kernel) | Inside a Triton kernel |
+| **Channel support** | Yes — `barrier(channel=N)` for multi-phase pipelines | No — uses CAS on dedicated signal pad slots |
+| **Self-resetting** | Yes — signal pads are toggled and reset by the barrier kernel itself | Yes — CAS(1→0) in phase 2 returns the slot to 0 |
+| **Overhead** | Extra kernel launch + stream sync | Zero extra kernel launches (runs inside existing kernel) |
+| **Best for** | inter-sm, without-sm (kernel exits after comm) | intra-sm (kernel has post-comm compute phase) |
+
+**Usage pattern:**
+
+```python
+# Host side: use symm_mem_hdl.barrier() around signal.zero_() for cross-rank sync
+# between iterations when the kernel itself has no post-comm compute phase.
+
+# Reset per-tile signals (must happen after all ranks finished consuming)
+ctx.signal_tensor.zero_()
+ctx.symm_mem_hdl.barrier()  # ensure all ranks see zeroed signals
+
+# Launch kernel — it exits when communication is done
+kernel[grid](...)
+```
+
+**Channel usage for multi-phase pipelines:**
+
+The `barrier(channel=N)` parameter supports multiple independent barrier channels within the same signal pad. This is used by PyTorch's `_pipelined_produce_and_all2all` and `_pipelined_all_gather_and_consume` to manage multi-phase pipelines:
+
+```python
+symm_mem.barrier(channel=0)  # phase 0: ensure workspace is ready
+# ... copy local shard ...
+symm_mem.barrier(channel=1)  # phase 1: all local shards copied
+# ... consume remote shards ...
+symm_mem.barrier(channel=0)  # final sync
+```
+
+For overlap kernels, `channel=0` is typically sufficient. The number of channels is bounded by `signal_pad_size / (sizeof(uint32_t) * world_size)`.
+
+**Signal pad size requirement:** Each channel uses `world_size * world_size` uint32 slots in the signal pad. The default signal pad size is typically sufficient for a few channels. If more channels are needed, call `symm_mem.set_signal_pad_size()` before any allocations.
+
+**Memory ordering:** The barrier kernel uses `memory_order_release` for puts and `memory_order_acquire` for waits. This establishes a full happens-before relationship: all stores before the barrier on any rank are visible to all loads after the barrier on every other rank. This is equivalent to the ordering guarantees of the in-kernel `barrier_all_intra_node_atomic_cas_block`.
+
+**Decision rule:**
+
+| Scenario | Use |
+|---|---|
+| Kernel has a post-comm compute phase (intra-sm) | In-kernel `barrier_all_intra_node_atomic_cas_block` (single CTA) |
+| Kernel exits after communication (inter-sm, without-sm) | Host-side `symm_mem_hdl.barrier()` |
+| Multi-phase pipelined host-side communication | Host-side `symm_mem_hdl.barrier(channel=N)` |
+
 ---
 
 ## 6. Per-tile signal pattern (inter-sm only)
@@ -435,7 +520,8 @@ Rule of thumb: any flag whose **point** is to advertise "data is ready" pairs **
 | `_cas_sys_release` / `_cas_sys_acquire` | — | ✅ (backs rank barrier) | — |
 | `_send_signal` / `_wait_signal` | ✅ (core mechanism) | — | — |
 | `barrier_on_this_grid` | usually ❌ (per-tile signal replaces it) | ✅ (separates compute/push from reduce) | — |
-| `barrier_all_intra_node_atomic_cas_block` | ❌ (use host-side `hdl.barrier()`) | ✅ (after grid barrier) | — |
+| `barrier_all_intra_node_atomic_cas_block` | ❌ (use host-side `symm_mem_hdl.barrier()`) | ✅ (after grid barrier) | — |
+| `symm_mem_hdl.barrier()` (host-side) | ✅ (around `signal.zero_()`) | ❌ (use in-kernel rank barrier) | ✅ (between iterations) |
 | `tl.debug_barrier()` | ✅ | ✅ | — |
 
 Without-sm relies on `hdl.barrier()` on the host side and copy-engine `cuStreamWriteValue32` progress polling instead of in-kernel barriers, so it does not pull from this catalog.

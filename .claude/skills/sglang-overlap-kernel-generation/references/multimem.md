@@ -2,7 +2,7 @@
 
 > **On-demand reference.** Load this file **only when** the user explicitly asks the collective communication portion (the "comm" half of intra-sm / inter-sm overlap) to use **multimem / NVLS / hardware multicast / in-network reduction**. Otherwise stay on the default `tl.store` + hand-written reduce path.
 
-> **Self-contained: do NOT import from `triton_dist`.** The generated kernel file must paste the implementations from §D directly. The only project-external dependencies remain `torch`, `torch.distributed`, `triton`, `triton.language`.
+> **Self-contained** The generated kernel file must paste the implementations from §D directly. The only project-external dependencies remain `torch`, `torch.distributed`, `triton`, `triton.language`.
 
 This reference covers the three operations that drive NVSwitch in-network compute:
 
@@ -16,17 +16,9 @@ The semantics are exactly equivalent to "N peer stores" / "N peer loads + sum" b
 
 ## (A) API Quick Reference
 
-### A.1 Hardware / software prerequisites
+### A.1 Prerequisites
 
-| Requirement | Minimum |
-|-------------|---------|
-| GPU | NVIDIA H100 or newer (SM 9.0+) |
-| Interconnect | NVSwitch V3+ with NVLink 4.0 Switch (NVLS-capable) |
-| CUDA | 12.3+ |
-| PyTorch | 2.11+ (symm_mem must expose `multicast_ptr`) |
-| Triton | 3.0+ |
-
-If any of the above is missing, `hdl.multicast_ptr` returns `0`. The host code **must** check for this and fall back to the default path (or raise a clear error). See §B.3.
+If `hdl.multicast_ptr` returns `0`. The host code **must** check for this and fall back to the default path (or raise a clear error). See §B.3.
 
 ### A.2 Multicast pointer from symm_mem
 
@@ -40,7 +32,7 @@ mc_ptr = hdl.multicast_ptr   # int64; 0 means "unsupported"
 
 - Returns a Python `int` (already an `int64` device address). Pass it directly into a Triton kernel; Triton will treat it as an `int64` scalar — the kernel side should reinterpret it as `*` of the element dtype via `tl.cast(mc_ptr, tl.pointer_type(dtype))` (or just use pointer arithmetic on the `int64` and cast at the store/load site).
 - The pointer covers the **same logical region** as `hdl.get_buffer(...)`, i.e. byte offsets line up with the local symm_mem buffer.
-- This is a stock PyTorch API on the symm_mem handle. **Do not import any wrapper from triton_dist.**
+- This is a stock PyTorch API on the symm_mem handle. 
 
 ### A.3 `multimem_st(ptr, val0[, val1, val2, val3], dtype=...)`
 
@@ -131,7 +123,7 @@ def create_overlap_context(M, N, dtype, group, device):
     hdl = symm_mem.rendezvous(symm_buf, group=group.group_name)
 
     # 3. Extract multicast pointer (must come AFTER rendezvous)
-    mc_ptr = hdl.multicast_ptr      # stock PyTorch API; no triton_dist import
+    mc_ptr = hdl.multicast_ptr      # stock PyTorch API
 
     # 4. Same signal-pad / grid-barrier plumbing as the default path
     signal_pad_ptrs = torch.tensor(
@@ -162,7 +154,7 @@ if ctx.mc_ptr == 0:
     )
 ```
 
-For a richer pre-flight diagnostic you may probe `torch.cuda.get_device_capability()[0] >= 9` and `torch.version.cuda` before allocating anything. Keep the check inline; do not import any helper from triton_dist.
+For a richer pre-flight diagnostic you may probe `torch.cuda.get_device_capability()[0] >= 9` and `torch.version.cuda` before allocating anything.
 
 ### B.4 Passing `mc_ptr` into the kernel
 
@@ -364,7 +356,7 @@ Skipping step 3 or step 4 is the most common cause of intermittent wrong results
 
 ## (D) Inlined Implementation Source (paste into the generated kernel file)
 
-Copy the block below verbatim into the **PTX Primitives** section of the generated file. It only depends on `triton` and `triton.language` — no triton_dist, no nvshmem, no other project module.
+Copy the block below verbatim into the **PTX Primitives** section of the generated file. It only depends on `triton` and `triton.language` — no nvshmem, no other project module.
 
 ```python
 import triton
@@ -522,13 +514,13 @@ def multimem_ld_reduce(ptr, DTYPE: tl.constexpr):
         return _multimem_ld_reduce_v4_f32(ptr)
 ```
 
-After pasting, the rest of the kernel file uses `multimem_st(ptr, v0, v1, v2, v3, DTYPE)` / `multimem_ld_reduce(ptr, DTYPE)` directly. No imports from `triton_dist.kernels.nvidia.multimem_api` should appear anywhere in the generated file.
+After pasting, the rest of the kernel file uses `multimem_st(ptr, v0, v1, v2, v3, DTYPE)` / `multimem_ld_reduce(ptr, DTYPE)` directly. 
 
 ---
 
 ## Checklist when generating a multimem-enabled overlap kernel
 
-- [ ] Source from §D is pasted into the file's PTX Primitives section; **no** `from triton_dist...multimem_api import ...` statement is present.
+- [ ] Source from §D is pasted into the file's PTX Primitives section; 
 - [ ] Host: accessed `hdl.multicast_ptr` **after** `symm_mem.rendezvous`, stored in `ctx.mc_ptr`.
 - [ ] Host: runtime check `ctx.mc_ptr != 0` with a clear error message.
 - [ ] Kernel signature: `mc_ptr` declared as a plain scalar (Triton treats it as int64).

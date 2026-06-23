@@ -114,9 +114,9 @@ def launch_inter_sm_overlap(ctx, compute_fn, comm_fn, data, ...):
     comm_stream.wait_stream(current_stream)
 
     # Launch compute kernel on current_stream (producer of signals).
-    # Compute kernel uses ctx.num_gemm_sms (= total SMs - num_comm_sms).
+    # Compute kernel uses ctx.num_comp_sms (= total SMs - num_comm_sms).
     # This leaves num_comm_sms SMs free for the concurrent comm kernel.
-    compute_grid = (ctx.num_gemm_sms,)
+    compute_grid = (ctx.num_comp_sms,)
     compute_fn[compute_grid](data, ctx.symm_buffer, ctx.signal, ...)
 
     # Launch persistent comm kernel on comm_stream.

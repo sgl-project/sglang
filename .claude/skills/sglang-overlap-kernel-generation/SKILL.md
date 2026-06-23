@@ -13,7 +13,7 @@ description: |
 ---
 # Compute-Communication Overlap Kernel Generator
 
-> **Platform limitation**: Currently only NVIDIA GPUs are supported (tested on SM90).
+> **Platform limitation**: Currently only NVIDIA GPUs are supported.
 
 ## Input
 
@@ -21,8 +21,7 @@ The user's request may only partially specify the configuration. For any item be
 
 When presenting options to the user via `AskUserQuestion`, put the full explanation directly into each option's **label** field (not just the description field, which may be hidden behind a tooltip in the UI). For example, use `"label": "inter-sm — two kernels, two streams"` rather than a bare `"label": "inter-sm"`. This ensures the user sees the explanation directly without needing to hover or click.
 
-1. **Compute kernel**: what kernel to overlap (e.g., GEMM, topk-reduce). Also clarify:
-   - **persistent** (one CTA loops over multiple tiles) or **non-persistent** (one CTA handles one tile)? *(default: persistent)*
+1. **Compute kernel**: what kernel to overlap (e.g., GEMM, topk-reduce).
 2. **Collective operation**: all-gather, reduce-scatter, all-reduce, etc.
 3. **Communication mechanism**: which hardware path for the collective? *(default: register)*
    - `register` — load/store via symmetric memory (SM-driven)
@@ -30,10 +29,11 @@ When presenting options to the user via `AskUserQuestion`, put the full explanat
    - `tma` — Tensor Memory Accelerator async bulk copy
    - `nvswitch` — multimem via NVSwitch hardware (NVLS)
 4. **Overlap mode**: how compute and comm are scheduled: *(default: inter-sm)*
-   - `inter-sm` — two kernels, two streams
+   - `inter-sm` — two separate kernels, two streams
    - `intra-sm` — fused single kernel, single stream
    - `without-sm` — copy engine (DMA), two streams
 5. **Execution order**: compute-first or comm-first
+6. **Overlap triton kernel type**: **persistent** (one CTA loops over multiple tiles) or **non-persistent** (one CTA handles one tile)? *(default: persistent)*
 
 **Constraint**: if communication mechanism = `copy_engine`, overlap mode is forced to `without-sm` (copy engine runs on DMA, not SMs) — inform the user and skip the overlap mode question.
 
@@ -47,13 +47,13 @@ Read `references/inter_sm.md` for signal primitives, cross-device barrier, host-
 
 ### Intra-SM — fused single kernel
 
-Compute and communication are **fused into one kernel**. Each CTA computes a tile, then directly writes results to peer symmetric memory buffers via load/store (or multimem load/store). Synchronization uses GPU-scope atomics (`atomic_add_release` / `load_acquire`) for intra-node CTA barriers and `symm_mem_sync` for cross-rank barriers. If the collective requires reduction (e.g., reduce-scatter), a final local-reduce phase sums contributions from all peers.
+Compute and communication are **fused into one kernel**. Each CTA computes a tile, then directly writes results to peer symmetric memory buffers via load/store (or multimem load/store). Synchronization uses GPU-scope atomics (`atomic_add_release` / `load_acquire`) for intra-node CTA barriers and `barrier_all_intra_node_atomic_cas_block` for cross-rank barriers. If the collective requires reduction (e.g., reduce-scatter), a final local-reduce phase sums contributions from all peers.
 
 Read `references/intra_sm.md` for barrier primitives, A2A push pattern, kernel structure template, and full implementation guide. The default push/reduce path uses `tl.store` / hand-written reduction; if the user wants the collective communication portion to use hardware multicast (NVLS) — i.e. `multimem.st` for the push phase and `multimem.ld_reduce` for the reduce phase — additionally read `references/multimem.md`.
 
 ### Without-SM — copy engine (DMA)
 
-Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A `progress` tensor, updated via `cuStreamWriteValue32` after each chunk copy, lets the compute kernel (on the main stream) poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready.
+Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A `progress` tensor, updated via `cuStreamWriteValue32` after each chunk copy, lets the compute kernel or the collectives (on the other stream) poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready.
 
 Read `references/without_sm.md` for copy engine setup, progress tracking, compute kernel polling pattern, and full implementation guide.
 
@@ -122,14 +122,11 @@ Read the appropriate reference file for the selected mode, then generate a compl
 
 **Multimem (NVLS) trigger — load `references/multimem.md` on demand.**
 
-Additionally read `references/multimem.md` **before** generating the kernel when **either** of the following holds:
-
-- **Keyword trigger** — the user's request literally mentions any of: `multimem`, `NVLS`, `multicast`, `硬件广播` / `硬件 multicast`, `multimem.st`, `multimem.ld_reduce`, `NVSwitch reduce` / `in-network reduce`, `multicast_ptr`.
-- **Intent trigger** — the user expresses a semantically equivalent goal even without those keywords, e.g. "用一条指令对所有 rank 广播 / 规约", "让交换机帮我做 reduce", "利用 NVSwitch 做 in-network reduction", "把 push 阶段从 N 次写降到 1 次", "让通信不占 SM 周期 / 走硬件路径".
+Additionally read `references/multimem.md` **before** generating the kernel when the user select the Communication mechanism as `nvswitch`.
 
 When triggered:
 1. Read `references/multimem.md` in addition to the selected mode file.
-2. **Inline the implementation source from `multimem.md` §D** (helpers + `multimem_st` + `multimem_ld_reduce` + their `_v*` impls) into the generated kernel file's PTX Primitives section. Do **not** import from `triton_dist.kernels.nvidia.multimem_api` — the generated file must remain self-contained per the "Self-contained kernel files" constraint below.
+2. **Inline the implementation source from `multimem.md` §D** (helpers + `multimem_st` + `multimem_ld_reduce` + their `_v*` impls) into the generated kernel file's PTX Primitives section.
 3. On the host side: extend the context dataclass with `mc_ptr`, access `hdl.multicast_ptr` (stock PyTorch symm_mem property, no extra import) after `symm_mem.rendezvous`, and guard against unsupported hardware (`mc_ptr == 0`).
 4. In the kernel: replace the per-peer `tl.store` push loop with `multimem_st(...)`, and replace the hand-written `acc += tl.load(peer_buf, ...)` reduction loop with `multimem_ld_reduce(..., op="sum", acc_dtype=tl.float32)`. Keep all existing grid-level and cross-rank barriers — multimem swaps out only the bulk data movement, not the synchronization.
 
@@ -144,7 +141,7 @@ Additionally read `references/triton_fp8_gemm.md` **before** generating the kern
 
 When triggered:
 1. Read `references/triton_fp8_gemm.md` in addition to the selected mode file and `references/primitives.md`.
-2. Inline the `_w8a8_block_fp8_matmul` kernel code from the reference into the generated file. The generated file must remain self-contained (no imports from `triton_dist` or `sglang`).
+2. Inline the `_w8a8_block_fp8_matmul` kernel code from the reference into the generated file. The generated file must remain self-contained.
 3. Choose the activation quantization strategy based on the overlap pattern (see `references/triton_fp8_gemm.md` §C.1):
    - **Separate quantize kernel + pre-quantized `_w8a8_block_fp8_matmul`**: run a `per_token_group_quant_fp8` kernel to produce `A_fp8` and `A_scale` first, then feed them into the standard kernel. Use this when exact per-`group_k` quantization granularity is required, or when A is already available in fp8 format.
    - **On-the-fly quantization inside the GEMM kernel**: modify the K-loop to load bf16 A, compute per-row `absmax`, cast to fp8 inline, then `tl.dot(fp8_A, fp8_B) * scale * B_scale`. Use this when A arrives as bf16 from symmetric memory and you want to save one kernel launch + one global memory round-trip. This is the recommended default for overlap kernels. When `BLOCK_SIZE_K == group_k == 128` (standard setting), numerical accuracy is equivalent to the separate-kernel approach.
@@ -160,7 +157,7 @@ After generating the kernel, produce a **verification checklist** and verify eac
 | Check | What to verify |
 |-------|---------------|
 | **Grid barrier correctness** | `barrier_on_this_grid` is called by ALL CTAs before cross-rank sync; the barrier counter is reset to 0 before each kernel launch |
-| **Cross-rank barrier single-CTA** | `barrier_all_intra_node_atomic_cas_block` is called by exactly ONE CTA per rank (guarded by `if pid == 0:`). The signal pad slots are binary (0↔1) and can only track one barrier invocation per rank pair; multiple CTAs calling it concurrently will CAS-contend on the same slots and **deadlock** |
+| **Cross-rank barrier single-CTA** | In-kernel `barrier_all_intra_node_atomic_cas_block` is called by **exactly ONE CTA per rank** (guarded by `if pid == 0:`). The signal pad slots are binary (0↔1) and can only track one barrier invocation per rank pair; multiple CTAs calling it concurrently will CAS-contend on the same slots and **deadlock**. For inter-sm and without-sm modes, do NOT use this in-kernel barrier — use host-side `symm_mem_hdl.barrier()` instead (see `primitives.md` §5.4) |
 | **Cross-rank barrier symmetry** | Every rank executes the same number of barrier calls; no conditional paths that skip barriers on some ranks. The `if pid == 0:` guard does NOT violate this — all ranks have a pid==0 CTA |
 | **Signal reset** | Signal tensor is reset by host `.zero_()` before each launch; `_send_signal` stores 1, `_wait_signal` spins until 1 — no in-kernel reset needed |
 | **No deadlock ordering** | If multiple barriers exist, all ranks execute them in the same order; no circular dependencies between barrier phases |
@@ -207,14 +204,14 @@ These checks prevent `CUDA error: an illegal memory access was encountered`. Thi
 |-------|---------------|
 | **num_warps=32** | The kernel launch specifies `num_warps=32` (not the default 4). These kernels are memory-bound; 32 warps (1024 threads/CTA) is needed to saturate memory bandwidth. Using default 4 warps causes 50%+ performance loss |
 | **num_stages=1** | Explicitly set `num_stages=1`. No software pipelining is needed for simple load/store patterns |
-| **N_CHUNKS splitting** | The N dimension is split into chunks (default 2) via an outer `tl.range` loop to reduce register pressure and improve SM occupancy |
+| **N_CHUNKS splitting** | The N dimension is split into chunks (default N dimension // 1024) via an outer `tl.range` loop to reduce register pressure and improve SM occupancy |
 | **tl.multiple_of hints** | `tl.multiple_of(N_per_chunk, 16)` and `tl.multiple_of(peer_buf, 16)` are used to enable vectorized 128-bit loads/stores |
 | **tl.constexpr strides** | Stride parameters are declared as `tl.constexpr` so the compiler can optimize address calculations at compile time |
 | **Incremental pointer update** | topk/reduction loops use `tl.static_range` + `ptr + j * stride` instead of recomputing full addresses each iteration |
 | **Input layout flattening** | 3D inputs like `[M, topk, N]` are flattened to `[M*topk, N]` for contiguous memory access in the topk dimension |
 | **Master CTA barrier** | `barrier_on_this_grid` uses the master CTA pattern (bid==0 spins, others wait for high bit) with a single `tl.debug_barrier()`, not the naive 3-barrier pattern (see `primitives.md` §5.2) |
 | **Multi-threaded CAS barrier** | `barrier_all_intra_node_atomic_cas_block` uses `flat_tid < world_size` for parallel peer signaling, not single-threaded serial iteration (see `primitives.md` §5.3) |
-| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use host-side `symm_mem_hdl.barrier()` around `signal.zero_()` instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required |
+| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use host-side `symm_mem_hdl.barrier()` around `signal.zero_()` instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required. See `primitives.md` §5.3 for the in-kernel barrier and §5.4 for the host-side barrier |
 | **PTX-level CAS spin-loop** | `_cas_sys_release`/`_cas_sys_acquire` have the spin-loop inside PTX (`@!%p0 bra cas_loop`), not in Python-level `while` loops (see `primitives.md` §4) |
 | **Auto block size** | `BLOCK_M`/`BLOCK_N` default to `None` and are auto-computed based on problem size: `BLOCK_N = next_power_of_2(N_per_chunk)`, `BLOCK_M = next_power_of_2(16K / BLOCK_N / element_size)` |
 
@@ -238,7 +235,7 @@ Read `references/benchmark_template.md` for the complete test file structure, ar
 ## Important Constraints
 
 - **No hardcoded paths**: all file paths, module imports, and resource locations must be relative or derived from runtime context (e.g., `os.path.dirname(__file__)`). The skill must work regardless of where the repo is cloned.
-- **Self-contained kernel files**: each generated kernel file imports only from standard packages (`torch`, `triton`, `triton.language`, `torch.distributed`) and the project's public APIs (`triton_dist.utils`, `triton_dist.profiler_utils`). No cross-imports between overlap kernel implementations.
+- **Self-contained kernel files**: each generated kernel file imports only from standard packages (`torch`, `triton`, `triton.language`, `torch.distributed`). No cross-imports between overlap kernel implementations.
 - **Reusable context**: the context dataclass must support repeated kernel launches without re-allocation. Only `grid_barrier.zero_()` and similar resets are needed between calls.
 
 ## References

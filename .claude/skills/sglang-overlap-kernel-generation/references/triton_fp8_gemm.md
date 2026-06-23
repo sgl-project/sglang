@@ -2,7 +2,7 @@
 
 > **On-demand reference.** Load this file when the user's compute kernel is a **GEMM / matmul** that operates on **FP8 quantized** inputs (e.g. batched GEMM, linear layers with FP8 weight, AllGather + FP8 GEMM overlap). If the compute kernel uses bf16/fp16 natively (not block-wise FP8), this reference is not needed.
 
-> **Self-contained: do NOT import from `triton_dist` or `sglang`.** The generated kernel file must include the matmul kernel inline. Only standard imports (`torch`, `torch.distributed`, `triton`, `triton.language`) are allowed.
+> **Self-contained: do NOT import from `sglang`.** The generated kernel file must include the matmul kernel inline. Only standard imports (`torch`, `torch.distributed`, `triton`, `triton.language`) are allowed.
 
 This reference documents the block-wise FP8 (W8A8) GEMM kernel used in production inference frameworks (SGLang, vLLM) and adapted for overlap kernels in triton_dist. It covers:
 

@@ -231,6 +231,6 @@ def launch_intra_sm_overlap(kernel_fn, input_tensor, ...):
         input_tensor, output, peer_ptrs, barrier,
         signal_pad_ptrs_device,
         M, N, K, rank, world_size,
-        BLOCK_M=128, BLOCK_N=128,
+        BLOCK_M=64, BLOCK_N=128,
     )
 ```
