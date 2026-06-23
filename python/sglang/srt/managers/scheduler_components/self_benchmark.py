@@ -702,6 +702,10 @@ class SelfBenchmark:
             queue_owner = getattr(self.scheduler, queue_name, None)
             if queue_owner is None:
                 continue
+            if isinstance(queue_owner, list):
+                if queue_owner:
+                    return True
+                continue
             queue = getattr(queue_owner, "queue", None)
             if queue:
                 return True
@@ -730,6 +734,9 @@ class SelfBenchmark:
         if self._write_results:
             self._write_output()
         self.phase = BenchmarkPhase.DONE
+        on_finish = getattr(self.scheduler, "on_self_benchmark_finished", None)
+        if on_finish is not None:
+            on_finish()
         logger.info("Self-benchmark completed")
 
     def _write_output(self) -> None:

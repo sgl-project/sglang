@@ -113,6 +113,24 @@ class TestSelfBenchmark(CustomTestCase):
                 1,
             )
 
+    def test_finish_notifies_scheduler_after_writing_output(self):
+        with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            scheduler = _make_scheduler(output_path)
+            calls = []
+            scheduler.on_self_benchmark_finished = lambda: calls.append("done")
+            benchmark = SelfBenchmark(scheduler)
+            benchmark.phase = BenchmarkPhase.SWEEP
+            benchmark._grid_index = len(benchmark._grid)
+
+            benchmark.maybe_schedule_next()
+
+            self.assertEqual(calls, ["done"])
+            self.assertFalse(benchmark.active)
+            with open(output_path) as f:
+                output = json.load(f)
+            self.assertIn("results", output)
+
     def test_decode_point_ignores_setup_prefill_until_decode_pass(self):
         benchmark = SelfBenchmark(_make_scheduler("/tmp/unused.json"))
         point = BenchmarkPoint(point_type="decode", context_length=8, batch_size=2)
@@ -338,6 +356,15 @@ class TestSelfBenchmark(CustomTestCase):
 
         self.assertFalse(benchmark._has_inflight_work())
         scheduler.chunked_req = object()
+        self.assertTrue(benchmark._has_inflight_work())
+
+    def test_disagg_prefill_inflight_list_counts_as_inflight_work(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.disagg_prefill_inflight_queue = []
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertFalse(benchmark._has_inflight_work())
+        scheduler.disagg_prefill_inflight_queue.append(object())
         self.assertTrue(benchmark._has_inflight_work())
 
     def test_disaggregated_workers_only_build_supported_grid(self):
