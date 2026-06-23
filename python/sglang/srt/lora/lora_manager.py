@@ -45,7 +45,7 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import get_available_gpu_memory, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -163,6 +163,18 @@ class LoRAManager:
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        logger.info(
+            f"LoRA adapter loading starts: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        result = self._load_lora_adapter(lora_ref)
+        logger.info(
+            f"LoRA adapter loading completes: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        return result
+
+    def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -245,6 +257,18 @@ class LoRAManager:
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        logger.info(
+            f"LoRA adapter unloading starts: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        result = self._unload_lora_adapter(lora_ref)
+        logger.info(
+            f"LoRA adapter unloading completes: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        return result
+
+    def _unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -483,7 +507,7 @@ class LoRAManager:
 
         if lora_paths:
             for lora_ref in lora_paths:
-                result = self.load_lora_adapter(lora_ref)
+                result = self._load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
@@ -665,6 +689,20 @@ class LoRAManager:
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
+        self,
+        lora_ref: LoRARef,
+        tensors: Dict[str, torch.Tensor],
+        config_dict: Dict,
+        added_tokens_config: Optional[Dict] = None,
+    ) -> LoRAUpdateOutput:
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self._load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
+    def _load_lora_adapter_from_tensors(
         self,
         lora_ref: LoRARef,
         tensors: Dict[str, torch.Tensor],

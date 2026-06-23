@@ -1700,47 +1700,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
-
-        logger.info(
-            f"LoRA adapter loading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.load_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter loading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
+        return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
         self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
     ):
-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
-        result = self.lora_manager.load_lora_adapter_from_tensors(
+        return self.lora_manager.load_lora_adapter_from_tensors(
             lora_ref, tensors, config_dict, added_tokens_config
         )
-        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
-        return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
-
-        logger.info(
-            f"LoRA adapter unloading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.unload_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter unloading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
+        return self.lora_manager.unload_lora_adapter(lora_ref)
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
