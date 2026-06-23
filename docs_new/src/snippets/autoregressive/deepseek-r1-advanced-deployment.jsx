@@ -10,6 +10,11 @@ const lookupData = {
         "default": true
       },
       {
+        "id": "b300",
+        "label": "B300",
+        "default": false
+      },
+      {
         "id": "h200",
         "label": "H200",
         "default": false
@@ -180,6 +185,66 @@ const lookupData = {
         "scheduler_recv_interval": 30,
         "stream_interval": 30,
         "fp8_gemm_backend": "flashinfer_trtllm"
+      }
+    },
+    {
+      "hardware": "b300",
+      "quantization": "fp8",
+      "gpu_count": 8,
+      "scenario": "low-latency",
+      "parameters": {
+        "model_path": "deepseek-ai/DeepSeek-R1-0528",
+        "tensor_parallel_size": 8,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "flashinfer",
+        "enforce_disable_flashinfer_allreduce_fusion": true,
+        "enable_symm_mem": true
+      }
+    },
+    {
+      "hardware": "b300",
+      "quantization": "fp8",
+      "gpu_count": 8,
+      "scenario": "high-throughput",
+      "parameters": {
+        "model_path": "deepseek-ai/DeepSeek-R1-0528",
+        "tensor_parallel_size": 8,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "flashinfer",
+        "enforce_disable_flashinfer_allreduce_fusion": true,
+        "enable_symm_mem": true
+      }
+    },
+    {
+      "hardware": "b300",
+      "quantization": "fp4",
+      "gpu_count": 8,
+      "scenario": "low-latency",
+      "parameters": {
+        "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "tensor_parallel_size": 8,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "flashinfer",
+        "enforce_disable_flashinfer_allreduce_fusion": true,
+        "moe_runner_backend": "flashinfer_cutlass",
+        "mem_fraction_static": 0.85,
+        "enable_symm_mem": true
+      }
+    },
+    {
+      "hardware": "b300",
+      "quantization": "fp4",
+      "gpu_count": 8,
+      "scenario": "high-throughput",
+      "parameters": {
+        "model_path": "nvidia/DeepSeek-R1-0528-FP4-v2",
+        "tensor_parallel_size": 8,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "flashinfer",
+        "enforce_disable_flashinfer_allreduce_fusion": true,
+        "moe_runner_backend": "flashinfer_cutlass",
+        "mem_fraction_static": 0.85,
+        "enable_symm_mem": true
       }
     },
     {
@@ -387,7 +452,7 @@ const lookupData = {
     {
       "hardware": "h200",
       "quantization": "fp4",
-      "error": "FP4 is only available for B200 hardware. Please select FP8 quantization."
+      "error": "FP4 is only available for B200/B300 hardware. Please select FP8 quantization."
     }
   ]
 };
@@ -407,6 +472,7 @@ const fieldToFlag = {
   enable_flashinfer_allreduce_fusion: 'enable-flashinfer-allreduce-fusion',
   scheduler_recv_interval: 'scheduler-recv-interval',
   enable_symm_mem: 'enable-symm-mem',
+  enforce_disable_flashinfer_allreduce_fusion: 'enforce-disable-flashinfer-allreduce-fusion',
   disable_radix_cache: 'disable-radix-cache',
   attention_backend: 'attention-backend',
   moe_runner_backend: 'moe-runner-backend',
@@ -497,7 +563,7 @@ const resolveItems = (option, values) =>
       title: 'Hardware Platform',
       items: uiOptions.hardware
         .filter((option) =>
-          ['b200', 'h200', 'mi300x', 'mi325x', 'mi355x'].includes(option.id)
+          ['b200', 'b300', 'h200', 'mi300x', 'mi325x', 'mi355x'].includes(option.id)
         )
         .map((option) => ({
           id: option.id,
