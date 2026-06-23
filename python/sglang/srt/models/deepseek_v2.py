@@ -830,7 +830,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
-        enable_alt_stream: bool = True,
+        allow_alt_stream_overlap: bool = True,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -845,7 +845,7 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
-                and enable_alt_stream
+                and allow_alt_stream_overlap
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
@@ -878,7 +878,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
-                enable_alt_stream=enable_alt_stream,
+                allow_alt_stream_overlap=allow_alt_stream_overlap,
             )
 
     def forward_normal_dual_stream(
@@ -1143,7 +1143,9 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
-        enable_alt_stream: bool = True,
+        # See DeepseekV2MoE.forward. Gates only the simple (non-SBO) shared-expert
+        # alt-stream overlap; the SBO overlap path is governed by enable_sbo_overlap.
+        allow_alt_stream_overlap: bool = True,
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -1159,7 +1161,7 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if enable_alt_stream and self.alt_stream is not None:
+                if allow_alt_stream_overlap and self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1356,7 +1358,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
-            and enable_alt_stream
+            and allow_alt_stream_overlap
             and self.alt_stream is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
