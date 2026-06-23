@@ -9,9 +9,6 @@ import torch
 
 from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
 
-if TYPE_CHECKING:
-    pass
-
 __all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme"]
 
 
