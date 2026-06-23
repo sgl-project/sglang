@@ -1196,18 +1196,39 @@ class TestDoubleSparsityRequestSummary(unittest.TestCase):
 
 
 class TestTableFreeConfigAndValidation(unittest.TestCase):
-    """Config contract for the absorbed-latent selection path: scorer_norm is
-    restricted to 'off' (the absorbed identity only holds there), and the
-    removed table-substrate fields are rejected as unknown."""
+    """Config contract for the absorbed-latent selection path: the served default
+    is cosine + current-slot inclusion (the two restored fixes), scorer_norm is
+    restricted to ('off', 'cosine'), and the removed table-substrate fields are
+    rejected as unknown."""
 
-    def test_scorer_norm_defaults_off(self):
+    def test_served_default_is_cosine_and_current_include(self):
         cfg = parse_double_sparsity_config(_valid_payload())
-        self.assertEqual(cfg.scorer_norm, "off")
+        self.assertEqual(cfg.scorer_norm, "cosine")
+        self.assertIs(cfg.include_current_slot, True)
 
-    def test_rejects_cosine(self):
+    def test_accepts_cosine_config(self):
         payload = (
             '{"channel_mask_path": "/tmp/cm.safetensors", "page_size": 64, '
             '"scorer_norm": "cosine"}'
+        )
+        cfg = parse_double_sparsity_config(payload)
+        self.assertEqual(cfg.scorer_norm, "cosine")
+
+    def test_explicit_rawdot_current_excluded_control_parses(self):
+        # The raw-dot bisection control must stay reachable by EXPLICIT config now
+        # that the default is flipped — pinned by its expected (off, false) values.
+        payload = (
+            '{"channel_mask_path": "/tmp/cm.safetensors", "page_size": 64, '
+            '"scorer_norm": "off", "include_current_slot": false}'
+        )
+        cfg = parse_double_sparsity_config(payload)
+        self.assertEqual(cfg.scorer_norm, "off")
+        self.assertIs(cfg.include_current_slot, False)
+
+    def test_rejects_non_bool_include_current_slot(self):
+        payload = (
+            '{"channel_mask_path": "/tmp/cm.safetensors", "page_size": 64, '
+            '"include_current_slot": "yes"}'
         )
         with self.assertRaises(ValueError):
             parse_double_sparsity_config(payload)
@@ -1235,6 +1256,107 @@ class TestTableFreeConfigAndValidation(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             parse_double_sparsity_config(payload)
+
+
+class TestCosineKeyNorm(unittest.TestCase):
+    """Cosine scorer building blocks (Fix B): resident-fp8 layout assertion,
+    full-coverage projection map (fail-closed), the resident key-norm helper, and
+    the cosine oracle's materialized-raw == raw-dot identity (so normalization is
+    the only variable between the raw-dot and cosine arms)."""
+
+    def test_resident_fp8_layout_assertion(self):
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+            assert_resident_fp8_layout,
+        )
+
+        # Real 0.4.4 layout: lora=512, rope=64 bf16 = 128B -> 512 + 4*4 + 128 = 656.
+        self.assertEqual(
+            assert_resident_fp8_layout(
+                kv_lora_rank=512, kv_cache_dim=656, rope_bytes=128
+            ),
+            4,
+        )
+        for kw in (
+            dict(kv_lora_rank=500, kv_cache_dim=656, rope_bytes=128),  # lora % 128
+            dict(kv_lora_rank=512, kv_cache_dim=640, rope_bytes=128),  # wrong total
+            dict(kv_lora_rank=512, kv_cache_dim=656, rope_bytes=64),  # wrong rope
+        ):
+            with self.assertRaises(ValueError):
+                assert_resident_fp8_layout(**kw)
+
+    def test_cosine_projection_coverage_fail_closed(self):
+        import torch
+
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        H, label_dim, lora = 4, 8, 256
+        mk = lambda: torch.randn(H, label_dim, lora)  # noqa: E731
+        fn = DeepseekSparseAttnBackend._prepare_cosine_projections
+        cpu = torch.device("cpu")
+        m = fn({0: mk(), 1: mk()}, n_layers=2, exp_shape=(H, label_dim, lora), device=cpu)
+        self.assertEqual(set(m), {0, 1})
+        self.assertEqual(tuple(m[0].shape), (H * label_dim, lora))
+        with self.assertRaises(RuntimeError):  # missing layer 1
+            fn({0: mk()}, n_layers=2, exp_shape=(H, label_dim, lora), device=cpu)
+        with self.assertRaises(RuntimeError):  # extra layer 2
+            fn(
+                {0: mk(), 1: mk(), 2: mk()},
+                n_layers=2,
+                exp_shape=(H, label_dim, lora),
+                device=cpu,
+            )
+        with self.assertRaises(RuntimeError):  # shape mismatch
+            fn(
+                {0: mk(), 1: torch.randn(H, label_dim, lora + 1)},
+                n_layers=2,
+                exp_shape=(H, label_dim, lora),
+                device=cpu,
+            )
+
+    def test_cosine_oracle_materialized_raw_equals_rawdot(self):
+        import torch
+
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+            absorbed_latent_cosine_logical,
+            absorbed_latent_score_logical,
+            key_norms_from_latent,
+        )
+
+        torch.manual_seed(0)
+        H, label_dim, lora, qk = 3, 4, 8, 6
+        bs, T, S = 2, 7, 5
+        queries = torch.randn(bs, H, qk)
+        c_kv = torch.randn(T, lora)
+        w_sel = torch.randn(H, label_dim, lora)
+        cs = torch.stack([torch.randperm(qk)[:label_dim] for _ in range(H)]).to(
+            torch.int64
+        )
+        cw = torch.randn(H, label_dim)
+        rtt = torch.randint(0, T, (bs, S), dtype=torch.int64)
+        rpi = torch.arange(bs, dtype=torch.int64)
+        sl = torch.tensor([S, S - 1], dtype=torch.int64)
+        # normalize=False routes the raw dot through the materialized-signature path
+        # — it must equal the absorbed raw-dot oracle (normalization is the ONLY
+        # variable between raw-dot and cosine).
+        raw = absorbed_latent_score_logical(queries, c_kv, w_sel, cs, cw, rpi, rtt, sl, S)
+        mat = absorbed_latent_cosine_logical(
+            queries, c_kv, w_sel, cs, cw, rpi, rtt, sl, S, normalize=False
+        )
+        self.assertTrue(torch.allclose(raw, mat, atol=1e-5, equal_nan=True))
+        # the cosine arm must actually differ from raw-dot (normalization active)
+        cos = absorbed_latent_cosine_logical(
+            queries, c_kv, w_sel, cs, cw, rpi, rtt, sl, S, normalize=True
+        )
+        self.assertFalse(torch.allclose(cos, mat, equal_nan=True))
+        # key-norm helper matches a manual ||w_sel[h] @ c_kv[t]||
+        kn = key_norms_from_latent(w_sel, c_kv)
+        manual = torch.stack(
+            [
+                torch.stack([(w_sel[h] @ c_kv[t]).norm() for h in range(H)])
+                for t in range(T)
+            ]
+        )
+        self.assertTrue(torch.allclose(kn, manual, atol=1e-5))
 
 
 class TestMetrics(unittest.TestCase):
