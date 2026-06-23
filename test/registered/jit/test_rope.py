@@ -205,16 +205,12 @@ def test_dsv4_fused_rope_pack_matches_inplace_materialize(
     head_offset = 3
     rope_dim = 64
 
-    q_base = torch.randn(
-        num_tokens, full_heads, head_dim, device=DEVICE, dtype=DTYPE
-    )
+    q_base = torch.randn(num_tokens, full_heads, head_dim, device=DEVICE, dtype=DTYPE)
     q = q_base[:, head_offset : head_offset + local_heads, :]
     assert not q.is_contiguous()
     assert q.stride(-1) == 1
 
-    positions = (
-        torch.arange(num_tokens, device=DEVICE, dtype=position_dtype) * 3 + 1
-    )
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=position_dtype) * 3 + 1
     freqs_cis = create_complex_freqs_cis(rope_dim, max_position=32)
 
     ref_base = q_base.clone()
