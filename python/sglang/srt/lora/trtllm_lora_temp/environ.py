@@ -80,10 +80,6 @@ class _LoraEnvs:
     SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE = _GatedBool(
         "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
     )
-    # opt3: cache the layer-static fields of LoRAInfo so _get_lora_info rebuilds only the
-    # per-batch fields each forward — cuts the per-layer Python cost paid on the eager
-    # prefill path (decode runs under cuda-graph, so it sees this only at capture).
-    SGLANG_OPT_LORA_LEAN_INFO = _GatedBool("SGLANG_OPT_LORA_LEAN_INFO", True)
 
     # ---- correctness fixes: on by default when experimental ----
     # gate_up gated-split fix (up_A shrink for the up half); set =0 only to A/B bisect.

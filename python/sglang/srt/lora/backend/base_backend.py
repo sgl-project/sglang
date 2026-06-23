@@ -189,22 +189,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
-        # FP8/FP4 quant-infos name the expert weights w13_weight/w2_weight; the BF16
-        # (unquantized) FlashInferTrtllmBf16MoeQuantInfo names them gemm1_weights/
-        # gemm2_weights. Shapes are equivalent for the buffer sizing here:
-        # w13 [E, 2*inter, ...], w2 [E, hidden, ...].
-        w13 = getattr(qinfo, "w13_weight", None)
-        if w13 is None:
-            w13 = qinfo.gemm1_weights
-        w2 = getattr(qinfo, "w2_weight", None)
-        if w2 is None:
-            w2 = qinfo.gemm2_weights
-        # Don't unpack a fixed ndim: FP8/FP4 weights are 3-D [E, N, K(/pack)], while the
-        # bf16 BlockMajorK-prepared weights are 4-D [E, N, K/128, 128]. dims 0/1 are
-        # E and N either way.
-        E, N = w13.shape[0], w13.shape[1]
-        hidden_dim = w2.shape[1]
-        device = w13.device
+        E, N, _ = qinfo.w13_weight.shape
+        hidden_dim = qinfo.w2_weight.shape[1]
+        device = qinfo.w13_weight.device
         dtype = compute_dtype
         num_experts = base.num_experts
 

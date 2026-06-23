@@ -102,6 +102,16 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
             local_expert_offset=int(base_layer.moe_ep_rank)
             * int(base_layer.num_local_experts),
         )
+        # Expose w13_weight/w2_weight on the bf16 quant-info so the backend-agnostic
+        # cuda-graph MoE buffer init (BaseLoRABackend.init_cuda_graph_moe_buffers) reads
+        # expert dims uniformly with the FP8/FP4 quant-infos (which name them w13/w2).
+        # The bf16 BlockMajorK weights are 4-D [E, N, K/128, 128]; collapsing the inner
+        # dims to a 3-D [E, N, K] view (free for contiguous weights) makes the upstream
+        # `E, N, _ = w13_weight.shape` dim-extraction work without touching base_backend.
+        _g1 = layer._quant_info.gemm1_weights
+        _g2 = layer._quant_info.gemm2_weights
+        layer._quant_info.w13_weight = _g1.reshape(_g1.shape[0], _g1.shape[1], -1)
+        layer._quant_info.w2_weight = _g2.reshape(_g2.shape[0], _g2.shape[1], -1)
         return
 
     assert getattr(
