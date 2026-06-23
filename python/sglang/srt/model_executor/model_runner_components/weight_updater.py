@@ -3,17 +3,27 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_available_gpu_memory, init_custom_process_group
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    dynamic_import,
+    get_available_gpu_memory,
+    init_custom_process_group,
+)
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,3 +261,89 @@ class WeightUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def update_weights_from_tensor(
+        self: WeightUpdater,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
+        load_format: Optional[str] = None,
+    ):
+        monkey_patch_torch_reductions()
+        if load_format == "flattened_bucket":
+            # Handle flattened bucket format
+            return self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+
+        # We need to get device after patch otherwise the device would be wrong
+        device_module = torch.get_device_module(self._mr.device)
+        infered_device = device_module.current_device()
+
+        named_tensors = [
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            for name, tensor in named_tensors
+        ]
+        if load_format == "direct":
+            _model_load_weights_direct(self._mr.model, named_tensors)
+        elif load_format in self._mr.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self._mr.model, named_tensors)
+        elif load_format is None:
+            self._mr.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
+        return True, "Success"
+
+    def _update_weights_from_flattened_bucket(
+        self: WeightUpdater,
+        flattened_tensor_bucket_dict,
+    ):
+        """Handle flattened bucket format for weight updates"""
+        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
+        metadata = flattened_tensor_bucket_dict["metadata"]
+
+        # Convert metadata dict to our format
+        converted_metadata = []
+        for meta in metadata:
+            converted_meta = FlattenedTensorMetadata(
+                name=meta.name,
+                shape=meta.shape,
+                dtype=meta.dtype,
+                start_idx=meta.start_idx,
+                end_idx=meta.end_idx,
+                numel=meta.numel,
+            )
+            converted_metadata.append(converted_meta)
+
+        # Create bucket and reconstruct tensors
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor, metadata=converted_metadata
+        )
+        reconstructed_tensors = bucket.reconstruct_tensors()
+
+        # Load the reconstructed tensors using the standard method
+        self._mr.model.load_weights(reconstructed_tensors)
+
+        return True, "Success"
+
+
+def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    params_dict = dict(model.named_parameters())
+    for name, tensor in named_tensors:
+        default_weight_loader(params_dict[name], tensor)
+
+
+def _unwrap_tensor(tensor, tp_rank, device):
+    if isinstance(tensor, LocalSerializedTensor):
+        tensor = tensor.get(tp_rank)
+    return tensor.to(device)
+
+
+@dataclass
+class LocalSerializedTensor:
+    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
+    The i-th element in the list corresponds to i-th rank's GPU."""
+
+    values: List[bytes]
+
+    def get(self, rank: int):
+        return MultiprocessingSerializer.deserialize(self.values[rank])
