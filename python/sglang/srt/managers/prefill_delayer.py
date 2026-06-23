@@ -118,9 +118,10 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len, allocatable_below_threshold.
+        # waiting_queue_len. The min-batch trigger uses a local (per-rank)
+        # judgment and is not gathered here.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 6),
+            (dp_size_dim, attn_tp_size, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -175,8 +176,9 @@ class PrefillDelayer:
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
-        # Gathered as a bool so a rank where it doesn't apply (chunked prefill
-        # in flight, or no count provided) contributes False.
+        # Local view of the min-batch trigger: True when this rank's own
+        # allocatable slots are below threshold. Used directly (not gathered)
+        # since running-batch slots are private to each DP rank.
         local_allocatable_below = (
             self._min_batch is not None
             and num_allocatable_reqs is not None
@@ -190,14 +192,12 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
-            local_allocatable_below=local_allocatable_below,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
-        global_allocatable_below = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -263,12 +263,11 @@ class PrefillDelayer:
                 )
 
             # Min-batch trigger: batch freed slots into one admission. Useful
-            # when each admission is expensive (e.g. draft prefill). Fires when
-            # any rank is below threshold (min < t == any i < t).
-            allocatable_condition = (
-                global_running_batch_max > 0
-                and global_allocatable_below.max().item() > 0
-            )
+            # when each admission is expensive (e.g. draft prefill). Per-rank
+            # local judgment (mirrors the legacy DFlash heuristic): each rank
+            # decides independently based on its own allocatable slots, since
+            # running-batch slots are private to each DP rank.
+            allocatable_condition = running_batch > 0 and local_allocatable_below
 
             # Wall-clock cap on the adaptive triggers to bound worst-case TTFT.
             if (queue_condition or allocatable_condition) and prev_state is not None:
@@ -351,7 +350,6 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
-        local_allocatable_below: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -360,7 +358,6 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
-                int(local_allocatable_below),
             ],
             device=self._gather_device,
             dtype=torch.int64,

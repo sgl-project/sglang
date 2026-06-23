@@ -377,8 +377,8 @@ _NEGOTIATE_TEST_CASES = [
         # One queue-trigger delay was recorded before the wall-clock release.
         expected_wait_forward_passes=1,
     ),
-    # Min-batch trigger: the most-constrained rank has 2 free slots,
-    # below min_batch=4, so prefill must wait for more to free.
+    # Min-batch trigger: every rank has 2 free slots, below min_batch=4, so
+    # prefill must wait for more to free. Per-rank local judgment.
     NegotiateTestCase(
         name="allocatable_trigger_delay",
         max_delay_passes=100,
@@ -391,7 +391,7 @@ _NEGOTIATE_TEST_CASES = [
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[2, 3, 8, 8],
+                num_allocatable_reqs=[2, 2, 2, 2],
             ),
             # skip_first_delayer consumes the first would-be delay; a second
             # identical call must actually delay.
@@ -400,7 +400,7 @@ _NEGOTIATE_TEST_CASES = [
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[2, 3, 8, 8],
+                num_allocatable_reqs=[2, 2, 2, 2],
             ),
         ],
         expected_allow=False,
@@ -419,7 +419,7 @@ _NEGOTIATE_TEST_CASES = [
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[4, 8, 8, 8],
+                num_allocatable_reqs=[4, 4, 4, 4],
             )
         ],
         expected_allow=True,
@@ -477,21 +477,21 @@ _NEGOTIATE_TEST_CASES = [
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[2, 3, 8, 8],
+                num_allocatable_reqs=[2, 2, 2, 2],
             ),
             NegotiateCall(
                 prefillable=[True, True, True, True],
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[2, 3, 8, 8],
+                num_allocatable_reqs=[2, 2, 2, 2],
             ),
             NegotiateCall(
                 prefillable=[True, True, True, True],
                 token_usage=[0.9, 0.9, 0.9, 0.9],
                 running_batch=[100, 100, 100, 100],
                 max_running_requests=1024,
-                num_allocatable_reqs=[2, 3, 8, 8],
+                num_allocatable_reqs=[2, 2, 2, 2],
                 sleep_before_s=0.2,  # > max_delay_ms (50ms)
             ),
         ],
