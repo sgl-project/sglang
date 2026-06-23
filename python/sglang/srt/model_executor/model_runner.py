@@ -166,6 +166,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
+    get_batch_sizes_to_capture,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -2538,15 +2539,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         graph_backend = defaultdict(
             lambda: f"{current_platform.device_name} graph",
             {
-                "cuda": "cuda graph",
-                "musa": "cuda graph",
-                "cpu": "cpu graph",
-                "npu": "npu graph",
+                "cuda": "CUDA graph",
+                "musa": "CUDA graph",
+                "cpu": "CPU graph",
+                "npu": "NPU graph",
             },
         )
+        role = "draft" if self.is_draft_worker else "target"
+        if self.spec_algorithm.is_speculative():
+            capture_name = f"{role} verify"
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
+        else:
+            capture_name = f"{role} decode"
+            num_tokens_per_bs = 1
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
-            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {capture_name} {graph_backend[self.device]} begin. "
+            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
+            f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
+
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
@@ -2567,12 +2585,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {capture_name} {graph_backend[self.device]} end. "
+            f"elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
-        """Initialize piecewise CUDA graph runner."""
+        """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
@@ -2613,17 +2632,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable piecewise CUDA graph for non-language models
+        # Disable prefill CUDA graph for non-language models
         if not hasattr(self.model, "model"):
             logger.warning(
-                "Disable piecewise CUDA graph because the model is not a language model"
+                "Disable prefill CUDA graph because the model is not a language model"
             )
             return
 
-        # Disable piecewise CUDA graph for non capture size
+        # Disable prefill CUDA graph for non capture size
         if not self.server_args.cuda_graph_config.prefill.bs:
             logger.warning(
-                "Disable piecewise CUDA graph because the capture size is not set"
+                "Disable prefill CUDA graph because the capture size is not set"
             )
             return
 
@@ -2638,7 +2657,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             layer_model = language_model
         else:
             logger.warning(
-                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+                "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )
             return
 
@@ -2710,14 +2729,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO(yuwei): support Non-Standard GQA
             log_info_on_rank0(
                 logger,
-                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+                "Disable prefill CUDA graph because some layers do not apply Standard GQA",
             )
             return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        prefill_backend = self.server_args.cuda_graph_config.prefill.backend
+        role = "draft" if self.is_draft_worker else "target"
+        capture_name = f"{role} prefill"
+        capture_num_tokens = sorted(self.server_args.cuda_graph_config.prefill.bs)
         logger.info(
-            f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
+            f"Capture {capture_name} CUDA graph begin. "
+            f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
+            f"avail mem={before_mem:.2f} GB"
         )
 
         self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
@@ -2725,8 +2750,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {capture_name} CUDA graph end. "
+            f"elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
