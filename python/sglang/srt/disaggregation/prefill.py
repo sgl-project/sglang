@@ -136,7 +136,9 @@ class PrefillBootstrapQueue:
         self.gloo_group = gloo_group
         self.scheduler = scheduler
         self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.max_token_pool_size
+            self.scheduler.tp_worker.model_runner.full_max_total_num_tokens
+            if self.scheduler.tp_worker.model_runner.is_hybrid_swa
+            else self.scheduler.tp_worker.model_runner.max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
