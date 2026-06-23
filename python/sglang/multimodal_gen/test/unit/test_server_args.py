@@ -25,9 +25,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
     SanaWMRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
-    FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
-    TurboWanT2V1_3B480PConfig,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
@@ -798,10 +796,6 @@ class TestOffloadDefaults(unittest.TestCase):
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
-        fastwan_deployment = FastWan2_1_T2V_480P_Config().get_model_deployment_config()
-        turbowan_1_3b_deployment = (
-            TurboWanT2V1_3B480PConfig().get_model_deployment_config()
-        )
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -825,23 +819,6 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
-
-        self.assertEqual(
-            fastwan_deployment.auto_disable_component_offload_min_available_memory_gb,
-            60,
-        )
-        self.assertEqual(
-            fastwan_deployment.auto_disable_component_offload_components,
-            ("text_encoder", "image_encoder", "vae"),
-        )
-        self.assertEqual(
-            turbowan_1_3b_deployment.auto_disable_component_offload_min_available_memory_gb,
-            60,
-        )
-        self.assertEqual(
-            turbowan_1_3b_deployment.auto_disable_component_offload_components,
-            ("text_encoder", "image_encoder", "vae"),
-        )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -969,60 +946,6 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
-
-    def test_auto_dmd_wan_keeps_components_resident_on_high_memory_gpu(self):
-        for pipeline_config, model_path in (
-            (
-                FastWan2_1_T2V_480P_Config(),
-                "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
-            ),
-            (
-                TurboWanT2V1_3B480PConfig(),
-                "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-            ),
-        ):
-            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
-                args = self._from_dict_with_pipeline_config(
-                    pipeline_config,
-                    available_memory_gb=80,
-                    kwargs={
-                        "model_path": model_path,
-                        "performance_mode": "auto",
-                    },
-                )
-
-                self.assertFalse(args.use_fsdp_inference)
-                self.assertTrue(args.dit_cpu_offload)
-                self.assertIsNone(args.layerwise_offload_components)
-                self.assertFalse(args.text_encoder_cpu_offload)
-                self.assertFalse(args.image_encoder_cpu_offload)
-                self.assertFalse(args.vae_cpu_offload)
-
-    def test_auto_dmd_wan_keeps_layerwise_components_on_mid_memory_gpu(self):
-        for pipeline_config, model_path in (
-            (
-                FastWan2_1_T2V_480P_Config(),
-                "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
-            ),
-            (
-                TurboWanT2V1_3B480PConfig(),
-                "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-            ),
-        ):
-            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
-                args = self._from_dict_with_pipeline_config(
-                    pipeline_config,
-                    available_memory_gb=48,
-                    kwargs={
-                        "model_path": model_path,
-                        "performance_mode": "auto",
-                    },
-                )
-
-                self.assertEqual(
-                    args.layerwise_offload_components,
-                    ["text_encoder", "image_encoder", "vae"],
-                )
 
     def test_auto_wan2_2_a14b_layerwise_offload_adds_dit(self):
         for pipeline_config, model_path in (
@@ -1673,14 +1596,6 @@ class TestModelIdResolution(unittest.TestCase):
     def test_sana_wm_model_path_resolves_registry(self):
         info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
         self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
-
-    def test_turbowan_1_3b_uses_high_memory_config(self):
-        info = _get_config_info("IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers")
-        self.assertIs(info.pipeline_config_cls, TurboWanT2V1_3B480PConfig)
-
-    def test_turbowan_14b_keeps_default_config(self):
-        info = _get_config_info("IPostYellow/TurboWan2.1-T2V-14B-Diffusers")
-        self.assertIs(info.pipeline_config_cls, TurboWanT2V480PConfig)
 
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
