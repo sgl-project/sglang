@@ -11,19 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with npu graph and torch.compile"""
 
 from __future__ import annotations
 
-import logging
-import threading
 from typing import TYPE_CHECKING, Dict, Union
 
-import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -31,25 +26,11 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
-from sglang.srt.utils import is_npu
-
-logger = logging.getLogger(__name__)
-
-if is_npu():
-    torch.cuda.CUDAGraph = torch.npu.NPUGraph
-    torch.cuda.synchronize = torch.npu.synchronize
-    torch.cuda.graph = torch.npu.graph
-    torch.cuda.stream = torch.npu.stream
-    torch.cuda.Stream = torch.npu.Stream
-    torch.cuda.current_stream = torch.npu.current_stream
-
 
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
-        super().__init__(eagle_worker)
-        self.update_attr_name = None
-        self.update_attr_type = None
         self._init_arch_map()
+        super().__init__(eagle_worker)
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -61,21 +42,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             AttentionArch.MHA: torch.Tensor(),
         }
 
-    def _create_graph(self):
-        return torch.npu.NPUGraph()
-
-    def _capture_init(self, run_once_fn):
-        for _ in range(2):
-            torch.npu.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
-
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.npu.graph(
-            graph, pool=pool, stream=stream, auto_dispatch_capture=True
-        ):
-            out = run_once_fn()
-        return out
+    def _cache_loc_dtype(self):
+        return torch.int32
 
     def _get_update_attr_name(self):
         return self.attr_name[AttentionArch.MLA]
@@ -83,33 +51,19 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
 
-    def _replay_update(self, seq_lens_list):
-        if isinstance(self.update_attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens_list).astype(np.int32))
-
-        self.graphs[self.bs].update(
-            cpu_update_input=[
-                {self.update_attr_name: seq_lens} for seq_lens in seq_lens_list
-            ]
-        )
-
-    def _replay(self, forward_batch: ForwardBatch):
-        self.update_attr_name = self._get_update_attr_name()
-        self.update_attr_type = self._get_update_attr_type()
+    def _replay_graph(self, shape_key, forward_batch):
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
-                seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
+                seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu[: self.raw_bs] + speculative_step_id + 1
+                )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
-            thread = threading.Thread(
-                target=self._replay_update, args=(seq_lens_for_each_draft_step,)
+            attr_name = self._get_update_attr_name()
+            cpu_update_input = [{attr_name: sl} for sl in seq_lens_for_each_draft_step]
+            return self.backend.replay_with_input_update(
+                shape_key, seq_lens=None, cpu_update_input=cpu_update_input
             )
-            thread.start()
-            self.graphs[self.bs].replay()
-            thread.join()
         else:
-            self.graphs[self.bs].replay()
-
-    def _cache_loc_dtype(self):
-        return torch.int32
+            return self.backend.replay(shape_key, forward_batch)
