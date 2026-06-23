@@ -2783,7 +2783,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def check_weights(self, action: str):
         return self._weight_checker.handle(action=action)
 
-    def update_weights_from_ipc(self, recv_req):
+    @staticmethod
+    def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
@@ -2791,7 +2792,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             # Create a worker extension that integrates with SGLang's model
-            worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
+            worker = SGLangCheckpointEngineWorkerExtensionImpl(self._mr)
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
