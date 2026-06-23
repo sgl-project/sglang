@@ -48,7 +48,15 @@ def _patch_cache_dit_similarity():
 
     _original_similarity = cache_manager.CachedContextManager.similarity
 
-    def patched_similarity(self, t1, t2, *, threshold, parallelized=False, prefix="Fn"):
+    def patched_similarity(
+        self: cache_manager.CachedContextManager,
+        t1: torch.Tensor,
+        t2: torch.Tensor,
+        *,
+        threshold: float,
+        parallelized: bool = False,
+        prefix: str = "Fn",
+    ) -> bool:
         if not parallelized:
             return _original_similarity(
                 self,
