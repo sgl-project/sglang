@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -85,16 +86,21 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        server_args = get_global_server_args()
+        is_quant_kernel = isinstance(
+            kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
+        ) or (
+            server_args is not None
+            and server_args.online_quantization == "ascend_w8a8"
+        )
 
         if get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
-            is_quant_kernel = isinstance(
-                kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
-            )
+
             self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
         else:
             # Non‑DeepEP (torch_npu) path
-            if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
+            if is_quant_kernel:
                 self.activation = NPUSwigluQuant()
             else:
                 if config.activation == "npu_swiglu_oai":
