@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -187,11 +188,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if self.model_runner.server_args.speculative_use_rejection_sampling
                 else None
             )
-            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                model_runner
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_bs, _hidden_size),
-                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None
