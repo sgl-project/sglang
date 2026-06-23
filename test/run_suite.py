@@ -46,15 +46,17 @@ PER_COMMIT_SUITES = {
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
         # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
-        # carries the mock-model / kv_canary *unit* tests; 1-gpu-large carries
-        # the subset of model e2e tests validated to pass on mi325 (quant
-        # fp8kv-triton, sessions streaming-session EAGLE3, spec standalone
-        # triton-backend variant). The rest of CUDA
-        # extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # carries the mock-model / kv_canary unit + single-GPU canary e2e
+        # tests; 1-gpu-large carries the subset of model e2e tests validated
+        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
+        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
+        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
+        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
         # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
