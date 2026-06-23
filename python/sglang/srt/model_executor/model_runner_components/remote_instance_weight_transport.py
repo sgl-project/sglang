@@ -7,6 +7,10 @@ from typing import Any, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    register_memory_region,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
@@ -47,6 +51,21 @@ class RemoteInstanceWeightTransport:
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
+
+    def maybe_register_and_publish_weight_info(self) -> None:
+        if (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            # ModelExpress owns TransferEngine memory registration and metadata
+            # publishing for backend=modelexpress. Re-registering here would
+            # overlap the same weight buffers.
+            and self.server_args.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            and self.engine is not None
+            and self.weight_info is None
+        ):
+            # Register memory and upstream the transfer engine info to the bootstrap server
+            self.weight_info = register_memory_region(self.model, self.engine)
+            self._register_to_engine_info_bootstrap()
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransport):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
