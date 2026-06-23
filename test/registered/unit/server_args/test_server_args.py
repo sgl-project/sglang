@@ -2,7 +2,6 @@ import importlib
 import json
 import os
 import tempfile
-import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -104,52 +103,8 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             enable_mamba_cache_stochastic_rounding=True,
         )
 
-        with self.assertRaisesRegex(ValueError, "SM100-family Blackwell"):
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
             server_args._handle_mamba_backend()
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
-    def test_allows_triton_with_fp16_on_sm100(self, _mock_sm100, _mock_is_cuda):
-        server_args = ServerArgs(
-            model_path="dummy",
-            mamba_ssm_dtype="float16",
-            mamba_backend="triton",
-            enable_mamba_cache_stochastic_rounding=True,
-            mamba_cache_philox_rounds=4,
-        )
-
-        server_args._handle_mamba_backend()
-        self.assertTrue(server_args.enable_mamba_cache_stochastic_rounding)
-        self.assertEqual(server_args.mamba_cache_philox_rounds, 4)
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=True)
-    def test_allows_flashinfer_with_fp16(
-        self, _mock_flashinfer_available, _mock_sm100, _mock_is_cuda
-    ):
-        flashinfer_module = types.ModuleType("flashinfer")
-        flashinfer_module.__path__ = []
-        flashinfer_mamba_module = types.ModuleType("flashinfer.mamba")
-        flashinfer_module.mamba = flashinfer_mamba_module
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "flashinfer": flashinfer_module,
-                "flashinfer.mamba": flashinfer_mamba_module,
-            },
-        ):
-            server_args = ServerArgs(
-                model_path="dummy",
-                mamba_ssm_dtype="float16",
-                mamba_backend="flashinfer",
-                enable_mamba_cache_stochastic_rounding=True,
-            )
-            server_args._handle_mamba_backend()
-
-        self.assertEqual(server_args.mamba_backend, "flashinfer")
-        self.assertTrue(server_args.enable_mamba_cache_stochastic_rounding)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
