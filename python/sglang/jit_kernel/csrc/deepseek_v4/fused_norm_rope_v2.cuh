@@ -814,7 +814,7 @@ struct FusedNormRopeBF16Kernel {
     TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
     TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
     TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
-    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(out_loc);
     TensorMatcher({-1, -1}).with_strides({kPageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
 
     switch (mode) {
@@ -835,7 +835,7 @@ struct FusedNormRopeBF16Kernel {
         .handle = plan.data_ptr(),
         .weight = weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
-        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
         .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
         .eps = eps,
         .compress_ratio = compress_ratio,
