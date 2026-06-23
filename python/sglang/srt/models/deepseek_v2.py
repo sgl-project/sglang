@@ -219,29 +219,6 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
-if _is_cuda:
-
-    @register_custom_op(out_shape="hidden_states")
-    def dsv2_flashinfer_moe_dual_stream_graph(
-        hidden_states: torch.Tensor,
-        layer_id: int,
-        should_allreduce_fusion: bool,
-        use_reduce_scatter: bool,
-    ) -> torch.Tensor:
-        forward_context = get_tc_piecewise_forward_context()
-        assert forward_context is not None
-        assert forward_context.moe_fusions is not None
-
-        moe_fusion = forward_context.moe_fusions[layer_id]
-        assert moe_fusion is not None
-        return moe_fusion.forward_normal_dual_stream(
-            hidden_states,
-            should_allreduce_fusion=should_allreduce_fusion,
-            use_reduce_scatter=use_reduce_scatter,
-            use_flashinfer_trtllm_bypass=True,
-        )
-
-
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -2924,6 +2901,27 @@ def flashinfer_dsv3_router_gemm(
         weight.t(),
         logits,
         launch_with_pdl=True,
+    )
+
+
+@register_custom_op(out_shape="hidden_states")
+def dsv2_flashinfer_moe_dual_stream_graph(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    should_allreduce_fusion: bool,
+    use_reduce_scatter: bool,
+) -> torch.Tensor:
+    forward_context = get_tc_piecewise_forward_context()
+    assert forward_context is not None
+    assert forward_context.moe_fusions is not None
+
+    moe_fusion = forward_context.moe_fusions[layer_id]
+    assert moe_fusion is not None
+    return moe_fusion.forward_normal_dual_stream(
+        hidden_states,
+        should_allreduce_fusion=should_allreduce_fusion,
+        use_reduce_scatter=use_reduce_scatter,
+        use_flashinfer_trtllm_bypass=True,
     )
 
 
