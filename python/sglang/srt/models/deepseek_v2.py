@@ -2165,6 +2165,17 @@ class DeepseekV2AttentionMLA(
             weight_block_size=weight_block_size,
         )
 
+        # Publish this layer's absorbed_w_sel into a shared {layer_id: w_sel} map on
+        # server_args (same publish channel as _ds_channel_selection above) so the
+        # DSA backend's cosine key-norm populate can resolve every DS layer's K-noPE
+        # projection — it validates full coverage at init. Only consumed when
+        # scorer_norm="cosine"; harmless (an unread map) otherwise.
+        _wsel_map = getattr(server_args, "_ds_absorbed_w_sel_by_layer", None)
+        if _wsel_map is None:
+            _wsel_map = {}
+            setattr(server_args, "_ds_absorbed_w_sel_by_layer", _wsel_map)
+        _wsel_map[self.layer_id] = self.double_sparsity_selector.absorbed_w_sel
+
         self.double_sparsity_selector.bind_runtime_data(
             channel_mask=local_mask,
             process_group=process_group,

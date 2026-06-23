@@ -366,6 +366,9 @@ class DeepseekSparseAttnBackend(
         # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
         # sizes the bf16 scratch in ds_graph_state.
         self.ds_score_reduce_bf16: bool = False
+        # Served scorer ("off" = raw channel-dot, "cosine" = direction-normalized);
+        # only "cosine" allocates + populates the key-norm cache below.
+        self._ds_scorer_norm: str = "off"
         # Compact DS selector widths to capture as extra graph variants
         # (config-borne; empty = full width only). The CUDA-graph runner reads
         # this to build its selector-width ladder.
@@ -392,6 +395,7 @@ class DeepseekSparseAttnBackend(
                 self.ds_score_reduce_bf16 = (
                     getattr(ds_cfg, "score_reduce_dtype", "bf16") == "bf16"
                 )
+                self._ds_scorer_norm = str(getattr(ds_cfg, "scorer_norm", "off"))
                 self.ds_selector_width_buckets = list(
                     getattr(ds_cfg, "selector_width_buckets", []) or []
                 )
@@ -447,6 +451,10 @@ class DeepseekSparseAttnBackend(
         self._ds_slot_written: Optional[torch.Tensor] = None
         self._ds_slot_written_true: Optional[torch.Tensor] = None
         self._ds_slot_written_false: Optional[torch.Tensor] = None
+        self._ds_key_norm_cache: Optional[torch.Tensor] = None
+        self._ds_key_norm_enabled: bool = False
+        self._ds_w_flat_by_layer = None
+        self._ds_key_norm_nan: Optional[torch.Tensor] = None
         if self.enable_double_sparsity:
             _num_local_layers = int(self._ds_channel_selection.shape[0])
             _num_kv_slots = self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
@@ -469,6 +477,104 @@ class DeepseekSparseAttnBackend(
             # Publish so the model layer's selector path (deepseek_v2) can resolve
             # it through the ForwardContext-published attention backend.
             setattr(model_runner.server_args, "_ds_slot_written", self._ds_slot_written)
+            # Cosine key-norm cache (Fix B): k_norm[layer, slot, h] =
+            # ||absorbed_w_sel[layer,h] @ dequant(resident fp8 latent[slot])||.
+            # Same lifecycle as _ds_slot_written (alloc here; populate at KV-append
+            # before marking the slot written; gather at decode scoring). Allocated
+            # ONLY for scorer_norm="cosine", so the raw-dot ("off") path is fully
+            # byte-identical — output AND cost — because the cache + populate are
+            # dormant. Fail-closed: unwritten slots hold NaN so an accidental read
+            # is detectably invalid.
+            self._ds_key_norm_enabled = self._ds_scorer_norm == "cosine"
+            if self._ds_key_norm_enabled:
+                from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+                    assert_resident_fp8_layout,
+                )
+
+                wsel_map = (
+                    getattr(
+                        model_runner.server_args, "_ds_absorbed_w_sel_by_layer", None
+                    )
+                    or {}
+                )
+                _kn_H = self.num_q_heads
+                self._knorm_label_dim = int(self.ds_label_dim)
+                self._knorm_lora = int(self.kv_lora_rank)
+                self._knorm_nblk = self._knorm_lora // 128
+                # Fail closed: cosine requires absorbed_w_sel for EVERY DS layer,
+                # published at bind with the exact expected shape. Validate FULL
+                # coverage here (at init), never accept a partial map and fail later
+                # inside the KV-write populate.
+                self._ds_w_flat_by_layer = self._prepare_cosine_projections(
+                    wsel_map,
+                    n_layers=int(self._ds_channel_selection.shape[0]),
+                    exp_shape=(_kn_H, self._knorm_label_dim, self._knorm_lora),
+                    device=self.device,
+                )
+                # Validate the resident fp8 byte layout the populate reads (task4),
+                # when the pool exposes it as fp8-packed.
+                _pool = self.token_to_kv_pool
+                _kvdim = getattr(_pool, "kv_cache_dim", None)
+                if _kvdim is not None and getattr(
+                    _pool, "dsa_kv_cache_store_fp8", False
+                ):
+                    _rope_dim = int(
+                        getattr(model_runner.model_config, "qk_rope_head_dim", 64)
+                    )
+                    assert_resident_fp8_layout(
+                        kv_lora_rank=self._knorm_lora,
+                        kv_cache_dim=int(_kvdim),
+                        rope_bytes=_rope_dim * 2,  # rope stored bf16 (2 bytes/elem)
+                    )
+                self._ds_key_norm_cache = torch.full(
+                    (_num_local_layers, _num_kv_slots, self.num_q_heads),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                # Device NaN scalar for graph-safe in-place invalidation (no CPU->CUDA).
+                self._ds_key_norm_nan = torch.full(
+                    (), float("nan"), dtype=torch.float32, device=self.device
+                )
+                # Preallocated scratch for the 0-alloc decode populate (T <= max_app).
+                _max_app = max(
+                    256,
+                    int(getattr(model_runner.server_args, "cuda_graph_max_bs", 0) or 0),
+                )
+                self._knorm_max_app = _max_app
+                _lora = self._knorm_lora
+                _nblk = self._knorm_nblk
+                self._knorm_slots = torch.zeros(
+                    _max_app, dtype=torch.int64, device=self.device
+                )
+                self._knorm_rowu8 = torch.zeros(
+                    (_max_app, _lora + _nblk * 4), dtype=torch.uint8, device=self.device
+                )
+                self._knorm_ckv = torch.zeros(
+                    (_max_app, _lora), dtype=torch.float32, device=self.device
+                )
+                self._knorm_klabel = torch.zeros(
+                    (_max_app, _kn_H * self._knorm_label_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self._knorm_out = torch.zeros(
+                    (_max_app, self.num_q_heads),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                # Publish so the model layer's invalidation path (deepseek_v2) can
+                # NaN-reset reused slots through the ForwardContext-resolved backend.
+                setattr(
+                    model_runner.server_args,
+                    "_ds_key_norm_cache",
+                    self._ds_key_norm_cache,
+                )
+                setattr(
+                    model_runner.server_args,
+                    "_ds_key_norm_nan",
+                    self._ds_key_norm_nan,
+                )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -1756,6 +1862,113 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @staticmethod
+    def _prepare_cosine_projections(wsel_map, *, n_layers, exp_shape, device):
+        """Validate the bind-published absorbed_w_sel map (fail closed at init):
+        every DS layer ``0..n_layers-1`` must be present with shape ``exp_shape``
+        ([H, label_dim, lora]); reject missing/out-of-range layer ids and shape
+        mismatches. Returns ``{layer_id: w_flat [H*label_dim, lora] fp32}`` on
+        ``device`` (the per-layer matmul rhs for the populate).
+        """
+        wsel_map = wsel_map or {}
+        expected = range(n_layers)
+        missing = [lid for lid in expected if lid not in wsel_map]
+        if missing:
+            raise RuntimeError(
+                f"Double Sparsity scorer_norm='cosine' requires absorbed_w_sel for "
+                f"every DS layer (0..{n_layers - 1}); bind published {sorted(wsel_map)} "
+                f"— layers {missing[:8]} missing."
+            )
+        extra = [lid for lid in wsel_map if lid not in expected]
+        if extra:
+            raise RuntimeError(
+                f"Double Sparsity cosine: unexpected absorbed_w_sel layer ids {extra} "
+                f"(expected 0..{n_layers - 1})."
+            )
+        H, label_dim, lora = exp_shape
+        for lid in expected:
+            if tuple(wsel_map[lid].shape) != tuple(exp_shape):
+                raise RuntimeError(
+                    f"Double Sparsity cosine: absorbed_w_sel[{lid}] shape "
+                    f"{tuple(wsel_map[lid].shape)} != expected {tuple(exp_shape)}."
+                )
+        return {
+            lid: wsel_map[lid]
+            .to(device=device, dtype=torch.float32)
+            .reshape(H * label_dim, lora)
+            .contiguous()
+            for lid in expected
+        }
+
+    def _populate_key_norm_cache(self, layer_id: int, cache_loc: torch.Tensor) -> None:
+        """Store the cosine key norm for the just-written slots, read from the
+        RESIDENT fp8-dequantized latent (the bytes the score kernel reads — NOT the
+        pre-quant ``k`` — so the norm matches the absorbed-raw-dot numerator and the
+        cosine oracle). In-place scatter into the preallocated cache; same graph-safe
+        lifecycle as ``_ds_slot_written``.
+        """
+        cache = self._ds_key_norm_cache
+        w_flat = (
+            self._ds_w_flat_by_layer.get(layer_id)
+            if self._ds_w_flat_by_layer
+            else None
+        )
+        if cache is None or w_flat is None:
+            # Fail closed: cosine is enabled but bind did not publish this layer's
+            # projection — raise rather than silently mark the slot written with a
+            # stale/absent key norm.
+            raise RuntimeError(
+                f"Double Sparsity key-norm populate has no projection for layer "
+                f"{layer_id} (cosine enabled but the bind publish is missing)."
+            )
+        pool = self.token_to_kv_pool
+        buf = pool.kv_buffer[layer_id - getattr(pool, "start_layer", 0)]  # [slots, 1, D]
+        lora = self._knorm_lora
+        nblk = self._knorm_nblk
+        H = self.num_q_heads
+        label_dim = self._knorm_label_dim
+        T = int(cache_loc.shape[0])
+        packed = buf.dtype == torch.uint8
+
+        if packed and T <= self._knorm_max_app:
+            # 0-ALLOC decode path: gather the resident [fp8 latent | fp32 scales]
+            # bytes into preallocated scratch (uint8 index_select, out=), dequant in
+            # place, matmul into the per-head signature, vector-norm into the cache.
+            # No tensor is allocated per call.
+            slots = self._knorm_slots[:T]
+            slots.copy_(cache_loc)
+            buf_ls = buf[:, 0, : lora + nblk * 4]  # [S, lora+nblk*4] uint8 view
+            rowu8 = self._knorm_rowu8[:T]
+            torch.index_select(buf_ls, 0, slots, out=rowu8)
+            fp8 = rowu8[:, :lora].view(torch.float8_e4m3fn)  # [T, lora]
+            scl = rowu8[:, lora : lora + nblk * 4].view(torch.float32)  # [T, nblk]
+            ckv = self._knorm_ckv[:T]
+            ckv.copy_(fp8)  # fp8 -> fp32 (in place)
+            ckv.view(T, nblk, lora // nblk).mul_(scl.view(T, nblk, 1))  # dequant
+            klabel = self._knorm_klabel[:T]
+            torch.matmul(ckv, w_flat.t(), out=klabel)  # [T, lora] @ [lora, H*label_dim]
+            out = self._knorm_out[:T]
+            torch.linalg.vector_norm(klabel.view(T, H, label_dim), dim=-1, out=out)
+            cache[layer_id].index_copy_(0, slots, out)  # in-place, 0-alloc
+            return
+
+        # Eager fallback (extend / non-fp8 KV): correctness over 0-alloc (prefill is
+        # not graph-captured, so a per-call allocation here is acceptable).
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+            dequantize_resident_latent,
+        )
+
+        slots = cache_loc.long()
+        row = buf[slots, 0, :]  # [T, D]
+        if packed:
+            fp8 = row[:, :lora].view(torch.float8_e4m3fn)
+            scl = row[:, lora : lora + nblk * 4].contiguous().view(torch.float32)
+            c_kv = dequantize_resident_latent(fp8, scl)
+        else:
+            c_kv = row[:, :lora].to(torch.float32)
+        k_label = torch.matmul(c_kv, w_flat.t()).view(-1, H, label_dim)
+        cache[layer_id].index_copy_(0, slots, k_label.norm(dim=-1))
+
     def _write_token_labels(
         self,
         layer,
@@ -1777,6 +1990,11 @@ class DeepseekSparseAttnBackend(
         """
         if not self.enable_double_sparsity:
             return
+        if self._ds_key_norm_enabled:
+            # Populate the cosine key-norm cache for the just-written slots from the
+            # resident fp8 latent, BEFORE marking the slot written, so a reader never
+            # sees a written slot whose key norm is stale/absent.
+            self._populate_key_norm_cache(layer.layer_id, cache_loc)
         if self._ds_slot_written is not None:
             # Device-scalar RHS (not Python `True`) so the indexed mark stays a
             # pure device-side copy — a CPU `True` would copy CPU->CUDA, which
