@@ -176,7 +176,7 @@ def get_last_loc(
     attn_backend = get_global_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
-    if (_is_hip or _is_cuda) and uses_triton_dispatch:
+    if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
