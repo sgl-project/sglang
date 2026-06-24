@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
@@ -56,13 +57,14 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram")
+    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
 
     def __init__(
         self,
         token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
+        limit: Optional[int] = None,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -70,23 +72,42 @@ class RadixKey:
         self.extra_key = extra_key
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
+        # Optional cap on raw tokens: behave as if token_ids were sliced to
+        # token_ids[:limit], without the O(n) copy. None = use all tokens.
+        self.limit = limit
+
+    def _raw_len(self) -> int:
+        n = len(self.token_ids)
+        if self.limit is not None and self.limit < n:
+            return self.limit
+        return n
+
+    def raw_token_ids(self) -> array:
+        """token_ids honoring `limit` (copies only when capped)."""
+        n = self._raw_len()
+        t = self.token_ids
+        return t if n == len(t) else t[:n]
 
     def __len__(self) -> int:
+        n = self._raw_len()
         if self.is_bigram:
-            n = len(self.token_ids)
             return n - 1 if n > 0 else 0
-        return len(self.token_ids)
+        return n
 
     # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
+        t = self.token_ids
+        n = self._raw_len()
         if self.is_bigram:
-            t = self.token_ids
-            for i in range(len(t) - 1):
+            for i in range(n - 1 if n > 0 else 0):
                 yield (t[i], t[i + 1])
+        elif n == len(t):
+            yield from t
         else:
-            yield from self.token_ids
+            for i in range(n):
+                yield t[i]
 
-    def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
+    def __getitem__(self, idx: Union[int, slice]) -> RadixKey:
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
@@ -109,7 +130,7 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
-    def page_aligned(self, page_size: int) -> "RadixKey":
+    def page_aligned(self, page_size: int) -> RadixKey:
         if page_size == 1:
             return self
         aligned_len = len(self) // page_size * page_size
@@ -119,7 +140,7 @@ class RadixKey:
         self,
         is_eagle: bool,
         value: Optional[torch.Tensor] = None,
-    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         # O(1): flip the bigram flag instead of materializing a tuple list.
         # value is paired with raw tokens and gets truncated to the bigram count.
         if is_eagle and not self.is_bigram:
@@ -128,44 +149,48 @@ class RadixKey:
                 value = value[: len(self)]
         return self, value
 
-    def _check_compatible(self, other: "RadixKey") -> None:
+    def _check_compatible(self, other: RadixKey) -> None:
         if self.extra_key != other.extra_key:
             raise ValueError(
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
-    def match(self, other: "RadixKey", page_size: int = 1) -> int:
+    def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
+        n = min(len(t0), len(t1))
+
+        # Exponential search for the first diverging token: gallop in doubling
+        # windows (one C-level slice compare each), then binary-search the window
+        # holding the divergence -- no per-token Python loop on long shared prefixes.
+        matched_tokens = n
+        lo = 0
+        step = 1
+        while lo < n:
+            hi = lo + step if lo + step < n else n
+            if t0[lo:hi] != t1[lo:hi]:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if t0[lo:mid] == t1[lo:mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                matched_tokens = lo
+                break
+            lo = hi
+            step *= 2
 
         if self.is_bigram:
-            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
+        matched_tokens = min(matched_tokens, len(self), len(other))
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
-
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -254,11 +279,11 @@ class TreeNode:
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(KVCacheEventMixin, BasePrefixCache):
+class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -319,6 +344,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._reset_session_radix_state()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -408,8 +434,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
-        return InsertResult(prefix_len=prefix_len)
+        prefix_len, last_node = self._insert_helper(
+            self.root_node, key, value, priority, chunked
+        )
+        return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
@@ -442,17 +470,21 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            session_leaf = result.last_device_node
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
+            session_leaf = None
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+
+        self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -463,7 +495,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -523,6 +555,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+        self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -592,7 +626,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -688,7 +722,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = key.child_key(self.page_size)
 
@@ -724,7 +758,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
@@ -749,6 +784,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
+        self._discard_session_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)

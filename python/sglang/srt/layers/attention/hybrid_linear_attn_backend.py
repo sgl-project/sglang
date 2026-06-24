@@ -2,8 +2,6 @@ import logging
 from typing import Optional, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
@@ -13,7 +11,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
+    track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -24,108 +24,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
-
-
-# Kernel to track mamba states if needed based on track mask
-@triton.jit
-def track_mamba_state_if_needed_kernel(
-    conv_states_ptr,
-    ssm_states_ptr,
-    cache_indices_ptr,
-    mamba_track_mask_ptr,
-    mamba_track_indices_ptr,
-    conv_state_stride_0,  # stride for first dimension (batch/pool index)
-    ssm_state_stride_0,  # stride for first dimension (batch/pool index)
-    conv_state_numel_per_row: tl.constexpr,  # total elements per row
-    ssm_state_numel_per_row: tl.constexpr,  # total elements per row
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Track conv_states and ssm_states rows based on track mask.
-
-    This kernel replaces a Python loop that copies state tensors for mamba attention.
-    For each batch element, if the track mask is True, it copies the entire row from
-    the source index (cache_indices[i]) to the destination index (mamba_track_indices[i]).
-
-    Grid: (batch_size,)
-    Each block handles one batch element, using multiple threads to copy data in parallel.
-    """
-    batch_idx = tl.program_id(0)
-
-    # Load the copy mask for this batch element
-    track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
-
-    # Early exit if we don't need to track
-    if not track_mask:
-        return
-
-    # Load source and destination indices
-    src_idx = tl.load(cache_indices_ptr + batch_idx)
-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
-
-    # Copy conv_states
-    # Each thread handles BLOCK_SIZE elements
-    for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
-        element_indices = offset + tl.arange(0, BLOCK_SIZE)
-        mask = element_indices < conv_state_numel_per_row
-
-        src_ptr = conv_states_ptr + src_idx * conv_state_stride_0 + element_indices
-        dst_ptr = conv_states_ptr + dst_idx * conv_state_stride_0 + element_indices
-
-        data = tl.load(src_ptr, mask=mask, other=0.0)
-        tl.store(dst_ptr, data, mask=mask)
-
-    # Copy ssm_states
-    for offset in range(0, ssm_state_numel_per_row, BLOCK_SIZE):
-        element_indices = offset + tl.arange(0, BLOCK_SIZE)
-        mask = element_indices < ssm_state_numel_per_row
-
-        src_ptr = ssm_states_ptr + src_idx * ssm_state_stride_0 + element_indices
-        dst_ptr = ssm_states_ptr + dst_idx * ssm_state_stride_0 + element_indices
-
-        data = tl.load(src_ptr, mask=mask, other=0.0)
-        tl.store(dst_ptr, data, mask=mask)
-
-
-def track_mamba_states_if_needed(
-    conv_states: torch.Tensor,
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    mamba_track_mask: torch.Tensor,
-    mamba_track_indices: torch.Tensor,
-    batch_size: int,
-):
-    """
-    Track mamba states using Triton kernel for better performance.
-
-    Args:
-        conv_states: Convolution states tensor [pool_size, ...]
-        ssm_states: SSM states tensor [pool_size, ...]
-        cache_indices: Source indices for each batch element [batch_size]
-        mamba_track_mask: Boolean mask indicating which elements to track [batch_size]
-        mamba_track_indices: Indices to track for each batch element [batch_size]
-        batch_size: Number of batch elements
-    """
-    conv_state_numel_per_row = conv_states[0].numel()
-    ssm_state_numel_per_row = ssm_states[0].numel()
-
-    # Choose BLOCK_SIZE based on the size of the data
-    BLOCK_SIZE = 1024
-
-    # Launch kernel with batch_size blocks
-    grid = (batch_size,)
-    track_mamba_state_if_needed_kernel[grid](
-        conv_states,
-        ssm_states,
-        cache_indices,
-        mamba_track_mask,
-        mamba_track_indices,
-        conv_states.stride(0),
-        ssm_states.stride(0),
-        conv_state_numel_per_row,
-        ssm_state_numel_per_row,
-        BLOCK_SIZE,
-    )
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -149,7 +47,12 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            or self.is_draft_worker
+        ):
             return
         if (
             forward_batch.mamba_clear_indices is not None
@@ -162,9 +65,20 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
-            self.req_to_token_pool.mamba_pool.copy_from(
-                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
-            )
+            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+            if ckpt_pool is not None:
+                # int8 checkpoints: dequantize the cached state (src = int8 ckpt slot)
+                # into the request's active bf16 slot (dst).
+                ckpt_pool.load_to_active(
+                    self.req_to_token_pool.mamba_pool,
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
+            else:
+                self.req_to_token_pool.mamba_pool.copy_from(
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -184,6 +98,10 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -270,6 +188,9 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            num_padding=(
+                0 if in_capture else getattr(forward_batch, "num_padding", None)
+            ),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -523,13 +444,15 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        num_padding: Optional[int] = None,
     ):
-        if seq_lens_cpu is None:
-            num_padding = 0
-        else:
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-            )
+        if num_padding is None:
+            if seq_lens_cpu is None:
+                num_padding = 0
+            else:
+                num_padding = torch.count_nonzero(
+                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -659,6 +582,8 @@ class MambaAttnBackendBase(AttentionBackend):
 class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         config = model_runner.mamba2_config
@@ -687,6 +612,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            num_padding=(
+                0 if in_capture else getattr(forward_batch, "num_padding", None)
+            ),
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
@@ -710,7 +638,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self,
         mixer: MambaMixer2,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         layer_id: int,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
@@ -718,7 +646,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        intermediate_states = mixer.forward(
+        mixer_out, intermediate_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -752,6 +680,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     num_decodes,
                 )
 
+        return mixer_out
+
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(
             "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
@@ -779,6 +709,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Dispatcher aliases the full-attn backend's pool refs.
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+        self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
+        self.needs_cpu_seq_lens = (
+            full_attn_backend.needs_cpu_seq_lens
+            or linear_attn_backend.needs_cpu_seq_lens
+        )
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -1003,7 +938,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             last_correct_step_indices,
         )
-        fused_mamba_state_scatter_with_mask(
+        # conv intermediate uses the deduplicated sliding-window (overlapping)
+        # layout, so it needs the strided-read scatter variant.
+        fused_conv_window_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
@@ -1020,7 +957,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_mamba_state_scatter_with_mask(
+            fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,
                 mamba_track_indices,

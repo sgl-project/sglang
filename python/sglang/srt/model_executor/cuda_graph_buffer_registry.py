@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
@@ -162,12 +175,12 @@ class GraphSlot:
     pad_value: Optional[Any] = None
     enabled: bool = True
     copy_from_fb: bool = True
-    post_fill: Optional[
-        Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]
-    ] = None
+    post_fill: Optional[Callable[[torch.Tensor, ForwardBatch, FillContext], None]] = (
+        None
+    )
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
     source_fn: Optional[
-        Callable[["ForwardBatch", "FillContext"], Optional[torch.Tensor]]
+        Callable[[ForwardBatch, FillContext], Optional[torch.Tensor]]
     ] = None
 
     # runtime
@@ -365,7 +378,7 @@ class CudaGraphBufferRegistry:
 
     def fill_from(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         *,
         raw_bs: int,
         padded_bs: int,
@@ -460,22 +473,13 @@ class CudaGraphBufferRegistry:
         *,
         padded_bs: int,
         padded_num_tokens: int,
-        forward_batch_template: "ForwardBatch",
-    ) -> "ForwardBatch":
-        """Return a FB view backed by registry slot buffers.
-
-        ``forward_batch_template`` provides the non-slot fields
-        (``forward_mode`` / ``spec_info`` / ``sampling_info`` /
-        ``capture_hidden_mode`` / ``dp_*`` / ``lora_ids`` / ...). Slot
-        fields are replaced with views into the registry buffers via
-        ``dataclasses.replace`` — the template itself is not mutated.
-
-        NOTE: currently parked / unused. It is NOT a drop-in for the decode
-        replay path's ``build_replay_fb_view``: it returns the *padded*
-        out_cache_loc slot slice (vs the raw ``fb.out_cache_loc`` that path
-        keeps), does not recompute ``seq_lens_sum`` for the padded tail, and
-        does not split ``forward_mode`` vs ``actual_forward_mode``. Reconcile
-        those before wiring it into any replay path.
+        forward_batch_template: ForwardBatch,
+    ) -> ForwardBatch:
+        """Return a FB view (``dataclasses.replace`` of ``forward_batch_template``)
+        whose slot fields are buffer views and whose non-slot fields are carried
+        from the template. A plain copy slot whose FB field is ``None`` this iter
+        is carried (not exposed as a stale buffer); computed slots are always
+        exposed.
         """
         import dataclasses
 
@@ -487,6 +491,14 @@ class CudaGraphBufferRegistry:
             # top-level FB attributes — their data is consumed in place off the
             # adopted backing object, not re-attached to the FB view here.
             if "." in slot.name:
+                continue
+            is_computed = slot.post_fill is not None or not slot.copy_from_fb
+            if (
+                not is_computed
+                and slot.source_fn is None
+                and getattr(forward_batch_template, slot.name, None) is None
+            ):
+                # Absent this iter (fill_from skipped it): carry the template.
                 continue
             replace_kwargs[slot.name] = slot.slice_for(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
@@ -507,19 +519,21 @@ def build_decode_registry(
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
     dp_size: int = 1,
+    register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
-    buffers, with padding policies matching
-    ``DecodeInputBuffers.populate_from_forward_batch``:
+    buffers, with the per-slot padding policy that resets the padded tail on
+    each replay:
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
-      - ``input_ids`` / ``positions`` / ``mrope_positions`` -> FOREACH_COPY
-        (head ``[:raw_n]`` is always overwritten by the copy; the old code's
-        full-buffer ``zero_()`` / ``fill_()`` on ``bs != raw_bs`` is therefore
-        equivalent to the tail-only reset the policies apply here).
+      - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
+        plan reads the padded tail, so leaving stale out-of-range values there
+        triggers an illegal memory access (issue #24361).
+      - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
+        copy and the padded tail is not read.
 
     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
     registered here — they are not per-replay FB copies (allocated and written
@@ -545,7 +559,13 @@ def build_decode_registry(
 
     slots = [
         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
-        GraphSlot("positions", _tokens, torch.int64, axis="tokens"),
+        GraphSlot(
+            "positions",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
         GraphSlot(
             "out_cache_loc",
             _tokens,
@@ -563,7 +583,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             padding_policy=PaddingPolicy.FILL_SENTINEL,
             pad_value=seq_len_fill_value,
@@ -571,7 +591,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens_cpu",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             device=torch.device("cpu"),
             padding_policy=PaddingPolicy.FILL_SENTINEL,
@@ -583,6 +603,7 @@ def build_decode_registry(
             torch.int64,
             axis="tokens",
             slice_fn=lambda buf, n: buf[:, :n],
+            padding_policy=PaddingPolicy.ZERO,
         ),
     ]
     if enable_mamba_track:
@@ -643,28 +664,34 @@ def build_decode_registry(
             )
         )
 
-    def _global_num_tokens_post_fill(buf, fb, ctx):
-        # Filled with the padded token count on the gathered (DP) path; left
-        # untouched otherwise. Not an FB copy (copy_from_fb=False).
-        if require_gathered_buffer:
-            buf.fill_(ctx.padded_num_tokens)
+    # Computed slots, always exposed by extract_buffer; callers that already set
+    # global_num_tokens_* on the batch pass register_global_num_tokens=False.
+    if register_global_num_tokens:
 
-    _global_shape = (
-        (lambda _bs, _mt: (dp_size,))
-        if require_mlp_tp_gather
-        else (lambda _bs, _mt: (1,))
-    )
-    for _global_name in ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu"):
-        slots.append(
-            GraphSlot(
-                _global_name,
-                _global_shape,
-                torch.int32,
-                axis="none",
-                copy_from_fb=False,
-                post_fill=_global_num_tokens_post_fill,
-            )
+        def _global_num_tokens_post_fill(buf, fb, ctx):
+            # Only the gathered (DP) path writes a value; otherwise left as init.
+            if require_gathered_buffer:
+                buf.fill_(ctx.padded_num_tokens)
+
+        _global_shape = (
+            (lambda _bs, _mt: (dp_size,))
+            if require_mlp_tp_gather
+            else (lambda _bs, _mt: (1,))
         )
+        for _global_name in (
+            "global_num_tokens_gpu",
+            "global_num_tokens_for_logprob_gpu",
+        ):
+            slots.append(
+                GraphSlot(
+                    _global_name,
+                    _global_shape,
+                    torch.int32,
+                    axis="none",
+                    copy_from_fb=False,
+                    post_fill=_global_num_tokens_post_fill,
+                )
+            )
 
     for slot in slots:
         bind = None
@@ -760,14 +787,19 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable (prefill) cuda-graph runners.
 
+    ``register_input_embeds`` (default ``True``) registers the multimodal
+    ``input_embeds`` slot; the eager extend path passes ``False`` so it is
+    carried from the batch (a read input) rather than written in-graph.
+
     Padding policies match the inline copy/zero in
-    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
     / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
     padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
     tokens *are* processed by the graph, so they must be benign), then the head
@@ -828,16 +860,17 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        slots.append(
-            GraphSlot(
-                "input_embeds",
-                lambda _bs2, mt: (mt, hidden_size),
-                embed_dtype,
-                axis="tokens",
-                padding_policy=PaddingPolicy.ZERO,
-                copy_from_fb=False,
+        if register_input_embeds:
+            slots.append(
+                GraphSlot(
+                    "input_embeds",
+                    lambda _bs2, mt: (mt, hidden_size),
+                    embed_dtype,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                    copy_from_fb=False,
+                )
             )
-        )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
@@ -854,3 +887,48 @@ def build_prefill_registry(
                 )
         reg.register_slot(slot, bind=bind)
     return reg
+
+
+def build_eager_registry(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool = False,
+    is_encoder_decoder: bool = False,
+    encoder_len_fill_value: int = 0,
+    dp_size: int = 1,
+) -> CudaGraphBufferRegistry:
+    """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
+    decode and eager prefill.
+
+    The decode slot set is a superset of eager prefill's needs (eager prefill
+    carries ``input_embeds`` from the batch and reads the bs-axis fields live),
+    so we reuse it, sized at ``(max_bs, max_num_token)`` where ``max_num_token``
+    is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
+    pads, so the sentinel tail is never read.
+
+    ``share_pool=True`` so same-named / same-size slots coalesce through the
+    process-wide pool. The ``EagerRunner`` is built before the cuda-graph runners
+    (see ``ModelRunner.init_backends``), so its (largest) allocations are
+    canonical and the cg runners' matching slots (prefill's token-axis at
+    ``max_num_token``, decode's bs-axis at ``max_bs``) adopt them.
+    """
+    return build_decode_registry(
+        device=device,
+        max_bs=max_bs,
+        max_num_token=max_num_token,
+        seq_len_fill_value=0,
+        cache_loc_dtype=cache_loc_dtype,
+        enable_mamba_track=enable_mamba_track,
+        is_encoder_decoder=is_encoder_decoder,
+        encoder_len_fill_value=encoder_len_fill_value,
+        enable_num_token_non_padded=False,
+        register_global_num_tokens=False,
+        require_gathered_buffer=False,
+        require_mlp_tp_gather=False,
+        dp_size=dp_size,
+        share_pool=True,
+        source=None,
+    )

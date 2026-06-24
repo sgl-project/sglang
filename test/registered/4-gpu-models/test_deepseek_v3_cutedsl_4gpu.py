@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb200")
+register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
@@ -141,6 +141,17 @@ class TestDummyWithSBO(CustomTestCase):
                 **os.environ,
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
+                # Dummy random weights legitimately produce NaN logits; turn
+                # off the CI crash machinery (async assert, coredump on GPU
+                # exception, crash-time coredump) so NaN is sanitized with a
+                # warning instead of killing the scheduler.
+                "SGLANG_ENABLE_ASYNC_ASSERT": "0",
+                "SGLANG_SANITIZE_NAN_LOGITS": "1",
+                "SGLANG_CUDA_COREDUMP": "0",
+                # Already injected into os.environ by the test process when
+                # SGLANG_CUDA_COREDUMP=1, so it must be overridden explicitly.
+                "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "0",
+                "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
             },
         )
 
