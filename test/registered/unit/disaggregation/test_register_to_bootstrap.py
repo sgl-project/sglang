@@ -165,9 +165,11 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            "cp_kv_layer_split",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
+        self.assertFalse(payload["cp_kv_layer_split"])
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -259,6 +261,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
+        mgr.cp_kv_layer_split = False
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16

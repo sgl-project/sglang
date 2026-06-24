@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.cp_kv_layer_split import is_cp_kv_layer_split_pool
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 
@@ -444,11 +445,19 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        if (
+            self.storage_config.cp_kv_layer_split
+            and self.storage_config.attn_cp_size > 1
+        ):
+            from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+            backup_primary_rank = get_attention_tp_rank()
+        else:
+            backup_primary_rank = self.storage_config.tp_rank
         self.backup_skip = (
             self.storage_config.is_mla_model
             # todo: load balancing
-            and self.storage_config.tp_rank != 0
+            and backup_primary_rank != 0
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -590,6 +599,7 @@ class HiCacheController:
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
+        cp_kv_layer_split = is_cp_kv_layer_split_pool(self.mem_pool_device)
         is_rank_replicated = is_mla_model or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
@@ -621,6 +631,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            cp_kv_layer_split=cp_kv_layer_split,
             extra_config=storage_backend_extra_config,
         )
 

@@ -74,6 +74,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    cp_kv_layer_split: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -93,6 +94,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.cp_kv_layer_split = bool(self.cp_kv_layer_split)
 
 
 @dataclasses.dataclass
@@ -138,8 +140,10 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        self.cp_kv_layer_split = bool(getattr(args, "cp_kv_layer_split", False))
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or self.cp_kv_layer_split
         )
 
         # bind zmq socket
@@ -332,7 +336,7 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            if not self.enable_all_cp_ranks_for_transfer:
+            if not (self.enable_all_cp_ranks_for_transfer or info.cp_kv_layer_split):
                 # Only retrieve from prefill CP rank 0 when not using all ranks
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
@@ -418,6 +422,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "cp_kv_layer_split": self.cp_kv_layer_split,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -651,6 +656,96 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def build_descriptor_matched_transfer_params(
+        self,
+        src_data_ptrs,
+        dst_data_ptrs,
+        item_lens,
+        src_data_layout,
+        dst_data_layout,
+        dst_item_lens=None,
+    ) -> Optional[List[Tuple[int, int, int]]]:
+        """Build transfer params by descriptor instead of positional index.
+
+        DeepSeek V4 CP KV LayerSplit is the first user: prefill CP ranks can
+        store only a subset of layers while decode stores the full layer set.
+        The descriptor matching itself is model-agnostic and keeps source
+        buffers aligned with their real decode destination buffers.
+        """
+        if not src_data_layout or not dst_data_layout:
+            if self.cp_kv_layer_split and (src_data_layout or dst_data_layout):
+                raise RuntimeError(
+                    "CP KV LayerSplit transfer requires descriptors on both "
+                    f"source and destination, got src={len(src_data_layout or [])}, "
+                    f"dst={len(dst_data_layout or [])}"
+                )
+            return None
+
+        dst_item_lens = dst_item_lens or []
+        if self.cp_kv_layer_split and not dst_item_lens:
+            raise RuntimeError(
+                "CP KV LayerSplit descriptor transfer requires destination item sizes"
+            )
+
+        if (
+            len(src_data_layout) != len(src_data_ptrs)
+            or len(src_data_layout) != len(item_lens)
+            or len(dst_data_layout) != len(dst_data_ptrs)
+            or (dst_item_lens and len(dst_data_layout) != len(dst_item_lens))
+        ):
+            if self.cp_kv_layer_split:
+                raise RuntimeError(
+                    "CP KV LayerSplit transfer descriptor length mismatch: "
+                    f"src_layout={len(src_data_layout)}, "
+                    f"src_ptrs={len(src_data_ptrs)}, item_lens={len(item_lens)}, "
+                    f"dst_layout={len(dst_data_layout)}, dst_ptrs={len(dst_data_ptrs)}, "
+                    f"dst_item_lens={len(dst_item_lens)}"
+                )
+            return None
+
+        dst_by_key = {}
+        if not dst_item_lens:
+            dst_item_lens = [None] * len(dst_data_layout)
+        for key, ptr, dst_item_len in zip(
+            dst_data_layout, dst_data_ptrs, dst_item_lens
+        ):
+            if key is None:
+                continue
+            key = tuple(key)
+            if key in dst_by_key:
+                raise RuntimeError(f"duplicate destination transfer descriptor {key!r}")
+            dst_by_key[key] = (ptr, dst_item_len)
+
+        layers_params = []
+        missing = []
+        seen_src = set()
+        for key, src_ptr, item_len in zip(src_data_layout, src_data_ptrs, item_lens):
+            if key is None:
+                continue
+            key = tuple(key)
+            if key in seen_src:
+                raise RuntimeError(f"duplicate source transfer descriptor {key!r}")
+            seen_src.add(key)
+            dst_match = dst_by_key.get(key)
+            if dst_match is None:
+                missing.append(key)
+                continue
+            dst_ptr, dst_item_len = dst_match
+            if dst_item_len is not None and int(item_len) != int(dst_item_len):
+                raise RuntimeError(
+                    "transfer descriptor item size mismatch for "
+                    f"{key!r}: source={int(item_len)}, destination={int(dst_item_len)}"
+                )
+            layers_params.append((int(src_ptr), int(dst_ptr), int(item_len)))
+
+        if missing:
+            raise RuntimeError(
+                "destination is missing transfer descriptors required by source: "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''}"
+            )
+
+        return layers_params
+
     def _start_heartbeat_checker_thread(self):
         """Start the heartbeat checker thread for Decode worker."""
 
@@ -862,7 +957,10 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not self.kv_mgr.cp_kv_layer_split
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
@@ -1214,6 +1312,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.cp_kv_layer_split: bool = False
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1280,6 +1379,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        cp_kv_layer_split = bool(data.get("cp_kv_layer_split", False))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1304,6 +1404,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "load_balance_method", "follow_bootstrap_room"
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+
+        self.cp_kv_layer_split = self.cp_kv_layer_split or cp_kv_layer_split
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -1368,6 +1470,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                cp_kv_layer_split=self.cp_kv_layer_split,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

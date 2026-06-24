@@ -37,6 +37,9 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    # Optional per-tensor descriptors used when source/destination buffer
+    # lists are not positional matches, e.g. DeepSeek V4 CP KV LayerSplit.
+    kv_data_layout: List[tuple]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -44,6 +47,7 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_data_layouts: List[List[tuple]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
     ib_device: str

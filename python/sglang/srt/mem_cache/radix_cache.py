@@ -127,7 +127,7 @@ class RadixKey:
         return RadixKey(self.token_ids[start:stop], self.extra_key)
 
     def __repr__(self) -> str:
-        preview = self.token_ids[:10]
+        preview = self.token_ids[:10].tolist()
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
     def page_aligned(self, page_size: int) -> RadixKey:

@@ -12,6 +12,12 @@ from sglang.jit_kernel.dsv4 import (
 )
 from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
+    cp_kv_layer_split_pre_compressor_skip,
+    is_cp_kv_layer_split_deepseek_v4_pool,
+    maybe_sync_cp_kv_extra_for_read,
+    maybe_sync_cp_kv_indexer_for_read,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -484,74 +490,93 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
-        state_pool = compressor.get_state_pool(self)
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
-        if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
-            self._forward_unified_hip(
-                token_to_kv_pool=token_to_kv_pool,
-                kv_score_input=kv_score_input,
-                state_pool=state_pool,
-                compressor=compressor,
-                layer_id=layer_id,
-            )
-        else:
-            out_loc = self._get_out_loc(compressor.ratio)
-            use_fp4_indexer = (
-                compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
-            )
-            bf16_store = False
-            if compressor.is_in_indexer:
-                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-                page_size = token_to_kv_pool.get_index_k_page_size()
-            elif is_unified_kv_triton():
-                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
-                page_size = 1
-                out_loc = getattr(
-                    self.forward_metadata.core_metadata.unified,
-                    f"c{compressor.ratio}_out_loc",
+        is_cp_kv_layer_split = is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool)
+        skip_non_owner_write = cp_kv_layer_split_pre_compressor_skip(
+            token_to_kv_pool,
+            layer_id,
+            forward_batch,
+            is_indexer=compressor.is_in_indexer,
+        )
+
+        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        if not skip_non_owner_write:
+            state_pool = compressor.get_state_pool(self)
+            if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
+                self._forward_unified_hip(
+                    token_to_kv_pool=token_to_kv_pool,
+                    kv_score_input=kv_score_input,
+                    state_pool=state_pool,
+                    compressor=compressor,
+                    layer_id=layer_id,
                 )
-                bf16_store = True
             else:
-                _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
-                assert compress_kv_pool is not None
-                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
-                if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                    out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
-                        out_loc
-                    )
-            self._forward_compress_all_in_one(
-                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                kv_score_input=kv_score_input,
-                ape=compressor.ape,
-                head_dim=compressor.head_dim,
-                norm=compressor.norm,
-                freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8),
-                is_indexer=compressor.is_in_indexer,
-                rotate=compressor.rotate,
-                compress_ratio=compressor.ratio,
-                page_size=page_size,
-                out_loc=out_loc,
-                use_fp4_indexer=use_fp4_indexer,
-                bf16_store=bf16_store,
-            )
-        online_c128_mtp = getattr(self, "online_c128_mtp", None)
-        if online_c128_mtp is not None:
-            online_c128_mtp.write_prefix_states(
-                layer_id=layer_id,
-                compressor=compressor,
-                kv_score_input=kv_score_input,
-                logical_forward_mode=getattr(
-                    forward_batch, "_original_forward_mode", None
+                out_loc = self._get_out_loc(compressor.ratio)
+                use_fp4_indexer = (
+                    compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
                 )
-                or forward_batch.forward_mode,
-            )
+                bf16_store = False
+                if compressor.is_in_indexer:
+                    kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
+                    page_size = token_to_kv_pool.get_index_k_page_size()
+                elif is_unified_kv_triton():
+                    kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
+                    page_size = 1
+                    out_loc = getattr(
+                        self.forward_metadata.core_metadata.unified,
+                        f"c{compressor.ratio}_out_loc",
+                    )
+                    bf16_store = True
+                else:
+                    _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+                    assert compress_kv_pool is not None
+                    kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                    if is_cp_kv_layer_split:
+                        page_size = compress_kv_pool.page_size
+                    else:
+                        page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                    if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
+                        # The v2 compressor writes directly into the raw C4 KV tensor.
+                        # HiSparse C4 therefore needs the physical C4 location here.
+                        # The compress kernel requires an int32 write location.
+                        out_loc = compress_kv_pool.translate_loc_to_hisparse_device(
+                            out_loc
+                        ).to(torch.int32)
+                self._forward_compress_all_in_one(
+                    kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                    kv_score_input=kv_score_input,
+                    ape=compressor.ape,
+                    head_dim=compressor.head_dim,
+                    norm=compressor.norm,
+                    freqs_cis_cache=compressor.freqs_cis,
+                    kv_cache=kv_cache.view(dtype=torch.uint8),
+                    is_indexer=compressor.is_in_indexer,
+                    rotate=compressor.rotate,
+                    compress_ratio=compressor.ratio,
+                    page_size=page_size,
+                    out_loc=out_loc,
+                    use_fp4_indexer=use_fp4_indexer,
+                    bf16_store=bf16_store,
+                )
+            online_c128_mtp = getattr(self, "online_c128_mtp", None)
+            if online_c128_mtp is not None:
+                online_c128_mtp.write_prefix_states(
+                    layer_id=layer_id,
+                    compressor=compressor,
+                    kv_score_input=kv_score_input,
+                    logical_forward_mode=getattr(
+                        forward_batch, "_original_forward_mode", None
+                    )
+                    or forward_batch.forward_mode,
+                )
+        if compressor.is_in_indexer:
+            maybe_sync_cp_kv_indexer_for_read(token_to_kv_pool, layer_id, forward_batch)
+        else:
+            maybe_sync_cp_kv_extra_for_read(token_to_kv_pool, layer_id, forward_batch)
 
     def _forward_unified_hip(
         self,

@@ -550,18 +550,26 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
+        indexer_page_table = page_table
+        if hasattr(token_to_kv_pool, "remap_indexer_page_table_for_read"):
+            indexer_page_table = token_to_kv_pool.remap_indexer_page_table_for_read(
+                c4_indexer.layer_id, indexer_page_table
+            )
+        else:
+            # Pre-LayerSplit invariant: backend builds indexer page table from
+            # the same source as core_attn_metadata.page_table.
+            assert indexer_metadata.page_table is core_metadata.page_table
         logits = fn(
             q,
             c4_indexer_kv_cache,
             weights,
             _c4sl,
-            page_table,
+            indexer_page_table,
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,
             False,
         )
 
-        assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
 

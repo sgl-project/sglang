@@ -330,14 +330,19 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def broadcast(self, tensor: torch.Tensor, src: int):
+    def broadcast(
+        self,
+        tensor: torch.Tensor,
+        src: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
         if self.disabled:
             return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        stream = self._resolve_stream()
+        stream = stream or self._resolve_stream()
 
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())

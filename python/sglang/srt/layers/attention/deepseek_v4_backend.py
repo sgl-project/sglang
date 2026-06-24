@@ -37,6 +37,7 @@ else:
     )
 
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
@@ -55,6 +56,17 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+)
+from sglang.srt.mem_cache.cp_kv_layer_split import (
+    maybe_reset_cp_kv_layer_split_active_pages,
+)
+from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
+    cp_kv_layer_split_resolve_store_swa_loc,
+    is_cp_kv_layer_split_deepseek_v4_pool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1092,6 +1104,7 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
+        maybe_reset_cp_kv_layer_split_active_pages(self.token_to_kv_pool)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -1291,7 +1304,19 @@ class DeepseekV4AttnBackend(
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        pool = self.token_to_kv_pool
+        if is_cp_kv_layer_split_deepseek_v4_pool(pool):
+            swa_loc = cp_kv_layer_split_resolve_store_swa_loc(
+                pool,
+                layer_id,
+                forward_batch,
+                forward_batch.out_cache_loc,
+                swa_k.shape[0],
+            )
+            if swa_loc is None:
+                return
+        else:
+            swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
@@ -1329,6 +1354,12 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        is_cp_kv_layer_split = is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool)
+        use_cp_kv_layer_split_prefill = is_cp_kv_layer_split and dsa_use_prefill_cp(
+            forward_batch
+        )
+        if is_cp_kv_layer_split and not use_cp_kv_layer_split_prefill:
+            token_to_kv_pool.clear_staging_remap_for_read()
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
@@ -1367,6 +1398,14 @@ class DeepseekV4AttnBackend(
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+            if use_cp_kv_layer_split_prefill:
+                swa_page_indices = token_to_kv_pool.remap_swa_indices_for_read(
+                    layer_id, swa_page_indices
+                )
+                if extra_indices is not None:
+                    extra_indices = token_to_kv_pool.remap_extra_indices_for_read(
+                        layer_id, extra_indices
+                    )
 
             def match_num_queries(x, value):
                 if x is None or x.shape[0] == q.shape[0]:

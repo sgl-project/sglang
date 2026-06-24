@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.dsv4 import (
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_layout import (
+    CpKvLayerSplitDeepSeekV4PoolLayout,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
@@ -25,6 +28,13 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+DSV4_TRANSFER_C4_KV = "dsv4_c4_kv"
+DSV4_TRANSFER_C4_INDEXER_KV = "dsv4_c4_indexer_kv"
+DSV4_TRANSFER_C128_KV = "dsv4_c128_kv"
+DSV4_TRANSFER_SWA_KV = "dsv4_swa_kv"
+DSV4_TRANSFER_ATTENTION_STATE = "dsv4_attention_state"
+DSV4_TRANSFER_INDEXER_STATE = "dsv4_indexer_state"
 
 
 def get_compress_state_ring_size(
@@ -371,7 +381,7 @@ class DeepSeekV4IndexerPool(KVCache):
 
 class DeepSeekV4LayerItem(NamedTuple):
     compress_ratio: Literal[0, 4, 128]
-    compress_layer_id: int
+    compress_layer_id: Optional[int] = None
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
@@ -463,6 +473,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        cp_kv_layer_split_layout: Optional[CpKvLayerSplitDeepSeekV4PoolLayout] = None,
     ):
         super().__init__(
             swa_size,
@@ -530,8 +541,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
-        c4_layer_num = sum(1 for r in stage_ratios if r == 4)
-        c128_layer_num = sum(1 for r in stage_ratios if r == 128)
+        if cp_kv_layer_split_layout is not None:
+            swa_buffers = cp_kv_layer_split_layout.swa_layer_num
+            c4_layer_num = cp_kv_layer_split_layout.c4_layer_num
+            c128_layer_num = cp_kv_layer_split_layout.c128_layer_num
+            c4_indexer_layer_num = cp_kv_layer_split_layout.c4_indexer_layer_num
+        else:
+            swa_buffers = layer_num
+            c4_layer_num = sum(1 for r in stage_ratios if r == 4)
+            c128_layer_num = sum(1 for r in stage_ratios if r == 128)
+            c4_indexer_layer_num = c4_layer_num
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
@@ -572,7 +591,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 size=swa_size,
                 page_size=swa_page_size,
                 dtype=dtype,
-                layer_num=layer_num,
+                layer_num=swa_buffers,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
@@ -612,7 +631,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_page_size,
             dtype,
             indexer_head_dim,
-            c4_layer_num,
+            c4_indexer_layer_num,
             device,
             enable_memory_saver,
         )
@@ -831,6 +850,56 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             ratio=ratio,
             swa_page_size=self.swa_page_size,
         )
+
+    def get_kv_transfer_layout(self) -> List[Tuple[str, int]]:
+        """Descriptors parallel to ``get_contiguous_buf_infos`` for PD transfer."""
+        if self._unified_kv:
+            return []
+
+        layout: List[Tuple[str, int]] = []
+        stage_layers = range(self._stage_start, self._stage_end)
+
+        layout.extend(
+            (DSV4_TRANSFER_C4_KV, layer_id)
+            for layer_id in stage_layers
+            if self.compression_ratios[layer_id] == 4
+        )
+        layout.extend(
+            (DSV4_TRANSFER_C4_INDEXER_KV, layer_id)
+            for layer_id in stage_layers
+            if self.compression_ratios[layer_id] == 4
+        )
+        layout.extend(
+            (DSV4_TRANSFER_C128_KV, layer_id)
+            for layer_id in stage_layers
+            if self.compression_ratios[layer_id] == 128
+        )
+        return layout
+
+    def get_state_transfer_layout(self) -> List[Tuple[str, int]]:
+        """Descriptors parallel to ``get_state_buf_infos`` for PD transfer."""
+        if self._unified_kv:
+            return []
+
+        layout: List[Tuple[str, int]] = []
+        swa_layer_num = len(self.swa_kv_pool.kv_buffer)
+        swa_end = min(self._stage_end, self._stage_start + swa_layer_num)
+
+        layout.extend(
+            (DSV4_TRANSFER_SWA_KV, layer_id)
+            for layer_id in range(self._stage_start, swa_end)
+        )
+        layout.extend(
+            (DSV4_TRANSFER_ATTENTION_STATE, layer_id)
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] != 0
+        )
+        layout.extend(
+            (DSV4_TRANSFER_INDEXER_STATE, layer_id)
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] == 4
+        )
+        return layout
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size
