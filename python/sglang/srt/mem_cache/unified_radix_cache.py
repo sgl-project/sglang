@@ -16,10 +16,12 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    FinishResult,
     IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
@@ -701,34 +703,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int, **kwargs
-    ) -> None:
-        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
+        req = params.req
+        if self.session.try_cache_finished_req(req, is_insert=params.is_insert):
+            return None
+
+        kv_committed_len = params.kv_committed_len
+        prev_prefix_len = params.prev_prefix_len
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
+            kv_indices = params.kv_indices[:kv_committed_len]
             self.token_to_kv_pool_allocator.free(kv_indices)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
-            return
+            return None
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
+        token_ids = params.token_ids
+        kv_indices = params.kv_indices[:kv_committed_len]
 
         result = None
         insert_params = None
 
-        if is_insert:
+        if params.is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
+                prev_prefix_len=prev_prefix_len,
+                priority=params.priority,
             )
+            insert_params.swa_evicted_seqlen = params.swa_evicted_seqlen
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -744,13 +745,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Truncate if needed
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache.cache_protected_len)
+                free_start = max(effective_cache_len, prev_prefix_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
             radix_key = RadixKey(
-                token_ids, req.extra_key, is_bigram=self.is_eagle
+                token_ids, params.extra_key, is_bigram=self.is_eagle
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -762,14 +763,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache.cache_protected_len :]
-            )
+            self.token_to_kv_pool_allocator.free(kv_indices[prev_prefix_len:])
 
+        assert (
+            params.last_node is not None
+        ), "cache_finished_req expects the req to still hold its cache lock"
         self.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
-            skip_swa=req.cache.swa_prefix_lock_released,
+            params.last_node,
+            DecLockRefParams(swa_uuid_for_lock=params.swa_uuid_for_lock),
+            skip_swa=params.swa_prefix_lock_released,
         )
 
         # cleanup
@@ -777,6 +779,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        return None
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):

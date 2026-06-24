@@ -35,10 +35,40 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+
+def _finish(cache, req, is_insert=True):
+    kv_committed_len = req.kv_committed_len
+    owned_start = req.cache.cache_protected_len
+    kv_indices = cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, :kv_committed_len
+    ]
+    result = cache.cache_finished_req(
+        CacheFinishParams(
+            token_ids=(req.origin_input_ids + req.output_ids)[:kv_committed_len],
+            extra_key=req.extra_key,
+            kv_indices=kv_indices,
+            kv_committed_len=kv_committed_len,
+            prev_prefix_len=owned_start,
+            prefix_indices_len=len(req.prefix_indices),
+            priority=getattr(req, "priority", 0) or 0,
+            is_insert=is_insert,
+            last_node=req.cache.last_node,
+            req=req,
+        )
+    )
+    if result is not None:
+        if result.prefix_len is not None:
+            cache.token_to_kv_pool_allocator.free(
+                kv_indices[owned_start : result.prefix_len]
+            )
+        if result.key_len is not None:
+            cache.token_to_kv_pool_allocator.free(kv_indices[result.key_len :])
 
 
 def _make_cache_with_pools(page_size=1):
@@ -153,7 +183,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req)
+        _finish(cache, req)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -202,7 +232,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req)
+        _finish(cache, req)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -245,7 +275,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # Transfer fails -> cache_finished_req with is_insert=False
         # This frees delta tokens and dec_lock_ref on last_node
-        cache.cache_finished_req(req, is_insert=False)
+        _finish(cache, req, is_insert=False)
 
         # The prefix node should be unlocked (back to evictable)
         self.assertEqual(cache.root_node.lock_ref, 1)
@@ -290,7 +320,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
-        cache.cache_finished_req(req, is_insert=False)
+        _finish(cache, req, is_insert=False)
 
         # Root lock unchanged, nothing protected or evictable
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -397,7 +427,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req)
+            _finish(cache, req)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

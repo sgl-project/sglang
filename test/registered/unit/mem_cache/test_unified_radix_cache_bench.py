@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import harvest_and_finish_req
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -241,7 +242,7 @@ def create_bench_cache(
     _rid = [0]
 
     def make_req():
-        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
@@ -252,6 +253,11 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        req.cache.cache_protected_len = 0
+        req.cache.last_node = None
+        req.cache.swa_uuid_for_lock = None
+        req.cache.swa_prefix_lock_released = False
         return req
 
     return tree, allocator, req_to_token_pool, make_req
@@ -656,7 +662,7 @@ def bench_cache_finished(
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(req, is_insert=True),
+        lambda req: harvest_and_finish_req(req, env.tree, is_insert=True),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,

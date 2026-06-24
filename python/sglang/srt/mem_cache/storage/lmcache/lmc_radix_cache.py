@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishParams,
     EvictParams,
     EvictResult,
+    FinishResult,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -428,19 +430,17 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
-    ) -> None:
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(
-            req, is_insert=is_insert, kv_committed_len=kv_committed_len
-        )
-        if not is_insert:
+        finish_result = super().cache_finished_req(params)
+        req = params.req
+        rid = params.rid
+        if not params.is_insert:
             if self._mode is LMCacheMode.MP:
-                self._mp_load_back_markers.pop(req.rid, None)
-                self.lmcache_connector.end_session(req.rid)
-            return
+                self._mp_load_back_markers.pop(rid, None)
+                self.lmcache_connector.end_session(rid)
+            return finish_result
 
         global_server_args = get_global_server_args()
         topk = global_server_args.speculative_eagle_topk
@@ -459,7 +459,7 @@ class LMCRadixCache(RadixCache):
 
         # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.
         match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(key=RadixKey(token_ids, params.extra_key))
         )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None
@@ -470,19 +470,20 @@ class LMCRadixCache(RadixCache):
             token_ids=token_ids,
             kv_indices=kv_indices,
             offset=0,
-            request_id=req.rid,
+            request_id=rid,
         )
         with torch.cuda.stream(self.store_stream):
             self.lmcache_connector.store_kv(store_md)
         if self._mode is LMCacheMode.MP:
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
-            self._mp_load_back_markers.pop(req.rid, None)
+            self._mp_load_back_markers.pop(rid, None)
             self.dec_lock_ref(new_last_node)
-            self.lmcache_connector.end_session(req.rid)
+            self.lmcache_connector.end_session(rid)
         elif self._mode is LMCacheMode.IP:
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
+        return finish_result
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""

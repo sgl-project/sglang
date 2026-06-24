@@ -36,10 +36,12 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    FinishResult,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -439,57 +441,45 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
-    ):
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
         """Cache request when it finishes."""
+        is_insert = params.is_insert
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
+            kv_indices = params.kv_indices[: params.kv_committed_len]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return None
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        token_ids = params.token_ids
+        kv_indices = params.kv_indices[: len(token_ids)]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids, params.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(key=radix_key, value=values, priority=params.priority)
             )
             session_leaf = result.last_device_node
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache.cache_protected_len : result.prefix_len]
-            )
+            prefix_len = result.prefix_len
         else:
             session_leaf = None
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache.cache_protected_len : key_len]
-            )
+            prefix_len = key_len
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
-        self._tag_session_leaf(req, radix_key, node=session_leaf)
+        self._tag_session_leaf(params.req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
-        if req.cache.last_node is not None:
-            self.dec_lock_ref(req.cache.last_node)
+        if params.last_node is not None:
+            self.dec_lock_ref(params.last_node)
+
+        return FinishResult(prefix_len=prefix_len, key_len=key_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

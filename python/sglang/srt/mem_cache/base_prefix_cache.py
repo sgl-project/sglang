@@ -70,6 +70,34 @@ class InsertParams:
 
 
 @dataclasses.dataclass
+class CacheFinishParams:
+    token_ids: Optional[Any] = None
+    extra_key: Optional[Any] = None
+    kv_indices: Optional[torch.Tensor] = None
+    kv_committed_len: int = 0
+
+    prev_prefix_len: int = 0
+    prefix_indices_len: int = 0
+    swa_evicted_seqlen: int = 0
+    priority: int = 0
+    is_insert: bool = True
+
+    last_node: Any = None
+    swa_uuid_for_lock: Optional[int] = None
+    swa_prefix_lock_released: bool = False
+
+    rid: Optional[str] = None
+
+    req: Optional[Req] = None
+
+
+@dataclasses.dataclass
+class FinishResult:
+    prefix_len: Optional[int] = None
+    key_len: Optional[int] = None
+
+
+@dataclasses.dataclass
 class InsertResult:
     """Result of an insert operation"""
 
@@ -248,7 +276,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
         pass
 
     @abstractmethod

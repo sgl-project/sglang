@@ -200,15 +200,15 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_committed_len: int)`
+### `cache_finished_req(params: CacheFinishParams) -> Optional[FinishResult]`
 
 Cache a completed request's KV data into the tree.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_committed_len` — committed KV length supplied by the caller |
-| **Output** | `None` |
+| **Inputs** | `params` — a `CacheFinishParams` the orchestrator harvested off the `Req` (token_ids, kv_indices tensor, prev_prefix_len, kv_committed_len, swa_evicted_seqlen, priority, is_insert, last_node, swa_uuid_for_lock); `params.req` carries the residual `Req` only for the mamba slot harvest (opid9 follow-up) |
+| **Output** | `None` (unified frees its dup/tail internally); plain `RadixCache` returns `FinishResult(prefix_len, key_len)` so the orchestrator owns the dup/tail frees |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
