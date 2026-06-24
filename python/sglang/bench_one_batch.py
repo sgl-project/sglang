@@ -15,7 +15,7 @@ warnings.warn(
     "release; use `sglang.benchmark.one_batch` instead "
     "(e.g. `python -m sglang.benchmark.one_batch`).",
     DeprecationWarning,
-    stacklevel=2,
+    stacklevel=1,
 )
 
 if __name__ == "__main__":
