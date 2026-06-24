@@ -9,14 +9,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
-from sglang.srt.mem_cache.kv_cache_utils import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
-    write_cache_indices,
-)
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.kv_cache_utils import write_cache_indices
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -189,25 +183,11 @@ def alloc_paged_token_slots_extend(
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
-    tree_cache: BasePrefixCache | None,
+    reserve_req_state_slots: Callable[[int], None],
 ) -> list[int]:
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+    reserve_req_state_slots(num_reqs)
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
@@ -224,6 +204,7 @@ def alloc_for_extend(
     batch: ScheduleBatch,
     *,
     space: FreeSpaceProvider,
+    reserve_req_state_slots: Callable[[int], None],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -246,7 +227,7 @@ def alloc_for_extend(
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool, batch.reqs, reserve_req_state_slots
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)

@@ -2050,6 +2050,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self,
             space=CacheFreeSpaceProvider(self.tree_cache),
+            reserve_req_state_slots=lambda num_reqs: self.req_to_token_pool.reserve_mamba_slots(
+                num_reqs, self.tree_cache
+            ),
         )
 
         # Set fields

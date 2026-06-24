@@ -73,6 +73,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
 logger = logging.getLogger(__name__)
@@ -287,6 +288,11 @@ class ReqToTokenPool:
                 r.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.req_pool_idx for r in reqs]
+
+    def reserve_mamba_slots(
+        self, num_reqs: int, tree_cache: Optional["BasePrefixCache"]
+    ) -> None:
+        pass
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
@@ -746,6 +752,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def reserve_mamba_slots(
+        self, num_reqs: int, tree_cache: Optional["BasePrefixCache"]
+    ) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.kv_cache_utils import (
+            MAMBA_STATE_PER_REQ_NO_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+        )
+
+        mamba_available_size = self.mamba_allocator.available_size()
+        if tree_cache.supports_mamba():
+            factor = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if self.enable_mamba_extra_buffer_lazy
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+        else:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and tree_cache.supports_mamba():
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
