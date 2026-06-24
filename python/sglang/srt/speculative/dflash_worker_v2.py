@@ -177,6 +177,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # If the target stores KV in a quantized dtype (e.g. fp8), the bf16 draft
+        # cannot share it (q/k dtype mismatch); give the draft its own bf16 KV pool.
+        _quantized_kv_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2) + (
+            (torch.float4_e2m1fn_x2,) if hasattr(torch, "float4_e2m1fn_x2") else ()
+        )
+        self._decouple_draft_kv_pool = (
+            getattr(target_worker.model_runner, "kv_cache_dtype", None)
+            in _quantized_kv_dtypes
+        )
+        if self._decouple_draft_kv_pool:
+            draft_server_args.kv_cache_dtype = "bf16"
+            logger.info(
+                "DFLASH: target KV dtype %s is incompatible with the bf16 draft; "
+                "giving the draft its own bf16 KV pool.",
+                target_worker.model_runner.kv_cache_dtype,
+            )
         saved_server_args = get_global_server_args()
         self._draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -318,6 +334,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        # Decoupled (quantized-KV target): None -> draft builds its own bf16 pool.
+        if getattr(self, "_decouple_draft_kv_pool", False):
+            token_to_kv_pool_allocator = None
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -1130,7 +1149,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
         """
-        attn_backend = self.target_worker.model_runner.attn_backend
+        model_runner = self.target_worker.model_runner
+        # Pure-MLA targets have no Mamba state; HybridAttnBackend exposes the
+        # method but delegates to an inner MLA backend that lacks it (hasattr is
+        # insufficient), so gate on mambaish_config.
+        if model_runner.mambaish_config is None:
+            return
+        attn_backend = model_runner.attn_backend
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
@@ -1561,9 +1586,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
+        # hasattr is insufficient (HybridAttnBackend delegates to an inner MLA
+        # backend lacking the method); require the target to actually have Mamba state.
+        need_mamba_verify_commit = (
+            self.target_worker.model_runner.mambaish_config is not None
+            and hasattr(
+                self.target_worker.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
         )
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
