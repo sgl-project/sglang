@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    maybe_evict_dsv4_state_on_swa,
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
@@ -26,7 +25,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
@@ -34,27 +33,23 @@ logger = logging.getLogger(__name__)
 
 
 def free_swa_out_of_window_slots(
-    req: Req,
-    pre_len: int,
     *,
+    req_pool_idx: int,
+    kv: ReqKvInfo,
+    owned_start: int,
+    pre_len: int,
     sliding_window_size: int,
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    on_swa_evicted: Callable[[int], None],
     drop_page_margin: bool = False,
 ) -> None:
     from sglang.srt.environ import envs
 
-    if req.kv is None:
-        return
-
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.cache.cache_protected_len
-    )
+    assert owned_start % page_size == 0, "cache_protected_len must be page aligned"
+    kv.swa_evicted_seqlen = max(kv.swa_evicted_seqlen, owned_start)
 
     # Subtract an extra page_size so the eviction frontier never reaches the
     # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
@@ -67,22 +62,20 @@ def free_swa_out_of_window_slots(
     else:
         evict_threshold = pre_len - sliding_window_size - page_size
     new_swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen,
+        kv.swa_evicted_seqlen,
         evict_threshold,
     )
 
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+    if new_swa_evicted_seqlen > kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req_pool_idx, kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
-        maybe_evict_dsv4_state_on_swa(
-            token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
-        )
-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+        on_swa_evicted(new_swa_evicted_seqlen)
+        kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def alloc_token_slots(

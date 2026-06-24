@@ -70,6 +70,7 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
+    maybe_evict_dsv4_state_on_swa,
 )
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -2918,13 +2919,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        if req.kv is None:
+            return
         free_swa_out_of_window_slots(
-            req,
-            pre_len,
+            req_pool_idx=req.req_pool_idx,
+            kv=req.kv,
+            owned_start=req.cache.cache_protected_len,
+            pre_len=pre_len,
             sliding_window_size=self.tree_cache.sliding_window_size,
             page_size=self.tree_cache.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            on_swa_evicted=lambda watermark: maybe_evict_dsv4_state_on_swa(
+                self.token_to_kv_pool_allocator,
+                self.req_to_token_pool,
+                req,
+                watermark,
+            ),
             drop_page_margin=self.tree_cache.is_chunk_cache(),
         )
 

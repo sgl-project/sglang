@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_evict_dsv4_state_on_swa,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
@@ -34,14 +37,24 @@ def evict_swa_out_of_window_for_unfinished(
     pre_len = tree_cache.unfinished_swa_evict_pre_len(req, chunked=chunked)
     if pre_len is None:
         return None
+    if req.kv is None:
+        return None
 
     free_swa_out_of_window_slots(
-        req,
-        pre_len,
+        req_pool_idx=req.req_pool_idx,
+        kv=req.kv,
+        owned_start=req.cache.cache_protected_len,
+        pre_len=pre_len,
         sliding_window_size=tree_cache.sliding_window_size,
         page_size=tree_cache.page_size,
         req_to_token_pool=tree_cache.req_to_token_pool,
         token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
+        on_swa_evicted=lambda watermark: maybe_evict_dsv4_state_on_swa(
+            tree_cache.token_to_kv_pool_allocator,
+            tree_cache.req_to_token_pool,
+            req,
+            watermark,
+        ),
     )
     return req.kv.swa_evicted_seqlen
 
