@@ -212,8 +212,21 @@ echo "--- bench.log tail ---"; tail -40 "$WORKDIR/bench.log" || true
 
 # ---------------------------------------------------------------------------
 # Normalize raw bench_serving output -> process_result.py schema.
-# bench_serving emits total_throughput / median_e2e_latency_ms and no model_id;
-# process_result.py expects total_token_throughput / median_e2el_ms / model_id.
+#
+# bench_serving and process_result.py disagree on field names, so we remap the
+# last JSON line of each raw file. If bench_serving ever renames an output
+# field, the KeyError raised here (rather than a silently wrong table) is the
+# signal to update this mapping. Field-by-field:
+#
+#   bench_serving key          ->  process_result.py key       (purpose)
+#   --------------------------     ------------------------     -------------------------
+#   max_concurrency            ->  max_concurrency             (sweep point; falls back to $C)
+#   total_throughput           ->  total_token_throughput      (in+out tok/s, tput_per_gpu)
+#   output_throughput          ->  output_throughput           (out tok/s, output_tput_per_gpu)
+#   median_ttft_ms             ->  median_ttft_ms              (TTFT; /1000 -> s)
+#   median_tpot_ms             ->  median_tpot_ms              (TPOT; -> interactivity)
+#   median_e2e_latency_ms      ->  median_e2el_ms              (E2E latency; /1000 -> s)
+#   (none; injected here)      ->  model_id                    (served model, from $MODEL_PATH)
 # ---------------------------------------------------------------------------
 TOTAL_GPUS=$((PTP + DTP))
 PROCESSED=0
