@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     NPUFinalizeRouting,
+    FinalizeRoutingWrapper,                # <-- new import
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
     NPUMoEInitRouting_v2,
@@ -24,14 +25,10 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.distributed.communication_op import (
-    tensor_model_parallel_all_gather,
-)
+# (no need to import tensor_model_parallel_all_gather here)
 
 
 class TorchNpuDispatchOutput(NamedTuple):
-    """Dispatch output specific to the TorchNpu dispatcher."""
-
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_weights: torch.Tensor
@@ -46,8 +43,6 @@ class TorchNpuDispatchOutput(NamedTuple):
 
 
 class TorchNpuCombineInput(NamedTuple):
-    """Combine input specific to the TorchNpu dispatcher."""
-
     hidden_states: torch.Tensor
 
     @property
@@ -56,14 +51,6 @@ class TorchNpuCombineInput(NamedTuple):
 
 
 class TorchNpuDispatcher(BaseDispatcher):
-    """
-    NPU MoE dispatcher that selects init / finalize routing kernels
-    depending on the inference phase (prefill vs decode).
-
-    Optimized: prefill & decode kernels are identical for the given quantisation
-    configuration, so we create only one pair and avoid the per‑call stream check.
-    """
-
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
@@ -71,28 +58,30 @@ class TorchNpuDispatcher(BaseDispatcher):
         self._dispatch_output: Optional[TorchNpuDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
-        self.set_ascend_dispatcher_output_dtype()
+        # Keep TP size for later use when wrapping the finalizer
         self.tp_size = get_tensor_model_parallel_world_size()
+
+        # Initialise routing kernels with default (no quant config yet)
+        self.set_ascend_dispatcher_output_dtype()
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+        self.set_ascend_dispatcher_output_dtype()
+
+        # If the quantisation is GGUF and TP is active, wrap the finalizer
+        # with an all‑gather so that the dispatcher stays completely clean.
         is_gguf = (
             self.quant_config
             and hasattr(self.quant_config, "get_name")
             and self.quant_config.get_name() == "gguf"
         )
         if is_gguf and self.tp_size > 1:
-            self.enable_all_gather = True
-        else:
-            self.enable_all_gather = False
-
-    def set_quant_config(self, quant_config: dict) -> None:
-        self.quant_config = quant_config
-        self.set_ascend_dispatcher_output_dtype()
+            # The wrapper will perform tensor_model_parallel_all_gather
+            # automatically after the standard finalize routing.
+            self.finalize = FinalizeRoutingWrapper(self.finalize, dim=-1)
 
     def set_ascend_dispatcher_output_dtype(self) -> None:
-        """
-        Choose the init & finalize routing kernels based on the quantisation config.
-        Since the kernels are identical for prefill and decode phases, we instantiate
-        each only once.
-        """
+        """Choose init & finalize routing kernels based on quant config."""
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
@@ -103,7 +92,6 @@ class TorchNpuDispatcher(BaseDispatcher):
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
-
         else:
             raise ValueError(
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
@@ -112,14 +100,10 @@ class TorchNpuDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> TorchNpuDispatchOutput:
-        """
-        Permute tokens to expert‑first order and optionally quantise them.
-        No longer needs to distinguish prefill vs decode because the same
-        routing kernels are used for both phases.
-        """
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
+
         (
             permuted_hidden_states,
             expanded_row_idx,
@@ -144,23 +128,18 @@ class TorchNpuDispatcher(BaseDispatcher):
         return self._dispatch_output
 
     def combine(self, combine_input: TorchNpuCombineInput) -> torch.Tensor:
-        """
-        Reverse the token permutation and apply gating weights.
-        Uses the same finalize kernel that was selected at initialisation.
-        """
         if self._dispatch_output is None:
             raise RuntimeError("combine() called before dispatch()")
 
         dispatch_out = self._dispatch_output
+
+        # The finalizer (possibly wrapped with TP all‑gather) does all the work.
         final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_ids,
         )
-        # TP all-gather for intermediate dimension if needed
-        if self.enable_all_gather:
-            final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, dim=-1)
 
         self._dispatch_output = None
         return final_hidden_states
