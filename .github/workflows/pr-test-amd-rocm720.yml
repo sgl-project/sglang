@@ -1139,7 +1139,6 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event_name == 'pull_request' && needs.call-gate.result == 'success') ||
             (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )
@@ -1190,7 +1189,6 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event_name == 'pull_request' && needs.call-gate.result == 'success') ||
             (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )

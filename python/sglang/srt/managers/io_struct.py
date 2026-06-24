@@ -25,9 +25,20 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 import torch
+import zmq
+import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
@@ -46,6 +57,8 @@ from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
+
+    from sglang.srt.managers.tokenizer_manager import SenderWrapper
 else:
     Image = Any
 
@@ -1815,6 +1828,13 @@ class FreezeGCReq(BaseReq):
 
 
 @dataclass
+class ShutdownReq(BaseReq):
+    # Broadcast across TP ranks via the normal recv path, so all ranks break
+    # the scheduler loop on the same iteration.
+    pass
+
+
+@dataclass
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -2182,6 +2202,30 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+def sock_send(
+    sender: Union[zmq.Socket, zmq.asyncio.Socket, SenderWrapper],
+    obj: Any,
+    flags: int = 0,
+) -> None:
+    sender.send_pyobj(obj, flags=flags)
+
+
+def sock_recv(socket, flags=0):
+    return socket.recv_pyobj(flags=flags)
+
+
+async def async_sock_send(
+    sender: Union[zmq.asyncio.Socket, SenderWrapper],
+    obj: Any,
+    flags: int = 0,
+) -> None:
+    await sender.send_pyobj(obj, flags=flags)
+
+
+async def async_sock_recv(socket, flags=0):
+    return await socket.recv_pyobj(flags=flags)
 
 
 def _check_all_req_types():

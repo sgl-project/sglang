@@ -464,7 +464,7 @@ if not current_platform.is_hip():
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
             T2V_sampling_params,
-        )
+        ),
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
