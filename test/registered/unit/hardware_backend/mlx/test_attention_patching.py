@@ -1207,8 +1207,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             "_maybe_collect_customized_info": lambda *a, **k: None,
         }
         saved = {
-            name: getattr(SchedulerBatchResultProcessor, name)
-            for name in noop_stubs
+            name: getattr(SchedulerBatchResultProcessor, name) for name in noop_stubs
         }
         for name, value in noop_stubs.items():
             setattr(SchedulerBatchResultProcessor, name, value)
@@ -1229,9 +1228,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = (
-            batch_result_processor_module.get_global_server_args
-        )
+        original_get_server_args = batch_result_processor_module.get_global_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
