@@ -1227,7 +1227,7 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
+            t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1235,7 +1235,7 @@ def tensor_hash(tensor_list) -> int:
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
@@ -1356,6 +1356,84 @@ def _slice_model_data(
     return sliced
 
 
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
+    """Compute per-item patch slice boundaries from 'num_patches' metadata.
+
+    Returns (patch_slices, total_num_patches) where patch_slices is a list of
+    (start, end) tuples for each item, or (None, None) if not applicable.
+    This function can be replaced or extended by model-specific plugins that
+    need custom patch-level splitting logic.
+    """
+    num_patches = model_specific_data.get("num_patches")
+    if _get_length(num_patches) != num_items:
+        return None, None
+
+    if isinstance(num_patches, torch.Tensor):
+        patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+    elif isinstance(num_patches, np.ndarray):
+        patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+    else:
+        patch_counts = [
+            int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            for x in num_patches
+        ]
+
+    if not all(count >= 0 for count in patch_counts):
+        return None, None
+
+    patch_slices = []
+    patch_start = 0
+    for count in patch_counts:
+        patch_end = patch_start + count
+        patch_slices.append((patch_start, patch_end))
+        patch_start = patch_end
+    return patch_slices, patch_start
+
+
+# Keys whose dim-0 aligns with total patch count rather than num_items.
+_PATCH_ALIGNED_KEYS = frozenset(("patch_pixel_values", "patch_newline_mask"))
+
+
+def _split_model_data_for_item(
+    model_specific_data: dict,
+    index: int,
+    num_items: int,
+    patch_slices,
+    total_num_patches,
+) -> dict:
+    """Split model_specific_data for a single item during simple-split expansion.
+
+    This function encapsulates the per-item splitting logic for model-specific
+    data fields. It handles three categories:
+      1. Patch-aligned fields (dim-0 == total_num_patches): sliced by patch boundaries.
+      2. Item-aligned fields (dim-0 == num_items): sliced by item index.
+      3. Shared/scalar fields: copied as-is.
+
+    To support additional models, extend `_PATCH_ALIGNED_KEYS` or override this
+    function with a model-specific variant.
+    """
+    new_data = {}
+    for k, v in model_specific_data.items():
+        if (
+            k in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and _get_length(v) == total_num_patches
+        ):
+            patch_start, patch_end = patch_slices[index]
+            new_data[k] = _slice_value(v, patch_start, patch_end)
+        elif isinstance(v, (list, tuple)) and len(v) == num_items:
+            new_data[k] = [v[index]]
+        elif (
+            isinstance(v, (torch.Tensor, np.ndarray))
+            and len(v.shape) > 0
+            and v.shape[0] == num_items
+        ):
+            new_data[k] = v[index : index + 1]
+        else:
+            new_data[k] = v
+    return new_data
+
+
 def _try_simple_split(item, num_items, expanded_mm_items):
     """Try to split a bundled item by matching feature dim-0 to offset count.
     Returns True if split succeeded, False otherwise."""
@@ -1373,6 +1451,10 @@ def _try_simple_split(item, num_items, expanded_mm_items):
     if feature_count != num_items:
         return False
 
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_items
+    )
+
     for i in range(num_items):
         new_item = copy.copy(item)
         if item.feature is not None:
@@ -1386,19 +1468,9 @@ def _try_simple_split(item, num_items, expanded_mm_items):
             else:
                 new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
         new_item.offsets = [item.offsets[i]]
-        new_data = {}
-        for k, v in item.model_specific_data.items():
-            if isinstance(v, (list, tuple)) and len(v) == num_items:
-                new_data[k] = [v[i]]
-            elif (
-                isinstance(v, (torch.Tensor, np.ndarray))
-                and len(v.shape) > 0
-                and v.shape[0] == num_items
-            ):
-                new_data[k] = v[i : i + 1]
-            else:
-                new_data[k] = v
-        new_item.model_specific_data = new_data
+        new_item.model_specific_data = _split_model_data_for_item(
+            item.model_specific_data, i, num_items, patch_slices, total_num_patches
+        )
         new_item.hash = None
         expanded_mm_items.append(new_item)
     return True
