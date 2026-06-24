@@ -16,7 +16,7 @@ warnings.warn(
     "future release; use `sglang.benchmark.offline_throughput` instead "
     "(e.g. `python -m sglang.benchmark.offline_throughput`).",
     DeprecationWarning,
-    stacklevel=2,
+    stacklevel=1,
 )
 
 if __name__ == "__main__":
