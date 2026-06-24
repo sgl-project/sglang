@@ -24,8 +24,6 @@ lookups read back.
 
 from __future__ import annotations
 
-import logging
-import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -36,24 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4St
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-logger = logging.getLogger(__name__)
-
-
-def _dsv4_debug_log_enabled() -> bool:
-    return os.environ.get("SGLANG_DSV4_NPU_DEBUG_LOG", "0") == "1"
-
-
-def _tensor_debug_value(tensor: Optional[torch.Tensor], limit: int = 16):
-    if tensor is None:
-        return None
-    if tensor.device.type == "cpu":
-        values = tensor[:limit].tolist()
-        if tensor.numel() > limit:
-            values.append("...")
-        return values
-    return f"shape={tuple(tensor.shape)}, device={tensor.device}, dtype={tensor.dtype}"
-
 
 def get_last_loc(
     req_to_token: torch.Tensor,
@@ -218,20 +198,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             state_table, req_pool_indices, raw_prefix_lens
         ).to(last_loc_dtype)
 
-        if _dsv4_debug_log_enabled():
-            logger.warning(
-                "DSV4 c%s state alloc request: need=%s available_before=%s "
-                "req_pool_indices=%s raw_prefix=%s state_prefix=%s state_seq=%s "
-                "state_last_loc=%s",
-                ratio,
-                state_extend_num_tokens,
-                allocator.available_size(),
-                _tensor_debug_value(req_pool_indices),
-                _tensor_debug_value(raw_prefix_lens),
-                _tensor_debug_value(state_prefix_lens_cpu),
-                _tensor_debug_value(state_seq_lens_cpu),
-                _tensor_debug_value(state_last_loc),
-            )
         result = allocator.alloc_extend(
             state_prefix_lens,
             state_prefix_lens_cpu,
@@ -241,19 +207,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             state_extend_num_tokens,
         )
         if result is None:
-            logger.warning(
-                "DSV4 c%s state pool exhausted detail: need=%s available=%s "
-                "req_pool_indices=%s raw_prefix=%s state_prefix=%s state_seq=%s "
-                "state_last_loc=%s",
-                ratio,
-                state_extend_num_tokens,
-                allocator.available_size(),
-                _tensor_debug_value(req_pool_indices),
-                _tensor_debug_value(raw_prefix_lens),
-                _tensor_debug_value(state_prefix_lens_cpu),
-                _tensor_debug_value(state_seq_lens_cpu),
-                _tensor_debug_value(state_last_loc),
-            )
             raise self._pool_exhausted(
                 ratio, "state", state_extend_num_tokens, allocator.available_size()
             )
@@ -692,28 +645,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             off = getattr(req, off_attr, 0)
             if kv_len > off:
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, off:kv_len]
-                if _dsv4_debug_log_enabled():
-                    logger.warning(
-                        "DSV4 c%s state free: req_pool_idx=%s committed=%s "
-                        "allocated=%s free_end=%s off=%s num_slots=%s "
-                        "available_before=%s",
-                        ratio,
-                        req_pool_idx,
-                        req.kv_committed_len,
-                        req.kv_allocated_len,
-                        kv_len,
-                        off,
-                        slots.numel(),
-                        allocator.available_size(),
-                    )
                 allocator.free(slots.to(torch.int64))
-                if _dsv4_debug_log_enabled():
-                    logger.warning(
-                        "DSV4 c%s state free done: req_pool_idx=%s available_after=%s",
-                        ratio,
-                        req_pool_idx,
-                        allocator.available_size(),
-                    )
 
     def backup_state(self):
         # EAGLE/NEXTN draft preprocess allocates speculative c{4,128} KV via

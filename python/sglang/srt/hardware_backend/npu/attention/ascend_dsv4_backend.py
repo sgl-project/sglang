@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import math
 import os
 from typing import TYPE_CHECKING, Optional
@@ -19,13 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-logger = logging.getLogger(__name__)
-
-
-def _dsv4_debug_log_enabled() -> bool:
-    return os.environ.get("SGLANG_DSV4_NPU_DEBUG_LOG", "0") == "1"
-
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
@@ -1700,36 +1692,12 @@ class DeepseekV4AscendAttnBackend(
         mask_c4 = (abs_positions % 4) != 0
         mask_c128 = (abs_positions % 128) != 0
 
-        expected_shape_c4 = min(positions.shape[0], c4_positions.shape[0])
-        expected_shape_c128 = min(positions.shape[0], c128_positions.shape[0])
         gather_shape_c4 = min(
             positions.shape[0], mask_c4.numel(), c4_positions.shape[0]
         )
         gather_shape_c128 = min(
             positions.shape[0], mask_c128.numel(), c128_positions.shape[0]
         )
-        if (
-            _dsv4_debug_log_enabled()
-            or gather_shape_c4 != expected_shape_c4
-            or gather_shape_c128 != expected_shape_c128
-        ):
-            logger.warning(
-                "DSV4 verify padding refresh: positions=%s c4_dst=%s c128_dst=%s "
-                "seq_lens_cpu=%s n_draft=%s request_num=%s mask_c4=%s mask_c128=%s "
-                "copy_c4=%s/%s copy_c128=%s/%s",
-                tuple(positions.shape),
-                tuple(c4_positions.shape),
-                tuple(c128_positions.shape),
-                tuple(seq_lens_cpu.shape),
-                n_draft,
-                request_num,
-                mask_c4.numel(),
-                mask_c128.numel(),
-                gather_shape_c4,
-                expected_shape_c4,
-                gather_shape_c128,
-                expected_shape_c128,
-            )
         sorted_indices_c4 = (
             torch.argsort(mask_c4.flatten(), dim=0, stable=True)[:gather_shape_c4]
             .pin_memory()
