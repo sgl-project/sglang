@@ -55,6 +55,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -75,6 +76,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    async_sock_recv,
+    async_sock_send,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -379,19 +383,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
+            send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
         else:
-            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
-
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+            self.send_to_scheduler = SenderWrapper(
+                port_args, send_to_scheduler, attach_multi_http_worker_info=True
+            )
 
         self.load_snapshot_reader = create_load_snapshot_reader(
             self.server_args,
@@ -1322,7 +1326,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        sock_send(self.send_to_scheduler, tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
@@ -1338,7 +1342,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        self.send_to_scheduler.send_pyobj(batch_req)
+        sock_send(self.send_to_scheduler, batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
     def _coalesce_streaming_chunks(
@@ -1663,7 +1667,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_pyobj(req)
+        sock_send(self.send_to_scheduler, req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1674,7 +1678,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await async_sock_send(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1688,7 +1692,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await async_sock_send(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1733,7 +1737,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1773,12 +1777,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Let the exception propagate to the caller.
             # Only legal requests will be sent to scheduler.
             logging.getLogger().setLevel(obj.log_level.upper())
-            self.send_to_scheduler.send_pyobj(obj)
+            sock_send(self.send_to_scheduler, obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        sock_send(self.send_to_scheduler, FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -1825,7 +1829,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
@@ -2648,7 +2652,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._subprocess_watchdog.stop()
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
-        self.send_to_scheduler.send_pyobj(ShutdownReq())
+        sock_send(self.send_to_scheduler, ShutdownReq())
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
@@ -2717,7 +2721,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.send_to_scheduler.send_pyobj(ranks)
+        sock_send(self.send_to_scheduler, ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
@@ -3115,3 +3119,25 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+class SenderWrapper:
+    def __init__(
+        self,
+        port_args,
+        send_to_scheduler,
+        attach_multi_http_worker_info=False,
+    ):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+        self.attach_multi_http_worker_info = attach_multi_http_worker_info
+
+    def _stamp_http_worker_ipc(self, obj):
+        if not self.attach_multi_http_worker_info:
+            return
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+
+    def send_pyobj(self, obj, flags=0):
+        self._stamp_http_worker_ipc(obj)
+        return self.send_to_scheduler.send_pyobj(obj, flags=flags)

@@ -640,7 +640,6 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
-    SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
@@ -997,6 +996,11 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_DFLASH_PREFILL_REFILL_TARGET",
+    "DFlash now auto-enables the min-free-slots delay; unset this env. To "
+    "override the threshold, use '--min-free-slots-delay'.",
 )
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
