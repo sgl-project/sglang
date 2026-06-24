@@ -15,7 +15,7 @@ that left" — you have to re-read the logic to be sure.
 
 **Rule:** split each mechanical move into two consecutive commits, each carrying one
 kind of operation with its own check. The **move** commit is then certifiable by
-`verify_move_commit` (see `SKILL.md`, verify mode); the **prep** commit is small and
+`verify_move.py` (see `SKILL.md`, verify mode); the **prep** commit is small and
 covered by tests.
 
 **Prep is human-reviewed, so it stays small and relocates nothing.** The code keeps its
@@ -63,7 +63,7 @@ sealing:
 
 **Check:** the body is byte-identical and the only other changes are move artifacts —
 the dropped decorator, the import, and the requalified call site — so
-`verify_move_commit <commit>` reports `CLEAN MOVE`. Cross-check with
+`verify_move.py <commit>` reports `CLEAN MOVE`. Cross-check with
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`,
 which marks the whole block as moved.
 
@@ -150,7 +150,7 @@ method); the body is **unchanged, line for line**:
 
 **Check:** the body is byte-identical, but this move also drops `@staticmethod` and
 changes the caller's qualifier (`Source.foo` → `self.component.foo`) — both non-import
-changes — so `verify_move_commit` reports `NEEDS REVIEW` and lists exactly those lines.
+changes — so `verify_move.py` reports `NEEDS REVIEW` and lists exactly those lines.
 A class-to-class method move cannot be import-residual-only, so it is not certified by
 the move verifier; verify it with reproduce mode (a transform script, see
 `reproduce-mode.md`) or read those few lines by hand. The split still pays off: because

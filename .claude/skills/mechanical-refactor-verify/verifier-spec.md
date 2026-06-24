@@ -1,32 +1,39 @@
 # Move verifier — specification (source of truth)
 
 This file defines the rule the move verifier enforces. It is the **single source of
-truth**: `mechanical_refactor_verify_utils.py` implements exactly this rule and its
-comments point here, the tests assert exactly this rule, and `SKILL.md` /
-`verification-mode.md` describe it in prose. If any of them disagree with this file,
-this file wins and the others are the bug.
+truth**: `verify_move.py` implements exactly this rule and its comments point here, the
+tests (`test_verify_move.py`) assert exactly this rule, and `SKILL.md` /
+`verification-mode.md` describe it in prose. If any of them disagree with this file, this
+file wins and the others are the bug.
 
 ## What the verifier certifies
 
 `verify_move_commit(commit)` answers one yes/no question about a single commit:
 
-> Is this commit a **pure relocation** — code moved from one place to another
-> byte-for-byte, with no change beyond a small, fixed set of **move artifacts**?
+> Is this commit a **pure relocation** — code moved from one place to another **in the
+> same order**, allowing one **uniform indentation shift** of the whole block, with no
+> change beyond a small fixed set of **move artifacts**?
 
 `CLEAN MOVE` = yes. `NEEDS REVIEW` = anything else.
 
-The bar is strict. The moved **body is byte-for-byte**, and the only other changes
-allowed are the deterministic side-effects of relocating code:
+The bar is strict. The moved block's lines appear in the **same order** on both sides;
+the whole block may be shifted by one **constant** indentation amount (the unavoidable
+reindent of relocation); and the only other changes allowed are the deterministic
+side-effects of relocating code:
 
 - **imports** — the symbol's home changed, so importers add / repath an import;
 - a one-sided **`@staticmethod` / `@classmethod`** — a method became a free function;
-- **requalifying a moved symbol's call sites** — its home changed, so `self.foo(x)`
-  becomes `foo(x)`, or `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments,
-  only the qualifier differs.
+- **requalifying a moved symbol's call sites** — `self.foo(x)` becomes `foo(x)`, or
+  `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments, only the qualifier
+  differs.
 
-Everything else is `NEEDS REVIEW`. A change to the body, to a call's **arguments**, to a
-symbol that **did not move**, or a line that merely *looks* almost the same, is **not** a
-move artifact.
+Everything else is `NEEDS REVIEW`: a **reorder**, a **non-uniform** indentation change, a
+**trailing-whitespace** change, a **line merge/split**, a changed **argument**, a
+**re-derived constant**, or a call rewrite for a symbol that **did not move**.
+
+**Blank lines are ignored.** A blank line never changes Python behavior, and separator
+blank lines (PEP 8 spacing between definitions) legitimately collapse when code is split
+across files or relocated, so a blank-line-only difference is tolerated.
 
 ## Why this split exists — prep is human-reviewed, move is machine-checked
 
@@ -34,87 +41,86 @@ A behaviour-preserving extraction is two commits:
 
 - a **prep** commit — the in-place reshape (de-self a method, retype `self`). A human
   reviews it, so it must be **small** and contain **no relocation**: the code stays
-  exactly where it is, so the diff is a handful of lines that are easy to eyeball.
+  exactly where it is.
 - a **move** commit — the relocation, certified by this verifier.
 
 The whitelist above is exactly what a relocation forces and a human should not have to
 re-read. Whitelisting those artifacts is what lets the move be machine-checked; it is
-**not** a licence to fold reshape work into the move. If the move's diff contains
-anything outside the whitelist, it is not a pure move — the reshape leaked in, and it
-belongs in prep (see `prep-and-move.md`).
+**not** a licence to fold reshape work into the move. If the move's diff contains anything
+outside the whitelist, the reshape leaked in and belongs in prep (see `prep-and-move.md`).
 
 ## The rule, precisely
 
 Given a commit (diffed against its first parent):
 
-1. **Collect changed lines.** From the commit's patch, take the removed (`-`) and added
-   (`+`) lines, excluding diff/hunk headers. Renames and splits are not followed (`-M`
-   off), so a renamed or split file appears as its full content removed and re-added —
-   which the match in step 4 pairs up.
+1. **Collect changed lines, per file.** From the patch take the removed (`-`) and added
+   (`+`) lines, grouped by file. Within each file, **cancel** any line that appears
+   byte-for-byte as **both** removed and added — that is git's own diff artifact (an
+   unchanged line re-represented as remove + add when nearby lines change), not a
+   relocation; a real relocation keeps its lines because they cross files. Aggregate the
+   surviving removed and added lines in patch order. Renames/splits are not followed
+   (`-M` off).
 
-2. **Collect import lines.** For every file the commit touches, parse the *before*
-   version (at `commit^`) and the *after* version (at `commit`) with Python's `ast`. A
-   line is an **import line** if it lies within an `Import` / `ImportFrom` node, so
-   single-line and parenthesised multi-line imports (every member line) are both
-   recognised. Record the stripped text as `imports_before` and `imports_after`. A file
-   that does not parse as Python contributes no import lines.
+2. **Collect import lines.** For every file the commit touches, parse the *before* version
+   (at `commit^`) and the *after* version (at `commit`) with Python's `ast`. A line is an
+   **import line** if it lies within an `Import` / `ImportFrom` node, so single-line and
+   parenthesised multi-line imports are both recognised.
 
-3. **Normalise.** `strip()` each changed line (drop leading indentation and trailing
-   whitespace) and discard blank lines. Indentation is ignored so a method body dedented
-   to module level — or re-indented under another class — still matches.
+3. **Peel the whitelist, preserving order.** From the surviving lines remove:
+   - **imports** (a line whose stripped text is in the parsed import set);
+   - **decorators** (a line that is exactly `@staticmethod` or `@classmethod`);
+   - **call-site requalifications** — a removed line and an added line that become equal
+     after dropping a `Qualifier.` prefix before a **moved symbol** (a qualifier must
+     actually be present, so a verbatim body line is not consumed). The moved symbols are
+     the `def` / `class` names that appear on both sides (ignoring indentation).
 
-4. **Match the move.** Let `R` and `A` be the multisets of normalised removed and added
-   lines. The moved lines are `R ∩ A`; the leftovers are `R_only = R − A` and
-   `A_only = A − R`. The names defined by a `def` / `class` line **within the moved
-   lines** are the commit's **moved symbols**.
+4. **Compare the remaining block as an ordered signature.** A block's **signature** is its
+   non-blank lines with the block's common leading indent removed, in order. The removed
+   block and the added block match iff their signatures are **equal as sequences**. This
+   absorbs a uniform indentation shift (the common prefix is removed) while preserving
+   relative indentation, trailing whitespace, and order — so a reorder, a non-uniform
+   indent change, a trailing-whitespace change, or a line merge makes the signatures
+   differ.
 
-5. **Peel the whitelist off the leftovers.**
-   - a leftover removed line in `imports_before` (or added line in `imports_after`) is an
-     allowed **import**;
-   - a leftover line that is exactly `@staticmethod` or `@classmethod` is an allowed
-     **decorator**;
-   - of what remains, drop every `Qualifier.` prefix that sits before a **moved symbol**
-     and match removed against added again: a pair that now matches is an allowed
-     **call-site requalification**. Only the qualifier is removed, so a call whose
-     arguments also changed will not match.
-
-6. **Verdict.** `CLEAN MOVE` iff there is at least one moved line and nothing is left to
-   review. Otherwise `NEEDS REVIEW`, listing every leftover. A commit with no removed and
-   no added lines (a pure rename git records with no content change) is clean too.
+5. **Verdict.** `CLEAN MOVE` iff the signatures match and at least one line relocated.
+   Otherwise `NEEDS REVIEW`, printing the signature diff. A commit whose surviving removed
+   and added lists are both empty (a pure rename git records with no content change) is
+   clean too.
 
 ## Allowed — the whole whitelist
 
-- A line relocated **byte-for-byte modulo leading indentation**.
+- A line **relocated in order**, modulo one **uniform** leading-indentation shift of the
+  whole block.
 - **Import statements** — added, removed, or repathed; single-line or multi-line.
 - A one-sided **`@staticmethod` / `@classmethod`**.
-- A **call-site requalification of a moved symbol** — removed and added lines that are
-  identical after dropping a `Qualifier.` before a symbol defined in the relocated block.
+- A **call-site requalification of a moved symbol**.
+- **Blank-line changes** — ignored.
 
 ## Not allowed (→ NEEDS REVIEW)
 
-- Any change to a relocated line's **content** beyond its qualifier — an argument
-  changed, an operator changed, internal spacing changed ("looks almost the same").
-- A **call rewrite for a symbol that did not move** in this commit (no matching relocated
-  `def` / `class`) — e.g. pointing a consumer at a different implementation. This is what
-  keeps a consumer-only edit from passing as a move.
-- A **signature change** on the moved definition itself (`def f(self: T)` → `def f(self)`):
-  the `def` line is not byte-identical, so it is not even a moved symbol.
+- A **reorder** of lines within the moved block.
+- A **non-uniform** indentation change (one that is not a single shift of the whole block).
+- A **trailing-whitespace** change, an internal-whitespace change, or a **line
+  merge/split**.
+- A **changed argument** in an otherwise-requalified call.
+- A **call rewrite for a symbol that did not move** in this commit — e.g. pointing a
+  consumer at a different implementation. This keeps a consumer-only edit from passing.
+- A **signature change** on the moved definition itself (`def f(self: T)` → `def f(self)`).
 - A **constant re-derived** in the destination module (`_flag = compute_flag()`).
-- A line a **formatter re-wrapped** during the move so it is no longer byte-identical
-  (use reproduce mode, see `reproduce-mode.md`).
+- A line a **formatter re-wrapped** so it is no longer identical (use reproduce mode, see
+  `reproduce-mode.md`).
 
 ## What the verdict does and does not assert
 
-- **Order-blind.** The match is on multisets, so a relocation that also reorders lines
-  within the moved block still reads `CLEAN MOVE`. Cross-check order with
-  `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`.
-- **Indentation-blind by design.** Two lines that differ only in leading whitespace are
-  the same line.
-- **Requalification is scoped to symbols relocated in this commit.** A call rewrite is
-  forgiven only for a symbol whose `def` / `class` line moved here, so a consumer-only
+- **Order-aware.** The block is compared as a sequence, so a relocation that reorders lines
+  within the moved block reads `NEEDS REVIEW`.
+- **Uniform-indentation-aware.** A whole-block shift by one constant amount is allowed; a
+  non-uniform change is flagged, since it can change Python semantics.
+- **Blank-line-insensitive** by design (see above).
+- **Requalification is scoped to symbols relocated in this commit**, so a consumer-only
   call rewrite (no relocated definition) cannot pass as a move.
 - It judges the **shape of the diff**, not intent. Confirm the commit's purpose from its
   subject before trusting a `CLEAN MOVE`.
 - Import classification is by **text membership** in the parsed import set; a code line
-  whose text coincidentally equals an import line elsewhere in the file would be treated
-  as an import. This is rare and the strictness elsewhere makes it harmless.
+  whose text coincidentally equals an import line elsewhere in the file would be treated as
+  an import. This is rare and the strictness elsewhere makes it harmless.
