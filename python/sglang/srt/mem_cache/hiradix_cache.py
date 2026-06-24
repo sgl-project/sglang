@@ -35,6 +35,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    PrefetchOperation as HybridPrefetchOperation,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_dsa_pool_to_hiradix_cache,
 )
@@ -1249,12 +1252,21 @@ class HiRadixCache(RadixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
-        operation = PrefetchOperation(
+        prefetch_op_cls = (
+            HybridPrefetchOperation
+            if isinstance(self.cache_controller, HybridCacheController)
+            else PrefetchOperation
+        )
+        extra_kwargs = {}
+        if prefetch_op_cls is HybridPrefetchOperation:
+            extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
+        operation = prefetch_op_cls(
             "__storage_hit_query__",
             self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
             prefetch_key,
             last_hash,
             prefix_keys,
+            **extra_kwargs,
         )
         hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
             operation
