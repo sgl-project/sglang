@@ -74,26 +74,27 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 ### Model and runtime
 
-- `--model-path &#123;MODEL&#125;`: model path or Hugging Face model ID
-- `--lora-path &#123;PATH&#125;` and `--lora-nickname &#123;NAME&#125;`: load a LoRA adapter
-- `--lora-merge-mode &#123;auto|merge|dynamic&#125;`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
-- `--num-gpus &#123;N&#125;`: number of GPUs to use
-- `--performance-mode &#123;manual|auto|speed|memory&#125;` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
-- `--tp-size &#123;N&#125;`: tensor parallelism size, mainly for encoders
-- `--sp-degree &#123;N&#125;`: sequence parallelism size
-- `--ulysses-degree &#123;N&#125;` and `--ring-degree &#123;N&#125;`: USP parallelism controls
-- `--enable-cfg-parallel &#123;true|false&#125;`: enable or explicitly disable CFG parallelism
-- `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang and diffusers pipelines
-- `--component-attention-backends &#123;MAP&#125;`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
-- `--attention-backend-config &#123;CONFIG&#125;`: attention backend configuration
+- `--model-path {MODEL}`: model path or Hugging Face model ID
+- `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
+- `--num-gpus {N}`: number of GPUs to use
+- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
+- `--tp-size {N}`: tensor parallelism size, mainly for encoders
+- `--sp-degree {N}`: sequence parallelism size
+- `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
+- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
+- `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
+- `--attention-backend-config {CONFIG}`: attention backend configuration
+- `--original-dtype {auto|bfloat16}`: Original data type of model, `auto` will use original published weights. Use other options if the data type of weights differs from the original one and weights do not have a quantization config.
 
 ### Sampling and output
 
-- `--prompt &#123;PROMPT&#125;` and `--negative-prompt &#123;PROMPT&#125;`
-- `--image-path &#123;PATH&#125; [&#123;PATH&#125; ...]`: input image(s) for image-to-video or image-to-image generation
-- `--num-inference-steps &#123;STEPS&#125;` and `--seed &#123;SEED&#125;`
-- `--height &#123;HEIGHT&#125;`, `--width &#123;WIDTH&#125;`, `--num-frames &#123;N&#125;`, `--fps &#123;FPS&#125;`
-- `--output-path &#123;PATH&#125;`, `--output-file-name &#123;NAME&#125;`, `--save-output`, `--return-frames`
+- `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
+- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
+- `--num-inference-steps {STEPS}` and `--seed {SEED}`
+- `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
+- `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 
 For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
@@ -288,7 +289,7 @@ Use `--backend diffusers` to force vanilla diffusers pipelines when no native SG
     </tr>
     <tr>
       <td><code>--cache-dit-config</code></td>
-      <td><code>&#123;PATH&#125;</code></td>
+      <td><code>{PATH}</code></td>
       <td>Cache-DiT config for diffusers pipelines</td>
     </tr>
   </tbody>
