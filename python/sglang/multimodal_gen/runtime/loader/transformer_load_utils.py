@@ -22,15 +22,18 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+    snapshot_download,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
@@ -317,12 +320,31 @@ def resolve_transformer_safetensors_to_load(
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        quantized_path = maybe_download_model(quantized_path)
+        original_quantized_path = quantized_path
+        quantized_path = maybe_download_model(original_quantized_path)
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            if not safetensors_list and not os.path.exists(original_quantized_path):
+                logger.warning(
+                    "No safetensors files found in cached transformer weights path "
+                    "%s; refreshing snapshot for %s",
+                    quantized_path,
+                    original_quantized_path,
+                )
+                quantized_path = snapshot_download(
+                    repo_id=original_quantized_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.safetensors.index.json",
+                    ],
+                    max_workers=8,
+                )
+                safetensors_list = _list_safetensors_files(quantized_path)
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
@@ -617,4 +639,4 @@ def _resolve_target_param_dtype(
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    return PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+    return resolve_precision(server_args, "dit", precision_attr="dit_precision")
