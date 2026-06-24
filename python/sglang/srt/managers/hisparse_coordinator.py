@@ -70,9 +70,32 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        # unified-KV HiSparse (ROCm) keeps the compressed C4 hot/cold data in
+        # the bf16 unified layout, so swap-in/backup use the generic linear MLA
+        # path instead of the FP8 page-padded dsv4 path.
+        self.is_unified_hisparse = False
+        if self.is_dsv4_hisparse:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                HiSparseUnifiedC4DevicePool,
+            )
+
+            self.is_unified_hisparse = isinstance(
+                self.token_to_kv_pool_allocator.hisparse_kvcache,
+                HiSparseUnifiedC4DevicePool,
+            )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
+            # Host cold-pool sizing (unified-KV / dsv4 path): the host pool is
+            # bound to size_full/compress_ratio -- a mirror of the GPU full-token
+            # c4 budget, not an independent expansion into host RAM.
+            # host_to_device_ratio (== c4_shrink_factor, >= 1) sets how much of
+            # that budget stays GPU-resident: ratio=1 keeps the full c4 pool
+            # on-GPU (host == device, a 1:1 mirror); ratio>1 shrinks the GPU c4
+            # pool (freeing memory for a larger overall token budget) while the
+            # host mirror still tracks the full budget. This is orthogonal to the
+            # per-request device_buffer_size hot window (the swap trigger), which
+            # is never scaled by ratio.
             num_host_pages = (
                 self.token_to_kv_pool_allocator.size_full // self.compress_ratio
                 + page_size
@@ -820,11 +843,13 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
-        swap_in_fn = (
-            load_cache_to_device_buffer_dsv4_mla
-            if self.is_dsv4_hisparse
-            else load_cache_to_device_buffer_mla
-        )
+        if self.is_dsv4_hisparse and not self.is_unified_hisparse:
+            # separate-KV: FP8 page-padded device + host C4 layout.
+            swap_in_fn = load_cache_to_device_buffer_dsv4_mla
+        else:
+            # unified-KV HiSparse (bf16 linear rows) and generic DSA MLA both
+            # use the linear swap path (stride == item_size_bytes).
+            swap_in_fn = load_cache_to_device_buffer_mla
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
