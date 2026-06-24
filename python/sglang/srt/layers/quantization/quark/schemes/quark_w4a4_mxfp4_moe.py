@@ -263,9 +263,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # gemm1_clamp_limit>0) need this; leave plain-SwiGLU models (GLM,
             # limit==0) on activation='silu' to avoid changing their path.
             from dataclasses import replace as _dc_replace
+
             _mm3_clamp = (
-                getattr(moe_runner_config, 'gemm1_clamp_limit', None)
-                or getattr(moe_runner_config, 'swiglu_limit', None)
+                getattr(moe_runner_config, "gemm1_clamp_limit", None)
+                or getattr(moe_runner_config, "swiglu_limit", None)
                 or 0.0
             )
             _mm3_cfg = (
@@ -302,8 +303,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # QUARK_MXFP4_SWIGLU_LIMIT_FIX: forward the GPT-OSS clamped-SwiGLU limit so the aiter
         # MoE runner selects the clamped-SwiGLU kernel instead of plain SiLU.
         _mm3_swiglu_limit = (
-            getattr(self.moe_runner_config, 'gemm1_clamp_limit', None)
-            or getattr(self.moe_runner_config, 'swiglu_limit', None)
+            getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            or getattr(self.moe_runner_config, "swiglu_limit", None)
             or 0.0
         )
         quant_info = AiterMoeQuantInfo(
