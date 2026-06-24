@@ -28,11 +28,15 @@ side-effects of relocating code:
   `def foo(self)` drops the decorator and the now-redundant annotation on `self`;
 - **requalifying a moved symbol's call sites** — `self.foo(x)` becomes `foo(x)`, or
   `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments, only the qualifier
-  differs.
+  differs;
+- **module scaffolding copied to a new destination module** — a top-level `logger`, a
+  module constant, or a `TYPE_CHECKING` guard the destination needs, copied **byte-for-byte
+  from a source file that still has it** (so it was not itself relocated).
 
 Everything else is `NEEDS REVIEW`: a **reorder**, a **non-uniform** indentation change, a
 **trailing-whitespace** change, a **line merge/split**, a changed **argument**, a
-**re-derived constant**, or a call rewrite for a symbol that **did not move**.
+constant **re-derived differently** in the destination, or a call rewrite for a symbol
+that **did not move**.
 
 **Blank lines are ignored.** A blank line never changes Python behavior, and separator
 blank lines (PEP 8 spacing between definitions) legitimately collapse when code is split
@@ -72,6 +76,10 @@ Given a commit (diffed against its first parent):
 3. **Peel the whitelist, preserving order.** From the surviving lines remove:
    - **imports** (a line whose stripped text is in the parsed import set);
    - **decorators** (a line that is exactly `@staticmethod` or `@classmethod`);
+   - **carried-over scaffolding** — an added top-level (indent-zero) line whose stripped
+     text equals a top-level line in some touched file's before-version **and** was not
+     itself removed (so a relocated module-level function stays in the block while a
+     copied `logger` / constant / `TYPE_CHECKING` guard is peeled);
    - **call-site requalifications** — a removed line and an added line that become equal
      after dropping a `Qualifier.` prefix before a **moved symbol** (a qualifier must
      actually be present, so a verbatim body line is not consumed). The moved symbols are
@@ -98,6 +106,8 @@ Given a commit (diffed against its first parent):
 - **Import statements** — added, removed, or repathed; single-line or multi-line.
 - A one-sided **`@staticmethod` / `@classmethod`**.
 - A **`self` type annotation dropped** from the moved definition.
+- **Carried-over module scaffolding** — a top-level line copied byte-for-byte from a source
+  file that still has it (a logger, a module constant, a `TYPE_CHECKING` guard).
 - A **call-site requalification of a moved symbol**.
 - **Blank-line changes** — ignored.
 

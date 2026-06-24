@@ -11,7 +11,9 @@ from mechanical_refactor_verify_utils import (
     _commit_changed_lines,
     _commit_import_texts,
     _import_line_texts,
+    _module_level_lines,
     _moved_symbol_names,
+    _peel_scaffold,
     _strip_moved_qualifiers,
     _strip_self_annotation,
     verify_move_commit,
@@ -134,6 +136,24 @@ def test_strip_self_annotation_leaves_plain_self_and_other_params() -> None:
     """A plain self, and annotations on other parameters, are untouched."""
     assert _strip_self_annotation("def foo(self) -> None:") == "def foo(self) -> None:"
     assert _strip_self_annotation("def foo(self, x: int):") == "def foo(self, x: int):"
+
+
+def test_module_level_lines_collects_only_top_level_nonblank() -> None:
+    """Only non-blank lines at indentation zero are returned."""
+    text = "import os\nlogger = mk()\n\ndef f():\n    return 1\n"
+    assert _module_level_lines(text) == {"import os", "logger = mk()", "def f():"}
+
+
+def test_peel_scaffold_removes_carried_top_level_lines_not_relocated() -> None:
+    """A top-level line copied from a source module (and not itself relocated) is
+    scaffolding; an indented line or a relocated def is not."""
+    block, scaffold = _peel_scaffold(
+        ["logger = mk()", "def helper():", "    return logger"],
+        {"logger = mk()", "def helper():"},
+        {"def helper():", "return logger"},
+    )
+    assert scaffold == ["logger = mk()"]
+    assert block == ["def helper():", "    return logger"]
 
 
 # --- _block_signature ----------------------------------------------------------
@@ -403,6 +423,70 @@ def test_method_to_method_drops_staticmethod_and_self_annotation(repo: Path) -> 
     )
     _commit(repo, "move foo into Target as an instance method")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_carried_over_module_scaffolding_is_certified(repo: Path) -> None:
+    """A new destination module that copies a logger line verbatim from the source (which
+    keeps it) is a clean move; the copied line is whitelisted as scaffolding."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "import logging\n\n"
+                "logger = logging.getLogger(__name__)\n\n\n"
+                "def helper(value):\n    return value * 2\n\n\n"
+                "def other():\n    return logger\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "import logging\n\n"
+                "from mod import helper\n\n"
+                "logger = logging.getLogger(__name__)\n\n\n"
+                "def other():\n    return logger\n"
+            ),
+            "mod.py": (
+                "import logging\n\n"
+                "logger = logging.getLogger(__name__)\n\n\n"
+                "def helper(value):\n    return value * 2\n"
+            ),
+        },
+    )
+    _commit(repo, "move helper to mod (carries logger)")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_changed_module_constant_still_needs_review(repo: Path) -> None:
+    """A module constant re-derived *differently* in the destination is not byte-identical
+    to the source line, so it is not scaffolding and the move needs review."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "_FLAG = build_flag()\n\n\n"
+                "def helper():\n    return _FLAG\n\n\n"
+                "def other():\n    return _FLAG\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "from mod import helper\n\n"
+                "_FLAG = build_flag()\n\n\n"
+                "def other():\n    return _FLAG\n"
+            ),
+            "mod.py": "_FLAG = build_other_flag()\n\n\ndef helper():\n    return _FLAG\n",
+        },
+    )
+    _commit(repo, "move helper but change _FLAG in the new module")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
 # --- verify_move_commit: the new order / whitespace rules ----------------------

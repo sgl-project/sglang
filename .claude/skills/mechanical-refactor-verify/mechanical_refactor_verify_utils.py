@@ -96,6 +96,36 @@ def _commit_import_texts(commit: str, repo_root: str) -> tuple[set[str], set[str
     return before, after
 
 
+def _module_level_lines(file_text: str) -> set[str]:
+    """Stripped text of every non-blank top-level (indent 0) line in a file."""
+    return {
+        line.strip()
+        for line in file_text.splitlines()
+        if line.strip() and not line[:1].isspace()
+    }
+
+
+def _commit_before_module_lines(commit: str, repo_root: str) -> set[str]:
+    """Top-level lines in the before-version of every file the commit touches -- the pool
+    of module scaffolding (a logger, module-level constants, a ``TYPE_CHECKING`` guard) a
+    new destination module may legitimately copy verbatim. See verifier-spec.md (whitelist).
+    """
+    status = _git_output(
+        ["show", commit, "--name-status", "--format=", "--no-color", "--no-ext-diff"],
+        repo_root,
+    )
+    lines: set[str] = set()
+    for line in status.splitlines():
+        if "\t" not in line:
+            continue
+        code, path = line.split("\t", 1)
+        if code[:1] in ("D", "M"):
+            lines |= _module_level_lines(
+                _git_output(["show", f"{commit}^:{path}"], repo_root)
+            )
+    return lines
+
+
 def _drop_counts(lines: list[str], to_drop: Counter) -> list[str]:
     """Return ``lines`` with up to ``to_drop[line]`` occurrences of each line removed,
     preserving order."""
@@ -226,6 +256,29 @@ def _peel_artifacts(
     return imports, decorators, block
 
 
+def _peel_scaffold(
+    lines: list[str], source_module_lines: set[str], removed_stripped: set[str]
+) -> tuple[list[str], list[str]]:
+    """Remove top-level lines that copy a module-level statement from a source file and
+    were not themselves relocated -- carried-over module scaffolding (a logger, a module
+    constant, a ``TYPE_CHECKING`` guard) the destination module needs. The "not relocated"
+    guard (``not in removed_stripped``) keeps a moved module-level function in the block.
+    See verifier-spec.md (whitelist)."""
+    scaffold, block = [], []
+    for line in lines:
+        stripped = line.strip()
+        if (
+            stripped
+            and not line[:1].isspace()
+            and stripped in source_module_lines
+            and stripped not in removed_stripped
+        ):
+            scaffold.append(stripped)
+        else:
+            block.append(line)
+    return block, scaffold
+
+
 def _peel_requalifications(
     rem_block: list[str], add_block: list[str], names: set[str]
 ) -> tuple[list[str], list[str], int]:
@@ -265,6 +318,7 @@ class MoveCheck:
     relocated: int
     imports: list[str]
     decorators: list[str]
+    scaffold: list[str]
     requalified: int
     review_diff: list[str]
     subject: str = ""
@@ -274,6 +328,8 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
     """Compute the verdict for a commit (no printing). Implements verifier-spec.md."""
     removed, added = _commit_changed_lines(commit, repo_root)
     imports_before, imports_after = _commit_import_texts(commit, repo_root)
+    before_module_lines = _commit_before_module_lines(commit, repo_root)
+    removed_stripped = {line.strip() for line in removed if line.strip()}
 
     rem_keys = Counter(line.strip() for line in removed if line.strip())
     add_keys = Counter(line.strip() for line in added if line.strip())
@@ -281,6 +337,9 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
 
     rem_imports, rem_decos, rem_block = _peel_artifacts(removed, imports_before)
     add_imports, add_decos, add_block = _peel_artifacts(added, imports_after)
+    add_block, scaffold = _peel_scaffold(
+        add_block, before_module_lines, removed_stripped
+    )
     rem_block, add_block, requalified = _peel_requalifications(
         rem_block, add_block, moved_names
     )
@@ -314,6 +373,7 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
         relocated=relocated,
         imports=sorted(set(rem_imports + add_imports)),
         decorators=sorted(set(rem_decos + add_decos)),
+        scaffold=sorted(set(scaffold)),
         requalified=requalified,
         review_diff=review_diff,
     )
@@ -325,6 +385,8 @@ def _print_check(check: MoveCheck) -> None:
         print(f"    [import] {text}")
     for text in check.decorators:
         print(f"    [decorator] {text}")
+    for text in check.scaffold:
+        print(f"    [scaffold] {text}")
     if check.requalified:
         print(f"  {check.requalified} call-site requalification(s) of moved symbol(s)")
     if check.clean and check.relocated > 0:
@@ -482,6 +544,7 @@ function render(onlyReview){
     out += '<div class="bd">';
     if(c.imports.length) out += '<div class="sec"><span class="k">imports:</span> '+c.imports.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
     if(c.decorators.length) out += '<div class="sec"><span class="k">decorators:</span> '+c.decorators.map(esc).join(', ')+'</div>';
+    if(c.scaffold.length) out += '<div class="sec"><span class="k">scaffold:</span> '+c.scaffold.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
     if(c.requalified) out += '<div class="sec"><span class="k">requalified call sites:</span> '+c.requalified+'</div>';
     if(c.review_diff.length){
       out += '<table class="diff"><tbody>';
