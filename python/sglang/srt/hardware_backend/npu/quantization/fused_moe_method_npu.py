@@ -20,6 +20,9 @@ from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_world_size,
+)
 logger = logging.getLogger(__name__)
 
 
