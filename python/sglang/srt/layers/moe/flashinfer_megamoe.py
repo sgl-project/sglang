@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Generic FlashInfer MegaMOE backend (moe_ep_v2.MoEEpMegaLayer).
+"""Generic FlashInfer MegaMOE backend (moe_ep.MoEEpMegaLayer).
 
 Wraps FlashInfer's fused EP all-to-all + expert-compute mega kernel so it can
 be selected as a model-agnostic MoE runner backend through the standard
@@ -70,7 +70,7 @@ def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
 
     import torch.distributed as dist
     from deep_gemm import transform_sf_into_required_layout
-    from flashinfer.moe_ep_v2 import (
+    from flashinfer.moe_ep import (
         BootstrapConfig,
         DeepGemmMegaMoeConfig,
         FleetParams,
@@ -168,7 +168,7 @@ def run_flashinfer_megamoe(
     layer: FusedMoE, dispatch_output: DispatchOutput
 ) -> StandardCombineInput:
     """Run the fused mega kernel and return per-rank outputs (no combine)."""
-    from flashinfer.moe_ep_v2 import MoEEpTensors
+    from flashinfer.moe_ep import MoEEpTensors
 
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
