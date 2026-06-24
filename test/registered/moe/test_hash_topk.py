@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
-from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -14,6 +13,7 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -29,8 +29,6 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     monkeypatch.setattr(
         hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
     )
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)
 
     topk = HashTopK(
         topk=3,
@@ -57,7 +55,10 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         num_physical_experts=256,
     )
 
-    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+    with (
+        get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
+        hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
+    ):
         output = topk(
             hidden_states=torch.empty(2, 4),
             router_logits=torch.ones(2, 256),
@@ -91,24 +92,22 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.router_logits.shape == (0, 6)
 
 
-def test_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)
-
+def test_topk_remaps_per_rank_fused_shared_slots():
     topk_ids = torch.tensor([[0, 65, 256], [63, 127, 256]], dtype=torch.int32)
     topk_weights = torch.tensor([[0.8, 0.7, 1.0], [0.6, 0.5, 1.0]])
 
-    topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
-        topk_ids,
-        topk_weights,
-        num_fused_shared_experts=1,
-        num_physical_routed_experts=256,
-        topk_config=TopKConfig(
-            top_k=3,
+    with get_parallel().override(moe_ep_size=4, moe_ep_rank=2):
+        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
+            topk_ids,
+            topk_weights,
             num_fused_shared_experts=1,
-            routed_scaling_factor=2.5,
-        ),
-    )
+            num_physical_routed_experts=256,
+            topk_config=TopKConfig(
+                top_k=3,
+                num_fused_shared_experts=1,
+                routed_scaling_factor=2.5,
+            ),
+        )
 
     assert topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(topk_weights[:, -1], torch.full((2,), 0.4))
