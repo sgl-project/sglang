@@ -242,7 +242,7 @@ class NPUSwigluStepAndMul(BaseActivation):
 # =============================================================================
 # 8. Standard SwiGLU
 # =============================================================================
-class NPUSwiglu(BaseActivation):
+class NPUSwigluAllGather(BaseActivation):
     """
     Standard SwiGLU activation (NPU backend).
 
