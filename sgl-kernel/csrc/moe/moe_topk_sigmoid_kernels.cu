@@ -172,6 +172,143 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   }
 }
 
+// ====================== Fused TopK sigmoid (non-power-of-2 experts) ======================
+//
+// Single-launch replacement for the moeSigmoid + moeTopK two-launch workspace path used when
+// num_experts is not a small power of two (e.g. 288). One block processes one token row:
+// sigmoid+bias selection scores are held in dynamic shared memory and the top-k experts are
+// chosen by k sequential block argmaxes (lower expert index wins ties, masking each selected
+// expert). This removes the [num_tokens, num_experts] fp32 workspace round-trip and the second
+// kernel launch.
+//
+// It is bit-faithful to the moeTopK path, including moeTopK's argmax seed of (value = -1.f,
+// index = 0): when no unselected expert has a biased score > -1, index 0 wins (and may repeat
+// across rounds), and the emitted weight is the unbiased score (correction_bias subtracted back),
+// exactly as moeTopK does. correction_bias is float32 (validated by the entry point).
+template <typename T, int TPB>
+__launch_bounds__(TPB) __global__ void fusedTopkSigmoid(
+    const T* __restrict__ gating_output,        // [num_tokens, num_experts]
+    const float* __restrict__ correction_bias,  // [num_experts] or nullptr
+    float* __restrict__ topk_weights,           // [num_tokens, k]
+    int* __restrict__ topk_indices,             // [num_tokens, k]
+    const int num_experts,
+    const int k,
+    const bool renormalize) {
+  // Dynamic shared memory layout: [s_score: num_experts floats][s_sel_w: k floats][s_sel_i: k ints]
+  extern __shared__ char fused_smem[];
+  float* s_score = reinterpret_cast<float*>(fused_smem);
+  float* s_sel_w = s_score + num_experts;
+  int* s_sel_i = reinterpret_cast<int*>(s_sel_w + k);
+
+  __shared__ float s_red_val[TPB];
+  __shared__ int s_red_idx[TPB];
+
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const T* grow = gating_output + static_cast<long long>(row) * num_experts;
+
+  // Pass 1: sigmoid + correction bias -> biased selection score in shared memory.
+  for (int e = tid; e < num_experts; e += TPB) {
+    float v = convert_to_float<T>(grow[e]);
+    v = 1.0f / (1.0f + expf(-v));
+    if (correction_bias != nullptr) {
+      v = v + correction_bias[e];
+    }
+    s_score[e] = v;
+  }
+  __syncthreads();
+
+  // Pass 2: k sequential argmax reductions; on equal score the lower expert index wins (matches
+  // cub::ArgMax). Each round is seeded with moeTopK's (value = -1.f, index = 0) sentinel.
+  for (int kk = 0; kk < k; ++kk) {
+    float best_v = -1.0f;
+    int best_i = 0;
+    for (int e = tid; e < num_experts; e += TPB) {
+      const float v = s_score[e];
+      if (v > best_v || (v == best_v && e < best_i)) {
+        best_v = v;
+        best_i = e;
+      }
+    }
+    s_red_val[tid] = best_v;
+    s_red_idx[tid] = best_i;
+    __syncthreads();
+
+    // Tree reduction over the block (TPB is a power of two).
+    for (int stride = TPB / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        const float ov = s_red_val[tid + stride];
+        const int oi = s_red_idx[tid + stride];
+        if (ov > s_red_val[tid] || (ov == s_red_val[tid] && oi < s_red_idx[tid])) {
+          s_red_val[tid] = ov;
+          s_red_idx[tid] = oi;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const int e = s_red_idx[0];
+      float val = s_red_val[0];
+      if (correction_bias != nullptr) {
+        val -= correction_bias[e];  // unbiased weight, as moeTopK subtracts the bias back
+      }
+      s_sel_i[kk] = e;
+      s_sel_w[kk] = val;
+      s_score[e] = -INFINITY;  // mask so this expert is not reselected
+    }
+    __syncthreads();
+  }
+
+  // Pass 3: renormalize over the selected weights (in selection order) and write outputs.
+  if (tid == 0) {
+    float* wrow = topk_weights + static_cast<long long>(row) * k;
+    int* irow = topk_indices + static_cast<long long>(row) * k;
+    float inv = 1.0f;
+    if (renormalize) {
+      float sum = 0.0f;
+      for (int kk = 0; kk < k; ++kk)
+        sum += s_sel_w[kk];
+      inv = 1.0f / sum;
+    }
+    for (int kk = 0; kk < k; ++kk) {
+      wrow[kk] = renormalize ? (s_sel_w[kk] * inv) : s_sel_w[kk];
+      irow[kk] = s_sel_i[kk];
+    }
+  }
+}
+
+// Dynamic shared-memory bytes for the fused path (scores + selected weights/indices).
+static inline size_t fusedTopkSigmoidSmemBytes(int num_experts, int topk) {
+  return sizeof(float) * static_cast<size_t>(num_experts) + (sizeof(float) + sizeof(int)) * static_cast<size_t>(topk);
+}
+
+// The fused single-launch path covers this shape iff its dynamic shared memory fits a conservative
+// budget (well within the 48 KB default; comfortably covers all real expert counts). Larger
+// num_experts fall back to the moeSigmoid + moeTopK workspace path.
+static inline bool fusedTopkSigmoidFits(int num_experts, int topk) {
+  constexpr size_t kFusedSmemLimit = 32 * 1024;
+  return fusedTopkSigmoidSmemBytes(num_experts, topk) <= kFusedSmemLimit;
+}
+
+template <typename T>
+void launchFusedTopkSigmoid(
+    const T* gating_output,
+    const float* correction_bias,
+    float* topk_weights,
+    int* topk_indices,
+    const int num_tokens,
+    const int num_experts,
+    const int topk,
+    const bool renormalize,
+    cudaStream_t stream) {
+  static constexpr int TPB = 128;  // fewer threads/block -> more resident blocks/SM -> better
+                                   // latency hiding for this __syncthreads-bound reduction kernel
+  const size_t smem = fusedTopkSigmoidSmemBytes(num_experts, topk);
+  fusedTopkSigmoid<T, TPB><<<num_tokens, TPB, smem, stream>>>(
+      gating_output, correction_bias, topk_weights, topk_indices, num_experts, topk, renormalize);
+}
+
 // ====================== TopK sigmoid things ===============================
 
 /*
@@ -472,23 +609,38 @@ void topkGatingSigmoidKernelLauncher(
       LAUNCH_SIGMOID(T, 256, WARPS_PER_TB);
       break;
     default: {
-      TORCH_CHECK(
-          sigmoid_workspace != nullptr,
-          "sigmoid_workspace must be provided for num_experts that are not a power of 2.");
-      static constexpr int TPB = 256;
-      moeSigmoid<T, TPB>
-          <<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, sigmoid_workspace, num_experts, correction_bias);
-      moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-          sigmoid_workspace,
-          nullptr,
-          topk_weights,
-          topk_indices,
-          num_experts,
-          topk,
-          0,
-          num_experts,
-          renormalize,
-          correction_bias);
+      if (fusedTopkSigmoidFits(num_experts, topk)) {
+        // Single fused launch (no workspace) for non-power-of-2 expert counts that fit in shared memory.
+        launchFusedTopkSigmoid<T>(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_indices,
+            num_tokens,
+            num_experts,
+            topk,
+            renormalize,
+            stream);
+      } else {
+        // Fallback: two-launch workspace path for expert counts too large for shared memory.
+        TORCH_CHECK(
+            sigmoid_workspace != nullptr,
+            "sigmoid_workspace must be provided for num_experts that are not a power of 2.");
+        static constexpr int TPB = 256;
+        moeSigmoid<T, TPB>
+            <<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, sigmoid_workspace, num_experts, correction_bias);
+        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
+            sigmoid_workspace,
+            nullptr,
+            topk_weights,
+            topk_indices,
+            num_experts,
+            topk,
+            0,
+            num_experts,
+            renormalize,
+            correction_bias);
+      }
     }
   }
 }
@@ -527,8 +679,10 @@ void topk_sigmoid(
   const int topk = static_cast<int>(topk_weights.size(-1));
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-  const bool needs_workspace = !is_pow_2 || num_experts > 256;
-  const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+  const bool use_default_path = !is_pow_2 || num_experts > 256;
+  // The fused single-launch path needs no workspace; only allocate when we fall back to moeSigmoid+moeTopK.
+  const bool needs_workspace = use_default_path && !fusedTopkSigmoidFits(num_experts, topk);
+  const int64_t workspace_size = needs_workspace ? static_cast<int64_t>(num_tokens) * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
