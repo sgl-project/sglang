@@ -47,6 +47,9 @@ class MatchPrefixParams:
 
     # Mamba specific
     cow_mamba: bool = False
+    # TODO(th4): read only by the mamba box + lmcache backend (+ streaming,
+    # pending removal); full/swa cache paths must not read it. Drop when
+    # streaming is deleted.
     req: Optional[Req] = None
 
     rid: Optional[str] = None
@@ -90,6 +93,9 @@ class CacheFinishParams:
 
     rid: Optional[str] = None
 
+    # TODO(th4): read only by the mamba box + lmcache backend (+ streaming,
+    # pending removal); full/swa cache paths must not read it. Drop when
+    # streaming is deleted.
     req: Optional[Req] = None
 
 
@@ -116,6 +122,9 @@ class CacheUnfinishParams:
     swa_uuid_for_lock: Optional[int] = None
     swa_prefix_lock_released: bool = False
 
+    # TODO(th4): read only by the mamba box + lmcache backend (+ streaming,
+    # pending removal); full/swa cache paths must not read it. Drop when
+    # streaming is deleted.
     req: Optional[Req] = None
 
 
@@ -209,6 +218,9 @@ class InitLoadBackParams:
     best_match_node: Any
     host_hit_length: int
     mem_quota: Optional[int] = None
+    # TODO(th4): read only by the mamba box + lmcache backend (+ streaming,
+    # pending removal); full/swa cache paths must not read it. Drop when
+    # streaming is deleted.
     req: Optional[Req] = None
 
     rid: Optional[str] = None
