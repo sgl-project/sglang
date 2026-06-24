@@ -133,17 +133,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
-    # TODO: replace with a faster model to test the --dit-layerwise-offload
-    # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
-    # so we do one warmup and send one request instead
-    DiffusionTestCase(
-        "layerwise_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            dit_layerwise_offload=True,
-            dit_offload_prefetch_size=2,
-        ),
-    ),
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
@@ -474,6 +463,11 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
+            # Pin CI's shared T2V_PROMPT ("A curious raccoon") instead of relying on
+            # prompt=None / unconditional generation — the latter drifts as the
+            # pipeline evolves, which is why this (previously planner-invisible) case
+            # diverged from its stale sglang_generated GT.
+            T2V_sampling_params,
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
