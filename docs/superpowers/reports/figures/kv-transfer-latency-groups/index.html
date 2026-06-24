@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KV Transfer Latency Groups</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --surface: #FCFCFD;
+      --panel: #FFFFFF;
+      --ink: #1F2430;
+      --muted: #6F768A;
+      --grid: #E6E8F0;
+    }
+    body {
+      margin: 0;
+      background: var(--surface);
+      color: var(--ink);
+      font-family: Aptos, Inter, "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      line-height: 1.2;
+    }
+    .intro {
+      margin: 0 0 24px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .chart-card {
+      margin: 22px 0 32px;
+      padding-top: 10px;
+      border-top: 1px solid var(--grid);
+    }
+    .chart-card h2 {
+      margin: 0 0 4px;
+      font-size: 18px;
+      line-height: 1.25;
+    }
+    .chart-card p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 14px;
+    }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: var(--panel);
+    }
+    code {
+      font-family: Menlo, Consolas, monospace;
+      font-size: 0.95em;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>KV Transfer 背景流量分组延迟曲线</h1>
+    <p class="intro">
+      数据来自 <code>docs/superpowers/reports/2026-06-23-kv-transfer-background-traffic-report.md</code> 中的 Markdown 汇总表。
+      每张图固定同一 baseline/profile，使用不同颜色和线型区分背景流量，x 轴为数据量 log2 刻度，y 轴为 p50 latency ms。
+    </p>
+    
+            <section class="chart-card">
+              <h2>KV-transfer p50 latency: RDMA 200G mlx5_0</h2>
+              <p>Foreground 099 -&gt; 102, p50 latency in ms; colors show background traffic level. Series: bg0 baseline, bg1, bg10, bg50, bg90.</p>
+              <img src="rdma_200_1x200_mlx5_0_p50_latency.svg" alt="KV-transfer p50 latency: RDMA 200G mlx5_0" />
+            </section>
+            
+            <section class="chart-card">
+              <h2>KV-transfer p50 latency: IPv6 mlx5_bond_0</h2>
+              <p>bg0 uses the 1x400 baseline table; bg1-bg90 use manual 200_1x200 dense runs. Series: bg0 baseline, bg1, bg10, bg50, bg90.</p>
+              <img src="rdma_ipv6_bond0_200_1x200_p50_latency.svg" alt="KV-transfer p50 latency: IPv6 mlx5_bond_0" />
+            </section>
+            
+            <section class="chart-card">
+              <h2>KV-transfer p50 latency: IPv6 400_2x200</h2>
+              <p>Two-shard aggregation; logical latency is the max shard latency per size and iteration. Series: bg1, bg10, bg50, bg90.</p>
+              <img src="rdma_ipv6_400_2x200_p50_latency.svg" alt="KV-transfer p50 latency: IPv6 400_2x200" />
+            </section>
+            
+            <section class="chart-card">
+              <h2>KV-transfer p50 latency: IPv6 400_4x100</h2>
+              <p>Four-shard aggregation; logical latency is the max shard latency per size and iteration. Series: bg1, bg10, bg50, bg90.</p>
+              <img src="rdma_ipv6_400_4x100_p50_latency.svg" alt="KV-transfer p50 latency: IPv6 400_4x100" />
+            </section>
+            
+            <section class="chart-card">
+              <h2>KV-transfer p50 latency: IPv6 800_4x200</h2>
+              <p>Four-shard aggregation; logical latency is the max shard latency per size and iteration. Series: bg1, bg10, bg50, bg90.</p>
+              <img src="rdma_ipv6_800_4x200_p50_latency.svg" alt="KV-transfer p50 latency: IPv6 800_4x200" />
+            </section>
+            
+  </main>
+</body>
+</html>

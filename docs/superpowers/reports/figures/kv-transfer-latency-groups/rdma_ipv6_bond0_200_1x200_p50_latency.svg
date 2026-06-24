@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img">
+<title>KV-transfer p50 latency: IPv6 mlx5_bond_0</title>
+<desc>bg0 uses the 1x400 baseline table; bg1-bg90 use manual 200_1x200 dense runs.</desc>
+<rect width="1120" height="720" fill="#FCFCFD" />
+<rect x="90" y="124" width="994" height="504" fill="#FFFFFF" />
+<line x1="90" y1="628.00" x2="1084" y2="628.00" stroke="#E6E8F0" stroke-width="1" />
+<text x="78" y="632.00" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">0</text>
+<line x1="90" y1="502.00" x2="1084" y2="502.00" stroke="#E6E8F0" stroke-width="1" />
+<text x="78" y="506.00" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">20</text>
+<line x1="90" y1="376.00" x2="1084" y2="376.00" stroke="#E6E8F0" stroke-width="1" />
+<text x="78" y="380.00" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">40</text>
+<line x1="90" y1="250.00" x2="1084" y2="250.00" stroke="#E6E8F0" stroke-width="1" />
+<text x="78" y="254.00" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">60</text>
+<line x1="90" y1="124.00" x2="1084" y2="124.00" stroke="#E6E8F0" stroke-width="1" />
+<text x="78" y="128.00" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">80</text>
+<line x1="90.00" y1="124" x2="90.00" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="90.00" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">1MiB</text>
+<line x1="180.36" y1="124" x2="180.36" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="180.36" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">2MiB</text>
+<line x1="270.73" y1="124" x2="270.73" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="270.73" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">4MiB</text>
+<line x1="361.09" y1="124" x2="361.09" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="361.09" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">8MiB</text>
+<line x1="451.45" y1="124" x2="451.45" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="451.45" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">16MiB</text>
+<line x1="541.82" y1="124" x2="541.82" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="541.82" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">32MiB</text>
+<line x1="632.18" y1="124" x2="632.18" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="632.18" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">64MiB</text>
+<line x1="722.55" y1="124" x2="722.55" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="722.55" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">128MiB</text>
+<line x1="812.91" y1="124" x2="812.91" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="812.91" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">256MiB</text>
+<line x1="903.27" y1="124" x2="903.27" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="903.27" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">512MiB</text>
+<line x1="993.64" y1="124" x2="993.64" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="993.64" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">1GiB</text>
+<line x1="1084.00" y1="124" x2="1084.00" y2="628" stroke="#E6E8F0" stroke-width="1" stroke-dasharray="2 6" />
+<text x="1084.00" y="656" text-anchor="middle" font-family="Menlo, Consolas, monospace" font-size="12" fill="#6F768A">2GiB</text>
+<line x1="90" y1="124" x2="90" y2="628" stroke="#D7DBE7" stroke-width="1.2" />
+<line x1="90" y1="628" x2="1084" y2="628" stroke="#D7DBE7" stroke-width="1.2" />
+<text x="90" y="32" text-anchor="start" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="19" font-weight="600" fill="#1F2430">KV-transfer p50 latency: IPv6 mlx5_bond_0</text>
+<text x="90" y="58" text-anchor="start" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="13" fill="#6F768A">bg0 uses the 1x400 baseline table; bg1-bg90 use manual 200_1x200 dense runs.</text>
+<line x1="90" y1="88" x2="124" y2="88" stroke="#5477C4" stroke-width="2.2" />
+<circle cx="107.00" cy="88.00" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<text x="134" y="92" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="12.5" fill="#1F2430">bg0 baseline</text>
+<line x1="240" y1="88" x2="274" y2="88" stroke="#71B436" stroke-width="2.2" stroke-dasharray="7 4" />
+<rect x="254.00" y="85.00" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<text x="284" y="92" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="12.5" fill="#1F2430">bg1</text>
+<line x1="356" y1="88" x2="390" y2="88" stroke="#B8A037" stroke-width="2.2" stroke-dasharray="2 4" />
+<polygon points="373.00,84.20 376.30,90.20 369.70,90.20" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<text x="400" y="92" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="12.5" fill="#1F2430">bg10</text>
+<line x1="472" y1="88" x2="506" y2="88" stroke="#CC6F47" stroke-width="2.2" stroke-dasharray="9 3 2 3" />
+<polygon points="489.00,84.20 492.80,88.00 489.00,91.80 485.20,88.00" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<text x="516" y="92" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="12.5" fill="#1F2430">bg50</text>
+<line x1="588" y1="88" x2="622" y2="88" stroke="#BD569B" stroke-width="2.2" stroke-dasharray="11 5" />
+<circle cx="605.00" cy="88.00" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<text x="632" y="92" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="12.5" fill="#1F2430">bg90</text>
+<polyline points="90.00,627.73 180.36,627.56 270.73,627.23 361.09,626.56 451.45,625.25 541.82,622.66 632.18,617.86 722.55,607.91 812.91,588.16 903.27,550.66 993.64,477.84 1084.00,333.80" fill="none" stroke="#5477C4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+<circle cx="90.00" cy="627.73" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="180.36" cy="627.56" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="270.73" cy="627.23" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="361.09" cy="626.56" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="451.45" cy="625.25" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="541.82" cy="622.66" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="632.18" cy="617.86" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="722.55" cy="607.91" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="812.91" cy="588.16" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="903.27" cy="550.66" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="993.64" cy="477.84" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<circle cx="1084.00" cy="333.80" r="3.2" fill="#5477C4" stroke="#2E4780" stroke-width="1" />
+<text x="1064.00" y="326.80" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="11.5" fill="#5477C4">bg0 baseline 46.7ms</text>
+<polyline points="90.00,627.70 180.36,627.50 270.73,627.14 361.09,626.44 451.45,625.03 504.31,623.63 541.82,622.34 594.68,620.22 632.18,617.69 685.04,612.70 722.55,607.70 775.40,597.75 812.91,587.79 865.77,567.68 903.27,548.44 956.13,508.63 993.64,471.44 1022.73,434.60 1046.50,397.23 1066.59,359.86 1084.00,323.22" fill="none" stroke="#71B436" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 4" />
+<rect x="87.00" y="624.70" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="177.36" y="624.50" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="267.73" y="624.14" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="358.09" y="623.44" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="448.45" y="622.03" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="501.31" y="620.63" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="538.82" y="619.34" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="591.68" y="617.22" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="629.18" y="614.69" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="682.04" y="609.70" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="719.55" y="604.70" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="772.40" y="594.75" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="809.91" y="584.79" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="862.77" y="564.68" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="900.27" y="545.44" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="953.13" y="505.63" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="990.64" y="468.44" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="1019.73" y="431.60" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="1043.50" y="394.23" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="1063.59" y="356.86" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<rect x="1081.00" y="320.22" width="6" height="6" fill="#71B436" stroke="#386411" stroke-width="1" />
+<text x="1064.00" y="316.22" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="11.5" fill="#71B436">bg1 48.4ms</text>
+<polyline points="90.00,627.73 180.36,627.56 270.73,627.23 361.09,626.57 451.45,625.26 504.31,623.93 541.82,622.70 594.68,620.27 632.18,617.86 685.04,612.85 722.55,607.84 775.40,597.84 812.91,587.87 865.77,568.94 903.27,550.58 956.13,513.49 993.64,470.64 1022.73,428.79 1046.50,389.55 1066.59,352.49 1084.00,316.35" fill="none" stroke="#B8A037" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="2 4" />
+<polygon points="90.00,623.93 93.30,629.93 86.70,629.93" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="180.36,623.76 183.66,629.76 177.06,629.76" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="270.73,623.43 274.03,629.43 267.43,629.43" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="361.09,622.77 364.39,628.77 357.79,628.77" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="451.45,621.46 454.75,627.46 448.15,627.46" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="504.31,620.13 507.61,626.13 501.01,626.13" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="541.82,618.90 545.12,624.90 538.52,624.90" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="594.68,616.47 597.98,622.47 591.38,622.47" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="632.18,614.06 635.48,620.06 628.88,620.06" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="685.04,609.05 688.34,615.05 681.74,615.05" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="722.55,604.04 725.85,610.04 719.25,610.04" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="775.40,594.04 778.70,600.04 772.10,600.04" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="812.91,584.07 816.21,590.07 809.61,590.07" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="865.77,565.14 869.07,571.14 862.47,571.14" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="903.27,546.78 906.57,552.78 899.97,552.78" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="956.13,509.69 959.43,515.69 952.83,515.69" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="993.64,466.84 996.94,472.84 990.34,472.84" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="1022.73,424.99 1026.03,430.99 1019.43,430.99" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="1046.50,385.75 1049.80,391.75 1043.20,391.75" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="1066.59,348.69 1069.89,354.69 1063.29,354.69" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<polygon points="1084.00,312.55 1087.30,318.55 1080.70,318.55" fill="#B8A037" stroke="#736422" stroke-width="1" />
+<text x="1064.00" y="309.35" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="11.5" fill="#B8A037">bg10 49.5ms</text>
+<polyline points="90.00,627.21 180.36,626.97 270.73,627.23 361.09,625.15 451.45,622.83 504.31,620.51 541.82,618.23 594.68,615.35 632.18,612.14 685.04,605.73 722.55,599.48 775.40,586.99 812.91,574.78 865.77,550.50 903.27,526.25 956.13,478.40 993.64,430.39 1022.73,382.59 1046.50,335.24 1066.59,287.45 1084.00,239.63" fill="none" stroke="#CC6F47" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 3 2 3" />
+<polygon points="90.00,623.41 93.80,627.21 90.00,631.01 86.20,627.21" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="180.36,623.17 184.16,626.97 180.36,630.77 176.56,626.97" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="270.73,623.43 274.53,627.23 270.73,631.03 266.93,627.23" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="361.09,621.35 364.89,625.15 361.09,628.95 357.29,625.15" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="451.45,619.03 455.25,622.83 451.45,626.63 447.65,622.83" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="504.31,616.71 508.11,620.51 504.31,624.31 500.51,620.51" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="541.82,614.43 545.62,618.23 541.82,622.03 538.02,618.23" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="594.68,611.55 598.48,615.35 594.68,619.15 590.88,615.35" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="632.18,608.34 635.98,612.14 632.18,615.94 628.38,612.14" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="685.04,601.93 688.84,605.73 685.04,609.53 681.24,605.73" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="722.55,595.68 726.35,599.48 722.55,603.28 718.75,599.48" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="775.40,583.19 779.20,586.99 775.40,590.79 771.60,586.99" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="812.91,570.98 816.71,574.78 812.91,578.58 809.11,574.78" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="865.77,546.70 869.57,550.50 865.77,554.30 861.97,550.50" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="903.27,522.45 907.07,526.25 903.27,530.05 899.47,526.25" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="956.13,474.60 959.93,478.40 956.13,482.20 952.33,478.40" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="993.64,426.59 997.44,430.39 993.64,434.19 989.84,430.39" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="1022.73,378.79 1026.53,382.59 1022.73,386.39 1018.93,382.59" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="1046.50,331.44 1050.30,335.24 1046.50,339.04 1042.70,335.24" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="1066.59,283.65 1070.39,287.45 1066.59,291.25 1062.79,287.45" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<polygon points="1084.00,235.83 1087.80,239.63 1084.00,243.43 1080.20,239.63" fill="#CC6F47" stroke="#804126" stroke-width="1" />
+<text x="1064.00" y="232.63" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="11.5" fill="#CC6F47">bg50 61.6ms</text>
+<polyline points="90.00,627.21 180.36,626.90 270.73,626.26 361.09,625.05 451.45,622.66 504.31,620.25 541.82,617.91 594.68,615.06 632.18,611.95 685.04,605.21 722.55,599.10 775.40,586.14 812.91,572.17 865.77,547.60 903.27,522.65 956.13,472.87 993.64,423.91 1022.73,374.66 1046.50,325.21 1066.59,276.05 1084.00,227.09" fill="none" stroke="#BD569B" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="11 5" />
+<circle cx="90.00" cy="627.21" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="180.36" cy="626.90" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="270.73" cy="626.26" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="361.09" cy="625.05" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="451.45" cy="622.66" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="504.31" cy="620.25" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="541.82" cy="617.91" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="594.68" cy="615.06" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="632.18" cy="611.95" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="685.04" cy="605.21" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="722.55" cy="599.10" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="775.40" cy="586.14" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="812.91" cy="572.17" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="865.77" cy="547.60" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="903.27" cy="522.65" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="956.13" cy="472.87" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="993.64" cy="423.91" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="1022.73" cy="374.66" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="1046.50" cy="325.21" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="1066.59" cy="276.05" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<circle cx="1084.00" cy="227.09" r="3.4" fill="#FFFFFF" stroke="#BD569B" stroke-width="2" />
+<text x="1064.00" y="220.09" text-anchor="end" font-family="Menlo, Consolas, monospace" font-size="11.5" fill="#BD569B">bg90 63.6ms</text>
+<text x="587.00" y="696" text-anchor="middle" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="13" fill="#1F2430">Data size, log2 scale</text>
+<text x="24" y="376.00" text-anchor="middle" transform="rotate(-90 24 376.00)" font-family="Aptos, Inter, Segoe UI, Arial, sans-serif" font-size="13" fill="#1F2430">p50 latency (ms)</text>
+</svg>

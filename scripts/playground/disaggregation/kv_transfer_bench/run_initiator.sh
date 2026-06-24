@@ -14,6 +14,23 @@ WARMUP="${WARMUP:-3}"
 REPEAT="${REPEAT:-20}"
 SUMMARY_CSV="${SUMMARY_CSV:-/tmp/kv-transfer-bench/summary.csv}"
 SAMPLES_JSONL="${SAMPLES_JSONL:-/tmp/kv-transfer-bench/samples.jsonl}"
+extra_cli_args=()
+if [[ -n "${RATE_LIMIT_GBPS:-}" ]]; then
+  extra_cli_args+=(--rate-limit-gbps "${RATE_LIMIT_GBPS}")
+fi
+if [[ -n "${CHUNK_SIZE:-}" ]]; then
+  extra_cli_args+=(--chunk-size "${CHUNK_SIZE}")
+fi
+if [[ -n "${BACKGROUND_DURATION_SECONDS:-}" ]]; then
+  extra_cli_args+=(--background-duration-seconds "${BACKGROUND_DURATION_SECONDS}")
+fi
+if [[ -n "${BACKGROUND_BYTES:-}" ]]; then
+  extra_cli_args+=(--background-bytes "${BACKGROUND_BYTES}")
+fi
+extra_cli_args_quoted=""
+if ((${#extra_cli_args[@]} > 0)); then
+  printf -v extra_cli_args_quoted ' %q' "${extra_cli_args[@]}"
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -50,4 +67,4 @@ exec docker run --rm \
   "${extra_env[@]}" \
   "${mounts[@]}" \
   "${SGLANG_IMAGE}" \
-  bash -lc "cd '${workdir}' && PYTHONPATH='${pythonpath}' python3 '${bench_script}' --role initiator --host '${HOST_IP}' --gpu-id '${GPU_ID}' --ib-device '${IB_DEVICE}' --protocol '${PROTOCOL}' --target-info-file '${TARGET_INFO_FILE}' --sizes '${SIZES}' --warmup '${WARMUP}' --repeat '${REPEAT}' --summary-csv '${SUMMARY_CSV}' --samples-jsonl '${SAMPLES_JSONL}'"
+  bash -lc "cd '${workdir}' && PYTHONPATH='${pythonpath}' python3 '${bench_script}' --role initiator --host '${HOST_IP}' --gpu-id '${GPU_ID}' --ib-device '${IB_DEVICE}' --protocol '${PROTOCOL}' --target-info-file '${TARGET_INFO_FILE}' --sizes '${SIZES}' --warmup '${WARMUP}' --repeat '${REPEAT}' --summary-csv '${SUMMARY_CSV}' --samples-jsonl '${SAMPLES_JSONL}'${extra_cli_args_quoted}"

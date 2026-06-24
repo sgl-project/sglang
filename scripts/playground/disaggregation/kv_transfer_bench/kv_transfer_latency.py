@@ -13,7 +13,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b?|b)?\s*$", re.I)
@@ -225,6 +225,73 @@ def _register_buffer(engine, ptr: int, num_bytes: int) -> float:
     return elapsed_ms
 
 
+def _gbps_to_bytes_per_second(rate_limit_gbps: float) -> float:
+    if rate_limit_gbps <= 0:
+        raise ValueError(f"rate limit must be positive: {rate_limit_gbps}")
+    return rate_limit_gbps * 1_000_000_000 / 8
+
+
+def _sleep_until_rate(
+    *,
+    start_ns: int,
+    bytes_sent: int,
+    bytes_per_second: float,
+    now_ns_fn: Callable[[], int],
+    sleep_fn: Callable[[float], None],
+) -> None:
+    target_elapsed_s = bytes_sent / bytes_per_second
+    elapsed_s = (now_ns_fn() - start_ns) / 1_000_000_000
+    sleep_s = target_elapsed_s - elapsed_s
+    if sleep_s > 0:
+        sleep_fn(sleep_s)
+
+
+def _transfer_sync_paced(
+    engine,
+    target: TargetInfo,
+    src_ptr: int,
+    num_bytes: int,
+    chunk_size: int,
+    rate_limit_gbps: Optional[float],
+    now_ns_fn: Callable[[], int] = time.perf_counter_ns,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
+    if num_bytes <= 0:
+        raise ValueError(f"transfer bytes must be positive: {num_bytes}")
+    if num_bytes > target.bytes:
+        raise ValueError(
+            f"requested transfer {format_bytes(num_bytes)} exceeds target "
+            f"buffer {format_bytes(target.bytes)}"
+        )
+    if rate_limit_gbps is None:
+        return engine.transfer_sync(target.session_id, src_ptr, target.ptr, num_bytes)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk size must be positive: {chunk_size}")
+
+    bytes_per_second = _gbps_to_bytes_per_second(rate_limit_gbps)
+    start_ns = now_ns_fn()
+    bytes_sent = 0
+    while bytes_sent < num_bytes:
+        length = min(chunk_size, num_bytes - bytes_sent)
+        ret = engine.transfer_sync(
+            target.session_id,
+            src_ptr + bytes_sent,
+            target.ptr + bytes_sent,
+            length,
+        )
+        if ret != 0:
+            return ret
+        bytes_sent += length
+        _sleep_until_rate(
+            start_ns=start_ns,
+            bytes_sent=bytes_sent,
+            bytes_per_second=bytes_per_second,
+            now_ns_fn=now_ns_fn,
+            sleep_fn=sleep_fn,
+        )
+    return 0
+
+
 def run_target(args: argparse.Namespace) -> int:
     max_bytes = parse_size(args.max_bytes)
     engine = _init_engine(args.host, args.gpu_id, args.ib_device, args.protocol)
@@ -273,26 +340,123 @@ def _sync_cuda(gpu_id: int) -> None:
     torch.cuda.synchronize(gpu_id)
 
 
+def run_background_initiator(
+    args: argparse.Namespace,
+    target: TargetInfo,
+    engine,
+    buffer,
+    register_ms: float,
+    resolved_ib_device: Optional[str],
+    background_bytes: int,
+    chunk_size: int,
+) -> int:
+    if args.background_duration_seconds <= 0:
+        raise ValueError("--background-duration-seconds must be positive")
+
+    _sync_cuda(args.gpu_id)
+    start_ns = time.perf_counter_ns()
+    end_ns = start_ns + int(args.background_duration_seconds * 1_000_000_000)
+    transfer_count = 0
+    error_count = 0
+    ok_bytes = 0
+
+    while time.perf_counter_ns() < end_ns:
+        ret = _transfer_sync_paced(
+            engine,
+            target,
+            buffer.data_ptr(),
+            background_bytes,
+            chunk_size,
+            args.rate_limit_gbps,
+        )
+        if ret == 0:
+            transfer_count += 1
+            ok_bytes += background_bytes
+        else:
+            error_count += 1
+            break
+
+    _sync_cuda(args.gpu_id)
+    elapsed_s = (time.perf_counter_ns() - start_ns) / 1_000_000_000
+    row = {
+        "mode": "background",
+        "source_host": args.host,
+        "target_host": target.host,
+        "source_gpu_id": args.gpu_id,
+        "target_gpu_id": target.gpu_id,
+        "source_ib_device": (
+            args.ib_device if resolved_ib_device is None else resolved_ib_device
+        ),
+        "target_ib_device": target.ib_device,
+        "protocol": args.protocol,
+        "bytes_per_transfer": background_bytes,
+        "human_bytes_per_transfer": format_bytes(background_bytes),
+        "transfer_count": transfer_count,
+        "error_count": error_count,
+        "total_bytes": ok_bytes,
+        "elapsed_s": elapsed_s,
+        "rate_limit_gbps": args.rate_limit_gbps,
+        "chunk_size": chunk_size,
+        "human_chunk_size": format_bytes(chunk_size),
+        "register_ms": register_ms,
+        "observed_payload_GBps": (
+            (ok_bytes / 1024**3) / elapsed_s if elapsed_s > 0 else None
+        ),
+    }
+    print(json.dumps(row, sort_keys=True), flush=True)
+    write_csv_summary(args.summary_csv, [row])
+    write_jsonl_samples(args.samples_jsonl, [])
+    print(f"summary_csv={args.summary_csv}", flush=True)
+    print(f"samples_jsonl={args.samples_jsonl}", flush=True)
+    return 0 if error_count == 0 else 1
+
+
 def run_initiator(args: argparse.Namespace) -> int:
     sizes = parse_size_list(args.sizes)
     target = _load_target_from_args(args)
-    if max(sizes) > target.bytes:
+    chunk_size = parse_size(args.chunk_size)
+    background_bytes = (
+        parse_size(args.background_bytes) if args.background_bytes else max(sizes)
+    )
+    max_transfer_bytes = (
+        background_bytes if args.background_duration_seconds > 0 else max(sizes)
+    )
+    if args.background_duration_seconds < 0:
+        raise ValueError("--background-duration-seconds cannot be negative")
+    if max_transfer_bytes > target.bytes:
         raise ValueError(
-            f"largest requested size {format_bytes(max(sizes))} exceeds target "
+            f"largest requested size {format_bytes(max_transfer_bytes)} exceeds target "
             f"buffer {format_bytes(target.bytes)}"
         )
 
     engine = _init_engine(args.host, args.gpu_id, args.ib_device, args.protocol)
-    buffer = _allocate_gpu_buffer(max(sizes), args.gpu_id)
-    register_ms = _register_buffer(engine, buffer.data_ptr(), max(sizes))
+    buffer = _allocate_gpu_buffer(max_transfer_bytes, args.gpu_id)
+    register_ms = _register_buffer(engine, buffer.data_ptr(), max_transfer_bytes)
     resolved_ib_device = engine.get_ib_device()
+
+    if args.background_duration_seconds > 0:
+        return run_background_initiator(
+            args,
+            target,
+            engine,
+            buffer,
+            register_ms,
+            resolved_ib_device,
+            background_bytes,
+            chunk_size,
+        )
 
     rows = []
     samples = []
     for num_bytes in sizes:
         for _ in range(args.warmup):
-            ret = engine.transfer_sync(
-                target.session_id, buffer.data_ptr(), target.ptr, num_bytes
+            ret = _transfer_sync_paced(
+                engine,
+                target,
+                buffer.data_ptr(),
+                num_bytes,
+                chunk_size,
+                args.rate_limit_gbps,
             )
             if ret != 0:
                 raise RuntimeError(
@@ -305,8 +469,13 @@ def run_initiator(args: argparse.Namespace) -> int:
         for iteration in range(args.repeat):
             _sync_cuda(args.gpu_id)
             start_ns = time.perf_counter_ns()
-            ret = engine.transfer_sync(
-                target.session_id, buffer.data_ptr(), target.ptr, num_bytes
+            ret = _transfer_sync_paced(
+                engine,
+                target,
+                buffer.data_ptr(),
+                num_bytes,
+                chunk_size,
+                args.rate_limit_gbps,
             )
             _sync_cuda(args.gpu_id)
             latency_ms = (time.perf_counter_ns() - start_ns) / 1e6
@@ -325,6 +494,8 @@ def run_initiator(args: argparse.Namespace) -> int:
                     "iteration": iteration,
                     "latency_ms": latency_ms,
                     "ret": ret,
+                    "rate_limit_gbps": args.rate_limit_gbps,
+                    "chunk_size": chunk_size,
                 }
             )
 
@@ -344,6 +515,9 @@ def run_initiator(args: argparse.Namespace) -> int:
             "repeat_count": args.repeat,
             "error_count": error_count,
             "register_ms": register_ms,
+            "rate_limit_gbps": args.rate_limit_gbps,
+            "chunk_size": chunk_size,
+            "human_chunk_size": format_bytes(chunk_size),
         }
         if ok_latencies:
             row.update(summarize_latencies_ms(ok_latencies, num_bytes))
@@ -383,6 +557,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sizes", default="1MB:1GB:x2")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument(
+        "--rate-limit-gbps",
+        type=float,
+        default=None,
+        help=(
+            "Optional application-level Mooncake payload rate limit in Gbit/s. "
+            "When set, each logical transfer is split into --chunk-size chunks "
+            "and paced with sleeps."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-size",
+        default="16MB",
+        help="Chunk size used when --rate-limit-gbps is set.",
+    )
+    parser.add_argument(
+        "--background-duration-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "When > 0, initiator runs a paced Mooncake background stream for "
+            "this many seconds instead of latency measurements."
+        ),
+    )
+    parser.add_argument(
+        "--background-bytes",
+        default=None,
+        help=(
+            "Logical transfer size for background mode. Defaults to the largest "
+            "value from --sizes."
+        ),
+    )
     parser.add_argument(
         "--summary-csv",
         default="/tmp/kv-transfer-bench/summary.csv",

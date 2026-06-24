@@ -1,6 +1,7 @@
 import csv
 import json
 
+from scripts.playground.disaggregation.kv_transfer_bench import kv_transfer_latency as bench
 from scripts.playground.disaggregation.kv_transfer_bench.kv_transfer_latency import (
     TargetInfo,
     build_parser,
@@ -111,3 +112,149 @@ def test_parser_accepts_initiator_role():
 
     assert args.role == "initiator"
     assert args.sizes == "1MB:8MB:x2"
+
+
+def test_parser_accepts_paced_transfer_options():
+    args = build_parser().parse_args(
+        [
+            "--role",
+            "initiator",
+            "--host",
+            "fd03:4514:80:6240::1",
+            "--target-info-json",
+            "{}",
+            "--sizes",
+            "512MB",
+            "--rate-limit-gbps",
+            "50",
+            "--chunk-size",
+            "8MB",
+            "--background-duration-seconds",
+            "120",
+            "--background-bytes",
+            "512MB",
+        ]
+    )
+
+    assert args.rate_limit_gbps == 50.0
+    assert args.chunk_size == "8MB"
+    assert args.background_duration_seconds == 120.0
+    assert args.background_bytes == "512MB"
+
+
+class _FakeEngine:
+    def __init__(self, ret_values=None):
+        self.calls = []
+        self.ret_values = list(ret_values or [])
+
+    def transfer_sync(self, session_id, src_ptr, dst_ptr, length):
+        self.calls.append((session_id, src_ptr, dst_ptr, length))
+        if self.ret_values:
+            return self.ret_values.pop(0)
+        return 0
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now_ns = 0
+        self.sleeps = []
+
+    def now(self):
+        return self.now_ns
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now_ns += int(seconds * 1_000_000_000)
+
+
+def test_transfer_sync_paced_preserves_single_transfer_when_unlimited():
+    engine = _FakeEngine()
+    target = TargetInfo(
+        session_id="target:1234",
+        host="target",
+        gpu_id=0,
+        ptr=2000,
+        bytes=4096,
+        ib_device="mlx5_bond_0",
+        protocol="rdma",
+    )
+    clock = _FakeClock()
+
+    ret = bench._transfer_sync_paced(
+        engine,
+        target,
+        src_ptr=1000,
+        num_bytes=300,
+        chunk_size=128,
+        rate_limit_gbps=None,
+        now_ns_fn=clock.now,
+        sleep_fn=clock.sleep,
+    )
+
+    assert ret == 0
+    assert engine.calls == [("target:1234", 1000, 2000, 300)]
+    assert clock.sleeps == []
+
+
+def test_transfer_sync_paced_chunks_and_sleeps_to_target_rate():
+    engine = _FakeEngine()
+    target = TargetInfo(
+        session_id="target:1234",
+        host="target",
+        gpu_id=0,
+        ptr=2000,
+        bytes=4096,
+        ib_device="mlx5_bond_0",
+        protocol="rdma",
+    )
+    clock = _FakeClock()
+
+    ret = bench._transfer_sync_paced(
+        engine,
+        target,
+        src_ptr=1000,
+        num_bytes=300,
+        chunk_size=128,
+        rate_limit_gbps=0.000008,
+        now_ns_fn=clock.now,
+        sleep_fn=clock.sleep,
+    )
+
+    assert ret == 0
+    assert engine.calls == [
+        ("target:1234", 1000, 2000, 128),
+        ("target:1234", 1128, 2128, 128),
+        ("target:1234", 1256, 2256, 44),
+    ]
+    assert [round(v, 3) for v in clock.sleeps] == [0.128, 0.128, 0.044]
+
+
+def test_transfer_sync_paced_stops_on_transfer_error():
+    engine = _FakeEngine(ret_values=[0, -1, 0])
+    target = TargetInfo(
+        session_id="target:1234",
+        host="target",
+        gpu_id=0,
+        ptr=2000,
+        bytes=4096,
+        ib_device="mlx5_bond_0",
+        protocol="rdma",
+    )
+    clock = _FakeClock()
+
+    ret = bench._transfer_sync_paced(
+        engine,
+        target,
+        src_ptr=1000,
+        num_bytes=300,
+        chunk_size=128,
+        rate_limit_gbps=0.000008,
+        now_ns_fn=clock.now,
+        sleep_fn=clock.sleep,
+    )
+
+    assert ret == -1
+    assert engine.calls == [
+        ("target:1234", 1000, 2000, 128),
+        ("target:1234", 1128, 2128, 128),
+    ]
