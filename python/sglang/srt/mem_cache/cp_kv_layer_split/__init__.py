@@ -16,24 +16,30 @@ from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_layout import (
     shard_cp_kv_layer_split_swa,
 )
 from sglang.srt.mem_cache.cp_kv_layer_split.ownership import (
-    CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS,
-    assert_cp_kv_layer_split_hicache_supported,
     build_owned_layer_local_index_map,
     kv_layer_owner,
     kv_layer_owner_global_rank,
     layers_per_cp_rank,
-    num_owned_compress_layers,
     num_owned_kv_layers,
-    num_stage_compress_layers,
     owned_kv_layer_range,
     owns_kv_layer,
-    should_use_cp_kv_layer_split_pool,
-    validate_cp_kv_layer_split_model_arch,
 )
 from sglang.srt.mem_cache.cp_kv_layer_split.pool_base import (
     CpKvLayerSplitPoolBase,
     is_cp_kv_layer_split_pool,
 )
+
+
+def should_use_cp_kv_layer_split_pool(server_args=None) -> bool:
+    """True when prefill CP KV LayerSplit should wire the specialized pool."""
+    from sglang.srt.server_args import get_global_server_args
+
+    args = server_args or get_global_server_args()
+    return bool(
+        args.enable_cp_kv_layer_split
+        and args.enable_dsa_prefill_context_parallel
+        and args.attn_cp_size > 1
+    )
 
 
 def maybe_reset_cp_kv_layer_split_active_pages(pool) -> None:
@@ -43,11 +49,9 @@ def maybe_reset_cp_kv_layer_split_active_pages(pool) -> None:
 
 
 __all__ = [
-    "CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS",
     "CpKvLayerSplitDeepSeekV4PoolLayout",
     "CpKvLayerSplitPoolBase",
     "any_cp_kv_layer_split_cache_sharded",
-    "assert_cp_kv_layer_split_hicache_supported",
     "build_cp_kv_layer_split_deepseek_v4_pool_layout",
     "build_cp_kv_layer_split_deepseek_v4_worst_case_pool_layout",
     "build_owned_layer_local_index_map",
@@ -57,9 +61,7 @@ __all__ = [
     "kv_layer_owner_global_rank",
     "layers_per_cp_rank",
     "maybe_reset_cp_kv_layer_split_active_pages",
-    "num_owned_compress_layers",
     "num_owned_kv_layers",
-    "num_stage_compress_layers",
     "owned_kv_layer_range",
     "owns_kv_layer",
     "shard_cp_kv_layer_split_c4",
@@ -67,5 +69,4 @@ __all__ = [
     "shard_cp_kv_layer_split_c128",
     "shard_cp_kv_layer_split_swa",
     "should_use_cp_kv_layer_split_pool",
-    "validate_cp_kv_layer_split_model_arch",
 ]

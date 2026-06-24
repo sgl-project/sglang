@@ -105,6 +105,11 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS = (
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
+)
+CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
@@ -3629,14 +3634,6 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        from sglang.srt.mem_cache.cp_kv_layer_split import (
-            assert_cp_kv_layer_split_hicache_supported,
-            validate_cp_kv_layer_split_model_arch,
-        )
-
-        validate_cp_kv_layer_split_model_arch(self, model_arch)
-        assert_cp_kv_layer_split_hicache_supported(self)
-
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -5247,6 +5244,29 @@ class ServerArgs:
     def _handle_cp_kv_layer_split(self):
         if not self.enable_cp_kv_layer_split:
             return
+
+        if (
+            self.model_path.lower() not in ("none", "dummy")
+            and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
+        ):
+            model_arch = self.get_model_config().hf_config.architectures[0]
+            if model_arch not in CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS:
+                supported = ", ".join(CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS)
+                raise ValueError(
+                    "--enable-cp-kv-layer-split is not supported for model arch "
+                    f"{model_arch!r}. Supported architectures: {supported}."
+                )
+
+        backend = self.hicache_storage_backend
+        if (
+            backend is not None
+            and backend not in CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS
+        ):
+            supported = ", ".join(CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS)
+            raise ValueError(
+                f"--enable-cp-kv-layer-split + --hicache-storage-backend={backend!r} "
+                f"is not yet supported. Supported backends under CP KV LayerSplit: {supported}."
+            )
 
         if not self.enable_dsa_prefill_context_parallel:
             raise ValueError(

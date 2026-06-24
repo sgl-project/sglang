@@ -28,7 +28,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.cp_kv_layer_split import (
-    assert_cp_kv_layer_split_hicache_supported,
     build_cp_kv_layer_split_deepseek_v4_worst_case_pool_layout,
     cp_kv_layer_split_sharding_flags,
     should_use_cp_kv_layer_split_pool,
@@ -470,8 +469,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.start_layer = mr.start_layer
         self.end_layer = mr.end_layer
         self.use_cp_kv_layer_split = should_use_cp_kv_layer_split_pool(mr.server_args)
-        if self.use_cp_kv_layer_split:
-            assert_cp_kv_layer_split_hicache_supported(mr.server_args)
         self.attn_cp_size = mr.server_args.attn_cp_size
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]

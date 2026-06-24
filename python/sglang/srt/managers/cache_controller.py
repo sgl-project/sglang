@@ -449,8 +449,6 @@ class HiCacheController:
             self.storage_config.cp_kv_layer_split
             and self.storage_config.attn_cp_size > 1
         ):
-            from sglang.srt.layers.dp_attention import get_attention_tp_rank
-
             backup_primary_rank = get_attention_tp_rank()
         else:
             backup_primary_rank = self.storage_config.tp_rank

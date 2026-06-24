@@ -16,6 +16,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_size,
@@ -1010,8 +1011,6 @@ class ModelRunnerKVCacheMixin:
         # attention-CP ranks. Capacity must therefore be identical within the CP
         # group so every rank allocates the same page-buffer shape.
         if should_use_cp_kv_layer_split_pool(self.server_args):
-            from sglang.srt.layers.dp_attention import get_attention_cp_group
-
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

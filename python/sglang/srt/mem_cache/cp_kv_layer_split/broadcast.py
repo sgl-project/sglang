@@ -86,15 +86,6 @@ class BroadcastSlots:
         pending = self.pending(kind)
         if pending.work is None:
             return
-        if next_layer_id is not None:
-            logger.debug(
-                "[cp-kv-layer-split] finishing pending %s broadcast before "
-                "starting next one: cp_rank=%s pending_layer=%s next_layer=%s",
-                kind,
-                self._cp_rank,
-                pending.layer_id,
-                next_layer_id,
-            )
         if pending.stream is not None:
             torch.cuda.current_stream().wait_stream(pending.stream)
         pending.work = None

@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.cp_kv_layer_split.ownership import _family_layer_count
+from sglang.srt.mem_cache.cp_kv_layer_split.ownership import (
+    num_owned_kv_layers,
+    owned_kv_layer_range,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,80 @@ def cp_kv_layer_split_sharding_flags() -> dict[str, bool]:
 
 def any_cp_kv_layer_split_cache_sharded() -> bool:
     return any(cp_kv_layer_split_sharding_flags().values())
+
+
+def _num_stage_compress_layers(
+    start_layer: int,
+    end_layer_exclusive: int,
+    compression_ratios: list[int],
+    compress_ratio: int,
+) -> int:
+    return sum(
+        1
+        for layer_id in range(start_layer, end_layer_exclusive)
+        if compression_ratios[layer_id] == compress_ratio
+    )
+
+
+def _num_owned_compress_layers(
+    cp_rank: int,
+    cp_size: int,
+    model_num_hidden_layers: int,
+    start_layer: int,
+    end_layer_exclusive: int,
+    compression_ratios: list[int],
+    compress_ratio: int,
+) -> int:
+    owned_start, owned_end = owned_kv_layer_range(
+        cp_rank, cp_size, model_num_hidden_layers, start_layer, end_layer_exclusive
+    )
+    return _num_stage_compress_layers(
+        owned_start,
+        owned_end,
+        compression_ratios,
+        compress_ratio,
+    )
+
+
+def _family_layer_count(
+    *,
+    sharded: bool,
+    cp_rank: int,
+    cp_size: int,
+    model_num_hidden_layers: int,
+    start_layer: int,
+    end_layer_exclusive: int,
+    compression_ratios: list[int],
+    compress_ratio: Optional[int] = None,
+) -> int:
+    """Count one DSV4 KV family for a pool layout."""
+    if compress_ratio is None:
+        if not sharded:
+            return end_layer_exclusive - start_layer
+        return num_owned_kv_layers(
+            cp_rank,
+            cp_size,
+            model_num_hidden_layers,
+            start_layer,
+            end_layer_exclusive,
+        )
+
+    if not sharded:
+        return _num_stage_compress_layers(
+            start_layer,
+            end_layer_exclusive,
+            compression_ratios,
+            compress_ratio,
+        )
+    return _num_owned_compress_layers(
+        cp_rank,
+        cp_size,
+        model_num_hidden_layers,
+        start_layer,
+        end_layer_exclusive,
+        compression_ratios,
+        compress_ratio,
+    )
 
 
 def build_cp_kv_layer_split_deepseek_v4_pool_layout(

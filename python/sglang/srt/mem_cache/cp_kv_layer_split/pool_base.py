@@ -95,17 +95,6 @@ class CpKvLayerSplitPoolBase:
             else:
                 staging[:1].copy_(source[:1])
 
-        logger.debug(
-            "[cp-kv-layer-split] compact broadcast cp_rank=%s layer=%s owner_cp=%s "
-            "active_pages=%s capacity=%s page_size=%s",
-            self.cp_rank,
-            layer_id,
-            owner_cp,
-            active_pages,
-            staging.shape[0],
-            page_size,
-        )
-
         pynccl_comm = get_pynccl_broadcast_comm()
         if async_kind is not None:
             self._broadcast_slots.start(
