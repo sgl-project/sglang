@@ -2165,16 +2165,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name:
-            name = name.replace(".scale", scale_target)
+        if "self_attn" in name and name.endswith(".scale"):
+            name = name[: -len(".scale")] + scale_target
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name:
-            name = name.replace(".scale", scale_target)
+        if "mlp" in name and name.endswith(".scale"):
+            name = name[: -len(".scale")] + scale_target
 
         return name
 
