@@ -2058,7 +2058,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(self.tree_cache, RefAwareCacheMixin):
             allow_high = any(
                 self.tree_cache.is_high_priority(req.priority or 0)
-                for req in reqs
+                for req in self.reqs
             )
             with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
                 out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
