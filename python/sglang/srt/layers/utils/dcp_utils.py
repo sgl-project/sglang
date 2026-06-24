@@ -16,10 +16,16 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_world_size,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda_alike
 
 
 def dcp_enabled() -> bool:
+    """
+    only checks whether dcp enabled for cuda platform
+    """
     if get_dcp_group_no_assert() is None:
+        return False
+    if not is_cuda_alike():
         return False
     return get_dcp_world_size() > 1
 
