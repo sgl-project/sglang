@@ -880,6 +880,10 @@ class ModelRunnerKVCacheMixin:
                             HiSparseTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
                                 page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
                         )
