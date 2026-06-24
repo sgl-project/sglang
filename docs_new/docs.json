@@ -1200,6 +1200,13 @@
                     ]
                   },
                   {
+                    "group": "Krea",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Krea/Krea-2"
+                    ]
+                  },
+                  {
                     "group": "ERNIE-Image",
                     "pages": [
                       "cookbook/diffusion/Ernie-Image/Ernie-Image"
