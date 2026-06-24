@@ -14,7 +14,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUUnquantMoEMethod,
-    NPUUnquantMoEMethodGGUF,
 )
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
