@@ -636,11 +636,17 @@ class HiSparseCoordinator:
         """Load top-k selected tokens into device memory and return their device indices.
 
         This is a naive per-request loop implementation for debugging/validation.
-        Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
+        Production code uses swap_in_selected_pages (JIT CUDA/HIP kernel) instead.
+        Used as a kernel oracle in test_hisparse_unit.py.
 
-        Note: dsv4 hisparse is not supported — DeepSeekV4SingleKVPoolHost has no
-        load_to_device_per_layer and indices live in compressed space. Currently
-        only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
+        Both the non-dsv4 and the dsv4 (DeepSeek V4 separate-KV C4) layouts are
+        supported. The per-request loc-selection logic below is layout-agnostic:
+        it indexes req_to_device_buffer / req_to_host_pool and delegates the
+        host->device byte copy to mem_pool_host.load_to_device_per_layer. For the
+        dsv4 path mem_pool_host is a DeepSeekV4PagedHostPool (which implements
+        load_to_device_per_layer for the token-granular, page-padded C4 value/
+        scale layout), and seq_lens / top_k_tokens are expressed in compressed C4
+        space (matching swap_in_selected_pages, called with compressed_seq_lens).
 
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
@@ -651,9 +657,6 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
