@@ -17,7 +17,11 @@ inline constexpr float log2e = 1.44269504088896340736f;
 /// \brief Constant: ln(2)
 inline constexpr float loge2 = 0.693147180559945309417f;
 /// \brief Maximum representable value for FP8 E4M3 format.
-inline constexpr float FP8_E4M3_MAX = 448.0f;
+/// Arch-aware: 448 on CUDA / AMD OCP e4m3fn (gfx950), 224 on AMD e4m3fnuz
+/// (gfx942). Mirrors kFP8E4M3Max so fp8 quant scale divisors and clamps in
+/// the dsv4 compute path (indexer Q-quant, MoE silu+mul / dispatch quant,
+/// GEMM per-tensor quant) do not over-saturate fnuz hardware.
+inline constexpr float FP8_E4M3_MAX = ::kFP8E4M3Max;
 static_assert(log2e * loge2 == 1.0f, "log2e * loge2 must be 1");
 
 /// \brief Returns the larger of `a` and `b`.
