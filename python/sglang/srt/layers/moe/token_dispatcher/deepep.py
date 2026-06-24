@@ -689,8 +689,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
-            if self.deepep_output_dtype == DispatcherOutputDtype.BF16:
-                hidden_states_scale = None
         else:
             hidden_states_scale = None
 
