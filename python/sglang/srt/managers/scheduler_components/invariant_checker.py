@@ -303,9 +303,9 @@ class SchedulerInvariantChecker:
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
+        last_iter = self.get_last_iter()
+        if last_iter is not None:
+            for req in last_iter.reqs:
                 _add_owner(
                     req,
                     f"req {req.rid}",
