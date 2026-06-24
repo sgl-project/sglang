@@ -53,8 +53,8 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
-    ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
+    ("mem_cache/owned_kv.py", "alloc_for_extend", "evict"): 1,
+    ("mem_cache/owned_kv.py", "alloc_for_decode", "evict"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
@@ -79,9 +79,7 @@ _OWNER_SITES = {
     ): 1,
     # streaming session slot save/restore and tail trimming
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
-    (_SS, "SessionSlot.save_from_req", "kv_allocated_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
-    (_SS, "SessionSlot.restore_to_req", "kv_allocated_len"): 1,
     (_SS, "StreamingSession._free_tail", "kv_committed_len"): 2,
     (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 2,
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,

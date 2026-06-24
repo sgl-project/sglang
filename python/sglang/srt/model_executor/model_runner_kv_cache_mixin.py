@@ -23,9 +23,9 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kv_cache_utils import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,

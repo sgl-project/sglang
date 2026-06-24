@@ -1,0 +1,38 @@
+[importlinter]
+root_packages =
+    sglang.srt.mem_cache
+include_external_packages = False
+
+[importlinter:contract:owned-kv-must-not-import-cache-backends]
+name = owned_kv must not directly import a concrete cache backend
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    sglang.srt.mem_cache.owned_kv
+forbidden_modules =
+    sglang.srt.mem_cache.radix_cache
+    sglang.srt.mem_cache.swa_radix_cache
+    sglang.srt.mem_cache.mamba_radix_cache
+    sglang.srt.mem_cache.unified_radix_cache
+    sglang.srt.mem_cache.chunk_cache
+    sglang.srt.mem_cache.hiradix_cache
+    sglang.srt.mem_cache.hi_mamba_radix_cache
+    sglang.srt.mem_cache.radix_cache_cpp
+    sglang.srt.mem_cache.unified_cache_components
+
+[importlinter:contract:cache-backends-must-not-import-owned-kv]
+name = cache backends must not directly import owned_kv
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    sglang.srt.mem_cache.radix_cache
+    sglang.srt.mem_cache.swa_radix_cache
+    sglang.srt.mem_cache.mamba_radix_cache
+    sglang.srt.mem_cache.unified_radix_cache
+    sglang.srt.mem_cache.chunk_cache
+    sglang.srt.mem_cache.hiradix_cache
+    sglang.srt.mem_cache.hi_mamba_radix_cache
+    sglang.srt.mem_cache.radix_cache_cpp
+    sglang.srt.mem_cache.unified_cache_components
+forbidden_modules =
+    sglang.srt.mem_cache.owned_kv

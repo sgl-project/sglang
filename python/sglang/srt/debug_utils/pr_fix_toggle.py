@@ -70,7 +70,7 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.mem_cache.common.get_req_to_token_extra_context_len
+  - target: sglang.srt.mem_cache.kv_cache_utils.get_req_to_token_extra_context_len
     edits:
       - match: |
           if (

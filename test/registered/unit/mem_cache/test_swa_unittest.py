@@ -16,8 +16,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.owned_kv import available_and_evictable_str
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache

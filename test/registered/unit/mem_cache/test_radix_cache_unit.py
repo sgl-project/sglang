@@ -17,7 +17,7 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.owned_kv import available_and_evictable_str
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner

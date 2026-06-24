@@ -143,6 +143,7 @@ test = [
   "diff-cover",
   "expecttest",
   "granian>=2.6.0",
+  "import-linter>=2.0",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
