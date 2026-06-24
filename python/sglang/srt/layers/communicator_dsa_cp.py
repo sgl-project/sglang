@@ -35,14 +35,11 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
     get_attention_cp_group,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_size,
-    get_attention_tp_size,
     get_local_dp_buffer,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 
 def dsa_enable_prefill_cp():
@@ -53,8 +50,8 @@ def dsa_enable_prefill_cp():
 
 
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
-    attn_dp_size = get_attention_dp_size()
-    attn_tp_size = get_attention_tp_size()
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
     hidden_states, local_hidden_states = (
         get_local_dp_buffer(get_attention_cp_group()),
@@ -65,11 +62,11 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
 
 
 def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
-    attn_dp_size = get_attention_dp_size()
-    attn_tp_size = get_attention_tp_size()
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
