@@ -43,6 +43,7 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>MXFP4</th>
     </tr>
   </thead>
   <tbody>
@@ -51,43 +52,49 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI300X/MI325X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=4</td>
     </tr>
   </tbody>
 </table>
 
 - **H100 and H200**: FP8 is the recommended deployment path.
 - **B300 and GB300**: NVFP4 is the recommended deployment path. Use `nvidia/GLM-5.1-NVFP4` with `--quantization modelopt_fp4`. Use `tp=8` on B300 and `tp=4` on GB300. The CUDA 13 image variant is required for B300 and GB300.
-- **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
+- **AMD GPUs**: BF16 and FP8 checkpoints run on MI300X/MI325X/MI355X at tp=8. On MI355X (gfx950), the MXFP4 checkpoint `amd/GLM-5.1-MXFP4` is also supported at tp=4 with `--kv-cache-dtype fp8_e4m3`. All AMD paths pass `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`, `--chunked-prefill-size 131072`, and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is supported on MI355X (gfx950) and unverified on MI300X/MI325X (gfx942).
 - For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5.1 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to enable the [IndexCache](https://github.com/THUDM/IndexCache) method for GLM-5.1. This can improve serving efficiency with only a small accuracy loss. If you are running rigorous accuracy evaluations, do not enable this feature.
 
@@ -153,6 +160,32 @@ sglang serve \
 ### 4.2 MI300X/MI325X/MI355X (ROCm) Server Command
 
 The following ROCm commands are additional options for AMD GPUs and do not replace the NVIDIA instructions above.
+
+#### MXFP4 (MI355X / gfx950)
+
+On MI355X (gfx950), set `SGLANG_DSA_TRITON_PREFILL=1` to enable a faster Triton attention kernel for the prefill phase (opt-in, off by default). Keep `--dsa-prefill-backend tilelang` as shown. The EAGLE speculative-decoding flags below are optional but recommended on gfx950.
+
+```shell Command
+# SGLANG_DSA_TRITON_PREFILL=1 is optional; it enables a faster Triton prefill kernel on gfx950
+SGLANG_DSA_TRITON_PREFILL=1 sglang serve \
+  --model-path amd/GLM-5.1-MXFP4 \
+  --tp 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --chunked-prefill-size 131072 \
+  --mem-fraction-static 0.85 \
+  --watchdog-timeout 1200 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --host 0.0.0.0 \
+  --port 30000
+```
 
 #### FP8 (Recommended)
 
