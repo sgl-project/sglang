@@ -339,10 +339,7 @@ def create_scheduler_watchdog(
         last_iter = scheduler.last_iter
         cur_batch_size = len(last_iter.reqs) if last_iter is not None else 0
         cur_batch_reqs = last_iter.reqs if last_iter is not None else []
-        return (
-            f"{cur_batch_size=}\n"
-            f"{cur_batch_reqs=}\n" + "\n".join(messages)
-        )
+        return f"{cur_batch_size=}\n" f"{cur_batch_reqs=}\n" + "\n".join(messages)
 
     return WatchdogRaw(
         debug_name="Scheduler",

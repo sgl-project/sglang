@@ -172,9 +172,6 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
-from sglang.srt.managers.scheduler_components.last_iter_snapshot import (
-    LastIterSnapshot,
-)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -184,6 +181,9 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
+)
+from sglang.srt.managers.scheduler_components.last_iter_snapshot import (
+    LastIterSnapshot,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
@@ -2645,9 +2645,7 @@ class Scheduler(
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -3957,9 +3955,7 @@ class Scheduler(
 
         if last_batch and last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
