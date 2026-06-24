@@ -181,21 +181,6 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             cp_kv_layer_split_layout=layout,
         )
         self._rebuild_compressed_layer_mapping_for_cp()
-        if logger.isEnabledFor(logging.DEBUG):
-            host_mapping = self.get_hicache_host_layer_mapping()
-            logger.debug(
-                "CpKvLayerSplitDeepSeekV4TokenToKVPool: cp_rank=%s HiCache host-pool "
-                "owned counts: swa=%s c4_kv=%s c128_kv=%s c4_indexer=%s c4_state=%s "
-                "c128_state=%s c4_indexer_state=%s",
-                cp_rank,
-                len(host_mapping["swa"]),
-                len(host_mapping["c4_kv"]),
-                len(host_mapping["c128_kv"]),
-                len(host_mapping["c4_indexer"]),
-                len(host_mapping["c4_state"]),
-                len(host_mapping["c128_state"]),
-                len(host_mapping["c4_indexer_state"]),
-            )
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size

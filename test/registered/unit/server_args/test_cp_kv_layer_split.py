@@ -1,6 +1,7 @@
 """Unit tests for --enable-cp-kv-layer-split ServerArgs guards."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
@@ -39,6 +40,17 @@ class TestCpKvLayerSplitServerArgs(CustomTestCase):
 
         self.assertTrue(args.enable_cp_kv_layer_split)
         self.assertTrue(args.disable_cuda_graph)
+
+    def test_rejects_unsupported_model_arch(self):
+        args = _make_layer_split_args()
+        args.model_path = "unsupported-model"
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"])
+        )
+
+        with patch.object(ServerArgs, "get_model_config", return_value=model_config):
+            with self.assertRaisesRegex(ValueError, "not supported for model arch"):
+                args._handle_cp_kv_layer_split()
 
     def test_disables_cuda_graph_backends_when_config_is_present(self):
         args = _make_layer_split_args()

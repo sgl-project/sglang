@@ -1275,8 +1275,6 @@ class MQALayer(MqaAttentionBase):
                 get_token_to_kv_pool(), self.layer_id, forward_batch
             )
         else:
-            # Always run prepare (even x.shape[0]==0) so every CP rank hits the
-            # same post-store sync inside _forward_prepare before indexer/compressor.
             q, kv = self._forward_prepare(
                 x,
                 positions,

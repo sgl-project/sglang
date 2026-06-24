@@ -272,8 +272,8 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
 
 
 @dataclass
-class _V4HostLayerMappings:
-    """Per-family ``{pp_local_id -> local_buffer_index}`` for V4 HiCache.
+class _DeepSeekV4HostLayerMappings:
+    """Per-family ``{pp_local_id -> local_buffer_index}`` for DeepSeek V4 HiCache.
 
     Under CP KV LayerSplit each map drops non-owned layers so the cache
     controller's per-entry ``layer_mapper`` returns ``None`` for them and skips
@@ -291,11 +291,13 @@ class _V4HostLayerMappings:
     c4_indexer_state: dict[int, int]
 
 
-def _compute_v4_host_layer_mappings(kvcache: Any) -> _V4HostLayerMappings:
+def _compute_deepseek_v4_host_layer_mappings(
+    kvcache: Any,
+) -> _DeepSeekV4HostLayerMappings:
     # CP KV LayerSplit pool exposes the per-rank owned view explicitly.
     if hasattr(kvcache, "get_hicache_host_layer_mapping"):
         raw = kvcache.get_hicache_host_layer_mapping()
-        return _V4HostLayerMappings(
+        return _DeepSeekV4HostLayerMappings(
             swa=raw["swa"],
             c4_kv=raw["c4_kv"],
             c128_kv=raw["c128_kv"],
@@ -333,7 +335,7 @@ def _compute_v4_host_layer_mappings(kvcache: Any) -> _V4HostLayerMappings:
             c128_state_pp_locals.append(layer_id)
     c4_state = {pp_local: i for i, pp_local in enumerate(c4_state_pp_locals)}
     c128_state = {pp_local: i for i, pp_local in enumerate(c128_state_pp_locals)}
-    return _V4HostLayerMappings(
+    return _DeepSeekV4HostLayerMappings(
         swa=swa,
         c4_kv=c4_kv,
         c128_kv=c128_kv,
@@ -370,7 +372,7 @@ def build_deepseek_v4_hicache_stack(
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
-    mappings = _compute_v4_host_layer_mappings(kvcache)
+    mappings = _compute_deepseek_v4_host_layer_mappings(kvcache)
     swa_layer_mapping = mappings.swa
     c4_layer_mapping = mappings.c4_kv
     c128_layer_mapping = mappings.c128_kv

@@ -6,7 +6,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_cp_round_robin_split_data,
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
     CpKvLayerSplitDeepSeekV4TokenToKVPool,
 )
@@ -111,8 +115,6 @@ def maybe_all_gather_cp_kv_layer_split_raw_loc(
         return raw_loc
 
     if raw_loc.shape[0] == kv_num_tokens * pool.cp_size:
-        from sglang.srt.layers.attention.dsa.utils import dsa_cp_round_robin_split_data
-
         return dsa_cp_round_robin_split_data(raw_loc)
 
     if raw_loc.shape[0] * pool.cp_size != kv_num_tokens:
@@ -121,8 +123,6 @@ def maybe_all_gather_cp_kv_layer_split_raw_loc(
             f"raw_loc={raw_loc.shape[0]}, kv_num_tokens={kv_num_tokens}, "
             f"cp_size={pool.cp_size}"
         )
-
-    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 
     return cp_all_gather_rerange_output(
         raw_loc.contiguous(),
