@@ -82,12 +82,22 @@ class CustomSpecAlgo:
     def is_ngram(self) -> bool:
         return False
 
+    def is_hybrid_suffix_mtp(self) -> bool:
+        return False
+
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
+
+    def need_topk(self) -> bool:
+        # Mirrors SpeculativeAlgorithm.need_topk: EAGLE-family / standalone draft
+        # paths carry topk sampling state. Plugins that dispatch like NGRAM
+        # short-circuit before this is consulted; HYBRID (is_eagle True) does
+        # traverse the EAGLE path in overlap_utils, so it must answer True here.
+        return self.is_eagle() or self.is_standalone()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass

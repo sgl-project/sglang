@@ -1649,6 +1649,32 @@ class ServerArgs:
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
 
+    # SUFFIX speculative decoding (arctic_inference SuffixDecodingCache)
+    speculative_suffix_max_tree_depth: A[
+        int,
+        "Max depth of the per-request suffix tree for SUFFIX speculative decoding.",
+    ] = 24
+    speculative_suffix_max_cached_requests: A[
+        int,
+        "Max number of finished requests cached in the shared suffix tree for SUFFIX speculative decoding.",
+    ] = 10000
+    speculative_suffix_max_spec_factor: A[
+        float,
+        "SUFFIX max speculation factor: caps draft length relative to the matched suffix score.",
+    ] = 1.0
+    speculative_suffix_min_token_prob: A[
+        float,
+        "SUFFIX minimum per-token probability for a draft token to be proposed.",
+    ] = 0.1
+
+    # HYBRID_SUFFIX_MTP (per-batch SUFFIX / MTP / NONE dispatch)
+    speculative_hybrid_mtp_always_warm: A[
+        bool,
+        "HYBRID_SUFFIX_MTP: after a SUFFIX-backed step, also run the MTP draft "
+        "keep-up forward so a subsequent MTP-picked step starts with warm draft "
+        "state (extra compute per SUFFIX step; off by default).",
+    ] = False
+
     # -------------------------------------------------------------------------
     # Expert parallelism
     # -------------------------------------------------------------------------

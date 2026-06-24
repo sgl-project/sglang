@@ -1,0 +1,164 @@
+"""Register the SUFFIX and HYBRID_SUFFIX_MTP speculative-decoding algorithms.
+
+HYBRID_SUFFIX_MTP (``_HybridLike`` / ``HybridSuffixMTPWorkerV2``) dispatches
+per batch among SUFFIX (NGRAM-style), MTP (EAGLE-style), and NONE (plain
+decode); it reports both ``is_ngram()`` and ``is_eagle()`` True so every
+builtin dispatch branch triggers, and swaps the matching cuda-graph runner
+before each verify.
+
+SUFFIX is registered as a *plugin* algorithm (``SpeculativeAlgorithm.register``)
+rather than a builtin enum value. ``_SuffixLike.is_ngram()`` returns ``True`` so
+SUFFIX transparently reuses every existing NGRAM dispatch branch in the
+scheduler / cuda-graph runner / model runner — the verify and KV-cache path is
+identical; only the draft source differs (see ``SuffixWorker``). NGRAM's worker
+is spec-v2 native, so SUFFIX inherits overlap-scheduling support
+(``supports_overlap=True``; the scheduler drives the same worker synchronously
+when overlap is disabled). The factory is imported lazily so
+``arctic_inference`` is required only when SUFFIX is actually selected.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Type
+
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+
+class _SuffixLike(CustomSpecAlgo):
+    """SUFFIX dispatches like NGRAM (shared verify / KV-cache path)."""
+
+    def is_ngram(self) -> bool:
+        return True
+
+    def is_suffix(self) -> bool:
+        return True
+
+    def has_draft_kv(self) -> bool:
+        # SUFFIX dispatches like NGRAM: the draft tree lives only in the verify
+        # mask, no draft KV chains are written. Mirrors the builtin enum's
+        # ``not is_ngram()``; the CustomSpecAlgo base conservatively defaults True.
+        return False
+
+    def carries_draft_hidden_states(self) -> bool:
+        # Model-free: the disagg prefill->decode transfer ships nothing beyond
+        # the bonus token (no draft hidden states), so the metadata buffer uses
+        # the minimal RDMA pad. The CustomSpecAlgo base omits this method
+        # entirely, but Scheduler.init_disaggregation (decode mode) calls it.
+        return False
+
+    def create_future_map(
+        self,
+        device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+    ):
+        # CustomSpecAlgo base does not provide this (the scheduler calls it
+        # unconditionally); mirror SpeculativeAlgorithm.create_future_map.
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+    def build_disagg_draft_input(
+        self,
+        batch,
+        server_args,
+        last_tokens_tensor,
+        future_map,
+    ):
+        # PD disaggregation: reconstruct the first decode batch's draft input
+        # on the decode instance (see suffix_disaggregation.py). SUFFIX is
+        # model-free, so unlike EAGLE nothing beyond the bonus token has to be
+        # shipped from the prefill instance.
+        from sglang.srt.speculative.suffix_disaggregation import (
+            build_suffix_disagg_draft_input,
+        )
+
+        return build_suffix_disagg_draft_input(
+            batch, server_args, last_tokens_tensor, future_map
+        )
+
+
+def _suffix_factory(server_args: ServerArgs) -> Type:
+    from sglang.srt.speculative.suffix_worker import SuffixWorker
+
+    return SuffixWorker
+
+
+class _HybridLike(CustomSpecAlgo):
+    """HYBRID_SUFFIX_MTP dispatches per-batch among SUFFIX (NGRAM-style),
+    MTP (EAGLE-style), and NONE (plain decode). It returns ``True`` for both
+    ``is_ngram()`` and ``is_eagle()`` so existing builtin-only branches still
+    trigger; the worker (``HybridSuffixMTPWorkerV2``) chooses the backend per
+    batch via :class:`HybridBackendSelector` and swaps the matching cuda-graph
+    runner before each verify.
+    """
+
+    def is_ngram(self) -> bool:
+        return True
+
+    def is_eagle(self) -> bool:
+        return True
+
+    def is_hybrid_suffix_mtp(self) -> bool:
+        return True
+
+    def has_draft_kv(self) -> bool:
+        # The MTP path writes a real EAGLE draft KV chain, so the draft KV pool
+        # must be allocated (unlike pure SUFFIX/NGRAM). The kv_cache_builder /
+        # overlap-FutureMap ngram short-circuits are exempted for HYBRID via
+        # ``is_ngram() and not is_hybrid_suffix_mtp()``.
+        return True
+
+    def carries_draft_hidden_states(self) -> bool:
+        # MTP keep-up carries draft hidden states (EAGLE-family). Only consulted
+        # in PD-disagg (out of scope here), but keep it EAGLE-consistent.
+        return True
+
+    def create_future_map(
+        self,
+        device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+    ):
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+
+def _hybrid_factory(server_args: ServerArgs) -> Type:
+    from sglang.srt.speculative.hybrid_suffix_mtp_worker_v2 import (
+        HybridSuffixMTPWorkerV2,
+    )
+
+    return HybridSuffixMTPWorkerV2
+
+
+def _validate_suffix_args(server_args: ServerArgs) -> None:
+    required = (
+        "speculative_suffix_max_tree_depth",
+        "speculative_suffix_max_cached_requests",
+        "speculative_suffix_max_spec_factor",
+        "speculative_suffix_min_token_prob",
+    )
+    missing = [a for a in required if not hasattr(server_args, a)]
+    if missing:
+        raise ValueError(f"SUFFIX speculative decoding requires server args {missing}.")
+
+
+SpeculativeAlgorithm.register(
+    "SUFFIX",
+    supports_overlap=True,
+    validate_server_args=_validate_suffix_args,
+    spec_class=_SuffixLike,
+)(_suffix_factory)
+
+SpeculativeAlgorithm.register(
+    "HYBRID_SUFFIX_MTP",
+    supports_overlap=True,
+    validate_server_args=_validate_suffix_args,
+    spec_class=_HybridLike,
+)(_hybrid_factory)

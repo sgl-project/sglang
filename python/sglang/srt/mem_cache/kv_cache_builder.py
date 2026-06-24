@@ -51,7 +51,11 @@ def get_draft_kv_pool(
 ):
     """Return (draft_token_to_kv_pool, draft_model_config) for the current
     draft worker, or (None, None) when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
+    if draft_worker is None or (
+        spec_algorithm.is_ngram() and not spec_algorithm.is_hybrid_suffix_mtp()
+    ):
+        # HYBRID is exempt: the MTP backend writes a real EAGLE draft KV chain,
+        # so its draft KV pool must be allocated despite is_ngram() being True.
         return None, None
 
     # V2 workers nest the draft runner under `.draft_worker`.

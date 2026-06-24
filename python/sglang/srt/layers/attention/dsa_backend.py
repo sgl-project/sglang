@@ -636,7 +636,16 @@ class DeepseekSparseAttnBackend(
         device = forward_batch.seq_lens.device
 
         if forward_batch.forward_mode.is_target_verify():
-            draft_token_num = self.speculative_num_draft_tokens
+            # Per-forward verify width. HYBRID_SUFFIX_MTP verifies at K_suffix
+            # for the SUFFIX backend and K_mtp (= num_steps + 1) for the MTP
+            # backend on the SAME target, so the metadata width must come from
+            # the batch's spec_info, not the static config. Falls back to the
+            # config value for builtin EAGLE/NGRAM (whose spec_info carries the
+            # same number).
+            draft_token_num = (
+                getattr(forward_batch.spec_info, "draft_token_num", None)
+                or self.speculative_num_draft_tokens
+            )
         else:
             draft_token_num = 0
 
@@ -685,22 +694,22 @@ class DeepseekSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
-                batch_size * self.speculative_num_draft_tokens + 1,
+                batch_size * draft_token_num + 1,
                 1,
                 dtype=torch.int32,
                 device=device,
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            extend_seq_lens_cpu = [draft_token_num] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             seqlens_expanded = seqlens_expand_triton(
                 torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
                 cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens,
+                draft_token_num * batch_size,
+                draft_token_num,
             )
             page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                page_table, repeats=draft_token_num, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
@@ -721,18 +730,28 @@ class DeepseekSparseAttnBackend(
                 device=device,
             )
 
+            # Per-forward draft-extend width. HYBRID_SUFFIX_MTP's MTP backend
+            # draft-extends by K_mtp (= num_steps + 1) while the target backend's
+            # static speculative_num_draft_tokens is K_suffix, so the metadata
+            # width must come from the batch, not the config. For builtin EAGLE
+            # V2 these are equal, so behaviour is unchanged.
+            draft_extend_width = (
+                forward_batch.extend_num_tokens // batch_size
+                if batch_size > 0
+                else self.speculative_num_draft_tokens
+            )
             seqlens_expanded = seqlens_expand_triton(
                 forward_batch.extend_seq_lens,
                 cache_seqlens_int32,
                 sum(extend_seq_lens_cpu),
-                self.speculative_num_draft_tokens,
+                draft_extend_width,
             )
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
-                # tokens upfront. All requests extend by the same fixed
-                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
+                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL
+                # speculated tokens upfront; all requests extend by the same
+                # fixed width (draft_extend_width above).
                 page_table = torch.repeat_interleave(
-                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                    page_table, repeats=draft_extend_width, dim=0
                 )
             else:
                 # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
@@ -983,6 +1002,24 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = dsa_cp_round_robin_split_data(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    def _cuda_graph_draft_token_num(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> int:
+        """Per-graph draft width = the count added to seq_lens for this forward.
+
+        Used both as the metadata-dict sub-key and as the verify/extend width.
+        HYBRID_SUFFIX_MTP captures three target-verify graphs at different widths
+        (K_suffix / K_mtp / 1) on the SAME backend, so the width must come from
+        the batch's spec_info, not the static config. Returns 0 for decode/idle
+        so a width-1 NONE verify never collides with a plain decode graph.
+        """
+        if forward_mode.is_target_verify():
+            w = getattr(spec_info, "draft_token_num", None)
+            return int(w) if w else self.speculative_num_draft_tokens
+        if forward_mode.is_draft_extend_v2():
+            return self.speculative_num_draft_tokens
+        return 0
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -991,7 +1028,20 @@ class DeepseekSparseAttnBackend(
 
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
+
+        Idempotent / grow-only: HYBRID_SUFFIX_MTP builds three decode graph
+        runners (K_suffix / K_mtp / 1) that share this one backend instance and
+        each call init_cuda_graph_state. The widest runner (K_suffix) is built
+        first, so later (narrower) calls must NOT wipe the already-allocated
+        buffers or the per-(bs, width) entries captured so far. Only (re)allocate
+        when the request needs more tokens than currently provisioned.
         """
+        if (
+            getattr(self, "decode_cuda_graph_metadata", None) is not None
+            and getattr(self, "_cuda_graph_max_num_tokens", 0) >= max_num_tokens
+        ):
+            return
+        self._cuda_graph_max_num_tokens = max_num_tokens
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1073,29 +1123,31 @@ class DeepseekSparseAttnBackend(
             else:
                 flashmla_metadata = None
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
+            # Per-graph width (K_suffix / K_mtp / 1 for HYBRID); equals the
+            # static config for builtin EAGLE/NGRAM.
+            cg_draft_token_num = self._cuda_graph_draft_token_num(
+                forward_mode, spec_info
             )
+            cache_seqlens_int32 = (seq_lens + cg_draft_token_num).to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
             page_table_1 = self.decode_cuda_graph_metadata["page_table"][
-                : bs * self.speculative_num_draft_tokens, :
+                : bs * cg_draft_token_num, :
             ]
             max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = torch.arange(
                 0,
-                bs * self.speculative_num_draft_tokens + 1,
+                bs * cg_draft_token_num + 1,
                 1,
                 dtype=torch.int32,
                 device=self.device,
             )
 
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            extend_seq_lens_cpu = [cg_draft_token_num] * bs
 
             seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens.tolist()
+                cg_draft_token_num + kv_len for kv_len in seq_lens.tolist()
             ]
             seqlens_expanded = torch.cat(
                 [
@@ -1115,12 +1167,12 @@ class DeepseekSparseAttnBackend(
             dsa_cache_seqlens_int32 = compute_dsa_seqlens(
                 seqlens_expanded, dsa_index_topk=self.dsa_index_topk
             )
-            dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
+            dsa_extend_seq_lens_list = [1] * bs * cg_draft_token_num
 
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
+                ].slice(slice(0, bs * cg_draft_token_num + 1))
 
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
@@ -1167,6 +1219,15 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
         )
+        # Key by (bs, width) so HYBRID's three target-verify graphs (K_suffix /
+        # K_mtp / 1) coexist on this shared backend instead of clobbering one
+        # bs slot. width=0 for decode/idle keeps those distinct from a width-1
+        # NONE verify. Also keep the legacy bs-only key so single-K call sites
+        # (the multi-step draft wrapper / from_precomputed fast path) that look
+        # up `[bs]` keep working unchanged — for a single-K backend both keys
+        # point at the same (only) entry.
+        cg_key = (bs, self._cuda_graph_draft_token_num(forward_mode, spec_info))
+        self.decode_cuda_graph_metadata[cg_key] = metadata
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -1189,7 +1250,11 @@ class DeepseekSparseAttnBackend(
         """
         assert seq_lens_cpu is not None
 
-        if bs not in self.decode_cuda_graph_metadata:
+        # (bs, width) key so HYBRID's K_suffix / K_mtp / 1 verify graphs each
+        # resolve to their own captured metadata (see _cuda_graph_draft_token_num).
+        cg_draft_token_num = self._cuda_graph_draft_token_num(forward_mode, spec_info)
+        cg_key = (bs, cg_draft_token_num)
+        if cg_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1210,7 +1275,7 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[cg_key]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -1228,31 +1293,29 @@ class DeepseekSparseAttnBackend(
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
-            max_seqlen_k = int(
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
+            max_seqlen_k = int(seq_lens_cpu.max().item() + cg_draft_token_num)
 
-            cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
+            cache_seqlens = (seq_lens + cg_draft_token_num).to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
             page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                page_indices, repeats=cg_draft_token_num, dim=0
             )
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
+                page_indices
+            )
+            extend_seq_lens_cpu = [cg_draft_token_num] * bs
 
             seqlens_expanded = seqlens_expand_triton(
                 torch.tensor(
                     extend_seq_lens_cpu, dtype=torch.int32, device=self.device
                 ),
                 cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
+                cg_draft_token_num * bs,
+                cg_draft_token_num,
             )
             metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
             dsa_cache_seqlens = compute_dsa_seqlens(
@@ -1375,6 +1438,8 @@ class DeepseekSparseAttnBackend(
         """
         self.set_dsa_prefill_impl(forward_batch=None)
 
+        # Single-K fast path (multi-step draft wrapper): the legacy bs-only key
+        # is kept in sync by _build_forward_metadata_cuda_graph's dual store.
         metadata = self.decode_cuda_graph_metadata[bs]
 
         # Track whether fused kernel succeeded
