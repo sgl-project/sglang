@@ -1,7 +1,9 @@
 [importlinter]
 root_packages =
     sglang.srt.mem_cache
+    sglang.srt.managers
 include_external_packages = False
+exclude_type_checking_imports = True
 
 [importlinter:contract:owned-kv-must-not-import-cache-backends]
 name = owned_kv must not directly import a concrete cache backend
@@ -36,3 +38,19 @@ source_modules =
     sglang.srt.mem_cache.unified_cache_components
 forbidden_modules =
     sglang.srt.mem_cache.owned_kv
+
+[importlinter:contract:owned-kv-and-cache-must-not-import-schedule-batch]
+name = owned_kv and the full/swa cache backends must not import schedule_batch at runtime
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    sglang.srt.mem_cache.owned_kv
+    sglang.srt.mem_cache.radix_cache
+    sglang.srt.mem_cache.swa_radix_cache
+    sglang.srt.mem_cache.unified_radix_cache
+    sglang.srt.mem_cache.chunk_cache
+    sglang.srt.mem_cache.unified_cache_components.full_component
+    sglang.srt.mem_cache.unified_cache_components.swa_component
+    sglang.srt.mem_cache.unified_cache_components.tree_component
+forbidden_modules =
+    sglang.srt.managers.schedule_batch
