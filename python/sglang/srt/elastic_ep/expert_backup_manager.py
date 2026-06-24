@@ -9,7 +9,7 @@ import zmq
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import BackupDramReq
+from sglang.srt.managers.io_struct import BackupDramReq, sock_recv, sock_send
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.server_args import (
@@ -62,7 +62,7 @@ class ExpertBackupManager:
         num_ready_clients = 0
 
         while num_ready_clients < server_args.tp_size:
-            self.recv_from_expert_backup_client.recv_pyobj()
+            sock_recv(self.recv_from_expert_backup_client)
             num_ready_clients += 1
 
         back_req = BackupDramReq(
@@ -72,7 +72,7 @@ class ExpertBackupManager:
             buffer_size=self.continuous_buffer.numel()
             * self.continuous_buffer.element_size(),
         )
-        self.send_to_expert_backup_client.send_pyobj(back_req)
+        sock_send(self.send_to_expert_backup_client, back_req)
 
         # Keep the manager subprocess alive until signals
         signal.pause()
