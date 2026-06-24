@@ -895,17 +895,13 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             for e in range(num_experts):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
                 # The raw dequantised shape should be (2*intermediate_full, hidden)
-                rows = 2 * intermediate_size
-                cols = hidden_size
+                rows = layer.w13_qweight.tensor_shape[1]   # 2 * intermediate_size_per_partition
+                cols = layer.w13_qweight.tensor_shape[2]   # hidden_size
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
-                dequant = (
-                    torch.from_numpy(dequant_np)
-                    .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)
-                    .transpose(-1, -2)        # -> (hidden, 2*intermediate_full)
-                    .contiguous()
-                )
-                w13_dequant.append(dequant)
+                dequant = torch.from_numpy(dequant_np).to(dtype=self.params_dtype,
+                         device=w13_qweight.device).reshape(rows, cols)
+                # w13 needs shape (hidden, 2*intermediate) → transpose
+                dequant = dequant.transpose(-1, -2).contiguous()
             w13_full = torch.stack(w13_dequant, dim=0)  # (E, hidden, 2*intermediate_full)
         else:
             # Already float, but may need reshape
@@ -915,17 +911,17 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     
         # Split w13 along intermediate dimension (dim=1 of the 2*intermediate part)
         if tp_size > 1:
-            # w13_full has shape (E, hidden, 2*intermediate_full). We split the intermediate_full portion.
-            # Each rank takes a slice of size inter_per_rank from the gate half and the up half.
-            # The full intermediate dimension is split into tp parts.
-            gate_start = tp_rank * inter_per_rank
-            gate_end   = gate_start + inter_per_rank
-            up_start   = intermediate_size + tp_rank * inter_per_rank
-            up_end     = up_start + inter_per_rank
-            gate_part = w13_full[:, :, gate_start:gate_end]
-            up_part   = w13_full[:, :, up_start:up_end]
-            w13_full = torch.cat([gate_part, up_part], dim=-1).contiguous()
-            # Now shape (E, hidden, 2*inter_per_rank)
+            inter_full = w13_full.shape[1] // 2
+            assert inter_full % tp_size == 0
+            inter_per_rank = inter_full // tp_size
+            start = tp_rank * inter_per_rank
+            end = start + inter_per_rank
+            gate = w13_full[:, :inter_full, :]          # (E, inter_full, hidden)
+            up   = w13_full[:, inter_full:, :]
+            gate = gate[:, start:end, :]
+            up   = up[:, start:end, :]
+            w13_per_rank = torch.cat([gate, up], dim=1)  # (E, 2*inter_per_rank, hidden)
+
     
         layer.register_buffer("w13_dequant", w13_full, persistent=False)
     
@@ -939,17 +935,11 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             for e in range(num_experts):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
                 # The raw dequantised shape should be (intermediate_full, hidden)
-                rows = intermediate_size
-                cols = hidden_size
+                rows = layer.w2_qweight.tensor_shape[1]   # intermediate_size_per_partition
+                cols = layer.w2_qweight.tensor_shape[2]   # hidden_size
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
-                dequant = (
-                    torch.from_numpy(dequant_np)
-                    .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)
-                    .transpose(-1, -2)        # -> (hidden, intermediate_full)
-                    .contiguous()
-                )
-                w2_dequant.append(dequant)
+                dequant = torch.from_numpy(dequant_np).to(dtype=self.params_dtype,
+                         device=w2_qweight.device).reshape(rows, cols)
             w2_full = torch.stack(w2_dequant, dim=0)  # (E, hidden, intermediate_full)
         else:
             w2_full = w2_qweight.data
@@ -958,9 +948,9 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     
         # Split w2 along intermediate dimension (dim=2)
         if tp_size > 1:
-            start = tp_rank * inter_per_rank
-            end   = start + inter_per_rank
-            w2_full = w2_full[:, :, start:end].contiguous()
+            start2 = tp_rank * inter_per_rank
+            end2 = start2 + inter_per_rank
+            w2_per_rank = w2_full[:, start2:end2, :]     # (E, inter_per_rank, hidden)
             # Now shape (E, hidden, inter_per_rank)
     
         layer.register_buffer("w2_dequant", w2_full, persistent=False)
