@@ -975,7 +975,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         batch_info = self.lora_backend.batch_info
 
         lora_ranks = batch_info.lora_ranks
-        max_lora_rank = self.down_lora_a_weights.shape[2]
         cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
@@ -984,16 +983,32 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm():
-            # Per-rank (local) expert count the LoRA buffers are indexed by, so
-            # virtual-experts indexing matches the buffers under EP.
-            num_experts = (
-                self.down_lora_a_weights.shape[1]
-                if self.down_lora_a_weights is not None
-                else self.base_layer.num_local_experts
-            )
+        # opt3: num_experts / max_lora_rank / hidden_size are layer-static (buffer-sized at
+        # init, never change across forwards). Compute once and cache so _get_lora_info trims
+        # its per-layer Python on the EAGER prefill path (decode runs under cuda-graph, so it
+        # sees this only at capture). Only scalars are cached — tensor refs stay read fresh,
+        # so an adapter swap can never serve stale weights.
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        _lean = lora_envs.SGLANG_OPT_LORA_LEAN_INFO.get()
+        _cache = getattr(self, "_lean_info_static", None)
+        if _cache is not None and _lean:
+            num_experts, max_lora_rank, hidden_size = _cache
         else:
-            num_experts = self.base_layer.num_experts
+            max_lora_rank = self.down_lora_a_weights.shape[2]
+            hidden_size = getattr(self.base_layer, "hidden_size", 0)
+            if self._lora_runner_backend.is_experimental_sgl_trtllm():
+                # Per-rank (local) expert count the LoRA buffers are indexed by, so
+                # virtual-experts indexing matches the buffers under EP.
+                num_experts = (
+                    self.down_lora_a_weights.shape[1]
+                    if self.down_lora_a_weights is not None
+                    else self.base_layer.num_local_experts
+                )
+            else:
+                num_experts = self.base_layer.num_experts
+            if _lean:
+                self._lean_info_static = (num_experts, max_lora_rank, hidden_size)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -1012,7 +1027,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             cg_buffers=cg_buffers,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            hidden_size=getattr(self.base_layer, "hidden_size", 0),
+            hidden_size=hidden_size,
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
