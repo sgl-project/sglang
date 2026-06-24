@@ -198,6 +198,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
+- `shape_discovery` (optional): Whether to record tensor shapes for Triton / FlashInfer / aiter kernels that otherwise bypass the PyTorch profiler. Requires shape recording to be enabled (the default). Default is `false`. See [Kernel Shape Discovery](#kernel-shape-discovery)
 
 **Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
 
@@ -295,6 +296,76 @@ python -m sglang.profiler \
 The profile merger generates:
 - Individual rank trace files: `&#123;profile_id&#125;-TP-&#123;tp&#125;-DP-&#123;dp&#125;-PP-&#123;pp&#125;-EP-&#123;ep&#125;.trace.json.gz`
 - Merged trace file: `merged-&#123;profile_id&#125;.trace.json.gz`
+
+### Kernel Shape Discovery
+
+Many SGLang kernels (Triton attention/MoE kernels, FlashInfer ops, and aiter ops on AMD) are launched in a way that bypasses the PyTorch profiler's operator recording, so they appear in a trace **without** `Input Dims` / `Input type`. This makes it hard to correlate a kernel in the timeline with the tensor shapes it ran on (for example, the `tilelang_sparse_fwd` operation when running GLM-style models shows up with no shape metadata).
+
+**Shape discovery** closes this gap. When enabled, SGLang wraps a registry of kernel entry points (plus auto-discovered kernel launchers under `flashinfer.*`, `sglang.srt.*`, and `aiter.ops.*`) so they are recorded as operator events with their tensor shapes. The implementation lives in `python/sglang/srt/utils/kernel_shape_profiler.py`; it is activated only while a profiling session is running and is fully reverted afterwards, so it has no effect on normal serving.
+
+This feature behaves identically in eager mode and graph (CUDA graph) mode, with one extra opt-in for the graph-capture trace described below.
+
+#### Prerequisites
+
+Shape recording must be enabled for shape discovery to take effect. It is on by default; the relevant environment variables are:
+
+```bash Command
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+export SGLANG_PROFILE_RECORD_SHAPES=True   # default True; required for shape discovery
+export SGLANG_PROFILE_WITH_STACK=True      # default True; optional, adds call stacks
+```
+
+If `SGLANG_PROFILE_RECORD_SHAPES` is set to `False`, the `shape_discovery` flag is ignored.
+
+#### Execution profiling (eager and graph mode)
+
+Pass `shape_discovery: true` in the `/start_profile` request. The captured trace will then contain shape information for the kernels that were previously missing it.
+
+```bash Command
+# Start profiling with shape discovery enabled
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "/tmp/profiles",
+    "num_steps": 10,
+    "activities": ["CPU", "GPU"],
+    "shape_discovery": true
+  }'
+```
+
+A typical workflow:
+
+```bash Command
+# Terminal 1: Start the server
+export SGLANG_TORCH_PROFILER_DIR=/tmp/profiles
+export SGLANG_PROFILE_RECORD_SHAPES=True
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+
+# Terminal 2: Profile a few steps with shape discovery
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{"num_steps": 10, "shape_discovery": true}'
+
+# Terminal 3: Generate load
+python -m sglang.bench_serving --backend sglang --num-prompts 100
+```
+
+Open the resulting trace (see [View traces](#view-traces)) and confirm that the previously shape-less kernels now report `Input Dims`.
+
+#### CUDA graph capture profiling
+
+CUDA graph **capture** is profiled separately from execution:
+
+1. In graph mode without any profiling flags, graph capture proceeds without being profiled (unchanged default behavior).
+2. Launch the server with `--enable-profile-cuda-graph` to generate a trace for the graph capture process. By itself, this does **not** run shape discovery.
+3. To additionally record kernel shapes in the graph-capture trace, launch the server with `--enable-shape-discovery-for-cuda-graph-profile` together with `--enable-profile-cuda-graph`:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-profile-cuda-graph \
+  --enable-shape-discovery-for-cuda-graph-profile
+```
 
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
