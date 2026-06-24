@@ -40,7 +40,7 @@ _MEGA_MOE_DG_ENV_APPLIED = False
 
 
 def _apply_mega_moe_dg_env() -> None:
-    """Forward MegaMOE env defaults before DeepGEMM first use.
+    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
 
     DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
     call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
@@ -55,14 +55,6 @@ def _apply_mega_moe_dg_env() -> None:
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
         os.environ.setdefault("DG_USE_MXF4_KIND", "1")
-    if torch.cuda.is_available():
-        try:
-            if torch.cuda.get_device_capability()[0] >= 10:
-                # PyTorch CUDA symmetric-memory multicast can hang during
-                # DeepGEMM MegaMOE rendezvous on SM100.
-                os.environ.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "1")
-        except RuntimeError:
-            pass
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
@@ -290,45 +282,27 @@ def build_mega_moe_experts_weights(experts) -> None:
     w2 = experts.w2_weight.data
     w2_sf_fp32 = experts.w2_weight_scale_inv.data
 
-    num_groups, n1, packed_k1 = w13.shape
-    _, n2, packed_k2 = w2.shape
+    num_groups, n1, half_k1 = w13.shape
+    k1 = half_k1 * 2
+    _, n2, half_k2 = w2.shape
+    k2 = half_k2 * 2
 
-    quant_method = getattr(experts, "quant_method", None)
-    is_fp4_packed = bool(
-        getattr(quant_method, "is_fp4_expert", False)
-        or getattr(experts, "_mega_moe_weights_are_fp4", False)
+    w13_sf = transform_sf_into_required_layout(
+        w13_sf_fp32,
+        mn=n1,
+        k=k1,
+        recipe=(1, 32),
+        num_groups=num_groups,
+        disable_ue8m0_cast=False,
     )
-    scales_format_ue8m0 = bool(
-        getattr(experts.w13_weight_scale_inv, "format_ue8m0", False)
-        and getattr(experts.w2_weight_scale_inv, "format_ue8m0", False)
+    w2_sf = transform_sf_into_required_layout(
+        w2_sf_fp32,
+        mn=n2,
+        k=k2,
+        recipe=(1, 32),
+        num_groups=num_groups,
+        disable_ue8m0_cast=False,
     )
-    if is_fp4_packed:
-        k1 = packed_k1 * 2
-        k2 = packed_k2 * 2
-    else:
-        k1 = packed_k1
-        k2 = packed_k2
-
-    if scales_format_ue8m0 and not is_fp4_packed:
-        w13_sf = w13_sf_fp32
-        w2_sf = w2_sf_fp32
-    else:
-        w13_sf = transform_sf_into_required_layout(
-            w13_sf_fp32,
-            mn=n1,
-            k=k1,
-            recipe=(1, 32),
-            num_groups=num_groups,
-            disable_ue8m0_cast=False,
-        )
-        w2_sf = transform_sf_into_required_layout(
-            w2_sf_fp32,
-            mn=n2,
-            k=k2,
-            recipe=(1, 32),
-            num_groups=num_groups,
-            disable_ue8m0_cast=False,
-        )
 
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
         # Build the interleaved L1 weight + scale once; share the weight buffer
