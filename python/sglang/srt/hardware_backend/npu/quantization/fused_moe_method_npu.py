@@ -700,7 +700,6 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
-        split_item,
     ) -> torch.Tensor:
         return self.matmul.forward(
             quant_info,
@@ -709,5 +708,4 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            split_item=split_item,
         )
