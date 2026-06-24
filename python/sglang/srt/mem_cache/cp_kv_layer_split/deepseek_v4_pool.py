@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 class _BatchActivePages:
     """Per-forward active pages plus remapped indices/page table."""
 
-    selected_pages: Optional["torch.Tensor"] = None
-    remapped: Optional["torch.Tensor"] = None
+    selected_pages: Optional[torch.Tensor] = None
+    remapped: Optional[torch.Tensor] = None
 
 
 class CpKvLayerSplitDeepSeekV4TokenToKVPool(
@@ -214,9 +214,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             overlap = ratio == 4
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
             ring_size = self.get_ring_size(ratio)
-            state_dtype = (
-                self.c4_state_dtype if ratio == 4 else self.c128_state_dtype
-            )
+            state_dtype = self.c4_state_dtype if ratio == 4 else self.c128_state_dtype
 
             if self._owns_attention_state_layer_id(idx):
                 self.compress_state_pools[idx] = CompressStatePool(
@@ -626,14 +624,8 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
 
     def _async_kind_for(self, kind: str) -> Optional[str]:
         """Resolve a broadcast slot kind to its async/inline status."""
-        if kind == "swa":
-            return (
-                "swa"
-                if envs.SGLANG_CP_KV_LAYER_SPLIT_DSV4_ENABLE_SWA_BROADCAST_OVERLAP.get()
-                else None
-            )
-        if kind in ("extra", "indexer"):
-            if envs.SGLANG_CP_KV_LAYER_SPLIT_DSV4_DISABLE_ASYNC_NON_SWA_BROADCAST.get():
+        if kind in ("swa", "extra", "indexer"):
+            if envs.SGLANG_CP_KV_LAYER_SPLIT_DSV4_DISABLE_ASYNC_BROADCAST.get():
                 return None
             return kind
         raise ValueError(f"unknown broadcast kind: {kind}")
