@@ -66,9 +66,7 @@ class TestDSASkipLogitsClean(CustomTestCase):
         # so every row has invalid positions [ke, s_k) that clean_logits=True
         # pre-fills with -inf and clean_logits=False does not.
         ks = torch.zeros(s_q, dtype=torch.int32, device=dev)
-        ke = torch.randint(
-            s_k // 2, s_k + 1, (s_q,), dtype=torch.int32, device=dev
-        )
+        ke = torch.randint(s_k // 2, s_k + 1, (s_q,), dtype=torch.int32, device=dev)
 
         logits_clean = fp8_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=True
@@ -114,9 +112,7 @@ class TestDSASkipLogitsClean(CustomTestCase):
         # as used by the GLM5 / DeepSeek DSA indexer.
         for s_q, s_k in [(1, 4096), (16, 4096), (128, 4096)]:
             with self.subTest(s_q=s_q, s_k=s_k):
-                self._run_case(
-                    s_q=s_q, s_k=s_k, num_heads=64, head_dim=128, topk=2048
-                )
+                self._run_case(s_q=s_q, s_k=s_k, num_heads=64, head_dim=128, topk=2048)
 
 
 if __name__ == "__main__":
