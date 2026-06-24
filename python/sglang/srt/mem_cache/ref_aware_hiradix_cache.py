@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.ref_aware_cache_mixin import (
     TIER_LOW_REF,
     TIER_UNUSED,
     RefAwareCacheMixin,
-    RefInfo,
     _classify_node_tier,
 )
 from sglang.srt.mem_cache.utils import compute_node_hash_values
@@ -60,13 +59,6 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
     # HiCache-specific: safe evictable size accounting for host capacity
     # ------------------------------------------------------------------
 
-    def high_ref_host_safe_evictable_size(self) -> int:
-        # A high-priority eviction scope (allow_high) can free every high-ref
-        # device node -- backuped ones via `_evict_backuped` (host copy kept),
-        # the rest via `_evict_regular`. So the admission budget equals the full
-        # high-ref evictable size.
-        return self.high_ref_evictable_size_
-
     def safe_evictable_size_by_tier(
         self, allow_low: bool = True, allow_high: bool = False
     ) -> int:
@@ -74,7 +66,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         if allow_low:
             total += self.low_ref_evictable_size_
         if allow_high:
-            total += self.high_ref_host_safe_evictable_size()
+            total += self.high_ref_evictable_size_
         return total
 
     # ------------------------------------------------------------------

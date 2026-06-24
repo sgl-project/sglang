@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class RefAwareRadixCache(RefAwareCacheMixin, RadixCache):
     """RadixCache with priority-aware tiered eviction (no host pool)."""
 
-    def __init__(self, params: "CacheInitParams", server_args: "ServerArgs" = None):
+    def __init__(self, params: CacheInitParams, server_args: ServerArgs = None):
         self._init_ref_aware_state(server_args)
         super().__init__(params)
 

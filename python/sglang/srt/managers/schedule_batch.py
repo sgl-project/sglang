@@ -2057,8 +2057,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if isinstance(self.tree_cache, RefAwareCacheMixin):
             allow_high = any(
-                self.tree_cache.is_high_priority(req.priority or 0)
-                for req in self.reqs
+                self.tree_cache.is_high_priority(req.priority or 0) for req in self.reqs
             )
             with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
                 out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
@@ -2491,7 +2490,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         scope = range(len(self.reqs)) if selected_indices is None else selected_indices
         hp_indices = [
-            i for i in scope
+            i
+            for i in scope
             if self.tree_cache.is_high_priority(self.reqs[i].priority or 0)
         ]
         if not hp_indices:
@@ -2527,6 +2527,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # policy.
         if not server_args.speculative_algorithm:
             from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
             if isinstance(self.tree_cache, RefAwareCacheMixin):
                 sorted_indices.sort(
                     key=lambda i: (

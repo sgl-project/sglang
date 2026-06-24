@@ -535,7 +535,8 @@ class PrefillAdder:
         assert isinstance(cache, RefAwareCacheMixin)
         available = self.token_to_kv_pool_allocator.available_size()
         evictable = cache.safe_evictable_size_by_tier(
-            allow_low=True, allow_high=is_high,
+            allow_low=True,
+            allow_high=is_high,
         )
         return available + evictable - self.rem_total_token_offset
 
@@ -549,9 +550,7 @@ class PrefillAdder:
             return False
         return self._kick_low_priority_for_high(req, total_tokens)
 
-    def _kick_low_priority_for_high(
-        self, req: Req, total_tokens_needed: int
-    ) -> bool:
+    def _kick_low_priority_for_high(self, req: Req, total_tokens_needed: int) -> bool:
         from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         cache = self.tree_cache
@@ -572,14 +571,18 @@ class PrefillAdder:
         kicked_reqs = []
         for _total_tokens, running_req in low_priority_reqs:
             kicked_reqs.append(running_req)
-            self.rem_total_token_offset -= self._get_running_request_total_token_offset(running_req)
+            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
+                running_req
+            )
             ref_aware_budget = self._rem_total_tokens_ref_aware(is_high=True)
             if total_tokens_needed < ref_aware_budget:
                 break
 
         if total_tokens_needed >= self._rem_total_tokens_ref_aware(is_high=True):
             for running_req in kicked_reqs:
-                self.rem_total_token_offset += self._get_running_request_total_token_offset(running_req)
+                self.rem_total_token_offset += (
+                    self._get_running_request_total_token_offset(running_req)
+                )
             return False
 
         kicked_set = set(kicked_reqs)
@@ -589,7 +592,9 @@ class PrefillAdder:
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in kicked_set:
                 release_counter += 1
-                self.running_batch.release_req(i, len(self.running_batch.reqs) - release_counter, server_args)
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, server_args
+                )
             else:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)

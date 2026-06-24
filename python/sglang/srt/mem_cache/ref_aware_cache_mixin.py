@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import heapq
 import logging
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
@@ -40,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RefInfo:
@@ -68,6 +68,7 @@ def _classify_node_tier(node: TreeNode) -> int:
 # ---------------------------------------------------------------------------
 # Mixin class
 # ---------------------------------------------------------------------------
+
 
 class RefAwareCacheMixin:
     """Mixin that adds ref-aware tiered eviction to any radix-style cache.
@@ -193,12 +194,7 @@ class RefAwareCacheMixin:
     # ------------------------------------------------------------------
 
     def _on_lock_ref_node(self, node: TreeNode):
-        """Hook called for each node during inc_lock_ref / dec_lock_ref traversal.
-
-        No-op in the base mixin. Override in concrete classes that need to
-        maintain additional per-node state (e.g. host leaf tracking in
-        RefAwareHiRadixCache).
-        """
+        pass
 
     # ------------------------------------------------------------------
     # inc_lock_ref / dec_lock_ref — full reimplementation with tier accounting
@@ -341,14 +337,8 @@ class RefAwareCacheMixin:
         target_tier: int,
         evict_one_fn,
     ) -> int:
-        """Shared heap-based eviction framework.
-
-        Walks the tier's leaf set in priority order. For each candidate node,
-        calls ``evict_one_fn(node) -> int`` which must perform the actual
-        eviction and return the number of tokens freed. The concrete class
-        provides this callback to handle backup/write-back logic.
-
-        Returns the total number of tokens evicted.
+        """
+        Shared heap-based eviction framework.
         """
         leaves = list(leaf_set)
         eviction_heap = [

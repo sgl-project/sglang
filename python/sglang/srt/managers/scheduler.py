@@ -131,8 +131,6 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
-    UpdateRefReqInput,
-    UpdateRefReqOutput,
     RpcReqInput,
     RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -146,6 +144,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -697,15 +697,21 @@ class Scheduler(
             if isinstance(self.tree_cache, RefAwareCacheMixin):
                 success, msg = self.tree_cache.release_ref(recv_req.rid)
                 return ReleaseRefReqOutput(success=success, message=msg)
-        return ReleaseRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+        return ReleaseRefReqOutput(
+            success=False, message="ref-aware KV buffer not enabled"
+        )
 
     def handle_update_ref(self, recv_req: UpdateRefReqInput):
         if not self.enable_ref_aware_kv_buffer:
-            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
         from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         if not isinstance(self.tree_cache, RefAwareCacheMixin):
-            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
 
         rid = recv_req.rid
         new_priority = recv_req.new_priority
@@ -2875,7 +2881,9 @@ class Scheduler(
 
         chunk_deferred = False
         if self.enable_ref_aware_kv_buffer and self.chunked_req is not None:
-            chunk_is_high = self.tree_cache.is_high_priority(self.chunked_req.priority or 0)
+            chunk_is_high = self.tree_cache.is_high_priority(
+                self.chunked_req.priority or 0
+            )
             if not chunk_is_high:
                 chunk_deferred = True
                 deferred_chunked_req = self.chunked_req
@@ -2939,7 +2947,9 @@ class Scheduler(
                     result_chunk = adder.add_chunked_req(deferred_chunked_req)
                     if result_chunk is not None:
                         # Budget insufficient: release KV cache and retract
-                        release_kv_cache(deferred_chunked_req, self.tree_cache, is_insert=False)
+                        release_kv_cache(
+                            deferred_chunked_req, self.tree_cache, is_insert=False
+                        )
                         deferred_chunked_req.reset_for_retract()
                         self._add_request_to_queue(deferred_chunked_req)
                         self.chunked_req = None

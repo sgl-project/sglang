@@ -126,9 +126,13 @@ class TestRefAwareTierAccounting(unittest.TestCase):
         cache._update_ref_aware_leaf_status(node)
 
         # allow_low=False, allow_high=False → only unused
-        self.assertEqual(cache.evictable_size_by_tier(allow_low=False, allow_high=False), 4)
+        self.assertEqual(
+            cache.evictable_size_by_tier(allow_low=False, allow_high=False), 4
+        )
         # allow_low=True → still 4 since no low-ref nodes
-        self.assertEqual(cache.evictable_size_by_tier(allow_low=True, allow_high=False), 4)
+        self.assertEqual(
+            cache.evictable_size_by_tier(allow_low=True, allow_high=False), 4
+        )
 
     def test_inc_priority_ref_low_moves_unused_to_low_ref(self):
         cache = self._make_cache()
@@ -183,14 +187,18 @@ class TestRefAwareTierAccounting(unittest.TestCase):
         self.assertEqual(cache.unused_evictable_size_, 0)
         self.assertEqual(cache.low_ref_evictable_size_, 4)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
-        self.assertEqual(cache.evictable_size_by_tier(allow_low=True, allow_high=False), 4)
+        self.assertEqual(
+            cache.evictable_size_by_tier(allow_low=True, allow_high=False), 4
+        )
 
         # low_ref → high_ref
         cache._inc_priority_ref_single(node, is_high=True)
         self.assertEqual(cache.unused_evictable_size_, 0)
         self.assertEqual(cache.low_ref_evictable_size_, 0)
         self.assertEqual(cache.high_ref_evictable_size_, 4)
-        self.assertEqual(cache.evictable_size_by_tier(allow_low=True, allow_high=True), 4)
+        self.assertEqual(
+            cache.evictable_size_by_tier(allow_low=True, allow_high=True), 4
+        )
 
     def test_dec_priority_ref_single_moves_back_to_unused(self):
         cache = self._make_cache()
