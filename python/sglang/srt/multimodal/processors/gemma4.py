@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutp
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 
 class Gemma4SGLangProcessor(SGLangBaseProcessor):
@@ -129,7 +129,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                         "fps": fps,
                         "duration": total_frames / fps if fps and fps > 0 else None,
                         "frames_indices": frame_indices,
-                        "video_backend": "torchcodec",
+                        "video_backend": _BACKEND,
                     }
                     video_metadata_list.append(metadata)
                     converted_videos.append(video)
