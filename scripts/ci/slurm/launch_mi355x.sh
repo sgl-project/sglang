@@ -116,10 +116,29 @@ echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
 # lands here; the launcher normalizes it into GITHUB_WORKSPACE afterwards.
 # ---------------------------------------------------------------------------
-WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+RUN_ID="${GITHUB_RUN_ID:-local}"
+RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-0}"
+WORKDIR_REL=".mi355x_ci/${RUN_ID}-${RUN_ATTEMPT}/${MATRIX_CONFIG_NAME}"
+WORKDIR="$HOME/$WORKDIR_REL"
+CONTAINER_WORKDIR="/host_home/$WORKDIR_REL"
+LOG_BUNDLE="$GITHUB_WORKSPACE/mi355x_multinode_logs.tar.gz"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/standalone_lb.py" "$WORKDIR/standalone_lb.py"
+cp "$CONFIG_FILE" "$WORKDIR/recipe.yaml" || true
+
+archive_logs() {
+    local status=$?
+    trap - EXIT
+    if [[ -d "$WORKDIR" ]]; then
+        tar czf "$LOG_BUNDLE" -C "$WORKDIR" . || true
+        echo "Saved MI355X log bundle: $LOG_BUNDLE"
+    fi
+    exit "$status"
+}
+trap archive_logs EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
@@ -218,11 +237,11 @@ docker run $DOCKER_COMMON --name mi355x_bench \
     export PYTHONPATH=/sgl-workspace/sglang/python:\$PYTHONPATH
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
-    python3 /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/standalone_lb.py \
+    python3 $CONTAINER_WORKDIR/standalone_lb.py \
       --prefill http://\$PIP:$PPORT $PBOOT --decode http://\$DIP:$DPORT \
       --host 0.0.0.0 --port $LBPORT &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
-    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    CIDIR=$CONTAINER_WORKDIR
     echo "[smoke] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
       -H "content-type: application/json" -d @\$CIDIR/smoke.json > \$CIDIR/smoke_out.json \
@@ -246,7 +265,7 @@ docker run $DOCKER_COMMON --name mi355x_bench \
     fi
     for C in ${CONCS//,/ }; do
       echo "=== concurrency=\$C ==="
-      OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
+      OUT=$CONTAINER_WORKDIR/raw_conc\${C}.json
       rm -f \$OUT
       python3 -m sglang.bench_serving --backend sglang \
         --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \

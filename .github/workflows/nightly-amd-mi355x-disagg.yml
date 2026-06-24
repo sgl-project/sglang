@@ -162,7 +162,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mi355x-${{ matrix.config.name }}-${{ github.run_id }}
-          path: ${{ github.workspace }}/*.json
+          path: |
+            ${{ github.workspace }}/*.json
+            ${{ github.workspace }}/mi355x_multinode_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
 
