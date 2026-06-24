@@ -957,7 +957,7 @@ class SchedulerBatchResultProcessor:
 
     def _maybe_register_ref(self, req):
         if self.server_args.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
                 self.tree_cache.register_ref(req)

@@ -2053,9 +2053,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-        if isinstance(self.tree_cache, RefAwareHiRadixCache):
+        if isinstance(self.tree_cache, RefAwareCacheMixin):
             allow_high = any(
                 self.tree_cache.is_high_priority(req.priority or 0)
                 for req in reqs
@@ -2470,9 +2470,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _evict_for_decode(
         self, num_tokens: int, selected_indices: Optional[List[int]] = None
     ):
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
             evict_from_tree_cache(self.tree_cache, num_tokens)
             return
 
@@ -2526,8 +2526,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
                 sorted_indices.sort(
                     key=lambda i: (
                         self.tree_cache.is_high_priority(self.reqs[i].priority or 0),

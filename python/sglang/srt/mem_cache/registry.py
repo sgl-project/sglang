@@ -151,6 +151,11 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_group=ctx.tp_group,
         )
 
+    if server_args.enable_ref_aware_kv_buffer:
+        from sglang.srt.mem_cache.ref_aware_radix_cache import RefAwareRadixCache
+
+        return RefAwareRadixCache(params=params, server_args=server_args)
+
     from sglang.srt.mem_cache.radix_cache import RadixCache
 
     return RadixCache(params)

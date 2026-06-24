@@ -464,11 +464,11 @@ class Scheduler(
 
         # TODO (zhangmj): Can be removed if support ref-aware HiRadixCache in UnifiedRadixCache for hybrid SSM/SWA.
         if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
-                RefAwareHiRadixCache,
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+                RefAwareCacheMixin,
             )
 
-            if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+            if not isinstance(self.tree_cache, RefAwareCacheMixin):
                 logger.warning(
                     "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
                     "disabling ref-aware KV buffer.",
@@ -692,9 +692,9 @@ class Scheduler(
 
     def handle_release_ref(self, recv_req: ReleaseRefReqInput):
         if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
                 success, msg = self.tree_cache.release_ref(recv_req.rid)
                 return ReleaseRefReqOutput(success=success, message=msg)
         return ReleaseRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
@@ -702,9 +702,9 @@ class Scheduler(
     def handle_update_ref(self, recv_req: UpdateRefReqInput):
         if not self.enable_ref_aware_kv_buffer:
             return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
             return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
 
         rid = recv_req.rid

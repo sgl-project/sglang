@@ -529,10 +529,10 @@ class PrefillAdder:
         )
 
     def _rem_total_tokens_ref_aware(self, is_high: bool):
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         cache = self.tree_cache
-        assert isinstance(cache, RefAwareHiRadixCache)
+        assert isinstance(cache, RefAwareCacheMixin)
         available = self.token_to_kv_pool_allocator.available_size()
         evictable = cache.safe_evictable_size_by_tier(
             allow_low=True, allow_high=is_high,
@@ -552,10 +552,10 @@ class PrefillAdder:
     def _kick_low_priority_for_high(
         self, req: Req, total_tokens_needed: int
     ) -> bool:
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         cache = self.tree_cache
-        if not isinstance(cache, RefAwareHiRadixCache):
+        if not isinstance(cache, RefAwareCacheMixin):
             return False
 
         threshold = self.high_priority_threshold

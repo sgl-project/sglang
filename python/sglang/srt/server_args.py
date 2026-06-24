@@ -6227,11 +6227,6 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
-        if self.enable_ref_aware_kv_buffer and not self.enable_hierarchical_cache:
-            raise ValueError(
-                "--enable-ref-aware-kv-buffer requires --enable-hierarchical-cache"
-            )
-
         if (
             self.enable_ref_aware_kv_buffer
             and self.enable_priority_scheduling
