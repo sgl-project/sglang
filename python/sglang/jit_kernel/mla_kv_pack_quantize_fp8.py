@@ -164,7 +164,10 @@ def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
 
     Memory bound. The flat kernel (1D grid over contiguous (token, head) pairs)
     wins everywhere except tiny ``s``, where ``v0``'s 2D grid trims launch
-    overhead.
+    overhead. For the flat path, ``num_warps`` tracks the total work
+    ``s * num_heads``: 4 warps keep more CTAs resident through the mid range
+    (including L2-resident prefix chunks), 8 warps win once the launch is large
+    enough to saturate HBM.
     """
     if s <= 2:
         # Launch-overhead-bound: minimal warps avoid setup cost.
@@ -174,7 +177,8 @@ def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
     if s <= 32:
         # Still launch-bound: a smaller BLOCK keeps more CTAs in flight.
         return "v1_flat", {"BLOCK": 8, "num_warps": 8, "num_stages": 2}
-    return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 2}
+    num_warps = 8 if s * num_heads >= 200_000 else 4
+    return "v1_flat", {"BLOCK": 16, "num_warps": num_warps, "num_stages": 3}
 
 
 _FP8_DTYPE_MAP = {
