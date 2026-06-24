@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
 import argparse
 import csv
-import dataclasses
 import json
 import math
 import os
@@ -35,15 +33,38 @@ _UNIT_TO_BYTES = {
 }
 
 
-@dataclasses.dataclass(frozen=True)
 class TargetInfo:
-    session_id: str
-    host: str
-    gpu_id: int
-    ptr: int
-    bytes: int
-    ib_device: str
-    protocol: str
+    def __init__(self, session_id, host, gpu_id, ptr, bytes, ib_device, protocol):
+        self.session_id = session_id
+        self.host = host
+        self.gpu_id = gpu_id
+        self.ptr = ptr
+        self.bytes = bytes
+        self.ib_device = ib_device
+        self.protocol = protocol
+
+    def as_dict(self):
+        return {
+            "session_id": self.session_id,
+            "host": self.host,
+            "gpu_id": self.gpu_id,
+            "ptr": self.ptr,
+            "bytes": self.bytes,
+            "ib_device": self.ib_device,
+            "protocol": self.protocol,
+        }
+
+
+def _time_ns() -> int:
+    if hasattr(time, "time_ns"):
+        return time.time_ns()
+    return int(time.time() * 1_000_000_000)
+
+
+def _perf_counter_ns() -> int:
+    if hasattr(time, "perf_counter_ns"):
+        return time.perf_counter_ns()
+    return int(time.perf_counter() * 1_000_000_000)
 
 
 def parse_size(raw: str) -> int:
@@ -134,7 +155,7 @@ def summarize_latencies_ms(latencies_ms: Iterable[float], num_bytes: int) -> dic
     p50 = _percentile(values, 0.50)
     p90 = _percentile(values, 0.90)
     p99 = _percentile(values, 0.99)
-    mean = statistics.fmean(values)
+    mean = sum(values) / len(values)
     return {
         "latency_ms_mean": mean,
         "latency_ms_p50": p50,
@@ -147,13 +168,13 @@ def summarize_latencies_ms(latencies_ms: Iterable[float], num_bytes: int) -> dic
     }
 
 
-def write_target_info(path: Path | str, info: TargetInfo) -> None:
+def write_target_info(path, info: TargetInfo) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(dataclasses.asdict(info), indent=2) + "\n")
+    target.write_text(json.dumps(info.as_dict(), indent=2) + "\n")
 
 
-def load_target_info(path: Path | str) -> TargetInfo:
+def load_target_info(path) -> TargetInfo:
     data = json.loads(Path(path).read_text())
     return TargetInfo(**data)
 
@@ -162,7 +183,7 @@ def parse_target_info_json(raw: str) -> TargetInfo:
     return TargetInfo(**json.loads(raw))
 
 
-def write_csv_summary(path: Path | str, rows: List[dict]) -> None:
+def write_csv_summary(path, rows: List[dict]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: List[str] = []
@@ -176,7 +197,7 @@ def write_csv_summary(path: Path | str, rows: List[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_jsonl_samples(path: Path | str, samples: Iterable[dict]) -> None:
+def write_jsonl_samples(path, samples: Iterable[dict]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w") as f:
@@ -215,9 +236,9 @@ def _allocate_gpu_buffer(num_bytes: int, gpu_id: int):
 
 
 def _register_buffer(engine, ptr: int, num_bytes: int) -> float:
-    start_ns = time.perf_counter_ns()
+    start_ns = _perf_counter_ns()
     ret = engine.batch_register([ptr], [num_bytes])
-    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
+    elapsed_ms = (_perf_counter_ns() - start_ns) / 1e6
     if ret != 0:
         raise RuntimeError(
             f"Mooncake batch_register failed: ret={ret}, ptr=0x{ptr:x}, bytes={num_bytes}"
@@ -253,7 +274,7 @@ def _transfer_sync_paced(
     num_bytes: int,
     chunk_size: int,
     rate_limit_gbps: Optional[float],
-    now_ns_fn: Callable[[], int] = time.perf_counter_ns,
+    now_ns_fn: Callable[[], int] = _perf_counter_ns,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> int:
     if num_bytes <= 0:
@@ -312,7 +333,7 @@ def run_target(args: argparse.Namespace) -> int:
 
     print(f"target_info_file={args.target_info_file}", flush=True)
     print(f"target_register_ms={register_ms:.3f}", flush=True)
-    print(f"TARGET_INFO_JSON={json.dumps(dataclasses.asdict(info), sort_keys=True)}")
+    print(f"TARGET_INFO_JSON={json.dumps(info.as_dict(), sort_keys=True)}")
     print("target_ready=true", flush=True)
 
     stop = False
@@ -344,7 +365,7 @@ def _wait_until_unix_ns(start_at_unix_ns: int) -> None:
     if start_at_unix_ns <= 0:
         return
     while True:
-        now_ns = time.time_ns()
+        now_ns = _time_ns()
         remaining_s = (start_at_unix_ns - now_ns) / 1_000_000_000
         if remaining_s <= 0:
             return
@@ -366,14 +387,14 @@ def run_background_initiator(
 
     _sync_cuda(args.gpu_id)
     _wait_until_unix_ns(args.start_at_unix_ns)
-    start_unix_ns = time.time_ns()
-    start_ns = time.perf_counter_ns()
+    start_unix_ns = _time_ns()
+    start_ns = _perf_counter_ns()
     end_ns = start_ns + int(args.background_duration_seconds * 1_000_000_000)
     transfer_count = 0
     error_count = 0
     ok_bytes = 0
 
-    while time.perf_counter_ns() < end_ns:
+    while _perf_counter_ns() < end_ns:
         ret = _transfer_sync_paced(
             engine,
             target,
@@ -390,8 +411,8 @@ def run_background_initiator(
             break
 
     _sync_cuda(args.gpu_id)
-    end_ns_actual = time.perf_counter_ns()
-    end_unix_ns = time.time_ns()
+    end_ns_actual = _perf_counter_ns()
+    end_unix_ns = _time_ns()
     elapsed_s = (end_ns_actual - start_ns) / 1_000_000_000
     row = {
         "mode": "background",
@@ -489,8 +510,8 @@ def run_initiator(args: argparse.Namespace) -> int:
         error_count = 0
         for iteration in range(args.repeat):
             _sync_cuda(args.gpu_id)
-            start_unix_ns = time.time_ns()
-            start_ns = time.perf_counter_ns()
+            start_unix_ns = _time_ns()
+            start_ns = _perf_counter_ns()
             ret = _transfer_sync_paced(
                 engine,
                 target,
@@ -500,8 +521,8 @@ def run_initiator(args: argparse.Namespace) -> int:
                 args.rate_limit_gbps,
             )
             _sync_cuda(args.gpu_id)
-            end_ns = time.perf_counter_ns()
-            end_unix_ns = time.time_ns()
+            end_ns = _perf_counter_ns()
+            end_unix_ns = _time_ns()
             latency_ms = (end_ns - start_ns) / 1e6
             if ret == 0:
                 ok_latencies.append(latency_ms)

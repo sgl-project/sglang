@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
 import argparse
 import csv
-import dataclasses
 import json
 import math
 import os
@@ -13,9 +11,9 @@ import signal
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 
 SRC_IPS = {
@@ -41,40 +39,25 @@ DENSE_SIZES_4 = (
 )
 
 
-@dataclasses.dataclass(frozen=True)
-class Endpoint:
-    lane: int
-    gpu_id: int
-    src_host: str
-    tgt_host: str
-    ib_device: str
-
-
-@dataclasses.dataclass(frozen=True)
-class MatrixRun:
-    run: str
-    lanes: tuple[Endpoint, ...]
-    shards: int
-    max_bytes: str
-    sizes: str
-    protocol: str
-    lane_cap_gbps: float
-    bg_rate_gbps: float
-    fg_rate_gbps: float
-
-
-@dataclasses.dataclass(frozen=True)
-class CompetitionCase:
-    run: str
-    flow_sizes: tuple[str, ...]
-    protocol: str
-    ib_device: str
-    lane_cap_gbps: float
-    mode: str
+Endpoint = namedtuple("Endpoint", "lane gpu_id src_host tgt_host ib_device")
+MatrixRun = namedtuple(
+    "MatrixRun",
+    "run lanes shards max_bytes sizes protocol lane_cap_gbps bg_rate_gbps fg_rate_gbps",
+)
+CompetitionCase = namedtuple(
+    "CompetitionCase",
+    "run flow_sizes protocol ib_device lane_cap_gbps mode",
+)
 
 
 def q(value: object) -> str:
     return shlex.quote(str(value))
+
+
+def _time_ns() -> int:
+    if hasattr(time, "time_ns"):
+        return time.time_ns()
+    return int(time.time() * 1_000_000_000)
 
 
 def parse_size(raw: str) -> int:
@@ -101,7 +84,7 @@ def format_gib(num_bytes: int) -> str:
     return f"{num_bytes / 1024**3:.6f}"
 
 
-def percentile(values: list[float], p: float) -> float:
+def percentile(values: List[float], p: float) -> float:
     values = sorted(values)
     if len(values) == 1:
         return values[0]
@@ -116,27 +99,27 @@ def percentile(values: list[float], p: float) -> float:
 class Runner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.local_children: list[subprocess.Popen] = []
+        self.local_children: List[subprocess.Popen] = []
 
-    def local_env(self) -> dict[str, str]:
+    def local_env(self) -> Dict[str, str]:
         env = os.environ.copy()
         env.setdefault("SGLANG_IMAGE", self.args.image)
         return env
 
-    def run_local(self, cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    def run_local(self, cmd: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
         print("+ " + " ".join(q(x) for x in cmd), flush=True)
         if self.args.dry_run:
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        return subprocess.run(cmd, check=check, text=True, env=self.local_env())
+        return subprocess.run(cmd, check=check, universal_newlines=True, env=self.local_env())
 
-    def run_local_capture(self, cmd: list[str], *, check: bool = True) -> str:
+    def run_local_capture(self, cmd: List[str], *, check: bool = True) -> str:
         print("+ " + " ".join(q(x) for x in cmd), flush=True)
         if self.args.dry_run:
             return ""
         result = subprocess.run(
             cmd,
             check=check,
-            text=True,
+            universal_newlines=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self.local_env(),
@@ -145,7 +128,7 @@ class Runner:
             print(result.stderr, file=sys.stderr, end="")
         return result.stdout
 
-    def remote_cmd(self) -> list[str]:
+    def remote_cmd(self) -> List[str]:
         cmd = ["ssh"]
         if self.args.ssh_key:
             cmd.extend(["-i", os.path.expanduser(self.args.ssh_key)])
@@ -158,7 +141,7 @@ class Runner:
         print("REMOTE", flush=True)
         if self.args.dry_run:
             return subprocess.CompletedProcess(self.remote_cmd(), 0, "", "")
-        return subprocess.run(self.remote_cmd(), input=script, text=True, check=check)
+        return subprocess.run(self.remote_cmd(), input=script, universal_newlines=True, check=check)
 
     def run_remote_capture(self, script: str, *, check: bool = True) -> str:
         print("+ ssh " + self.args.target_ssh_host + " bash -s <<'REMOTE'", flush=True)
@@ -169,7 +152,7 @@ class Runner:
         result = subprocess.run(
             self.remote_cmd(),
             input=script,
-            text=True,
+            universal_newlines=True,
             check=check,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -182,10 +165,10 @@ class Runner:
         self,
         *,
         name: str,
-        env: dict[str, str],
+        env: Dict[str, str],
         out_dir: Path,
         inner_cmd: str,
-    ) -> list[str]:
+    ) -> List[str]:
         cmd = [
             "docker",
             "run",
@@ -228,7 +211,7 @@ class Runner:
         self,
         *,
         name: str,
-        env: dict[str, str],
+        env: Dict[str, str],
         out_dir: Path,
         inner_cmd: str,
         log_path: Path,
@@ -260,7 +243,7 @@ fi
 """
         self.run_remote(remote_script, check=False)
 
-    def remote_target_script(self, run: MatrixRun | CompetitionCase, targets: list[Endpoint], out_dir: Path, max_bytes: str) -> str:
+    def remote_target_script(self, run: Union[MatrixRun, CompetitionCase], targets: List[Endpoint], out_dir: Path, max_bytes: str) -> str:
         lines = [
             "set -euo pipefail",
             f"mkdir -p {q(str(out_dir / 'raw'))}",
@@ -310,7 +293,7 @@ fi
         lines.append(f"grep '^TARGET_INFO_JSON=' {q(str(out_dir / 'raw'))}/target*.log")
         return "\n".join(lines) + "\n"
 
-    def start_remote_monitor(self, run: MatrixRun | CompetitionCase, out_dir: Path, endpoints: Iterable[Endpoint]) -> None:
+    def start_remote_monitor(self, run: Union[MatrixRun, CompetitionCase], out_dir: Path, endpoints: Iterable[Endpoint]) -> None:
         devices = " ".join(endpoint.ib_device for endpoint in endpoints if run.protocol == "rdma")
         if not devices:
             return
@@ -343,10 +326,10 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
 """
         self.run_remote(script)
 
-    def fetch_target_jsons(self, out_dir: Path, pattern: str) -> dict[int, str]:
+    def fetch_target_jsons(self, out_dir: Path, pattern: str) -> Dict[int, str]:
         script = f"set -euo pipefail\ngrep '^TARGET_INFO_JSON=' {q(str(out_dir / 'raw'))}/{pattern}\n"
         output = self.run_remote_capture(script)
-        result: dict[int, str] = {}
+        result: Dict[int, str] = {}
         for line in output.splitlines():
             if "TARGET_INFO_JSON=" not in line:
                 continue
@@ -444,7 +427,7 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
         self.cleanup_run(spec.run, out_dir)
         self.wait_terminate(bg_procs)
 
-    def container_env(self, protocol: str, ib_device: str, target_json: str) -> dict[str, str]:
+    def container_env(self, protocol: str, ib_device: str, target_json: str) -> Dict[str, str]:
         env = {
             "MOONCAKE_PROTOCOL": protocol,
             "IB_DEVICE": ib_device,
@@ -457,7 +440,7 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
             env["MC_FORCE_TCP"] = "1"
         return env
 
-    def wait_all(self, procs: list[subprocess.Popen], label: str) -> None:
+    def wait_all(self, procs: List[subprocess.Popen], label: str) -> None:
         if self.args.dry_run:
             return
         errors = []
@@ -468,7 +451,7 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
         if errors:
             raise RuntimeError(f"{label} docker process failed: {errors}")
 
-    def wait_terminate(self, procs: list[subprocess.Popen]) -> None:
+    def wait_terminate(self, procs: List[subprocess.Popen]) -> None:
         if self.args.dry_run:
             return
         for proc in procs:
@@ -482,8 +465,8 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
 
     def aggregate_matrix(self, out_dir: Path, shards: int) -> None:
         raw = out_dir / "raw"
-        groups: dict[tuple[int, int], list[float]] = defaultdict(list)
-        errors: dict[int, int] = defaultdict(int)
+        groups: Dict[Tuple[int, int], List[float]] = defaultdict(list)
+        errors: Dict[int, int] = defaultdict(int)
         for path in sorted(raw.glob("shard-bond*-dense-samples.jsonl")):
             with path.open() as f:
                 for line in f:
@@ -495,7 +478,7 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
                     else:
                         errors[logical_bytes] += 1
 
-        by_size: dict[int, list[float]] = defaultdict(list)
+        by_size: Dict[int, List[float]] = defaultdict(list)
         for (logical_bytes, _), vals in groups.items():
             if len(vals) == shards:
                 by_size[logical_bytes].append(max(vals))
@@ -546,7 +529,7 @@ echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
             target_jsons = {endpoint.lane: self.fake_target_json(endpoint, max_bytes) for endpoint in targets}
         else:
             target_jsons = self.fetch_target_jsons(out_dir, "target-flow*.log")
-        start_at = time.time_ns() + int(self.args.competition_start_delay_seconds * 1_000_000_000)
+        start_at = _time_ns() + int(self.args.competition_start_delay_seconds * 1_000_000_000)
         procs = []
         for flow_index, size in enumerate(case.flow_sizes):
             rate = None
@@ -616,12 +599,12 @@ def human_bytes(num_bytes: int) -> str:
     raise AssertionError("unreachable")
 
 
-def write_csv(path: Path, rows: list[dict]) -> None:
+def write_csv(path: Path, rows: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("")
         return
-    fieldnames: list[str] = []
+    fieldnames: List[str] = []
     for row in rows:
         for key in row:
             if key not in fieldnames:
@@ -646,8 +629,8 @@ def one_lane_endpoint(src_host: str, tgt_host: str, ib_device: str) -> Endpoint:
     return Endpoint(lane=0, gpu_id=0, src_host=src_host, tgt_host=tgt_host, ib_device=ib_device)
 
 
-def matrix_runs(args: Optional[argparse.Namespace] = None) -> list[MatrixRun]:
-    runs: list[MatrixRun] = []
+def matrix_runs(args: Optional[argparse.Namespace] = None) -> List[MatrixRun]:
+    runs: List[MatrixRun] = []
     for bg in (1, 10, 50, 90):
         bg_rate = 200 * bg / 100
         fg_rate = 200 - bg_rate
@@ -705,8 +688,8 @@ def matrix_runs(args: Optional[argparse.Namespace] = None) -> list[MatrixRun]:
     return runs
 
 
-def competition_cases() -> list[CompetitionCase]:
-    cases: list[CompetitionCase] = []
+def competition_cases() -> List[CompetitionCase]:
+    cases: List[CompetitionCase] = []
     two_flow_other_sizes = ("256MB", "512MB", "1GB", "2GB", "4GB")
     for mode in ("fair", "uncapped"):
         for other in two_flow_other_sizes:
@@ -734,7 +717,7 @@ def competition_cases() -> list[CompetitionCase]:
     return cases
 
 
-def selected_matrix_runs(args: argparse.Namespace) -> list[MatrixRun]:
+def selected_matrix_runs(args: argparse.Namespace) -> List[MatrixRun]:
     runs = matrix_runs(args)
     if args.only:
         requested = set(args.only)
@@ -742,7 +725,7 @@ def selected_matrix_runs(args: argparse.Namespace) -> list[MatrixRun]:
     return runs
 
 
-def selected_competition_cases(args: argparse.Namespace) -> list[CompetitionCase]:
+def selected_competition_cases(args: argparse.Namespace) -> List[CompetitionCase]:
     cases = competition_cases()
     if args.only:
         requested = set(args.only)
@@ -788,7 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     runner = Runner(args)
 
