@@ -49,13 +49,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                as_tuple=True
+            )[0]
             self.forward_metadata.conv_states_mask_indices = (
-                forward_batch.mamba_track_indices[
-                    self.forward_metadata.mamba_track_mask_indices
-                ]
+                forward_batch.mamba_track_indices[mamba_track_mask_indices]
             )
 
     def prepare_gdn_inputs(
@@ -234,6 +232,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
+            # forward_extend runs eagerly (no CUDA-graph capture/replay), so
+            # has_mamba_track_mask / conv_states_mask_indices are always populated
+            # by init_forward_metadata{,_out_graph}. If extend is ever graph-replayed,
+            # _replay_metadata must precompute these too, otherwise tracking is skipped.
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
