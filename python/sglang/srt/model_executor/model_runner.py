@@ -945,8 +945,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.server_args.disable_cuda_graph:
             self.server_args.disable_cuda_graph = True
             disabled = True
-        if not self.server_args.disable_piecewise_cuda_graph:
-            self.server_args.disable_piecewise_cuda_graph = True
+        if not self.server_args.disable_prefill_cuda_graph:
+            self.server_args.disable_prefill_cuda_graph = True
             disabled = True
         if disabled:
             logger.warning(

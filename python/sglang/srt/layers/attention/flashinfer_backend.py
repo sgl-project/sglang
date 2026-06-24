@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.runtime_context import get_parallel
 
 """
