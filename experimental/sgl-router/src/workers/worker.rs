@@ -31,6 +31,26 @@ fn parse_bootstrap_host(url: &str) -> String {
     "localhost".to_string()
 }
 
+/// Wire protocol the router uses when forwarding requests to a worker's
+/// HTTP interface.
+///
+/// Resolved per worker from `/server_info` introspection (`enable_http2`),
+/// not from the discovery backend. Defaults to [`WireProtocol::Http1`],
+/// which is always safe: an engine launched with `--enable-http2` (Granian
+/// `HTTPModes.auto`) accepts HTTP/1.1 too, so the only mismatch that fails is
+/// speaking h2c to an HTTP/1.1-only Uvicorn engine — which we avoid by
+/// upgrading to [`WireProtocol::H2c`] only when the engine itself reports
+/// `enable_http2 == true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProtocol {
+    /// HTTP/1.1 (reqwest default). Safe for every engine.
+    #[default]
+    Http1,
+    /// Cleartext HTTP/2 with prior knowledge (h2c). Used only for engines
+    /// launched with `--enable-http2`.
+    H2c,
+}
+
 /// RAII guard that increments `active_requests` on construction and
 /// decrements on drop.  Obtain via [`Worker::load_guard`].
 ///
@@ -99,18 +119,28 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// Wire protocol for forwarding requests to this worker. Resolved at
+    /// registration from `/server_info` (`enable_http2`); see
+    /// [`WireProtocol`]. Immutable for the worker's lifetime — an engine
+    /// that flips `--enable-http2` restarts and re-registers as a fresh
+    /// worker.
+    pub protocol: WireProtocol,
 }
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
-        Self::with_cb_config(spec, None)
+        Self::with_cb_config(spec, None, WireProtocol::default())
     }
 
-    /// Construct a worker with an explicit circuit-breaker configuration.
-    /// Pass `None` to use the default config (threshold = 3, cool_down = 30 s).
+    /// Construct a worker with an explicit circuit-breaker configuration and
+    /// wire protocol. Pass `None` for the default breaker config
+    /// (threshold = 3, cool_down = 30 s) and [`WireProtocol::Http1`] for the
+    /// default protocol. `protocol` is resolved by the worker manager from
+    /// `/server_info` (`enable_http2`); see [`crate::workers::manager`].
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
     ) -> Self {
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -126,6 +156,7 @@ impl Worker {
             active_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            protocol,
         }
     }
 
@@ -173,6 +204,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("active_load", &self.active_load())
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -200,6 +232,35 @@ mod tests {
         assert_eq!(w.active_load(), 1);
         drop(g2);
         assert_eq!(w.active_load(), 0);
+    }
+
+    #[test]
+    fn protocol_defaults_to_http1() {
+        assert_eq!(WireProtocol::default(), WireProtocol::Http1);
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+        });
+        assert_eq!(w.protocol, WireProtocol::Http1);
+    }
+
+    #[test]
+    fn with_cb_config_carries_protocol() {
+        let w = Worker::with_cb_config(
+            WorkerSpec {
+                id: WorkerId("w".into()),
+                url: "http://x".into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![],
+                bootstrap_port: None,
+            },
+            None,
+            WireProtocol::H2c,
+        );
+        assert_eq!(w.protocol, WireProtocol::H2c);
     }
 
     #[test]

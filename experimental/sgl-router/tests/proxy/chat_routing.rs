@@ -12,7 +12,7 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -790,6 +790,7 @@ async fn forward_json_to_records_failure_on_body_drop() {
         .forward_json_to(
             &worker.url,
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             body,
@@ -846,6 +847,7 @@ async fn forward_json_to_records_success_only_after_body_completes() {
         .forward_json_to(
             &ok_worker.url,
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             bytes::Bytes::from_static(b"{}"),
@@ -896,6 +898,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
         .forward_streaming_to(
             &worker.url,
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             body,
@@ -945,6 +948,7 @@ async fn forward_json_to_records_failure_on_5xx() {
         .forward_json_to(
             &worker.url,
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             body,
@@ -978,6 +982,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
         .forward_json_to(
             &worker.url,
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             body,
@@ -1015,6 +1020,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
         .forward_json_to(
             "not-a-url",
             &breaker,
+            WireProtocol::Http1,
             "/v1/chat/completions",
             &headers,
             body,

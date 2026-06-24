@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::WorkerRegistry;
+use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,28 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
         });
     }
     None
+}
+
+/// Resolve the wire protocol for a worker from its `/server_info`
+/// (`enable_http2`) and the scheme of the URL the router will dial.
+///
+/// Upgrades to [`WireProtocol::H2c`] only when the engine self-reports
+/// `--enable-http2` **and** the worker URL is cleartext `http://`. The h2c
+/// client speaks cleartext HTTP/2 with prior knowledge, which is what
+/// Granian's `HTTPModes.auto` serves on a plaintext port. An `https://`
+/// engine with `--enable-http2` instead serves HTTP/2 over TLS (ALPN); the
+/// router dials cleartext and cannot speak that, so it stays on HTTP/1.1 —
+/// which the default reqwest client negotiates fine over TLS. Everything
+/// else (`Some(false)`, `None` from older SGLang, an unparsable URL) also
+/// stays on the always-safe HTTP/1.1 default.
+fn resolve_protocol(enable_http2: Option<bool>, worker_url: &str) -> WireProtocol {
+    let dials_cleartext = url::Url::parse(worker_url)
+        .map(|u| u.scheme() == "http")
+        .unwrap_or(false);
+    match (enable_http2, dials_cleartext) {
+        (Some(true), true) => WireProtocol::H2c,
+        _ => WireProtocol::Http1,
+    }
 }
 
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
@@ -428,8 +450,26 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    // Pick cleartext h2c vs HTTP/1.1 from the engine's self-report and the
+    // dialed scheme (see `resolve_protocol`). HTTP/1.1 is the always-safe
+    // default: Granian's `auto` mode accepts it, and it negotiates fine over
+    // TLS — so the only mismatch that would fail (cleartext h2c to a
+    // non-h2c endpoint) is exactly what the cleartext-scheme gate prevents.
+    let protocol = resolve_protocol(info.enable_http2, &worker_url);
+    match protocol {
+        WireProtocol::H2c => tracing::info!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
+        ),
+        WireProtocol::Http1 if info.enable_http2 == Some(true) => tracing::warn!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 but the worker URL is not cleartext http://; \
+             the router only speaks cleartext h2c, staying on HTTP/1.1",
+        ),
+        WireProtocol::Http1 => {}
+    }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    if let Err(e) = registry.add_with_cb(spec, cb) {
+    if let Err(e) = registry.add_with_cb(spec, cb, protocol) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -503,6 +543,49 @@ mod tests {
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn resolve_protocol_upgrades_to_h2c_only_for_cleartext_http2_engine() {
+        // The one case that gets h2c: engine self-reports --enable-http2 and
+        // we dial cleartext http://.
+        assert_eq!(
+            resolve_protocol(Some(true), "http://10.0.0.1:30000"),
+            WireProtocol::H2c,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_https_even_with_http2() {
+        // A TLS engine with --enable-http2 serves h2-over-TLS, not cleartext
+        // h2c; the router dials cleartext, so it must stay on HTTP/1.1
+        // (which negotiates fine over TLS) rather than break every request.
+        assert_eq!(
+            resolve_protocol(Some(true), "https://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_when_http2_disabled_or_unknown() {
+        // Explicit false (HTTP/1.1-only Uvicorn) and absent field (older
+        // SGLang) both keep the safe default.
+        assert_eq!(
+            resolve_protocol(Some(false), "http://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+        assert_eq!(
+            resolve_protocol(None, "http://10.0.0.1:30000"),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_unparsable_url() {
+        assert_eq!(
+            resolve_protocol(Some(true), "not a url"),
+            WireProtocol::Http1,
+        );
     }
 
     /// Helper: spawn a tiny fake worker that returns the supplied JSON body

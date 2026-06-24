@@ -8,6 +8,7 @@ pub mod sse;
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
+use crate::workers::WireProtocol;
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -32,7 +33,16 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
 
 #[derive(Debug)]
 pub struct Proxy {
+    /// HTTP/1.1 client — used for every worker that did not self-report
+    /// `--enable-http2`, and for side-channel admin traffic (e.g. cache
+    /// flush). Always safe against any engine.
     pub client: Client,
+    /// Cleartext HTTP/2 (h2c, prior-knowledge) client — used only for
+    /// workers that introspection resolved to [`WireProtocol::H2c`]. A
+    /// prior-knowledge client speaks *only* HTTP/2, so it must never be
+    /// pointed at an HTTP/1.1-only engine; selection is gated by the
+    /// worker's resolved protocol in [`Self::client_for`].
+    client_h2c: Client,
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
@@ -42,16 +52,36 @@ impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
+    ///
+    /// Two clients are built sharing identical pool/timeout tuning; the h2c
+    /// client additionally pins HTTP/2 prior knowledge so it can talk
+    /// cleartext h2c to Granian engines (no ALPN on plaintext).
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
-        let client = Client::builder()
-            .pool_max_idle_per_host(64)
-            .connect_timeout(Duration::from_secs(5))
+        let base = || {
+            Client::builder()
+                .pool_max_idle_per_host(64)
+                .connect_timeout(Duration::from_secs(5))
+        };
+        let client = base().build().context("build reqwest client")?;
+        let client_h2c = base()
+            .http2_prior_knowledge()
             .build()
-            .context("build reqwest client")?;
+            .context("build h2c reqwest client")?;
         Ok(Self {
             client,
+            client_h2c,
             request_timeout,
         })
+    }
+
+    /// Pick the client matching the worker's resolved wire protocol: the
+    /// prior-knowledge HTTP/2 client for h2c workers, the HTTP/1.1 client for
+    /// everyone else.
+    fn client_for(&self, protocol: WireProtocol) -> &Client {
+        match protocol {
+            WireProtocol::Http1 => &self.client,
+            WireProtocol::H2c => &self.client_h2c,
+        }
     }
 
     /// Classify a reqwest error into the right `ApiError` variant, given an
@@ -92,6 +122,7 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &CircuitBreaker,
+        protocol: WireProtocol,
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
@@ -105,7 +136,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -172,6 +203,7 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &Arc<CircuitBreaker>,
+        protocol: WireProtocol,
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
@@ -187,7 +219,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -265,5 +297,18 @@ mod tests {
     async fn new_returns_result_not_panic() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
         assert_eq!(p.request_timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn client_for_selects_per_protocol() {
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        // Http1 → the shared HTTP/1.1 client; H2c → the prior-knowledge
+        // client. They are distinct instances, and Http1 maps to the same
+        // client used for side-channel admin traffic (`p.client`).
+        assert!(std::ptr::eq(p.client_for(WireProtocol::Http1), &p.client));
+        assert!(!std::ptr::eq(
+            p.client_for(WireProtocol::Http1),
+            p.client_for(WireProtocol::H2c),
+        ));
     }
 }

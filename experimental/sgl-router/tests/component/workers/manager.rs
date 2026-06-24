@@ -4,7 +4,7 @@
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::workers::{manager, WorkerRegistry};
+use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,6 +130,63 @@ async fn manager_handles_mode_changed() {
             .len(),
         1
     );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A worker whose `/server_info` reports `enable_http2: true` is registered
+/// with [`WireProtocol::H2c`], so the proxy forwards over cleartext h2c.
+#[tokio::test]
+async fn manager_resolves_h2c_protocol_from_server_info() {
+    let (url, _s) =
+        spawn_fake_worker(json!({"served_model_name": "m", "enable_http2": true})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let w = registry
+        .get(&WorkerId("w1".into()))
+        .expect("worker registered");
+    assert_eq!(w.protocol, WireProtocol::H2c);
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A worker that omits `enable_http2` (older SGLang) stays on the safe
+/// HTTP/1.1 default.
+#[tokio::test]
+async fn manager_defaults_http1_when_enable_http2_absent() {
+    let (url, _s) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let w = registry
+        .get(&WorkerId("w1".into()))
+        .expect("worker registered");
+    assert_eq!(w.protocol, WireProtocol::Http1);
 
     drop(tx);
     h.await.unwrap();

@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::workers::worker::Worker;
+use crate::workers::worker::{WireProtocol, Worker};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -51,11 +51,13 @@ pub struct WorkerRegistry {
 
 impl WorkerRegistry {
     pub fn add(&self, spec: WorkerSpec) -> Result<(), AddWorkerError> {
-        self.add_with_cb(spec, None)
+        self.add_with_cb(spec, None, WireProtocol::Http1)
     }
 
-    /// Add a worker, optionally supplying a circuit-breaker config.
-    /// Pass `None` to use the circuit-breaker default (threshold = 3).
+    /// Add a worker, optionally supplying a circuit-breaker config, and the
+    /// wire protocol resolved from `/server_info`. Pass `None` for the
+    /// circuit-breaker default (threshold = 3) and [`WireProtocol::Http1`]
+    /// for the default protocol.
     ///
     /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
     /// `by_model` memberships are cleared first so a model that the new
@@ -83,6 +85,7 @@ impl WorkerRegistry {
         &self,
         spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
     ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
@@ -121,7 +124,7 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb));
+        let w = Arc::new(Worker::with_cb_config(spec, cb, protocol));
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {
@@ -310,7 +313,11 @@ mod tests {
         use std::time::Duration;
 
         let r = WorkerRegistry::default();
-        let _ = r.add_with_cb(spec("ok", WorkerMode::Plain, &["m"]), None);
+        let _ = r.add_with_cb(
+            spec("ok", WorkerMode::Plain, &["m"]),
+            None,
+            WireProtocol::Http1,
+        );
         // Give "bad" a threshold=1 breaker so a single record_failure
         // flips it to Open.
         let _ = r.add_with_cb(
@@ -319,6 +326,7 @@ mod tests {
                 threshold: NonZeroU32::new(1).unwrap(),
                 cool_down: Duration::from_secs(30),
             }),
+            WireProtocol::Http1,
         );
         let bad = r.get(&WorkerId("bad".into())).expect("bad worker present");
         bad.breaker.record_failure();
