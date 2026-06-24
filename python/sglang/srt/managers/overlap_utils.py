@@ -147,7 +147,6 @@ class FutureMap:
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
 
-        self.need_verified_id = getattr(draft_input, "verified_id", None) is not None
         self.need_bonus_tokens = getattr(draft_input, "bonus_tokens", None) is not None
         self.need_topk = self.spec_algo.need_topk()
         self.need_hidden_states = (
@@ -155,22 +154,6 @@ class FutureMap:
             and getattr(draft_input, "hidden_states", None) is not None
         )
 
-        if self.need_verified_id:
-            verified_id0 = draft_input.verified_id[0]
-            self.verified_id_buf = (
-                torch.full(
-                    (self.req_pool_size, *verified_id0.shape),
-                    -1,
-                    dtype=verified_id0.dtype,
-                    device=self.device,
-                )
-                if _DEBUG_ASSERT
-                else torch.empty(
-                    (self.req_pool_size, *verified_id0.shape),
-                    dtype=verified_id0.dtype,
-                    device=self.device,
-                )
-            )
         if self.need_topk:
             topk_p0 = draft_input.topk_p[0]
             topk_index0 = draft_input.topk_index[0]
@@ -219,8 +202,6 @@ class FutureMap:
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
-        if self.need_verified_id:
-            draft_input.verified_id = self.verified_id_buf[indices]
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
@@ -248,10 +229,6 @@ class FutureMap:
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if _DEBUG_ASSERT:
-            if self.need_verified_id:
-                _assert_nonneg_and_invalidate(
-                    draft_input.verified_id, self.verified_id_buf, indices
-                )
             if self.need_bonus_tokens:
                 _assert_nonneg_and_invalidate(
                     draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -345,10 +322,6 @@ class FutureMap:
         draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
-        if self.need_verified_id:
-            self.verified_id_buf[indices] = draft_input.verified_id.to(
-                self.verified_id_buf.dtype
-            )
         if self.need_bonus_tokens:
             self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
                 self.output_tokens_buf.dtype
