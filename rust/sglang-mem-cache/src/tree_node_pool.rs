@@ -5,11 +5,10 @@ use std::hash::Hash;
 use tch::Tensor;
 
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
-use crate::error::RadixCacheInitError;
 use crate::components::{
-    ComponentPoolState, EvictResult, FullSlot, LRUData, Slot, MambaSlot, SwaSlot,
-    evict_full_value,
+    ComponentPoolState, EvictResult, FullSlot, LRUData, MambaSlot, Slot, SwaSlot, evict_full_value,
 };
+use crate::error::RadixCacheInitError;
 
 /// Validated page size for the radix cache.
 #[derive(Debug, Clone, Copy)]
@@ -361,11 +360,7 @@ impl<K: ChildKeyType> TreeNodePool<K> {
     }
 
     /// Insert a leaf node and attach to `parent_idx` as a child.
-    pub fn insert_leaf(
-        &mut self,
-        parent_idx: NodeIdx,
-        node: TreeNode<K>,
-    ) -> NodeIdx {
+    pub fn insert_leaf(&mut self, parent_idx: NodeIdx, node: TreeNode<K>) -> NodeIdx {
         let child_key_owned = node.child_key(self.page_size).to_owned();
         let child_idx = self.alloc(node);
         self.get_mut(child_idx).parent = Some(parent_idx);
@@ -458,11 +453,7 @@ impl<K: ChildKeyType> TreeNodePool<K> {
     }
 
     /// Evict a leaf and update all bookkeeping.
-    pub fn evict_leaf(
-        &mut self,
-        idx: NodeIdx,
-        result: &mut EvictResult,
-    ) {
+    pub fn evict_leaf(&mut self, idx: NodeIdx, result: &mut EvictResult) {
         // TODO(Jialin): pass the configured components so this can iterate
         // generically instead of hard-coding SWA + Mamba snapshots + unlinks.
         let (

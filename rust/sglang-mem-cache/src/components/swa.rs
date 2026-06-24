@@ -3,10 +3,13 @@
 use tch::Tensor;
 
 use super::{Component, IncLockRefResult, MatchValidator};
+use super::{
+    EvictRequest, EvictResult, FullSlot, Slot, dec_lock_ref_non_full, evict_non_full,
+    inc_lock_ref_non_full,
+};
 use crate::component_type::ComponentType;
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
-use super::{EvictRequest, EvictResult, FullSlot, Slot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, NodeSplit, TreeNode, TreeNodePool};
 
 pub struct SwaComponent {
@@ -307,7 +310,7 @@ impl<K: ChildKeyType> MatchValidator<K> for SwaMatchValidator {
     }
 }
 
-/// LRU for SWA values.
+/// SWA component slot.
 pub struct SwaSlot;
 
 impl Slot for SwaSlot {
@@ -327,10 +330,10 @@ impl Slot for SwaSlot {
     }
 
     fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
-        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ true)
+        inc_lock_ref_non_full::<K, Self>(pool, node_idx, /* enforce_full_cap */ true)
     }
 
     fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
-        Self::dec_lock_ref_non_full(pool, node_idx)
+        dec_lock_ref_non_full::<K, Self>(pool, node_idx)
     }
 }

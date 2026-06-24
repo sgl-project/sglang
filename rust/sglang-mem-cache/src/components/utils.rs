@@ -121,11 +121,7 @@ pub(crate) fn iteratively_delete_tombstone_leaf<K: ChildKeyType, S: Slot>(
     loop {
         let node = pool.get(node_idx);
 
-        if S::has_value(node)
-            || !node.is_leaf()
-            || node.is_root()
-            || FullSlot::lock_ref(node) > 0
-        {
+        if S::has_value(node) || !node.is_leaf() || node.is_root() || FullSlot::lock_ref(node) > 0 {
             break;
         }
         assert_eq!(
@@ -143,4 +139,65 @@ pub(crate) fn iteratively_delete_tombstone_leaf<K: ChildKeyType, S: Slot>(
         pool.evict_leaf(node_idx, result);
         node_idx = parent;
     }
+}
+
+/// Lock-ref increment shared by non-FULL components.
+pub(crate) fn inc_lock_ref_non_full<K: ChildKeyType, S: Slot>(
+    pool: &mut TreeNodePool<K>,
+    node_idx: NodeIdx,
+    enforce_full_cap: bool,
+) -> i64 {
+    let component = S::COMPONENT;
+    let node = pool.get_mut(node_idx);
+    let new = S::lock_ref(node) + 1;
+    if enforce_full_cap {
+        let full_ref = FullSlot::lock_ref(node);
+        assert!(
+            new <= full_ref,
+            "{component:?}Slot::inc_lock_ref: prospective lock_ref {new} exceeds \
+             full_lock_ref {full_ref} — caller must inc FULL on this node first",
+        );
+    }
+    if new == 1 {
+        assert!(
+            S::has_value(node),
+            "{component:?}Slot::inc_lock_ref called on a node without value \
+             populated (node_idx={node_idx})",
+        );
+    }
+    S::set_lock_ref(node, new);
+    if new != 1 {
+        return 0;
+    }
+    let delta = S::value_len(node);
+    let state = S::pool_state_mut(pool);
+    state.unlocked_size -= delta;
+    state.locked_size += delta;
+    -(delta as i64)
+}
+
+/// Lock-ref decrement shared by non-FULL components.
+pub(crate) fn dec_lock_ref_non_full<K: ChildKeyType, S: Slot>(
+    pool: &mut TreeNodePool<K>,
+    node_idx: NodeIdx,
+) -> i64 {
+    let component = S::COMPONENT;
+    let node = pool.get_mut(node_idx);
+    let new = S::lock_ref(node) - 1;
+    if new == 0 {
+        assert!(
+            S::has_value(node),
+            "{component:?}Slot::dec_lock_ref called on a node without value \
+             populated (node_idx={node_idx})",
+        );
+    }
+    S::set_lock_ref(node, new);
+    if new != 0 {
+        return 0;
+    }
+    let delta = S::value_len(node);
+    let state = S::pool_state_mut(pool);
+    state.unlocked_size += delta;
+    state.locked_size -= delta;
+    delta as i64
 }

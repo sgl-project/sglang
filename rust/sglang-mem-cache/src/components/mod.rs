@@ -3,7 +3,7 @@
 mod full;
 mod mamba;
 mod swa;
-mod evict_utils;
+mod utils;
 
 use tch::Tensor;
 
@@ -28,13 +28,10 @@ pub struct IncLockRefResult {
 
 /// Orchestrator-facing per-component trait.
 pub trait Component<K: ChildKeyType>: Send {
-    /// Fresh per-walk validator, or `None` if this component has no gating.
+    /// Stateful validator for one prefix-match walk; `None` if no gating.
     fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>>;
 
     /// Per-component inc-lock walk from `node_idx` up the tree.
-    ///
-    /// Dispatched forward (FULL then SWA) so FULL's `lock_ref` is bumped
-    /// before SWA's `swa_lock_ref <= full_lock_ref` assert runs.
     fn inc_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -42,9 +39,6 @@ pub trait Component<K: ChildKeyType>: Send {
     ) -> Option<IncLockRefResult>;
 
     /// Per-component dec-lock walk, inverse of `inc_lock_ref`.
-    ///
-    /// Dispatched in REVERSE (SWA then FULL) so FULL's
-    /// `swa_lock_ref <= full_lock_ref` assert doesn't fire transiently.
     fn dec_lock_ref(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -53,16 +47,10 @@ pub trait Component<K: ChildKeyType>: Send {
     ) -> Option<i64>;
 
     /// Per-component evict step.
-    ///
-    /// Dispatched forward (FULL then SWA): FULL's evict cross-bumps
-    /// `result.evicted[Swa]` per leaf, so SWA won't over-evict.
     fn evict(&self, pool: &mut TreeNodePool<K>, request: &EvictRequest, result: &mut EvictResult);
 
     /// Per-overlap-node insert hook. Returns `consumed_from`: slots in
     /// `value_slice[consumed_from..]` are claimed by this component.
-    ///
-    /// Default claims nothing. `insert_helper` frees up to `min` across
-    /// components.
     #[allow(clippy::too_many_arguments)]
     fn consume_value(
         &self,
@@ -79,8 +67,7 @@ pub trait Component<K: ChildKeyType>: Send {
         Ok(node_key_len)
     }
 
-    /// Pre-leaf-creation veto hook; `true` aborts leaf creation. Default
-    /// `false`. `insert_helper` takes `any()` across components.
+    /// Pre-leaf-creation veto hook; `true` aborts leaf creation. Default `false`.
     fn should_skip_leaf_creation(
         &self,
         _total_prefix_len: usize,
@@ -102,12 +89,10 @@ pub trait Component<K: ChildKeyType>: Send {
     ) {
     }
 
-    /// Per-component LRU recency bump from `node_idx` up to MRU. No default
-    /// so a new LRU-bearing component can't forget to override.
+    /// Per-component LRU recency bump from `node_idx` up to MRU.
     fn bump_mru_walk(&self, pool: &mut TreeNodePool<K>, node_idx: NodeIdx);
 
-    /// Per-component value redistribution after a node split. No default so
-    /// a new per-node-state component can't forget to override.
+    /// Per-component value redistribution after a node split.
     fn redistribute_on_node_split(
         &self,
         pool: &mut TreeNodePool<K>,
@@ -120,7 +105,9 @@ pub trait Component<K: ChildKeyType>: Send {
 pub use full::{FullComponent, FullSlot};
 pub use mamba::{MambaComponent, MambaSlot};
 pub use swa::{SwaComponent, SwaSlot};
-pub(crate) use evict_utils::{evict_full, evict_full_value, evict_non_full};
+pub(crate) use utils::{
+    dec_lock_ref_non_full, evict_full, evict_full_value, evict_non_full, inc_lock_ref_non_full,
+};
 
 /// Per-component eviction budget, indexed by `ct as usize`.
 #[derive(Default, Clone, Copy)]
@@ -161,7 +148,7 @@ impl Default for ComponentPoolState {
     }
 }
 
-/// Per-node intrusive LRU state for one LRU slot.
+/// Per-node intrusive LRU state for one slot.
 #[derive(Default, Clone, Copy)]
 pub struct LRUData {
     pub prev: NodeIdx,
@@ -169,7 +156,7 @@ pub struct LRUData {
     pub in_list: bool,
 }
 
-/// Marker trait selecting the right LRU slot to use.
+/// Per-component slot: value, lock_ref, and LRU bookkeeping.
 pub trait Slot: Sized {
     /// Component this slot belongs to.
     const COMPONENT: ComponentType;
@@ -182,10 +169,10 @@ pub trait Slot: Sized {
         Self::lock_ref(node) == 0
     }
 
-    /// Bookkeeping on the value's parent after `set_value`. Default no-op.
+    /// Bookkeeping after `set_value`. Default no-op.
     fn postprocess_set_value<K: ChildKeyType>(_pool: &mut TreeNodePool<K>, _parent_idx: NodeIdx) {}
 
-    /// Bookkeeping on the value's parent after `take_value`. Default no-op.
+    /// Bookkeeping after `take_value`. Default no-op.
     fn postprocess_take_value<K: ChildKeyType>(_pool: &mut TreeNodePool<K>, _parent_idx: NodeIdx) {}
 
     fn node_components<K: ChildKeyType>(
@@ -445,71 +432,4 @@ pub trait Slot: Sized {
 
     /// Decrease this slot's `lock_ref`; returns the delta to `unlocked_size`.
     fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64;
-
-    /// Lock-ref increment shared by non-FULL components.
-    fn inc_lock_ref_non_full<K: ChildKeyType>(
-        pool: &mut TreeNodePool<K>,
-        node_idx: NodeIdx,
-        enforce_full_cap: bool,
-    ) -> i64 {
-        let component = Self::COMPONENT;
-        let node = pool.get_mut(node_idx);
-        #[allow(clippy::panic, reason = "u32 lock_ref overflow effectively impossible")]
-        let new = Self::lock_ref(node)
-            .checked_add(1)
-            .unwrap_or_else(|| panic!("{component:?}Slot::inc_lock_ref: u32 overflow"));
-        if enforce_full_cap {
-            let full_ref = FullSlot::lock_ref(node);
-            assert!(
-                new <= full_ref,
-                "{component:?}Slot::inc_lock_ref: prospective lock_ref {new} exceeds \
-                 full_lock_ref {full_ref} — caller must inc FULL on this node first",
-            );
-        }
-        if new == 1 {
-            assert!(
-                Self::has_value(node),
-                "{component:?}Slot::inc_lock_ref called on a node without value \
-                 populated (node_idx={node_idx})",
-            );
-        }
-        Self::set_lock_ref(node, new);
-        if new != 1 {
-            return 0;
-        }
-        let delta = Self::value_len(node);
-        let state = Self::pool_state_mut(pool);
-        state.unlocked_size -= delta;
-        state.locked_size += delta;
-        -(delta as i64)
-    }
-
-    /// Lock-ref decrement shared by non-FULL components.
-    fn dec_lock_ref_non_full<K: ChildKeyType>(
-        pool: &mut TreeNodePool<K>,
-        node_idx: NodeIdx,
-    ) -> i64 {
-        let component = Self::COMPONENT;
-        let node = pool.get_mut(node_idx);
-        #[allow(clippy::panic, reason = "underflow = dec without matching inc")]
-        let new = Self::lock_ref(node)
-            .checked_sub(1)
-            .unwrap_or_else(|| panic!("{component:?}Slot::dec_lock_ref: underflow"));
-        if new == 0 {
-            assert!(
-                Self::has_value(node),
-                "{component:?}Slot::dec_lock_ref called on a node without value \
-                 populated (node_idx={node_idx})",
-            );
-        }
-        Self::set_lock_ref(node, new);
-        if new != 0 {
-            return 0;
-        }
-        let delta = Self::value_len(node);
-        let state = Self::pool_state_mut(pool);
-        state.unlocked_size += delta;
-        state.locked_size -= delta;
-        delta as i64
-    }
 }

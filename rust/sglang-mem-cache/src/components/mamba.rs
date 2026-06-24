@@ -1,9 +1,11 @@
 //! Mamba component for the radix tree.
 
 use super::{Component, IncLockRefResult, MatchValidator};
+use super::{
+    EvictRequest, EvictResult, Slot, dec_lock_ref_non_full, evict_non_full, inc_lock_ref_non_full,
+};
 use crate::component_type::ComponentType;
 use crate::error::RadixCacheInitError;
-use super::{EvictRequest, EvictResult, Slot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Mamba radix-tree component.
@@ -100,7 +102,7 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
     }
 }
 
-/// LRU for Mamba values.
+/// Mamba component slot.
 pub struct MambaSlot;
 
 impl Slot for MambaSlot {
@@ -113,10 +115,10 @@ impl Slot for MambaSlot {
     }
 
     fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
-        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ true)
+        inc_lock_ref_non_full::<K, Self>(pool, node_idx, /* enforce_full_cap */ true)
     }
 
     fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
-        Self::dec_lock_ref_non_full(pool, node_idx)
+        dec_lock_ref_non_full::<K, Self>(pool, node_idx)
     }
 }

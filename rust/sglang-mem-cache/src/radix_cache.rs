@@ -3,11 +3,9 @@ use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
 use crate::components::{Component, FullComponent, IncLockRefResult, MambaComponent, SwaComponent};
+use crate::components::{EvictRequest, EvictResult, FullSlot, MambaSlot, Slot, SwaSlot};
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
-use crate::components::{
-    EvictRequest, EvictResult, FullSlot, Slot, MambaSlot, SwaSlot,
-};
 use crate::tree_node_pool::{
     ChildKeyType, MatchChildResult, NodeIdx, PageSize, TreeNode, TreeNodePool,
 };
