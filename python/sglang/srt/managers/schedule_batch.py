@@ -86,10 +86,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_cache_utils import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.eviction import (
+    CacheFreeSpaceProvider,
+    evict_from_tree_cache,
+)
 from sglang.srt.mem_cache.owned_kv import (
     alloc_for_decode,
     alloc_for_extend,
-    evict_from_tree_cache,
     free_swa_out_of_window_slots,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -2045,7 +2048,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
+            self,
+            space=CacheFreeSpaceProvider(self.tree_cache),
         )
 
         # Set fields
@@ -2645,7 +2649,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(
+            self,
+            token_per_req=1,
+            space=CacheFreeSpaceProvider(self.tree_cache),
+        )
 
         # Update req-level memory management fields
         for req in self.reqs:

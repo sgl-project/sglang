@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.common import (
     harvest_and_finish_req,
     maybe_cache_unfinished_req,
 )
+from sglang.srt.mem_cache.eviction import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -46,7 +47,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.owned_kv import available_and_evictable_str
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (

@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.kv_cache_utils import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.mem_cache.eviction import CacheFreeSpaceProvider
 from sglang.srt.mem_cache.owned_kv import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -82,7 +83,11 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         if page_size == 1:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+            out_cache_loc = alloc_token_slots(
+                batch.token_to_kv_pool_allocator,
+                num_needed_tokens,
+                space=CacheFreeSpaceProvider(batch.tree_cache),
+            )
         else:
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
@@ -90,13 +95,14 @@ class EagleDraftInputV2Mixin:
                 cur_kv_lens_device,
             )
             out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
+                batch.token_to_kv_pool_allocator,
                 cur_kv_lens_device,
                 cur_kv_lens_cpu,
                 nxt_kv_lens_device,
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
+                space=CacheFreeSpaceProvider(batch.tree_cache),
             )
 
         assign_req_to_token_pool_func(
