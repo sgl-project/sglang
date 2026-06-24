@@ -53,6 +53,7 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
+    profile_steps: Optional[int] = None
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -170,6 +171,16 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
+            "--profile-steps",
+            type=int,
+            default=BenchArgs.profile_steps,
+            help="Number of forward steps to profile. When set, profiling "
+            "auto-stops after this many steps (recommended for slow GPU trace "
+            "capture such as MLX/Metal on Apple Silicon, where capturing a full "
+            "generation would otherwise be prohibitively slow). When unset, the "
+            "whole run is profiled.",
+        )
+        parser.add_argument(
             "--skip-warmup",
             action="store_true",
             help="Skip the warmup batches.",
@@ -210,6 +221,7 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    profile_steps: Optional[int] = None,
     return_logprob: bool = False,
     logprob_start_len: int = -1,
 ):
@@ -240,8 +252,15 @@ def throughput_test_once(
         assert (
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        profiler_dir = os.environ["SGLANG_TORCH_PROFILER_DIR"]
+        os.makedirs(profiler_dir, exist_ok=True)
+        # Snapshot before starting: when profile_steps is set the profiler
+        # auto-stops mid-generation, so the trace file appears during generate().
+        known_files = set(os.listdir(profiler_dir))
+        if profile_steps is not None:
+            backend.start_profile(num_steps=profile_steps)
+        else:
+            backend.start_profile()
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -253,10 +272,11 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
-        known_files = set(os.listdir(dir))
-        backend.stop_profile()
-        monitor_trace_file(known_files, dir)
+        # When profile_steps is set the run auto-stops after that many forward
+        # steps, so an explicit stop here would error ("not in progress").
+        if profile_steps is None:
+            backend.stop_profile()
+        monitor_trace_file(known_files, profiler_dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
@@ -455,6 +475,7 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        profile_steps=bench_args.profile_steps,
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )
