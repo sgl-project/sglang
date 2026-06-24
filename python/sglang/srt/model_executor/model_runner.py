@@ -2358,29 +2358,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def configure_kv_cache_dtype(self):
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args=self.server_args,
+                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
                 model=self.model,
                 model_dtype=self.dtype,
+                is_draft_worker=self.is_draft_worker,
+                is_dflash=self.spec_algorithm.is_dflash(),
+                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
             )
         )
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
-
-        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
-        if (
-            self.is_draft_worker
-            and self.spec_algorithm.is_dflash()
-            and self.server_args.speculative_draft_attention_backend == "fa4"
-            and self.kv_cache_dtype != self.dtype
-        ):
-            logger.info(
-                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
-                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
-                self.kv_cache_dtype,
-                self.dtype,
-            )
-            self.kv_cache_dtype = self.dtype
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
