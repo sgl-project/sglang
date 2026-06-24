@@ -98,6 +98,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import disable, enable, is_enabled
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
@@ -196,6 +197,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        )
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
@@ -489,6 +493,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+        if self.enable_shape_discovery_for_cuda_graph_profile:
+            disable()
 
         # Optionally persist the shaped capture trace (record_shapes=True) for
         # offline per-kernel analysis -- opt-in via
@@ -817,15 +823,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                base_post_warmup_hook = getattr(
+                    self.model_runner.attn_backend,
+                    "on_after_cuda_graph_warmup",
+                    None,
+                )
+
+                def post_warmup_hook():
+                    if base_post_warmup_hook is not None:
+                        base_post_warmup_hook()
+                    # Activate the kernel shape profiler AFTER warmup runs so
+                    # that lazily-imported modules (e.g. tilelang_kernel) are
+                    # already in sys.modules and auto-discovery can find them.
+                    if (
+                        self.enable_profile_cuda_graph
+                        and self.enable_shape_discovery_for_cuda_graph_profile
+                        and not is_enabled()
+                    ):
+                        enable()
+
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     dummies=None,
-                    post_warmup_hook=getattr(
-                        self.model_runner.attn_backend,
-                        "on_after_cuda_graph_warmup",
-                        None,
-                    ),
+                    post_warmup_hook=post_warmup_hook,
                 )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
