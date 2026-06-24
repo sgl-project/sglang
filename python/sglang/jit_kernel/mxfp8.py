@@ -103,6 +103,7 @@ def es_sm100_mxfp8_blockscaled_grouped_quant(
 
 
 def es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
+    d: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     sfa: torch.Tensor,
@@ -110,15 +111,12 @@ def es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
     expert_offsets: torch.Tensor,
     blockscale_offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
+    d_ptrs: torch.Tensor,
+    b_ptrs: torch.Tensor,
+    sfb_ptrs: torch.Tensor,
     workspace: torch.Tensor,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    num_experts, m, tokens = a.shape[0], a.shape[1], b.shape[0]
-    d = torch.empty((tokens, m), device=a.device, dtype=dtype)
-    d_ptrs = torch.empty((num_experts,), device=a.device, dtype=torch.int64)
-    b_ptrs = torch.empty((num_experts,), device=a.device, dtype=torch.int64)
-    sfb_ptrs = torch.empty((num_experts,), device=a.device, dtype=torch.int64)
-    module = _jit_es_sm100_mxfp8_blockscaled_moe_group_gemm(dtype)
+) -> None:
+    module = _jit_es_sm100_mxfp8_blockscaled_moe_group_gemm(d.dtype)
     module.es_sm100_mxfp8_blockscaled_moe_group_gemm(
         a,
         b,
@@ -133,4 +131,3 @@ def es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
         d_ptrs,
         workspace,
     )
-    return d

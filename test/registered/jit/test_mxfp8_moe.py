@@ -127,7 +127,14 @@ def test_es_sm100_mxfp8_blockscaled_grouped_mm(num_experts, out_dtype):
 
     b_quant = b_quant.view(num_experts, n_g, k_g)
     b_scale_factor = b_scale_factor.view(num_experts, n_g, k_g // 32)
-    d = es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
+
+    d = torch.empty((expert_offset, n_g), device=device, dtype=out_dtype)
+    d_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    sfb_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+
+    es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
+        d,
         b_quant,
         a_quant,
         b_scale_factor,
@@ -135,8 +142,10 @@ def test_es_sm100_mxfp8_blockscaled_grouped_mm(num_experts, out_dtype):
         _expert_offsets,
         _a_blockscale_offsets,
         tokens_per_expert,
+        d_ptrs,
+        b_ptrs,
+        sfb_ptrs,
         workspace,
-        a.dtype,
     )
 
     for g in range(num_experts):
