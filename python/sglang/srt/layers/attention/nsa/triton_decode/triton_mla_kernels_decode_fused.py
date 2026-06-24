@@ -17,6 +17,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import is_gfx942_supported
+
+# gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
+# gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
+_KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
+
 
 def _bucket_total_tokens(total_tokens: int) -> int:
     """Round total_tokens up to the nearest power of 2 for autotune key stability."""
@@ -213,37 +219,37 @@ def _process_kv_block_aggressive(
 
     qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-    nope_fp8_0 = nope_uint8_0.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
     kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
     kv_0 = tl.where(valid_2d, kv_0, 0.0)
     qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
 
-    nope_fp8_1 = nope_uint8_1.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
     kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
     kv_1 = tl.where(valid_2d, kv_1, 0.0)
     qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
 
-    nope_fp8_2 = nope_uint8_2.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
     kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
     kv_2 = tl.where(valid_2d, kv_2, 0.0)
     qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
 
-    nope_fp8_3 = nope_uint8_3.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
     kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
     kv_3 = tl.where(valid_2d, kv_3, 0.0)
     qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
 
-    nope_fp8_4 = nope_uint8_4.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
     kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
     kv_4 = tl.where(valid_2d, kv_4, 0.0)
     qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
 
-    nope_fp8_5 = nope_uint8_5.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
     kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
     kv_5 = tl.where(valid_2d, kv_5, 0.0)
     qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
 
-    nope_fp8_6 = nope_uint8_6.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
     kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
     kv_6 = tl.where(valid_2d, kv_6, 0.0)
     qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
