@@ -34,7 +34,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import harvest_and_finish_req
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    harvest_and_finish_req,
+    maybe_cache_unfinished_req,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -42,7 +46,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.owned_kv import available_and_evictable_str
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
@@ -1827,7 +1830,7 @@ class UnifiedRadixCacheSuite:
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            tree.cache_unfinished_req(req)
+            maybe_cache_unfinished_req(req, tree)
 
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
         expected_evicted = (pre_len - 1) - cushion
@@ -1877,7 +1880,7 @@ class UnifiedRadixCacheSuite:
         req.kv.swa_evicted_seqlen = 0
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            tree.cache_unfinished_req(req)
+            maybe_cache_unfinished_req(req, tree)
 
         self.assertEqual(
             req.kv.swa_evicted_seqlen,

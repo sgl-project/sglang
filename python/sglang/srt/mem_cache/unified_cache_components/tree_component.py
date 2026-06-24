@@ -380,10 +380,10 @@ class TreeComponent(ABC):
         paths it is still provided so components can free their resources."""
         pass
 
-    def free_out_of_window_slots(
-        self, req: Req, pre_len: int, insert_params: InsertParams
-    ) -> None:
-        pass
+    def unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
+    ) -> Optional[int]:
+        return None
 
     # ---- HiCache Hooks ----
 

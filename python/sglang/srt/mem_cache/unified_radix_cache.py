@@ -816,10 +816,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 effective_cache_len = min(effective_cache_len, cl)
 
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            for comp in self._components_tuple:
-                comp.free_out_of_window_slots(
-                    req, effective_cache_len - 1, insert_params
-                )
+            insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
@@ -884,6 +881,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+    def unfinished_swa_evict_pre_len(
+        self, req: Req, chunked: bool = False
+    ) -> Optional[int]:
+        if self.session.would_short_circuit_unfinished(req, chunked=chunked):
+            return None
+        if self.disable:
+            return None
+        token_ids = req.get_fill_ids()
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cl = comp.unfinished_effective_cache_len(req, len(token_ids))
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        return effective_cache_len - 1
 
     # ---- Internal Helpers ----
 

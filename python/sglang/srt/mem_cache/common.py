@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_evict_dsv4_state_on_swa,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, CacheFinishParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.owned_kv import free_swa_out_of_window_slots
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align
 
@@ -14,10 +18,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def evict_swa_out_of_window_for_unfinished(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    chunked: bool,
+) -> Optional[int]:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        return None
+    if not tree_cache.supports_swa():
+        return None
+
+    pre_len = tree_cache.unfinished_swa_evict_pre_len(req, chunked=chunked)
+    if pre_len is None:
+        return None
+    if req.kv is None:
+        return None
+
+    free_swa_out_of_window_slots(
+        req_pool_idx=req.req_pool_idx,
+        kv=req.kv,
+        owned_start=req.cache.cache_protected_len,
+        pre_len=pre_len,
+        sliding_window_size=tree_cache.sliding_window_size,
+        page_size=tree_cache.page_size,
+        req_to_token_pool=tree_cache.req_to_token_pool,
+        token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
+        on_swa_evicted=lambda watermark: maybe_evict_dsv4_state_on_swa(
+            tree_cache.token_to_kv_pool_allocator,
+            tree_cache.req_to_token_pool,
+            req,
+            watermark,
+        ),
+    )
+    return req.kv.swa_evicted_seqlen
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
+    evict_swa_out_of_window_for_unfinished(
+        req, tree_cache, chunked=kwargs.get("chunked", False)
+    )
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
