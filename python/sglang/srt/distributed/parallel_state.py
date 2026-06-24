@@ -2335,11 +2335,11 @@ def ensure_model_parallel_initialized(
         f"{pp_world_size=} vs. "
         f"{pipeline_model_parallel_size=}"
     )
-
-    dcp_world_size = get_dcp_group().world_size
-    assert (
-        dcp_world_size == decode_context_parallel_size
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+    if decode_context_parallel_size > 1:
+        dcp_world_size = get_dcp_group().world_size
+        assert (
+            dcp_world_size == decode_context_parallel_size
+        ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
 
 
 def model_parallel_is_initialized():
