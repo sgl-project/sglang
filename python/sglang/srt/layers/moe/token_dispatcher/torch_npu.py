@@ -151,7 +151,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         )
         # TP all-gather for intermediate dimension if needed
         if self.tp_size > 1:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
+            final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, dim=-1)
 
         self._dispatch_output = None
         return final_hidden_states
