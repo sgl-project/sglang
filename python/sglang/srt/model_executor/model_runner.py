@@ -196,6 +196,10 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.utils.common import (
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     broadcast_pyobj,
