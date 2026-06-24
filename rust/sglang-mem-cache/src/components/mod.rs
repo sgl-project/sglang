@@ -373,8 +373,8 @@ pub trait Slot: Sized {
         } else {
             assert!(
                 !require_value,
-                "redistribute_on_split: value required but absent — a device FULL \
-                 value must exist on a node split",
+                "redistribute_on_split: require_value set but this slot has no \
+                 value on the node split",
             );
         }
     }
