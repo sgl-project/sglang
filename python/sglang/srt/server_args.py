@@ -90,6 +90,7 @@ from sglang.srt.utils.common import (
     is_triton_kernels_available,
     is_xpu,
     json_list_type,
+    log_info_on_rank0,
     nullable_str,
     parse_connector_type,
     torch_release,
@@ -136,6 +137,26 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+]
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
+
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -2707,6 +2728,8 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        self._handle_chunked_prefill_and_prefix_cache()
+
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
@@ -4466,6 +4489,27 @@ class ServerArgs:
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
+
+    def _handle_chunked_prefill_and_prefix_cache(self):
+        model_config = self.get_model_config()
+
+        if model_config.is_multimodal:
+            if not model_config.is_multimodal_chunked_prefill_supported:
+                self.chunked_prefill_size = -1
+                logger.info(
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
+                    f"{model_config.hf_config.model_type}"
+                )
+
+        if (
+            not self.use_mla_backend()
+            or self.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            self.disable_chunked_prefix_cache = True
+
+        if not self.disable_chunked_prefix_cache:
+            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         if model_arch in [

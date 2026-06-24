@@ -152,9 +152,6 @@ from sglang.srt.model_executor.model_runner_components.quantization_checks impor
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
 )
-from sglang.srt.model_executor.model_runner_components.server_args_adjustment import (
-    model_specific_adjustment,
-)
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
 )
@@ -243,30 +240,11 @@ MLA_ATTENTION_BACKENDS = [
     "intel_xpu",
 ]
 
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
-
 
 def add_mla_attention_backend(backend_name):
     if backend_name not in MLA_ATTENTION_BACKENDS:
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
 
 
 # Detect stragger ranks in model loading
@@ -466,11 +444,6 @@ class ModelRunner:
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
-
-        # Model-specific adjustment
-        model_specific_adjustment(
-            server_args=self.server_args, model_config=self.model_config
-        )
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
