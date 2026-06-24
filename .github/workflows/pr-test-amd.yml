@@ -1165,12 +1165,100 @@ jobs:
             ci_sglang \
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
+      # ---------------------------------------------------------------------
+      # DEBUG (bingxche): per-NIC RDMA health isolation. The disaggregation
+      # suite has failed on 3 consecutive scheduled runs with
+      # `transport retry counter exceeded` (ionic cqe error 12 /
+      # IBV_WC_RETRY_EXC_ERR); the failing local NIC is consistently rdma5
+      # while the peer node varies (10.42.20.122/.151/.195). These two steps
+      # capture per-NIC error-counter deltas across the test + kernel ionic
+      # errors so IT can confirm/repair the faulty NIC. Remove before merge.
+      - name: DEBUG RDMA NIC counters (pre-test baseline)
+        if: ${{ always() }}
+        run: |
+          set +e
+          IB=/sys/class/infiniband
+          mkdir -p /tmp/rdma_pre
+          echo "Runner host: $(hostname)"
+          [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
+          for d in "$IB"/*; do
+            dev=$(basename "$d"); p="$d/ports/1/counters"
+            for c in local_link_integrity_errors port_rcv_errors port_xmit_discards \
+                     symbol_error link_downed link_error_recovery \
+                     port_rcv_remote_physical_errors; do
+              cat "$p/$c" 2>/dev/null > "/tmp/rdma_pre/${dev}.${c}"
+            done
+          done
+          echo "Baseline captured for: $(ls $IB | paste -sd, -)"
+
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: DEBUG RDMA NIC diagnostic (post-test, isolate faulty NIC)
+        if: ${{ always() }}
+        run: |
+          set +e
+          IB=/sys/class/infiniband
+          echo "===================================================================="
+          echo "Runner host: $(hostname)   (failure peer IPs were 10.42.20.x)"
+          echo "===================================================================="
+          echo ""
+          echo "### 1. Per-NIC ERROR-COUNTER DELTA during this disaggregation run ###"
+          echo "    (the NIC with large growth is the faulty link)"
+          printf "%-8s %-34s %12s %12s %12s\n" DEV COUNTER before after delta
+          if [ -d "$IB" ]; then
+            for d in "$IB"/*; do
+              dev=$(basename "$d"); p="$d/ports/1/counters"
+              for c in local_link_integrity_errors port_rcv_errors port_xmit_discards \
+                       symbol_error link_downed link_error_recovery \
+                       port_rcv_remote_physical_errors; do
+                after=$(cat "$p/$c" 2>/dev/null)
+                before=$(cat "/tmp/rdma_pre/${dev}.${c}" 2>/dev/null)
+                [ -z "$after" ] && continue
+                if [ -n "$before" ] && [ "$before" != "$after" ]; then
+                  printf "%-8s %-34s %12s %12s %12s\n" "$dev" "$c" "$before" "$after" "$((after-before))"
+                fi
+              done
+            done
+            echo "(no rows above = no error counters changed during the test)"
+          else
+            echo "No $IB on host"
+          fi
+          echo ""
+          echo "### 2. Absolute per-NIC error counters (cumulative since boot) ###"
+          printf "%-8s %8s %12s %12s %12s %12s %12s\n" DEV state lnk_integ rcv_err xmit_disc sym_err lnk_down
+          if [ -d "$IB" ]; then
+            for d in "$IB"/*; do
+              dev=$(basename "$d"); pp="$d/ports/1"; p="$pp/counters"
+              printf "%-8s %8s %12s %12s %12s %12s %12s\n" "$dev" \
+                "$(cat $pp/state 2>/dev/null | grep -oE '[A-Z_]+' | head -1)" \
+                "$(cat $p/local_link_integrity_errors 2>/dev/null)" \
+                "$(cat $p/port_rcv_errors 2>/dev/null)" \
+                "$(cat $p/port_xmit_discards 2>/dev/null)" \
+                "$(cat $p/symbol_error 2>/dev/null)" \
+                "$(cat $p/link_downed 2>/dev/null)"
+            done
+          fi
+          echo ""
+          echo "### 3. Kernel ionic / RDMA errors (dmesg) ###"
+          (dmesg -T 2>/dev/null || dmesg 2>/dev/null || journalctl -k --no-pager 2>/dev/null) \
+            | grep -iE "ionic|cqe with error|retry counter|IBV_WC|qpid" | tail -120 \
+            || echo "no matching kernel lines / insufficient permission"
+          echo ""
+          echo "### 4. ibv_devinfo per device (port state/rate/link_layer) ###"
+          if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
+            docker exec -u root ci_sglang bash -c '
+              for dev in $(ibv_devinfo -list 2>/dev/null | grep -oE "rdma[0-9]+"); do
+                echo "==== $dev ===="
+                ibv_devinfo -d "$dev" 2>&1 | grep -E "state|phys_state|rate|link_layer|fw_ver|active_width|active_speed"
+              done'
+          else
+            echo "container ci_sglang not running; skipping ibv_devinfo"
+          fi
 
   pr-test-amd-finish:
     needs:
