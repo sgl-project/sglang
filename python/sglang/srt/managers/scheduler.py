@@ -3253,10 +3253,15 @@ class Scheduler(
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
-                            batch_result.copy_to_cpu(
-                                return_logprob=batch.return_logprob,
-                                return_hidden_states=batch.return_hidden_states,
-                            )
+                            # Result D2H on copy_stream overlaps the next forward
+                            # instead of serializing on forward_stream; it's a leaf
+                            # gated by copy_done, so nothing on forward_stream waits.
+                            self.copy_stream.wait_stream(self.forward_stream)
+                            with self.copy_stream_ctx:
+                                batch_result.copy_to_cpu(
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
                         else:
                             batch_result.future_indices = future_indices
 
