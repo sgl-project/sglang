@@ -39,6 +39,24 @@ class TestMxfp4Tensor(unittest.TestCase):
         self.assertEqual(dequant.shape, fp8_weight.shape)
         self.assertTrue(torch.isfinite(dequant.float()).all())
 
+    def test_quantize_fp8_weight_to_mxfp4_grouped_weight(self):
+        fp8_weight = (
+            torch.linspace(-2.0, 2.0, 2 * 32 * 32, dtype=torch.float32)
+            .reshape(2, 32, 32)
+            .to(torch.float8_e4m3fn)
+        )
+        fp8_scale = torch.ones(2, 1, 1, dtype=torch.float32)
+
+        fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(
+            fp8_weight,
+            fp8_scale,
+        )
+
+        self.assertEqual(fp4_weight.dtype, torch.int8)
+        self.assertEqual(fp4_weight.shape, torch.Size([2, 32, 16]))
+        self.assertEqual(fp4_scale.dtype, torch.float8_e8m0fnu)
+        self.assertEqual(fp4_scale.shape, torch.Size([2, 32, 1]))
+
 
 if __name__ == "__main__":
     unittest.main()

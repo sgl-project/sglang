@@ -360,38 +360,20 @@ def build_mega_moe_experts_weights(experts) -> None:
 
 def convert_fp8_experts_to_fp4_for_mega_moe(experts, weight_block_size) -> None:
     """Convert block-FP8 checkpoint expert weights to DeepGEMM Mega-MoE FP4."""
-    from deep_gemm.utils import per_token_cast_to_fp4
-
-    from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+    from sglang.srt.layers.quantization.mxfp4_tensor import (
+        quantize_fp8_weight_to_mxfp4,
+    )
 
     if getattr(experts, "_mega_moe_weights_are_fp4", False):
         return
     assert weight_block_size == [128, 128], weight_block_size
 
     def convert_pair(weight: torch.nn.Parameter, scale: torch.nn.Parameter):
-        num_groups, n, k = weight.shape
-        fp4_weight = torch.empty(
-            (num_groups, n, k // 2),
-            device=weight.device,
-            dtype=torch.int8,
+        return quantize_fp8_weight_to_mxfp4(
+            weight.data,
+            scale.data,
+            fp8_scale_block_size=weight_block_size[0],
         )
-        fp4_scale = torch.empty(
-            (num_groups, n, k // 32),
-            device=weight.device,
-            dtype=torch.float32,
-        )
-        for group_idx in range(num_groups):
-            bf16_weight = block_quant_dequant(
-                weight[group_idx],
-                scale[group_idx],
-                weight_block_size,
-                torch.bfloat16,
-            )
-            fp4_weight[group_idx], fp4_scale[group_idx] = per_token_cast_to_fp4(
-                bf16_weight, use_ue8m0=True, gran_k=32
-            )
-            del bf16_weight
-        return fp4_weight, fp4_scale
 
     w13_weight, w13_scale = convert_pair(
         experts.w13_weight, experts.w13_weight_scale_inv
