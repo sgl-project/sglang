@@ -3,8 +3,8 @@
 Inspect a single commit's diff and confirm every changed line is either part of the
 moved block -- relocated in the same order, allowing one uniform indentation shift for
 the whole block -- or a whitelisted move artifact: an import, a dropped
-@staticmethod/@classmethod, or a call site requalified for a moved symbol. Anything else
-is listed for review.
+@staticmethod/@classmethod (and the self type annotation dropped with it), or a call site
+requalified for a moved symbol. Anything else is listed for review.
 
 This module is self-contained (only git + the standard library) and independent of the
 reproduce-mode helper. The exact rule it enforces is specified in verifier-spec.md (the
@@ -169,6 +169,21 @@ def _strip_moved_qualifiers(line: str, names: set[str]) -> str:
     return line
 
 
+_SELF_ANNOTATION = re.compile(r"(\bdef\s+\w+\(\s*self)\s*:[^,)]+")
+
+
+def _strip_self_annotation(line: str) -> str:
+    """Drop a type annotation on a definition's ``self`` parameter
+    (``def foo(self: Target)`` -> ``def foo(self)``).
+
+    Relocating a ``@staticmethod def foo(self: Target)`` into ``Target`` as a normal
+    instance method ``def foo(self)`` drops the decorator (a whitelisted artifact) and the
+    now-redundant annotation on ``self``; both are mechanical side-effects of the move, so
+    the annotation is normalised away before the block comparison. See verifier-spec.md.
+    """
+    return _SELF_ANNOTATION.sub(r"\1", line)
+
+
 def _block_signature(lines: list[str]) -> list[str]:
     """The block's non-blank lines with its common leading indent removed, in order.
 
@@ -246,8 +261,12 @@ def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
         rem_block, add_block, moved_names
     )
 
-    rem_signature = _block_signature(rem_block)
-    add_signature = _block_signature(add_block)
+    rem_signature = [
+        _strip_self_annotation(line) for line in _block_signature(rem_block)
+    ]
+    add_signature = [
+        _strip_self_annotation(line) for line in _block_signature(add_block)
+    ]
     block_matches = rem_signature == add_signature
     relocated = len(rem_signature)
     nothing_changed = not removed and not added

@@ -148,14 +148,14 @@ method); the body is **unchanged, line for line**:
   omitted).
 - caller: `Source.foo(self.component, ...)` → `self.component.foo(...)`.
 
-**Check:** the body is byte-identical, but this move also drops `@staticmethod` and
-changes the caller's qualifier (`Source.foo` → `self.component.foo`) — both non-import
-changes — so `mechanical_refactor_verify_utils.py` reports `NEEDS REVIEW` and lists exactly those lines.
-A class-to-class method move cannot be import-residual-only, so it is not certified by
-the move verifier; verify it with reproduce mode (a transform script, see
-`reproduce-mode.md`) or read those few lines by hand. The split still pays off: because
-prep left the body untouched, the move is a clean cut/paste and the only lines to read
-are the decorator and the caller.
+**Check:** the body is byte-identical, and the dropped `@staticmethod` and the
+`def foo(self: Target)` → `def foo(self)` annotation drop are recognised as move
+artifacts. The caller still changes from `Source.foo(self.component, ...)` to
+`self.component.foo(...)` — the receiver moves out of the argument list, which is **not**
+a requalification — so `mechanical_refactor_verify_utils.py` reports `NEEDS REVIEW` on the
+caller line(s). Read those few lines, or verify the whole commit with reproduce mode (a
+transform script, see `reproduce-mode.md`). The split still pays off: because prep left
+the body untouched, the move is a clean cut/paste and the only line to read is the caller.
 
 ## Anti-pattern: prep adds the body, move deletes it
 

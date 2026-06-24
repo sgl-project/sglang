@@ -23,6 +23,9 @@ side-effects of relocating code:
 
 - **imports** — the symbol's home changed, so importers add / repath an import;
 - a one-sided **`@staticmethod` / `@classmethod`** — a method became a free function;
+- a **`self` type annotation dropped** from the moved definition — relocating
+  `@staticmethod def foo(self: Target)` into `Target` as the instance method
+  `def foo(self)` drops the decorator and the now-redundant annotation on `self`;
 - **requalifying a moved symbol's call sites** — `self.foo(x)` becomes `foo(x)`, or
   `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments, only the qualifier
   differs.
@@ -75,12 +78,13 @@ Given a commit (diffed against its first parent):
      the `def` / `class` names that appear on both sides (ignoring indentation).
 
 4. **Compare the remaining block as an ordered signature.** A block's **signature** is its
-   non-blank lines with the block's common leading indent removed, in order. The removed
-   block and the added block match iff their signatures are **equal as sequences**. This
-   absorbs a uniform indentation shift (the common prefix is removed) while preserving
-   relative indentation, trailing whitespace, and order — so a reorder, a non-uniform
-   indent change, a trailing-whitespace change, or a line merge makes the signatures
-   differ.
+   non-blank lines with the block's common leading indent removed, in order, and with a
+   type annotation on any `self` parameter dropped (so `def foo(self: Target)` matches
+   `def foo(self)`). The removed block and the added block match iff their signatures are
+   **equal as sequences**. This absorbs a uniform indentation shift (the common prefix is
+   removed) and the `self`-annotation drop, while preserving relative indentation, trailing
+   whitespace, and order — so a reorder, a non-uniform indent change, a trailing-whitespace
+   change, or a line merge makes the signatures differ.
 
 5. **Verdict.** `CLEAN MOVE` iff the signatures match and at least one line relocated.
    Otherwise `NEEDS REVIEW`, printing the signature diff. A commit whose surviving removed
@@ -93,6 +97,7 @@ Given a commit (diffed against its first parent):
   whole block.
 - **Import statements** — added, removed, or repathed; single-line or multi-line.
 - A one-sided **`@staticmethod` / `@classmethod`**.
+- A **`self` type annotation dropped** from the moved definition.
 - A **call-site requalification of a moved symbol**.
 - **Blank-line changes** — ignored.
 
@@ -105,7 +110,8 @@ Given a commit (diffed against its first parent):
 - A **changed argument** in an otherwise-requalified call.
 - A **call rewrite for a symbol that did not move** in this commit — e.g. pointing a
   consumer at a different implementation. This keeps a consumer-only edit from passing.
-- A **signature change** on the moved definition itself (`def f(self: T)` → `def f(self)`).
+- A **signature change** other than dropping the `self` annotation — a real parameter's
+  type, name, default, or position changing.
 - A **constant re-derived** in the destination module (`_flag = compute_flag()`).
 - A line a **formatter re-wrapped** so it is no longer identical (use reproduce mode, see
   `reproduce-mode.md`).

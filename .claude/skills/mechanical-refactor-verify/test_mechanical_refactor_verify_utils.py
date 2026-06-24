@@ -13,6 +13,7 @@ from mechanical_refactor_verify_utils import (
     _import_line_texts,
     _moved_symbol_names,
     _strip_moved_qualifiers,
+    _strip_self_annotation,
     verify_move_commit,
 )
 
@@ -118,6 +119,20 @@ def test_strip_moved_qualifiers_drops_qualifier_before_moved_symbol() -> None:
 def test_strip_moved_qualifiers_leaves_non_moved_symbols_untouched() -> None:
     """A qualifier before a symbol that did not move is left in place."""
     assert _strip_moved_qualifiers("old.compute(a)", {"helper"}) == "old.compute(a)"
+
+
+def test_strip_self_annotation_drops_self_type() -> None:
+    """A type annotation on the self parameter of a def is removed."""
+    assert (
+        _strip_self_annotation("def foo(self: Target) -> None:")
+        == "def foo(self) -> None:"
+    )
+
+
+def test_strip_self_annotation_leaves_plain_self_and_other_params() -> None:
+    """A plain self, and annotations on other parameters, are untouched."""
+    assert _strip_self_annotation("def foo(self) -> None:") == "def foo(self) -> None:"
+    assert _strip_self_annotation("def foo(self, x: int):") == "def foo(self, x: int):"
 
 
 # --- _block_signature ----------------------------------------------------------
@@ -348,6 +363,44 @@ def test_pure_file_rename_is_certified(repo: Path) -> None:
     _commit(repo, "base")
     _git(repo, "mv", "orig.py", "renamed.py")
     _commit(repo, "rename orig.py to renamed.py")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_method_to_method_drops_staticmethod_and_self_annotation(repo: Path) -> None:
+    """Relocating `@staticmethod def foo(self: Target)` into Target as an instance method
+    `def foo(self)` is clean: the dropped decorator and the dropped self annotation are
+    both mechanical move artifacts."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "class Source:\n"
+                "    @staticmethod\n"
+                '    def foo(self: "Target") -> None:\n'
+                "        self.field_a = 1\n"
+                "\n"
+                "    def other(self):\n"
+                "        return 0\n"
+            ),
+            "tgt.py": "class Target:\n    def existing(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "class Source:\n    def other(self):\n        return 0\n",
+            "tgt.py": (
+                "class Target:\n"
+                "    def existing(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def foo(self) -> None:\n"
+                "        self.field_a = 1\n"
+            ),
+        },
+    )
+    _commit(repo, "move foo into Target as an instance method")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
