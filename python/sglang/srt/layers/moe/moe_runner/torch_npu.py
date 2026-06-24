@@ -97,7 +97,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         )
         if is_gguf and self.tp_size > 1:
             self.enable_all_gather = True
-        else
+        else:
             self.enable_all_gather = False
 
         kernel = config.layer.w2_kernel
