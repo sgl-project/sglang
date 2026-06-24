@@ -69,7 +69,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             and self.quant_config.get("quant_type") == "gguf"
             and get_tensor_model_parallel_world_size() > 1
         ):
-            self.finalize = FinalizeRoutingWrapper(self.finalize, dim=-1)
+            self.finalize = AllGatherFinalizeRoutingWrapper(self.finalize, dim=-1)
 
     def set_ascend_dispatcher_output_dtype(self) -> None:
         """Choose init & finalize routing kernels based on quant config."""
