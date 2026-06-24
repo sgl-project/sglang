@@ -21,6 +21,9 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_ascend_dispatcher_output_dtype,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_world_size,
+)
 
 
 class TorchNpuDispatchOutput(NamedTuple):
@@ -66,6 +69,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         self.quant_config: Optional[dict] = None
         self.set_ascend_dispatcher_output_dtype()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
@@ -142,6 +146,9 @@ class TorchNpuDispatcher(BaseDispatcher):
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_ids,
         )
+        # TP all-gather for intermediate dimension if needed
+        if self.tp_size > 1:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         self._dispatch_output = None
         return final_hidden_states
