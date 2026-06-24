@@ -4202,6 +4202,19 @@ class FlashInferIndicesUpdaterPrefill:
             "token_pos_in_items_len": token_pos_in_items_len,
             "max_item_len_ptr": max_item_len_ptr,
         }
+        # NVFP4 split-KV is lossy on the extend geometry (qo_len << kv_len from a
+        # reused radix prefix): with little query parallelism the FA2 scheduler
+        # splits the KV dimension flash-decoding style, but a split boundary can
+        # land mid scale-factor block (NVFP4 packs a per-16 FP8 scale) and the
+        # small per-split chunk trips the 1-byte-KV tile-count floor, corrupting
+        # prefix-cached reads. Verified on E2B/E4B: forcing split-KV off restores
+        # radix-on retrieval out to 1448 tokens (== bf16); leaving it on cliffs at
+        # ~600 tok of reused-prefix context. Disable split-KV for native FP4 until
+        # the split path respects the per-16 scale blocks + tile floor. The kernel
+        # is shared with vLLM via FlashInfer #3684, so the gate belongs upstream
+        # too (keyed on FP4 kv_data_type); pinned here where FP4 is unambiguous.
+        if getattr(self.attn_backend, "is_nvfp4_native", False):
+            paged_plan_kwargs["disable_split_kv"] = True
         if self.k_data_type != self.v_data_type:
             paged_plan_kwargs.update(
                 k_data_type=self.k_data_type,
