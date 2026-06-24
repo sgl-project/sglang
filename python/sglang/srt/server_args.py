@@ -858,6 +858,13 @@ class ServerArgs:
             aliases=["--tensor-parallel-size"],
         ),
     ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
+        ),
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -2539,6 +2546,7 @@ class ServerArgs:
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
+        self._handle_dcp_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -2684,6 +2692,24 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _handle_dcp_validation(self):
+        # Decode context parallel (DCP) is currently implemented and validated
+        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+        # early instead of letting them fail deeper in model initialization.
+        if self.dcp_size < 1:
+            raise ValueError(
+                "Decode context parallel size (--dcp-size / "
+                "--decode-context-parallel-size) must be >= 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
+        if self.dcp_size > 1 and not is_hip():
+            raise ValueError(
+                "Decode context parallel (--dcp-size / "
+                "--decode-context-parallel-size > 1) is currently only "
+                f"supported on the AMD HIP platform, but got dcp_size="
+                f"{self.dcp_size} on a non-HIP platform."
+            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
