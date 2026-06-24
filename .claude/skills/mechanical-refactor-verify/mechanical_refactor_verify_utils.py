@@ -10,8 +10,10 @@ Two complementary checks, both self-contained in this file (no external scripts)
 - Verify mode (``verify_move_commit``): inspect a single commit and certify it is a
   pure relocation (function move, file split, module extraction) without any
   reproduce script -- it confirms every changed line is either relocated byte-for-byte
-  or an import, and prints whatever is left over for review. Use for a stack of commits
-  (each its own PR) where only some commits are mechanical. Runnable directly:
+  or a whitelisted move artifact (an import, a dropped @staticmethod/@classmethod, or a
+  call site requalified for a moved symbol), and prints whatever is left over for
+  review. Use for a stack of commits (each its own PR) where only some commits are
+  mechanical. Runnable directly:
 
       python3 mechanical_refactor_verify_utils.py move <commit>
 
@@ -20,6 +22,7 @@ of truth); this module implements that file and nothing more.
 """
 
 import ast
+import re
 import shlex
 import subprocess
 import sys
@@ -199,33 +202,91 @@ def _normalize_block(lines: list[str]) -> Counter:
     return counts
 
 
+# Decorators a de-self drops when a method becomes a free function; the move carries
+# them on only one side. See verifier-spec.md (whitelist).
+_MOVE_DECORATORS = {"@staticmethod", "@classmethod"}
+
+
+def _moved_symbol_names(relocated_lines: list[str]) -> set[str]:
+    """Names defined (def / class) within the relocated block -- the symbols that moved.
+
+    A call site may be requalified for these names only, so a requalification of a
+    symbol that did NOT move in this commit is never silently allowed. See
+    verifier-spec.md (whitelist).
+    """
+    names: set[str] = set()
+    for line in relocated_lines:
+        match = re.match(r"(?:async\s+)?def\s+(\w+)", line) or re.match(
+            r"class\s+(\w+)", line
+        )
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def _strip_moved_qualifiers(line: str, names: set[str]) -> str:
+    """Drop a ``Qualifier.`` prefix before any moved symbol name (``self.foo`` -> ``foo``).
+
+    Only the qualifier is removed; arguments and the rest of the line are untouched, so a
+    call whose arguments also changed will not match its old form. See verifier-spec.md.
+    """
+    for name in names:
+        line = re.sub(rf"\b[\w.]+\.{re.escape(name)}\b", name, line)
+    return line
+
+
 def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
     """Certify a commit is a pure relocation (function move / file split / rename).
 
-    Implements verifier-spec.md exactly: every changed line must either be relocated
-    byte-for-byte (indentation ignored) or be an import statement. Imports are the only
-    tolerated non-moved change; anything else -- a call-site rewrite, a dropped
-    decorator, a re-derived constant, a line that changed by even one byte -- is listed
-    for review and the commit is not certified.
+    Implements verifier-spec.md. Every changed line must be either relocated
+    byte-for-byte (indentation ignored) or a whitelisted move artifact: an import, a
+    one-sided @staticmethod/@classmethod, or a call site that differs from its old form
+    only by the qualifier of a symbol defined in the relocated block. Anything else -- a
+    body edit, a re-derived constant, a call rewrite for a symbol that did not move, a
+    line that changed by even one byte -- is listed for review and the commit is not
+    certified.
     """
     root = repo_root or exec_command("git rev-parse --show-toplevel")
     removed, added = _commit_changed_lines(commit, root)
     imports_before, imports_after = _commit_import_texts(commit, root)
     rem, add = _normalize_block(removed), _normalize_block(added)
 
-    relocated = sum((rem & add).values())
-    imports: list[str] = []
-    to_review: list[str] = []
-    for line in sorted((rem - add).elements()):
-        (imports if line in imports_before else to_review).append(line)
-    for line in sorted((add - rem).elements()):
-        (imports if line in imports_after else to_review).append(line)
+    moved = rem & add
+    relocated = sum(moved.values())
+    moved_names = _moved_symbol_names(list(moved.elements()))
+
+    def _peel(lines: list[str], import_set: set[str]) -> tuple[list, list, list]:
+        imports, decorators, rest = [], [], []
+        for line in lines:
+            if line in import_set:
+                imports.append(line)
+            elif line in _MOVE_DECORATORS:
+                decorators.append(line)
+            else:
+                rest.append(line)
+        return imports, decorators, rest
+
+    rem_imports, rem_decos, rem_rest = _peel(
+        list((rem - add).elements()), imports_before
+    )
+    add_imports, add_decos, add_rest = _peel(
+        list((add - rem).elements()), imports_after
+    )
+
+    rem_requal = Counter(_strip_moved_qualifiers(line, moved_names) for line in rem_rest)
+    add_requal = Counter(_strip_moved_qualifiers(line, moved_names) for line in add_rest)
+    requalified = sum((rem_requal & add_requal).values())
+    to_review = sorted((rem_requal - add_requal).elements()) + sorted(
+        (add_requal - rem_requal).elements()
+    )
 
     print(f"commit {commit}: move check (rule: verifier-spec.md)")
     print(f"  {relocated} line(s) relocated byte-for-byte (indentation ignored)")
-    print(f"  {len(imports)} import line(s) (the only allowed non-moved change):")
-    for line in imports:
+    for line in sorted(rem_imports + add_imports):
         print(f"    [import] {line}")
+    for line in sorted(rem_decos + add_decos):
+        print(f"    [decorator] {line}")
+    print(f"  {requalified} call-site requalification(s) of moved symbol(s)")
     print(f"  {len(to_review)} line(s) to review:")
     for line in to_review:
         print(f"    [review] {line}")
@@ -234,12 +295,14 @@ def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
     clean = not to_review and (relocated > 0 or nothing_changed)
     if clean and relocated > 0:
         print(
-            "  => CLEAN MOVE (every changed line is a byte-identical move or an import)"
+            "  => CLEAN MOVE (every changed line is a byte-identical move or a move artifact)"
         )
     elif clean:
         print("  => CLEAN (pure rename; no content changed)")
     else:
-        print("  => NEEDS REVIEW (a non-import line changed, or nothing was relocated)")
+        print(
+            "  => NEEDS REVIEW (a non-artifact line changed, or nothing was relocated)"
+        )
     return clean
 
 

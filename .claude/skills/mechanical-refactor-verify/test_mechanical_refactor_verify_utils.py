@@ -12,7 +12,9 @@ from mechanical_refactor_verify_utils import (
     _commit_changed_lines,
     _commit_import_texts,
     _import_line_texts,
+    _moved_symbol_names,
     _normalize_block,
+    _strip_moved_qualifiers,
     dedent,
     exec_command,
     git_add_and_commit,
@@ -100,6 +102,33 @@ def test_commit_import_texts_collects_before_and_after(repo: Path) -> None:
     before, after = _commit_import_texts("HEAD", str(repo))
     assert "import os" in before
     assert "import sys" in after
+
+
+# --- _moved_symbol_names / _strip_moved_qualifiers -----------------------------
+
+
+def test_moved_symbol_names_collects_def_and_class_names() -> None:
+    """def, async def and class lines in the relocated block name the moved symbols."""
+    lines = ["def foo(a):", "    return a", "async def bar():", "class Baz:", "x = 1"]
+    assert _moved_symbol_names(lines) == {"foo", "bar", "Baz"}
+
+
+def test_moved_symbol_names_ignores_non_definition_lines() -> None:
+    """Lines that are not def/class definitions contribute no moved symbols."""
+    assert _moved_symbol_names(["return foo()", "x = bar(1)"]) == set()
+
+
+def test_strip_moved_qualifiers_drops_qualifier_before_moved_symbol() -> None:
+    """A Qualifier. prefix before a moved symbol is removed; other tokens are kept."""
+    assert (
+        _strip_moved_qualifiers("self.x = C.helper(self.v)", {"helper"})
+        == "self.x = helper(self.v)"
+    )
+
+
+def test_strip_moved_qualifiers_leaves_non_moved_symbols_untouched() -> None:
+    """A qualifier before a symbol that did not move is left in place."""
+    assert _strip_moved_qualifiers("old.compute(a)", {"helper"}) == "old.compute(a)"
 
 
 # --- _normalize_block ----------------------------------------------------------
@@ -355,9 +384,10 @@ def test_near_identical_line_change_needs_review(repo: Path, capsys) -> None:
     assert "return value*2" in capsys.readouterr().out
 
 
-def test_staticmethod_drop_with_call_rewrite_needs_review(repo: Path) -> None:
-    """The old lenient case: dropping @staticmethod and rewriting C.helper -> helper
-    leaves non-import leftovers, so under the strict rule it needs review."""
+def test_staticmethod_drop_with_call_requalification_is_certified(repo: Path) -> None:
+    """Dropping @staticmethod and requalifying C.helper -> helper are move artifacts:
+    the decorator is whitelisted and the call differs only by the moved symbol's
+    qualifier, so the move is clean."""
     _write(
         repo,
         **{
@@ -396,11 +426,12 @@ def test_staticmethod_drop_with_call_rewrite_needs_review(repo: Path) -> None:
         },
     )
     _commit(repo, "extract helper")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
-def test_move_with_self_attr_call_site_rewrite_needs_review(repo: Path) -> None:
-    """A move that also rewrites a `self.x = C.helper(...)` call site is not pure."""
+def test_move_with_self_attr_call_site_requalification_is_certified(repo: Path) -> None:
+    """A move that requalifies a `self.x = C.helper(...)` call site is clean: only the
+    moved symbol's qualifier changed, the arguments are untouched."""
     _write(
         repo,
         **{
@@ -430,8 +461,8 @@ def test_move_with_self_attr_call_site_rewrite_needs_review(repo: Path) -> None:
             "mod.py": "def helper(value):\n    return value * 2\n",
         },
     )
-    _commit(repo, "extract helper; rewrite self.x call site")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+    _commit(repo, "extract helper; requalify self.x call site")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
 def test_constant_rederivation_in_new_module_needs_review(repo: Path, capsys) -> None:
@@ -468,6 +499,69 @@ def test_call_site_rewrite_without_a_move_is_not_clean(repo: Path) -> None:
         **{"src.py": "result = new.compute(a, b)\nother = new.compute(c, d)\n"},
     )
     _commit(repo, "point consumers at new")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+
+
+def test_requalification_does_not_forgive_a_changed_argument(repo: Path) -> None:
+    """Requalifying the qualifier is allowed, but if the call's argument also changed
+    the line no longer matches its old form and the move needs review."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "class C:\n"
+                "    @staticmethod\n"
+                "    def helper(value):\n"
+                "        return value * 2\n"
+                "\n"
+                "    def m(self):\n"
+                "        self.x = C.helper(self.v)\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "from mod import helper\n"
+                "\n"
+                "\n"
+                "class C:\n"
+                "    def m(self):\n"
+                "        self.x = helper(self.w)\n"
+            ),
+            "mod.py": "def helper(value):\n    return value * 2\n",
+        },
+    )
+    _commit(repo, "extract helper but also change the argument")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+
+
+def test_call_rewrite_for_a_non_moved_symbol_needs_review(repo: Path) -> None:
+    """A clean move plus an unrelated call rewrite for a symbol that did not move is
+    flagged: requalification is scoped to the moved symbol only."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "def helper(value):\n    return value * 2\n\n\n"
+                "helper(3)\n"
+                "result = old.compute(7)\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "from mod import helper\n\nhelper(3)\nresult = new.compute(7)\n"
+            ),
+            "mod.py": "def helper(value):\n    return value * 2\n",
+        },
+    )
+    _commit(repo, "move helper but also repoint compute")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 

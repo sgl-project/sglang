@@ -18,7 +18,7 @@ There are two ways to make it checkable. Pick by the shape of the work:
 | Your situation | Mode | The proof |
 |---|---|---|
 | One PR is a single mechanical refactor; or a rename / inline where a formatter re-wraps lines | **Reproduce** (Mode A) | a transform script regenerates the PR's diff byte-for-byte |
-| A stack of commits (each its own PR), only some mechanical, mixed with semantic ones | **Verify** (Mode B) | a verifier certifies each mechanical commit is a byte-identical relocation (only imports may also change); semantic commits get ordinary review |
+| A stack of commits (each its own PR), only some mechanical, mixed with semantic ones | **Verify** (Mode B) | a verifier certifies each mechanical commit is a byte-identical relocation plus only mechanical move artifacts; semantic commits get ordinary review |
 
 Both modes depend only on `mechanical_refactor_verify_utils.py` next to this skill —
 no external scripts or services are required to check the result.
@@ -46,20 +46,22 @@ Use when the work is a chain where each commit becomes its own PR and only some
 commits are mechanical. No reproduce script; you classify each commit and certify each
 relocation from its diff with
 `mechanical_refactor_verify_utils.py move <commit>` (`CLEAN MOVE` = every changed line
-is either relocated byte-for-byte or an import; otherwise it lists the lines to
-review). Semantic commits get ordinary review.
+is either relocated byte-for-byte or a mechanical move artifact — an import, a dropped
+`@staticmethod`, or a requalified call site; otherwise it lists the lines to review).
+Semantic commits get ordinary review.
 
 → Full step-by-step, and what the report does and does not assert: **`verification-mode.md`** (next to this file).
 
 ## Make extractions verifiable: split prep + move
 
-A move is certifiable only when its sole non-relocated change is an import (see
-`verifier-spec.md`). De-self'ing a method — turning `self.x` reads into parameters,
-dropping a decorator, rewriting a call site — is behavior-preserving but leaves
-non-import changes, so it cannot be certified as a pure move on its own. Split such an
-extraction into a **prep** commit (the in-place reshape into a free function, checked by
-tests) followed by a **move** commit (the pure relocation, whose only leftover is the
-import, certified by `move <commit>`).
+A move is certifiable only when its body is byte-identical and its only other changes
+are mechanical move artifacts — imports, a dropped `@staticmethod`, and requalifying the
+moved symbol's call sites (see `verifier-spec.md`). De-self'ing a method — turning
+`self.x` reads into parameters — is behavior-preserving but is a *reshape*, not a move,
+so it must not ride along in the move commit. Split such an extraction into a **prep**
+commit (the small in-place reshape, no relocation, checked by tests) followed by a
+**move** commit (the pure relocation, certified by `move <commit>`). Prep is the part a
+human reviews, so keep its diff small.
 
 → The full philosophy — why, the two-commit recipe, the class-extraction technique,
 what counts as mechanical, and the anti-patterns: **`prep-and-move.md`** (next to this

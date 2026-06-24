@@ -6,7 +6,7 @@ operations with different correctness criteria**:
 | Operation | What it does | How you check it |
 |---|---|---|
 | **Semantic reshape** | method → free function or method; `self.X` → a parameter, or `self` retyped to the target class; signature / typing change | behavior unchanged: lint + tests pass |
-| **Physical move** | cut from the source, paste into the target, fix imports | the moved body is byte-identical, line for line, and the only other change is an import |
+| **Physical move** | cut from the source, paste into the target, fix imports | the moved body is byte-identical, line for line, and the only other changes are move artifacts (imports, a dropped `@staticmethod`, requalified call sites) |
 
 Put both in one commit and the two criteria contaminate each other: a single hunk then
 contains the reshape **and** an indentation shift **and** a cross-file relocation, so
@@ -18,46 +18,52 @@ kind of operation with its own check. The **move** commit is then certifiable by
 `verify_move_commit` (see `SKILL.md`, verify mode); the **prep** commit is small and
 covered by tests.
 
+**Prep is human-reviewed, so it stays small and relocates nothing.** The code keeps its
+place — prep only changes its *shape* (de-self a method, retype `self`) so a human can
+eyeball the whole diff. The **move** does all the relocating and is machine-certified;
+the verifier forgives only the artifacts a relocation forces (imports, a dropped
+`@staticmethod`, requalifying the moved symbol's call sites). Never fold reshape work
+into the move to make the verifier pass — if the move's diff has anything outside those
+artifacts, the reshape leaked in and belongs back in prep.
+
 The shape of the **prep** commit depends on where the code is going — to a
 module-level function (**Case 1**) or onto a class (**Case 2**). The **move** commit is
 the same idea in both: a pure relocation whose body is byte-identical.
 
 ## Case 1: method → free function (in a module)
 
-### Commit 1 — prep: de-self into a module-level free function, in place
+### Commit 1 — prep: de-self in place (no relocation)
 
-Reshape the method into a **module-level free function in the same file**, so it no
-longer depends on `self` and the caller refers to it by a bare name:
+Reshape the method **in its original file and position** so it no longer depends on
+`self`. The body stays exactly where it is — this is a small, human-reviewed diff:
 
 - `self.X` (read) → pass `X` in as a parameter.
 - `self.X = v` (write) → `return v`; the caller assigns. (Or pass an explicit mutable
   object.)
 - `self.other_method(...)` → prep that method in the same commit, or inject it as a
   `Callable` argument.
-- define `def foo(...)` at **module level** in the source file (not a `@staticmethod`
-  on the class) and remove the method from the class.
-- call site: `self.foo(args)` → `foo(args)` (bare name; `foo` is now module-level in the
-  same file).
+- once `self` is gone, mark it `@staticmethod`; the body **does not move**.
+- call site: `self.foo(args)` → `TheClass.foo(args)` (class-qualified).
 
-Making it a free function — rather than a `@staticmethod` left on the class — is what
-lets the next commit be certified. The caller already uses the bare name `foo(...)`,
-which does **not** change when `foo` later moves to another module; only the import
-does. A `@staticmethod` would instead force the move to also rewrite `TheClass.foo` →
-`foo` and drop the decorator, and those are non-import changes the move verifier
-rejects.
+Qualifying the call site reflects the real fact that `foo` no longer needs an instance.
+The decorator and this qualifier are the only relocation artifacts the next commit will
+carry, and the verifier whitelists exactly those — so prep can stay this small.
 
-**Check:** lint + tests pass; the diff is the body reshape plus the bare-name call site.
+**Check:** lint + tests pass; the diff is just the body reshape plus the call-site
+qualifier — and nothing has moved.
 
 ### Commit 2 — move: relocate to the module
 
-Cut the free function, paste it into the target module, and do only the minimal sealing:
+Cut the `@staticmethod` block, paste it into the target module, and do only the minimal
+sealing:
 
-- move `def foo(...)` to the target module; the body is **unchanged, line for line**.
-- source file: add `from target import foo`, and remove any now-unused imports.
-- the call site `foo(args)` is **untouched** — only the import changed.
+- drop `@staticmethod`, dedent to module level; the body is **unchanged, line for line**.
+- source file: add the import of the moved symbol, and remove any now-unused imports.
+- call site: `TheClass.foo(args)` → `foo(args)` (qualifier removed; args untouched).
 
-**Check:** the only non-relocated change is the import, so `verify_move_commit <commit>`
-reports `CLEAN MOVE`; cross-check with
+**Check:** the body is byte-identical and the only other changes are move artifacts —
+the dropped decorator, the import, and the requalified call site — so
+`verify_move_commit <commit>` reports `CLEAN MOVE`. Cross-check with
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`,
 which marks the whole block as moved.
 
@@ -201,7 +207,7 @@ See `.claude/skills/large-class-style/SKILL.md`.
 A move that is split uses two consecutive commits with reserved suffixes:
 
 ```
-<id>-prep    # commit 1: in-place reshape (Case 1 → free function, or Case 2 retype-self)
+<id>-prep    # commit 1: in-place reshape (Case 1 de-self, or Case 2 retype-self)
 <id>-move    # commit 2: pure relocation
 ```
 
