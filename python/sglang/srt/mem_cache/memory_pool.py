@@ -275,8 +275,6 @@ class ReqToTokenPool:
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
-        from sglang.srt.managers.schedule_batch import ReqKvInfo
-
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
@@ -286,10 +284,6 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                # TODO(th4): owned-kv ownership (req.kv) belongs in the owned-kv
-                # subsystem, not in the low-level ReqToTokenPool; kept here in
-                # the presence op to preserve equivalence.
-                r.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -297,10 +291,6 @@ class ReqToTokenPool:
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
-        # TODO(th4): clearing owned-kv ownership (req.kv) belongs in the owned-kv
-        # subsystem, not in the low-level ReqToTokenPool; kept here in the
-        # presence op to preserve equivalence.
-        req.kv = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))

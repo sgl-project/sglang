@@ -429,6 +429,9 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    fresh_reqs = [r for r in reqs if r.req_pool_idx is None]
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
@@ -438,6 +441,8 @@ def alloc_req_slots(
             f"{req_to_token_pool.available_size()=}, "
             f"{num_reqs=}, "
         )
+    for r in fresh_reqs:
+        r.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
     return req_pool_indices
 
 
@@ -686,6 +691,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
+    req.kv = None
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
