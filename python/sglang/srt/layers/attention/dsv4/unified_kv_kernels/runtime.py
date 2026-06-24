@@ -120,15 +120,37 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
 
 def decode(
     *,
-    q: torch.Tensor,  # [T, H, D] (local heads)
+    q: torch.Tensor,  # [T, H, D] (local heads, or all-gathered DCP-group heads)
     unified_kv: torch.Tensor,  # [pages, D] bf16
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
-) -> torch.Tensor:
+    apply_sink: bool = True,
+    return_lse: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    physical: bool = False,
+    swa_pages: int = 0,
+):
+    """Decode attention. With ``dcp_size>1`` each rank attends its round-robin
+    KV shard and (with ``return_lse=True``, ``apply_sink=False``) returns the
+    sink-less ``(out, lse)`` partials for the cross-rank merge. ``physical=True``
+    switches the per-rank shard from stream-position round-robin to physical
+    unified-slot ownership (``swa_pages`` marks the replicated-SWA boundary)."""
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        apply_sink=apply_sink,
+        return_lse=return_lse,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        physical=physical,
+        swa_pages=swa_pages,
     )
 
 
