@@ -917,6 +917,15 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             w2_full = torch.stack(w2_dequant_list, dim=0)  # (E, hidden, inter_full)
         else:
             w2_full = w2_qweight.data
+
+        # Debug: print shapes
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            logger.info(
+                f"[TP rank before {get_tensor_model_parallel_rank()}] "
+                f"w13_dequant.shape before = {w13_full.shape}, "
+                f"w2_dequant.shape before = {w2_full.shape}"
+            )
     
         # ---- TP splitting ----
         tp_size = get_tensor_model_parallel_world_size()
@@ -952,10 +961,6 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             del layer.w13_qweight
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
-
-        # After registering the buffers
-        layer.register_buffer("w13_dequant", w13_full, persistent=False)
-        layer.register_buffer("w2_dequant", w2_full, persistent=False)
         
         # Debug: print shapes
         tp_size = get_tensor_model_parallel_world_size()
