@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    UnfinishResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventMixin
@@ -49,7 +51,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    pass
 
 import logging
 
@@ -484,27 +486,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return None
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
         """Cache request when it is unfinished."""
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
-            ]
+            kv_indices = params.kv_indices[: len(params.token_ids)]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
-            return
+            return UnfinishResult(prefix_indices=kv_indices)
 
-        token_ids = req.get_fill_ids()
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        token_ids = params.token_ids
+        kv_indices = params.kv_indices[: len(token_ids)]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids, params.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache.cache_protected_len
+        old_prefix_len = params.prev_prefix_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -527,30 +526,36 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            (params.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
         )
 
-        req.cache.cache_protected_len = len(new_indices)
+        new_cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
-            skip_swa=req.cache.swa_prefix_lock_released,
+            params.last_node,
+            DecLockRefParams(swa_uuid_for_lock=params.swa_uuid_for_lock),
+            skip_swa=params.swa_prefix_lock_released,
         )
-        req.cache.swa_prefix_lock_released = False
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
-            req.prefix_indices = torch.cat(
+            new_prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
         else:
-            req.prefix_indices = new_indices
-        req.cache.last_node = new_last_node
-        req.cache.swa_uuid_for_lock = swa_uuid_for_lock
+            new_prefix_indices = new_indices
+
+        return UnfinishResult(
+            prefix_indices=new_prefix_indices,
+            cache_protected_len=new_cache_protected_len,
+            lock_handover=True,
+            last_node=new_last_node,
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            swa_prefix_lock_released=False,
+        )
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

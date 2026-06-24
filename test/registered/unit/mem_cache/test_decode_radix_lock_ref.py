@@ -36,10 +36,40 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheFinishParams,
+    CacheUnfinishParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+
+def _unfinish(cache, req, chunked=False):
+    token_ids = req.get_fill_ids()
+    kv_indices = cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : len(token_ids)
+    ]
+    result = cache.cache_unfinished_req(
+        CacheUnfinishParams(
+            token_ids=token_ids,
+            extra_key=req.extra_key,
+            kv_indices=kv_indices,
+            req_pool_idx=req.req_pool_idx,
+            prev_prefix_len=req.cache_protected_len,
+            prefix_indices_len=len(req.prefix_indices),
+            priority=getattr(req, "priority", 0) or 0,
+            chunked=chunked,
+            last_node=req.last_node,
+            req=req,
+        )
+    )
+    if result is None:
+        return
+    if result.prefix_indices is not None:
+        req.prefix_indices = result.prefix_indices
+    if result.cache_protected_len is not None:
+        req.cache_protected_len = result.cache_protected_len
+    if result.lock_handover:
+        req.last_node = result.last_node
 
 
 def _finish(cache, req, is_insert=True):
@@ -180,7 +210,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         )
 
         # Step 2: cache_unfinished_req (dec old lock, inc new lock)
-        cache.cache_unfinished_req(req)
+        _unfinish(cache, req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
         _finish(cache, req)
@@ -229,7 +259,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         )
 
         # Step 2: cache_unfinished_req (dec root=no-op, inc new leaf)
-        cache.cache_unfinished_req(req)
+        _unfinish(cache, req)
 
         # Step 3: cache_finished_req (dec leaf)
         _finish(cache, req)
@@ -426,7 +456,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 last_node=matched_node,
             )
 
-            cache.cache_unfinished_req(req)
+            _unfinish(cache, req)
             _finish(cache, req)
 
         # After all iterations, root lock should be 1, no protected nodes

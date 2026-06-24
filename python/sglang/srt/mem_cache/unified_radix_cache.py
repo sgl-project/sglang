@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -28,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    UnfinishResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -780,28 +782,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return None
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
-            return
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
+        req = params.req
+        session_result = self.session.try_cache_unfinished_req(
+            req, chunked=params.chunked
+        )
+        if session_result is not None:
+            return session_result
 
-        token_ids = req.get_fill_ids()
+        token_ids = params.token_ids
+        old_prefix_len = params.prev_prefix_len
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(token_ids)
-            ]
-            req.prefix_indices = kv_indices
-            return
+            kv_indices = params.kv_indices[: len(token_ids)]
+            return UnfinishResult(prefix_indices=kv_indices)
 
-        kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        kv_indices_orig = params.kv_indices[: len(token_ids)]
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache.cache_protected_len,
-            chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            prev_prefix_len=old_prefix_len,
+            chunked=params.chunked,
+            priority=params.priority,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -815,21 +819,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 effective_cache_len = min(effective_cache_len, cl)
 
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+            insert_params.swa_evicted_seqlen = params.swa_evicted_seqlen
 
         if effective_cache_len <= 0:
-            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            new_prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
                 )
-            return
+            return UnfinishResult(prefix_indices=new_prefix_indices)
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
-            req.extra_key,
+            params.extra_key,
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
@@ -845,32 +849,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
-            req.cache.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            old_prefix_len <= len(new_indices) + self.page_size - 1
+        ), f"{old_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache.cache_protected_len, len(new_indices))),
-            new_indices[req.cache.cache_protected_len :],
+            (params.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            new_indices[old_prefix_len:],
         )
 
         self.dec_lock_ref(
-            req.cache.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.cache.swa_uuid_for_lock),
+            params.last_node,
+            DecLockRefParams(swa_uuid_for_lock=params.swa_uuid_for_lock),
         )
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
-            req.prefix_indices = torch.cat(
+            new_prefix_indices = torch.cat(
                 [new_indices, kv_indices_orig[len(new_indices) :]]
             )
         else:
-            req.prefix_indices = new_indices
-        req.cache.cache_protected_len = len(new_indices)
-        req.cache.last_node = new_last_node
-        req.cache.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+            new_prefix_indices = new_indices
 
         # cleanup
         for comp in self._components_tuple:
@@ -880,6 +881,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+        return UnfinishResult(
+            prefix_indices=new_prefix_indices,
+            cache_protected_len=len(new_indices),
+            lock_handover=True,
+            last_node=new_last_node,
+            swa_uuid_for_lock=lock_result.swa_uuid_for_lock,
+        )
 
     def unfinished_swa_evict_pre_len(
         self, req: Req, chunked: bool = False

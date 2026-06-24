@@ -98,6 +98,36 @@ class FinishResult:
 
 
 @dataclasses.dataclass
+class CacheUnfinishParams:
+    token_ids: Optional[Any] = None
+    extra_key: Optional[Any] = None
+    kv_indices: Optional[torch.Tensor] = None
+    req_pool_idx: Optional[int] = None
+
+    prev_prefix_len: int = 0
+    prefix_indices_len: int = 0
+    swa_evicted_seqlen: int = 0
+    priority: int = 0
+    chunked: bool = False
+
+    last_node: Any = None
+    swa_uuid_for_lock: Optional[int] = None
+    swa_prefix_lock_released: bool = False
+
+    req: Optional[Req] = None
+
+
+@dataclasses.dataclass
+class UnfinishResult:
+    prefix_indices: Optional[torch.Tensor] = None
+    cache_protected_len: Optional[int] = None
+    lock_handover: bool = False
+    last_node: Any = None
+    swa_uuid_for_lock: Optional[int] = None
+    swa_prefix_lock_released: Optional[bool] = None
+
+
+@dataclasses.dataclass
 class InsertResult:
     """Result of an insert operation"""
 
@@ -280,7 +310,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def cache_unfinished_req(self, req: Req, **kwargs):
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
         pass
 
     def unfinished_swa_evict_pre_len(

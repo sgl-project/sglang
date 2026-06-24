@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     EvictParams,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -150,10 +151,48 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
-    evict_swa_out_of_window_for_unfinished(
-        req, tree_cache, chunked=kwargs.get("chunked", False)
+    chunked = kwargs.get("chunked", False)
+    evict_swa_out_of_window_for_unfinished(req, tree_cache, chunked=chunked)
+    harvest_and_cache_unfinished_req(req, tree_cache, chunked=chunked)
+
+
+def harvest_and_cache_unfinished_req(
+    req: Req, tree_cache: BasePrefixCache, chunked: bool = False
+) -> None:
+    token_ids = req.get_fill_ids()
+    kv_indices = tree_cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : len(token_ids)
+    ]
+    unfinish_params = CacheUnfinishParams(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        kv_indices=kv_indices,
+        req_pool_idx=req.req_pool_idx,
+        prev_prefix_len=req.cache.cache_protected_len,
+        prefix_indices_len=len(req.prefix_indices),
+        swa_evicted_seqlen=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
+        priority=getattr(req, "priority", 0) or 0,
+        chunked=chunked,
+        last_node=req.cache.last_node,
+        swa_uuid_for_lock=req.cache.swa_uuid_for_lock,
+        swa_prefix_lock_released=req.cache.swa_prefix_lock_released,
+        req=req,
     )
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    unfinish_result = tree_cache.cache_unfinished_req(unfinish_params)
+
+    if unfinish_result is None:
+        return
+    if unfinish_result.prefix_indices is not None:
+        req.prefix_indices = unfinish_result.prefix_indices
+    if unfinish_result.cache_protected_len is not None:
+        req.cache.cache_protected_len = unfinish_result.cache_protected_len
+    if unfinish_result.lock_handover:
+        req.cache.last_node = unfinish_result.last_node
+        req.cache.swa_uuid_for_lock = unfinish_result.swa_uuid_for_lock
+        if unfinish_result.swa_prefix_lock_released is not None:
+            req.cache.swa_prefix_lock_released = (
+                unfinish_result.swa_prefix_lock_released
+            )
 
 
 def write_cache_indices(

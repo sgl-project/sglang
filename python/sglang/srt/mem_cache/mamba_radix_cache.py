@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -45,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    UnfinishResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -53,7 +55,6 @@ from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
@@ -626,30 +627,30 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(params.last_node)
         return None
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
         """Cache request when it is unfinished."""
+        req = params.req
 
-        def _skip_cache_unfinished_req(req: Req) -> None:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
-            ]
-
+        def _skip_cache_unfinished_req(
+            kv_indices: torch.Tensor,
+        ) -> UnfinishResult:
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return
+            return UnfinishResult(
+                prefix_indices=kv_indices.to(dtype=torch.int64, copy=True)
+            )
 
-        token_ids = req.get_fill_ids()
+        token_ids = params.token_ids
         cache_len = (
             req.mamba.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
         if self.disable or cache_len is None:
-            return _skip_cache_unfinished_req(req)
+            return _skip_cache_unfinished_req(params.kv_indices[: len(token_ids)])
 
-        kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        kv_indices_orig = params.kv_indices[: len(token_ids)]
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
@@ -694,13 +695,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.mamba.mamba_pool_idx.unsqueeze(0), mamba_value_donated
             )
 
+        old_prefix_len = params.prev_prefix_len
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(page_aligned_token_ids, params.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
-                prev_prefix_len=req.cache.cache_protected_len,
-                chunked=chunked,
+                prev_prefix_len=old_prefix_len,
+                chunked=params.chunked,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
@@ -709,7 +711,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, params.extra_key))
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -720,28 +722,33 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
         assert (
-            req.cache.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            old_prefix_len <= len(new_indices) + self.page_size - 1
+        ), f"{old_prefix_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache.cache_protected_len, len(new_indices))),
-            new_indices[req.cache.cache_protected_len :],
+            (params.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(req.cache.last_node)
+        self.dec_lock_ref(params.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # NOTE: this is needed for both page_size == 1 and page_size > 1
-        req.prefix_indices = torch.cat(
+        new_prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
-        req.cache.cache_protected_len = len(new_indices)
         req.mamba.mamba_last_track_seqlen = None
-        req.cache.last_node = new_last_node
+
+        return UnfinishResult(
+            prefix_indices=new_prefix_indices,
+            cache_protected_len=len(new_indices),
+            lock_handover=True,
+            last_node=new_last_node,
+        )
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
