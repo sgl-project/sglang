@@ -60,6 +60,7 @@ class FakeReq:
         self.req_pool_idx = req_pool_idx
         self.prefix_indices = []
         self.last_node = None
+        self.kv_committed_len = 0
 
 
 class FakeKVScoreBuffer:
@@ -184,6 +185,7 @@ class TestDSV4C128RadixState(unittest.TestCase):
         req.prefix_indices = torch.cat(
             [match.device_indices, torch.arange(128, 160, dtype=torch.int64)]
         )
+        req.kv_committed_len = len(req.prefix_indices)
         req.last_node = match.last_device_node
         cache.restore_c128_state_for_reqs([req])
 

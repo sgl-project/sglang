@@ -494,7 +494,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 # Chunked prefill can keep live, non-radix KV from the previous
                 # chunk in prefix_indices. The request slot already has the
                 # matching C128 state, so radix restore must leave it intact.
-                continue
+                if getattr(req, "kv_committed_len", 0) >= prefix_len:
+                    continue
             assert node_prefix_len == prefix_len
             if snapshot is not None:
                 kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
