@@ -965,7 +965,8 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        page_size = self.token_to_kv_pool_allocator.page_size
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = token_to_kv_pool.page_size
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -1002,6 +1003,7 @@ class SchedulerDisaggregationPrefillMixin:
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
             seq_len = min(req.fill_len, len(req.origin_input_ids))
+            swa_state_page_size = getattr(token_to_kv_pool, "swa_page_size", page_size)
 
             def _mamba_payload():
                 return [
@@ -1015,7 +1017,9 @@ class SchedulerDisaggregationPrefillMixin:
             def _swa_payload():
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = (window_start // swa_state_page_size) * (
+                    swa_state_page_size
+                )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
@@ -1025,14 +1029,16 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), swa_state_page_size
                 )
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                return kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), token_to_kv_pool.page_size
+                )
 
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
