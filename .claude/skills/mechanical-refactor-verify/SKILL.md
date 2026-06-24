@@ -24,9 +24,10 @@ Each mode is a single self-contained script next to this skill — **`mechanical
 for Mode A and **`mechanical_refactor_verify_utils.py`** for Mode B — needing only git and the standard
 library, so anyone can re-run the result.
 
-The exact rule Mode B's verifier enforces — what counts as a move and what does not —
-is specified in **`verifier-spec.md`**, the source of truth that the script, its tests,
-and this guide all follow.
+What counts as a clean move — the one property both modes certify, and how each of the two
+proofs (Mode A's reproduce-and-byte-diff, Mode B's inspect) establishes it — is specified in
+**`verifier-spec.md`**, the single source of truth that both scripts, their tests, and this
+guide all follow.
 
 A mechanical commit/PR contains **only** mechanical changes (moves, splits, renames,
 import fixes, formatting). Semantic changes (new logic, API/signature redesign,
