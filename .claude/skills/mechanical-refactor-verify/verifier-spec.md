@@ -2,20 +2,19 @@
 
 ## 1. What this file is
 
-- This file is the **single source of truth** for *what the skill certifies* and *how*.
-  The code (`mechanical_refactor_verify_utils.py`, `mechanical_refactor_reproduce_utils.py`,
-  `mechanical_refactor_reproduce_gen_utils.py`), the tests, and the prose guides
-  (`SKILL.md`, `verification-mode.md`, `reproduce-mode.md`) all implement or describe this
-  file. If any of them disagrees with it, **this file wins** and the others are the bug.
-- There is **one property** being certified — *a commit is a pure relocation* — and **two
-  proofs** of it:
-    - **Proof A — reproduce** (§3): regenerate the move from the base commit and diff it
-      byte-for-byte. This is the primary, authoritative proof and the one normally run,
-      because it emits a self-contained Python script anyone can re-run and audit.
-    - **Proof B — inspect** (§4): judge the shape of the commit's diff statically. Fast and
-      dependency-free, but conservative — it declines to guess when a formatter rewrapped
-      lines, deferring to Proof A.
-- A commit is a **clean move** if **either** proof certifies it (§5).
+- This file is the **single source of truth** for *what the skill certifies* and *how*. The
+  code (`mechanical_refactor_reproduce_utils.py`, `mechanical_refactor_reproduce_gen_utils.py`),
+  the tests, and the prose guides (`SKILL.md`, `reproduce-mode.md`, `prep-and-move.md`) all
+  implement or describe this file. If any of them disagrees with it, **this file wins** and
+  the others are the bug.
+- There is **one property** being certified — *a commit is a pure relocation* — and **one
+  proof** of it: **reproduce** (§3). Regenerate the move from the base commit with faithful
+  AST primitives, run the formatter, and diff byte-for-byte against the target commit. An
+  empty diff is a machine proof; any residual is a bundled non-move change surfaced for
+  review.
+- The proof is authoritative because it runs the **real formatter** and compares **bytes**:
+  a commit a formatter rewrapped is reproduced exactly, and the proof is a small,
+  self-contained Python script anyone can re-run and audit.
 
 ## 2. The property — a "clean move"
 
@@ -23,12 +22,21 @@
 > order** — allowing one **uniform indentation shift** of the whole block — plus a small
 > fixed set of **move artifacts**, and nothing else.
 
+Equivalently: the commit is reproducible by composing only the faithful relocation
+primitives (§3.3). The whitelist below is exactly what those primitives do; the not-allowed
+list is what they refuse to do, so it surfaces as a residual diff.
+
 ### 2.1 Allowed — the whole whitelist
 
 - A line **relocated in order**, modulo one **uniform** leading-indentation shift of the
   whole block (the unavoidable reindent of relocation).
+- When the destination module is **new**, the relocated block may include the module
+  **scaffolding** the prep commit staged in the source's tail — module-level imports, a
+  `logger`, an `if TYPE_CHECKING:` guard, module constants — because the move *relocates*
+  that scaffolding, it does not author it (§2.4).
 - **Import statements** — added, removed, or repathed; single-line or parenthesised
-  multi-line. The symbol's home changed, so importers adjust.
+  multi-line. The symbol's home changed, so importers adjust. A move to a new module may
+  also add `from __future__ import annotations`.
 - A one-sided **`@staticmethod` / `@classmethod`** — a method became a free function or
   vice versa.
 - A **`self` type annotation dropped** from the moved definition — relocating
@@ -38,53 +46,62 @@
   `Old.foo(x)` → `New.foo(x)`: same symbol, same arguments, only the qualifier differs.
 - A **call-site lowering of a moved method** — a staticmethod call
   `Owner.method(receiver, rest)` → the instance-method call `receiver.method(rest)` (the
-  receiver moves out of the argument list), compared on the whole call expression so a
-  formatter's wrapping is tolerated.
-- **Blank-line changes** — ignored (§2.3).
+  receiver moves out of the argument list).
+- **Blank-line changes** — ignored (§2.3): the formatter normalises them.
 
 ### 2.2 Not allowed — the commit is **not** a clean move
 
 - A **reorder** of lines within the moved block.
+- A **statement-level reorder** that relocates no definition — e.g. moving a call below
+  other statements in a method body. It changes evaluation order, so it is a *reshape* a
+  human must confirm, not a machine-certifiable relocation (§2.4, §3.4).
 - A **non-uniform** indentation change (one that is not a single shift of the whole block) —
   it can change Python semantics.
 - A **trailing-whitespace** change, an internal-whitespace change, or a **line merge/split**.
 - A **changed argument** in an otherwise-requalified call.
 - A **call rewrite for a symbol that did not move** in this commit (e.g. pointing a
-  consumer at a different implementation) — keeps a consumer-only edit from passing.
+  consumer at a different implementation).
 - A **signature change** other than dropping the `self` annotation — a real parameter's
   type, name, default, or position changing.
 - A **rename** of the moved symbol (even a privacy flip `_foo` → `foo`).
-- **Any new module-level scaffolding** the move introduces — a `logger`, a module
-  constant, a `TYPE_CHECKING` guard.
+- **New module-level scaffolding the move authors fresh** — a `logger`, a module constant, a
+  `TYPE_CHECKING` guard the move *introduces* (as opposed to relocates from the source tail,
+  §2.1).
 - A **constant re-derived** in the destination module (`_flag = compute_flag()`).
 
-The last two are **correct flags, not false positives**: a rename or fresh scaffolding is
-reshape work, so it belongs in the **prep** commit, not the move (§2.4, `prep-and-move.md`).
+A rename, fresh scaffolding, or a statement reorder is reshape work, so it belongs in the
+**prep** commit, not the move (§2.4, `prep-and-move.md`). The reproduce proof reports such a
+commit as a residual diff (or, when no definition relocated at all, as unsupported) — it does
+not certify it.
 
 ### 2.3 Blank lines are ignored
 
 - A blank line never changes Python behavior, and PEP 8 separator blanks legitimately
-  collapse when code is split across files or relocated, so a blank-line-only difference is
-  tolerated by both proofs.
+  collapse when code is split across files or relocated. The formatter normalises them on
+  both the reproduced and target sides, so a blank-line-only difference cannot appear in the
+  byte diff.
 
 ### 2.4 Why the bar is this strict — prep is human-reviewed, move is machine-checked
 
 - A behaviour-preserving extraction is **two commits**:
-    - a **prep** commit — the in-place reshape (de-self a method, retype `self`, add the new
-      module's scaffolding, rename). A human reviews it, so it must be **small** and contain
-      **no relocation**: the code stays exactly where it is.
+    - a **prep** commit — the in-place reshape (de-self a method, retype `self`, stage the
+      new module's scaffolding, rename, reorder statements). A human reviews it, so it must
+      be **small** and contain **no cross-file relocation**: the code stays where it is.
     - a **move** commit — the pure relocation, certified by this spec.
 - The whitelist in §2.1 is exactly what a relocation *forces* and a human should not have to
   re-read. It is **not** a licence to fold reshape work into the move. If the move's diff
   contains anything outside the whitelist, the reshape leaked in and belongs in prep.
+- **Extracting to a new module** is staged this way: prep inlines the future module's whole
+  body — scaffolding plus the def — as a trailing block in the source file (a human reviews
+  that the body is unchanged and the scaffolding is right); the move then cuts that tail into
+  the new file. The new file therefore contains only relocated lines plus `from __future__
+  import annotations`, so it stays a clean move.
 
-## 3. Proof A (primary) — reproduce: regenerate the move and byte-diff
+## 3. The proof — reproduce: regenerate the move and byte-diff
 
-Instead of inspecting the diff, **regenerate** the move from the base commit with faithful
-AST primitives, run the formatter, and diff byte-for-byte against the target commit. An
-empty diff is a machine proof that the commit is exactly that relocation; any residual diff
-is a bundled non-move change surfaced for review. This is the proof that handles a commit
-the formatter rewrapped, which Proof B cannot.
+Regenerate the move from the base commit with faithful AST primitives, run the formatter
+(pre-commit: black / isort / ruff), and diff byte-for-byte against the target commit. An
+empty diff proves the commit is exactly that relocation.
 
 ### 3.1 The auto-generated, self-contained Python script
 
@@ -95,13 +112,14 @@ the formatter rewrapped, which Proof B cannot.
   ```
 
 - For each matched commit it:
-    - **infers a recipe** from the commit's diff + before-state AST — which symbol moved
-      (`src` → `dst`, into which class), which call sites were lowered or requalified, which
-      local imports the move orphaned, which module imports the destination gained;
+    - **infers a recipe** from the commit's diff + before-state AST — which symbols moved
+      (`src` → `dst`, into which class, or into a new module), which call sites were lowered
+      or requalified, which imports were repathed, and the symmetric module-level import diff
+      each file gained or lost;
     - **emits** a standalone `repro_scripts/<sha>.py` whose only import is
       `mechanical_refactor_reproduce_utils`;
-    - **runs** it — checks out the base in a throwaway worktree, replays the primitives,
-      runs `pre-commit` (black / isort / ruff), and byte-diffs against the target;
+    - **runs** it — checks out the base in a throwaway worktree, replays the primitives, runs
+      `pre-commit`, and byte-diffs against the target;
     - records the verdict.
 - The **product** is a self-contained folder, independently auditable without the skill:
     - `repro_scripts/<sha>.py` — one script per commit;
@@ -110,13 +128,14 @@ the formatter rewrapped, which Proof B cannot.
 - **Verdicts**:
     - `PASS` — byte-identical to the target; the commit is certified a clean move.
     - `RESIDUAL` — a non-empty diff; the residual is the bundled non-move change to review.
-    - `UNSUPPORTED` — the recipe is not yet inferable (§3.4); hand-write the `Repro`.
+    - `UNSUPPORTED` — no definition relocated (a rename or statement-level reshape), or the
+      recipe is not yet inferable (§3.4); review as prep, or hand-write the `Repro`.
 
-### 3.2 Why it is the authoritative proof
+### 3.2 Why it is a trustworthy proof
 
 - It runs the **real formatter**, so a call the formatter split across an `= (` line, or a
-  reflow that left a closing bracket as unchanged context, is reproduced exactly — the case
-  Proof B conservatively flags.
+  reflow that left a closing bracket as unchanged context, is reproduced exactly — there is
+  no diff-shape heuristic to fool.
 - The proof is the **few primitive calls** in the generated script; a reviewer audits those,
   not a hand-written transform.
 - It is **self-contained and re-runnable** by anyone (a CI step, a PR reviewer), so the
@@ -129,93 +148,44 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
 
 - `move_symbol` — cut a `def`/`class` with its decorators, drop `@staticmethod` /
   `@classmethod`, dedent, paste at a class end or at module level.
+- `extract_to_new_module` — cut the contiguous tail of the source (the moved defs plus the
+  scaffolding that leads into them) and write it as a new module, prepending
+  `from __future__ import annotations` when the move adds it. The formatter sorts the imports
+  and normalises blank lines.
 - `lower_call_sites` — `Owner.m(receiver, rest)` → `receiver.m(rest)`.
 - `requalify_call_sites` — `Owner.m(args)` → `m(args)`.
-- `remove_import` — function-scoped, all occurrences, with the trailing blank.
+- `remove_import` — function-scoped or module-level, all occurrences, with the trailing
+  blank.
 - `add_import` — let the formatter's import sorter place it.
+- `add_typechecking_import` — append an import inside the destination's `if TYPE_CHECKING:`
+  block (a moved annotation needs its type imported there); the sorter orders the block.
+- `repath_import` — repath a function-scoped `from old import ... name ...` to
+  `from new import ...` in place (module-level repaths fall out of add/remove + the sorter).
 
-### 3.4 What the generator does **not** yet infer (reported `UNSUPPORTED`)
+### 3.4 What the proof does **not** certify
 
-- a **new-file extract** — per `prep-and-move.md` the new module's scaffolding belongs in
-  prep, so once the chain is split the move targets an existing module;
-- a move whose **source is already a free function** — its callers cannot be inferred from
-  the qualifier alone;
-- a move that also **renames** — not a pure relocation.
+- A **rename** (even a privacy flip) and a **statement-level reorder** are not pure
+  relocations; the generator infers no recipe and reports them `UNSUPPORTED`. They belong in
+  prep (§2.4) and are reviewed there, not machine-certified.
+- A **new-file extract whose source is not a staged trailing block** — a method still inside
+  the class, or a constant sitting far above the moved defs — is reported `UNSUPPORTED`:
+  finish the prep so the whole module body sits together at the source tail first.
+- An **extract from multiple sources into one new file** is not yet inferred — split it so
+  each new module is filled from a single source, or hand-write the `Repro`.
 
-For these, write the `Repro` by hand (see `reproduce-mode.md`).
+For an inference gap (not a property violation), write the `Repro` by hand (see
+`reproduce-mode.md`); the same byte-diff then certifies it.
 
-## 4. Proof B (fast screen) — inspect: judge the diff's shape
+## 4. What a verdict asserts (and does not)
 
-A static, dependency-free check (no worktree, no formatter): `verify_move_commit(commit)`
-answers one yes/no question from the commit's diff alone. Fast, so it is the first screen
-over a stack of commits — but **conservative**: a commit the formatter rewrapped reads
-`NEEDS REVIEW` here even when it is a faithful move. That is **not a false positive** — the
-inspect path is declining to guess, and the commit should be settled by Proof A.
-
-### 4.1 The verdict
-
-- `CLEAN MOVE` — the property in §2 holds by the diff's shape.
-- `NEEDS REVIEW` — anything else (the signature diff is printed).
-
-### 4.2 The rule, precisely
-
-Given a commit (diffed against its first parent):
-
-1. **Collect changed lines, per file.** Take the removed (`-`) and added (`+`) lines, grouped
-   by file. Within each file, **cancel** any line that appears byte-for-byte as **both**
-   removed and added — that is git's own diff artifact (an unchanged line re-represented when
-   nearby lines change), not a relocation; a real relocation keeps its lines because they
-   cross files. Aggregate the survivors in patch order. Renames/splits are not followed
-   (`-M` off).
-2. **Collect import lines.** For every file the commit touches, parse the *before* version
-   (at `commit^`) and the *after* version (at `commit`) with `ast`. A line is an **import
-   line** if it lies within an `Import` / `ImportFrom` node, so single-line and parenthesised
-   multi-line imports are both recognised.
-3. **Peel the whitelist, preserving order.** From the surviving lines remove:
-    - **imports** (a line whose stripped text is in the parsed import set);
-    - **decorators** (a line that is exactly `@staticmethod` or `@classmethod`);
-    - **call-site requalifications** — a removed and an added line that become equal after
-      dropping a `Qualifier.` prefix before a **moved symbol** (a qualifier must actually be
-      present, so a verbatim body line is not consumed). Moved symbols are the `def`/`class`
-      names on both sides (ignoring indentation, after the `self`-annotation drop);
-    - **call-site lowerings** — a call group starting at `Owner.method(receiver, ...)` whose
-      canonical form (whitespace-collapsed, receiver moved to the front, redundant `= (...)`
-      wrapper dropped) equals an added `receiver.method(...)` call group. A line-based diff
-      cannot reassemble a call the formatter split across an `= (` line or whose closing
-      bracket is unchanged context — those still read `NEEDS REVIEW`; settle them with
-      Proof A.
-4. **Compare the remaining block as an ordered signature.** A block's **signature** is its
-   non-blank lines with the block's common leading indent removed, in order, with any `self`
-   parameter's type annotation dropped. The removed and added blocks match iff their
-   signatures are **equal as sequences**. This absorbs a uniform indentation shift and the
-   `self`-annotation drop while preserving relative indentation, trailing whitespace, and
-   order.
-5. **Verdict.** `CLEAN MOVE` iff the signatures match and at least one line relocated;
-   otherwise `NEEDS REVIEW`. A commit whose surviving removed and added lists are both empty
-   (a pure rename git records with no content change) is clean too.
-
-## 5. How the two proofs relate
-
-- A commit is a **clean move** if **either** proof certifies it (Proof A `PASS` or Proof B
-  `CLEAN MOVE`).
-- **Proof B first, Proof A to settle.** Inspect is the cheap screen over a stack; whatever it
-  flags `NEEDS REVIEW` is either a real bundled change or a formatter reflow — run Proof A to
-  tell which (`PASS` = it was only reflow; `RESIDUAL` = a real change to review).
-- **Disagreement resolves to Proof A.** Proof B is a heuristic on diff shape; Proof A runs the
-  real formatter and compares bytes, so it is authoritative.
-- Both certify the **same property** (§2). Neither judges **intent**: confirm the commit's
+- **Order-aware** — a relocation that reorders lines within the moved block leaves a
+  residual.
+- **Uniform-indentation-aware** — a whole-block shift by one constant amount reproduces
+  cleanly; a non-uniform change leaves a residual, since it can change Python semantics.
+- **Blank-line-insensitive** by design (§2.3): the formatter normalises both sides.
+- **Requalification / lowering / repath is scoped to symbols relocated in this commit**, so a
+  consumer-only call or import rewrite (no relocated definition) cannot reproduce as a move —
+  it surfaces as a residual.
+- It judges the **shape of a relocation**, not **intent** — a `PASS` says "this commit is
+  exactly these relocations", not "this relocation was a good idea". Confirm the commit's
   purpose from its subject before trusting any clean verdict.
-
-## 6. What a verdict does and does not assert
-
-- **Order-aware** — a relocation that reorders lines within the moved block is not clean.
-- **Uniform-indentation-aware** — a whole-block shift by one constant amount is allowed; a
-  non-uniform change is flagged, since it can change Python semantics.
-- **Blank-line-insensitive** by design (§2.3).
-- **Requalification/lowering is scoped to symbols relocated in this commit**, so a
-  consumer-only call rewrite (no relocated definition) cannot pass as a move.
-- It judges the **shape of a relocation**, not **intent** — confirm the commit's purpose from
-  its subject.
-- Proof B classifies imports by **text membership** in the parsed import set; a code line
-  whose text coincidentally equals an import line elsewhere would be treated as an import.
-  This is rare, and the strictness elsewhere makes it harmless.

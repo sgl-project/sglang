@@ -14,9 +14,8 @@ neither a human nor a tool can mechanically confirm "the body that landed is the
 that left" — you have to re-read the logic to be sure.
 
 **Rule:** split each mechanical move into two consecutive commits, each carrying one
-kind of operation with its own check. The **move** commit is then certifiable by
-`mechanical_refactor_verify_utils.py` (see `SKILL.md`, verify mode); the **prep** commit is small and
-covered by tests.
+kind of operation with its own check. The **move** commit is then certifiable by the
+reproduce proof (see `SKILL.md`); the **prep** commit is small and covered by tests.
 
 **Prep is human-reviewed, so it stays small and relocates nothing.** The code keeps its
 place — prep only changes its *shape* (de-self a method, retype `self`) so a human can
@@ -62,8 +61,8 @@ sealing:
 - call site: `TheClass.foo(args)` → `foo(args)` (qualifier removed; args untouched).
 
 **Check:** the body is byte-identical and the only other changes are move artifacts —
-the dropped decorator, the import, and the requalified call site — so
-`mechanical_refactor_verify_utils.py <commit>` reports `CLEAN MOVE`. Cross-check with
+the dropped decorator, the import, and the requalified call site — so the reproduce proof
+(`mechanical_refactor_reproduce_gen_utils.py <commit>`) reports `PASS`. Cross-check with
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`,
 which marks the whole block as moved.
 
@@ -149,32 +148,45 @@ method); the body is **unchanged, line for line**:
 - caller: `Source.foo(self.component, ...)` → `self.component.foo(...)`.
 
 **Check:** the body is byte-identical, and the dropped `@staticmethod` and the
-`def foo(self: Target)` → `def foo(self)` annotation drop are recognised as move
-artifacts. The caller still changes from `Source.foo(self.component, ...)` to
-`self.component.foo(...)` — the receiver moves out of the argument list, which is **not**
-a requalification — so `mechanical_refactor_verify_utils.py` reports `NEEDS REVIEW` on the
-caller line(s). Read those few lines, or verify the whole commit with reproduce mode (a
-transform script, see `reproduce-mode.md`). The split still pays off: because prep left
-the body untouched, the move is a clean cut/paste and the only line to read is the caller.
+`def foo(self: Target)` → `def foo(self)` annotation drop are move artifacts. The caller
+changes from `Source.foo(self.component, ...)` to `self.component.foo(...)` — the receiver
+moves out of the argument list — which the reproduce proof replays with its `lower_call_sites`
+primitive, so the whole commit reports `PASS` (`mechanical_refactor_reproduce_gen_utils.py
+<commit>`). The split still pays off: because prep left the body untouched, the move is a
+clean cut/paste.
 
-## Extracting to a new module: prep builds the module, move adds only the body
+## Extracting to a new module: prep stages the module body as a trailing block
 
-When the destination module does not exist yet, **prep creates it** — with everything the
-new module needs *except* the moved body:
+When the destination module does not exist yet, **prep inlines the whole future module — its
+scaffolding *and* its body — as a trailing block at the bottom of the source file**, below the
+class. The move then cuts that contiguous tail into the new file. Staging it this way (rather
+than authoring the new file in prep) keeps the move a *pure relocation*: every line in the new
+file demonstrably came from the source the commit before.
 
-- the module scaffolding: `from __future__ import annotations`, the module-level imports the
-  moved code uses, a `logger = logging.getLogger(__name__)`, any module-level constants the
-  body reads, an `if TYPE_CHECKING:` block;
-- if a constant must be **re-derived** for the new module (e.g. the source cached
-  `_is_hip = is_hip()` and the new module needs `_use_aiter = ... and is_hip()`), that
-  re-derivation is a prep decision — a human confirms it is equivalent — so it lands in prep.
+### Commit 1 — prep: inline the module body as a trailing block (no relocation)
 
-The **move** then only cuts the body verbatim into the already-built module and adds the
-consumer import. The new file in the move's diff therefore contains **only the relocated
-body plus imports** — nothing else. If the move's new file also introduces a logger, a
-constant, or a `TYPE_CHECKING` guard, that scaffolding leaked in and belongs back in prep.
-Likewise, removing a now-unused module-level constant from the source is prep/follow-up, not
-move — the move whitelists only *import* removals.
+In the **source file**, after the class, build the future module exactly as it will look:
+
+- the module scaffolding: the module-level imports the moved code uses, a
+  `logger = logging.getLogger(__name__)`, any module-level constants the body reads, an
+  `if TYPE_CHECKING:` block;
+- the moved functions and classes themselves, with their bodies **unchanged**;
+- rewrite the call sites to the now-module-level names (`self.foo(...)` → `foo(...)`).
+
+Nothing relocates across files yet — a human reviews that the body is unchanged and the
+scaffolding is right. If a constant must be **re-derived** for the new module (e.g. the source
+cached `_is_hip = is_hip()` and the new module needs `_use_aiter = ... and is_hip()`), that
+re-derivation is a prep decision — a human confirms it is equivalent — so it lands in prep.
+
+### Commit 2 — move: cut the trailing block into the new file
+
+Cut the contiguous tail (scaffolding plus the staged defs/classes) verbatim into the new
+module, adding `from __future__ import annotations` at its top and the consumer import in the
+source. The new file therefore contains **only relocated lines plus imports** — nothing the
+move authored. The reproduce proof replays this with `extract_to_new_module` and reports
+`PASS`. If the staged block is not a clean tail — a method still inside the class, a constant
+sitting far above — the proof reports `UNSUPPORTED`: finish the prep so the whole module body
+sits together at the source tail first.
 
 ## A move never renames
 
