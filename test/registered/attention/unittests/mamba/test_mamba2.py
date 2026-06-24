@@ -193,7 +193,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         backend = fixture.backend
         bs = case.batch_size
 
-        backend.init_cuda_graph_state(max_bs=bs, max_num_tokens=bs)
+        backend.init_static_metadata_buffers(max_bs=bs, max_num_tokens=bs)
 
         # Sentinel distinguishes "never written" from "overwritten with -1".
         backend.state_indices_list[bs - 1].fill_(99)
