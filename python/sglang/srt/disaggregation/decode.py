@@ -1290,7 +1290,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        was_fresh = req.req_pool_idx is None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
@@ -1298,7 +1297,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        if was_fresh:
+        # TODO(th4): co-locate this req.kv bookkeeping with the real KV
+        # allocation; the pool alloc above and the kv_allocated_len assignment
+        # below should become a single owned-kv allocation step.
+        if req.kv is None:
             from sglang.srt.managers.schedule_batch import ReqKvInfo
 
             req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
