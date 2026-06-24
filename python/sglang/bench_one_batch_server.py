@@ -1,13 +1,15 @@
-"""Back-compat shim. The implementation now lives in
-``sglang.benchmark.one_batch_server``; this module preserves the
-``python -m sglang.bench_one_batch_server`` entry point and the
-``from sglang.bench_one_batch_server import ...`` imports.
+"""Deprecated import path for ``sglang.benchmark.one_batch_server``.
+
+``python -m sglang.bench_one_batch_server`` and
+``from sglang.bench_one_batch_server import ...`` still work, but the
+implementation now lives in ``sglang.benchmark.one_batch_server``.
+Update references to the new path.
 """
 
 import warnings
 
 from sglang.benchmark.one_batch_server import *  # noqa: F401,F403
-from sglang.benchmark.one_batch_server import main
+from sglang.benchmark.one_batch_server import cli_main
 
 warnings.warn(
     "`sglang.bench_one_batch_server` is deprecated and will be removed in a "
@@ -18,4 +20,4 @@ warnings.warn(
 )
 
 if __name__ == "__main__":
-    main()
+    cli_main()
