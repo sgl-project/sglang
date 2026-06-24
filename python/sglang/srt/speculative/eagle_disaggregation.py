@@ -59,8 +59,13 @@ def build_eagle_disagg_draft_input(
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
     if batch.enable_overlap:
+        # Local import to avoid a module-load cycle through overlap_utils.
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
         spec_info.future_indices = batch.req_pool_indices
         future_map.publish(spec_info.future_indices, batch.seq_lens)
-        future_map.stash(spec_info.future_indices, spec_info)
+        future_map.stash(
+            spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
+        )
 
     return spec_info

@@ -153,5 +153,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         else:
             # Non-spec: stash last token into the relay so the first DECODE's
             # resolve_forward_inputs gathers it like any other decode iter.
-            future_map.stash(self.req_pool_indices, last_tokens_tensor)
+            # Local import: this mixin is pulled into schedule_batch, which
+            # overlap_utils transitively imports -- a top-level import cycles.
+            from sglang.srt.managers.overlap_utils import RelayPayload
+
+            future_map.stash(
+                self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+            )
             self.input_ids = None
