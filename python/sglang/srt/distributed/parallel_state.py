@@ -819,11 +819,11 @@ class GroupCoordinator:
         # custom all-gather path: an equal-chunk (no variable sizes) reduce-scatter
         # using the registered symmetric-memory buffers, which is faster than the
         # generic RCCL kernel for the small, latency-bound decode collective.
-        # Gated by SGLANG_USE_AITER_RS (default off). Falls back (returns False)
-        # for unsupported shape/size/topology so the caller uses RCCL.
+        # Gated by SGLANG_DP_USE_REDUCE_SCATTER. Falls back (returns False)
+        # for non-ROCm / unsupported shape/size/topology so the caller uses RCCL.
         if not (
             is_hip()
-            and envs.SGLANG_USE_AITER_RS.get()
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and self._has_aiter_custom_reduce_scatter()
             and input.is_contiguous()
             and output.is_contiguous()
