@@ -9,7 +9,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import get_attention_tp_size, get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -353,10 +353,16 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        # A large value will lead to large memory occupation, thus users should change it accordingly
-        self.num_max_dispatch_tokens_per_rank = (
+        configured_num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        attn_tp_size = get_attention_tp_size()
+        # DeepEP low-latency receives the attention-TP scattered MoE input.
+        # The env value is the pre-scatter per-rank token capacity, so the
+        # DeepEP buffer capacity should cover only this rank's attn-TP shard.
+        self.num_max_dispatch_tokens_per_rank = (
+            configured_num_max_dispatch_tokens_per_rank + attn_tp_size - 1
+        ) // attn_tp_size
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
