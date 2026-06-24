@@ -244,6 +244,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # Agent-aware KV cache metadata. Only set when a request carries agent_hints.
+        self.agent_meta: Optional[dict] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -485,6 +487,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         self._tag_session_leaf(req, radix_key, node=session_leaf)
+        
+        self._annotate_agent_cache_node(req, session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -557,6 +561,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
 
         self._tag_session_leaf(req, radix_key, node=new_last_node)
+        
+        self._annotate_agent_cache_node(req, new_last_node)
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -680,6 +686,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        if child.agent_meta is not None:
+            new_node.agent_meta = dict(child.agent_meta)
         new_node.hit_count = child.hit_count
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -816,7 +824,51 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
+    def _annotate_agent_cache_node(self, req: Req, node: Optional[TreeNode]) -> None:
+        """Attach optional agent-aware metadata to a terminal radix node.
 
+        This metadata is used only for experimental eviction scoring. It does not
+        change prefix matching, does not pin cache entries, and does not implement
+        shared_prefix_hash-driven reuse.
+        """
+        if node is None or node is self.root_node:
+            return
+
+        hints = getattr(req, "agent_hints", None)
+        if not hints:
+            return
+        if not isinstance(hints, dict):
+            return
+
+        meta = {}
+
+        for key in (
+            "workflow_id",
+            "agent_id",
+            "step_id",
+            "step_index",
+            "total_steps",
+            "parent_step_id",
+            "children_step_ids",
+            "tool_name",
+            "shared_prefix_hash",
+            "reuse_hint",
+        ):
+            value = hints.get(key)
+            if value is not None:
+                meta[key] = value
+
+        expected_tool_duration_ms = hints.get("expected_tool_duration_ms")
+        if expected_tool_duration_ms is not None:
+            meta["expected_tool_duration_ms"] = expected_tool_duration_ms
+
+        cache_ttl_ms = hints.get("cache_ttl_ms")
+        if cache_ttl_ms is not None:
+            meta["cache_ttl_ms"] = cache_ttl_ms
+            meta["cache_ttl_deadline"] = time.monotonic() + cache_ttl_ms / 1000.0
+
+        if meta:
+            node.agent_meta = meta
 
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()
