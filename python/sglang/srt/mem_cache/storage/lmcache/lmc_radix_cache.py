@@ -36,7 +36,6 @@ except ImportError as e:
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
@@ -198,9 +197,9 @@ class LMCRadixCache(RadixCache):
         last_node: TreeNode = base_res.last_device_node
 
         if self._mode is LMCacheMode.MP:
-            if params.req is None:
+            if params.rid is None:
                 return base_res
-            return self._mp_match_prefix(key, base_res, value, last_node, params.req)
+            return self._mp_match_prefix(key, base_res, value, last_node, params.rid)
         elif self._mode is LMCacheMode.IP:
             return self._ip_match_prefix(key, base_res, value, last_node)
         return base_res
@@ -211,7 +210,7 @@ class LMCRadixCache(RadixCache):
         base_res: MatchResult,
         value: torch.Tensor,
         last_node: TreeNode,
-        req: Req,
+        rid: str,
     ) -> MatchResult:
         """MP LOOKUP
 
@@ -220,15 +219,15 @@ class LMCRadixCache(RadixCache):
         the held read locks and returns the radix-only result.
         """
         token_ids = key.raw_token_ids()
-        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
+        matched = self.lmcache_connector.lookup_kv(token_ids, rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
-            self.lmcache_connector.release_pending(req.rid)
+            self.lmcache_connector.release_pending(rid)
             return base_res
 
         if token_ids is key.token_ids:
             token_ids = token_ids[:]
-        self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
+        self._mp_load_back_markers[rid] = _LMCacheLoadBackMarker(
             key=RadixKey(token_ids, key.extra_key, key.is_bigram),
             value_numel=int(value.numel()),
         )
@@ -294,8 +293,8 @@ class LMCRadixCache(RadixCache):
         TreeNode into the radix tree, and returns
         ``(new_indices, new_last_node)``.
         """
-        req = params.req
-        marker = self._mp_load_back_markers.pop(req.rid)
+        rid = params.rid
+        marker = self._mp_load_back_markers.pop(rid)
         last_node: TreeNode = params.best_match_node
 
         result = self._load_back(
@@ -305,7 +304,7 @@ class LMCRadixCache(RadixCache):
             last_node=last_node,
             load_fn=lambda sm, pp: self._mp_load_back(
                 marker=marker,
-                request_id=req.rid,
+                request_id=rid,
                 slot_mapping=sm,
                 prefix_pad=pp,
             ),
@@ -314,7 +313,7 @@ class LMCRadixCache(RadixCache):
             # Either alloc failed (locks still held by lookup_kv) or
             # retrieve returned nothing (locks already released by
             # retrieve_kv). release_pending is idempotent on locks_held.
-            self.lmcache_connector.release_pending(req.rid)
+            self.lmcache_connector.release_pending(rid)
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,

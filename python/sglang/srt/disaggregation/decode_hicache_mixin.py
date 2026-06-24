@@ -207,6 +207,7 @@ class DecodeHiCacheTransferMixin:
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                rid=dr.req.rid,
             )
         )
         # Failback: total coverage < required prefix means device alloc likely failed.
