@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,7 +40,7 @@ _MEGA_MOE_DG_ENV_APPLIED = False
 
 
 def _apply_mega_moe_dg_env() -> None:
-    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
+    """Forward MegaMOE env defaults before DeepGEMM first use.
 
     DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
     call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
@@ -54,6 +55,14 @@ def _apply_mega_moe_dg_env() -> None:
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
         os.environ.setdefault("DG_USE_MXF4_KIND", "1")
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.get_device_capability()[0] >= 10:
+                # PyTorch CUDA symmetric-memory multicast can hang during
+                # DeepGEMM MegaMOE rendezvous on SM100.
+                os.environ.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "1")
+        except RuntimeError:
+            pass
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
@@ -114,8 +123,6 @@ def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch] = None,
-    should_allreduce_fusion: bool = False,
-    use_reduce_scatter: bool = False,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -132,30 +139,19 @@ def forward_mega_moe(
         moe.alt_stream.wait_stream(current_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
-        with mega_stream_ctx:
-            y = _run_mega_routed(
-                moe, hidden_states, forward_batch, input_ids_global, num_tokens
-            )
-        current_stream.wait_stream(moe.alt_stream)
     else:
+        shared_output = moe._forward_shared_experts(hidden_states)
+        mega_stream_ctx = nullcontext()
+
+    with mega_stream_ctx:
         y = _run_mega_routed(
             moe, hidden_states, forward_batch, input_ids_global, num_tokens
         )
-        shared_output = moe._forward_shared_experts(hidden_states)
 
-    if shared_output is not None and not getattr(moe, "_shared_expert_tp1", False):
-        y.add_(shared_output)
-    if moe.tp_size > 1:
-        from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+    if sbo_overlap_flag:
+        current_stream.wait_stream(moe.alt_stream)
 
-        if not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            y = tensor_model_parallel_all_reduce(y)
-    if shared_output is not None and getattr(moe, "_shared_expert_tp1", False):
+    if shared_output is not None:
         y.add_(shared_output)
     return y
 
@@ -172,6 +168,7 @@ def _run_mega_routed(
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
+
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
@@ -216,6 +213,7 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
+
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
@@ -251,6 +249,7 @@ def _run_mega_routed(
             buf.topk_weights,
             quant_group_size=32,
         )
+
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(

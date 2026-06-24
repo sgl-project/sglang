@@ -835,8 +835,6 @@ class DeepseekV2MoE(nn.Module):
                 self,
                 hidden_states,
                 forward_batch,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
                 input_ids_global=input_ids_global,
             )
 
