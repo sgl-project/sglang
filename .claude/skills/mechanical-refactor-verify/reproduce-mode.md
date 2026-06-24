@@ -120,6 +120,10 @@ python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_reproduce_
 ```
 
 A passing script is the proof; its few primitive calls are what a reviewer audits. The
-inference currently covers "a method moved onto an existing class, call sites lowered,
-local imports removed"; new-file extracts, free-function moves, and renames are reported as
-unsupported (write the `Repro` by hand for those).
+inference covers a method moved onto an existing class (call sites lowered) and a method
+moved to a module-level free function (call sites requalified), with local-import removal
+and gained module imports. It reports as unsupported: a new-file extract (per
+`prep-and-move.md` the new module's scaffolding belongs in prep, so once the chain is split
+the move targets an existing module), a move whose source is already a free function (its
+callers cannot be inferred from the qualifier alone), and a move that also renames (not a
+pure relocation). Write the `Repro` by hand for those.

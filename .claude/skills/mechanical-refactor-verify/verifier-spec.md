@@ -1,10 +1,22 @@
 # Move verifier — specification (source of truth)
 
-This file defines the rule the move verifier enforces. It is the **single source of
-truth**: `mechanical_refactor_verify_utils.py` implements exactly this rule and its comments point here, the
-tests (`test_mechanical_refactor_verify_utils.py`) assert exactly this rule, and `SKILL.md` /
-`verification-mode.md` describe it in prose. If any of them disagree with this file, this
-file wins and the others are the bug.
+This file defines the rule the **inspect verifier** enforces — the static, diff-shape
+decision made by `mechanical_refactor_verify_utils.py`. It is the **single source of
+truth** for that rule: the module implements exactly this rule and its comments point here,
+the tests (`test_mechanical_refactor_verify_utils.py`) assert exactly this rule, and
+`SKILL.md` / `verification-mode.md` describe it in prose. If any of them disagree with this
+file, this file wins and the others are the bug.
+
+The inspect verifier is deliberately conservative: it certifies only what it can prove by
+comparing the diff's lines, so a commit a formatter re-wrapped (a call split across an `= (`
+line, a closing bracket left as unchanged context) reads `NEEDS REVIEW` here even when it is
+a faithful move. That is not a false positive — it is the inspect path declining to guess.
+The **reproduce path** (`mechanical_refactor_reproduce_utils.py` + the generator
+`mechanical_refactor_reproduce_gen_utils.py`, specified in `reproduce-mode.md`) is the
+complementary, authoritative fallback for those: it regenerates the move from the base state
+via faithful AST primitives, runs the formatter, and diffs byte-for-byte, so formatter
+reflow is absorbed and any bundled non-move change surfaces as a residual. A commit is a
+clean move if **either** path certifies it.
 
 ## What the verifier certifies
 
