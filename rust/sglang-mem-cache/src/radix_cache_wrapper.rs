@@ -21,15 +21,18 @@ pub struct RustEvictResult {
 }
 
 fn deferred_action_to_py(py: Python<'_>, action: DeferredAction) -> PyObject {
+    // Lead with the owning ComponentType so the Python consumer routes by it.
+    let ct = action.component_type().into_py(py);
     match action {
         DeferredAction::FullFree { full_to_free } => {
-            ("FullFree", PyTensor(full_to_free).into_py(py)).into_py(py)
+            (ct, "FullFree", PyTensor(full_to_free).into_py(py)).into_py(py)
         }
         DeferredAction::SwaRecover {
             node_idx,
             old_full_to_free,
             new_full_value,
         } => (
+            ct,
             "SwaRecover",
             node_idx,
             PyTensor(old_full_to_free).into_py(py),
@@ -39,7 +42,7 @@ fn deferred_action_to_py(py: Python<'_>, action: DeferredAction) -> PyObject {
         DeferredAction::SwaStamp {
             node_idx,
             full_value,
-        } => ("SwaStamp", node_idx, PyTensor(full_value).into_py(py)).into_py(py),
+        } => (ct, "SwaStamp", node_idx, PyTensor(full_value).into_py(py)).into_py(py),
     }
 }
 

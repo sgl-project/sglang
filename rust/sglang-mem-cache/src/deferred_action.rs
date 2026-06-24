@@ -1,5 +1,6 @@
 use tch::Tensor;
 
+use crate::component_type::ComponentType;
 use crate::tree_node_pool::NodeIdx;
 
 /// An action emitted by the Rust radix tree for the Python orchestrator to apply.
@@ -22,4 +23,16 @@ pub enum DeferredAction {
         /// Full KV mapped (full->swa) into the node's SWA value.
         full_value: Tensor,
     },
+}
+
+impl DeferredAction {
+    /// The component that owns this action; the Python consumer routes by it.
+    pub fn component_type(&self) -> ComponentType {
+        match self {
+            DeferredAction::FullFree { .. } => ComponentType::Full,
+            DeferredAction::SwaRecover { .. } | DeferredAction::SwaStamp { .. } => {
+                ComponentType::Swa
+            }
+        }
+    }
 }

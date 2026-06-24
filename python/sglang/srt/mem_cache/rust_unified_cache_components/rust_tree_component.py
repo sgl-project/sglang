@@ -36,27 +36,28 @@ class RustTreeComponent:
     """Pool-side handler for one `ComponentType`. Defaults are no-ops."""
 
     component_type: ComponentType
-    # DeferredAction tags this component handles in `stage_insert_action`.
-    insert_action_tags: tuple[str, ...] = ()
 
     def __init__(self, cache: "RustUnifiedRadixCache"):
         self.cache = cache
 
+    # --- Required: every component implements these (raise if not). ---
     def free_evicted(self, freed_bin: list[torch.Tensor]) -> None:
         """Free this component's evicted tensors into its pool."""
         raise NotImplementedError
 
+    def evictable_size(self) -> int:
+        raise NotImplementedError
+
+    def protected_size(self) -> int:
+        raise NotImplementedError
+
+    # --- Optional hooks: the orchestrator loops these over every component, so
+    #     only the participating component overrides; the rest stay no-ops. ---
     def stage_insert_action(self, action: tuple) -> None:
-        """Apply one insert DeferredAction (may buffer for `commit`)."""
+        """Apply one routed insert DeferredAction (may buffer for `commit`)."""
 
     def commit_insert_actions(self) -> None:
         """Flush anything `stage_insert_action` buffered. Default no-op."""
-
-    def evictable_size(self) -> int:
-        return 0
-
-    def protected_size(self) -> int:
-        return 0
 
     def finalize_match(self, params: Any, rust_result: Any) -> None:
         """Pool-side match post-processing (e.g. Mamba CoW). Default no-op."""

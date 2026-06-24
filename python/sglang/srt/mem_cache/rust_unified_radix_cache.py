@@ -23,7 +23,6 @@ import torch
 from sglang.srt.mem_cache._mem_cache_core import (
     ComponentType,
     RadixCacheInfraPyError,
-    RadixCacheRuntimePyError,
     RustBigramRadixCacheWrapper,
     RustPageRadixCacheWrapper,
 )
@@ -98,11 +97,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # Pool-side per-component handlers; dispatch to these instead of
         # branching per component inline.
         self.components = build_components(self)
-        self._action_dispatch = {
-            tag: comp
-            for comp in self.components.values()
-            for tag in comp.insert_action_tags
-        }
 
     def _reject_unsupported(self, params: CacheInitParams, server_args: Any) -> None:
         if params.eviction_policy.lower() != "lru":
@@ -233,16 +227,11 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
 
     def _process_insert_actions(self, deferred_actions: list[tuple]) -> None:
-        """Route each insert-path action to its component, then commit."""
+        """Route each action to its component by ComponentType, then commit."""
         if not deferred_actions or self.token_to_kv_pool_allocator is None:
             return
         for action in deferred_actions:
-            comp = self._action_dispatch.get(action[0])
-            if comp is None:
-                raise RadixCacheRuntimePyError(
-                    f"_process_insert_actions: unsupported insert action {action[0]!r}"
-                )
-            comp.stage_insert_action(action)
+            self.components[action[0]].stage_insert_action(action)
         for comp in self.components.values():
             comp.commit_insert_actions()
 

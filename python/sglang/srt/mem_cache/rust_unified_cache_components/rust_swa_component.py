@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.rust_unified_cache_components.rust_tree_component impo
 
 class RustSWAComponent(RustTreeComponent):
     component_type = ComponentType.Swa
-    insert_action_tags = ("SwaRecover", "SwaStamp")
 
     def __init__(self, cache):
         super().__init__(cache)
@@ -40,12 +39,13 @@ class RustSWAComponent(RustTreeComponent):
 
     def stage_insert_action(self, action):
         alloc = self.cache.token_to_kv_pool_allocator
-        if action[0] == "SwaRecover":
-            _, node_idx, old_full_to_free, new_full_value = action
+        # action[0] is ComponentType.Swa (already routed); action[1] is the tag.
+        if action[1] == "SwaRecover":
+            _ct, _tag, node_idx, old_full_to_free, new_full_value = action
             alloc.free(old_full_to_free)
             full_value = new_full_value
         else:  # SwaStamp
-            _, node_idx, full_value = action
+            _ct, _tag, node_idx, full_value = action
         self._node_indices.append(node_idx)
         self._values.append(alloc.translate_loc_from_full_to_swa(full_value))
 

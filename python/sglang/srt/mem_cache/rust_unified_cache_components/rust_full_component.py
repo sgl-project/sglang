@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.rust_unified_cache_components.rust_tree_component impo
 
 class RustFullComponent(RustTreeComponent):
     component_type = ComponentType.Full
-    insert_action_tags = ("FullFree",)
 
     def free_evicted(self, freed_bin):
         alloc = self.cache.token_to_kv_pool_allocator
@@ -33,8 +32,8 @@ class RustFullComponent(RustTreeComponent):
             alloc.free(t)
 
     def stage_insert_action(self, action):
-        # ("FullFree", full_to_free)
-        self.cache.token_to_kv_pool_allocator.free(action[1])
+        # (ComponentType.Full, "FullFree", full_to_free)
+        self.cache.token_to_kv_pool_allocator.free(action[2])
 
     def evictable_size(self):
         return self.cache._rust_radix.evictable_token_size()
