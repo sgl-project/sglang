@@ -150,6 +150,12 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                 hidden_states
             )
 
+        # ---- SHAPE CHECK ----
+        # After SwiGLU, hidden_states shape should be (total_tokens, inter_per_rank)
+        # w2 should be (E, hidden_size, inter_per_rank)
+        assert hidden_states.shape[-1] == w2.shape[-1], \
+            f"Shape mismatch: hidden after swiglu {hidden_states.shape} vs w2 {w2.shape}"
+
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -159,6 +165,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             output_dtype=original_dtype,
             weight_prefix="w2",
             group_list_type=group_list_type,
+            split_item=1,
         )
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return TorchNpuRunnerOutput(hidden_states=hidden_states)
