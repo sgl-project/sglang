@@ -8,7 +8,7 @@ use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
+use crate::{config::RoutingMode,core::{steps::workflow_data::WorkerRegistrationData, Worker}};
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -115,13 +115,40 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // Initialize cache-aware policy if configured
             let all_workers = app_context.worker_registry.get_by_model(&model_id);
 
-            // Check for configuration conflicts between prefill and decode
-            self.check_worker_conflicts(&model_id, &all_workers);
-            if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    app_context
-                        .policy_registry
-                        .init_cache_aware_policy(&model_id, &all_workers);
+            let is_pd_mode = matches!(
+                app_context.router_config.mode,
+                RoutingMode::PrefillDecode { .. }
+            );
+            if is_pd_mode {
+                let prefill_workers: Vec<_> = all_workers.iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect();
+
+                let decode_workers: Vec<_> = all_workers.iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+                .cloned()
+                .collect();
+
+                app_context.policy_registry.init_pd_cache_aware_policies(
+                    &prefill_workers,
+                    &decode_workers,
+                );
+                debug!(
+                    "Updated PD cache-aware policies for model {} (prefill: {}, decode: {})",
+                    model_id,
+                    prefill_workers.len(),
+                    decode_workers.len()
+                );
+            } else {
+                // Check for configuration conflicts between prefill and decode
+                self.check_worker_conflicts(&model_id, &all_workers);
+                if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
+                    if policy.name() == "cache_aware" {
+                        app_context
+                            .policy_registry
+                            .init_cache_aware_policy(&model_id, &all_workers);
+                    }
                 }
             }
 

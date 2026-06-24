@@ -133,15 +133,18 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        let bootstrap_host = match url::Url::parse(&self.url) {
+        // may dp aware url: http://xxx:xx@0
+        let parts: Vec<&str> = self.url.split('@').collect();
+        let new_url = parts[0].to_string();
+        let bootstrap_host = match url::Url::parse(&new_url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) if !self.url.contains("://") => {
-                match url::Url::parse(&format!("http://{}", self.url)) {
+            Err(_) if !new_url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", new_url)) {
                     Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
                     Err(_) => {
                         tracing::warn!(
                             "Failed to parse URL '{}', defaulting to localhost",
-                            self.url
+                            new_url
                         );
                         "localhost".to_string()
                     }
@@ -150,7 +153,7 @@ impl BasicWorkerBuilder {
             Err(_) => {
                 tracing::warn!(
                     "Failed to parse URL '{}', defaulting to localhost",
-                    self.url
+                    new_url
                 );
                 "localhost".to_string()
             }
