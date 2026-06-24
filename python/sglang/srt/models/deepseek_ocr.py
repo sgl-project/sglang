@@ -832,7 +832,7 @@ def _build_sam(
     )
     image_encoder.eval()
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, weights_only=True)
         image_encoder.load_state_dict(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
@@ -1417,7 +1417,7 @@ def build_qwen2_decoder_as_encoder(
         max_query=max_query,
     )
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, weights_only=True)
         decoder_as_encoder.load_state_dict(state_dict, strict=True)
     return decoder_as_encoder
 

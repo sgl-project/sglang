@@ -686,6 +686,7 @@ async def get_server_info():
 
 
 @app.get("/server_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
@@ -695,9 +696,16 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
+    # Serialize server args but redact sensitive fields
+    server_args_dict = dataclasses.asdict(server_args)
+    # Remove sensitive authentication credentials from response
+    _SENSITIVE_FIELDS = ("api_key", "admin_api_key")
+    for field in _SENSITIVE_FIELDS:
+        if field in server_args_dict:
+            server_args_dict[field] = "[REDACTED]" if server_args_dict[field] else None
+
     return {
-        **dataclasses.asdict(server_args),
+        **server_args_dict,
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
@@ -1029,6 +1037,22 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     if obj is None:
         obj = ProfileReqInput()
 
+    # Validate output_dir to prevent path traversal
+    if obj.output_dir is not None:
+        from pathlib import Path
+
+        resolved_dir = Path(obj.output_dir).resolve()
+        # Block obvious traversal attempts and sensitive paths
+        output_dir_str = str(resolved_dir)
+        if any(
+            output_dir_str.startswith(p)
+            for p in ("/etc", "/proc", "/sys", "/dev", "/root")
+        ):
+            return Response(
+                content=f"Invalid output_dir: path not allowed\n",
+                status_code=400,
+            )
+
     await _global_state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
         start_step=obj.start_step,
@@ -1059,6 +1083,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/set_trace_level", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 def set_trace_level(level: int = Query(..., ge=0)):
     set_global_trace_level(level)
 
@@ -1411,6 +1436,16 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
+    # Validate lora_path: must be an absolute path, no traversal sequences
+    from pathlib import Path
+
+    lora_path = Path(obj.lora_path).resolve()
+    if ".." in obj.lora_path:
+        return ORJSONResponse(
+            {"success": False, "message": "Invalid lora_path: path traversal detected"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
 
     if result.success:
@@ -1426,6 +1461,7 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
 ):
