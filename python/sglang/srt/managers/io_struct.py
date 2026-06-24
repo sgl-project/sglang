@@ -1736,6 +1736,10 @@ class AbortReq(BaseReq):
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
     abort_message: Optional[str] = None
+    # Optional HTTP status code to attach to the resulting FINISH_ABORT.
+    # Used when the abort is triggered internally (e.g. running timeout) so
+    # that the client-visible error matches the single-stage behavior.
+    abort_status_code: Optional[int] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
