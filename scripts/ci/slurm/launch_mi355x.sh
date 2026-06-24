@@ -22,6 +22,15 @@
 #   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
+#   RUNNER_NAME        - GitHub runner name (a built-in default env var)
+#   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
+#                        The allocation is named
+#                          mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>
+#                        so workflow cleanup can scancel exactly this leg's job
+#                        (full name) or this runner's stale jobs (RUNNER_NAME
+#                        prefix) -- never a blanket `squeue --me`. The run id +
+#                        config make the name unique per matrix leg even if two
+#                        runners happen to share a name.
 #   SLURM_EXCLUSIVE    - request whole nodes (default 1); set 0 to disable
 #   TIME_LIMIT         - salloc time limit, default 02:30:00 (covers server
 #                        load + perf sweep + full GSM8K, under the 180m step cap)
@@ -338,8 +347,15 @@ EXCLUSIVE_ARG=()
 # One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
 TOTAL_NODES=$((PW + DW))
 
+# Name the allocation <RUNNER_NAME>-<GITHUB_RUN_ID>-<config> so the workflow's
+# cleanup steps can scancel precisely instead of a blanket `squeue --me` that
+# would kill a concurrent matrix leg. RUNNER_NAME alone is not assumed unique;
+# GITHUB_RUN_ID + config make the name unique per matrix leg regardless.
+JOB_NAME="mi355x-ci-${RUNNER_NAME:-norunner}-${GITHUB_RUN_ID:-0}-${MATRIX_CONFIG_NAME}"
+
 set +e
-salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" -t "$TIME_LIMIT" \
+salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
+    --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
     bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
 SALLOC_RC=$?
 set -e

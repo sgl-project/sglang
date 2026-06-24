@@ -106,6 +106,10 @@ jobs:
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: mi355x-${{ matrix.config.name }}
       MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
+      # NOTE: RUNNER_NAME is a built-in default env var on every runner, so the
+      # launch + cleanup steps read it directly. Do NOT set it here from
+      # ${{ runner.name }} -- the `runner` context is not available in job-level
+      # env and makes the whole workflow file invalid.
       # Local snapshot on the cluster's shared NFS (preferred over downloading).
       MODEL_PATH: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8/snapshots/ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17
 
@@ -116,9 +120,17 @@ jobs:
       - name: Clean up prior Slurm jobs from this runner
         continue-on-error: true
         run: |
-          STALE_JOBS=$(squeue --me --noheader --format="%i" || true)
+          # launch_mi355x.sh names the allocation
+          #   mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>
+          # Here we clear THIS runner's leftovers from a crashed previous run, so
+          # we match the RUNNER_NAME prefix (older runs have a different run id).
+          # Never a blanket `squeue --me`, which would kill a concurrent leg.
+          # %200j: squeue truncates the job name (%j) by default -- widen it so
+          # the grep sees the full name.
+          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
+          STALE_JOBS=$(squeue --me --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
           if [ -n "$STALE_JOBS" ]; then
-            echo "Cancelling stale jobs: $STALE_JOBS"
+            echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
             scancel $STALE_JOBS
           fi
 
@@ -158,9 +170,14 @@ jobs:
         if: failure() || cancelled()
         continue-on-error: true
         run: |
-          ACTIVE_JOBS=$(squeue --me --noheader --format="%i" || true)
+          # Cancel only THIS leg's allocation -- match the full job name
+          # mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>. GITHUB_RUN_ID +
+          # config are unique per matrix leg, so a concurrent leg is never hit.
+          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
+          JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-${MATRIX_CONFIG_NAME}"
+          ACTIVE_JOBS=$(squeue --me --noheader --format="%i %200j" | grep -F "$JOB_TAG" | awk '{print $1}' || true)
           if [ -n "$ACTIVE_JOBS" ]; then
-            echo "Cancelling jobs: $ACTIVE_JOBS"
+            echo "Cancelling jobs for ${JOB_TAG}: $ACTIVE_JOBS"
             scancel $ACTIVE_JOBS
           fi
 
