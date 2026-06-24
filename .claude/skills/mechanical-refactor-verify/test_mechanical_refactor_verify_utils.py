@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from verify_move import (
+from mechanical_refactor_verify_utils import (
     _block_signature,
     _commit_changed_lines,
     _commit_import_texts,

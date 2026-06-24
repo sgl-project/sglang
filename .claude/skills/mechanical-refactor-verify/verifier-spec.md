@@ -1,8 +1,8 @@
 # Move verifier — specification (source of truth)
 
 This file defines the rule the move verifier enforces. It is the **single source of
-truth**: `verify_move.py` implements exactly this rule and its comments point here, the
-tests (`test_verify_move.py`) assert exactly this rule, and `SKILL.md` /
+truth**: `mechanical_refactor_verify_utils.py` implements exactly this rule and its comments point here, the
+tests (`test_mechanical_refactor_verify_utils.py`) assert exactly this rule, and `SKILL.md` /
 `verification-mode.md` describe it in prose. If any of them disagree with this file, this
 file wins and the others are the bug.
 

@@ -17,7 +17,7 @@ relocations are certified here; semantic commits get ordinary human review.
 ## Step 2: Certify each relocation commit
 
 ```bash
-python3 .claude/skills/mechanical-refactor-verify/verify_move.py <commit>
+python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py <commit>
 ```
 
 It reports, for the commit's diff:

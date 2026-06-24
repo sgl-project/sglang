@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 sys.path.append(".claude/skills/mechanical-refactor-verify")
-from reproduce_refactor import (
+from mechanical_refactor_reproduce_utils import (
     verify_mechanical_refactor,
     exec_command,
     git_add_and_commit,

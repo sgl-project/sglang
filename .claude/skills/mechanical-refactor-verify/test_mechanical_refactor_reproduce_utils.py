@@ -6,8 +6,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import reproduce_refactor as rr
-from reproduce_refactor import (
+import mechanical_refactor_reproduce_utils as rr
+from mechanical_refactor_reproduce_utils import (
     dedent,
     exec_command,
     git_add_and_commit,

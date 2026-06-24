@@ -10,7 +10,7 @@ This module is self-contained (only git + the standard library) and independent 
 reproduce-mode helper. The exact rule it enforces is specified in verifier-spec.md (the
 source of truth); this module implements that file and nothing more. Runnable directly:
 
-    python3 verify_move.py <commit>
+    python3 mechanical_refactor_verify_utils.py <commit>
 """
 
 import ast
@@ -284,7 +284,9 @@ def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
 def _main(argv: list[str]) -> int:
     if len(argv) == 1:
         return 0 if verify_move_commit(argv[0]) else 1
-    print("usage: python3 verify_move.py <commit>", file=sys.stderr)
+    print(
+        "usage: python3 mechanical_refactor_verify_utils.py <commit>", file=sys.stderr
+    )
     return 2
 
 

@@ -20,8 +20,8 @@ There are two ways to make it checkable. Pick by the shape of the work:
 | One PR is a single mechanical refactor; or a rename / inline where a formatter re-wraps lines | **Reproduce** (Mode A) | a transform script regenerates the PR's diff byte-for-byte |
 | A stack of commits (each its own PR), only some mechanical, mixed with semantic ones | **Verify** (Mode B) | a verifier certifies each mechanical commit is an in-order relocation (uniform indent shift allowed) plus only mechanical move artifacts; semantic commits get ordinary review |
 
-Each mode is a single self-contained script next to this skill — **`reproduce_refactor.py`**
-for Mode A and **`verify_move.py`** for Mode B — needing only git and the standard
+Each mode is a single self-contained script next to this skill — **`mechanical_refactor_reproduce_utils.py`**
+for Mode A and **`mechanical_refactor_verify_utils.py`** for Mode B — needing only git and the standard
 library, so anyone can re-run the result.
 
 The exact rule Mode B's verifier enforces — what counts as a move and what does not —
@@ -46,7 +46,7 @@ worktree and diff it byte-for-byte against the target commit.
 Use when the work is a chain where each commit becomes its own PR and only some
 commits are mechanical. No reproduce script; you classify each commit and certify each
 relocation from its diff with
-`verify_move.py <commit>` (`CLEAN MOVE` = every changed line is either part of the moved
+`mechanical_refactor_verify_utils.py <commit>` (`CLEAN MOVE` = every changed line is either part of the moved
 block — relocated in order, allowing one uniform indent shift — or a mechanical move
 artifact: an import, a dropped `@staticmethod`, or a requalified call site; otherwise it
 lists the lines to review). Semantic commits get ordinary review.
@@ -61,7 +61,7 @@ moved symbol's call sites (see `verifier-spec.md`). De-self'ing a method — tur
 `self.x` reads into parameters — is behavior-preserving but is a *reshape*, not a move,
 so it must not ride along in the move commit. Split such an extraction into a **prep**
 commit (the small in-place reshape, no relocation, checked by tests) followed by a
-**move** commit (the pure relocation, certified by `verify_move.py <commit>`). Prep is
+**move** commit (the pure relocation, certified by `mechanical_refactor_verify_utils.py <commit>`). Prep is
 the part a human reviews, so keep its diff small.
 
 → The full philosophy — why, the two-commit recipe, the class-extraction technique,
@@ -72,5 +72,5 @@ file).
 
 - **Reproduce-mode PR**: run the one-click command from the PR description; `PASS`
   means the diff is byte-identical to what the script produces.
-- **Verify-mode PR** (a mechanical commit): run `verify_move.py <commit>`; confirm
+- **Verify-mode PR** (a mechanical commit): run `mechanical_refactor_verify_utils.py <commit>`; confirm
   `CLEAN MOVE`, or that the small to-review set is only equivalent wiring.
