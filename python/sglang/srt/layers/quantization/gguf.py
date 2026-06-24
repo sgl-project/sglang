@@ -953,6 +953,19 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
 
+        # After registering the buffers
+        layer.register_buffer("w13_dequant", w13_full, persistent=False)
+        layer.register_buffer("w2_dequant", w2_full, persistent=False)
+        
+        # Debug: print shapes
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            logger.info(
+                f"[TP rank {get_tensor_model_parallel_rank()}] "
+                f"w13_dequant.shape = {w13_full.shape}, "
+                f"w2_dequant.shape = {w2_full.shape}"
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
