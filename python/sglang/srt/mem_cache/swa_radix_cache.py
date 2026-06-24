@@ -489,7 +489,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             snapshot = self._get_c128_snapshot_at_node_end(node)
             if node is self.root_node or not self._is_c128_restorable_node(node):
                 continue
-            assert self._node_prefix_len(node) == prefix_len
+            node_prefix_len = self._node_prefix_len(node)
+            if node_prefix_len < prefix_len:
+                # Chunked prefill can keep live, non-radix KV from the previous
+                # chunk in prefix_indices. The request slot already has the
+                # matching C128 state, so radix restore must leave it intact.
+                continue
+            assert node_prefix_len == prefix_len
             if snapshot is not None:
                 kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
             else:

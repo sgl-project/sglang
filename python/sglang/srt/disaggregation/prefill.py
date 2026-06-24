@@ -249,7 +249,6 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
-        req.disagg_transfer_input_len = len(req.origin_input_ids)
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -273,9 +272,7 @@ class PrefillBootstrapQueue:
 
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        transfer_input_len = len(req.origin_input_ids)
-        req.disagg_transfer_input_len = transfer_input_len
-        num_kv_indices = transfer_input_len
+        num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
@@ -970,9 +967,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
-        transfer_input_len = getattr(
-            req, "disagg_transfer_input_len", len(req.origin_input_ids)
-        )
+        transfer_input_len = len(req.origin_input_ids)
         end_idx = (
             end_idx if end_idx is not None else min(req.fill_len, transfer_input_len)
         )

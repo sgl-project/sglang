@@ -172,6 +172,24 @@ class TestDSV4C128RadixState(unittest.TestCase):
         self.assertEqual(kv_pool.restored, [])
         self.assertEqual(kv_pool.cleared, [3])
 
+    def test_chunked_prefill_live_tail_skips_restore(self):
+        cache, kv_pool = self._make_cache()
+        self._insert_tokens(cache, 260)
+
+        req = FakeReq(req_pool_idx=3)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(128))), req=req)
+        )
+
+        req.prefix_indices = torch.cat(
+            [match.device_indices, torch.arange(128, 160, dtype=torch.int64)]
+        )
+        req.last_node = match.last_device_node
+        cache.restore_c128_state_for_reqs([req])
+
+        self.assertEqual(kv_pool.restored, [])
+        self.assertEqual(kv_pool.cleared, [])
+
     def test_store_partial_snapshot_uses_requested_prefix_length(self):
         cache, kv_pool = self._make_cache()
         leaf = self._insert_tokens(cache, 260)
