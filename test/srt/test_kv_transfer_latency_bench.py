@@ -133,6 +133,10 @@ def test_parser_accepts_paced_transfer_options():
             "120",
             "--background-bytes",
             "512MB",
+            "--flow-id",
+            "flow-a",
+            "--start-at-unix-ns",
+            "123456789",
         ]
     )
 
@@ -140,6 +144,8 @@ def test_parser_accepts_paced_transfer_options():
     assert args.chunk_size == "8MB"
     assert args.background_duration_seconds == 120.0
     assert args.background_bytes == "512MB"
+    assert args.flow_id == "flow-a"
+    assert args.start_at_unix_ns == 123456789
 
 
 class _FakeEngine:
@@ -258,3 +264,15 @@ def test_transfer_sync_paced_stops_on_transfer_error():
         ("target:1234", 1000, 2000, 128),
         ("target:1234", 1128, 2128, 128),
     ]
+
+
+def test_wait_until_unix_ns_sleeps_until_deadline(monkeypatch):
+    times = iter([1_000_000_000, 1_040_000_000, 1_060_000_000])
+    sleeps = []
+
+    monkeypatch.setattr(bench.time, "time_ns", lambda: next(times))
+    monkeypatch.setattr(bench.time, "sleep", sleeps.append)
+
+    bench._wait_until_unix_ns(1_050_000_000)
+
+    assert sleeps == [0.05, 0.01]

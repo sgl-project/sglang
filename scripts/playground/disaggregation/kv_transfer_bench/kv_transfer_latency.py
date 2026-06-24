@@ -340,6 +340,17 @@ def _sync_cuda(gpu_id: int) -> None:
     torch.cuda.synchronize(gpu_id)
 
 
+def _wait_until_unix_ns(start_at_unix_ns: int) -> None:
+    if start_at_unix_ns <= 0:
+        return
+    while True:
+        now_ns = time.time_ns()
+        remaining_s = (start_at_unix_ns - now_ns) / 1_000_000_000
+        if remaining_s <= 0:
+            return
+        time.sleep(min(remaining_s, 0.050))
+
+
 def run_background_initiator(
     args: argparse.Namespace,
     target: TargetInfo,
@@ -354,6 +365,8 @@ def run_background_initiator(
         raise ValueError("--background-duration-seconds must be positive")
 
     _sync_cuda(args.gpu_id)
+    _wait_until_unix_ns(args.start_at_unix_ns)
+    start_unix_ns = time.time_ns()
     start_ns = time.perf_counter_ns()
     end_ns = start_ns + int(args.background_duration_seconds * 1_000_000_000)
     transfer_count = 0
@@ -377,9 +390,12 @@ def run_background_initiator(
             break
 
     _sync_cuda(args.gpu_id)
-    elapsed_s = (time.perf_counter_ns() - start_ns) / 1_000_000_000
+    end_ns_actual = time.perf_counter_ns()
+    end_unix_ns = time.time_ns()
+    elapsed_s = (end_ns_actual - start_ns) / 1_000_000_000
     row = {
         "mode": "background",
+        "flow_id": args.flow_id,
         "source_host": args.host,
         "target_host": target.host,
         "source_gpu_id": args.gpu_id,
@@ -395,6 +411,10 @@ def run_background_initiator(
         "error_count": error_count,
         "total_bytes": ok_bytes,
         "elapsed_s": elapsed_s,
+        "start_time_unix_ns": start_unix_ns,
+        "end_time_unix_ns": end_unix_ns,
+        "start_time_monotonic_ns": start_ns,
+        "end_time_monotonic_ns": end_ns_actual,
         "rate_limit_gbps": args.rate_limit_gbps,
         "chunk_size": chunk_size,
         "human_chunk_size": format_bytes(chunk_size),
@@ -446,6 +466,7 @@ def run_initiator(args: argparse.Namespace) -> int:
             chunk_size,
         )
 
+    _wait_until_unix_ns(args.start_at_unix_ns)
     rows = []
     samples = []
     for num_bytes in sizes:
@@ -468,6 +489,7 @@ def run_initiator(args: argparse.Namespace) -> int:
         error_count = 0
         for iteration in range(args.repeat):
             _sync_cuda(args.gpu_id)
+            start_unix_ns = time.time_ns()
             start_ns = time.perf_counter_ns()
             ret = _transfer_sync_paced(
                 engine,
@@ -478,13 +500,16 @@ def run_initiator(args: argparse.Namespace) -> int:
                 args.rate_limit_gbps,
             )
             _sync_cuda(args.gpu_id)
-            latency_ms = (time.perf_counter_ns() - start_ns) / 1e6
+            end_ns = time.perf_counter_ns()
+            end_unix_ns = time.time_ns()
+            latency_ms = (end_ns - start_ns) / 1e6
             if ret == 0:
                 ok_latencies.append(latency_ms)
             else:
                 error_count += 1
             samples.append(
                 {
+                    "flow_id": args.flow_id,
                     "source_host": args.host,
                     "target_host": target.host,
                     "source_gpu_id": args.gpu_id,
@@ -493,6 +518,10 @@ def run_initiator(args: argparse.Namespace) -> int:
                     "human_bytes": format_bytes(num_bytes),
                     "iteration": iteration,
                     "latency_ms": latency_ms,
+                    "start_time_unix_ns": start_unix_ns,
+                    "end_time_unix_ns": end_unix_ns,
+                    "start_time_monotonic_ns": start_ns,
+                    "end_time_monotonic_ns": end_ns,
                     "ret": ret,
                     "rate_limit_gbps": args.rate_limit_gbps,
                     "chunk_size": chunk_size,
@@ -500,6 +529,7 @@ def run_initiator(args: argparse.Namespace) -> int:
             )
 
         row = {
+            "flow_id": args.flow_id,
             "source_host": args.host,
             "target_host": target.host,
             "source_gpu_id": args.gpu_id,
@@ -557,6 +587,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sizes", default="1MB:1GB:x2")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument(
+        "--flow-id",
+        default=os.environ.get("FLOW_ID", ""),
+        help="Optional logical flow identifier copied into summary and samples.",
+    )
+    parser.add_argument(
+        "--start-at-unix-ns",
+        type=int,
+        default=int(os.environ.get("START_AT_UNIX_NS", "0") or "0"),
+        help=(
+            "Optional wall-clock Unix timestamp in nanoseconds. When set, the "
+            "initiator waits until this time after setup/registration and before "
+            "starting measured or background transfers."
+        ),
+    )
     parser.add_argument(
         "--rate-limit-gbps",
         type=float,
