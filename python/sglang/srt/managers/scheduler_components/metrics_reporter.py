@@ -435,8 +435,13 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(self, num_tokens: int) -> Tuple[float, float, float]:
-        tokens = max(0, int(num_tokens))
+    def _estimate_prefill_perf(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Tuple[float, float, float]:
+        if batch is None or batch.extend_lens is None:
+            return 0.0, 0.0, 0.0
+
+        tokens = max(0, int(sum(batch.extend_lens)))
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
@@ -483,6 +488,16 @@ class SchedulerMetricsReporter:
             + tokens * self._ffn_act_bytes_per_token
         )
         return flops, read_bytes, write_bytes
+
+    def _prefill_sol_suffix(
+        self, batch: Optional[ScheduleBatch], elapsed_s: float
+    ) -> str:
+        """Hook for model-specific speed-of-light metrics on prefill log lines."""
+        return ""
+
+    def _decode_sol_suffix(self, batch: ScheduleBatch, elapsed_s: float) -> str:
+        """Hook for model-specific speed-of-light metrics on decode log lines."""
+        return ""
 
     def reset_metrics(self):
         self.forward_ct_decode = 0
@@ -553,9 +568,13 @@ class SchedulerMetricsReporter:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
-            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
-            tflops_per_s = flops / gap_latency / 1e12
-            msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+            sol_suffix = self._prefill_sol_suffix(batch, gap_latency)
+            if sol_suffix:
+                msg += sol_suffix
+            else:
+                flops, _, _ = self._estimate_prefill_perf(batch)
+                tflops_per_s = flops / gap_latency / 1e12
+                msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
@@ -572,9 +591,7 @@ class SchedulerMetricsReporter:
                 dp_cooperation_info=dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
-                    prefill_stats.log_input_tokens
-                )
+                flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
                     num_read_bytes_per_gpu=read_bytes,
@@ -764,6 +781,10 @@ class SchedulerMetricsReporter:
                 f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
                 f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
                 f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
+            )
+            msg += self._decode_sol_suffix(
+                batch,
+                gap_latency / max(1, self.scheduler.server_args.decode_log_interval),
             )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
