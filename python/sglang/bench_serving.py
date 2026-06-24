@@ -2158,6 +2158,7 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
+            "agentic-trace",
             "autobench",
             "sharegpt",
             "custom",
@@ -2175,6 +2176,22 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--dataset-offset",
+        type=int,
+        default=0,
+        help="Rotate the conversation list by this many entries before sampling "
+        "(agentic-trace dataset). Lets successive sweep steps start on fresh "
+        "conversations, mirroring evalscope --dataset-offset.",
+    )
+    parser.add_argument(
+        "--agentic-max-turns",
+        type=int,
+        default=None,
+        help="Cap each conversation to at most this many turns (agentic-trace "
+        "dataset). Default: use all turns in the trace. Useful for small, "
+        "fast profiling runs.",
     )
     parser.add_argument(
         "--speed-bench-category",
