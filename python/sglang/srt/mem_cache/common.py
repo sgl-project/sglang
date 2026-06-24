@@ -635,11 +635,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba.mamba_pool_idx is not None:
+        if req.mamba is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.mamba.mamba_pool_idx.unsqueeze(-1)
             )
-            req.mamba.mamba_pool_idx = None
+            req.mamba = None
         return
 
     kv_committed_len = req.effective_kv_committed_len()
@@ -680,7 +680,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         not tree_cache.supports_mamba()
     ):
         assert (
-            req.mamba.mamba_pool_idx is not None
+            req.mamba is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the

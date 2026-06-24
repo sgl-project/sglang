@@ -130,7 +130,8 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
-            req.mamba.mamba_last_track_seqlen = None
+            if req.mamba is not None:
+                req.mamba.mamba_last_track_seqlen = None
 
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch

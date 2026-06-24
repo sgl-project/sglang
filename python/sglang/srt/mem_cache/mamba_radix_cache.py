@@ -1113,7 +1113,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
-            if req.mamba.mamba_pool_idx is None:
+            from sglang.srt.managers.schedule_batch import ReqMambaInfo
+
+            if req.mamba is None:
                 dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
@@ -1121,7 +1123,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                req.mamba.mamba_pool_idx = dst_index[0]
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=dst_index[0],
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
             req.mamba_cow_src_index = last_node.mamba_value
             req.mamba_needs_clear = False
 

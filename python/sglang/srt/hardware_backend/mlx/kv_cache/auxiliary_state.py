@@ -225,15 +225,23 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
+        from sglang.srt.managers.schedule_batch import ReqMambaInfo
+
         auxiliary_state_indices = []
         for req in reqs:
-            if req.mamba.mamba_pool_idx is not None:
+            if req.mamba is not None:
                 mid = req.mamba.mamba_pool_idx
             else:
                 allocated = self.auxiliary_state_pool.alloc(1)
                 assert allocated is not None, "Not enough MLX auxiliary state slots"
                 mid = allocated[0]
-                req.mamba.mamba_pool_idx = mid
+                req.mamba = ReqMambaInfo(
+                    mamba_pool_idx=mid,
+                    mamba_ping_pong_track_buffer=None,
+                    mamba_next_track_idx=None,
+                    mamba_last_track_seqlen=None,
+                    mamba_branching_seqlen=None,
+                )
             auxiliary_state_indices.append(mid.to(dtype=torch.int32))
         self.req_index_to_auxiliary_state_index_mapping[select_index] = torch.stack(
             auxiliary_state_indices
@@ -250,15 +258,14 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         return 0
 
     def free_mamba_cache(self, req, mamba_ping_pong_track_buffer_to_keep=None):
-        if req.mamba.mamba_pool_idx is not None:
-            self.auxiliary_state_pool.free(req.mamba.mamba_pool_idx.unsqueeze(0))
-            req.mamba.mamba_pool_idx = None
+        if req.mamba is None:
+            return
+        self.auxiliary_state_pool.free(req.mamba.mamba_pool_idx.unsqueeze(0))
         track_buffer = req.mamba.mamba_ping_pong_track_buffer
         if track_buffer is not None:
             if mamba_ping_pong_track_buffer_to_keep is None:
                 self.auxiliary_state_pool.free(track_buffer)
-            req.mamba.mamba_ping_pong_track_buffer = None
-            req.mamba.mamba_next_track_idx = None
+        req.mamba = None
 
     def free_auxiliary_state_cache(self, req, track_buffer_to_keep=None):
         self.free_mamba_cache(
@@ -300,8 +307,6 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         track_len = req.mamba.mamba_last_track_seqlen
         if track_buffer is not None and track_len is not None:
             return track_buffer[0].unsqueeze(-1).clone(), True
-        if req.mamba.mamba_pool_idx is None:
-            return None, False
         return req.mamba.mamba_pool_idx.unsqueeze(-1).clone(), False
 
     def prepare_for_caching_req(
@@ -354,15 +359,18 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(
                     insert_params.mamba_value
                 )
-            if bool(
-                getattr(insert_params, "mlx_auxiliary_state_uses_track_slot", False)
-            ):
-                track_buffer = req.mamba.mamba_ping_pong_track_buffer
-                if track_buffer is not None:
-                    self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
-                req.mamba.mamba_ping_pong_track_buffer = None
-                req.mamba.mamba_next_track_idx = None
-            req.mamba.mamba_last_track_seqlen = None
+            if req.mamba is not None:
+                if bool(
+                    getattr(insert_params, "mlx_auxiliary_state_uses_track_slot", False)
+                ):
+                    track_buffer = req.mamba.mamba_ping_pong_track_buffer
+                    if track_buffer is not None:
+                        self.cache.req_to_token_pool.auxiliary_state_pool.free(
+                            track_buffer
+                        )
+                    req.mamba.mamba_ping_pong_track_buffer = None
+                    req.mamba.mamba_next_track_idx = None
+                req.mamba.mamba_last_track_seqlen = None
             return
 
         auxiliary_value_exists = (
@@ -381,10 +389,11 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             self.cache.req_to_token_pool.free_auxiliary_state_cache(req)
         else:
             # The radix tree now owns the live auxiliary-state slot.
-            track_buffer = req.mamba.mamba_ping_pong_track_buffer
+            track_buffer = (
+                req.mamba.mamba_ping_pong_track_buffer
+                if req.mamba is not None
+                else None
+            )
             if track_buffer is not None:
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
-                req.mamba.mamba_ping_pong_track_buffer = None
-                req.mamba.mamba_next_track_idx = None
-            req.mamba.mamba_pool_idx = None
-        req.mamba.mamba_last_track_seqlen = None
+            req.mamba = None

@@ -688,7 +688,7 @@ class ReqKvInfo:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqMambaInfo:
-    mamba_pool_idx: Optional[torch.Tensor]  # shape (1)
+    mamba_pool_idx: torch.Tensor  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor]  # shape (2)
     mamba_next_track_idx: Optional[int]  # 0 or 1
     mamba_last_track_seqlen: Optional[int]  # seq len of the last cached mamba state
@@ -810,13 +810,7 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
-        self.mamba: ReqMambaInfo = ReqMambaInfo(
-            mamba_pool_idx=None,
-            mamba_ping_pong_track_buffer=None,
-            mamba_next_track_idx=None,
-            mamba_last_track_seqlen=None,
-            mamba_branching_seqlen=None,
-        )
+        self.mamba: Optional[ReqMambaInfo] = None
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1185,7 +1179,6 @@ class Req(ReqDllmMixin):
                 self.host_hit_length,
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
-                self.mamba.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1194,8 +1187,12 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
-                match_result.mamba_branching_seqlen,
             )
+            if (
+                match_result.mamba_branching_seqlen is not None
+                and self.mamba is not None
+            ):
+                self.mamba.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is not None:
                 self.cache.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1458,11 +1455,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
-        self.mamba.mamba_pool_idx = None
-        self.mamba.mamba_ping_pong_track_buffer = None
-        self.mamba.mamba_next_track_idx = None
-        self.mamba.mamba_last_track_seqlen = None
-        self.mamba.mamba_branching_seqlen = None
+        assert self.mamba is None, "expect it is already released"
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
@@ -1487,7 +1480,8 @@ class Req(ReqDllmMixin):
         ]
         # Copies over both the kv cache and mamba state if available
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
-            token_indices, mamba_indices=self.mamba.mamba_pool_idx
+            token_indices,
+            mamba_indices=self.mamba.mamba_pool_idx if self.mamba is not None else None,
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1496,7 +1490,9 @@ class Req(ReqDllmMixin):
         ]
         # Loads both the kv cache and mamba state if exists
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba.mamba_pool_idx
+            self.kv_cache_cpu,
+            token_indices,
+            mamba_indices=self.mamba.mamba_pool_idx if self.mamba is not None else None,
         )
         del self.kv_cache_cpu
 
@@ -2253,7 +2249,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         # Collect mamba init info for deferred ops on forward stream
-        if any(req.mamba.mamba_pool_idx is not None for req in reqs):
+        if any(req.mamba is not None for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
 
         if self.model_config.is_encoder_decoder:
