@@ -3,6 +3,7 @@ Adds bootstrap fields to each request, fans it out to the prefill and decode
 servers, and returns the decode response.
 Usage: python3 standalone_lb.py --prefill URL BOOTSTRAP_PORT --decode URL --host H --port P
 """
+
 import argparse
 import asyncio
 import random
@@ -17,7 +18,9 @@ CHUNK = 1024 * 64
 
 
 class LB:
-    def __init__(self, prefill_url, bootstrap_port, decode_url, host, port, timeout=3600):
+    def __init__(
+        self, prefill_url, bootstrap_port, decode_url, host, port, timeout=3600
+    ):
         self.prefill_url = prefill_url
         self.bootstrap_port = bootstrap_port
         self.decode_url = decode_url
@@ -117,7 +120,9 @@ async def comp(request_data: dict):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prefill", nargs=2, metavar=("URL", "BOOTSTRAP_PORT"), required=True)
+    ap.add_argument(
+        "--prefill", nargs=2, metavar=("URL", "BOOTSTRAP_PORT"), required=True
+    )
     ap.add_argument("--decode", required=True)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
