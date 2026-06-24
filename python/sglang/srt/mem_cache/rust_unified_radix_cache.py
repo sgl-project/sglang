@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.rust_unified_cache_components import build_components
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -50,6 +51,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_INIT_NODE_CAPACITY = 1024
+
+_FULL = int(ComponentType.Full)
+_SWA = int(ComponentType.Swa)
+_MAMBA = int(ComponentType.Mamba)
 
 
 class RustUnifiedRadixCache(BasePrefixCache):
@@ -94,6 +99,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
         # Shared empty tensor for fast return; must not be mutated.
         self._empty_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        # Pool-side per-component handlers; dispatch to these instead of
+        # branching per component inline.
+        self.components = build_components(self)
+        self._action_dispatch = {
+            tag: comp
+            for comp in self.components.values()
+            for tag in comp.insert_action_tags
+        }
 
     def _reject_unsupported(self, params: CacheInitParams, server_args: Any) -> None:
         if params.eviction_policy.lower() != "lru":
@@ -231,41 +244,18 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
 
     def _process_insert_actions(self, deferred_actions: list[tuple]) -> None:
-        """Apply the insert-path emitted actions."""
+        """Route each insert-path action to its component, then commit."""
         if not deferred_actions or self.token_to_kv_pool_allocator is None:
             return
-
-        swa_node_indices: list[int] = []
-        swa_values: list[torch.Tensor] = []
         for action in deferred_actions:
-            tag = action[0]
-            if tag == "FullFree":
-                _, full_to_free = action
-                self.token_to_kv_pool_allocator.free(full_to_free)
-            elif tag == "SwaRecover":
-                _, node_idx, old_full_to_free, new_full_value = action
-                self.token_to_kv_pool_allocator.free(old_full_to_free)
-                swa_node_indices.append(node_idx)
-                swa_values.append(
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        new_full_value
-                    )
-                )
-            elif tag == "SwaStamp":
-                _, node_idx, full_value = action
-                swa_node_indices.append(node_idx)
-                swa_values.append(
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        full_value
-                    )
-                )
-            else:
+            comp = self._action_dispatch.get(action[0])
+            if comp is None:
                 raise RadixCacheRuntimePyError(
-                    f"_process_insert_actions: unsupported insert action {tag!r}"
+                    f"_process_insert_actions: unsupported insert action {action[0]!r}"
                 )
-
-        if swa_node_indices:
-            self._rust_radix.apply_swa_writes(swa_node_indices, swa_values)
+            comp.stage_insert_action(action)
+        for comp in self.components.values():
+            comp.commit_insert_actions()
 
     def evict(self, params: EvictParams) -> EvictResult:
         if params.mamba_num != 0 and not self.supports_mamba():
@@ -287,23 +277,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         result = self._rust_radix.evict([full_budget, swa_budget, mamba_budget])
 
-        full_idx = int(ComponentType.Full)
-        swa_idx = int(ComponentType.Swa)
-        mamba_idx = int(ComponentType.Mamba)
-        if self.token_to_kv_pool_allocator is not None:
-            for freed in result.freed[full_idx]:
-                self.token_to_kv_pool_allocator.free(freed)
-            for freed in result.freed[swa_idx]:
-                self.token_to_kv_pool_allocator.free_swa(freed)
-        if self.supports_mamba():
-            for freed in result.freed[mamba_idx]:
-                self.req_to_token_pool.mamba_allocator.free(freed)
+        for idx, comp in self.components.items():
+            comp.free_evicted(result.freed[idx])
 
         self.update_eviction_metrics(sum(result.evicted), start_time)
         return EvictResult(
-            num_tokens_evicted=result.evicted[full_idx],
-            swa_num_tokens_evicted=result.evicted[swa_idx],
-            mamba_num_evicted=result.evicted[mamba_idx],
+            num_tokens_evicted=result.evicted[_FULL],
+            swa_num_tokens_evicted=result.evicted[_SWA],
+            mamba_num_evicted=result.evicted[_MAMBA],
         )
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -325,10 +306,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return DecLockRefResult()
 
     def evictable_size(self) -> int:
-        return self._rust_radix.evictable_token_size()
+        return self.components[_FULL].evictable_size()
 
     def protected_size(self) -> int:
-        return self._rust_radix.protected_token_size()
+        return self.components[_FULL].protected_size()
 
     def total_size(self):
         return self._rust_radix.total_size()
@@ -340,32 +321,24 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return self.protected_size()
 
     def swa_evictable_size(self) -> int:
-        if self.sliding_window_size is None:
-            return 0
-        return self._rust_radix.swa_evictable_token_size()
+        comp = self.components.get(_SWA)
+        return comp.evictable_size() if comp is not None else 0
 
     def swa_protected_size(self) -> int:
-        if self.sliding_window_size is None:
-            return 0
-        return self._rust_radix.swa_protected_token_size()
+        comp = self.components.get(_SWA)
+        return comp.protected_size() if comp is not None else 0
 
     def mamba_evictable_size(self) -> int:
-        return (
-            self._rust_radix.mamba_evictable_token_size()
-            if self.supports_mamba()
-            else 0
-        )
+        comp = self.components.get(_MAMBA)
+        return comp.evictable_size() if comp is not None else 0
 
     def mamba_protected_size(self) -> int:
-        return (
-            self._rust_radix.mamba_protected_token_size()
-            if self.supports_mamba()
-            else 0
-        )
+        comp = self.components.get(_MAMBA)
+        return comp.protected_size() if comp is not None else 0
 
     def mamba_total_size(self) -> int:
-        # Mamba's unit is slots, not tokens.
-        return self._rust_radix.mamba_total_size() if self.supports_mamba() else 0
+        comp = self.components.get(_MAMBA)
+        return comp.total_size() if comp is not None else 0
 
     def sanity_check(self) -> None:
         # TODO(Jialin): no-op stub — wire up a Rust-side LRU/tree consistency
@@ -373,10 +346,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return None
 
     def supports_swa(self) -> bool:
-        return self.sliding_window_size is not None
+        return _SWA in self.components
 
     def supports_mamba(self) -> bool:
-        return self.mamba_cache_chunk_size is not None
+        return _MAMBA in self.components
 
     # TODO(Jialin): expose Rust-side iteration; leak-diagnostic only.
     def all_values_flatten(self) -> torch.Tensor:
