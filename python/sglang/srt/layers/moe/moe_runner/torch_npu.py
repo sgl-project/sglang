@@ -94,22 +94,25 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
         else:
             # Non‑DeepEP (torch_npu) path
+            # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                self.activation = NPUSwigluQuant()
-            elif getattr(config, 'use_tp_all_gather_activation', False):
-                self.activation = NPUSwigluAllGather()
+                inner = NPUSwigluQuant()
             else:
                 if config.activation == "npu_swiglu_oai":
-                    self.activation = NPUSwigluOAI(layer=config.layer)
+                    inner = NPUSwigluOAI(layer=config.layer)
                 elif config.activation == "silu":
                     if config.gemm1_clamp_limit is not None:
-                        self.activation = NPUSwigluStepAndMul(
-                            clamp_limit=config.gemm1_clamp_limit
-                        )
+                        inner = NPUSwigluStepAndMul(clamp_limit=config.gemm1_clamp_limit)
                     else:
-                        self.activation = NPUSwiglu()
+                        inner = NPUSwiglu()
                 else:
-                    self.activation = NPUGeluAndMul()
+                    inner = NPUGeluAndMul()
+
+            # 2. If the quant method (GGUF) needs TP all‑gather, wrap the activation
+            if getattr(config.layer, '_needs_tp_all_gather_activation', False):
+                self.activation = AllGatherWrapper(inner, dim=-1)
+            else:
+                self.activation = inner
 
     def run(
         self,
