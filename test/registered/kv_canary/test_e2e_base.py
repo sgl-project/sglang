@@ -8,7 +8,7 @@ from sglang.test.kv_canary.e2e_base import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-b-test-cpu")
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestCanaryE2EBase(CustomTestCase):

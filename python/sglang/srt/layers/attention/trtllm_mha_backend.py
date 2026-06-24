@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -247,6 +248,56 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if is_swa:
                 return swa_pt
         return self.forward_metadata.page_table
+
+    @staticmethod
+    def _get_scalar_scale(
+        layer: RadixAttention,
+        float_attr: str,
+        scale_attr: str,
+    ) -> float:
+        scale = getattr(layer, float_attr, None)
+        if scale is None:
+            scale = getattr(layer, scale_attr, None)
+        if scale is None:
+            return 1.0
+        if isinstance(scale, torch.Tensor):
+            logger.warning_once(
+                "Ignoring tensor %s for TRT-LLM MHA FP8 KV cache scale. "
+                "Expected %s to be populated with a Python scalar.",
+                scale_attr,
+                float_attr,
+            )
+            return 1.0
+        scale = float(scale)
+        return scale if scale > 0.0 else 1.0
+
+    def _get_bmm_scales(
+        self, layer: RadixAttention, q_scale: float | torch.Tensor = 1.0
+    ) -> tuple[float | torch.Tensor, float]:
+        """Return FlashInfer TRT-LLM MHA BMM scales.
+
+        The FP8 paths store Q/K/V as values divided by their per-tensor scales.
+        FlashInfer applies bmm1_scale to QK and bmm2_scale to PV, so FP8 reads
+        need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
+        entries are already in model dtype.
+        """
+        if self.data_type != torch.float8_e4m3fn:
+            return layer.scaling, 1.0
+
+        k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
+        v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
+        return q_scale * k_scale * layer.scaling, v_scale
+
+    def _maybe_quantize_q(
+        self, q: torch.Tensor, *, force_fp8: bool = False
+    ) -> tuple[torch.Tensor, float | torch.Tensor]:
+        if self.data_type != torch.float8_e4m3fn:
+            return q, 1.0
+        if self.is_xqa_impl and not force_fp8:
+            return q, 1.0
+
+        q_2d, q_scale = scaled_fp8_quant(q.reshape(-1, q.shape[-1]).contiguous(), None)
+        return q_2d.reshape(q.shape), q_scale
 
     def init_cuda_graph_state(
         self,
@@ -736,9 +787,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        # For XQA, q_dtype should be bf16
-        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
-            q = q.to(torch.float8_e4m3fn)
+        # For XQA, q_dtype should be bf16. TRT-LLM-GEN uses FP8 Q; dynamically
+        # quantize it and pass the descale into BMM1 instead of unscaled casting.
+        q, q_scale = self._maybe_quantize_q(q)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -757,15 +808,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -827,8 +870,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
+        q, q_scale = self._maybe_quantize_q(
+            q, force_fp8=not forward_batch.forward_mode.is_target_verify()
+        )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -848,15 +892,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 

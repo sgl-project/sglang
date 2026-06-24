@@ -46,6 +46,9 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -158,7 +161,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if self._pool is None:
-                    self._pool = self._device_module.graph_pool_handle()
+                    self._pool = get_or_create_global_graph_memory_pool(
+                        self._device_module
+                    )
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(

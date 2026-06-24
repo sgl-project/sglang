@@ -124,7 +124,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    ProfileReqInput,
+    ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1024,23 +1024,9 @@ async def hicache_storage_backend_status():
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Optional[ProfileReq] = None):
     """Start profiling."""
-    if obj is None:
-        obj = ProfileReqInput()
-
-    await _global_state.tokenizer_manager.start_profile(
-        output_dir=obj.output_dir,
-        start_step=obj.start_step,
-        num_steps=obj.num_steps,
-        activities=obj.activities,
-        with_stack=obj.with_stack,
-        record_shapes=obj.record_shapes,
-        profile_by_stage=obj.profile_by_stage,
-        merge_profiles=obj.merge_profiles,
-        profile_prefix=obj.profile_prefix,
-        profile_stages=obj.profile_stages,
-    )
+    await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
     return Response(
         content="Start profiling.\n",
         status_code=200,
