@@ -179,23 +179,13 @@ def run_flashinfer_megamoe(
 
     mega = layer.flashinfer_megamoe_layer
     _ensure_shared_workspace(mega)
-    num_tokens = x.shape[0]
 
-    hidden = x.to(torch.bfloat16)
-    ids = topk_ids.to(torch.int64)
-    weights = topk_weights.to(torch.float32)
-
-    if num_tokens == 0:
-        # The mega kernel is collective (symm-buffer all-to-all), so every rank
-        # must launch it even with no local tokens. Pad one dummy token (routed
-        # to expert 0) and drop it from the output to keep ranks in lockstep.
-        hidden = x.new_zeros((1, layer.hidden_size), dtype=torch.bfloat16)
-        ids = ids.new_zeros((1, layer.top_k))
-        weights = weights.new_zeros((1, layer.top_k))
-
-    y = mega.forward(
-        MoEEpTensors(hidden_states=hidden, topk_ids=ids, topk_weights=weights)
+    t = MoEEpTensors(
+        hidden_states=x.to(torch.bfloat16),
+        topk_ids=topk_ids.to(torch.int64),
+        topk_weights=topk_weights.to(torch.float32),
     )
+    y = mega.forward(t)
 
     # The kernel's combine applies topk_weights but not routed_scaling_factor.
     # When it isn't fused into topk upstream (HashTopK layers can't fuse it),
@@ -204,8 +194,5 @@ def run_flashinfer_megamoe(
         rsf = layer.moe_runner_config.routed_scaling_factor
         if rsf is not None and rsf != 1.0:
             y.mul_(rsf)
-
-    if num_tokens == 0:
-        y = y[:0]
 
     return StandardCombineInput(hidden_states=y)
