@@ -298,6 +298,13 @@ sleep 5
 ( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
   echo $? > "$WORKDIR/bench_exit" ) &
 BENCH_BG=$!
+# Stream bench output live and poll the markers with xtrace OFF, so the console
+# shows clean benchmark/accuracy output instead of a compgen/sleep trace every
+# 10s. (Mirrors NVIDIA's launch_gb200.sh, which set +x around its log stream.)
+touch "$WORKDIR/bench.log"
+tail -n +1 -F "$WORKDIR/bench.log" 2>/dev/null &
+TAIL_PID=$!
+set +x
 RC=0
 while [[ ! -f "$WORKDIR/bench_exit" ]]; do
   if compgen -G "$WORKDIR/server_exit_*" > /dev/null; then
@@ -309,6 +316,8 @@ while [[ ! -f "$WORKDIR/bench_exit" ]]; do
   fi
   sleep 10
 done
+set -x
+kill "$TAIL_PID" 2>/dev/null || true
 [[ "$RC" -eq 0 ]] && RC=$(cat "$WORKDIR/bench_exit" 2>/dev/null || echo 1)
 echo "[drive] bench finished (rc=$RC), tearing down"
 for n in "${PNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
@@ -335,14 +344,14 @@ salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_
 SALLOC_RC=$?
 set -e
 
-echo "--- bench.log tail ---"; tail -40 "$WORKDIR/bench.log" || true
-
-# drive.sh exits non-zero when a server died or bench failed. Surface the server
-# logs (the actual root cause). We still fall through to normalize whatever raw
-# results the completed concurrencies produced -- partial perf data is worth
-# uploading -- and propagate the failure via the exit code at the end.
+# bench output already streamed live from drive.sh (tail -F). drive.sh exits
+# non-zero when a server died or bench failed; on failure dump bench.log + the
+# server logs (the actual root cause). We still fall through to normalize
+# whatever raw results the completed concurrencies produced -- partial perf data
+# is worth uploading -- and propagate the failure via the exit code at the end.
 if [[ "$SALLOC_RC" -ne 0 ]]; then
-    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); prefill/decode logs:" >&2
+    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + server logs:" >&2
+    echo "--- bench.log (tail) ---"; tail -40 "$WORKDIR/bench.log" 2>/dev/null || true
     for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
         [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
     done
