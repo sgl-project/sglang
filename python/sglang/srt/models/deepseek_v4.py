@@ -219,7 +219,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def _is_bcg_prefill(forward_batch: "ForwardBatch") -> bool:
+def _is_bcg_prefill(forward_batch: ForwardBatch) -> bool:
     return forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
 
 
