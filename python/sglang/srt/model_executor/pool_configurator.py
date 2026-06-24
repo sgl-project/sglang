@@ -205,11 +205,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
-            # MiniMax sparse layout (mirrors MiniMaxSparseKVPool):
-            #   main pool   : K+V for every layer (dense + sparse), kv_cache_dtype.
-            #   indexer pool: sparse layers only, single-head, model dtype.
-            #     - "kv" sparse layers store both K and V in the indexer.
-            #     - "k-only" sparse layers store only K (V is never read).
+            # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
+            # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
             sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
             dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
             indexer_k_only_layer_ids = set(

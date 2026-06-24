@@ -1104,22 +1104,12 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
-        # KV cache memory layout.
-        # - NHD (default): [num_pages, page_size, head_num, head_dim] (slot-major,
-        #   i.e. buffer shape [size, head_num, head_dim]).
-        # - HND (SGLANG_USE_HND_KVCACHE): [num_pages, head_num, page_size, head_dim],
-        #   which paged backends (trtllm_mha) consume directly and which lets a
-        #   (page, head) pair be folded into one paged index for per-kv-head sparse
-        #   page tables.
-        # - vectorized_5d (ROCm AITER, SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d):
-        #   SHUFFLE 5D physical layout for K/V consumed natively by aiter
-        #   `mha_batch_prefill_func` (prefill) and `pa_decode_gluon` (decode):
-        #     K shape: (num_blocks, H, D_k // X, page, X)
-        #     V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes
-        #   Only meaningful on the AITER backend (HIP + SGLANG_USE_AITER=1); the env
-        #   var is ignored elsewhere since no consumer kernel exists for SHUFFLE 5D.
-        # HND (NVIDIA sparse path) and vectorized_5d (ROCm AITER) are mutually
-        # exclusive; HND takes precedence if both are somehow requested.
+        # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
+        # HND folds (page, head) into one paged index for per-kv-head sparse page tables
+        # (paged backends like trtllm_mha consume directly). vectorized_5d SHUFFLE 5D:
+        #   K: (num_blocks, H, D_k // X, page, X)  V: (num_blocks, H, page // X, D_v, X),
+        #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
+        # HND and vectorized_5d are mutually exclusive; HND takes precedence.
         self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
         if self.use_hnd:
             total_slots = self.size + self.page_size
@@ -1140,10 +1130,8 @@ class MHATokenToKVPool(KVCache):
                     )
                 self.kv_cache_layout = layout
                 if layout == "vectorized_5d":
-                    # X is the inner vectorization width in the SHUFFLE layout,
-                    # determined by the STORAGE dtype (not the compute dtype) since
-                    # it controls how many elements fit in 16 bytes of the on-pool
-                    # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
+                    # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
+                    # dtype) since it tiles the 16-byte on-pool vector.
                     self._kv_vector_x = 16 // self.store_dtype.itemsize
                     assert (self.size + self.page_size) % self.page_size == 0
                     assert self.page_size % self._kv_vector_x == 0, (
@@ -1236,10 +1224,7 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # NHD (default): [size, head_num, head_dim] = [num_pages, page_size,
-                # head_num, head_dim]. HND: [num_pages, head_num, page_size, head_dim].
-                # vectorized_5d (ROCm AITER): SHUFFLE 5D K/V. The padded page (slot 0's
-                # page) absorbs dummy padded-token writes in every layout.
+                # The padded page (slot 0's page) absorbs dummy padded-token writes.
                 if self.use_hnd:
                     k_shape = (
                         self.num_pages,
@@ -1507,8 +1492,7 @@ class MHATokenToKVPool(KVCache):
             return
 
         if self.use_hnd:
-            # HND buffer [num_pages, head_num, page_size, head_dim]: a slot is at
-            # [page, :, off, :], not a contiguous row, so scatter by (page, off).
+            # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
             pages = loc // self.page_size
@@ -2890,13 +2874,8 @@ def masked_set_kv_buffer_kernel(
 
 
 class MHATokenToKOnlyPool(KVCache):
-    """K-only variant of MHATokenToKVPool.
-
-    Used by MiniMax sparse layers whose index branch never reads V (the
-    ``sparse_disable_index_value`` flag), so allocating V would just waste
-    memory. Exposes the ``k_buffer`` list at the same shape as the K side of
-    MHATokenToKVPool, plus ``get_key_buffer`` and accounting hooks.
-    """
+    """K-only pool for MiniMax sparse layers whose index branch never reads V
+    (``sparse_disable_index_value``); allocating V would waste memory."""
 
     def __init__(
         self,
@@ -3014,9 +2993,8 @@ class MiniMaxSparseKVPool(KVCache):
 
         index_dtype = index_dtype if index_dtype is not None else dtype
 
-        # Split sparse layers by V allocation policy:
-        #   * kv_sparse: ``index_kv_pool`` allocates both K and V
-        #   * k_only_sparse: ``index_k_pool`` allocates only K (V is never read)
+        # Split sparse layers by V policy: kv_sparse (index_kv_pool holds K+V) vs
+        # k_only_sparse (index_k_pool holds only K; V is never read).
         disable_set = set(disable_value_sparse_layer_ids or [])
         local_kv_sparse_layer_ids = [
             g for g in local_sparse_layer_ids if g not in disable_set
@@ -3213,9 +3191,8 @@ class MiniMaxSparseKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_idx_k: torch.Tensor,
     ) -> bool:
-        """Fast-path precondition: CUDA, no per-store quantization, and a single
-        head byte size shared by the main and index caches (see
-        ``set_fused_kv_index_buffer``)."""
+        """Fast-path precondition: CUDA, no per-store quantization, and a uniform
+        head byte size shared by main and index caches."""
         main = self.main_pool
         return (
             envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
@@ -3242,13 +3219,8 @@ class MiniMaxSparseKVPool(KVCache):
         cache_idx_k: torch.Tensor,
         cache_idx_v: Optional[torch.Tensor],
     ) -> None:
-        """Store main K/V + index K (+ optional index V) for a sparse layer.
-
-        When enabled and applicable, writes all caches in one fused JIT launch;
-        otherwise falls back to the separate ``set_kv_buffer`` /
-        ``set_index_k_buffer`` / ``set_index_kv_buffer`` calls. ``cache_idx_v``
-        is None for value-disabled (block-selector) layers.
-        """
+        """Store main K/V + index K (+ optional index V) for a sparse layer in
+        one fused JIT launch, falling back to separate stores when not applicable."""
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
@@ -3310,13 +3282,8 @@ class MiniMaxSparseKVPool(KVCache):
         return self.main_pool.maybe_get_custom_mem_pool()
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # TODO: enable speculative decoding by passing
-        # `enable_kv_cache_copy=True` to BOTH sub-pools at construction time
-        # (so each pool allocates its move-kernel workspace) and then making
-        # this delegate to `main_pool.move_kv_cache` + `index_pool.move_kv_cache`.
-        # Currently the sub-pools are constructed without that flag, so calling
-        # the delegated move would fail; raise explicitly to surface the gap
-        # the moment any spec-decode path tries to use this pool.
+        # TODO: spec-decode needs sub-pools built with enable_kv_cache_copy=True,
+        # then delegate to main_pool/index_pool.move_kv_cache.
         raise NotImplementedError(
             "move_kv_cache is not yet supported for MiniMaxSparseKVPool: "
             "sub-pools must be built with enable_kv_cache_copy=True first."

@@ -30,10 +30,8 @@ def _cuda_major() -> int:
         return 0
 
 
-# direct+page_first_direct host transfer routes to the AOT
-# transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which returns
-# cudaErrorInvalidValue on CUDA 13 and throws instead of falling back. M3 sparse
-# production uses io_backend="kernel" + layer_first, not this combo.
+# direct+page_first_direct routes to transfer_kv_all_layer_direct_lf_pf, which on
+# CUDA 13 throws (cudaErrorInvalidValue) instead of falling back. M3 uses kernel+layer_first.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 
@@ -316,10 +314,8 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             page_size,
             device="cuda" if io_backend == "kernel" else "cpu",
         )
-        # page_first kernel routes the main-KV backup through the staged
-        # write-back kernel (staged_write_back.cuh), whose verifier requires
-        # dst_indices on CPU/CUDAHost; the index-k backup (hicache.cuh)
-        # requires CUDA indices. Feed a CPU copy to the main-KV call only.
+        # page_first main-KV backup (staged_write_back.cuh) needs CPU dst_indices,
+        # index-k backup (hicache.cuh) needs CUDA indices — feed a CPU copy to main only.
         kv_host_indices = (
             host_indices.cpu()
             if (io_backend, layout) == ("kernel", "page_first")
