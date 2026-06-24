@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,11 +12,6 @@ if TYPE_CHECKING:
 
 _HIDDEN = 3072
 _ALIGN = 32
-_DISABLED = os.environ.get("SGLANG_NSS_NATIVE_DISABLE", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
 
 
 def _aligned(t: torch.Tensor) -> bool:
@@ -88,7 +82,7 @@ _module = _jit_norm_scale_shift_module
 
 
 def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
-    if _DISABLED or norm_type != "layer" or weight is not None or bias is not None:
+    if norm_type != "layer" or weight is not None or bias is not None:
         return None
     if not _qwen_activation(x) or not _blackwell_or_newer(x.device):
         return None
@@ -108,7 +102,7 @@ def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
 def try_fused_scale_residual_norm_scale_shift(
     residual, x, gate, weight, bias, scale, shift, norm_type, eps
 ):
-    if _DISABLED or norm_type != "layer" or weight is not None or bias is not None:
+    if norm_type != "layer" or weight is not None or bias is not None:
         return None
     if not (
         _qwen_activation(x)
