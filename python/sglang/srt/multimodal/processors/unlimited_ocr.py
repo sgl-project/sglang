@@ -17,11 +17,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 # image_mode -> (base_size, image_size, crop_mode)
 _IMAGE_MODE_PRESETS = {
-    "tiny":   (512,  512,  False),
-    "small":  (640,  640,  False),
-    "base":   (1024, 1024, False),
-    "large":  (1280, 1280, False),
-    "gundam": (1024, 640,  True),
+    "tiny": (512, 512, False),
+    "small": (640, 640, False),
+    "base": (1024, 1024, False),
+    "large": (1280, 1280, False),
+    "gundam": (1024, 640, True),
 }
 _DEFAULT_MODE = "gundam"
 
@@ -34,7 +34,9 @@ def _resolve_mode(images_config, num_images: int = 1) -> dict:
     key = mode.strip().lower()
     preset = _IMAGE_MODE_PRESETS.get(key)
     if preset is None:
-        logger.error(f"Unknown image_mode '{mode}'. Supported: {', '.join(_IMAGE_MODE_PRESETS)}")
+        logger.error(
+            f"Unknown image_mode '{mode}'. Supported: {', '.join(_IMAGE_MODE_PRESETS)}"
+        )
         raise ValueError(
             f"Unknown image_mode '{mode}'. "
             f"Supported: {', '.join(_IMAGE_MODE_PRESETS)}"
@@ -87,7 +89,9 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
     ):
         """Process multimodal data asynchronously."""
         request_obj = kwargs.get("request_obj")
-        images_config = getattr(request_obj, "images_config", None) if request_obj else None
+        images_config = (
+            getattr(request_obj, "images_config", None) if request_obj else None
+        )
         processor_kwargs = _resolve_mode(images_config, num_images=len(image_data))
 
         # Extract prefix from images_config (tokenized separately to avoid merge)
@@ -107,7 +111,9 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
         if prefix:
             prefix_ids = self._tokenizer.encode(prefix, add_special_tokens=False)
             prefix_token_count = len(prefix_ids)
-            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
+            input_ids = torch.cat(
+                [input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)]
+            )
 
         self._mix_config_into_hash(mm_items, processor_kwargs)
 

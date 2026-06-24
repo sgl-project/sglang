@@ -1,7 +1,7 @@
 """Standalone UNLIMITED-OCR configuration and HF processor."""
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from PIL import Image, ImageOps
@@ -13,7 +13,6 @@ from transformers import (
 )
 
 from sglang.srt.configs.deepseek_ocr import (
-    DictOutput,
     ImageTransform,
     MlpProjectorConfig,
     VisionEncoderConfig,
@@ -138,9 +137,15 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
 
         super().__init__(tokenizer, **kwargs)
 
-    def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1,
-                           base_size: int = None, image_size: int = None,
-                           crop_mode: bool = None):
+    def format_messages_v2(
+        self,
+        messages: str,
+        pil_images,
+        max_req_input_len=-1,
+        base_size: int = None,
+        image_size: int = None,
+        crop_mode: bool = None,
+    ):
         """Tokenize messages with embedded images and return processed tensors."""
         base_size = base_size or self.base_size
         image_size = image_size or self.image_size
@@ -241,9 +246,14 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             images_seq_mask,
             images_spatial_crop,
             images_crop,
-        ) = self.format_messages_v2(prompt, images, max_req_input_len,
-                                    base_size=base_size, image_size=image_size,
-                                    crop_mode=crop_mode)
+        ) = self.format_messages_v2(
+            prompt,
+            images,
+            max_req_input_len,
+            base_size=base_size,
+            image_size=image_size,
+            crop_mode=crop_mode,
+        )
 
         target_ids = torch.LongTensor(masked_tokenized_str)
 
@@ -251,8 +261,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         has_local_crops = []
         if len(images_spatial_crop) > 0:
             has_local_crops = [
-                (crop[0] > 1 or crop[1] > 1).item()
-                for crop in images_spatial_crop
+                (crop[0] > 1 or crop[1] > 1).item() for crop in images_spatial_crop
             ]
 
         if len(images_list) == 0:
@@ -354,7 +363,9 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
                 crop_ratio = [1, 1]
             else:
                 if cropping:
-                    images_crop_raw, crop_ratio = dynamic_preprocess(image, image_size=image_size)
+                    images_crop_raw, crop_ratio = dynamic_preprocess(
+                        image, image_size=image_size
+                    )
                 else:
                     crop_ratio = [1, 1]
 
@@ -449,9 +460,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         if len(images_list) == 0:
             pixel_values = torch.zeros((1, 3, base_size, base_size))
             images_spatial_crop = torch.zeros((1, 1), dtype=torch.long)
-            images_crop = torch.zeros(
-                (1, 3, image_size, image_size)
-            ).unsqueeze(0)
+            images_crop = torch.zeros((1, 3, image_size, image_size)).unsqueeze(0)
         else:
             pixel_values = torch.stack(images_list, dim=0)
             images_spatial_crop = torch.tensor(images_spatial_crop, dtype=torch.long)
@@ -477,6 +486,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
 # ---------------------------------------------------------------------------
 # Config classes
 # ---------------------------------------------------------------------------
+
 
 class UnlimitedLanguageConfig(PretrainedConfig):
     """Configuration for the UNLIMITED language model backbone."""

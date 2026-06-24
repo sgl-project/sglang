@@ -41,7 +41,6 @@ from sglang.jit_kernel.flash_attention import (
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
-
 # ---------------------------------------------------------------------------
 # Prefill-aware SWA: triton kernel to build a decode page_table that holds only
 # the protected prefill tokens [0, prefill_len) plus the sliding decode window
@@ -1641,10 +1640,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Prefill-aware SWA: the page_table already encodes only the
                 # protected prefill tokens + the sliding decode window, so use it
                 # directly and disable FA's own sliding-window truncation.
-                if (
-                    self.is_prefill_aware_swa
-                    and metadata.pa_swa_page_table is not None
-                ):
+                if self.is_prefill_aware_swa and metadata.pa_swa_page_table is not None:
                     page_table = metadata.pa_swa_page_table
                     cache_seqlens = metadata.pa_swa_cache_seqlens
                     window_size = (-1, -1)

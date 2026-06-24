@@ -120,9 +120,7 @@ class PureSWARadixCache(RadixCache):
 
         # Page-align evict_floor upward
         if self.page_size > 1 and swa_evict_floor > 0:
-            swa_evict_floor = (
-                -(-swa_evict_floor // self.page_size) * self.page_size
-            )
+            swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size
 
         # Memory layout at request completion:
         #   [0, old_prefix_len)                    — already in tree (protected)
@@ -156,9 +154,7 @@ class PureSWARadixCache(RadixCache):
             # [swa_evicted_seqlen, key_len) — window range, still alive, not cached
             alive_start = max(swa_evicted_seqlen, insert_end)
             if alive_start < key_len:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[alive_start:key_len]
-                )
+                self.token_to_kv_pool_allocator.free(kv_indices[alive_start:key_len])
         else:
             # No insert: free all alive tokens that weren't freed by _evict_swa
             # [old_prefix_len, swa_evict_floor) — alive, never freed
@@ -170,9 +166,7 @@ class PureSWARadixCache(RadixCache):
             # [swa_evicted_seqlen, key_len) — alive window tokens
             alive_start = max(swa_evicted_seqlen, old_prefix_len)
             if swa_evicted_seqlen > 0 and alive_start < key_len:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[alive_start:key_len]
-                )
+                self.token_to_kv_pool_allocator.free(kv_indices[alive_start:key_len])
 
         # Free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])

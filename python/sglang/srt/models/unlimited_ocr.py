@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # Main model class
 # ---------------------------------------------------------------------------
 
+
 class UnlimitedOCRForCausalLM(nn.Module):
     """Standalone UNLIMITED OCR model (OCR1: SAM + CLIP ViT) with prefill-aware SWA.
 
@@ -289,10 +290,17 @@ class UnlimitedOCRForCausalLM(nn.Module):
             .type(torch.long)
             .to(device=pixel_values.device)
         )
-        pixel_values = pixel_values.view(pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:])
-        images_crop = images_crop.view(images_crop.shape[0] * images_crop.shape[1], 1, *images_crop.shape[2:])
-        images_spatial_crop = images_spatial_crop.view(images_spatial_crop.shape[0] * images_spatial_crop.shape[1],
-            1, *images_spatial_crop.shape[2:])
+        pixel_values = pixel_values.view(
+            pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:]
+        )
+        images_crop = images_crop.view(
+            images_crop.shape[0] * images_crop.shape[1], 1, *images_crop.shape[2:]
+        )
+        images_spatial_crop = images_spatial_crop.view(
+            images_spatial_crop.shape[0] * images_spatial_crop.shape[1],
+            1,
+            *images_spatial_crop.shape[2:],
+        )
 
         assert images_crop.dim() == 6
         assert images_spatial_crop.dim() == 3
@@ -389,7 +397,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                     or "sam_model" in name
                     or "view_seperator" in name
                 ):
-                    name = name[len("model."):]
+                    name = name[len("model.") :]
                 elif not (
                     ".projector" in name
                     or "vision_model" in name
