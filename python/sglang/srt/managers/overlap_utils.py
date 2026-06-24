@@ -147,7 +147,6 @@ class FutureMap:
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
 
-        self.need_bonus_tokens = getattr(draft_input, "bonus_tokens", None) is not None
         self.need_topk = self.spec_algo.need_topk()
         self.need_hidden_states = (
             spec_need_hidden_states()
@@ -218,21 +217,19 @@ class FutureMap:
                 self.output_tokens_buf,
                 hidden_states_buf,
             )
-            if self.need_bonus_tokens:
-                draft_input.bonus_tokens = bonus_tokens
+            draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
-        elif self.need_bonus_tokens:
+        else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if _DEBUG_ASSERT:
-            if self.need_bonus_tokens:
-                _assert_nonneg_and_invalidate(
-                    draft_input.bonus_tokens, self.output_tokens_buf, indices
-                )
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
@@ -322,10 +319,9 @@ class FutureMap:
         draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
-        if self.need_bonus_tokens:
-            self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
-                self.output_tokens_buf.dtype
-            )
+        self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            self.output_tokens_buf.dtype
+        )
 
         if self.need_topk:
             self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
