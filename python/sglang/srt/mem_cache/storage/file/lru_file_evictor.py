@@ -28,24 +28,12 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Callable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
-
-
-def _sharded_path(file_path: str, filename: str) -> str:
-    """Resolve a ``.bin`` filename to its sharded path under ``file_path``.
-
-    Reuses ``HiCacheFile._shard_subdir`` rather than re-deriving the bucket so
-    the evictor's scan/unlink paths can never desynchronize from the paths the
-    backend writes to. (``HiCacheFile`` imports the evictor lazily inside its
-    ``__init__``, so this module-level import is not circular.)
-    """
-    return os.path.join(file_path, HiCacheFile._shard_subdir(filename), filename)
 
 
 def _parse_size_to_bytes(value: Any) -> int:
@@ -82,11 +70,18 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
+        shard_dir_fn: Callable[[str], str],
         extra_config: Optional[dict] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
+        # Maps a ``.bin`` filename to its relative hash-prefix shard subdir.
+        # Injected by HiCacheFile (its ``_shard_subdir``) so the evictor resolves
+        # the exact same on-disk paths the backend writes to, without importing
+        # the backend here -- HiCacheFile imports this evictor lazily, so a
+        # module-level back-import would be circular.
+        self._shard_dir_fn = shard_dir_fn
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -331,6 +326,15 @@ class LRUFileEvictor:
             self._lru[stem] = size
             self._total_bytes += size
 
+    def _sharded_path(self, filename: str) -> str:
+        """Resolve a ``.bin`` filename to its full sharded path under file_path.
+
+        Delegates the bucket layout to the backend-supplied ``shard_dir_fn`` so
+        the evictor's scan/unlink paths can never desynchronize from where the
+        backend writes.
+        """
+        return os.path.join(self.file_path, self._shard_dir_fn(filename), filename)
+
     def _rmdir_empty_shard(self, tensor_path: str) -> None:
         """Remove now-empty hash-prefix subdirs after unlinking a victim.
 
@@ -370,7 +374,7 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = _sharded_path(self.file_path, f"{evict_stem}.bin")
+        tensor_path = self._sharded_path(f"{evict_stem}.bin")
         try:
             os.remove(tensor_path)
             freed = evict_size

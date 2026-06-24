@@ -350,16 +350,20 @@ class HiCacheFile(HiCacheStorage):
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # All LRU / size accounting and disk eviction lives in the evictor so
-        # this backend stays a thin raw-bytes store. Imported lazily because
-        # lru_file_evictor imports HiCacheFile at module level for the shared
-        # shard-path helper; a top-level import here would be circular.
+        # this backend stays a thin raw-bytes store. Imported lazily: the storage
+        # package __init__ pulls in the backend factory, which imports this
+        # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        # The evictor unlinks pages and so must resolve the same sharded paths
+        # the backend writes to. Inject the bucket helper rather than have the
+        # evictor import this module back (which would be circular).
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
+            shard_dir_fn=self._shard_subdir,
             extra_config=storage_config.extra_config,
         )
 
@@ -375,7 +379,7 @@ class HiCacheFile(HiCacheStorage):
         ``O(total_files)`` scandir into ``O(keys)`` stats. The bucket is derived
         purely from the leading hex of the filename (the content-hash prefix),
         so get/set/exists and the evictor all resolve the same path -- the
-        evictor imports this exact helper to stay in sync.
+        evictor receives this exact helper (as ``shard_dir_fn``) to stay in sync.
         """
         # First 4 hex chars give 256x256 buckets; short/atypical names fall
         # back to a single flat bucket.
