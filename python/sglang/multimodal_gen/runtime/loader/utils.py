@@ -14,6 +14,9 @@ from typing import Any, Dict, Type
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.loader.checkpoint_name_resolver import (
+    CheckpointNameResolver,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -103,7 +106,13 @@ def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
     valid_target_names: set[str] | None = None,
-) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
+    return_resolver: bool = False,
+) -> (
+    tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]
+    | tuple[
+        dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]], CheckpointNameResolver
+    ]
+):
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
 
@@ -117,11 +126,11 @@ def hf_to_custom_state_dict(
     """
     custom_param_sd = {}
     to_merge_params = defaultdict(dict)  # type: ignore
-    reverse_param_names_mapping = {}
+    resolver = CheckpointNameResolver(param_names_mapping)
     if isinstance(hf_param_sd, dict):
         hf_param_sd = hf_param_sd.items()  # type: ignore
     for source_param_name, full_tensor in hf_param_sd:  # type: ignore
-        target_param_name, merge_index, num_params_to_merge = param_names_mapping(
+        target_param_name, merge_index, num_params_to_merge = resolver.map_source_param(
             source_param_name
         )
         if (
@@ -135,8 +144,9 @@ def hf_to_custom_state_dict(
             num_params_to_merge = None
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
-        reverse_param_names_mapping[target_param_name] = (
+        resolver.record_source_param(
             source_param_name,
+            target_param_name,
             merge_index,
             num_params_to_merge,
         )
@@ -172,7 +182,10 @@ def hf_to_custom_state_dict(
                     full_tensor.dtype,
                 )
         custom_param_sd[target_param_name] = full_tensor
-    return custom_param_sd, reverse_param_names_mapping
+    resolver.validate_complete_fused_params()
+    if return_resolver:
+        return custom_param_sd, resolver.reverse_param_names_mapping, resolver
+    return custom_param_sd, resolver.reverse_param_names_mapping
 
 
 class skip_init_modules:
