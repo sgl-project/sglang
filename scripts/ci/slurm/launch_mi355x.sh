@@ -46,24 +46,42 @@ fi
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
-read -r IMAGE ATTN IB PPORT DPORT PBOOT DBOOT LBPORT MEMFRAC PAGE MAXREQ CHUNK SWA PTP DTP CONCS NPF RRR <<EOF
-$(python3 - "$CONFIG_FILE" <<'PY'
+# Ensure PyYAML is available to the host python used for parsing.
+python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
+    || pip install --user pyyaml -q 2>/dev/null || true
+
+# Emit KEY=value lines and eval them (robust single-level command substitution;
+# avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
+RECIPE_VARS="$(python3 - "$CONFIG_FILE" <<'PY'
 import sys, yaml
 r = yaml.safe_load(open(sys.argv[1]))
 rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
-print(
-    rt["image"], rt["attention_backend"], rt["ib_devices"],
-    rt["prefill_port"], rt["decode_port"],
-    rt["prefill_bootstrap_port"], rt["decode_bootstrap_port"], rt["lb_port"],
-    rt["mem_fraction_static"], rt["page_size"], rt["max_running_requests"],
-    rt["chunked_prefill_size"], rt["swa_full_tokens_ratio"],
-    b["prefill"]["tensor-parallel-size"], b["decode"]["tensor-parallel-size"],
-    ",".join(str(c) for c in bn["concurrencies"]),
-    bn["num_prompts_factor"], bn["random_range_ratio"],
-)
+def emit(k, v): print(f"{k}={v}")
+emit("IMAGE", rt["image"])
+emit("ATTN", rt["attention_backend"])
+emit("IB", rt["ib_devices"])
+emit("PPORT", rt["prefill_port"])
+emit("DPORT", rt["decode_port"])
+emit("PBOOT", rt["prefill_bootstrap_port"])
+emit("DBOOT", rt["decode_bootstrap_port"])
+emit("LBPORT", rt["lb_port"])
+emit("MEMFRAC", rt["mem_fraction_static"])
+emit("PAGE", rt["page_size"])
+emit("MAXREQ", rt["max_running_requests"])
+emit("CHUNK", rt["chunked_prefill_size"])
+emit("SWA", rt["swa_full_tokens_ratio"])
+emit("PTP", b["prefill"]["tensor-parallel-size"])
+emit("DTP", b["decode"]["tensor-parallel-size"])
+emit("CONCS", ",".join(str(c) for c in bn["concurrencies"]))
+emit("NPF", bn["num_prompts_factor"])
+emit("RRR", bn["random_range_ratio"])
 PY
-)
-EOF
+)"
+if [[ -z "$RECIPE_VARS" ]]; then
+    echo "ERROR: failed to parse recipe $CONFIG_FILE (empty output from python3/yaml)" >&2
+    exit 1
+fi
+eval "$RECIPE_VARS"
 # Optional image override from workflow_dispatch input.
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
