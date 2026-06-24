@@ -518,7 +518,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         # Release the forked slot when the cache didn't consume it.
         if mamba_value_forked is not None and insert_result.mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+            self.req_to_token_pool.mamba_allocator.free(mamba_value_forked)
 
         # Re-read the canonical tree-owned indices; insert may have de-duplicated.
         # With SWA a rematch can return fewer indices than atom_len.
@@ -587,13 +587,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         TODO(Jialin): port this retry-with-alloc wrapper into `MambaPool`.
         """
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
         mamba_pool = self.req_to_token_pool.mamba_pool
-        dst = mamba_pool.alloc(1)
+        dst = mamba_allocator.alloc(1)
         if dst is None:
             if protect_node_idx is not None:
                 self.inc_lock_ref(protect_node_idx)
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            dst = mamba_pool.alloc(1)
+            dst = mamba_allocator.alloc(1)
             if protect_node_idx is not None:
                 self.dec_lock_ref(protect_node_idx)
             assert dst is not None, "Can not alloc mamba cache"
