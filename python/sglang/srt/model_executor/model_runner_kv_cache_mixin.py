@@ -16,10 +16,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -335,18 +331,6 @@ class ModelRunnerKVCacheMixin:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
-
-    def _init_dcp_kv_pool_allocator(self: ModelRunner, need_sort) -> None:
-        # When dcp_enabled, kv cache is stored across dcp ranks in round-robin mode. max_total_num_tokens should be scaled up by dcp_world_size of current dcp rank. This ensures the correctness of computing the number of free KV cache tokens when assembling forward_batch in schedule_policy.
-        self.max_total_num_tokens *= get_attention_dcp_world_size()
-        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-            self.max_total_num_tokens,
-            self.page_size * get_attention_dcp_world_size(),
-            dtype=self.kv_cache_dtype,
-            device=self.device,
-            kvcache=self.token_to_kv_pool,
-            need_sort=need_sort,
-        )
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
@@ -899,31 +883,23 @@ class ModelRunnerKVCacheMixin:
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
                         )
-                    elif self.page_size == 1:
-                        if dcp_enabled():
-                            self._init_dcp_kv_pool_allocator(need_sort)
-                        else:
-                            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                            )
+                    elif self.page_size == 1 and self.dcp_size == 1:
+                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                     else:
-                        if dcp_enabled():
-                            self._init_dcp_kv_pool_allocator(need_sort)
-                        else:
-                            self.token_to_kv_pool_allocator = (
-                                PagedTokenToKVPoolAllocator(
-                                    self.max_total_num_tokens,
-                                    page_size=self.page_size,
-                                    dtype=self.kv_cache_dtype,
-                                    device=self.device,
-                                    kvcache=self.token_to_kv_pool,
-                                    need_sort=need_sort,
-                                )
-                            )
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
 
             if self.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
