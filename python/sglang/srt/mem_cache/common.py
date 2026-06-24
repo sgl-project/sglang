@@ -75,6 +75,9 @@ def free_swa_out_of_window_slots(
 ) -> None:
     from sglang.srt.environ import envs
 
+    if req.kv is None:
+        return
+
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache.cache_protected_len % page_size == 0
