@@ -29,7 +29,14 @@ from sglang.srt.mem_cache.triton_ops.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_num_new_pages,
+    is_hip,
+    next_power_of_2,
+)
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -117,6 +124,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+
+        # Pre-warm the torch.unique HIP kernel used in free(). When a request
+        # finishes with a prompt that already exists in the radix tree (e.g.
+        # bench_serving sending the same warmup+measured prompt), the radix
+        # cache's _insert_helper frees the duplicate KV indices via
+        # token_to_kv_pool_allocator.free(value[start:prefix_len]). That call
+        # path runs `torch.unique(free_index // self.page_size)` on a
+        # ~prompt_len-sized int64 tensor. The first such call on AMD ROCm
+        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
+        # shows up as a mysterious "second-request slow" (Run 1) for
+        # repeated-prompt benchmarks. Running it once at init time moves
+        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
+        # warm-up is gated on _is_hip and skipped on other platforms.
+        if _is_hip and torch.cuda.is_available():
+            try:
+                _warmup = torch.arange(1024, dtype=torch.int64, device=device)
+                _ = torch.unique(_warmup // page_size)
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         self.clear()
 
     def alloc(self, need_size: int):
