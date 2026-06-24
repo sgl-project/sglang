@@ -774,7 +774,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.server_args.kv_cache_dtype, self.kv_cache_dtype = configure_kv_cache_dtype(
-            server_args=self.server_args,
+            server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
             model=self.model,
             model_dtype=self.dtype,
         )

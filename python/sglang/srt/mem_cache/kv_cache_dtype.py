@@ -4,7 +4,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -22,11 +21,10 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 
 def configure_kv_cache_dtype(
     *,
-    server_args: ServerArgs,
+    server_args_kv_cache_dtype: str,
     model: nn.Module,
     model_dtype: torch.dtype,
 ) -> tuple[str, torch.dtype]:
-    server_args_kv_cache_dtype = server_args.kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
