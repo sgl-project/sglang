@@ -135,8 +135,6 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
-        # alloc req without free mamba cache
-        req.mamba.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
@@ -156,7 +154,6 @@ class TestMamba(unittest.TestCase):
             self._setup_tree_and_allocator()
         )
         mamba_allocator = req_to_token_pool.mamba_allocator
-        mamba_pool = req_to_token_pool.mamba_pool
         # test
         print(
             f"[Start] allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
@@ -311,15 +308,9 @@ class TestMamba(unittest.TestCase):
             )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
-        assert req9.mamba.mamba_pool_idx is not None
-        assert torch.all(
-            mamba_pool.mamba_cache.conv[0][:, req9.mamba.mamba_pool_idx]
-            == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
-        )
-        assert torch.all(
-            mamba_pool.mamba_cache.temporal[:, req9.mamba.mamba_pool_idx]
-            == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
-        )
+        assert req9.mamba_cow_src_index is None
+        assert result.mamba_cow_src is not None
+        assert torch.equal(result.mamba_cow_src, last_node.mamba_value)
 
         print(tree.available_and_evictable_str())
         print(available_and_evictable_str(tree))

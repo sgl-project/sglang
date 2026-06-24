@@ -246,6 +246,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    mamba_cow_src: Optional[torch.Tensor] = None
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:

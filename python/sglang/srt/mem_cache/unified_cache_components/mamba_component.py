@@ -77,7 +77,6 @@ class MambaComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
-        req = params.req
         last_node = result.best_match_node
 
         # HiCache can still use prefix matches and load back host-backed Mamba
@@ -93,24 +92,7 @@ class MambaComponent(TreeComponent):
             branching_seqlen = None
 
         mamba_value = last_node.component_data[self.component_type].value
-        if cow_mamba and mamba_value is not None:
-            assert req is not None
-            if req.mamba.mamba_pool_idx is None:
-                dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                if dst_index is None:
-                    # Capture the inc result and thread swa_uuid_for_lock back
-                    # into dec. Without it, SWA's release walks past this
-                    # request's window boundary all the way to root and
-                    # over-decrements SWA locks held by other resident requests
-                    # on ancestor nodes.
-                    lock_result = self.cache.inc_lock_ref(last_node)
-                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                    self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                req.mamba.mamba_pool_idx = dst_index[0]
-            req.mamba_cow_src_index = mamba_value
-            req.mamba_needs_clear = False
+        mamba_cow_src = mamba_value if (cow_mamba and mamba_value is not None) else None
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.
@@ -120,7 +102,10 @@ class MambaComponent(TreeComponent):
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
 
-        return result._replace(mamba_branching_seqlen=branching_seqlen)
+        return result._replace(
+            mamba_branching_seqlen=branching_seqlen,
+            mamba_cow_src=mamba_cow_src,
+        )
 
     def commit_insert_component_data(
         self,
