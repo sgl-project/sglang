@@ -4,9 +4,10 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
-    NPUFinalizeRouting,
     AllGatherFinalizeRoutingWrapper,
+    NPUFinalizeRouting,
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
     NPUMoEInitRouting_v2,
@@ -22,7 +23,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_ascend_dispatcher_output_dtype,
 )
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+
 
 class TorchNpuDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor

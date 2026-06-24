@@ -4,13 +4,13 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.activation import GeluAndMul
 
 
 # =============================================================================
@@ -69,6 +69,7 @@ class NPUSwigluQuantWithScales(BaseActivation):
 class NPUSwigluDeepEPKernel(BaseActivation):
     def __init__(self, need_quant: bool = True):
         from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
         self._kernel = swiglu_quant
         self.need_quant = need_quant
 
@@ -97,6 +98,7 @@ class NPUGeluAndMul(BaseActivation):
 class NPUSwigluOAI(BaseActivation):
     def __init__(self, layer: Any):
         from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+
         self._kernel = swiglu_oai
         self._layer = layer
 
@@ -131,6 +133,7 @@ class AllGatherActivationWrapper(BaseActivation):
     This allows the runner to stay TP‑agnostic: the wrapper is applied
     transparently at construction time.
     """
+
     def __init__(self, inner: BaseActivation, dim: int = -1):
         self.inner = inner
         self.dim = dim

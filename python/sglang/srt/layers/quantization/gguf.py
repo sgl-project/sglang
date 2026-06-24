@@ -890,9 +890,13 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 w13_dequant_list.append(dequant)
 
             w13_full = torch.stack(w13_dequant_list, dim=0)
-            layer.register_buffer("w13_dequant", npu_format_cast(w13_full), persistent=False)
+            layer.register_buffer(
+                "w13_dequant", npu_format_cast(w13_full), persistent=False
+            )
         else:
-            layer.register_buffer("w13_dequant", npu_format_cast(w13_qweight.data), persistent=False)
+            layer.register_buffer(
+                "w13_dequant", npu_format_cast(w13_qweight.data), persistent=False
+            )
 
         # Pre-dequantize w2 weights (down projection)
         w2_qweight = layer.w2_qweight
@@ -921,9 +925,13 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
             w2_full = torch.stack(w2_dequant_list, dim=0)
 
-            layer.register_buffer("w2_dequant", npu_format_cast(w2_full), persistent=False)
+            layer.register_buffer(
+                "w2_dequant", npu_format_cast(w2_full), persistent=False
+            )
         else:
-            layer.register_buffer("w2_dequant", npu_format_cast(w2_qweight.data), persistent=False)
+            layer.register_buffer(
+                "w2_dequant", npu_format_cast(w2_qweight.data), persistent=False
+            )
 
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
@@ -956,6 +964,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_dequant,
         )
         return self.runner.run(dispatch_output, quant_info)
+
 
 class GGUFEmbeddingAscendMethod(GGUFLinearAscendMethod):
     """Embedding method for GGUF on Ascend NPU."""

@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.moe.activation import (
+    AllGatherActivationWrapper,
     NPUGeluAndMul,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
-    AllGatherActivationWrapper,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
@@ -46,6 +46,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
+
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -102,14 +103,16 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                     inner = NPUSwigluOAI(layer=config.layer)
                 elif config.activation == "silu":
                     if config.gemm1_clamp_limit is not None:
-                        inner = NPUSwigluStepAndMul(clamp_limit=config.gemm1_clamp_limit)
+                        inner = NPUSwigluStepAndMul(
+                            clamp_limit=config.gemm1_clamp_limit
+                        )
                     else:
                         inner = NPUSwiglu()
                 else:
                     inner = NPUGeluAndMul()
 
             # 2. If the quant method (GGUF) needs TP all‑gather, wrap the activation
-            if getattr(config, 'use_tp_all_gather_activation', False):
+            if getattr(config, "use_tp_all_gather_activation", False):
                 self.activation = AllGatherActivationWrapper(inner, dim=-1)
             else:
                 self.activation = inner

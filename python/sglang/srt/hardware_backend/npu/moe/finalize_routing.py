@@ -81,6 +81,7 @@ class AllGatherFinalizeRoutingWrapper(BaseFinalizeRouting):
 
     This keeps the runner / permute hooks free of TP logic.
     """
+
     def __init__(self, inner: BaseFinalizeRouting, dim: int = -1):
         self.inner = inner
         self.dim = dim
