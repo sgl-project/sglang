@@ -1,28 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU regression tests pinning fixes made during OmniDreams GPU bring-up.
+"""CPU correctness pins for OmniDreams (no checkpoint, no GPU required).
 
-Each test guards a specific defect found while validating OmniDreams end-to-end
-on GPU (no checkpoint, no GPU required):
+Two kinds of pins live here:
 
-1. Meta-init load materializes the non-persistent sinusoidal ``emb`` buffer
-   (otherwise the production meta->load path leaves it on the meta device and
-   ``_load_dit_model`` raises / ``.to()`` fails).
-2. ``TimestepEmbedding`` casts the float32 sinusoid to the MLP param dtype
-   (otherwise a bf16 model hits a float!=bf16 matmul error).
-3. The registry resolves a non-diffusers local checkpoint via a path detector,
-   and the path-detector short-circuit is gated to dirs WITHOUT model_index.json
-   (so it cannot hijack a normal diffusers model).
-4. ``_compute_num_chunks`` maps ``num_frames`` -> chunk count and caps the AR
-   rollout length (``_MAX_AR_CHUNKS``) against unbounded requests.
-5. ``apply_chat_template`` BatchEncoding output is normalized to the input_ids
-   tensor (newer transformers return a dict-like, not a bare tensor).
-6. ``read_vae_state_dict`` reads diffusers safetensors; ``load_wan_vae`` raises
-   a helpful error for a non-diffusers (original-Wan) state dict.
-7. ``OmniDreamsTextEncoderConfig._resolve_bf16_src`` prefers a local
-   ``text_encoder`` dir, else the pinned HF id + revision.
+* **Phase-0 scaffold** — constructs the DiT on the meta device (no memory for
+  ~2B params) and validates the checkpoint-exact structure against an
+  independently-derived authoritative key fixture, plus the pre/post-fusion
+  shapes, the 2-step flow-match sigmas, and the 3D-RoPE layout.
+* **Regression guards** — each test pins a specific defect found while
+  validating OmniDreams end-to-end on GPU:
+
+  1. Meta-init load materializes the non-persistent sinusoidal ``emb`` buffer.
+  2. ``TimestepEmbedding`` casts the float32 sinusoid to the MLP param dtype.
+  3. The registry resolves a non-diffusers local checkpoint via a path
+     detector, gated to dirs WITHOUT model_index.json.
+  4. ``_compute_num_chunks`` maps ``num_frames`` -> chunk count and caps the AR
+     rollout length (``_MAX_AR_CHUNKS``).
+  5. ``apply_chat_template`` BatchEncoding output is normalized to input_ids.
+  6. ``read_vae_state_dict`` reads diffusers safetensors; ``load_wan_vae``
+     raises a helpful error for a non-diffusers state dict.
+  7. ``OmniDreamsTextEncoderConfig._resolve_bf16_src`` prefers a local
+     ``text_encoder`` dir, else the pinned HF id + revision.
 """
 
 import json
+import os
 import types
 from collections import OrderedDict
 from itertools import chain
@@ -34,11 +36,16 @@ from sglang.multimodal_gen.configs.models.dits.omnidreams import (
     OmniDreamsDiTArchConfig,
     OmniDreamsDiTConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+    OmniDreamsPipelineConfig,
+    warp_flow_match_sigmas,
+)
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     OmniDreamsDiT,
     TimestepEmbedding,
     Timesteps,
 )
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import rope_dims
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     COSMOS_REASON1_HIDDEN,
 )
@@ -48,7 +55,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
     OmniDreamsBeforeDenoisingStage,
 )
 
+_KEY_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt")
 
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def _tiny_arch() -> OmniDreamsDiTArchConfig:
     return OmniDreamsDiTArchConfig(
         in_channels=4,
@@ -64,7 +76,86 @@ def _tiny_arch() -> OmniDreamsDiTArchConfig:
     )
 
 
-# ---- 1. meta-init buffer materialization ----------------------------------- #
+def _load_fixture_keys() -> set[str]:
+    with open(_KEY_FIXTURE) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def _build_meta_model() -> OmniDreamsDiT:
+    with torch.device("meta"):
+        return OmniDreamsDiT(config=OmniDreamsDiTConfig(), hf_config={})
+
+
+# --------------------------------------------------------------------------- #
+# Phase-0 scaffold: structure / shape / schedule / RoPE layout
+# --------------------------------------------------------------------------- #
+def test_state_dict_matches_authoritative_key_fixture():
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    model = _build_meta_model()
+    keys = set(model.state_dict().keys())
+    ckpt_keys = _load_fixture_keys()
+    assert len(ckpt_keys) == 570
+    # The packed-QKV merge maps the checkpoint's separate q/k/v -> to_qkv and k/v ->
+    # to_kv (param_names_mapping). Apply it to the checkpoint keys and verify they
+    # cover exactly the model's state_dict (i.e. the flat checkpoint stays loadable).
+    mapping_fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
+    mapped = {mapping_fn(k)[0] for k in ckpt_keys}
+    assert (
+        mapped == keys
+    ), f"missing={sorted(keys - mapped)} extra={sorted(mapped - keys)}"
+
+
+def test_unique_bias_is_crossattn_proj():
+    model = _build_meta_model()
+    biases = [k for k in model.state_dict() if k.endswith(".bias")]
+    assert biases == ["crossattn_proj.0.bias"]
+
+
+def test_pre_fusion_shapes():
+    model = _build_meta_model()
+    sd = model.state_dict()
+    # x_embedder keeps the padding-mask channel pre-fusion: (16 + 1 + 1) * 2 * 2 = 72.
+    assert tuple(sd["x_embedder.proj.1.weight"].shape) == (2048, 72)
+    # HDMap embed: 16 * 2 * 2 = 64 in-features.
+    assert tuple(sd["additional_patch_embedding.proj.1.weight"].shape) == (2048, 64)
+    # Final layer pre-shuffle: patch_dim = 2*2*1*16 = 64.
+    assert tuple(sd["final_layer.linear.weight"].shape) == (64, 2048)
+    assert tuple(sd["crossattn_proj.0.weight"].shape) == (1024, 100352)
+
+
+def test_post_load_weights_fuses_in_place():
+    model = _build_meta_model()
+    pre_keys = set(model.state_dict().keys())
+    model.post_load_weights()
+    sd = model.state_dict()
+    # Padding-mask channels dropped: 72 -> 68.
+    assert tuple(sd["x_embedder.proj.1.weight"].shape) == (2048, 68)
+    # Shuffle fuse is a reorder; shape is preserved.
+    assert tuple(sd["final_layer.linear.weight"].shape) == (64, 2048)
+    # Fusion must not add or remove parameters.
+    assert set(sd.keys()) == pre_keys
+    assert model._is_padding_mask_fused and model._is_shuffle_op_fused
+
+
+def test_two_step_flow_match_sigmas():
+    sigmas = warp_flow_match_sigmas()
+    assert len(sigmas) == 3
+    assert abs(sigmas[0] - 1.0) < 1e-9
+    assert abs(sigmas[1] - 0.8036) < 1e-3
+    assert sigmas[2] == 0.0
+    # The pipeline config exposes the same schedule.
+    assert OmniDreamsPipelineConfig().denoising_sigmas() == sigmas
+
+
+def test_rope_layout_neox_44_42_42():
+    assert rope_dims(128) == (44, 42, 42)
+    assert sum(rope_dims(128)) == 128
+
+
+# --------------------------------------------------------------------------- #
+# Regression 1: meta-init buffer materialization
+# --------------------------------------------------------------------------- #
 def test_meta_init_materializes_nonpersistent_buffers():
     with torch.device("meta"):
         model = OmniDreamsDiT(
@@ -89,7 +180,9 @@ def test_meta_init_materializes_nonpersistent_buffers():
     assert ts.emb.shape == (ts.num_channels // 2,)
 
 
-# ---- 2. TimestepEmbedding dtype cast --------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Regression 2: TimestepEmbedding dtype cast
+# --------------------------------------------------------------------------- #
 def test_timestep_embedding_casts_sinusoid_to_param_dtype():
     te = TimestepEmbedding(16, 16, use_adaln_lora=True).to(torch.bfloat16)
     sinusoid_fp32 = torch.randn(16, dtype=torch.float32)
@@ -99,7 +192,9 @@ def test_timestep_embedding_casts_sinusoid_to_param_dtype():
     assert torch.isfinite(raw).all() and torch.isfinite(lora).all()
 
 
-# ---- 3. registry resolution + gated short-circuit -------------------------- #
+# --------------------------------------------------------------------------- #
+# Regression 3: registry resolution + gated short-circuit
+# --------------------------------------------------------------------------- #
 def test_registry_resolves_nondiffusers_local_omnidreams(tmp_path):
     import sglang.multimodal_gen.registry as reg
 
@@ -130,7 +225,9 @@ def test_registry_path_detector_gated_to_non_diffusers(tmp_path):
     assert info is None
 
 
-# ---- 4. num_frames -> chunk mapping + AR cap ------------------------------- #
+# --------------------------------------------------------------------------- #
+# Regression 4: num_frames -> chunk mapping + AR cap
+# --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "num_frames,expected",
     [(5, 1), (6, 2), (13, 2), (14, 3), (21, 3)],  # len_t=2: first=5, step=8
@@ -150,7 +247,9 @@ def test_compute_num_chunks_caps_ar_loop():
     )
 
 
-# ---- 5. tokenizer BatchEncoding normalization ------------------------------ #
+# --------------------------------------------------------------------------- #
+# Regression 5: tokenizer BatchEncoding normalization
+# --------------------------------------------------------------------------- #
 def test_encode_text_normalizes_batchencoding():
     n_layers = 3  # tiny stand-in for the 28 transformer layers
     hidden = COSMOS_REASON1_HIDDEN
@@ -184,7 +283,9 @@ def test_encode_text_normalizes_batchencoding():
     assert torch.isfinite(out).all()
 
 
-# ---- 6. VAE state-dict reader + helpful error ------------------------------ #
+# --------------------------------------------------------------------------- #
+# Regression 6: VAE state-dict reader + helpful error
+# --------------------------------------------------------------------------- #
 def test_read_vae_state_dict_safetensors_file_and_dir(tmp_path):
     from safetensors.torch import save_file
 
@@ -243,7 +344,9 @@ def test_load_wan_vae_raises_helpful_error_on_key_mismatch(tmp_path, monkeypatch
         )
 
 
-# ---- 7. text-encoder source resolution ------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Regression 7: text-encoder source resolution
+# --------------------------------------------------------------------------- #
 def test_resolve_text_encoder_src_prefers_local_then_hf(tmp_path):
     from sglang.multimodal_gen.configs.models.omnidreams_components import (
         OmniDreamsTextEncoderConfig,
@@ -261,3 +364,7 @@ def test_resolve_text_encoder_src_prefers_local_then_hf(tmp_path):
     (te / "config.json").write_text("{}")
     src2, rev2 = cfg._resolve_bf16_src()
     assert src2 == str(te) and rev2 is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
