@@ -52,7 +52,9 @@ class CpKvLayerSplitPoolBase:
 
     @staticmethod
     def _pool_num_pages(pool) -> int:
-        return (pool.size + pool.page_size - 1) // pool.page_size
+        # Paged KV allocators reserve page 0 for dummy/padded tokens and allocate
+        # real cache pages from 1..size//page_size.
+        return pool.size // pool.page_size + 1
 
     def _active_pages_for_indices(
         self,
