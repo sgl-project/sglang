@@ -45,7 +45,9 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
-
+from sglang.srt.distributed.communication_op import (
+    tensor_model_parallel_all_reduce,   # <-- use all‑reduce
+)
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
