@@ -895,11 +895,6 @@ class DeepseekV2MoE(nn.Module):
             if server_args.enable_eplb
             else None
         )
-        # Routed experts run on the main stream; the shared experts are forked
-        # onto the alt (side) stream *after* the routed matmul below is enqueued.
-        # Forking before the routed matmul (e.g. right after topk) makes
-        # CUDA-graph capture allocate a fresh side stream per layer and breaks
-        # the flashinfer PDL chain. Mirrors the tokenspeed execution order.
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         topk_kwargs = (
@@ -911,8 +906,6 @@ class DeepseekV2MoE(nn.Module):
             expert_location_dispatch_info=dispatch_info,
             **topk_kwargs,
         )
-        # _forward_shared_experts returns a tensor iff these hold; compute the
-        # predicate up front since the shared output is now materialized later.
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
@@ -936,8 +929,6 @@ class DeepseekV2MoE(nn.Module):
         ):
             final_hidden_states *= self.routed_scaling_factor
 
-        # Shared experts overlap on the alt (side) stream, forked after the
-        # routed matmul above so capture reuses the single alt_stream.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
