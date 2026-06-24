@@ -187,16 +187,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
         rust_result: Any,
         result: MatchResult,
     ) -> MatchResult:
-        """Per-component post-processing that requires Python-owned resources."""
-        # Mamba CoW: allocate a request-local slot from the matched state.
-        if (
-            self.supports_mamba()
-            and params.cow_mamba
-            and rust_result.mamba_value is not None
-        ):
-            self._copy_on_write_mamba(
-                params.req, rust_result.last_device_node_idx, rust_result.mamba_value
-            )
+        """Component post-processing that requires Python-owned resources."""
+        for comp in self.components.values():
+            comp.finalize_match(params, rust_result)
         return result
 
     def _empty_match_result(self) -> MatchResult:
@@ -378,8 +371,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            if self.supports_mamba():
-                self.req_to_token_pool.free_mamba_cache(req)
+            for comp in self.components.values():
+                comp.cleanup_after_caching_req(req, is_finished=True, disabled=True)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -387,56 +380,49 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # extra_buffer mode: truncate to Mamba chunk aligned.
-        if self.enable_mamba_extra_buffer:
-            cache_len = req.mamba_last_track_seqlen or 0
-            if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
-                token_ids = token_ids[:cache_len]
-                kv_indices = kv_indices[:cache_len]
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len,
+            swa_evicted_seqlen=req.swa_evicted_seqlen,
+        )
+        # Components fill their insert value and may shorten the cached length.
+        cache_len = len(token_ids)
+        for comp in self.components.values():
+            cl = comp.prepare_for_caching_req(
+                req, insert_params, len(token_ids), is_finished=True
+            )
+            if cl is not None:
+                cache_len = min(cache_len, cl)
+        if cache_len != len(token_ids):
+            cache_end_idx = max(cache_len, req.cache_protected_len)
+            self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+            token_ids = token_ids[:cache_len]
+            kv_indices = kv_indices[:cache_len]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         atom_len = len(radix_key)
-        values = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
+        insert_params.key = radix_key
+        insert_params.value = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
 
-        mamba_value, mamba_ping_pong_track_buffer_to_keep = self._extract_mamba_value(
-            req
-        )
-
-        mamba_exist = False
+        insert_result = None
         if is_insert:
-            insert_result = self.insert(
-                InsertParams(
-                    key=radix_key,
-                    value=values,
-                    prev_prefix_len=req.cache_protected_len,
-                    swa_evicted_seqlen=req.swa_evicted_seqlen,
-                    mamba_value=mamba_value,
-                )
-            )
-            mamba_exist = insert_result.mamba_exist
+            insert_result = self.insert(insert_params)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : atom_len]
             )
-            # Skipped insert: caller still owns the Mamba slot.
-            mamba_exist = mamba_value is not None
 
         # Free everything past the aligned atom prefix.
         self.token_to_kv_pool_allocator.free(kv_indices[atom_len:])
 
-        # Mamba slot release. extra_buffer always frees the orphaned primary
-        # (keeping the surviving ping-pong slot); no_buffer frees only on reject.
-        if mamba_exist:
-            mamba_ping_pong_track_buffer_to_keep = None
-        free_mamba_cache = self.enable_mamba_extra_buffer or mamba_exist
-        if self.supports_mamba() and free_mamba_cache:
-            self.req_to_token_pool.free_mamba_cache(
+        for comp in self.components.values():
+            comp.cleanup_after_caching_req(
                 req,
-                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+                is_finished=True,
+                inserted=is_insert,
+                insert_result=insert_result,
+                insert_params=insert_params,
             )
 
         # Release the prefill lock.
@@ -454,44 +440,39 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # extra_buffer mode: truncate to Mamba chunk aligned.
-        if self.enable_mamba_extra_buffer:
-            cache_len = req.mamba_last_track_seqlen
-            # No chunk-aligned boundary yet, skip caching.
-            if cache_len is None:
+        insert_params = InsertParams(
+            chunked=chunked,
+            prev_prefix_len=req.cache_protected_len,
+        )
+        # Components fill their insert value; a None return means skip caching.
+        cache_len = len(token_ids)
+        for comp in self.components.values():
+            cl = comp.prepare_for_caching_req(
+                req, insert_params, len(token_ids), is_finished=False
+            )
+            if cl is None:
                 req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
                 return
-            token_ids = token_ids[:cache_len]
+            cache_len = min(cache_len, cl)
+        token_ids = token_ids[:cache_len]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         atom_len = len(radix_key)
-        values = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
+        insert_params.key = radix_key
+        insert_params.value = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
 
-        # Fork so decode mutations don't alias the cached state.
-        mamba_value_forked = None
-        if self.supports_mamba() and req.mamba_pool_idx is not None:
-            mamba_value_src, _ = self._extract_mamba_value(req)
-            assert mamba_value_src is not None, (
-                "mamba_value_src must be present when supports_mamba() and "
-                "req.mamba_pool_idx is not None"
+        insert_result = self.insert(insert_params)
+
+        for comp in self.components.values():
+            comp.cleanup_after_caching_req(
+                req,
+                is_finished=False,
+                inserted=True,
+                insert_result=insert_result,
+                insert_params=insert_params,
             )
-            mamba_value_forked = self._mamba_fork_from(mamba_value_src)
-
-        insert_result = self.insert(
-            InsertParams(
-                key=radix_key,
-                value=values,
-                chunked=chunked,
-                prev_prefix_len=req.cache_protected_len,
-                mamba_value=mamba_value_forked,
-            )
-        )
-
-        # Release the forked slot when the cache didn't consume it.
-        if mamba_value_forked is not None and insert_result.mamba_exist:
-            self.req_to_token_pool.mamba_allocator.free(mamba_value_forked)
 
         # Re-read the canonical tree-owned indices; insert may have de-duplicated.
         # With SWA a rematch can return fewer indices than atom_len.
@@ -529,59 +510,3 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.cache_protected_len = len(new_indices)
-        # Clear the chunk-aligned marker so the next call recomputes it.
-        if self.supports_mamba():
-            req.mamba_last_track_seqlen = None
-
-    # ----- Utils -----
-    def _extract_mamba_value(
-        self, req: "Req"
-    ) -> tuple[Optional[torch.Tensor], Optional[int]]:
-        """Build the `mamba_value` tensor to insert into the radix tree."""
-        if not self.supports_mamba() or req.mamba_pool_idx is None:
-            return None, None
-        if not self.enable_mamba_extra_buffer:
-            return req.mamba_pool_idx.unsqueeze(-1).clone(), None
-        # extra_buffer mode: also return the ping-pong index to release later.
-        track_buffer_to_keep = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            req.mamba_next_track_idx
-        )
-        mamba_value = (
-            req.mamba_ping_pong_track_buffer[track_buffer_to_keep].unsqueeze(-1).clone()
-        )
-        return mamba_value, track_buffer_to_keep
-
-    def _mamba_fork_from(
-        self,
-        mamba_value: torch.Tensor,
-        protect_node_idx: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Fork `mamba_value` in the pool, evicting only if alloc fails.
-
-        TODO(Jialin): port this retry-with-alloc wrapper into `MambaPool`.
-        """
-        mamba_allocator = self.req_to_token_pool.mamba_allocator
-        mamba_pool = self.req_to_token_pool.mamba_pool
-        dst = mamba_allocator.alloc(1)
-        if dst is None:
-            if protect_node_idx is not None:
-                self.inc_lock_ref(protect_node_idx)
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            dst = mamba_allocator.alloc(1)
-            if protect_node_idx is not None:
-                self.dec_lock_ref(protect_node_idx)
-            assert dst is not None, "Can not alloc mamba cache"
-        mamba_pool.copy_from(mamba_value, dst)
-        return dst
-
-    def _copy_on_write_mamba(
-        self, req: "Req", last_node_idx: int, src_index: torch.Tensor
-    ) -> None:
-        """Copy the matched node's Mamba SSM state into req-local space."""
-        if req.mamba_pool_idx is None:
-            forked = self._mamba_fork_from(src_index, protect_node_idx=last_node_idx)
-            req.mamba_pool_idx = forked[0]
-        else:
-            self.req_to_token_pool.mamba_pool.copy_from(
-                src_index, req.mamba_pool_idx.unsqueeze(0)
-            )

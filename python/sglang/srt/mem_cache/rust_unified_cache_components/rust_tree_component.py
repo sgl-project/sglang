@@ -21,12 +21,14 @@ therefore do NOT mirror `TreeComponent` one-for-one.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from sglang.srt.mem_cache._mem_cache_core import ComponentType
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.mem_cache.rust_unified_radix_cache import RustUnifiedRadixCache
 
 
@@ -55,3 +57,29 @@ class RustTreeComponent:
 
     def protected_size(self) -> int:
         return 0
+
+    def finalize_match(self, params: Any, rust_result: Any) -> None:
+        """Pool-side match post-processing (e.g. Mamba CoW). Default no-op."""
+
+    def prepare_for_caching_req(
+        self,
+        req: "Req",
+        insert_params: "InsertParams",
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        """Build this component's insert value (set on `insert_params`); return
+        the cache length it wants (min-reduced across components), or `None` to
+        skip caching this request. Default: cache the full length."""
+        return token_ids_len
+
+    def cleanup_after_caching_req(
+        self,
+        req: "Req",
+        is_finished: bool,
+        inserted: bool = False,
+        insert_result: "Optional[InsertResult]" = None,
+        insert_params: "Optional[InsertParams]" = None,
+        disabled: bool = False,
+    ) -> None:
+        """Release this component's per-request pool slots. Default no-op."""
