@@ -33,11 +33,11 @@ EXPLICIT = {
     "/platforms/xpu": "/docs/hardware-platforms/xpu",
     # platforms/ascend → hardware-platforms/ascend-npus (flattened, renamed)
     "/platforms/ascend/ascend_npu": "/docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support",
-    "/platforms/ascend/ascend_npu_best_practice": "/docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU",
-    "/platforms/ascend/ascend_npu_deepseek_example": "/docs/hardware-platforms/ascend-npus/DeepSeek-Examples",
-    "/platforms/ascend/ascend_npu_glm5_examples": "/docs/hardware-platforms/ascend-npus/GLM-5",
-    "/platforms/ascend/ascend_npu_qwen3_examples": "/docs/hardware-platforms/ascend-npus/Qwen3-Examples",
-    "/platforms/ascend/ascend_npu_qwen3_5_examples": "/docs/hardware-platforms/ascend-npus/Qwen3.5",
+    "/platforms/ascend/ascend_npu_best_practice": "/docs/hardware-platforms/ascend-npus/best_practice",
+    "/platforms/ascend/ascend_npu_deepseek_example": "/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+    "/platforms/ascend/ascend_npu_glm5_examples": "/docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
+    "/platforms/ascend/ascend_npu_qwen3_examples": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b",
+    "/platforms/ascend/ascend_npu_qwen3_5_examples": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b",
     "/platforms/ascend/ascend_npu_support_features": "/docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU",
     "/platforms/ascend/ascend_npu_support_models": "/docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU",
     # Old pages dropped — redirect to section overview
