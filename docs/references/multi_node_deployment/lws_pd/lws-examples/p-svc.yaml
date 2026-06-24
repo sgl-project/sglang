@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseekr10528-prefill-main
+spec:
+  selector:
+    leaderworkerset.sigs.k8s.io/name: deepseekr10528-prefill-main
+    role: leader
+  ports:
+    - protocol: TCP
+      port: 30000
+      targetPort: 30000
