@@ -106,11 +106,12 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 RUN ln -s ${ROCM_HOME} /opt/rocm
 
 ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="0"
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV TRITON_COMMIT_DEFAULT="5f3f125e8f63c24613f1f73b937442864f263f94"
 
 # ===============================
 # Base image 942 with rocm700 and args
@@ -131,6 +132,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
 # Base image 950 and args
@@ -151,6 +153,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -175,7 +178,7 @@ ARG BRANCH_TYPE=remote
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
+ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -322,7 +325,8 @@ RUN if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
       && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
         && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
         && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
-        && FLYDSL_RELEASE_TYPE=release pip install -e .;'; \
+        && FLYDSL_RELEASE_TYPE=release pip install . \
+        && rm -fr /sgl-workspace/llvm-project;'; \
     fi
 
 # -----------------------
@@ -769,14 +773,30 @@ RUN cd /tmp/whl \
 # so future `pip install` will break the ROCm stack.
 # A workaround for this is to reinstall the default triton
 # wheel with the `rocm/pytorch` image in the root directory.
+# For ROCm 7.14, it is a different story:
+# https://github.com/ROCm/rocm-systems/issues/7643
+# Rebuilding tag 3.7.0 seems to workaround this issue without
+# sacrificing accuracy. The previous section to rewrite the metadata
+# of the wheel becomes unnecessary once we apply the trick to fake
+# the version string as we do here.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip uninstall -y triton \
      && apt install -y cmake \
      && git clone ${TRITON_REPO} triton-custom \
      && cd triton-custom \
      && git checkout ${TRITON_COMMIT} \
+     && if [ "$GPU_ARCH" = "gfx950-rocm7_14" ]; then \
+            sed -i 's/TRITON_VERSION = "3\.7\.0"/TRITON_VERSION = "3.6.0"/' setup.py \
+         && sed -i "s/__version__ = '3\.7\.0'/__version__ = '3.6.0'/" python/triton/__init__.py \
+         && sed -i '/^def get_git_version_suffix():/,/^def get_triton_version_suffix():/{ /^def get_triton_version_suffix():/!{ /^def get_git_version_suffix():/!d; }; }' setup.py \
+         && sed -i '/^def get_git_version_suffix():/a\    return ""' setup.py; \
+        fi \
      && pip install -r python/requirements.txt \
-     && pip install -e . \
+     && if [ "$GPU_ARCH" = "gfx950-rocm7_14" ]; then \
+            TRITON_WHEEL_VERSION_SUFFIX=+rocm7.14.0a20260612 pip install -e .; \
+        else \
+            pip install -e .; \
+        fi \
      && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
