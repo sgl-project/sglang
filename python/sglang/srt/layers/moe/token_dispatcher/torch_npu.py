@@ -72,16 +72,6 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         self.quant_config: Optional[dict] = None
         self.set_ascend_dispatcher_output_dtype()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        is_gguf = (
-            self.quant_config
-            and hasattr(self.quant_config, "get_name")
-            and self.quant_config.get_name() == "gguf"
-        )
-        if is_gguf and self.tp_size > 1:
-            self.enable_all_gather = True
-        else:
-            self.enable_all_gather = False
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
@@ -158,9 +148,6 @@ class TorchNpuDispatcher(BaseDispatcher):
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_ids,
         )
-        # TP all-gather for intermediate dimension if needed
-        if self.enable_all_gather:
-            final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, dim=-1)
 
         self._dispatch_output = None
         return final_hidden_states
