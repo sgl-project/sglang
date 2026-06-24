@@ -221,30 +221,6 @@ if _is_npu:
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
-MLA_ATTENTION_BACKENDS = [
-    "aiter",
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-    "ascend",
-    "dsa",
-    "nsa",  # Deprecated alias for "dsa"
-    "intel_xpu",
-]
-
-
-def add_mla_attention_backend(backend_name):
-    if backend_name not in MLA_ATTENTION_BACKENDS:
-        MLA_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
-
-
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
