@@ -158,7 +158,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return TorchNpuRunnerOutput(hidden_states=hidden_states)
 
 
