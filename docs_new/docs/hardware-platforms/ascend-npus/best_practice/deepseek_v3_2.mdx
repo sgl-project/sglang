@@ -21,6 +21,8 @@ This guide describes the best practice data for DeepSeek-V3.2 on the Ascend NPU.
 
 ## Optimal Configuration
 
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
+
 ### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K 26ms
 
 **Model**: DeepSeek-V3.2
@@ -120,7 +122,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -169,7 +174,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -309,7 +317,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -358,7 +369,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -498,7 +512,10 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
@@ -547,7 +564,10 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code \
+        --attention-backend ascend \
+        --device npu
         NODE_RANK=$i
         break
     fi
