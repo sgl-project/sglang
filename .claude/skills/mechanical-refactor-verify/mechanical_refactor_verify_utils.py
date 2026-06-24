@@ -11,6 +11,10 @@ reproduce-mode helper. The exact rule it enforces is specified in verifier-spec.
 source of truth); this module implements that file and nothing more. Runnable directly:
 
     python3 mechanical_refactor_verify_utils.py <commit>
+    python3 mechanical_refactor_verify_utils.py <base>..<tip> [--match REGEX]
+
+The range form verifies every commit in the range oldest first; ``--match`` restricts it
+to commits whose subject matches the regex (e.g. ``--match -move``) and skips the rest.
 """
 
 import ast
@@ -300,11 +304,59 @@ def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
     return clean
 
 
-def _main(argv: list[str]) -> int:
-    if len(argv) == 1:
-        return 0 if verify_move_commit(argv[0]) else 1
+def verify_move_range(
+    rev_range: str, *, match: str | None = None, repo_root: str | None = None
+) -> bool:
+    """Verify every commit in a git range (e.g. ``main..branch``), oldest first.
+
+    With ``match`` (a regex) only commits whose subject matches are verified; the rest
+    are skipped, so a long chain's log stays focused on, say, the ``-move`` commits.
+    Prints each verified commit's report and a final summary; returns True iff every
+    verified commit is clean.
+    """
+    root = repo_root or _repo_root()
+    commits = _git_output(["rev-list", "--reverse", rev_range], root).split()
+    pattern = re.compile(match) if match else None
+
+    results: list[tuple[str, str, bool]] = []
+    skipped = 0
+    for commit in commits:
+        subject = _git_output(["log", "-1", "--format=%s", commit], root).strip()
+        if pattern is not None and not pattern.search(subject):
+            skipped += 1
+            continue
+        clean = verify_move_commit(commit, repo_root=root)
+        print()
+        results.append((commit[:9], subject, clean))
+
+    n_clean = sum(1 for _, _, clean in results if clean)
+    print("=" * 72)
     print(
-        "usage: python3 mechanical_refactor_verify_utils.py <commit>", file=sys.stderr
+        f"verified {len(results)} commit(s)"
+        + (f", skipped {skipped} (no subject match)" if pattern is not None else "")
+        + f": {n_clean} clean, {len(results) - n_clean} need review"
+    )
+    for short, subject, clean in results:
+        print(f"  {'CLEAN ' if clean else 'REVIEW'}  {short}  {subject}")
+    return all(clean for _, _, clean in results)
+
+
+def _main(argv: list[str]) -> int:
+    match: str | None = None
+    if "--match" in argv:
+        i = argv.index("--match")
+        if i + 1 < len(argv):
+            match = argv[i + 1]
+            argv = argv[:i] + argv[i + 2 :]
+    if len(argv) == 1:
+        target = argv[0]
+        if ".." in target:
+            return 0 if verify_move_range(target, match=match) else 1
+        return 0 if verify_move_commit(target) else 1
+    print(
+        "usage: python3 mechanical_refactor_verify_utils.py <commit>\n"
+        "       python3 mechanical_refactor_verify_utils.py <base>..<tip> [--match REGEX]",
+        file=sys.stderr,
     )
     return 2
 

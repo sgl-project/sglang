@@ -20,7 +20,15 @@ relocations are certified here; semantic commits get ordinary human review.
 python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py <commit>
 ```
 
-It reports, for the commit's diff:
+To sweep a whole chain at once, pass a range; `--match` keeps the log focused on the
+commits you care about (e.g. the `-move` commits) and skips the rest, ending with a
+per-commit CLEAN/REVIEW summary:
+
+```bash
+python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py <base>..<tip> --match -move
+```
+
+It reports, for each commit's diff:
 
 - how many lines were **relocated in order** (the whole block may be shifted by one
   uniform indentation amount, so a method body dedented to module level still counts);

@@ -15,6 +15,7 @@ from mechanical_refactor_verify_utils import (
     _strip_moved_qualifiers,
     _strip_self_annotation,
     verify_move_commit,
+    verify_move_range,
 )
 
 # The rule under test is specified in verifier-spec.md; these tests assert exactly that
@@ -694,3 +695,50 @@ def test_added_import_is_labelled_import_not_review(repo: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "[import] from mod import helper" in out
     assert "[review]" not in out
+
+
+# --- verify_move_range ---------------------------------------------------------
+
+
+def _make_move_then_tweak(repo: Path) -> str:
+    """Build base -> a clean move (subject has '-move') -> a logic tweak; return base."""
+    _write(
+        repo,
+        **{"src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n"},
+    )
+    base = _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n\nhelper(3)\n",
+            "mod.py": "def helper(value):\n    return value * 2\n",
+        },
+    )
+    _commit(repo, "extract-helper-move: move helper to mod")
+    _write(repo, **{"mod.py": "def helper(value):\n    return value * 3\n"})
+    _commit(repo, "tweak-helper: change the logic")
+    return base
+
+
+def test_verify_move_range_match_skips_non_matching_subjects(
+    repo: Path, capsys
+) -> None:
+    """With --match only commits whose subject matches are verified; others are skipped."""
+    base = _make_move_then_tweak(repo)
+    result = verify_move_range(f"{base}..HEAD", match="-move", repo_root=str(repo))
+    out = capsys.readouterr().out
+    assert result is True
+    assert "verified 1 commit(s), skipped 1" in out
+    assert "extract-helper-move" in out
+    assert "tweak-helper" not in out
+
+
+def test_verify_move_range_without_match_verifies_every_commit(
+    repo: Path, capsys
+) -> None:
+    """Without --match the whole range is verified; a non-move makes the result False."""
+    base = _make_move_then_tweak(repo)
+    result = verify_move_range(f"{base}..HEAD", repo_root=str(repo))
+    out = capsys.readouterr().out
+    assert result is False
+    assert "verified 2 commit(s)" in out
