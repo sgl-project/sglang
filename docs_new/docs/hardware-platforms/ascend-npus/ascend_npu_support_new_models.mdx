@@ -336,8 +336,8 @@ Using the same Llama wrapper from the previous section, here is how to package a
 sglang_custom_project/
 |----setup.py
 |----custom_llm/
-    |----__init__.py
-    |----llama_wrapper.py
+     |----__init__.py
+     |----llama_wrapper.py
 ```
 
 Write the `setup.py`:
@@ -369,7 +369,7 @@ from sglang.srt.models.llama import LlamaForCausalLM
 
 class LlamaWrapper(LlamaForCausalLM):
     def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
-                prefix: str = "") -> None:
+                 prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch,
