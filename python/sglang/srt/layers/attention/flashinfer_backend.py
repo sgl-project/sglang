@@ -3687,6 +3687,23 @@ class FlashInferIndicesUpdaterDecode:
                 )
             )
 
+        # Gemma-4 full-attention (head_dim==512) NVFP4: BatchDecodeWithPagedKVCache
+        # has no head_dim_vo and would JIT-compile an unsupported symmetric vo=512
+        # FP4 module (FlashInfer #3684 only provides asymmetric qk=512/vo=256).
+        # forward_decode routes this layer through the prefill wrapper (vo=256
+        # decode-as-prefill); the decode wrapper here is planned only for its index
+        # buffers, which are dtype-independent, so plan it as bf16 to avoid
+        # requesting the FP4 vo=512 module. Mirrors vLLM #46329, which routes all
+        # VO-split decode through the prefill wrapper.
+        _geom = self.wrapper_geometries[wrapper_id]
+        _decode_data_type = self.kv_data_type
+        if (
+            self.attn_backend.is_nvfp4_native
+            and _flashinfer_vo_split_enabled()
+            and _geom.head_dim == 512
+        ):
+            _decode_data_type = self.q_data_type
+
         global global_override_indptr_cpu
         locally_override = False
         if seq_lens_cpu is not None and global_override_indptr_cpu is None:
@@ -3705,7 +3722,7 @@ class FlashInferIndicesUpdaterDecode:
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             plan_kwargs = {
-                "data_type": self.kv_data_type,
+                "data_type": _decode_data_type,
                 "q_data_type": self.q_data_type,
                 "non_blocking": True,
                 "fixed_split_size": fixed_split_size,
@@ -3733,7 +3750,7 @@ class FlashInferIndicesUpdaterDecode:
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
             plan_kwargs = {
-                "data_type": self.kv_data_type,
+                "data_type": _decode_data_type,
                 "q_data_type": self.q_data_type,
                 "non_blocking": True,
                 "fixed_split_size": fixed_split_size,
