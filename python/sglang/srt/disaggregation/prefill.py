@@ -361,7 +361,10 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
-                if not self.finalize_bootstrap(req):
+                if should_force_retry(req):  # skip checking for testing
+                    if not self.ensure_metadata_buffer(req):
+                        continue  # no more metadata buffer
+                elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
