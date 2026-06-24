@@ -45,8 +45,8 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
-from sglang.srt.distributed.communication_op import (
-    tensor_model_parallel_all_reduce,   # <-- use all‑reduce
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_world_size,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,8 @@ class TorchNpuRunnerCore(MoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
+
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         kernel = config.layer.w2_kernel
 
@@ -149,6 +151,9 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states, pertoken_scale = self.activation._apply_activation(
                 hidden_states
             )
+            # TP all-gather for intermediate dimension if needed
+            if self.tp_size > 1:
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
