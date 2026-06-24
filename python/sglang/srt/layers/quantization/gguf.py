@@ -983,7 +983,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
+        #from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         quant_info = TorchNpuQuantInfo(
