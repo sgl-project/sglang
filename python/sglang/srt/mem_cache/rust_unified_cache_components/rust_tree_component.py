@@ -40,17 +40,21 @@ class RustTreeComponent:
     def __init__(self, cache: "RustUnifiedRadixCache"):
         self.cache = cache
 
-    # --- Required: every component implements these (raise if not). ---
+    # --- Required: every component frees into its own pool (raise if not). ---
     def free_evicted(self, freed_bin: list[torch.Tensor]) -> None:
         """Free this component's evicted tensors into its pool. `evict()`
         guarantees the pool allocator is live before calling."""
         raise NotImplementedError
 
+    # --- Generic size accounting, keyed by this component's type. ---
     def evictable_size(self) -> int:
-        raise NotImplementedError
+        return self.cache._rust_radix.component_evictable_size(self.component_type)
 
     def protected_size(self) -> int:
-        raise NotImplementedError
+        return self.cache._rust_radix.component_protected_size(self.component_type)
+
+    def total_size(self) -> int:
+        return self.cache._rust_radix.component_total_size(self.component_type)
 
     # --- Optional hooks: the orchestrator loops these over every component, so
     #     only the participating component overrides; the rest stay no-ops. ---

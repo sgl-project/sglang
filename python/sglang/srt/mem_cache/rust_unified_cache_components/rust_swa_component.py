@@ -57,9 +57,3 @@ class RustSWAComponent(RustTreeComponent):
             self.cache._rust_radix.apply_swa_writes(self._node_indices, self._values)
             self._node_indices = []
             self._values = []
-
-    def evictable_size(self):
-        return self.cache._rust_radix.swa_evictable_token_size()
-
-    def protected_size(self):
-        return self.cache._rust_radix.swa_protected_token_size()

@@ -39,16 +39,6 @@ class RustMambaComponent(RustTreeComponent):
         for t in freed_bin:
             mamba_allocator.free(t)
 
-    def evictable_size(self):
-        return self.cache._rust_radix.mamba_evictable_token_size()
-
-    def protected_size(self):
-        return self.cache._rust_radix.mamba_protected_token_size()
-
-    def total_size(self):
-        # Mamba's unit is slots, not tokens.
-        return self.cache._rust_radix.mamba_total_size()
-
     def finalize_match(self, params, rust_result):
         """Copy the matched node's SSM state into a request-local slot."""
         if not params.cow_mamba or rust_result.mamba_value is None:

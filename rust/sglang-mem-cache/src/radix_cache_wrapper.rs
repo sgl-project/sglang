@@ -6,7 +6,7 @@ use pyo3::types::PyList;
 
 use crate::py_interop::PyTensor;
 
-use crate::component_type::NUM_COMPONENT_TYPES;
+use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::components::{EvictRequest, EvictResult};
 use crate::deferred_action::DeferredAction;
 use crate::radix_cache::{BigramRadixCache, InsertResult, MatchResult, PageRadixCache};
@@ -231,36 +231,20 @@ macro_rules! define_radix_cache_wrapper {
                 self.inner.active_tree_node_count()
             }
 
-            fn evictable_token_size(&self) -> usize {
-                self.inner.evictable_token_size()
+            fn component_evictable_size(&self, ct: ComponentType) -> usize {
+                self.inner.component_evictable_size(ct)
             }
 
-            fn protected_token_size(&self) -> usize {
-                self.inner.protected_token_size()
+            fn component_protected_size(&self, ct: ComponentType) -> usize {
+                self.inner.component_protected_size(ct)
+            }
+
+            fn component_total_size(&self, ct: ComponentType) -> usize {
+                self.inner.component_total_size(ct)
             }
 
             fn total_size(&self) -> (usize, usize) {
                 self.inner.total_size()
-            }
-
-            fn swa_evictable_token_size(&self) -> usize {
-                self.inner.swa_evictable_token_size()
-            }
-
-            fn swa_protected_token_size(&self) -> usize {
-                self.inner.swa_protected_token_size()
-            }
-
-            fn mamba_evictable_token_size(&self) -> usize {
-                self.inner.mamba_evictable_token_size()
-            }
-
-            fn mamba_protected_token_size(&self) -> usize {
-                self.inner.mamba_protected_token_size()
-            }
-
-            fn mamba_total_size(&self) -> usize {
-                self.inner.mamba_total_size()
             }
 
             /// Lock `node_idx` and ancestors, protecting the prefix from eviction.

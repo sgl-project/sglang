@@ -36,9 +36,3 @@ class RustFullComponent(RustTreeComponent):
                 f"RustFullComponent: unknown insert action {tag!r}"
             )
         self.cache.token_to_kv_pool_allocator.free(full_to_free)
-
-    def evictable_size(self):
-        return self.cache._rust_radix.evictable_token_size()
-
-    def protected_size(self):
-        return self.cache._rust_radix.protected_token_size()

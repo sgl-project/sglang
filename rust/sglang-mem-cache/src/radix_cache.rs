@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use tch::{Device, Kind, Tensor};
 
+use crate::component_type::ComponentType;
 use crate::components::{Component, FullComponent, IncLockRefResult, MambaComponent, SwaComponent};
-use crate::components::{EvictRequest, EvictResult, FullSlot, MambaSlot, Slot, SwaSlot};
+use crate::components::{EvictRequest, EvictResult, MambaSlot, Slot, SwaSlot};
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_pool::{
@@ -584,57 +585,29 @@ impl<K: ChildKeyType> RadixCache<K> {
         self.tree_node_pool.active_node_count()
     }
 
-    /// Sum of `key.len()` across FULL device-value unreferenced nodes.
-    pub fn evictable_token_size(&self) -> usize {
-        FullSlot::unlocked_size(&self.tree_node_pool)
+    /// Unreferenced (evictable) token size for one component.
+    pub fn component_evictable_size(&self, ct: ComponentType) -> usize {
+        self.tree_node_pool.components[ct as usize].unlocked_size
     }
 
-    /// Sum of `key.len()` across FULL device-value referenced nodes.
-    pub fn protected_token_size(&self) -> usize {
-        FullSlot::locked_size(&self.tree_node_pool)
+    /// Referenced (protected) token size for one component.
+    pub fn component_protected_size(&self, ct: ComponentType) -> usize {
+        self.tree_node_pool.components[ct as usize].locked_size
     }
 
-    /// `(FULL tokens, auxiliary tokens)`, where aux is the SWA + Mamba values.
-    /// Mirrors `UnifiedRadixCache.total_size()`.
+    /// Total (evictable + protected) token size for one component.
+    pub fn component_total_size(&self, ct: ComponentType) -> usize {
+        let s = &self.tree_node_pool.components[ct as usize];
+        s.unlocked_size + s.locked_size
+    }
+
+    /// `(FULL tokens, auxiliary tokens)`, aux = SWA + Mamba. Mirrors
+    /// `UnifiedRadixCache.total_size()`; absent components contribute 0.
     pub fn total_size(&self) -> (usize, usize) {
-        let full = FullSlot::total_size(&self.tree_node_pool);
-        let mut aux = 0;
-        if self.has_swa_component {
-            aux += SwaSlot::total_size(&self.tree_node_pool);
-        }
-        if self.has_mamba_component {
-            aux += MambaSlot::total_size(&self.tree_node_pool);
-        }
+        let full = self.component_total_size(ComponentType::Full);
+        let aux = self.component_total_size(ComponentType::Swa)
+            + self.component_total_size(ComponentType::Mamba);
         (full, aux)
-    }
-
-    /// Total Mamba slots (evictable + protected).
-    pub fn mamba_total_size(&self) -> usize {
-        if self.has_mamba_component {
-            MambaSlot::total_size(&self.tree_node_pool)
-        } else {
-            0
-        }
-    }
-
-    /// Sum of `key.len()` across SWA device-value unreferenced nodes.
-    pub fn swa_evictable_token_size(&self) -> usize {
-        SwaSlot::unlocked_size(&self.tree_node_pool)
-    }
-
-    /// Sum of `key.len()` across SWA device-value referenced nodes.
-    pub fn swa_protected_token_size(&self) -> usize {
-        SwaSlot::locked_size(&self.tree_node_pool)
-    }
-
-    /// Count of unlocked nodes with a Mamba value populated.
-    pub fn mamba_evictable_token_size(&self) -> usize {
-        MambaSlot::unlocked_size(&self.tree_node_pool)
-    }
-
-    /// Count of locked nodes with a Mamba value populated.
-    pub fn mamba_protected_token_size(&self) -> usize {
-        MambaSlot::locked_size(&self.tree_node_pool)
     }
 
     /// Acquire: dispatch to each component's `inc_lock_ref` (FULL first, then
