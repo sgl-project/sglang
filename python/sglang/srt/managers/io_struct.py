@@ -1793,6 +1793,7 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     # The prefix of the profile filenames
