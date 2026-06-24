@@ -5,7 +5,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.activation import GeluAndMul
-
+from sglang.srt.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+)
 
 # =============================================================================
 # Abstract base for all activation variants
@@ -235,6 +237,25 @@ class NPUSwigluStepAndMul(BaseActivation):
         gate = F.silu(gate).clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
         return gate * up
+
+
+# =============================================================================
+# 8. Standard SwiGLU
+# =============================================================================
+class NPUSwiglu(BaseActivation):
+    """
+    Standard SwiGLU activation (NPU backend).
+
+    Use when:
+        - Running without activation quantisation (e.g. W8A8 decode).
+        - The downstream matmul does not need an activation scale.
+    """
+
+    def _apply_activation(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return tensor_model_parallel_all_gather(torch.ops.npu.npu_swiglu(hidden_states), dim=-1) , None
+
 
 
 # =============================================================================
