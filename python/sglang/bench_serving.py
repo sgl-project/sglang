@@ -11,7 +11,7 @@ from sglang.benchmark.serving import (  # noqa: F401
 
 warnings.warn(
     "sglang.bench_serving is deprecated; use sglang.benchmark.serving instead.",
-    DeprecationWarning,
+    FutureWarning,
     stacklevel=1,
 )
 

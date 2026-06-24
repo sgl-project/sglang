@@ -13,7 +13,7 @@ warnings.warn(
     "`sglang.bench_one_batch_server` is deprecated and will be removed in a "
     "future release; use `sglang.benchmark.one_batch_server` instead "
     "(e.g. `python -m sglang.benchmark.one_batch_server`).",
-    DeprecationWarning,
+    FutureWarning,
     stacklevel=1,
 )
 
