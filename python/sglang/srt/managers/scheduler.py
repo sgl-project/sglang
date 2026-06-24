@@ -172,6 +172,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.last_iter_snapshot import (
+    LastIterSnapshot,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -964,6 +967,12 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # Snapshot of the last forward batch for out-of-loop readers (request
+        # receiver, pool stats, invariant checker). Published at iter end.
+        self.last_iter: Optional[LastIterSnapshot] = None
+        # Whether the last forward batch was empty/absent (cur_batch and
+        # last_batch are equal between iters, so this captures both).
+        self.idle: bool = True
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1501,6 +1510,14 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    @staticmethod
+    def _last_iter_snapshot(batch: Optional[ScheduleBatch]) -> LastIterSnapshot:
+        return LastIterSnapshot(
+            forward_mode=batch.forward_mode if batch is not None else None,
+            reqs=batch.reqs if batch is not None else [],
+            is_empty=batch is None or batch.is_empty(),
+        )
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1528,6 +1545,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self.last_iter = self._last_iter_snapshot(batch)
+            self.idle = batch is None or batch.is_empty()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1589,6 +1608,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self.last_iter = self._last_iter_snapshot(batch)
+            self.idle = batch is None or batch.is_empty()
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -1724,7 +1745,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_forward_mode=lambda: (
-                self.last_batch.forward_mode if self.last_batch is not None else None
+                self.last_iter.forward_mode if self.last_iter is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
@@ -1757,7 +1778,7 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens,
-            get_last_batch=lambda: self.last_batch,
+            get_last_iter=lambda: self.last_iter,
             get_running_batch=lambda: self.running_batch,
         )
 
@@ -1775,7 +1796,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_last_batch=lambda: self.last_batch,
+            get_last_iter=lambda: self.last_iter,
             get_running_batch=lambda: self.running_batch,
         )
 
@@ -3499,8 +3520,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and self.idle
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )

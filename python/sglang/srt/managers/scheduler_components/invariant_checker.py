@@ -52,7 +52,7 @@ class SchedulerInvariantChecker:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
-    get_last_batch: Callable
+    get_last_iter: Callable
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -194,43 +194,43 @@ class SchedulerInvariantChecker:
         For full pool: uncached = allocated - cache_protected_len
         For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
         """
-        # After decode: running_batch IS last_batch (same object), count once.
-        # After prefill: they differ, both hold uncached tokens.
-        # Use identity (is / is not), not membership or ==: ScheduleBatch's
-        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
-        last_batch = self.get_last_batch()
+        # Dedup reqs by identity: after a decode iter, last_iter.reqs and
+        # running_batch.reqs hold the same Req objects (count once); after a
+        # prefill iter they are disjoint (count both). The previous code relied
+        # on ScheduleBatch object identity; with last_iter now a snapshot we
+        # dedup the reqs directly instead.
+        last_iter = self.get_last_iter()
         running_batch = self.get_running_batch()
-        batches = [last_batch]
-        if (
-            running_batch is not None
-            and running_batch is not last_batch
-            and not running_batch.is_empty()
-        ):
-            batches.append(running_batch)
+        reqs_by_id = {}
+        if last_iter is not None:
+            for req in last_iter.reqs:
+                reqs_by_id[id(req)] = req
+        if running_batch is not None and not running_batch.is_empty():
+            for req in running_batch.reqs:
+                reqs_by_id.setdefault(id(req), req)
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
-                    continue
+        for req in reqs_by_id.values():
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            if req.kv_committed_freed or req.req_pool_idx is None:
+                continue
 
-                allocated_len = req.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+            allocated_len = req.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
-                    )
+            full_uncached += allocated_len - req.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.cache_protected_len, req.swa_evicted_seqlen
+                )
 
         return full_uncached, swa_uncached
 
     def self_check_during_busy(self):
-        if self.get_last_batch() is None:
+        if self.get_last_iter() is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()

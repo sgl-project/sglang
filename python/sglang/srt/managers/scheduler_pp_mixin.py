@@ -94,6 +94,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
@@ -162,6 +163,7 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
+            self.idle = server_is_idle
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
@@ -222,6 +224,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
@@ -340,6 +343,7 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
+            self.idle = server_is_idle
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
@@ -367,6 +371,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
@@ -533,6 +538,7 @@ class SchedulerPPMixin:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
+            self.idle = server_is_idle
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
