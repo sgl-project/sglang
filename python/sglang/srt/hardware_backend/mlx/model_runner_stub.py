@@ -16,6 +16,9 @@ from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    ModelLayerInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +136,11 @@ class MlxModelRunnerStub(ModelRunner):
             self.model_config.num_hidden_layers,
             self.model_config.num_attention_layers,
         )
-        self.start_layer = 0
-        self.end_layer = model_num_layers
-        self.num_effective_layers = model_num_layers
+        self.layer_info = ModelLayerInfo(
+            start_layer=0,
+            end_layer=model_num_layers,
+            num_effective_layers=model_num_layers,
+        )
 
         # KV cache dtype
         self.kv_cache_dtype = self.dtype

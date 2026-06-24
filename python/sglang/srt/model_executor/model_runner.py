@@ -124,6 +124,7 @@ from sglang.srt.model_executor.model_runner_components.expert_location_helpers i
     get_healthy_expert_location_src_rank,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
     resolve_layer_indices,
 )
@@ -500,9 +501,9 @@ class ModelRunner:
             use_mla_backend=self.use_mla_backend,
             mambaish_config=mambaish_config(self.model_config),
             hybrid_gdn_config=hybrid_gdn_config(self.model_config),
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
-            num_effective_layers=self.num_effective_layers,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            num_effective_layers=self.layer_info.num_effective_layers,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
@@ -598,20 +599,17 @@ class ModelRunner:
 
         self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
 
-        layer_info = resolve_layer_indices(
+        self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
         )
-        self.start_layer = layer_info.start_layer
-        self.end_layer = layer_info.end_layer
-        self.num_effective_layers = layer_info.num_effective_layers
 
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             is_hybrid_swa=self.is_hybrid_swa,
         )
 
@@ -652,7 +650,7 @@ class ModelRunner:
             model_config=self.model_config,
             pp_size=self.ps.pp_size,
             pp_rank=self.ps.pp_rank,
-            start_layer=self.start_layer,
+            start_layer=self.layer_info.start_layer,
         )
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):

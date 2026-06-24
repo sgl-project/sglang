@@ -119,11 +119,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             effective_layer_ids = [
                 i
                 for i in mambaish.full_attention_layer_ids
-                if kvc.start_layer <= i < kvc.end_layer
+                if kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
             ]
             num_layers = len(effective_layer_ids)
         else:
-            num_layers = kvc.num_effective_layers
+            num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
 
@@ -461,11 +461,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
-        self.compression_ratios = cfg.compress_ratios[kvc.start_layer : kvc.end_layer]
+        self.compression_ratios = cfg.compress_ratios[
+            kvc.layer_info.start_layer : kvc.layer_info.end_layer
+        ]
         if kvc.ps.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
-                f"layers=[{kvc.start_layer},{kvc.end_layer}) "
+                f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
