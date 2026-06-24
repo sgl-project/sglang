@@ -92,7 +92,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             sliding_window_size=self.sliding_window_size,
             mamba_cache_chunk_size=self.mamba_cache_chunk_size,
         )
-        # Shared disabled-path tensor; must not be mutated.
+        # Shared empty tensor for fast return; must not be mutated.
         self._empty_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def _reject_unsupported(self, params: CacheInitParams, server_args: Any) -> None:
