@@ -238,7 +238,12 @@ def maybe_recover_ep_ranks(
     # are safe even though polling appears local.
     if ranks_to_recover and try_recover_ranks(ranks_to_recover):
         eplb_manager.reset_generator()
-        rebroadcast_expert_location_metadata(invoked_in_elastic_ep_rejoin_path=False)
+        broadcast_global_expert_location_metadata(
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            )
+        )
+        ElasticEPStateManager.instance().reset()
         broadcast_pyobj(
             [random_seed],
             parallel_state.get_world_group().rank,
@@ -249,16 +254,3 @@ def maybe_recover_ep_ranks(
         return True
 
     return False
-
-
-def rebroadcast_expert_location_metadata(
-    *, invoked_in_elastic_ep_rejoin_path: bool
-) -> None:
-    broadcast_global_expert_location_metadata(
-        src_rank=get_healthy_expert_location_src_rank(
-            invoked_in_elastic_ep_rejoin_path=invoked_in_elastic_ep_rejoin_path
-        )
-    )
-    ElasticEPStateManager.instance().reset()
-
-    _refresh_ep_members()

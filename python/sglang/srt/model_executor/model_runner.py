@@ -53,7 +53,6 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
     maybe_recover_ep_ranks,
-    rebroadcast_expert_location_metadata,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -65,6 +64,7 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
+    broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -117,6 +117,9 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
     capture_prefill_graph,
+)
+from sglang.srt.model_executor.model_runner_components.expert_location_helpers import (
+    get_healthy_expert_location_src_rank,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
@@ -353,7 +356,12 @@ class ModelRunner:
             and self.server_args.elastic_ep_rejoin
         ):
             join_process_groups()
-            rebroadcast_expert_location_metadata(invoked_in_elastic_ep_rejoin_path=True)
+            broadcast_global_expert_location_metadata(
+                src_rank=get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            )
+            ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
