@@ -22,6 +22,7 @@
 #   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
+#   SLURM_EXCLUSIVE    - request whole nodes (default 1); set 0 to disable
 #   TIME_LIMIT         - salloc time limit, default 01:00:00
 
 set -euo pipefail
@@ -231,10 +232,16 @@ chmod +x "$WORKDIR/drive.sh"
 NODELIST_ARG=()
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 
+# Request whole nodes so a co-scheduled job can't share a node and skew the
+# benchmark numbers. Toggle off with SLURM_EXCLUSIVE=0 on partitions that
+# disallow --exclusive.
+EXCLUSIVE_ARG=()
+[[ "${SLURM_EXCLUSIVE:-1}" == "1" ]] && EXCLUSIVE_ARG=(--exclusive)
+
 # One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
 TOTAL_NODES=$((PW + DW))
 
-salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" -t "$TIME_LIMIT" \
+salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" -t "$TIME_LIMIT" \
     bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
 
 echo "--- bench.log tail ---"; tail -40 "$WORKDIR/bench.log" || true
