@@ -66,7 +66,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         if (
             isinstance(self.quant_config, dict)
             and self.quant_config.get("quant_type") == "gguf"
-            and self.tp_size > 1
+            and get_tensor_model_parallel_world_size() > 1
         ):
             self.finalize = FinalizeRoutingWrapper(self.finalize, dim=-1)
 
