@@ -1144,6 +1144,71 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+@triton.jit
+def _fill_padded_rows_kernel(
+    out_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        ptrs = out_ptr + row * stride_row + cols
+        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        tl.store(ptrs, fill, mask=mask)
+
+
+def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+    # The fused kernel uses one program per row and assumes a row-major 2D
+    # tensor (columns contiguous); fall back to eager for anything else.
+    return x.dim() == 2 and x.stride(1) == 1
+
+
+def _fill_padded_rows(
+    x: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    fill_value,
+) -> None:
+    """Set ``x[row, :] = fill_value`` for every padded row (row index
+    ``>= num_token_non_padded``) using a single Triton launch.
+
+    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
+    issues several launch-latency-bound kernels per call. The grid is static
+    (one program per row) and the pad count is read from device memory inside
+    the kernel, so this is safe to capture inside a CUDA/HIP graph.
+    """
+    # Metadata-only checks (no device sync): the kernel reads a single scalar
+    # routing count from device memory, so it must be a 1-element integer tensor
+    # on the same device as ``x``.
+    assert isinstance(
+        num_token_non_padded, torch.Tensor
+    ), "num_token_non_padded must be a torch.Tensor"
+    assert num_token_non_padded.numel() == 1, (
+        "num_token_non_padded must be a single-element tensor, got shape "
+        f"{tuple(num_token_non_padded.shape)}"
+    )
+    assert (
+        not num_token_non_padded.dtype.is_floating_point
+    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
+    assert (
+        num_token_non_padded.device == x.device
+    ), "num_token_non_padded and x must be on the same device"
+    n_rows, n_cols = x.shape
+    _fill_padded_rows_kernel[(n_rows,)](
+        x,
+        num_token_non_padded,
+        n_cols,
+        fill_value,
+        x.stride(0),
+        BLOCK_COLS=triton.next_power_of_2(n_cols),
+    )
+
+
 def _eplb_remap_enabled() -> bool:
     # A real logical->physical mapping only exists when EPLB is enabled, the
     # initial expert placement is non-trivial, or there are redundant physical
@@ -1252,6 +1317,8 @@ def _mask_topk_ids_padded_region(
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         mask = (indices >= num_token_non_padded).unsqueeze(-1)
         topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
+    elif _can_fuse_padded_region(topk_ids):
+        _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value
