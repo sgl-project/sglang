@@ -263,28 +263,6 @@ The profile merger generates:
 - Individual rank trace files: `{profile_id}-TP-{tp}-DP-{dp}-PP-{pp}-EP-{ep}.trace.json.gz`
 - Merged trace file: `merged-{profile_id}.trace.json.gz`
 
-### Profile the CUDA graph capture phase
-
-The tools above profile the steady-state runtime (prefill / decode). To instead profile the **CUDA graph capture phase** that runs once at server startup, launch the server with `--enable-profile-cuda-graph`. This exports one PyTorch Profiler trace per captured batch size, which is useful for diagnosing slow or memory-heavy graph capture.
-
-```bash
-# set trace path
-export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
-
-# launch the server with CUDA graph capture profiling enabled
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --enable-profile-cuda-graph
-```
-
-Behavior and output:
-
-- Traces are written to `${SGLANG_TORCH_PROFILER_DIR}/capture_traces/` (falls back to `traces/capture_traces/` if the variable is unset).
-- One trace file is produced per captured batch size, named `bs_{bs}_rank0.json.gz`. The captured forward for each batch size is wrapped in a `capture_{num_tokens}_{forward_mode}` range, making it easy to locate in the trace.
-- The two warmup runs that precede each capture are skipped, so only the capture run is recorded.
-- Only tensor-parallel rank 0 is profiled.
-- A CUDA memory snapshot (`cuda_graph_runner_memory_usage.pickle`) and per-kernel CPU/CUDA time summary tables are also emitted for the capture phase.
-
-The capture traces are viewed the same way as other PyTorch Profiler traces (see [View traces](#view-traces)).
-
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
 ```bash
