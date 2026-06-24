@@ -64,15 +64,14 @@ if TYPE_CHECKING:
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
-        mr = model_runner
-        sa = mr.server_args
+        sa = model_runner.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
         num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
+        if model_runner.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
             num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
-            if mr.is_draft_worker:
+            if model_runner.is_draft_worker:
                 num_tokens_per_bs = max(
                     sa.speculative_eagle_topk or 1,
                     num_draft_tokens,
@@ -84,8 +83,8 @@ class EagerRunner(BaseRunner):
                 )
             else:
                 num_tokens_per_bs = (
-                    mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
+                    model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                        num_draft_tokens, model_runner.is_draft_worker
                     )
                 )
         else:
@@ -93,10 +92,10 @@ class EagerRunner(BaseRunner):
             if dllm_config is not None:
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
                 num_tokens_per_bs = dllm_config.block_size
-        max_bs = mr.max_running_requests
+        max_bs = model_runner.max_running_requests
         if (
-            mr.is_draft_worker
-            and mr.spec_algorithm.is_frozen_kv_mtp()
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
             and sa.speculative_eagle_topk > 1
         ):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
@@ -108,31 +107,33 @@ class EagerRunner(BaseRunner):
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
-        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
+        prefill_ceiling = max(
+            model_runner.max_total_num_tokens, sa.max_prefill_buffer_tokens()
+        )
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
         if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
         self._eager_num_tokens_per_bs = num_tokens_per_bs
-        is_encoder_decoder = mr.model_config.is_encoder_decoder
+        is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
-            device=mr.device,
+            device=model_runner.device,
             max_bs=max_bs,
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                sa.enable_mamba_extra_buffer() and mr.spec_algorithm.is_none()
+                sa.enable_mamba_extra_buffer() and model_runner.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(
-                getattr(mr.model_config.hf_config, "max_source_positions", 0)
+                getattr(model_runner.model_config.hf_config, "max_source_positions", 0)
                 if is_encoder_decoder
                 else 0
             ),
             dp_size=sa.dp_size,
         )
-        # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
+        # Eager has no capture step, so warm up here (run-once via model_runner._kernel_warmed_up).
         self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
@@ -144,12 +145,13 @@ class EagerRunner(BaseRunner):
         be optimal at decode. The eager input registry spans the prefill token
         ceiling; the dummy run only needs the decode-sized slice.
         """
-        mr = self.model_runner
+        model_runner = self.model_runner
         num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
+        if model_runner.spec_algorithm.is_speculative():
             num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    model_runner.server_args.speculative_num_draft_tokens,
+                    model_runner.is_draft_worker,
                 )
             )
         return (

@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 # Mutable ``_weights_send_group`` dict prevents ``frozen=True``; explicit
 # Rule-5 exception per the dataclass-defaults sprint-wide rule.
-# tp_rank / tp_size / gpu_id read via ``self._mr`` (consistent with
+# tp_rank / tp_size / gpu_id read via ``self._model_runner`` (consistent with
 # WeightUpdater) — no redundant storage.
 @dataclass(slots=True, kw_only=True)
 class WeightExporter:
-    _mr: Any  # ModelRunner — kept untyped to avoid TYPE_CHECKING import here
+    _model_runner: Any  # ModelRunner — kept untyped to avoid TYPE_CHECKING import here
     _weights_send_group: dict = field(default_factory=dict)
 
     def init_weights_send_group_for_remote_instance(
@@ -39,13 +39,13 @@ class WeightExporter:
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self._mr.tp_size
-        ), f"Expected {self._mr.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self._mr.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self._mr.tp_rank}"
+            len(ports_list) == self._model_runner.tp_size
+        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
 
         logger.info(
-            f"init custom process group: tp_rank={self._mr.tp_rank}, gpu_id={self._mr.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"init custom process group: tp_rank={self._model_runner.tp_rank}, gpu_id={self._model_runner.gpu_id}, master_address={master_address}, master_port={group_port}, "
             f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
@@ -60,7 +60,7 @@ class WeightExporter:
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self._mr.gpu_id),
+                device_id=torch.device("cuda", self._model_runner.gpu_id),
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
@@ -85,10 +85,10 @@ class WeightExporter:
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self._mr.tp_size
-        ), f"Expected {self._mr.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self._mr.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self._mr.tp_rank}"
+            len(ports_list) == self._model_runner.tp_size
+        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
 
         if self._weights_send_group[group_name] is not None:
             send_group = self._weights_send_group[group_name]
@@ -102,7 +102,7 @@ class WeightExporter:
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
-            for _, weights in self._mr.model.named_parameters():
+            for _, weights in self._model_runner.model.named_parameters():
                 torch.distributed.broadcast(
                     weights,
                     src=0,
@@ -125,7 +125,7 @@ class WeightExporter:
 
         logger.info(f"Saving model to {url}")
         RemoteModelLoader.save_model(
-            self._mr.model, self._mr.model_config.model_path, url
+            self._model_runner.model, self._model_runner.model_config.model_path, url
         )
 
     def save_sharded_model(
@@ -139,7 +139,7 @@ class WeightExporter:
         logger.info(
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
-        ShardedStateLoader.save_model(self._mr.model, path, pattern, max_size)
+        ShardedStateLoader.save_model(self._model_runner.model, path, pattern, max_size)
 
     def get_weights_by_name(
         self: WeightExporter, name: str, truncate_size: int = 100
@@ -151,8 +151,8 @@ class WeightExporter:
         """
         # TODO: (chenyang) Add support for Qwen models.
         try:
-            return self._mr.model.get_weights_by_name(
-                name, truncate_size, tp_size=self._mr.tp_size
+            return self._model_runner.model.get_weights_by_name(
+                name, truncate_size, tp_size=self._model_runner.tp_size
             )
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")

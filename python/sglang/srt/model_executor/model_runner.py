@@ -466,7 +466,7 @@ class ModelRunner:
         )
 
     def init_weight_exporter(self):
-        self.weight_exporter = WeightExporter(_mr=self)
+        self.weight_exporter = WeightExporter(_model_runner=self)
 
     def init_remote_instance_weight_transport(self):
         self.remote_instance_weight_transport = RemoteInstanceWeightTransport(

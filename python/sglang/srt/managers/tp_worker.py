@@ -339,10 +339,10 @@ class TpModelWorker(BaseTpWorker):
             self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
             self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.model_runner.alloc_memory_pool(memory_pool_config)
-        for mr in self.model_runner_list[1:]:
-            mr.req_to_token_pool = self.req_to_token_pool
-            mr.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
-            mr.alloc_memory_pool(memory_pool_config)
+        for model_runner in self.model_runner_list[1:]:
+            model_runner.req_to_token_pool = self.req_to_token_pool
+            model_runner.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
+            model_runner.alloc_memory_pool(memory_pool_config)
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
@@ -360,16 +360,18 @@ class TpModelWorker(BaseTpWorker):
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
         self.model_runner.init_attention_backends()
-        for mr in self.model_runner_list[1:]:
-            mr.init_attention_backends()
+        for model_runner in self.model_runner_list[1:]:
+            model_runner.init_attention_backends()
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs for all model runners."""
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
-        for mr in self.model_runner_list[1:]:
-            mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+        for model_runner in self.model_runner_list[1:]:
+            model_runner.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig

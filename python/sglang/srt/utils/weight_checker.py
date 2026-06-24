@@ -140,14 +140,14 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        mr = self._model_runner
+        model_runner = self._model_runner
         return ParallelismInfo(
-            tp_rank=mr.tp_rank,
-            tp_size=mr.tp_size,
-            dp_rank=mr.dp_rank if mr.dp_rank is not None else 0,
-            dp_size=mr.dp_size,
-            pp_rank=mr.pp_rank,
-            pp_size=mr.pp_size,
+            tp_rank=model_runner.tp_rank,
+            tp_size=model_runner.tp_size,
+            dp_rank=model_runner.dp_rank if model_runner.dp_rank is not None else 0,
+            dp_size=model_runner.dp_size,
+            pp_rank=model_runner.pp_rank,
+            pp_size=model_runner.pp_size,
             rank=dist.get_rank() if dist.is_initialized() else 0,
             size=dist.get_world_size() if dist.is_initialized() else 1,
         )
