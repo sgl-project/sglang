@@ -92,7 +92,7 @@ class HttpServerEngineAdapter(EngineBase):
             {
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(self.server_args.tp_size)
+                    for _ in range(self.server_args.tp_size * self.server_args.pp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
