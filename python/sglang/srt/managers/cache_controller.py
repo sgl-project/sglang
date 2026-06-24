@@ -14,7 +14,6 @@ limitations under the License.
 """
 
 import logging
-import os
 import threading
 import time
 from queue import Empty, Queue
@@ -577,7 +576,7 @@ class HiCacheController:
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
-            self.dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
+            self.dp_rank = 0
 
         self.pp_rank = get_pipeline_model_parallel_rank()
         self.pp_size = get_pipeline_model_parallel_world_size()
