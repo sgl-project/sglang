@@ -90,6 +90,15 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        is_gguf = (
+            self.quant_confi
+            and hasattr(self.quant_config, "get_name")
+            and self.quant_config.get_name() == "gguf
+        )
+        if is_gguf and self.tp_size > 1:
+            self.enable_all_gather = True
+        else
+            self.enable_all_gather = False
 
         kernel = config.layer.w2_kernel
 
@@ -155,7 +164,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                 hidden_states
             )
             # TP all-gather for intermediate dimension if needed
-            if self.tp_size > 1:
+            if self.enable_all_gather:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         # --- w2 (down) projection ---
