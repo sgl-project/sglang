@@ -19,12 +19,12 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -170,7 +170,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         layer_sparse_attention_config = {
             int(i): j for i, j in self.sparse_attention_config[layer_idx].items()
         }
-        start_head = self.num_heads * get_tensor_model_parallel_rank()
+        start_head = self.num_heads * get_parallel().tp_rank
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 

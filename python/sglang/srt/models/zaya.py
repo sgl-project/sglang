@@ -50,11 +50,8 @@ from torch import nn
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -75,6 +72,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -202,9 +200,9 @@ class CCA(nn.Module):
         self.total_padding = self.padding0 + self.padding1
 
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
 
@@ -833,8 +831,8 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
         # and ``ZayaConfig.mamba2_cache_params`` sizes the conv-state cache on
@@ -843,7 +841,7 @@ class ZayaAttention(nn.Module):
         # ``use_dp_attention_reduce``), which this model does not wire up, so
         # require the two groups to coincide and fail fast instead of silently
         # mis-sizing the conv-state cache.
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
@@ -1143,7 +1141,7 @@ class ZayaBlock(nn.Module):
         self.mlp_expansion = int(config.zaya_mlp_expansion)
         self.topk = int(getattr(config, "moe_router_topk", 1))
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if self.tp_size > self.num_moe_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than the "
