@@ -50,29 +50,41 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         validate_repo_id(candidate)  # let it raise if invalid
         return candidate
 
-    repo_id = resolve_model_repo_id(server_args.model_path)
-    if envs.SGLANG_USE_MODELSCOPE.get():
-        from modelscope.hub.api import HubApi
+    # Prefer the hub pipeline tag for Hub models; fall back to the loaded pipeline's
+    # own task_type for local checkpoints (e.g. a single .safetensors path), which
+    # have no hub repo to query.
+    task_name = None
+    try:
+        repo_id = resolve_model_repo_id(server_args.model_path)
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.hub.api import HubApi
 
-        api = HubApi()
-        model_info_obj = api.model_info(repo_id)
-        task_name = model_info_obj.tasks[0]["Name"].replace("-synthesis", "")
-    else:
-        from huggingface_hub import model_info
+            api = HubApi()
+            model_info_obj = api.model_info(repo_id)
+            task_name = model_info_obj.tasks[0]["Name"].replace("-synthesis", "")
+        else:
+            from huggingface_hub import model_info
 
-        task_name = model_info(repo_id).pipeline_tag
+            task_name = model_info(repo_id).pipeline_tag
+    except Exception as e:
+        logger.info(
+            "Could not resolve task from the model hub (%s); using the loaded "
+            "pipeline's task_type.",
+            e,
+        )
 
     # init client
     sync_scheduler_client.initialize(server_args)
 
     if task_name in ("text-to-video", "image-to-video", "video-to-video"):
         task_type = "video"
-    elif task_name in ["text-to-image", "image-to-image"]:
+    elif task_name in ("text-to-image", "image-to-image"):
         task_type = "image"
     else:
-        raise ValueError(
-            f"The task name {task_name} of model {server_args.model_path} is not a valid task name. Please check the model path."
+        task_type = (
+            "image" if server_args.pipeline_config.task_type.is_image_gen() else "video"
         )
+        task_name = task_name or server_args.pipeline_config.task_type.name
     video_visible_only = task_type == "video"
     image_visible_only = task_type == "image"
 

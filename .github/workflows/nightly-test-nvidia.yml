@@ -24,6 +24,7 @@ on:
           - 'nightly-test-perf-4-gpu-b200'
           - 'nightly-test-perf-8-gpu-b200'
           - 'nightly-test-specialized-8-gpu-b200'
+          - 'nightly-test-perf-4-gpu-gb300'
           - 'nightly-test-kernel-1-gpu-h100'
           - 'nightly-test-diffusion-comparison'
           - 'nightly-test-kernel-8-gpu-h200'
@@ -505,9 +506,80 @@ jobs:
 
       - name: Run test
         timeout-minutes: 200
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "4-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
+
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  # GB300 (Grace-Blackwell NVL4) performance tests - 4 GPU (ARM64)
+  nightly-test-perf-4-gpu-gb300:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-gb300')
+    runs-on: 4-gpu-gb300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 600
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "4-gpu-gb300"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu-gb300 --nightly --continue-on-error --timeout-per-file 7200
+
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -695,6 +767,7 @@ jobs:
       - nightly-test-vlm-perf-2-gpu-h100
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
+      - nightly-test-perf-4-gpu-gb300
       - nightly-test-diffusion-comparison
       - nightly-test-precision-8-gpu-h200
       - consolidate-metrics
