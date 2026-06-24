@@ -493,3 +493,155 @@ def test_repro_run_reports_residual_when_a_change_is_bundled(
     diff = Repro(base, target).lower_call_sites("foo", "Old", paths=["c.py"]).run()
     assert "UNRELATED" in diff
     assert "RESIDUAL" in capsys.readouterr().out
+
+
+# --- extract_to_new_module -----------------------------------------------------
+
+
+def test_extract_to_new_module_cuts_trailing_block(tmp_path: Path) -> None:
+    """Cuts the trailing scaffolding+def block into a new file, prepending the future import."""
+    (tmp_path / "src.py").write_text(
+        "class M:\n"
+        "    def keep(self):\n"
+        "        return 1\n"
+        "\n"
+        "\n"
+        "import logging\n"
+        "\n"
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "\n"
+        "def foo(x):\n"
+        "    return x + 1\n"
+    )
+    r = Repro("b", "t").extract_to_new_module(
+        "src.py", "new.py", symbols=["foo"], future_import=True
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "src.py").read_text() == (
+        "class M:\n    def keep(self):\n        return 1\n\n\n"
+    )
+    assert (tmp_path / "new.py").read_text() == (
+        "from __future__ import annotations\n"
+        "import logging\n"
+        "\n"
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "\n"
+        "def foo(x):\n"
+        "    return x + 1\n"
+    )
+
+
+def test_extract_to_new_module_carries_a_trailing_class(tmp_path: Path) -> None:
+    """A class in the staged tail (not just a def) travels with the cut block."""
+    (tmp_path / "src.py").write_text(
+        "class M:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass\n"
+        "class Cfg:\n"
+        "    x: int\n"
+        "\n"
+        "\n"
+        "def foo():\n"
+        "    return Cfg(1)\n"
+    )
+    r = Repro("b", "t").extract_to_new_module(
+        "src.py", "new.py", symbols=["Cfg", "foo"], future_import=False
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "src.py").read_text() == "class M:\n    pass\n\n\n"
+    assert "class Cfg:" in (tmp_path / "new.py").read_text()
+    assert "def foo():" in (tmp_path / "new.py").read_text()
+
+
+# --- repath_import / add_typechecking_import -----------------------------------
+
+
+def test_repath_import_rewrites_nested_import(tmp_path: Path) -> None:
+    """A function-scoped import is repathed in place; the bare call is untouched."""
+    (tmp_path / "c.py").write_text(
+        "class K:\n"
+        "    def run(self):\n"
+        "        from old.mod import foo\n"
+        "\n"
+        "        return foo(1)\n"
+    )
+    r = Repro("b", "t").repath_import(
+        "c.py", old_module="old.mod", new_module="new.mod", name="foo"
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "c.py").read_text() == (
+        "class K:\n"
+        "    def run(self):\n"
+        "        from new.mod import foo\n"
+        "\n"
+        "        return foo(1)\n"
+    )
+
+
+def test_repath_import_leaves_a_module_level_import(tmp_path: Path) -> None:
+    """Only nested imports are repathed; a module-level import is left to the sorter."""
+    (tmp_path / "c.py").write_text("from old.mod import foo\n\n\nx = foo(1)\n")
+    r = Repro("b", "t").repath_import(
+        "c.py", old_module="old.mod", new_module="new.mod", name="foo"
+    )
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_typechecking_import_inserts_in_block(tmp_path: Path) -> None:
+    """The import is appended inside the existing TYPE_CHECKING block."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "    from b import Y\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+
+
+def test_move_symbol_drops_self_annotation_into_class(tmp_path: Path) -> None:
+    """Moving a `def foo(self: Target)` into Target drops the now-redundant annotation."""
+    (tmp_path / "src.py").write_text(
+        "class M:\n"
+        "    @staticmethod\n"
+        "    def foo(self: Target, x):\n"
+        "        return self.y + x\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class Target:\n    def keep(self):\n        return 1\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "foo",
+        src="src.py",
+        dst="dst.py",
+        into_class="Target",
+        dedent=0,
+        drop_self_annotation=True,
+    )
+    _apply(r, tmp_path)
+    text = (tmp_path / "dst.py").read_text()
+    assert "def foo(self, x):" in text
+    assert "self: Target" not in text

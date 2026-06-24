@@ -1,19 +1,20 @@
 """Reproduce a whole mechanical refactor and diff it byte-for-byte against a commit.
 
 You write a ``transform()`` that recreates the change; ``verify_mechanical_refactor``
-checks out the base commit in a throwaway worktree, runs the transform, runs pre-commit,
-and diffs the result against the target commit. An empty diff is a PASS. Use this for a
-single mechanical PR, and for renames / inlines where a formatter re-wraps lines
-(reproduce-and-diff is more robust there than inspecting the diff).
+checks out the base commit in a throwaway worktree, runs the transform, runs pre-commit on
+the changed files, and diffs the result against the target commit. An empty diff is a PASS.
+Use this for a single mechanical PR -- a relocation, a whole-file split, or a rename where a
+formatter re-wraps lines, which reproduce-and-byte-diff certifies exactly.
 
 The ``Repro`` builder composes faithful relocation primitives (``move_symbol``,
-``lower_call_sites``, ``requalify_call_sites``, ``remove_import``, ``add_import``) into a
-transform, so a move that a formatter re-wrapped can be reproduced and certified. Each
-primitive does only a relocation-faithful edit (it never changes logic), so a byte match
-after the formatter certifies the commit is exactly that relocation. The primitives are
-deliberately small and AST-driven; see reproduce-mode.md.
+``extract_to_new_module``, ``lower_call_sites``, ``requalify_call_sites``,
+``remove_import``, ``add_import``, ``repath_import``, ``add_typechecking_import``) into a
+transform, so a move that a formatter re-wrapped can be reproduced and certified. Each primitive does only a
+relocation-faithful edit (it never changes logic), so a byte match after the formatter
+certifies the commit is exactly that relocation. The primitives are deliberately small and
+AST-driven; see reproduce-mode.md.
 
-This module is self-contained and independent of the move-verifier.
+This module is self-contained and needs only git and the standard library.
 """
 
 import ast
@@ -71,7 +72,16 @@ def verify_mechanical_refactor(
         transform(Path(worktree_dir))
 
         print("[3/4] Running pre-commit...")
-        exec_command("pre-commit run --all-files", cwd=worktree_dir, check=False)
+        exec_command("git add -A", cwd=worktree_dir)
+        changed = exec_command(
+            f"git diff --cached --name-only --diff-filter=ACMR {base_commit}",
+            cwd=worktree_dir,
+        ).split()
+        if changed:
+            files = " ".join(shlex.quote(path) for path in changed)
+            exec_command(
+                f"pre-commit run --files {files}", cwd=worktree_dir, check=False
+            )
         if exec_command("git status --porcelain", cwd=worktree_dir):
             git_add_and_commit("pre-commit fixes", cwd=worktree_dir)
 
@@ -171,6 +181,30 @@ def _rewrite_calls(text: str, predicate: "Callable", build: "Callable") -> str:
     for sl, sc, el, ec, r in sorted(repls, reverse=True):
         text = _replace_span(text, sl, sc, el, ec, r)
     return text
+
+
+def _drop_self_annotation(method_text: str, name: str) -> str:
+    """Drop the type annotation from a moved method's ``self`` parameter -- relocating
+    ``def foo(self: Target)`` into ``Target`` makes the annotation redundant. The body is
+    otherwise untouched, so the relocation stays byte-faithful. ``method_text`` may still be
+    class-indented, so it is dedented to parse and the columns are mapped back."""
+    first_line = method_text.split("\n", 1)[0]
+    base_indent = len(first_line) - len(first_line.lstrip(" "))
+    fn = _find_def(ast.parse(dedent(method_text, base_indent)), name)
+    if fn is None or not fn.args.args:
+        return method_text
+    first = fn.args.args[0]
+    if first.arg != "self" or first.annotation is None:
+        return method_text
+    annotation = first.annotation
+    return _replace_span(
+        method_text,
+        first.lineno,
+        first.col_offset + base_indent + len("self"),
+        annotation.end_lineno,
+        annotation.end_col_offset + base_indent,
+        "",
+    )
 
 
 class Repro:
@@ -296,6 +330,60 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def add_typechecking_import(self, rel: str, import_stmt: str) -> "Repro":
+        """Append ``import_stmt`` inside the file's ``if TYPE_CHECKING:`` block -- a moved
+        definition whose annotations reference a type needs that type imported there. The
+        import sorter orders the block, so the exact insertion point does not matter."""
+
+        def op(root: Path) -> None:
+            path = root / rel
+            lines = path.read_text().splitlines(keepends=True)
+            for node in ast.parse("".join(lines)).body:
+                if isinstance(node, ast.If) and ast.unparse(node.test) in (
+                    "TYPE_CHECKING",
+                    "typing.TYPE_CHECKING",
+                ):
+                    indent = " " * node.body[0].col_offset
+                    at = node.body[-1].end_lineno
+                    lines.insert(at, f"{indent}{import_stmt}\n")
+                    path.write_text("".join(lines))
+                    return
+            raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")
+
+        self.ops.append(op)
+        return self
+
+    def repath_import(
+        self, rel: str, *, old_module: str, new_module: str, name: str
+    ) -> "Repro":
+        """Repath every function-scoped ``from old_module import ... name ...`` to
+        ``from new_module import ...`` in place -- the moved symbol's home changed, so its
+        importer adjusts. Only imports nested below module level are touched; a module-level
+        import is left to the import sorter via add_import / remove_import."""
+
+        def op(root: Path) -> None:
+            path = root / rel
+            lines = path.read_text().splitlines(keepends=True)
+            tree = ast.parse("".join(lines))
+            top_level = {id(node) for node in tree.body}
+            changed = False
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and id(node) not in top_level
+                    and node.module == old_module
+                    and any(alias.name == name for alias in node.names)
+                ):
+                    lines[node.lineno - 1] = lines[node.lineno - 1].replace(
+                        f"from {old_module} import", f"from {new_module} import", 1
+                    )
+                    changed = True
+            assert changed, f"nested import of {name} from {old_module} not in {rel}"
+            path.write_text("".join(lines))
+
+        self.ops.append(op)
+        return self
+
     def move_symbol(
         self,
         name: str,
@@ -304,11 +392,13 @@ class Repro:
         dst: str,
         into_class: str | None,
         dedent: int = 0,
+        drop_self_annotation: bool = False,
     ) -> "Repro":
         """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` -- at
         the end of ``into_class`` (or module level when None) -- dropping a move decorator
-        and dedenting by ``dedent``. The body is moved verbatim; the formatter normalises
-        the surrounding blank lines."""
+        and dedenting by ``dedent``. When ``drop_self_annotation``, the moved method's
+        ``self: Target`` annotation is dropped (redundant inside the class). The body is moved
+        verbatim; the formatter normalises the surrounding blank lines."""
 
         def op(root: Path) -> None:
             src_path = root / src
@@ -326,6 +416,8 @@ class Repro:
                     ln[dedent:] if ln[:dedent] == " " * dedent else ln for ln in kept
                 ]
             method_text = "".join(kept)
+            if drop_self_annotation:
+                method_text = _drop_self_annotation(method_text, name)
 
             dst_lines = dst_path.read_text().splitlines(keepends=True)
             if into_class is not None:
@@ -337,6 +429,68 @@ class Repro:
             dst_path.write_text(
                 "".join(dst_lines[:at] + ["\n", method_text] + dst_lines[at:])
             )
+
+        self.ops.append(op)
+        return self
+
+    def extract_to_new_module(
+        self,
+        src: str,
+        dst: str,
+        *,
+        symbols: list[str],
+        future_import: bool = True,
+    ) -> "Repro":
+        """Cut the contiguous tail of ``src`` -- the moved ``symbols`` and the module
+        scaffolding that leads into them (imports, a ``TYPE_CHECKING`` guard, a logger,
+        module constants) -- and write it as the new module ``dst``, prepending
+        ``from __future__ import annotations`` when ``future_import``. The body is moved
+        verbatim; the formatter sorts the imports and normalises the blank lines."""
+
+        def op(root: Path) -> None:
+            src_path = root / src
+            dst_path = root / dst
+            src_lines = src_path.read_text().splitlines(keepends=True)
+            body = ast.parse("".join(src_lines)).body
+            wanted = set(symbols)
+            scaffolding = (
+                ast.Import,
+                ast.ImportFrom,
+                ast.If,
+                ast.Assign,
+                ast.AnnAssign,
+            )
+            cut = len(body)
+            while cut > 0:
+                node = body[cut - 1]
+                is_symbol = (
+                    isinstance(
+                        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    )
+                    and node.name in wanted
+                )
+                if is_symbol or isinstance(node, scaffolding):
+                    cut -= 1
+                else:
+                    break
+            tail = body[cut:]
+            present = {
+                node.name
+                for node in tail
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                )
+            }
+            assert wanted <= present, f"{wanted - present} not in the cut tail of {src}"
+
+            decorators = getattr(tail[0], "decorator_list", [])
+            start = min([tail[0].lineno] + [d.lineno for d in decorators])
+            block = "".join(src_lines[start - 1 :])
+            src_path.write_text("".join(src_lines[: start - 1]))
+
+            prefix = "from __future__ import annotations\n" if future_import else ""
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            dst_path.write_text(prefix + block)
 
         self.ops.append(op)
         return self
@@ -353,7 +507,16 @@ class Repro:
             )
             for op in self.ops:
                 op(Path(worktree))
-            exec_command("pre-commit run --all-files", cwd=worktree, check=False)
+            exec_command("git add -A", cwd=worktree)
+            changed = exec_command(
+                f"git diff --cached --name-only --diff-filter=ACMR {self.base}",
+                cwd=worktree,
+            ).split()
+            if changed:
+                files = " ".join(shlex.quote(path) for path in changed)
+                exec_command(
+                    f"pre-commit run --files {files}", cwd=worktree, check=False
+                )
             if exec_command("git status --porcelain", cwd=worktree):
                 git_add_and_commit("repro", cwd=worktree)
             diff = exec_command(
