@@ -1708,6 +1708,18 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class PostProcessWeightsReqInput(BaseReq):
+    restore_weights_before_load: bool = False
+    post_process_quantization: bool = False
+
+
+@dataclass
+class PostProcessWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str = "checksum"
 
