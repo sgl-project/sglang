@@ -12,9 +12,7 @@ from mechanical_refactor_verify_utils import (
     _commit_changed_lines,
     _commit_import_texts,
     _import_line_texts,
-    _module_level_lines,
     _moved_symbol_names,
-    _peel_scaffold,
     _strip_moved_qualifiers,
     _strip_self_annotation,
     verify_move_commit,
@@ -166,35 +164,6 @@ def test_canonical_call_drops_redundant_assignment_parens() -> None:
     removed = _canonical_call("ok = Owner.foo(self.x, a, b)", {"foo"}, True)
     added = _canonical_call("ok = ( self.x.foo(a, b) )", {"foo"}, False)
     assert removed == added
-
-
-def test_module_level_lines_collects_only_top_level_nonblank() -> None:
-    """Only non-blank lines at indentation zero are returned."""
-    text = "import os\nlogger = mk()\n\ndef f():\n    return 1\n"
-    assert _module_level_lines(text) == {"import os", "logger = mk()", "def f():"}
-
-
-def test_peel_scaffold_removes_carried_top_level_lines_not_relocated() -> None:
-    """A top-level line copied from a source module (and not itself relocated) is
-    scaffolding; an indented line or a relocated def is not."""
-    block, scaffold = _peel_scaffold(
-        ["logger = mk()", "def helper():", "    return logger"],
-        {"logger = mk()", "def helper():"},
-        {"def helper():", "return logger"},
-    )
-    assert scaffold == ["logger = mk()"]
-    assert block == ["def helper():", "    return logger"]
-
-
-def test_peel_scaffold_removes_universal_boilerplate_even_if_fresh() -> None:
-    """A TYPE_CHECKING guard or logger line is scaffolding even when the source lacked it."""
-    block, scaffold = _peel_scaffold(
-        ["if TYPE_CHECKING:", "logger = logging.getLogger(__name__)", "def f():"],
-        set(),
-        set(),
-    )
-    assert scaffold == ["if TYPE_CHECKING:", "logger = logging.getLogger(__name__)"]
-    assert block == ["def f():"]
 
 
 # --- _block_signature ----------------------------------------------------------
@@ -466,9 +435,9 @@ def test_method_to_method_drops_staticmethod_and_self_annotation(repo: Path) -> 
     assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
-def test_carried_over_module_scaffolding_is_certified(repo: Path) -> None:
-    """A new destination module that copies a logger line verbatim from the source (which
-    keeps it) is a clean move; the copied line is whitelisted as scaffolding."""
+def test_module_scaffolding_in_a_move_needs_review(repo: Path) -> None:
+    """A move whose new module adds a logger line is not a pure relocation -- the logger is
+    new module scaffolding that belongs in the prep commit, so the move needs review."""
     _write(
         repo,
         **{
@@ -497,13 +466,13 @@ def test_carried_over_module_scaffolding_is_certified(repo: Path) -> None:
             ),
         },
     )
-    _commit(repo, "move helper to mod (carries logger)")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+    _commit(repo, "move helper to mod (also adds a logger)")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
 def test_changed_module_constant_still_needs_review(repo: Path) -> None:
-    """A module constant re-derived *differently* in the destination is not byte-identical
-    to the source line, so it is not scaffolding and the move needs review."""
+    """A module constant added/changed in the destination is not part of the moved body, so
+    the move needs review."""
     _write(
         repo,
         **{

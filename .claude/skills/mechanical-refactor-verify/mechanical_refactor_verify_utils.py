@@ -96,36 +96,6 @@ def _commit_import_texts(commit: str, repo_root: str) -> tuple[set[str], set[str
     return before, after
 
 
-def _module_level_lines(file_text: str) -> set[str]:
-    """Stripped text of every non-blank top-level (indent 0) line in a file."""
-    return {
-        line.strip()
-        for line in file_text.splitlines()
-        if line.strip() and not line[:1].isspace()
-    }
-
-
-def _commit_before_module_lines(commit: str, repo_root: str) -> set[str]:
-    """Top-level lines in the before-version of every file the commit touches -- the pool
-    of module scaffolding (a logger, module-level constants, a ``TYPE_CHECKING`` guard) a
-    new destination module may legitimately copy verbatim. See verifier-spec.md (whitelist).
-    """
-    status = _git_output(
-        ["show", commit, "--name-status", "--format=", "--no-color", "--no-ext-diff"],
-        repo_root,
-    )
-    lines: set[str] = set()
-    for line in status.splitlines():
-        if "\t" not in line:
-            continue
-        code, path = line.split("\t", 1)
-        if code[:1] in ("D", "M"):
-            lines |= _module_level_lines(
-                _git_output(["show", f"{commit}^:{path}"], repo_root)
-            )
-    return lines
-
-
 def _drop_counts(lines: list[str], to_drop: Counter) -> list[str]:
     """Return ``lines`` with up to ``to_drop[line]`` occurrences of each line removed,
     preserving order."""
@@ -255,35 +225,6 @@ def _peel_artifacts(
         else:
             block.append(line)
     return imports, decorators, block
-
-
-_LOGGER_RE = re.compile(r"^logger = logging\.getLogger\(")
-
-
-def _is_universal_scaffold(stripped: str) -> bool:
-    """A top-level line that is benign module boilerplate regardless of the source: a
-    ``TYPE_CHECKING`` guard or a logger definition (these never carry logic)."""
-    return stripped == "if TYPE_CHECKING:" or bool(_LOGGER_RE.match(stripped))
-
-
-def _peel_scaffold(
-    lines: list[str], source_module_lines: set[str], removed_stripped: set[str]
-) -> tuple[list[str], list[str]]:
-    """Remove top-level module scaffolding the destination module needs: a line copied
-    byte-for-byte from a source file that was not itself relocated, or universal boilerplate
-    (a logger / ``TYPE_CHECKING`` guard). The "not relocated" guard keeps a moved
-    module-level function in the block. See verifier-spec.md (whitelist)."""
-    scaffold, block = [], []
-    for line in lines:
-        stripped = line.strip()
-        top_level = bool(stripped) and not line[:1].isspace()
-        carried = top_level and stripped in source_module_lines
-        universal = top_level and _is_universal_scaffold(stripped)
-        if (carried or universal) and stripped not in removed_stripped:
-            scaffold.append(stripped)
-        else:
-            block.append(line)
-    return block, scaffold
 
 
 def _peel_requalifications(
@@ -443,7 +384,6 @@ class MoveCheck:
     relocated: int
     imports: list[str]
     decorators: list[str]
-    scaffold: list[str]
     requalified: int
     review_diff: list[str]
     subject: str = ""
@@ -453,8 +393,6 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
     """Compute the verdict for a commit (no printing). Implements verifier-spec.md."""
     removed, added = _commit_changed_lines(commit, repo_root)
     imports_before, imports_after = _commit_import_texts(commit, repo_root)
-    before_module_lines = _commit_before_module_lines(commit, repo_root)
-    removed_stripped = {line.strip() for line in removed if line.strip()}
 
     # Normalise the self annotation before matching def lines, so a method relocated as
     # def foo(self: Target) -> def foo(self) is still recognised as a moved symbol (and its
@@ -469,9 +407,6 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
 
     rem_imports, rem_decos, rem_block = _peel_artifacts(removed, imports_before)
     add_imports, add_decos, add_block = _peel_artifacts(added, imports_after)
-    add_block, scaffold = _peel_scaffold(
-        add_block, before_module_lines, removed_stripped
-    )
     rem_block, add_block, requalified = _peel_requalifications(
         rem_block, add_block, moved_names
     )
@@ -509,7 +444,6 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
         relocated=relocated,
         imports=sorted(set(rem_imports + add_imports)),
         decorators=sorted(set(rem_decos + add_decos)),
-        scaffold=sorted(set(scaffold)),
         requalified=requalified,
         review_diff=review_diff,
     )
@@ -521,8 +455,6 @@ def _print_check(check: MoveCheck) -> None:
         print(f"    [import] {text}")
     for text in check.decorators:
         print(f"    [decorator] {text}")
-    for text in check.scaffold:
-        print(f"    [scaffold] {text}")
     if check.requalified:
         print(f"  {check.requalified} call-site adaptation(s) of moved symbol(s)")
     if check.clean and check.relocated > 0:
@@ -680,7 +612,6 @@ function render(onlyReview){
     out += '<div class="bd">';
     if(c.imports.length) out += '<div class="sec"><span class="k">imports:</span> '+c.imports.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
     if(c.decorators.length) out += '<div class="sec"><span class="k">decorators:</span> '+c.decorators.map(esc).join(', ')+'</div>';
-    if(c.scaffold.length) out += '<div class="sec"><span class="k">scaffold:</span> '+c.scaffold.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
     if(c.requalified) out += '<div class="sec"><span class="k">call-site adaptations:</span> '+c.requalified+'</div>';
     if(c.review_diff.length){
       out += '<table class="diff"><tbody>';
