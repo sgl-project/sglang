@@ -6,7 +6,7 @@ ModelDeploymentConfig provides model-specific config on how to deploy a model op
 from dataclasses import dataclass
 from typing import Literal
 
-OffloadComponentName = Literal["dit", "text_encoder", "image_encoder"]
+OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
 
 
 @dataclass(frozen=True)
@@ -24,3 +24,4 @@ class ModelDeploymentConfig:
     fsdp_auto_min_available_memory_gb: float | None = None
     fsdp_auto_requires_cfg: bool = True
     fsdp_auto_requires_default_parallelism: bool = True
+    auto_enable_cfg_parallel: bool = True

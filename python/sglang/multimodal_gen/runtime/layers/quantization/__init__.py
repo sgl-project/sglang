@@ -2,6 +2,9 @@
 
 from typing import Literal, get_args
 
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -25,6 +28,7 @@ QuantizationMethods = Literal[
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "bitsandbytes",
     "modelslim",
     "mxfp8",
     "mxfp4",
@@ -38,6 +42,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "modelopt": ModelOptFp8DiffusionConfig,
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
+    "bitsandbytes": BitsAndBytesConfig,
     "modelslim": ModelSlimConfig,
     "fp8": Fp8Config,
     "mxfp4": Mxfp4Config,

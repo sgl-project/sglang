@@ -402,7 +402,7 @@ class StreamingSessionServerBase(CustomTestCase):
     - `env_overrides`: list of `(env_attr_name, value)` tuples; each is
       pushed onto the `setUpClass` context stack so the env override is
       live during `popen_launch_server` and torn down on
-      `tearDownClass`-time. `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=2`
+      `tearDownClass`-time. `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=1`
       is always applied on top of these.
     """
 
@@ -417,8 +417,9 @@ class StreamingSessionServerBase(CustomTestCase):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2)
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1)
             )
+            stack.enter_context(envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(True))
             for name, val in cls.env_overrides:
                 stack.enter_context(getattr(envs, name).override(val))
             cls.process = popen_launch_server(

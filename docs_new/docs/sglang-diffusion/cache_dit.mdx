@@ -1,6 +1,7 @@
 ---
 title: "Cache-DiT Acceleration"
 description: "Configure Cache-DiT acceleration for diffusion inference."
+tag: "approx"
 ---
 SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **1.69x inference speedup** with minimal quality loss.
 
@@ -559,8 +560,7 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 ## Limitations
 
-- **SGLang-native pipelines**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically
-  disabled when `world_size > 1`.
+- **SGLang-native pipelines**: Distributed Cache-DiT paths exist for supported pipelines. Hybrid SP+TP configurations add communication and cache coordination overhead, so validate them on the target model and hardware before using them as production defaults.
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
 - **Model support**: Only models registered in Cache-DiT's BlockAdapterRegister are supported
 
