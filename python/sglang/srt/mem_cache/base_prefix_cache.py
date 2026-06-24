@@ -49,6 +49,8 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    rid: Optional[str] = None
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -208,6 +210,8 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+
+    rid: Optional[str] = None
 
 
 class MatchResult(NamedTuple):

@@ -98,6 +98,7 @@ def match_prefix_for_req(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            rid=req.rid if include_req else None,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -935,6 +936,7 @@ class PrefillAdder:
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
+                        rid=req.rid,
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
