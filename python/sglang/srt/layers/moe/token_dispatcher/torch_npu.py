@@ -72,8 +72,8 @@ class TorchNpuDispatcher(BaseDispatcher):
         print(self.quant_config)
         is_gguf = (
             self.quant_config
-            and hasattr(self.quant_config, "get_name")
-            and self.quant_config.get_name() == "gguf"
+            and hasattr(self.quant_config, "quant_type")
+            and self.quant_config.quant_type == "gguf"
         )
         if is_gguf and self.tp_size > 1:
             # The wrapper will perform tensor_model_parallel_all_gather
