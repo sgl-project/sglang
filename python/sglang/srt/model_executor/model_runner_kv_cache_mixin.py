@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -905,8 +904,6 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                        if is_cuda():
-                            self.max_total_num_tokens *= self.dcp_size
 
             if self.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
