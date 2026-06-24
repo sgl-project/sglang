@@ -4,8 +4,8 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.mock_model.utils import MOCK_MODEL_PATH
 from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -20,8 +20,6 @@ _TOP_P = 0.99
 _TOP_K = 10
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
-    "--load-format",
-    "dummy",
     "--mem-fraction-static",
     "0.7",
 )
@@ -33,7 +31,7 @@ _INVALID_SAMPLING_MASK_ERROR = (
 class SamplingMaskTestMixin:
     @classmethod
     def _launch_server(cls, other_args=()):
-        cls.model = MOCK_MODEL_PATH
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
