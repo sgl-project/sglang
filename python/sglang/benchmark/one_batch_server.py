@@ -5,11 +5,11 @@ This script launches a server and uses the HTTP interface.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
 
 Usage:
-python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
 """
 
 import argparse
@@ -1152,7 +1152,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     return results, server_info
 
 
-def main():
+def cli_main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -1165,4 +1165,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()
