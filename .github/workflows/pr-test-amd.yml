@@ -1202,9 +1202,10 @@ jobs:
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          set -o pipefail
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }} 2>&1 | tee /tmp/disagg.out
 
       - name: DEBUG RDMA NIC diagnostic (post-test, isolate faulty NIC)
         if: ${{ always() }}
@@ -1217,57 +1218,38 @@ jobs:
           [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
 
           echo ""
-          echo "### 0. rdma<->netdev mapping ###"
-          for d in "$IB"/*; do
-            dev=$(basename "$d")
-            printf "  %-8s -> %s\n" "$dev" "$(cat /tmp/rdma_pre/${dev}.netdev 2>/dev/null)"
-          done
+          echo "### 1. PRIMARY EVIDENCE: failed RDMA transfers bucketed by local NIC ###"
+          echo "    (from the ionic provider's own errors in the test output)"
+          if [ -f /tmp/disagg.out ]; then
+            echo "-- 'transport retry counter exceeded' failures per local_nic --"
+            grep -oE "local_nic: rdma[0-9]+" /tmp/disagg.out | sort | uniq -c | sort -rn \
+              || echo "   (none found)"
+            echo ""
+            echo "-- peer nodes seen in those failures --"
+            grep -oE "peer_nic: [0-9.]+" /tmp/disagg.out | sort | uniq -c | sort -rn | head
+            echo ""
+            echo "-- KV-transfer timeouts / cqe errors (counts) --"
+            printf "   cqe with error            : %s\n" "$(grep -c 'cqe with error' /tmp/disagg.out)"
+            printf "   transport retry exceeded  : %s\n" "$(grep -c 'transport retry counter exceeded' /tmp/disagg.out)"
+            printf "   KVPoll WaitingForInput TO : %s\n" "$(grep -c 'timed out after .* in KVPoll.WaitingForInput' /tmp/disagg.out)"
+            echo ""
+            echo "-- sample raw error lines --"
+            grep -E "cqe with error|transport retry counter exceeded" /tmp/disagg.out | head -4 | sed 's/^/   /'
+          else
+            echo "/tmp/disagg.out not found (test step did not produce output)"
+          fi
 
           echo ""
-          echo "### 1. ionic hw_counters DELTA during this run (nonzero growth only) ###"
-          echo "    The NIC with large error/retry/drop growth is the faulty link."
-          printf "%-8s %-36s %14s %14s %14s\n" DEV COUNTER before after delta
-          for d in "$IB"/*; do
-            dev=$(basename "$d")
-            now="$d/ports/1/hw_counters"
-            [ -d "$now" ] || continue
-            for f in "$now"/*; do
-              [ -f "$f" ] || continue
-              key=$(basename "$f")
-              after=$(cat "$f" 2>/dev/null)
-              before=$(grep -E "^${key} " "/tmp/rdma_pre/${dev}.hw" 2>/dev/null | awk '{print $2}')
-              case "$after" in (''|*[!0-9]*) continue;; esac
-              case "$before" in (''|*[!0-9]*) before=0;; esac
-              delta=$((after-before))
-              [ "$delta" -ne 0 ] && printf "%-8s %-36s %14s %14s %14s\n" "$dev" "$key" "$before" "$after" "$delta"
-            done
-          done
-          echo "(no rows = no hw_counters changed; see section 2)"
+          echo "### 2. rdma statistic (netlink; bypasses pod sysfs mount limits) ###"
+          if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
+            docker exec -u root ci_sglang bash -c 'rdma statistic show link 2>&1 || rdma statistic 2>&1 || echo "rdma statistic unavailable"' | head -80
+          else
+            echo "container ci_sglang not running"
+          fi
 
           echo ""
-          echo "### 2. ethtool -S DELTA, error/drop/retry/nak/seq/timeout counters ###"
-          printf "%-12s %-40s %14s\n" NETDEV COUNTER delta
-          for d in "$IB"/*; do
-            dev=$(basename "$d")
-            nd=$(cat /tmp/rdma_pre/${dev}.netdev 2>/dev/null)
-            [ -n "$nd" ] || continue
-            command -v ethtool >/dev/null 2>&1 || continue
-            ethtool -S "$nd" 2>/dev/null | sed 's/^ *//' > /tmp/${dev}.eth.now
-            while read -r line; do
-              key=$(echo "$line" | cut -d: -f1)
-              after=$(echo "$line" | cut -d: -f2 | tr -dc '0-9')
-              echo "$key" | grep -qiE "err|drop|nak|seq|timeout|retr|discard|miss|fail" || continue
-              before=$(grep -E "^${key}:" /tmp/rdma_pre/${dev}.eth 2>/dev/null | cut -d: -f2 | tr -dc '0-9')
-              [ -n "$after" ] || continue
-              [ -n "$before" ] || before=0
-              delta=$((after-before))
-              [ "$delta" -ne 0 ] && printf "%-12s %-40s %14s\n" "$nd" "$key" "$delta"
-            done < /tmp/${dev}.eth.now
-          done
-          echo "(no rows = no error/drop counters grew via ethtool)"
-
-          echo ""
-          echo "### 3. ibv_devinfo per device (port state/rate/link_layer) ###"
+          echo "### 3. ibv_devinfo per device (note: all show PORT_ACTIVE => ###"
+          echo "###    fault is transient transport, NOT a hard link-down)     ###"
           if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
             docker exec -u root ci_sglang bash -c '
               for dev in $(ibv_devinfo -list 2>/dev/null | grep -oE "rdma[0-9]+" | sort); do
@@ -1277,6 +1259,13 @@ jobs:
           else
             echo "container ci_sglang not running; skipping ibv_devinfo"
           fi
+
+          echo ""
+          echo "NOTE: /sys/class/infiniband/*/ports/1/{counters,hw_counters} and"
+          echo "device/net are NOT populated inside the k8s runner pod (only the"
+          echo "infiniband class dir is bind-mounted), so sysfs/ethtool counter"
+          echo "deltas are unavailable here. Section 1 (provider errors) is the"
+          echo "authoritative per-NIC signal."
 
   pr-test-amd-finish:
     needs:
