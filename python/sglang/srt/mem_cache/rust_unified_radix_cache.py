@@ -179,7 +179,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
     ) -> MatchResult:
         """Component post-processing that requires Python-owned resources."""
         for comp in self.components.values():
-            comp.finalize_match(params, rust_result)
+            comp.finalize_match_result(params, rust_result)
         return result
 
     def _empty_match_result(self) -> MatchResult:

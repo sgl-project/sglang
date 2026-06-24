@@ -67,7 +67,7 @@ pub trait Component<K: ChildKeyType>: Send {
     /// Per-overlap-node insert hook. Returns `consumed_from`: slots in
     /// `value_slice[consumed_from..]` are claimed by this component.
     #[allow(clippy::too_many_arguments)]
-    fn consume_value(
+    fn update_component_on_insert_overlap(
         &self,
         _pool: &mut TreeNodePool<K>,
         _components: &[Box<dyn Component<K>>],

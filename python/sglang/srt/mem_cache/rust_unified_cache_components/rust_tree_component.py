@@ -66,7 +66,7 @@ class RustTreeComponent:
         after every action is staged (so batched writes go out in one call).
         Default no-op."""
 
-    def finalize_match(self, params: Any, rust_result: Any) -> None:
+    def finalize_match_result(self, params: Any, rust_result: Any) -> None:
         """Pool-side match post-processing (e.g. Mamba CoW). Default no-op."""
 
     def prepare_for_caching_req(

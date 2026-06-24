@@ -387,7 +387,7 @@ impl<K: ChildKeyType> RadixCache<K> {
 
     /// Take `min(consumed_from)` across components for one overlap node.
     #[allow(clippy::too_many_arguments)]
-    fn consume_value(
+    fn update_component_on_insert_overlap(
         &mut self,
         child_idx: NodeIdx,
         node_key_len: usize,
@@ -399,7 +399,7 @@ impl<K: ChildKeyType> RadixCache<K> {
     ) -> Result<usize, RadixCacheRuntimeError> {
         let mut consumed_from = node_key_len;
         for comp in self.components.iter() {
-            let comp_consumed = comp.consume_value(
+            let comp_consumed = comp.update_component_on_insert_overlap(
                 &mut self.tree_node_pool,
                 &self.components,
                 child_idx,
@@ -483,7 +483,7 @@ impl<K: ChildKeyType> RadixCache<K> {
 
             let value_slice = value.narrow(0, consumed as i64, step_len as i64);
 
-            let consumed_from = self.consume_value(
+            let consumed_from = self.update_component_on_insert_overlap(
                 current_node_idx,
                 step_len,
                 consumed,

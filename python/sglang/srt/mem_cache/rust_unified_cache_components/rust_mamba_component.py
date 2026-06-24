@@ -39,7 +39,7 @@ class RustMambaComponent(RustTreeComponent):
         for t in freed_bin:
             mamba_allocator.free(t)
 
-    def finalize_match(self, params, rust_result):
+    def finalize_match_result(self, params, rust_result):
         """Copy the matched node's SSM state into a request-local slot."""
         if not params.cow_mamba or rust_result.mamba_value is None:
             return

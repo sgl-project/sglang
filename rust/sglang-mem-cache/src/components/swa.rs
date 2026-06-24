@@ -138,7 +138,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
     /// - Branch 3: returns node_key_len (claimed nothing)
     /// - Not a tombstone / no SWA frontier: returns node_key_len
     #[allow(clippy::too_many_arguments)]
-    fn consume_value(
+    fn update_component_on_insert_overlap(
         &self,
         pool: &mut TreeNodePool<K>,
         components: &[Box<dyn Component<K>>],
