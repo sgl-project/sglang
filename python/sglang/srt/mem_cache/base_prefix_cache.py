@@ -320,8 +320,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> Optional[UnfinishResult]:
         pass
 
-    def unfinished_swa_evict_pre_len(
-        self, req: Req, chunked: bool = False
+    def supports_unfinished_swa_evict(self) -> bool:
+        return False
+
+    def would_short_circuit_unfinished(self, req: Req, chunked: bool = False) -> bool:
+        return False
+
+    def aggregate_unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
     ) -> Optional[int]:
         return None
 

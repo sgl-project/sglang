@@ -891,20 +891,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             swa_uuid_for_lock=lock_result.swa_uuid_for_lock,
         )
 
-    def unfinished_swa_evict_pre_len(
-        self, req: Req, chunked: bool = False
+    def supports_unfinished_swa_evict(self) -> bool:
+        return True
+
+    def would_short_circuit_unfinished(self, req: Req, chunked: bool = False) -> bool:
+        return self.session.would_short_circuit_unfinished(req, chunked=chunked)
+
+    def aggregate_unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
     ) -> Optional[int]:
-        if self.session.would_short_circuit_unfinished(req, chunked=chunked):
-            return None
-        if self.disable:
-            return None
-        token_ids = req.get_fill_ids()
-        effective_cache_len = len(token_ids)
+        result = None
         for comp in self._components_tuple:
-            cl = comp.unfinished_effective_cache_len(req, len(token_ids))
+            cl = comp.unfinished_effective_cache_len(req, token_ids_len)
             if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
-        return effective_cache_len - 1
+                result = cl if result is None else min(result, cl)
+        return result
 
     # ---- Internal Helpers ----
 

@@ -402,12 +402,13 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.cache_unfinished_req(params)
 
-    def unfinished_swa_evict_pre_len(
-        self, req: Req, chunked: bool = False
+    def supports_unfinished_swa_evict(self) -> bool:
+        return self.inner.supports_unfinished_swa_evict()
+
+    def aggregate_unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
     ) -> Optional[int]:
-        if self.would_short_circuit_unfinished(req, chunked=chunked):
-            return None
-        return self.inner.unfinished_swa_evict_pre_len(req, chunked=chunked)
+        return self.inner.aggregate_unfinished_effective_cache_len(req, token_ids_len)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)

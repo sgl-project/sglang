@@ -34,7 +34,7 @@ def evict_swa_out_of_window_for_unfinished(
     if not tree_cache.supports_swa():
         return None
 
-    pre_len = tree_cache.unfinished_swa_evict_pre_len(req, chunked=chunked)
+    pre_len = _unfinished_swa_evict_pre_len(req, tree_cache, chunked=chunked)
     if pre_len is None:
         return None
     if req.kv is None:
@@ -57,6 +57,28 @@ def evict_swa_out_of_window_for_unfinished(
         ),
     )
     return req.kv.swa_evicted_seqlen
+
+
+def _unfinished_swa_evict_pre_len(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    chunked: bool,
+) -> Optional[int]:
+    if not tree_cache.supports_unfinished_swa_evict():
+        return None
+    if tree_cache.would_short_circuit_unfinished(req, chunked=chunked):
+        return None
+    if tree_cache.disable:
+        return None
+
+    token_ids = req.get_fill_ids()
+    effective_cache_len = len(token_ids)
+    component_cache_len = tree_cache.aggregate_unfinished_effective_cache_len(
+        req, len(token_ids)
+    )
+    if component_cache_len is not None:
+        effective_cache_len = min(effective_cache_len, component_cache_len)
+    return effective_cache_len - 1
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
