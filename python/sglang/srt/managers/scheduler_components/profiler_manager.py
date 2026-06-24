@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -365,7 +366,11 @@ class SchedulerProfilerManager:
             self.torch_profiler_output_dir,
             merge_message,
         )
-        self.torch_profiler = None
+
+        if self.torch_profiler is not None:
+            self.torch_profiler = None
+            gc.collect()
+
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
