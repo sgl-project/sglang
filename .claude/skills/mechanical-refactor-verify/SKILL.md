@@ -38,44 +38,16 @@ worktree and diff it byte-for-byte against the target commit.
 
 ## Mode B — Verify (a stack of mixed commits)
 
-Use when the work is a chain where each commit becomes its own PR, and only some
-commits are mechanical. No reproduce script; you certify each mechanical commit
-directly.
+Use when the work is a chain where each commit becomes its own PR and only some
+commits are mechanical. No reproduce script; you classify each commit and certify each
+relocation from its diff with
+`mechanical_refactor_verify_utils.py move <commit>` (`CLEAN MOVE` = only imports / call
+sites changed; otherwise it lists the lines to review). Semantic commits get ordinary
+review.
 
-1. **Classify each commit**: a mechanical *relocation* (function move, file split,
-   module extraction) vs a *semantic* change (new logic, API/signature redesign,
-   behavior change).
+→ Full step-by-step, and what the report does and does not assert: **`verification-mode.md`** (next to this file).
 
-2. **Certify each relocation commit**:
-
-   ```bash
-   python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py move <commit>
-   ```
-
-   It reports, for the commit's diff:
-   - how many lines were **relocated byte-for-byte** (indentation ignored, so a method
-     becoming an indentation-shifted free function still counts);
-   - the **wiring** lines (the new import and the rewritten call sites);
-   - any **to review** lines — the only thing a human must read.
-
-   `CLEAN MOVE` means nothing needs review. Otherwise read the (usually tiny)
-   to-review set and confirm each line is an equivalent adaptation. Optional eyeball
-   cross-check:
-
-   ```bash
-   git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change
-   ```
-
-3. **Semantic commits** get ordinary human review — the verifier does not apply to
-   them. Mixing mechanical and semantic commits in one branch is fine: each commit is
-   reviewed by the method that fits it.
-
-> The verifier compares the deleted and added line sets (indentation ignored), so it
-> certifies that the body did not change during the move; it does not check line
-> order within the moved block. The `--color-moved` cross-check above catches a
-> reordered block.
-
-### Make extractions verifiable: split prep + move
+## Make extractions verifiable: split prep + move
 
 De-self'ing a method (turning `self.x` reads into parameters, narrowing a signature)
 is behavior-preserving but **not** byte-identical, so it cannot be certified as a pure
