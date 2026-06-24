@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,9 +9,11 @@ from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopKConfig,
     remap_topk_for_per_rank_shared_slots,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -109,6 +112,45 @@ def test_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
 
     assert topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(topk_weights[:, -1], torch.full((2,), 0.4))
+
+
+def test_deepep_empty_forward_does_not_append_shared_slot_twice():
+    captured = {}
+
+    class FakeTopK:
+        def empty_topk_output(self, device, *, layer_id=None):
+            return StandardTopKOutput(
+                topk_weights=torch.empty((0, 9), dtype=torch.float32, device=device),
+                topk_ids=torch.empty((0, 9), dtype=torch.int32, device=device),
+                router_logits=torch.empty((0, 8), dtype=torch.float32, device=device),
+            )
+
+    class FakeExperts:
+        should_fuse_routed_scaling_factor_in_topk = True
+
+        def __call__(self, hidden_states, topk_output):
+            captured["topk_ids_shape"] = tuple(topk_output.topk_ids.shape)
+            captured["topk_weights_shape"] = tuple(topk_output.topk_weights.shape)
+            return hidden_states
+
+    moe = SimpleNamespace(
+        _fuse_shared_experts_inside_sbo=False,
+        is_nextn=False,
+        num_fused_shared_experts=1,
+        layer_id=0,
+        topk=FakeTopK(),
+        experts=FakeExperts(),
+        alt_stream=None,
+        routed_scaling_factor=1.0,
+    )
+
+    hidden_states = torch.empty((0, 4), dtype=torch.float32)
+    forward_batch = SimpleNamespace(num_token_non_padded=None)
+
+    DeepseekV2MoE.forward_deepep(moe, hidden_states, forward_batch)
+
+    assert captured["topk_ids_shape"] == (0, 9)
+    assert captured["topk_weights_shape"] == (0, 9)
 
 
 if __name__ == "__main__":

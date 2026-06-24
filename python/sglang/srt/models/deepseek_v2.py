@@ -1175,16 +1175,6 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
-            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
-                n = self.num_fused_shared_experts
-                topk_output = topk_output._replace(
-                    topk_ids=topk_output.topk_ids.new_empty(
-                        (0, topk_output.topk_ids.shape[-1] + n)
-                    ),
-                    topk_weights=topk_output.topk_weights.new_empty(
-                        (0, topk_output.topk_weights.shape[-1] + n)
-                    ),
-                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
