@@ -3248,10 +3248,9 @@ class UnifiedRadixCacheSuite:
         # Long enough that _maybe_split_leaf_for_swa_lock splits the insert into
         # an out-of-window internal node + a window-capped leaf.
         seq = self._make_seq(1, wp + 3)
-        if (
-            allocator.full_available_size() < len(seq)
-            or allocator.swa_available_size() < len(seq)
-        ):
+        if allocator.full_available_size() < len(
+            seq
+        ) or allocator.swa_available_size() < len(seq):
             self.skipTest("kv pool too small for split topology")
         self._insert(tree, allocator, req_to_token_pool, seq)
         tree.writing_check(write_back=True)
