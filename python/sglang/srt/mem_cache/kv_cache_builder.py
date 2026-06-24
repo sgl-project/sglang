@@ -233,6 +233,7 @@ def build_kv_cache(
             tp_size=ps.tp_size,
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
+            full_tokens_per_layer=full_tokens_per_layer,
         )
     )
 

@@ -2184,6 +2184,12 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
+            # Prefill-aware SWA: propagate prefix_token_count so the prefill
+            # batch can exclude trailing prefix tokens from SWA eviction
+            # protection (they should participate in the sliding window).
+            if getattr(image_inputs, "prefix_token_count", 0):
+                req.prefix_token_count = image_inputs.prefix_token_count
+
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
@@ -2997,6 +3003,14 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+
+        # For prefill-aware SWA models (e.g. UNLIMITED-OCR), protect all prefill
+        # tokens from SWA eviction so the decode phase can still attend to them.
+        # Prefix tokens are excluded so they participate in the sliding window.
+        if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
+            for req in new_batch.reqs:
+                prefill_len = req.fill_len
+                req.swa_evict_floor = prefill_len - req.prefix_token_count
 
         return new_batch
 

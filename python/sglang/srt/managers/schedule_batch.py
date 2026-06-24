@@ -418,6 +418,10 @@ class MultimodalProcessorOutput:
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
+    # Trailing prefix tokens that should participate in the sliding window
+    # (not protected from SWA eviction). Used by prefill-aware SWA (OCR) models.
+    prefix_token_count: int = 0
+
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
@@ -438,6 +442,7 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
+            prefix_token_count=d.get("prefix_token_count", 0),
         )
 
     @staticmethod
@@ -495,6 +500,10 @@ class MultimodalInputs:
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    # Trailing prefix tokens that should participate in the sliding window
+    # (not protected from SWA eviction). Used by prefill-aware SWA (OCR) models.
+    prefix_token_count: int = 0
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -567,6 +576,8 @@ class MultimodalInputs:
             val = getattr(obj, arg, None)
             if val is not None:
                 setattr(mm_inputs, arg, val)
+
+        mm_inputs.prefix_token_count = getattr(obj, "prefix_token_count", 0)
 
         return mm_inputs
 
@@ -867,6 +878,13 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # SWA eviction floor: KV positions below this are never freed by the
+        # sliding-window eviction path. Used by prefill-aware SWA (OCR) models
+        # to protect all prefill tokens so decode can still attend to them.
+        self.swa_evict_floor: int = 0
+        # Number of trailing prefix tokens that should participate in the
+        # sliding window (excluded from swa_evict_floor protection).
+        self.prefix_token_count: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

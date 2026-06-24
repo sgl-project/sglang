@@ -42,6 +42,9 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    # Number of full-attention KV tokens per layer. 0 (with is_hybrid_swa) means
+    # the model is all-SWA (no full-attention layers), e.g. UNLIMITED-OCR.
+    full_tokens_per_layer: Optional[int] = None
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -84,6 +87,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
             return ChunkCache(params)
+        if ctx.full_tokens_per_layer == 0:
+            # All-SWA model (no full-attention layers): the SWA chunk cache must
+            # skip the range already freed by _evict_swa during decode.
+            from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+
+            return PureSWAChunkCache(params)
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
@@ -112,6 +121,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return cache
 
     if ctx.is_hybrid_swa:
+        if ctx.full_tokens_per_layer == 0:
+            # All-SWA model (no full-attention layers, e.g. UNLIMITED-OCR): use
+            # the simpler PureSWARadixCache (no tombstone mechanism needed).
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+
+            return PureSWARadixCache(params=params)
         from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
         return SWARadixCache(params=params)

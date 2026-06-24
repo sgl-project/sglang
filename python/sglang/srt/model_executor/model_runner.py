@@ -1488,6 +1488,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
+        # Prefill-aware SWA: model declares that all prefill tokens should be
+        # retained in the KV cache during decode (e.g. UNLIMITED-OCR models).
+        self.prefill_aware_swa = (
+            hasattr(self.model, "is_prefill_aware_swa")
+            and self.model.is_prefill_aware_swa()
+        )
+
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -2305,7 +2312,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens
+            # All-SWA models (e.g. UNLIMITED-OCR) have no full-attention layers,
+            # so the full pool is empty; fall back to the SWA pool size to keep
+            # the per-request token capacity valid.
+            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
 
