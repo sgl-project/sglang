@@ -93,6 +93,10 @@ default = true
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+# cuLA Lightning-Attention KVBuffer backend (linear_backend="cula"). Requires
+# Python 3.12+, CUDA 12.9+, and Blackwell (sm100) GPUs. Install from source:
+#   pip install -e https://github.com/inclusionAI/cuLA.git --no-build-isolation
+cula = ["cuda-linear-attention"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",

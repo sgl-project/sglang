@@ -369,6 +369,9 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    linear_backend=getattr(
+                        self.model_config.hf_config, "linear_backend", "seg_la"
+                    ),
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
