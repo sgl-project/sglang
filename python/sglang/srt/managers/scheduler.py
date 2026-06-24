@@ -35,6 +35,7 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+import zmq
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
@@ -1578,6 +1579,22 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
+                # Opportunistic flush at the
+                # `disable_overlap_for_batch` sync boundary. After
+                # pop_and_process, the previous iter's forward is fully
+                # drained (sampling's CPU sync) and the next iter's
+                # forward has NOT yet been launched — `forward_stream` is
+                # truly idle, so the conservative non-urgent guard inside
+                # `_flush` finds `event.query()` True and compacts freely.
+                # Sync-free; best-effort.
+                allocator = getattr(self, "token_to_kv_pool_allocator", None)
+                if allocator is not None and hasattr(
+                    allocator, "flush_opportunistic"
+                ):
+                    try:
+                        allocator.flush_opportunistic()
+                    except Exception:
+                        pass
 
             # Launch the current batch
             if batch:
@@ -2525,7 +2542,6 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
-        self._chunked_req_scheduled_last_iter = False
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -2811,8 +2827,32 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # Snapshot the CONTINUING chunked-req state BEFORE this iteration
+        # mutates it (add_chunked_req below reassigns self.chunked_req —
+        # returning None on the final chunk — and is_chunked is bumped at the
+        # bottom). The graceful-refusal path restores this snapshot verbatim
+        # so a refused iteration is a true no-op on the in-progress chunked
+        # prefill: it resumes cleanly next iter WITHOUT being double-tracked
+        # (waiting_queue + self.chunked_req) and WITHOUT leaking/dropping its
+        # already-allocated chunk KV. `add_chunked_req` takes no lock_ref and
+        # the req is tracked via self.chunked_req (never the waiting queue).
+        _prev_chunked_req = self.chunked_req
+        _prev_is_chunked = (
+            self.chunked_req.inflight_middle_chunks if self.chunked_req is not None else None
+        )
+        # `add_chunked_req` (below) is the ONLY writer of `fill_len` here; it
+        # advances it to `len(prefix_indices) + extend_input_len`. Snapshot the
+        # pre-advance value so the graceful-refusal path can restore it: a
+        # refused chunk commits no KV, so its `fill_len` must stay at the last
+        # COMMITTED frontier. Otherwise the content-based stash gate at the top
+        # of the next iter (`fill_len > len(prefix_indices)`) spuriously fires
+        # and caches the un-run chunk (→ `prefix_indices == fill_ids` →
+        # `extend_num_tokens == 0` → empty `forward_extend` rotary crash).
+        _prev_fill_len = None
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            _prev_fill_len = self.chunked_req.fill_len
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2944,7 +2984,95 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if not new_batch.prepare_for_extend():
+            # Planner refused to admit the batch (shared-pool
+            # byte-coordinated mamba shortfall with no evict path —
+            # see `common.alloc_req_slots`). No KV/req-pool mutations
+            # have been committed at this point. Restore the
+            # admission state so the reqs get retried next iter
+            # rather than dropped (or the scheduler crashing with the
+            # opaque per-req `HybridReqToTokenPool.alloc` assert).
+            #
+            # CRITICAL — undo tree-cache lock refs first. PrefillAdder.
+            # add_one_req calls `_req_inc_lock_ref(req)` for every req
+            # it appends to `can_run_list` (schedule_policy.py:904/909/
+            # 950). Each lock pins `req.last_node.full_lock_ref` until
+            # `cache_finished_req` releases it. If we re-queue without
+            # releasing here, each refusal cycle leaks ONE lock per
+            # req — the MambaRadixCache sanity check eventually trips
+            # with `x_lru should not be locked when idle, full_lock_ref
+            # =N` once the scheduler goes idle. For chunk_cache this
+            # is a no-op (dec_lock_ref returns delta=0). For SWA pass
+            # the saved `swa_uuid_for_lock` back as params.
+            #
+            # EXCLUDE the CONTINUING chunked_req (snapshotted as
+            # `_prev_chunked_req` BEFORE add_chunked_req ran — using the live
+            # `self.chunked_req` here is WRONG because add_chunked_req resets
+            # it to None on the final chunk). The continuing chunked prefill
+            # is added to `can_run_list` via `add_chunked_req`
+            # (schedule_policy.py:687) — which takes NO lock_ref and is tracked
+            # across iters via `self.chunked_req`, NOT the waiting queue. It
+            # must NOT be (a) dec_lock_ref'd here (never took a lock this iter
+            # → under-count) nor (b) re-queued to waiting (already tracked as
+            # the chunked_req; re-queuing double-tracks it → next iter it is
+            # admitted via BOTH add_chunked_req AND the waiting queue →
+            # re-allocated → its already-allocated chunk KV is leaked = the
+            # Mode-2 orphan). A NEW chunked req (adder.new_chunked_req) WAS
+            # added via add_one_req (lock taken, popped from waiting), so it IS
+            # released + re-queued like any normal req.
+            continuing_chunked = (
+                _prev_chunked_req
+                if (_prev_chunked_req is not None and _prev_chunked_req in can_run_list)
+                else None
+            )
+            for req in can_run_list:
+                if req is continuing_chunked:
+                    continue
+                if self.is_hybrid_swa:
+                    params = getattr(req, "swa_uuid_for_lock", None)
+                    self.tree_cache.dec_lock_ref(req.last_node, params)
+                    req.swa_uuid_for_lock = None
+                else:
+                    self.tree_cache.dec_lock_ref(req.last_node)
+            self.waiting_queue = [
+                r for r in can_run_list if r is not continuing_chunked
+            ] + self.waiting_queue
+            # A NEW chunked req goes back to waiting as a normal req; undo the
+            # is_chunked bump it received below.
+            if adder.new_chunked_req is not None:
+                adder.new_chunked_req.inflight_middle_chunks -= 1
+            # Restore the CONTINUING chunked-req so it resumes next iter
+            # (covers BOTH the more-chunks case — self.chunked_req already ==
+            # _prev — and the last-chunk case where add_chunked_req reset it to
+            # None). For the new-chunked / no-chunked cases _prev_chunked_req
+            # is None, so self.chunked_req is correctly cleared.
+            self.chunked_req = _prev_chunked_req
+            # CRITICAL: this iteration's chunk was REFUSED — it did NOT commit
+            # any KV, so `add_chunked_req`'s `fill_len` advance must be undone.
+            # The stash gate at the top of the next get_next_batch_to_run is
+            # content-based (`fill_len > len(prefix_indices)` → stash via
+            # `cache_unfinished_req`); leaving `fill_len` advanced would stash
+            # the un-run chunk, setting `prefix_indices = req_to_token[:fill_len]`
+            # and marking it already-prefilled. For a LAST chunk that makes
+            # `prefix_indices == fill_ids` → `extend_num_tokens == 0` → an empty
+            # `forward_extend` that crashes in rotary_emb (`reshape tensor of 0
+            # elements`); for a MIDDLE chunk it silently skips computing real
+            # tokens (garbage KV). Restoring `fill_len` to its pre-advance value
+            # keeps the gate at the last COMMITTED frontier, so the extend
+            # recomputes the remaining (>0) tokens next iter.
+            #
+            # (The legacy `_chunked_req_scheduled_last_iter = False` suppression
+            # that lived here is gone: upstream replaced the flag-based stash
+            # gate with the content-based one above, so the flag no longer gates
+            # anything — restoring `fill_len` is the equivalent fix for the new
+            # gate.)
+            if _prev_chunked_req is not None:
+                _prev_chunked_req.inflight_middle_chunks = _prev_is_chunked
+                if _prev_fill_len is not None:
+                    _prev_chunked_req.fill_len = _prev_fill_len
+            # Signal back-off for this iter; the next iter will retry.
+            self.running_batch.batch_is_full = True
+            return None
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3064,6 +3192,25 @@ class Scheduler(
                         len(r.output_ids) for r in retracted_reqs
                     ),
                 )
+            # Guard against an admission deadlock on the EMPTY-batch path.
+            # `estimate_new_token_ratio_after_retract([])` returns 0.0 (its
+            # arithmetic is `0 / (0 + 1)`), and `retract_decode` empties the
+            # batch when it aborts the last/only request — one that cannot fit
+            # even alone (a genuinely ~pool-sized request at a tight
+            # mem-fraction). Neither that estimator nor `retract_decode` floors
+            # the result, so applied raw `current = 0.0` freezes admission and
+            # the server hangs with no progress. Floor at the tracker's `min`
+            # (the same floor `decay_step` enforces) so admission always
+            # resumes; the oversized request is aborted with a 500 below and the
+            # scheduler keeps draining the queue.
+            #
+            # NOTE: one trigger was the shared pool's optimistic
+            # `available_size` OVER-admitting a too-big request — now fixed by
+            # the Mamba joint-budget reservation. This floor is KEPT as the
+            # GENERAL safety for the empty-batch ratio-0 case, which is
+            # independent of that fix (and which upstream's unfloored estimator
+            # shares).
+            new_token_ratio = max(new_token_ratio, self.new_token_ratio_tracker.min)
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
@@ -3235,6 +3382,36 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
+                        # Record a dedicated `forward_done`
+                        # event right after the forward (BEFORE copy_to_cpu).
+                        # This is what lazy-compaction `_flush` uses to gate
+                        # src reuse: when this fires, the in-flight forward's
+                        # KV reads have settled. Distinct from `copy_done`
+                        # (which fires later, after the host-side D2H of the
+                        # output) so compaction is not coupled to copy_to_cpu's
+                        # call site.
+                        forward_done = self.device_module.Event()
+                        forward_done.record(stream=self.forward_stream)
+                        allocator = self.token_to_kv_pool_allocator
+                        if hasattr(allocator, "set_latest_forward_done_event"):
+                            allocator.set_latest_forward_done_event(forward_done)
+                        # Write-set classification.
+                        # Hand the allocator the virtual `out_cache_loc` of
+                        # this forward as a TENSOR REFERENCE (no GPU work
+                        # here — the earlier `register_inflight_batch`
+                        # design materialized via `.tolist()` inside this
+                        # forward_stream_ctx and forced a sync on the
+                        # just-launched forward, costing 5-16 ms/forward
+                        # under SWA × overlap × cg_on).
+                        # The allocator's `_flush` materializes the
+                        # write-set lazily on schedule_stream only when a
+                        # survivor candidate actually needs to be checked.
+                        if hasattr(allocator, "set_inflight_forward"):
+                            allocator.set_inflight_forward(
+                                forward_done,
+                                getattr(batch, "out_cache_loc", None),
+                            )
+                        batch_result.forward_done = forward_done
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
@@ -3486,6 +3663,13 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if allocator is not None and hasattr(allocator, "flush_opportunistic"):
+            try:
+                allocator.flush_opportunistic()
+            except Exception:
+                pass
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

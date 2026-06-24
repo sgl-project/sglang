@@ -25,9 +25,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 # The set_kv_buffer integration test needs SharedMHATokenToKVPool, which only
-# exists once the shared-memory-pool feature lands; skip it where absent.
+# exists once the shared-KV-pool feature lands; skip it where absent.
 _HAS_SHARED_POOL = (
-    importlib.util.find_spec("sglang.srt.mem_cache.shared_memory_pool") is not None
+    importlib.util.find_spec("sglang.srt.mem_cache.shared_kv_pool") is not None
 )
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -154,7 +154,7 @@ class TestStoreCache4D(unittest.TestCase):
     def test_store_cache_4d_ps1_byte_identical(self):
         """At page_size=1 the kernel constexpr-folds to the slot-major
         envelope view. Output must be byte-identical to advanced indexing.
-        This protects the Stage 1/2/3 green eval matrix from regression."""
+        This protects against byte-layout regression."""
         self._check_parity(
             num_pages=64,
             page_size=1,
@@ -228,8 +228,7 @@ class TestStoreCache4D(unittest.TestCase):
 
     def test_store_cache_4d_dtype_fp8_e5m2(self):
         """fp8_e5m2 is used for KV-cache quantization. Caller is responsible
-        for the cast (Phase 1); the kernel sees same-dtype source and
-        destination."""
+        for the cast; the kernel sees same-dtype source and destination."""
         self._check_parity(
             num_pages=16,
             page_size=64,
@@ -338,9 +337,9 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         meaningfully different from the per-call gather."""
         import torch as _t
 
-        from sglang.srt.mem_cache.shared_memory_pool import (
+        from sglang.srt.mem_cache.shared_kv_pool import (
             MHASubPoolSpec,
-            SharedMemoryPool,
+            SharedKVPool,
             SharedMHATokenToKVPool,
         )
 
@@ -362,7 +361,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
             store_dtype=_t.bfloat16,
             grow_direction="down",
         )
-        pool = SharedMemoryPool(
+        pool = SharedKVPool(
             total_bytes=total + peer.entry_bytes() * 16,
             sub_pool_specs=[spec, peer],
             device="cuda",
@@ -450,7 +449,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         self._run_set_kv_buffer_and_compare(page_size=64)
 
     def _run_full_loc_fast_path_parity(self, page_size: int):
-        """Stage 3.5 fast-path byte-identity: writing through the precomputed
+        """Fast-path byte-identity: writing through the precomputed
         full-physical loc (`set_loc` fast path) must produce a byte-identical
         KV buffer to writing the virtual loc and letting `set_kv_buffer`
         translate per call. Uses a NON-identity v2p so the two paths are

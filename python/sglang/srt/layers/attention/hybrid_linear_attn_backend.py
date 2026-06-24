@@ -91,6 +91,27 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _maybe_translate_mamba_indices(
+        self, mamba_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Shared KV pool: ``get_mamba_indices`` returns *virtual* per-request
+        mamba ids; translate them to *physical* slot ids. No-op for the
+        non-shared ``HybridReqToTokenPool`` (it has no ``translate_mamba_indices``).
+
+        MUST be applied EVERYWHERE the mamba indices feed the SSM/conv kernels:
+        the eager ``_forward_metadata`` AND the cuda-graph
+        ``_capture_metadata`` / ``_replay_metadata`` (which copy the indices into
+        the captured-graph's stable ``state_indices_list`` buffer). Omitting it on
+        the cuda-graph path made cg_on feed VIRTUAL ids to the captured Mamba
+        kernels as if PHYSICAL → wrong state slot → garbled/truncated output,
+        while cg_off (eager) was correct. The translate runs in replay-prep
+        (eager, before ``graph.replay()``), so it reads the LIVE v2p table
+        post-compaction; the physical result is copied into the stable buffer the
+        captured graph reads.
+        """
+        _translate = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+        return _translate(mamba_indices) if _translate is not None else mamba_indices
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -106,6 +127,23 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        # Shared KV pool: get_mamba_indices returns *virtual* per-request ids;
+        # translate to *physical* slot ids once per batch (no-op for the
+        # non-shared HybridReqToTokenPool). MUST also happen on the cuda-graph
+        # capture/replay metadata path — see `_maybe_translate_mamba_indices`.
+        # Translate BEFORE the cuda-graph padding sentinel below, so the
+        # virtual->physical gather reads only real ids; padded rows are then
+        # poisoned to -1 (the mamba kernels skip -1).
+        mamba_cache_indices = self._maybe_translate_mamba_indices(mamba_cache_indices)
+        _translate_mamba = getattr(
+            self.req_to_token_pool, "translate_mamba_indices", None
+        )
+        if _translate_mamba is not None and forward_batch.mamba_track_indices is not None:
+            # The *_track_* index derivations below index by mamba slot too
+            # (speculative path; spec is off for the shared pool today).
+            forward_batch.mamba_track_indices = _translate_mamba(
+                forward_batch.mamba_track_indices
+            )
         _real_bs = getattr(forward_batch, "_original_batch_size", None)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -276,6 +314,18 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
         )
+        # OPEN-6 FIX: translate the radix prefix-cache mamba TRACK destination
+        # (`mamba_track_indices`) virtual→physical on the cg_on replay path, IN
+        # PLACE on the captured registry slot. The eager `_forward_metadata`
+        # translates it (L133-138); this replay path must too, else the captured
+        # decode track-save (`conv_states[mamba_track_indices] = …`) writes to the
+        # wrong/untranslated slot. No-op for the non-shared pool (no
+        # `translate_mamba_indices`) and at capture.
+        if not in_capture:
+            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            if _tr is not None and _mt is not None and _mt.numel() > 0:
+                _mt.copy_(_tr(_mt))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
@@ -556,6 +606,10 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        # Shared pool: virtual -> physical (no-op otherwise). The captured Mamba
+        # kernels read state_indices_list as PHYSICAL slot ids, so we must
+        # translate before copying — same as the eager _forward_metadata path.
+        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # GDN ReplaySSM (slice 1b): point at the STATIC per-bs write-cursor
@@ -619,6 +673,11 @@ class MambaAttnBackendBase(AttentionBackend):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        # Shared pool: virtual -> physical (no-op otherwise), reading the LIVE
+        # v2p table in replay-prep, BEFORE the padding sentinel below. The
+        # captured Mamba kernels read state_indices_list as PHYSICAL slot ids,
+        # so this translate is required here.
+        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
@@ -862,6 +921,22 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
         )
+        # OPEN-6 FIX: translate the Mamba prefix-cache track DESTINATION
+        # (`mamba_track_indices`) virtual->physical on the cg_on replay path, IN
+        # PLACE on the captured registry slot. The eager `_forward_metadata`
+        # translates it (L133-138) but THIS override (the path Falcon-H1 actually
+        # runs) did not — so the captured decode track-save
+        # (`conv_states[mamba_track_indices]`, hybrid_linear_attn_backend.py:947 →
+        # mamba_state_scatter_triton) indexed conv with VIRTUAL ids → wrong
+        # physical slot (NaN) / freed-slot sentinel (OOB). Mirrors the working
+        # index staged by `_replay_metadata` above. No-op for the non-shared pool
+        # (no `translate_mamba_indices`) and at capture. The freed-slot -1 result
+        # is now skipped by the kernel's pad_slot_id guard.
+        if not in_capture:
+            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            if _tr is not None and _mt is not None and _mt.numel() > 0:
+                _mt.copy_(_tr(_mt))
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
@@ -880,6 +955,38 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
+
+    def _select_causal_conv_backend(self, use_triton_causal_conv: bool) -> bool:
+        """Decide the causal-conv kernel: it FOLLOWS ``--linear-attn-backend``.
+
+        ``--linear-attn-backend triton`` (the default) ⇒ the stride-aware Triton
+        causal-conv kernels; any other linear-attn backend ⇒ the model's own
+        choice (CUDA sgl-kernel by default). This keeps the conv kernel
+        consistent with the declared linear-attn backend instead of being a
+        per-model hardcode.
+
+        Why it matters for the shared pool: it stores Mamba conv/temporal state
+        in envelope-STRIDED views (slot stride == ``entry_bytes``, not the inner
+        size); only the stride-aware Triton conv reads them correctly — the CUDA
+        ``causal_conv1d`` path GARBLES them. The shared pool's
+        gate (``ServerArgs._handle_shared_kv_pool``) already asserts
+        ``--linear-attn-backend triton``, so the shared pool always lands on
+        Triton conv here — no per-pool special-casing, no env knob.
+
+        A model that explicitly requested Triton conv (e.g. spec decoding's
+        intermediate-state path in Nemotron-H / Granite) is always honored.
+        Logged ONCE per backend instance.
+        """
+        la_backend = get_global_server_args().linear_attn_backend
+        resolved = use_triton_causal_conv or (la_backend == "triton")
+        if not getattr(self, "_logged_conv_kernel_choice", False):
+            self._logged_conv_kernel_choice = True
+            logger.info(
+                "[mamba] causal-conv kernel = %s (linear_attn_backend=%s)",
+                "TRITON (stride-aware)" if resolved else "CUDA (sgl-kernel)",
+                la_backend,
+            )
+        return resolved
     def forward(
         self,
         mixer: MambaMixer2,
@@ -891,6 +998,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
+        use_triton_causal_conv = self._select_causal_conv_backend(
+            use_triton_causal_conv
+        )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(
             hidden_states=hidden_states,
@@ -988,6 +1098,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
+
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):
@@ -997,6 +1108,26 @@ class HybridLinearAttnBackend(AttentionBackend):
         init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Forward the upstream #27091 in-graph metadata hook to the
+        sub-backend(s). For the shared pool this propagates the full-attn
+        (Triton) read-path v2p translate into the captured decode graph (the
+        Triton sub-backend overrides the hook); the Mamba sub-backend inherits
+        the base no-op (no kv_indices read path).
+
+        WHY THIS EXISTS: `cuda_graph_runner.run_once` calls
+        `attn_backend.init_forward_metadata_in_graph(forward_batch)`. For a
+        hybrid model the top-level `attn_backend` is THIS wrapper; without this
+        forward it would use the base no-op, the translate would be SILENTLY
+        SKIPPED, and the captured graph would read VIRTUAL kv_indices -> the
+        full-attention reads the WRONG KV slots under cg_on. The resulting
+        symptom looks like Mamba-state garble but is actually a full-attention
+        READ bug; the Mamba state divergence is downstream (layer 0's wrong
+        attention output flows through the residual).
+        """
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

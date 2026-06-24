@@ -414,33 +414,94 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
-) -> list[int]:
-    """Allocate request slots from the pool."""
+) -> Optional[list[int]]:
+    """Allocate request slots from the pool.
+
+    Returns:
+        The list of req_pool_idx slots, or ``None`` when the planner
+        detects that the requested batch cannot be honored — in which
+        case the caller should treat the prefill batch as not-ready and
+        re-queue the reqs for a subsequent scheduler iteration.
+
+    Why ``None`` instead of raising: under the shared KV pool, the
+    byte-coordinated mamba availability can drop below the
+    slot-conservation view at any moment when the peer (full) sub-pool
+    consumes bytes. The shared pool correctly implements the contract
+    "``schedulable_available_size() >= N`` ⇒ ``alloc(N)`` succeeds"; the
+    planner must respect that contract. Without this guard the per-req
+    loop in ``HybridReqToTokenPool.alloc`` would assert-fail when its
+    inner byte-coordinated ``mamba_pool.alloc(1)`` returned ``None``
+    mid-loop.
+    """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
+        # Byte-coordinated availability: the shared `SharedMambaSlotAllocator`
+        # exposes `schedulable_available_size`, which accounts for the peer pool's
+        # byte usage and triggers eviction when the shared byte buffer is tight
+        # even if slot-wise free space looks plentiful. Fall back to the slot
+        # allocator's plain free count (upstream's `MambaSlotAllocator.available_size`)
+        # for the non-shared pool, where the two views coincide. The
+        # lazy-extra-buffer factor below is upstream's (kept intact).
+        mamba_available_size = getattr(
+            req_to_token_pool.mamba_allocator,
+            "schedulable_available_size",
+            req_to_token_pool.mamba_allocator.available_size,
+        )()
+        # The eviction-trigger factor: how much "headroom" to ask the tree
+        # cache to free. For radix this is 3× — or the upstream
+        # lazy-extra-buffer variant when enabled — to leave room for potential
+        # COW (mamba_radix_cache._match_post_processor may allocate 1-2
+        # additional slots per req for copy-on-write branching). For chunk this
+        # is 1× — exact required. The lazy factor (kept from the upstream
+        # lazy-extra-buffer integration) only changes the eviction HEADROOM,
+        # not the strict refusal minimum below.
         if tree_cache.supports_mamba():
-            factor = (
+            evict_factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
                 if req_to_token_pool.enable_mamba_extra_buffer_lazy
                 else MAMBA_STATE_PER_REQ_PREFIX_CACHE
             )
         else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
+            evict_factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        # The refusal-trigger threshold MUST use the strict minimum
+        # (1 mamba slot per req) — not the 3× safety margin. The
+        # ``HybridReqToTokenPool.alloc`` per-req loop only needs 1
+        # mamba slot per req for its baseline call; the extra slots
+        # for COW are taken on the radix path later AFTER alloc
+        # succeeds. Using the 3× factor as the refusal threshold
+        # would refuse admissions that ACTUALLY would succeed,
+        # turning into a livelock under steady-state pressure (with all
+        # reqs pinning mamba slots: planner keeps refusing, scheduler
+        # keeps restoring, decoding freezes).
+        min_required = num_reqs  # ≥ 1 slot per req
+        evict_target = num_reqs * evict_factor
+        if mamba_available_size < evict_target:
             if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                mamba_num = max(0, evict_target - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                # Re-read after eviction so we know whether it
+                # freed enough for the strict minimum. Same byte-coordinated
+                # accessor (with the upstream slot-allocator fallback) as the
+                # initial read above.
+                mamba_available_size = getattr(
+                    req_to_token_pool.mamba_allocator,
+                    "schedulable_available_size",
+                    req_to_token_pool.mamba_allocator.available_size,
+                )()
+            # Refuse ONLY when the strict minimum cannot be honored —
+            # i.e., the ``mamba_pool.alloc(1)`` per-req loop would
+            # genuinely fail. The 3× evict target was a "best effort"
+            # hint to the tree cache; missing that target is fine as
+            # long as the strict minimum is met.
+            if mamba_available_size < min_required:
+                return None
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
-        raise RuntimeError(
-            "alloc_req_slots runs out of memory. "
-            "Please set a smaller number for `--max-running-requests`. "
-            f"{req_to_token_pool.available_size()=}, "
-            f"{num_reqs=}, "
-        )
+        # Same intent as the mamba branch above: the alloc could not be
+        # honored — let the caller back off and retry next iter rather
+        # than crash with a hard error in the middle of batch prep.
+        return None
     return req_pool_indices
 
 
@@ -458,14 +519,16 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
-        out_cache_loc: allocated cache locations
-        req_pool_indices_device: request pool indices as a device tensor
-        req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
+        ``None`` if ``alloc_req_slots`` could not satisfy the request
+        (planner contract — caller should treat the batch as not-ready
+        and re-queue). Otherwise a 3-tuple ``(out_cache_loc,
+        req_pool_indices_device, req_pool_indices_cpu)`` where the last is
+        the host (CPU) mirror of the request pool indices.
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -482,6 +545,11 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
+    if req_pool_indices is None:
+        # Planner refused to over-promise — propagate so the scheduler
+        # can re-queue the reqs and retry next iter. No KV/req-pool
+        # mutations have been committed yet at this point.
+        return None
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 

@@ -2346,6 +2346,9 @@ class HybridLinearKVPool(KVCache):
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
+        # When provided (shared-KV-pool path), use this pool for the
+        # full-attention layers instead of constructing one internally.
+        full_kv_pool: Optional[KVCache] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2358,7 +2361,11 @@ class HybridLinearKVPool(KVCache):
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
         self.use_mla = use_mla
-        if not use_mla:
+        if full_kv_pool is not None:
+            # Shared-KV-pool path: the caller built a SharedMHATokenToKVPool
+            # aliasing the shared byte buffer.
+            self.full_kv_pool = full_kv_pool
+        elif not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
 
             if current_platform.is_out_of_tree():
@@ -2416,6 +2423,12 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+        # Per-batch full-physical loc, pinned by `set_full_loc`. When set
+        # (shared-pool path), `set_kv_buffer` passes it to the underlying
+        # SharedMHATokenToKVPool so its data-ptr fast path fires and skips the
+        # per-call v2p gather on every full-attention layer.
+        self.full_loc: Optional[torch.Tensor] = None
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -2494,9 +2507,14 @@ class HybridLinearKVPool(KVCache):
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
+            # Fast path: when the per-batch full-physical loc is pinned
+            # (`set_full_loc`), pass it so SharedMHATokenToKVPool's data-ptr
+            # fast path fires and skips the per-call v2p gather. Falls back to
+            # the (virtual) `loc` when no precompute is pinned (non-shared path).
+            write_loc = self.full_loc if self.full_loc is not None else loc
             self.full_kv_pool.set_kv_buffer(
                 None,
-                loc,
+                write_loc,
                 cache_k,
                 cache_v,
                 k_scale,
@@ -2512,6 +2530,14 @@ class HybridLinearKVPool(KVCache):
                     cache_k,
                     cache_v,
                 )
+
+    def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
+        """Per-batch full-physical loc for the full-attention layers. Forwards
+        to ``full_kv_pool.set_loc`` when the underlying pool exposes it (the
+        shared-pool ``SharedMHATokenToKVPool``); no-op for a static pool."""
+        if hasattr(self.full_kv_pool, "set_loc"):
+            self.full_loc = loc
+            self.full_kv_pool.set_loc(loc)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)

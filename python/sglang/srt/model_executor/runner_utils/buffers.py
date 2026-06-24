@@ -69,6 +69,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    # Shared-KV-pool cuda-graph WRITE-location buffer (int64, matching the
+    # v2p table dtype). Holds the full-physical write locations under the shared
+    # pool, refreshed IN-GRAPH each replay by `_capture_shared_pool_write_translate`.
+    # `None` for non-shared pools (then the capture pins / in-graph translate are
+    # no-ops, keeping baseline cg_on byte-identical).
+    out_cache_loc_full_physical: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -106,6 +112,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        enable_shared_kv_pool: bool = False,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -113,6 +120,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            # Shared pool: a separate int64 full-physical write buffer is
+            # allocated (matching the v2p table), refreshed in-graph each replay.
+            # The SWA write loc rides the backend `swa_out_cache_loc` rail, so no
+            # SWA buffer is allocated here. None for non-shared pools.
+            if enable_shared_kv_pool:
+                out_cache_loc_full_physical = torch.zeros(
+                    (max_num_token,), dtype=torch.int64
+                )
+            else:
+                out_cache_loc_full_physical = None
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -199,6 +216,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_full_physical=out_cache_loc_full_physical,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,

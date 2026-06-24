@@ -51,6 +51,11 @@ def track_mamba_state_if_needed_kernel(
     src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
     dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
 
+    # Skip freed/unallocated slots: a freed slot maps to -1, and
+    # `state_ptr + (-1) * stride` would fault before the buffer.
+    if src_idx < 0 or dst_idx < 0:
+        return
+
     # Copy conv_states
     # Each thread handles BLOCK_SIZE elements
     for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
