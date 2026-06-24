@@ -5,14 +5,14 @@ import triton.language as tl
 
 @triton.jit
 def _prepare_dflash_draft_block_contig_kernel(
-    verified_id_ptr,
+    bonus_tokens_ptr,
     prefix_lens_ptr,
     req_pool_indices_ptr,
     req_to_token_ptr,
     block_ids_out_ptr,
     positions_out_ptr,
     cache_loc_out_ptr,
-    verified_id_stride,
+    bonus_tokens_stride,
     prefix_lens_stride,
     req_pool_indices_stride,
     req_to_token_row_stride,
@@ -30,7 +30,7 @@ def _prepare_dflash_draft_block_contig_kernel(
 
     prefix_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride)
     req_idx = tl.load(req_pool_indices_ptr + row * req_pool_indices_stride)
-    verified_id = tl.load(verified_id_ptr + row * verified_id_stride)
+    bonus_token = tl.load(bonus_tokens_ptr + row * bonus_tokens_stride)
 
     logical_pos = prefix_len.to(tl.int64) + cols
     valid = row_mask & (logical_pos < req_to_token_width)
@@ -38,7 +38,7 @@ def _prepare_dflash_draft_block_contig_kernel(
     slot_ids = tl.load(req_row_ptr + logical_pos, mask=valid, other=0)
 
     block_ids = tl.full((BLOCK_SIZE,), mask_token_id, tl.int64)
-    block_ids = tl.where(cols == 0, verified_id.to(tl.int64), block_ids)
+    block_ids = tl.where(cols == 0, bonus_token.to(tl.int64), block_ids)
     tl.store(
         block_ids_out_ptr + row * block_ids_row_stride + cols, block_ids, mask=row_mask
     )
@@ -69,7 +69,7 @@ def _is_row_major_contiguous_2d(x: torch.Tensor) -> bool:
 
 
 def _prepare_dflash_draft_block_unchecked(
-    verified_id: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     prefix_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -78,7 +78,7 @@ def _prepare_dflash_draft_block_unchecked(
     cache_loc_out: torch.Tensor,
     mask_token_id: int,
 ) -> None:
-    batch_size = int(verified_id.numel())
+    batch_size = int(bonus_tokens.numel())
     if batch_size == 0:
         return
 
@@ -101,14 +101,14 @@ def _prepare_dflash_draft_block_unchecked(
     block = triton.next_power_of_2(block_size)
     num_warps = _pick_num_warps(block)
     _prepare_dflash_draft_block_contig_kernel[(batch_size,)](
-        verified_id,
+        bonus_tokens,
         prefix_lens,
         req_pool_indices,
         req_to_token,
         block_ids_out,
         positions_out,
         cache_loc_out,
-        verified_id.stride(0),
+        bonus_tokens.stride(0),
         prefix_lens.stride(0),
         req_pool_indices.stride(0),
         req_to_token.stride(0),
