@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Shared scaffolding for the prefill and decode CUDA graph runners."""
 
 from __future__ import annotations
@@ -5,22 +18,15 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
-import torch
-
-from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -59,7 +65,7 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    capture_bs = list(server_args.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
@@ -68,15 +74,19 @@ def get_batch_sizes_to_capture(
         num_tokens_per_bs = 1
 
     if require_gathered_buffer(server_args):
-        mul_base *= get_attention_tp_size()
+        mul_base *= get_parallel().attn_tp_size
 
-    if mul_base % get_attention_cp_size() != 0:
-        mul_base *= get_attention_cp_size()
+    if mul_base % get_parallel().attn_cp_size != 0:
+        mul_base *= get_parallel().attn_cp_size
 
+    # pad `num_max_requests` to avoid being filtered out
     num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
     if max(capture_bs) > num_max_requests:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
 
+    # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
@@ -90,7 +100,7 @@ def get_batch_sizes_to_capture(
     return capture_bs, compile_bs
 
 
-class BaseCudaGraphRunner(ABC):
+class BaseCudaGraphRunner(BaseRunner):
     """Abstract base for phase-specific cuda-graph runners.
 
     A subclass (DecodeCudaGraphRunner / PrefillCudaGraphRunner) owns one
@@ -99,19 +109,18 @@ class BaseCudaGraphRunner(ABC):
     selection, static buffer population, attention metadata init,
     replay dispatch, and output slicing.
 
-    Methods:
-      - can_run(forward_batch) — should forward_batch go through cuda
-        graph replay (vs eager fallback)?
+    Adds the capture/shape machinery on top of BaseRunner:
       - capture_prepare(size, ...) — build the dummy ForwardBatch and
-        per-capture local state needed by capture_one_shape.
-      - capture() — outer capture loop; iterates over shapes and calls
+        per-shape local state needed by capture_one_shape.
+      - capture() — one-time setup; iterates over shapes and calls
         capture_one_shape for each.
       - capture_one_shape(size, ...) — drive one model forward at this
         shape into the backend's captured artifact.
-      - replay_prepare(forward_batch, ...) — pad to the nearest captured
-        bucket, populate static input buffers, init attention metadata.
-      - replay(forward_batch, ...) — dispatch one batch through cuda
-        graph replay.
+      - _pad_to_bucket(...) — round a raw shape up to the nearest captured
+        bucket.
+
+    Inherits from BaseRunner: __init__ and the abstract
+    can_run_graph / load_batch / execute.
 
     Notes:
       - buffers and backend are populated by the subclass before
@@ -122,36 +131,22 @@ class BaseCudaGraphRunner(ABC):
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
 
-    def __init__(self, model_runner: ModelRunner) -> None:
-        self.model_runner = model_runner
-        self.device = model_runner.device
-        self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.tbo_plugin = TboCudaGraphRunnerPlugin()
-
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         """Return the smallest buckets[i] >= raw_size.
 
-        Caller's can_run must reject raw_size > max(buckets) before
-        reaching replay_prepare; this assertion makes the contract
+        Caller's can_run_graph must reject raw_size > max(buckets) before
+        reaching load_batch; this assertion makes the contract
         explicit (bisect_left returns len(buckets) when the value
         exceeds all buckets, which would otherwise IndexError below
         with no diagnostic).
         """
         assert raw_size <= buckets[-1], (
             f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
-            f"can_run should have rejected this batch"
+            f"can_run_graph should have rejected this batch"
         )
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
-
-    @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch) -> bool: ...
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...
@@ -161,17 +156,3 @@ class BaseCudaGraphRunner(ABC):
 
     @abstractmethod
     def capture_one_shape(self, size: int, *args, **kwargs) -> Any: ...
-
-    @abstractmethod
-    def replay_prepare(
-        self,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ) -> Any: ...
-
-    @abstractmethod
-    def replay(
-        self,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ) -> Any: ...

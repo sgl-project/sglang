@@ -94,7 +94,7 @@ class DmdDenoisingStage(DenoisingStage):
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
 
         denoising_loop_start_time = time.time()
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:

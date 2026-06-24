@@ -55,6 +55,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -70,10 +71,14 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
+    ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    async_sock_recv,
+    async_sock_send,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -378,19 +383,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
+            send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
         else:
-            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
-
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+            self.send_to_scheduler = SenderWrapper(
+                port_args, send_to_scheduler, attach_multi_http_worker_info=True
+            )
 
         self.load_snapshot_reader = create_load_snapshot_reader(
             self.server_args,
@@ -597,30 +602,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
-        if self.server_args.language_only:
-            self._handle_epd_disaggregation_encode_request(obj)
+        try:
+            if self.server_args.language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
 
-        # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer, request)
+            # Log the request
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-        async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
 
-            # Tokenize the request and send it to the scheduler
-            if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                state = self.rid_to_state[obj.rid]
-                if obj.return_prompt_token_ids:
-                    state.prompt_token_ids = list(tokenized_obj.input_ids)
-                self._send_one_request(tokenized_obj)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(obj, request):
-                    yield response
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    state = self.rid_to_state[obj.rid]
+                    if obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(obj, request):
+                        yield response
+        except Exception:
+            # _init_req_state created a rid_to_state entry per (sub-)request up
+            # front. The normal remover is the scheduler-response path
+            # (_handle_batch_output), so a failure *before* a request reaches the
+            # scheduler -- e.g. input-length validation rejecting an over-context
+            # request -- would otherwise leak those entries forever. Drop any that
+            # are still pending; entries already removed on the normal completion
+            # path are left untouched (pop is a no-op).
+            self._discard_pending_req_states(obj)
+            raise
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -985,8 +1001,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
-        # Validate custom logit processor
+        # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
+            self._validate_token_ids_logprob(obj)
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -1046,6 +1063,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
+
+    def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
+        # Batch requests are split into per-request sub-objects before this
+        # runs (normalize_batch_and_arguments + __getitem__), so the only
+        # legal shape here is the per-request contract of
+        # TokenizedGenerateReqInput.token_ids_logprob: a flat list of ints.
+        token_ids_logprob = obj.token_ids_logprob
+        if not token_ids_logprob:
+            return
+        if not isinstance(token_ids_logprob, list):
+            raise ValueError("token_ids_logprob must be a flat list of integers.")
+        vocab_size = self.model_config.vocab_size
+        for token_id in token_ids_logprob:
+            if not isinstance(token_id, int):
+                raise ValueError("token_ids_logprob must be a flat list of integers.")
+            if token_id < 0 or token_id >= vocab_size:
+                raise ValueError(
+                    f"token_ids_logprob contains out-of-vocabulary token id "
+                    f"{token_id}; valid range is [0, {vocab_size})."
+                )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
@@ -1289,7 +1326,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        sock_send(self.send_to_scheduler, tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
@@ -1305,7 +1342,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        self.send_to_scheduler.send_pyobj(batch_req)
+        sock_send(self.send_to_scheduler, batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
     def _coalesce_streaming_chunks(
@@ -1630,7 +1667,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_pyobj(req)
+        sock_send(self.send_to_scheduler, req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1641,7 +1678,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await async_sock_send(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1655,7 +1692,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await async_sock_send(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1700,7 +1737,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1740,12 +1777,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Let the exception propagate to the caller.
             # Only legal requests will be sent to scheduler.
             logging.getLogger().setLevel(obj.log_level.upper())
-            self.send_to_scheduler.send_pyobj(obj)
+            sock_send(self.send_to_scheduler, obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        sock_send(self.send_to_scheduler, FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -1792,7 +1829,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
@@ -1833,19 +1870,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            # Surface scheduler load info on each response so clients can do
-            # response-based flow control without polling /v1/loads. The
-            # scheduler already piggy-backs the per-DP-rank load on
-            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
-            load = getattr(recv_obj, "load", None)
-            if load is not None:
-                num_running_reqs = getattr(load, "num_running_reqs", None)
-                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
-                if num_running_reqs is not None:
-                    meta_info["num_running_reqs"] = num_running_reqs
-                if num_waiting_reqs is not None:
-                    meta_info["num_waiting_reqs"] = num_waiting_reqs
-
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -1885,6 +1909,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             state.customized_info_accumulated[k] = []
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
+
+                # Add multimodal prompt token counts only for requests that
+                # actually consumed them, so plain-text meta_info stays unchanged.
+                image_tokens_list = getattr(recv_obj, "image_tokens", None)
+                audio_tokens_list = getattr(recv_obj, "audio_tokens", None)
+                video_tokens_list = getattr(recv_obj, "video_tokens", None)
+                if image_tokens_list and image_tokens_list[i]:
+                    meta_info["image_tokens"] = image_tokens_list[i]
+                if audio_tokens_list and audio_tokens_list[i]:
+                    meta_info["audio_tokens"] = audio_tokens_list[i]
+                if video_tokens_list and video_tokens_list[i]:
+                    meta_info["video_tokens"] = video_tokens_list[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
@@ -2611,6 +2647,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        # Stop the watchdog: child exits are expected during shutdown, not crashes.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        # Ask schedulers to release resources in userspace and exit (see
+        # ShutdownReq), then wait for them before hard-killing the rest.
+        sock_send(self.send_to_scheduler, ShutdownReq())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
@@ -2621,7 +2666,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Two scheduler messages can race in handle_loop for the same rid: a
+        # batch output that finishes it normally (deletes rid_to_state[rid])
+        # and this abort echo. If the finish wins, the rid is already gone and
+        # there is nothing left to abort. Common under mass client
+        # disconnects, amplified by prefix / abort_all fan-out.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.info(
+                "Abort request for rid=%s not found in rid_to_state; "
+                "likely already finished/removed.",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -2664,7 +2721,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.send_to_scheduler.send_pyobj(ranks)
+        sock_send(self.send_to_scheduler, ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
@@ -2805,6 +2862,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.server_args.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+
+    def _discard_pending_req_states(self, obj):
+        """Drop rid_to_state entries created by _init_req_state for *obj*.
+
+        Safe to call after a partial/failed dispatch: only entries still present
+        are removed, and the scheduler-response path looks up state with
+        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        """
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid
+        for rid in rids:
+            self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -2982,6 +3053,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
+            model_name=server_args.model_path,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2996,6 +3068,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
+                model_name=server_args.model_path,
             )
         else:
             raise e
@@ -3046,3 +3119,25 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+class SenderWrapper:
+    def __init__(
+        self,
+        port_args,
+        send_to_scheduler,
+        attach_multi_http_worker_info=False,
+    ):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+        self.attach_multi_http_worker_info = attach_multi_http_worker_info
+
+    def _stamp_http_worker_ipc(self, obj):
+        if not self.attach_multi_http_worker_info:
+            return
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+
+    def send_pyobj(self, obj, flags=0):
+        self._stamp_http_worker_ipc(obj)
+        return self.send_to_scheduler.send_pyobj(obj, flags=flags)
