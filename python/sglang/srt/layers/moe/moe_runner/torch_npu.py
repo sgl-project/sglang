@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
+    NPUUnquantMoEMethodGGUF,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
