@@ -13,6 +13,7 @@ class BaseMatmul(ABC):
         expert_tokens: torch.Tensor,
         output_dtype: torch.dtype,
         group_list_type,
+        split_item,
         **scale_args,
     ) -> torch.Tensor:
         pass
@@ -27,8 +28,8 @@ class GroupedMatmul(BaseMatmul):
         expert_tokens: torch.Tensor,
         output_dtype: torch.dtype,
         group_list_type,
-        **scale_args,
         split_item,
+        **scale_args,
     ) -> torch.Tensor:
         # Use cached weight attribute if available, otherwise fall back to direct getattr
         weight = getattr(quant_info, f"{weight_prefix}_weight", None)
