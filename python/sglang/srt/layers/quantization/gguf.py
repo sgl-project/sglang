@@ -794,7 +794,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
         self.w13_kernel = NPUUnquantMoEMethod()
-        self.w2_kernel = NPUUnquantMoEMethodGGUF()
+        self.w2_kernel = NPUUnquantMoEMethod()
 
     def create_weights(
         self,
@@ -937,6 +937,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         layer.w13_kernel = self.w13_kernel
         layer.w2_kernel = self.w2_kernel
         moe_runner_config.layer = layer
+        moe_runner_config.use_tp_all_gather_activation = True
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
