@@ -249,7 +249,11 @@ class RustUnifiedRadixCache(BasePrefixCache):
             max(0, params.swa_num_tokens) if self.sliding_window_size is not None else 0
         )
         mamba_budget = max(0, params.mamba_num) if self.supports_mamba() else 0
-        if self.disable or (full_budget == 0 and swa_budget == 0 and mamba_budget == 0):
+        if (
+            self.disable
+            or self.token_to_kv_pool_allocator is None
+            or (full_budget == 0 and swa_budget == 0 and mamba_budget == 0)
+        ):
             return EvictResult(num_tokens_evicted=0)
 
         # FULL eviction can cross-bump freed[Swa], so release every freed bin

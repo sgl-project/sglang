@@ -42,7 +42,8 @@ class RustTreeComponent:
 
     # --- Required: every component implements these (raise if not). ---
     def free_evicted(self, freed_bin: list[torch.Tensor]) -> None:
-        """Free this component's evicted tensors into its pool."""
+        """Free this component's evicted tensors into its pool. `evict()`
+        guarantees the pool allocator is live before calling."""
         raise NotImplementedError
 
     def evictable_size(self) -> int:

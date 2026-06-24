@@ -32,8 +32,6 @@ class RustSWAComponent(RustTreeComponent):
 
     def free_evicted(self, freed_bin):
         alloc = self.cache.token_to_kv_pool_allocator
-        if alloc is None:
-            return
         for t in freed_bin:
             alloc.free_swa(t)
 
