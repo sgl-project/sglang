@@ -297,32 +297,37 @@ fi
         devices = " ".join(endpoint.ib_device for endpoint in endpoints if run.protocol == "rdma")
         if not devices:
             return
+        raw_dir = out_dir / "raw"
+        monitor_csv = raw_dir / "rdma-rcv-monitor.csv"
+        monitor_err = raw_dir / "rdma-rcv-monitor.err"
+        monitor_pid = raw_dir / "rdma-monitor.pid"
+        monitor_inner = f"""
+declare -A last
+for dev in {devices}; do
+  last[$dev]=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data)
+done
+tlast=$(date +%s)
+while true; do
+  sleep 2
+  now=$(date +%s)
+  ts=$(date -Iseconds)
+  dt=$((now - tlast))
+  for dev in {devices}; do
+    cur=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data)
+    prev=${{last[$dev]}}
+    gbps=$(awk -v cur="$cur" -v prev="$prev" -v dt="$dt" 'BEGIN{{printf "%.3f",(cur-prev)*32/dt/1e9}}')
+    echo "$ts,$dev,$gbps"
+    last[$dev]=$cur
+  done
+  tlast=$now
+done
+"""
         script = f"""
 set -euo pipefail
-mkdir -p {q(str(out_dir / 'raw'))}
-echo "ts,dev,rcv_Gbps" > {q(str(out_dir / 'raw' / 'rdma-rcv-monitor.csv'))}
-(
-  declare -A last
-  for dev in {devices}; do
-    last[$dev]=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data)
-  done
-  tlast=$(date +%s)
-  while true; do
-    sleep 2
-    now=$(date +%s)
-    ts=$(date -Iseconds)
-    dt=$((now - tlast))
-    for dev in {devices}; do
-      cur=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data)
-      prev=${{last[$dev]}}
-      gbps=$(awk -v cur="$cur" -v prev="$prev" -v dt="$dt" 'BEGIN{{printf "%.3f",(cur-prev)*32/dt/1e9}}')
-      echo "$ts,$dev,$gbps"
-      last[$dev]=$cur
-    done
-    tlast=$now
-  done
-) >> {q(str(out_dir / 'raw' / 'rdma-rcv-monitor.csv'))} &
-echo $! > {q(str(out_dir / 'raw' / 'rdma-monitor.pid'))}
+mkdir -p {q(str(raw_dir))}
+echo "ts,dev,rcv_Gbps" > {q(str(monitor_csv))}
+nohup bash -lc {q(monitor_inner)} </dev/null >> {q(str(monitor_csv))} 2>> {q(str(monitor_err))} &
+echo $! > {q(str(monitor_pid))}
 """
         self.run_remote(script)
 
