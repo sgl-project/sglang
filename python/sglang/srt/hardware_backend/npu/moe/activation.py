@@ -78,12 +78,12 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        result = self._kernel(
+        hidden_states, per_token_scale = self._kernel(
             hidden_states, group_list, group_list_type, need_quant=self.need_quant
         )
-        if isinstance(result, tuple):
-            return result
-        return result, None
+        if self.need_quant:
+            return hidden_states, per_token_scale
+        return hidden_states, None
 
 
 class NPUGeluAndMul(BaseActivation):
