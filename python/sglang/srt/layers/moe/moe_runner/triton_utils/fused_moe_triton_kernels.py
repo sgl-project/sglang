@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_sm90_supported,
+    is_xpu,
 )
 
 try:
@@ -40,7 +42,15 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _is_xpu:
+    # Let the Intel GPU backend emit 2D block I/O for tensor-descriptor
+    # load/stores that do not feed a tl.dot (e.g. the c_sorted output store).
+    # setdefault so an explicit user setting still wins. Must be set before the
+    # Triton kernels below are compiled.
+    os.environ.setdefault("TRITON_INTEL_ENABLE_BLOCK_IO_ALL_LAYOUTS", "1")
 
 if _is_cuda:
     pass
@@ -378,6 +388,9 @@ def fused_moe_kernel(
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
+    A_MAKE_DEVICE_DESC: tl.constexpr,
+    B_MAKE_DEVICE_DESC: tl.constexpr,
+    C_MAKE_DEVICE_DESC: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     MASK_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
@@ -461,9 +474,26 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # ``a_desc``/``b_desc`` are host-side TMA descriptors passed in. When they are
+    # None and ``*_MAKE_DEVICE_DESC`` is set, the equivalent device-side
+    # descriptors are built locally here from raw base/shape/strides (no global
+    # allocator, 2D, and kept on the fast 2D-block-I/O path by being created in
+    # the loading kernel).
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
+    elif A_MAKE_DEVICE_DESC:
+        assert use_fp8_w8a8 and group_n > 0 and group_k > 0
+        start_offs_m = pid_m * BLOCK_SIZE_M
+        # A is laid out in sorted order for the TMA path; describe its M x K
+        # extent natively (last stride == 1). Overwrite ``a_desc`` so the load
+        # site below treats the host and in-kernel descriptors uniformly.
+        a_desc = tl.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(EM, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        )
     else:
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
@@ -471,6 +501,20 @@ def fused_moe_kernel(
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
+    elif B_MAKE_DEVICE_DESC:
+        start_offs_n = pid_n * BLOCK_SIZE_N
+        # Fold the expert index into the base pointer so the descriptor is 2D
+        # over the (N, K) weight slice (the rank-3 form drops off the fast
+        # path). Native row-major layout keeps the last stride == 1; the loaded
+        # (BLOCK_N, BLOCK_K) block is transposed for the dot below. Overwrite
+        # ``b_desc``; the load site distinguishes this 2D form from the rank-3
+        # host descriptor via ``B_MAKE_DEVICE_DESC``.
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr + off_experts * stride_be,
+            shape=(N, K),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+        )
     else:
         b_ptrs = (
             b_ptr
@@ -544,7 +588,12 @@ def fused_moe_kernel(
                 other=0.0,
             )
 
-        if b_desc is not None:
+        if B_MAKE_DEVICE_DESC:
+            # In-kernel 2D descriptor over (N, K); transpose the (BLOCK_N,
+            # BLOCK_K) block to (BLOCK_K, BLOCK_N) for the dot. Checked before
+            # ``b_desc is not None`` since both descriptor paths set ``b_desc``.
+            b = b_desc.load([start_offs_n, k_start]).T
+        elif b_desc is not None:
             b = (
                 b_desc.load([off_experts_i32, start_offs_n, k_start])
                 .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
@@ -635,6 +684,22 @@ def fused_moe_kernel(
         )
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+    elif C_MAKE_DEVICE_DESC:
+        # c_sorted store only: rows are the contiguous block ``offs_token_id``
+        # (= pid_m * BLOCK_SIZE_M + arange), so the output tile is a 2D
+        # rectangle describable by a device-side descriptor. Build it locally
+        # over the (EM, N) buffer; out-of-bounds columns are masked by ``shape``
+        # and padding rows (token_mask == False) are written with benign values
+        # that the down-projection re-reads in the same sorted order and masks
+        # out at its final scatter.
+        start_offs_m = pid_m * BLOCK_SIZE_M
+        c_desc = tl.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(EM, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        )
+        c_desc.store([start_offs_m, pid_n * BLOCK_SIZE_N], accumulator)
     else:
         if c_sorted:
             c_ptrs = (
@@ -885,24 +950,44 @@ def invoke_fused_moe_kernel(
         )
 
     else:
-        if a_use_tma or b_use_tma:
-            _set_triton_tma_allocator()
-
-        if a_use_tma:
-            a_desc = TensorDescriptor(
-                A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
-            )
-        else:
+        a_make_device_desc = False
+        b_make_device_desc = False
+        c_make_device_desc = False
+        if _is_xpu:
+            # Device-side descriptors are built *inside* the kernel from raw
+            # base/shape/strides. They need no global allocator, and being created
+            # locally (not passed across the tt.call boundary) and 2D keeps them on
+            # the hardware 2D-block-I/O fast path.
+            a_make_device_desc = a_use_tma
+            b_make_device_desc = b_use_tma
+            # c_sorted stores write a contiguous (EM, N) tile, so they can use a
+            # device-side descriptor store. Only c_sorted is eligible (the token
+            # scatter of the other paths is not a 2D rectangle).
+            c_make_device_desc = c_sorted
             a_desc = None
-        if b_use_tma:
-            # B is constant weights -> cache descriptor
-            b_desc = _get_b_tma_desc_cached(
-                B,
-                config["BLOCK_SIZE_N"],
-                config["BLOCK_SIZE_K"],
-            )
-        else:
             b_desc = None
+        else:
+            if a_use_tma or b_use_tma:
+                _set_triton_tma_allocator()
+
+            if a_use_tma:
+                a_desc = TensorDescriptor(
+                    A,
+                    A.shape,
+                    A.stride(),
+                    [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]],
+                )
+            else:
+                a_desc = None
+            if b_use_tma:
+                # B is constant weights -> cache descriptor
+                b_desc = _get_b_tma_desc_cached(
+                    B,
+                    config["BLOCK_SIZE_N"],
+                    config["BLOCK_SIZE_K"],
+                )
+            else:
+                b_desc = None
 
         fused_moe_kernel[grid](
             A,
@@ -949,6 +1034,9 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,
+            A_MAKE_DEVICE_DESC=a_make_device_desc,
+            B_MAKE_DEVICE_DESC=b_make_device_desc,
+            C_MAKE_DEVICE_DESC=c_make_device_desc,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
