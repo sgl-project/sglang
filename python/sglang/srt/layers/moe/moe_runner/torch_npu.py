@@ -14,7 +14,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
-    NPUSwigluAllGather,
+    AllGatherActivationWrapper,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
@@ -110,7 +110,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
 
             # 2. If the quant method (GGUF) needs TP all‑gather, wrap the activation
             if getattr(config.layer, '_needs_tp_all_gather_activation', False):
-                self.activation = AllGatherWrapper(inner, dim=-1)
+                self.activation = AllGatherActivationWrapper(inner, dim=-1)
             else:
                 self.activation = inner
 
