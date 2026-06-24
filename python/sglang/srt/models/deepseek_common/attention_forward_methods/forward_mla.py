@@ -371,14 +371,18 @@ class DeepseekMLAForwardMixin:
                 else:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
-                        self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        self.w_kc_dequant
+                        if self.w_kc_dequant is not None
+                        else self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
 
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
                 q_nope_out = torch.bmm(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
-                    self.w_kc.to(torch.bfloat16) * self.w_scale,
+                    self.w_kc_dequant
+                    if self.w_kc_dequant is not None
+                    else self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
             else:
                 # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
@@ -655,7 +659,9 @@ class DeepseekMLAForwardMixin:
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
+                        self.w_vc_dequant
+                        if self.w_vc_dequant is not None
+                        else self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
             if _bmm_buf is not None:
@@ -689,7 +695,9 @@ class DeepseekMLAForwardMixin:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
-                    self.w_vc.to(torch.bfloat16) * self.w_scale,
+                    self.w_vc_dequant
+                    if self.w_vc_dequant is not None
+                    else self.w_vc.to(torch.bfloat16) * self.w_scale,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
             else:

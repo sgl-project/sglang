@@ -1687,6 +1687,10 @@ class DeepseekV2AttentionMLA(
 
         self.w_kc = None
         self.w_vc = None
+        # Dequantized (bf16) absorbed weights, cached once at load time to
+        # avoid recomputing w.to(bf16) * w_scale every decode step.
+        self.w_kc_dequant = None
+        self.w_vc_dequant = None
         self.w_scale = 1.0
 
         self.w_scale_k = None
