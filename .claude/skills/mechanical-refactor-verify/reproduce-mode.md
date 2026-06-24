@@ -77,3 +77,49 @@ python3 <(curl -sL <raw_url>)   # PASS = byte-identical to this PR
 
 A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
 fixes, formatting). Semantic changes go in a separate PR.
+
+## The `Repro` builder — relocation primitives instead of a hand-written transform
+
+For a method/function relocation, compose the transform from faithful primitives instead
+of editing line ranges by hand. Each primitive does only a relocation-faithful, AST-driven
+edit (it never changes logic), so a byte match after the formatter certifies the commit is
+exactly that relocation — and a bundled change surfaces as a residual diff.
+
+```python
+from mechanical_refactor_reproduce_utils import Repro
+
+r = Repro(base="<base_sha>", target="<commit>")
+# Lower call sites / fix imports BEFORE moving, so a call to a moved method from inside
+# another moved method is lowered while still in the source and travels with the body.
+r.lower_call_sites("update_weights_from_ipc", "ModelRunner", paths=["a.py", "b.py"])
+r.remove_import("a.py", "from x import ModelRunner", in_function="update_weights_from_ipc")
+r.add_import("dst.py", "import gc")
+r.move_symbol("update_weights_from_ipc", src="a.py", dst="dst.py", into_class="WeightUpdater", dedent=0)
+r.run()   # PASS = byte-identical; otherwise prints the residual
+```
+
+Primitives: `move_symbol` (cut a def with its decorators, drop `@staticmethod`/`@classmethod`,
+dedent, paste at the end of a class or at module level), `lower_call_sites`
+(`Owner.m(receiver, rest)` → `receiver.m(rest)`), `requalify_call_sites` (`Owner.m(args)` →
+`m(args)`), `remove_import` (function-scoped, all occurrences, with the trailing blank),
+`add_import` (the formatter's import sorter places it).
+
+## Auto-generate a reproduce script from a commit
+
+`mechanical_refactor_reproduce_gen_utils.py` infers the recipe from a commit's diff and
+before-state AST, then emits and runs a standalone, auditable reproduce script — no one
+hand-writes it.
+
+```bash
+# one commit: print the inferred script and run it
+python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_reproduce_gen_utils.py <commit>
+
+# a range: write a self-contained folder (repro_scripts/<sha>.py + output.log + output.html)
+python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_reproduce_gen_utils.py \
+    <base>..<tip> --match -move: --out repro_out
+```
+
+A passing script is the proof; its few primitive calls are what a reviewer audits. The
+inference currently covers "a method moved onto an existing class, call sites lowered,
+local imports removed"; new-file extracts, free-function moves, and renames are reported as
+unsupported (write the `Repro` by hand for those).

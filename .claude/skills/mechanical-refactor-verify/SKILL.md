@@ -36,10 +36,14 @@ behavior change) go in their own commit/PR.
 
 Use when the whole PR is one mechanical refactor, or for a rename / inline where the
 formatter re-wraps lines (reproduce-and-diff is more robust there than inspecting the
-diff). You write a small `transform()` and let the skill regenerate the PR in a
-worktree and diff it byte-for-byte against the target commit.
+diff). You write a small `transform()` — or, for a method/function relocation, compose the
+`Repro` builder's faithful primitives (`move_symbol`, `lower_call_sites`, `remove_import`,
+`add_import`) — and let the skill regenerate the PR in a worktree and diff it byte-for-byte
+against the target commit. For a relocation commit, `mechanical_refactor_reproduce_gen_utils.py`
+can **infer the recipe and emit the reproduce script for you** (`<base>..<tip> --match -move:
+--out DIR` writes scripts + log + html).
 
-→ Full step-by-step and the script template: **`reproduce-mode.md`** (next to this file).
+→ Full step-by-step, the `Repro` primitives, and the auto-generator: **`reproduce-mode.md`**.
 
 ## Mode B — Verify (a stack of mixed commits)
 
