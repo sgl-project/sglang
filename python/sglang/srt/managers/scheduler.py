@@ -150,6 +150,10 @@ from sglang.srt.managers.io_struct import (
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
+from sglang.srt.managers.min_free_slots_delayer import (
+    MinFreeSlotsDelayer,
+    resolve_min_free_slots,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
@@ -237,11 +241,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import (
-    resolve_dflash_prefill_refill_target,
-    should_delay_dflash_prefill_for_batching,
-    validate_dflash_request,
-)
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -894,11 +894,18 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.dflash_prefill_refill_target = (
-            resolve_dflash_prefill_refill_target(self.max_running_requests)
-            if self.spec_algorithm.is_dflash()
-            else 1
+        # DFlash auto-enables the legacy formula; other workloads opt in via
+        # --min-free-slots-delay. Built independently of the prefill delayer.
+        self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
+        min_free_slots = resolve_min_free_slots(
+            self.server_args.min_free_slots_delay,
+            self.max_running_requests,
+            is_dflash=self.spec_algorithm.is_dflash(),
         )
+        if min_free_slots is not None:
+            self.min_free_slots_delayer = MinFreeSlotsDelayer(
+                min_free_slots=min_free_slots
+            )
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.ps.pp_size, 1
@@ -2720,19 +2727,6 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
-        if not self.spec_algorithm.is_dflash():
-            return False
-        if running_bs <= 0 or self.chunked_req is not None:
-            return False
-
-        return should_delay_dflash_prefill_for_batching(
-            running_bs=running_bs,
-            num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
-            max_running_requests=self.max_running_requests,
-            prefill_refill_target=self.dflash_prefill_refill_target,
-        )
-
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2775,7 +2769,15 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        if self._should_delay_dflash_prefill_for_batching(running_bs):
+        # Skipped during a chunked prefill: that pass must proceed regardless.
+        if (
+            self.min_free_slots_delayer is not None
+            and self.chunked_req is None
+            and self.min_free_slots_delayer.should_delay(
+                running_bs=running_bs,
+                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+            )
+        ):
             return None
 
         # Ignore the check if self.chunked_req is not None.
