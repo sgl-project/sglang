@@ -627,7 +627,14 @@ def run_dp_sharded_mrope_vision_model(
     else:
         image_embeds_local_padded = image_embeds_local
 
-    # Do all_gather to collect embeddings from all ranks
+    # Do all_gather to collect embeddings from all ranks.
+    # Ensure the buffer is contiguous first: when no padding is appended,
+    # ``image_embeds_local_padded`` is the raw vision-model output, which may be
+    # non-contiguous. Feeding a non-contiguous buffer into the collective
+    # triggers an illegal write ("Memory access fault ... read-only page") on
+    # ROCm/RCCL. This mirrors ``run_dp_sharded_vision_model``, which already
+    # enforces contiguity before its all_gather.
+    image_embeds_local_padded = image_embeds_local_padded.contiguous()
     gathered_embeds = get_attention_tp_group().all_gather(
         image_embeds_local_padded, dim=0
     )
