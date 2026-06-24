@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -17,6 +15,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
@@ -29,6 +28,10 @@ def decide_needs_cpu_seq_lens(
     CPU mirror outside the backend layer to split the batch) or ngram (its
     USE_FULL_MASK verify path reads the host mirror regardless of backend).
     """
+    # Local import: keep overlap_utils' module-level deps leaf-only so it stays
+    # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
@@ -173,6 +176,9 @@ class FutureMap:
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
 
     def _lazy_init_forward_buf(self, payload: RelayPayload):
+        # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
+        from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+
         self._forward_buf_initialized = True
 
         # Spec extras are gated by spec_algo, not by the payload's shape, so a

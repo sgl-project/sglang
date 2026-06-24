@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -59,9 +60,6 @@ def build_eagle_disagg_draft_input(
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
     if batch.enable_overlap:
-        # Local import to avoid a module-load cycle through overlap_utils.
-        from sglang.srt.managers.overlap_utils import RelayPayload
-
         spec_info.future_indices = batch.req_pool_indices
         future_map.publish(spec_info.future_indices, batch.seq_lens)
         future_map.stash(
