@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils import kernel_shape_profiler
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
@@ -62,6 +63,7 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        shape_discovery: bool = False,
     ):
         # not supported yet
         assert start_step is None
@@ -82,6 +84,7 @@ class ProfileManager:
             output_dir=output_dir,
             output_prefix=profile_prefix,
             profile_id=profile_id,
+            shape_discovery=shape_discovery,
         )
 
         self.stage_based_trigger.configure(
@@ -89,6 +92,7 @@ class ProfileManager:
             interesting_stages=profile_stages or ["prefill", "decode"],
         )
 
+        self.shape_discovery = shape_discovery
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def manual_start(self):
@@ -245,6 +249,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         ps: ParallelState,
         cpu_group,
         first_rank_in_node: bool,
+        **kwargs,
     ):
         self.output_dir = output_dir
         self.output_prefix = output_prefix
@@ -256,11 +261,12 @@ class _ProfilerConcreteBase(_ProfilerBase):
 
 
 class _ProfilerTorch(_ProfilerConcreteBase):
-    def __init__(self, with_stack: bool, record_shapes: bool, activities, **kwargs):
+    def __init__(self, with_stack: bool, record_shapes: bool, activities, shape_discovery: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.with_stack = with_stack
         self.record_shapes = record_shapes
         self.activities = activities
+        self.shape_discovery = shape_discovery
 
     def start(self):
         activity_map = {
@@ -283,12 +289,21 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
             ),
         )
+
+        # Enable shape metadata for Triton & FlashInfer kernels
+        if self.record_shapes and self.shape_discovery:
+            kernel_shape_profiler.enable()
+
         self.torch_profiler.start()
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         self.torch_profiler.stop()
+
+        # Disable kernel shape profiling instrumentation
+        if self.record_shapes and self.shape_discovery:
+            kernel_shape_profiler.disable()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]

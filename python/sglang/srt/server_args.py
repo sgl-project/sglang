@@ -744,6 +744,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_shape_discovery_for_cuda_graph_profile: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
 
@@ -6906,6 +6907,11 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-shape-discovery-for-cuda-graph-profile",
+            action="store_true",
+            help="Enable shape discovery for cuda graph profiling.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

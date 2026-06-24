@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -100,6 +101,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import enable, disable, is_enabled
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -333,6 +335,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        ) and get_tensor_model_parallel_rank() == 0
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
@@ -584,9 +589,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # Profiling helpers
     # -----------------------------------------------------------------
     def _init_profile_context_and_memory_record(self):
+        rank = get_tensor_model_parallel_rank()
+        trace_dir = os.path.join(os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces")
+        os.makedirs(trace_dir, exist_ok=True)
+
+        self._profile_bs_list = list(reversed(self.capture_bs))
+        self._profile_bs_idx = 0
+
+        def on_trace_ready(prof):
+            bs = self._profile_bs_list[self._profile_bs_idx]
+            trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
+            prof.export_chrome_trace(trace_file)
+            logger.info(f"Saved trace for bs={bs} to {trace_file}")
+            self._profile_bs_idx += 1
+
         profile_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
             record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            profile_memory=True,
+            on_trace_ready=on_trace_ready,
         )
         torch.cuda.memory._record_memory_history()
         return profile_context
@@ -606,6 +630,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+        if self.enable_shape_discovery_for_cuda_graph_profile:
+            disable()
 
     # -----------------------------------------------------------------
     # capture_prepare
@@ -762,6 +788,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+            self._profiler = profile_context
 
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
@@ -781,7 +808,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
-            self._post_process_after_profile(prof)
+            self._post_process_after_profile(profile_context)
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -901,16 +928,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    dummies=None,
-                    post_warmup_hook=getattr(
-                        self.model_runner.attn_backend,
-                        "on_after_cuda_graph_warmup",
-                        None,
-                    ),
-                )
+                if self.enable_profile_cuda_graph:
+                    if self.enable_shape_discovery_for_cuda_graph_profile and not is_enabled():
+                        enable()
+                    self._profiler.step()
+
+                with torch.profiler.record_function(
+                    f"capture_{num_tokens}_DECODE"
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        dummies=None,
+                        post_warmup_hook=getattr(
+                            self.model_runner.attn_backend,
+                            "on_after_cuda_graph_warmup",
+                            None,
+                        ),
+                    )
+
+                if self.enable_profile_cuda_graph:
+                    self._profiler.step()
 
     # -----------------------------------------------------------------
     # recapture

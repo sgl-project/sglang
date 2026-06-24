@@ -258,7 +258,22 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            # QUARK_MXFP4_SWIGLU_ACTIVATION_FIX: aiter MXFP4 per_1x32 kernel/dtype selection keys on
+            # activation==Swiglu. Only clamped-SwiGLU models (e.g. MiniMax-M3,
+            # gemm1_clamp_limit>0) need this; leave plain-SwiGLU models (GLM,
+            # limit==0) on activation='silu' to avoid changing their path.
+            from dataclasses import replace as _dc_replace
+            _mm3_clamp = (
+                getattr(moe_runner_config, 'gemm1_clamp_limit', None)
+                or getattr(moe_runner_config, 'swiglu_limit', None)
+                or 0.0
+            )
+            _mm3_cfg = (
+                _dc_replace(moe_runner_config, activation="swiglu")
+                if _mm3_clamp > 0
+                else moe_runner_config
+            )
+            self.runner = MoeRunner(moe_runner_backend, _mm3_cfg)
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -284,6 +299,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
+        # QUARK_MXFP4_SWIGLU_LIMIT_FIX: forward the GPT-OSS clamped-SwiGLU limit so the aiter
+        # MoE runner selects the clamped-SwiGLU kernel instead of plain SiLU.
+        _mm3_swiglu_limit = (
+            getattr(self.moe_runner_config, 'gemm1_clamp_limit', None)
+            or getattr(self.moe_runner_config, 'swiglu_limit', None)
+            or 0.0
+        )
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -291,5 +313,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            swiglu_limit=_mm3_swiglu_limit,
         )
         return self.runner.run(dispatch_output, quant_info)
