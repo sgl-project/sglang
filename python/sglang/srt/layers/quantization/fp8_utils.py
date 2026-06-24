@@ -1250,6 +1250,29 @@ def block_quant_dequant(
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 
+def quantize_block_fp8_weight_to_mxfp4(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.bfloat16,
+    )
+    fp4_quantized, fp4_scale = MXFP4QuantizeUtil.quantize(
+        fp8_weight_dequant, block_size=mxfp4_block_size
+    )
+    fp4_weight = fp4_quantized.quantized_data.contiguous().view(torch.int8)
+    fp4_scale = fp4_scale.view(
+        *fp8_weight_dequant.shape[:-1],
+        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
+    )
+    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
+
+
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)

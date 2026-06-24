@@ -62,8 +62,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
-from sglang.srt.layers.quantization.mxfp4_tensor import quantize_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -639,7 +639,15 @@ class FusedMoE(torch.nn.Module):
                 "in FP4."
             )
 
-            fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(fp8_weight, fp8_scale)
+            weight_block_size = getattr(self.quant_config, "weight_block_size", None)
+            if weight_block_size is None:
+                raise ValueError(
+                    "Loading FP8 shared expert weights into FP4 fused MoE weights "
+                    "requires block-FP8 weight_block_size."
+                )
+            fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
+                fp8_weight, fp8_scale, weight_block_size
+            )
 
             weight_data = weight_param.data[expert_id]
             scale_data = scale_param.data[expert_id]

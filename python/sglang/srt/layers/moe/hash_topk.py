@@ -103,8 +103,8 @@ class HashTopK(nn.Module):
         if self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
             n = self.num_fused_shared_experts
             topk_output = topk_output._replace(
-                topk_ids=topk_output.topk_ids.new_full(
-                    (0, topk_output.topk_ids.shape[-1] + n), -1
+                topk_ids=topk_output.topk_ids.new_empty(
+                    (0, topk_output.topk_ids.shape[-1] + n)
                 ),
                 topk_weights=topk_output.topk_weights.new_empty(
                     (0, topk_output.topk_weights.shape[-1] + n)

@@ -330,34 +330,3 @@ def build_mega_moe_experts_weights(experts) -> None:
         experts.mega_l2_weights = l2_pair
 
     experts._mega_moe_weights_built = True
-
-
-def convert_fp8_experts_to_fp4_for_mega_moe(experts, weight_block_size) -> None:
-    """Convert block-FP8 checkpoint expert weights to DeepGEMM Mega-MoE FP4."""
-    from sglang.srt.layers.quantization.mxfp4_tensor import (
-        quantize_fp8_weight_to_mxfp4,
-    )
-
-    if getattr(experts, "_mega_moe_weights_are_fp4", False):
-        return
-    assert weight_block_size == [128, 128], weight_block_size
-
-    def convert_pair(weight: torch.nn.Parameter, scale: torch.nn.Parameter):
-        return quantize_fp8_weight_to_mxfp4(
-            weight.data,
-            scale.data,
-            fp8_scale_block_size=weight_block_size[0],
-        )
-
-    w13_weight, w13_scale = convert_pair(
-        experts.w13_weight, experts.w13_weight_scale_inv
-    )
-    w2_weight, w2_scale = convert_pair(experts.w2_weight, experts.w2_weight_scale_inv)
-
-    experts.w13_weight.data = w13_weight
-    experts.w2_weight.data = w2_weight
-    experts.w13_weight_scale_inv.data = w13_scale
-    experts.w2_weight_scale_inv.data = w2_scale
-    experts.w13_weight_scale_inv.format_ue8m0 = False
-    experts.w2_weight_scale_inv.format_ue8m0 = False
-    experts._mega_moe_weights_are_fp4 = True
