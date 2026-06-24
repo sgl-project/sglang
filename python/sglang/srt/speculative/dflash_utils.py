@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -16,7 +16,20 @@ from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
+# Projectors supported by the SGLang DFlash inference path. The public Domino
+# checkpoints use projector_type="domino" for the GRU-prefix + MLP bias path.
+# Keep causal_v5 as a backward-compatible alias for older internal checkpoints.
+_DFLASH_DOMINO_PROJECTORS = frozenset({"domino", "causal_v5"})
+_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset(
+    {None, *_DFLASH_DOMINO_PROJECTORS}
+)
+
 logger = logging.getLogger(__name__)
+
+
+def is_dflash_domino_projector(projector_type: Optional[str]) -> bool:
+    return projector_type in _DFLASH_DOMINO_PROJECTORS
+
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -384,14 +397,18 @@ def _parse_optional_int(
     return parsed
 
 
-@dataclass(frozen=True)
-class DFlashDraftConfig:
+class DFlashDraftConfig(msgspec.Struct, frozen=True):
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    projector_type: Optional[str] = None
+    gru_hidden_dim: Optional[int] = None
+    emb_dim: Optional[int] = None
+    pure_draft_prefix_len: int = 0
+    shift_label: bool = False
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -510,6 +527,68 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    projector_type = dflash_cfg.get("projector_type", None)
+    if projector_type is not None:
+        if not isinstance(projector_type, str) or not projector_type:
+            raise ValueError(
+                "DFLASH dflash_config.projector_type must be a non-empty string, "
+                f"got {projector_type!r}."
+            )
+        if projector_type not in _DFLASH_SUPPORTED_PROJECTORS:
+            raise ValueError(
+                "DFLASH dflash_config.projector_type is not supported by SGLang yet. "
+                f"Got projector_type={projector_type!r}, "
+                f"supported={sorted(p for p in _DFLASH_SUPPORTED_PROJECTORS if p is not None)}."
+            )
+
+    # Domino fields. emb_dim is top-level on the HF config (not inside dflash_config).
+    gru_hidden_dim = _parse_optional_int(
+        dflash_cfg.get("gru_hidden_dim", None),
+        field_name="DFLASH dflash_config.gru_hidden_dim",
+        min_value=1,
+    )
+    emb_dim = _parse_optional_int(
+        _cfg_get(draft_text_config, "emb_dim", None),
+        field_name="DFLASH emb_dim",
+        min_value=1,
+    )
+
+    pure_draft_prefix_len_raw = dflash_cfg.get("pure_draft_prefix_len", 0)
+    parsed_pure_draft_prefix_len = _parse_optional_int(
+        pure_draft_prefix_len_raw,
+        field_name="DFLASH dflash_config.pure_draft_prefix_len",
+        min_value=0,
+    )
+    pure_draft_prefix_len = (
+        0 if parsed_pure_draft_prefix_len is None else int(parsed_pure_draft_prefix_len)
+    )
+
+    shift_label_raw = dflash_cfg.get("shift_label", False)
+    if not isinstance(shift_label_raw, bool):
+        raise ValueError(
+            "DFLASH dflash_config.shift_label must be a bool, "
+            f"got {shift_label_raw!r} (type={type(shift_label_raw).__name__})."
+        )
+    shift_label = bool(shift_label_raw)
+
+    if is_dflash_domino_projector(projector_type):
+        if gru_hidden_dim is None:
+            raise ValueError(
+                "DFLASH Domino requires dflash_config.gru_hidden_dim to be set."
+            )
+        if emb_dim is None:
+            raise ValueError(
+                "DFLASH Domino requires top-level config.emb_dim to be set."
+            )
+        # The current SGLang adapter supports both shift_label=True and
+        # shift_label=False Domino/causal_v5 alignment, while still assuming the
+        # single pure-draft prefix token.
+        if pure_draft_prefix_len != 1:
+            raise NotImplementedError(
+                "DFLASH Domino currently requires dflash_config.pure_draft_prefix_len=1, "
+                f"got {pure_draft_prefix_len}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -517,6 +596,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        projector_type=projector_type,
+        gru_hidden_dim=gru_hidden_dim,
+        emb_dim=emb_dim,
+        pure_draft_prefix_len=pure_draft_prefix_len,
+        shift_label=shift_label,
     )
 
 
