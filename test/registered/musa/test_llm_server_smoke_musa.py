@@ -82,7 +82,7 @@ class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
         )
         self.assertIsInstance(content, str)
         self.assertGreater(len(content.strip()), 0)
-        self.assertIn("Beijing", content.lower())
+        self.assertIn("beijing", content.strip().lower())
 
     def test_generate(self):
         resp = requests.post(
