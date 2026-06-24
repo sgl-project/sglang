@@ -1729,7 +1729,6 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     with (
         get_tp_group().graph_capture(stream=stream) as context,
         get_pp_group().graph_capture(context),
-        get_dcp_group().graph_capture(context),
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
