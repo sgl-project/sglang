@@ -357,6 +357,18 @@ if [[ "$SALLOC_RC" -ne 0 ]]; then
     done
 fi
 
+# Surface the GSM8K accuracy in the job summary -- it scrolls past in the live
+# log, and the perf table (collect-results/summarize.py) doesn't include it.
+if [[ "$ACC_ENABLED" == "1" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    ACC_LINE=$(grep -aoE "Accuracy: [0-9.]+" "$WORKDIR/bench.log" 2>/dev/null | tail -1 || true)
+    {
+        echo "### GSM8K accuracy gate — ${MATRIX_CONFIG_NAME}"
+        echo '```'
+        echo "${ACC_LINE:-Accuracy: <not found in bench.log>}   (threshold > ${ACC_THR})"
+        echo '```'
+    } >> "$GITHUB_STEP_SUMMARY"
+fi
+
 # ---------------------------------------------------------------------------
 # Normalize raw bench_serving output -> process_result.py schema.
 #
