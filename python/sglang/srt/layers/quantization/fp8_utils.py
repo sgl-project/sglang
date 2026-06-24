@@ -270,7 +270,7 @@ if is_blackwell_supported() and is_flashinfer_available():
             x_scale.reshape(1),
             weight_scale.reshape(1),
             out_dtype,
-            backend="auto",
+            backend="cublas",
         ).view(m, n)
 
     @lru_cache(maxsize=1)
