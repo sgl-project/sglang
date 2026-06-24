@@ -234,6 +234,8 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
                 assert allocated is not None, "Not enough MLX auxiliary state slots"
                 mid = allocated[0]
                 req.mamba.mamba_pool_idx = mid
+            if req.mamba_branching_seqlen_pending is not None:
+                req.mamba.mamba_branching_seqlen = req.mamba_branching_seqlen_pending
             auxiliary_state_indices.append(mid.to(dtype=torch.int32))
         self.req_index_to_auxiliary_state_index_mapping[select_index] = torch.stack(
             auxiliary_state_indices

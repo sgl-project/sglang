@@ -35,11 +35,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import (
-    available_and_evictable_str,
     harvest_and_cache_unfinished_req,
     harvest_and_finish_req,
     maybe_cache_unfinished_req,
 )
+from sglang.srt.mem_cache.eviction import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -1215,7 +1215,6 @@ class UnifiedRadixCacheSuite:
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        mamba_pool = req_to_token_pool.mamba_pool
 
         seq = self._make_seq(1, 2)
         self._insert(tree, allocator, req_to_token_pool, seq)
@@ -1225,15 +1224,10 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", seq)), cow_mamba=True, req=req2)
         )
         self.assertEqual(len(m.device_indices), len(seq))
-        self.assertIsNotNone(req2.mamba.mamba_pool_idx)
-
+        self.assertIsNone(req2.mamba_cow_src_index)
         src_value = m.last_device_node.component_data[ComponentType.MAMBA].value
-        self.assertTrue(
-            torch.all(
-                mamba_pool.mamba_cache.conv[0][:, req2.mamba.mamba_pool_idx]
-                == mamba_pool.mamba_cache.conv[0][:, src_value]
-            )
-        )
+        self.assertIsNotNone(m.mamba_cow_src)
+        self.assertTrue(torch.equal(m.mamba_cow_src, src_value))
         tree.sanity_check()
 
     def test_swa_insert_and_match(self):
@@ -3429,6 +3423,28 @@ class UnifiedRadixCacheSuite:
         self.assertIs(with_hicache.best_match_node, leaf_h)
         self.assertIs(with_hicache.last_device_node, tree_h.root_node)
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
+
+    def test_pure_query_branching_seqlen_survives_to_owned_mamba_slot(self):
+        """Pure-query match staging carries branching seqlen onto the mamba slot allocated for a fresh req."""
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        _, _, req_to_token_pool = build_fixture(self.cfg)
+        chunk_size = get_global_server_args().mamba_cache_chunk_size
+
+        req = Req(
+            rid=self._rid,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self._rid += 1
+        self.assertIsNone(req.mamba.mamba_pool_idx)
+        req.mamba_branching_seqlen_pending = chunk_size
+
+        req_to_token_pool.alloc([req])
+
+        self.assertIsNotNone(req.mamba.mamba_pool_idx)
+        self.assertEqual(req.mamba.mamba_branching_seqlen, chunk_size)
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
