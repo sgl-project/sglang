@@ -99,7 +99,12 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
-    import sgl_kernel_npu  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 

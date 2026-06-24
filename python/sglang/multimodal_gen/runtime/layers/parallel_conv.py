@@ -14,6 +14,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
+if current_platform.is_cuda():
+    from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+        fused_causal_conv3d_cat_pad,
+    )
+else:
+    fused_causal_conv3d_cat_pad = None
+
 _SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
     "spatial_parallel_decode_disabled", default=False
 )
@@ -56,6 +63,49 @@ def _tensor_chunk(x: torch.Tensor, dim: int = -2, world_size: int = 1, rank: int
     return torch.tensor_split(x, world_size, dim=dim)[rank].contiguous(
         memory_format=_halo_memory_format(x)
     )
+
+
+def _can_fuse_causal_conv3d_cat_pad(
+    x: torch.Tensor,
+    cache_x: torch.Tensor | None,
+    padding: list[int],
+) -> bool:
+    if cache_x is None or fused_causal_conv3d_cat_pad is None:
+        return False
+    if not x.is_cuda or not x.is_contiguous() or not cache_x.is_contiguous():
+        return False
+    if x.dim() != 5 or cache_x.dim() != 5 or x.dtype != cache_x.dtype:
+        return False
+    if x.shape[0] != cache_x.shape[0] or x.shape[1] != cache_x.shape[1]:
+        return False
+    if x.shape[3:] != cache_x.shape[3:]:
+        return False
+
+    width_left, width_right, height_top, height_bottom, depth_left, depth_right = (
+        padding
+    )
+    if width_left != width_right or height_top != height_bottom or depth_right != 0:
+        return False
+    if depth_left < cache_x.shape[2]:
+        return False
+    return bool(width_left or height_top)
+
+
+def causal_conv3d_cat_pad(
+    x: torch.Tensor,
+    cache_x: torch.Tensor | None,
+    padding: list[int],
+) -> torch.Tensor:
+    if cache_x is not None and padding[4] > 0:
+        if cache_x.device != x.device:
+            cache_x = cache_x.to(x.device)
+        if _can_fuse_causal_conv3d_cat_pad(x, cache_x, padding):
+            return fused_causal_conv3d_cat_pad(x, cache_x, padding)
+        x = torch.cat([cache_x, x], dim=2)
+        padding[4] -= cache_x.shape[2]
+    if any(padding):
+        x = F.pad(x, padding)
+    return x
 
 
 def split_for_parallel_decode(
@@ -551,12 +601,7 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
         if spatial_parallel_decode_disabled():
             padding[2] = self.height_pad_top
             padding[3] = self.height_pad_bottom
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-
-        x = F.pad(x, padding)
+        x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
 
         if spatial_parallel_decode_disabled():

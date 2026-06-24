@@ -205,20 +205,20 @@ inline void canary_write_step_cuda(
   SymbolicSize N_write_reqs = {"write_req_capacity"};
   SymbolicSize N_tokens = {"num_tokens_padded"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
-  TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLCUDA>(device_).verify(canary_buf);
+  TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLGPU>(device_).verify(canary_buf);
 
   // write_offsets has shape [write_req_capacity + 1]; the length relationship is pinned by the
   // RuntimeCheck below, this matcher pins dtype + device.
   SymbolicSize N_write_offsets = {"write_offsets_len"};
-  TensorMatcher({N_write_offsets}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(write_offsets);
-  TensorMatcher({N_write_reqs}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(write_seed_slot_indices);
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_num_valid_reqs);
+  TensorMatcher({N_write_offsets}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(write_offsets);
+  TensorMatcher({N_write_reqs}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(write_seed_slot_indices);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(write_num_valid_reqs);
 
   TensorMatcher({N_tokens})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(input_ids)
       .verify(positions)
       .verify(out_cache_loc);
@@ -232,47 +232,47 @@ inline void canary_write_step_cuda(
   if (enable_write_input_assert_bool) {
     TensorMatcher({N_tokens})
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(expected_input_tokens.value())
         .verify(expected_input_positions.value());
   }
 
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(violation_write_index);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(violation_write_index);
   SymbolicSize N_ring = {"ring_capacity"};
   TensorMatcher({N_ring, static_cast<int64_t>(kViolationFields)})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(violation_ring);
   TensorMatcher({1})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(slot_run_counter)
       .verify(kernel_run_counter);
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(enable_chain_position_assert);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(enable_chain_position_assert);
 
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
   TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_0);
   SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
   SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
   TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_1);
   SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
   SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
   TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_2);
   SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
   SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
   TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_3);
   TensorMatcher({static_cast<int64_t>(kMaxRealKvSources), static_cast<int64_t>(kRealKvSourceFieldsPerEntry)})
       .with_dtype<int32_t>()

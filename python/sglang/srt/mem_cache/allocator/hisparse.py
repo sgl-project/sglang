@@ -86,10 +86,23 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
-        )
+        if self.page_size != 1:
+            raise NotImplementedError(
+                "HiSparse generic allocation is only supported for page_size=1. "
+                "Use alloc_extend for paged allocation."
+            )
+
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+
+        hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            return None
+
+        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        return logical_indices
 
     def alloc_logical_only(
         self,
@@ -172,8 +185,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
-        assert self.page_size > 1
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
@@ -555,11 +566,3 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )

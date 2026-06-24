@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -9,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> None:
+def apply_nemotron_h_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply NemotronH model-specific server arg defaults and constraints."""
     model_config = server_args.get_model_config()
     is_modelopt = model_config.quantization in [
@@ -55,11 +57,9 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
         else:
             server_args.moe_runner_backend = "flashinfer_cutlass"
 
-    server_args._handle_mamba_radix_cache(
-        model_arch=model_arch,
-        sm100_default_attention_backend="flashinfer",
-        fallback_attention_backend="flashinfer",
-    )
+    if is_sm100_supported() and server_args.attention_backend is None:
+        server_args.attention_backend = "flashinfer"
+    server_args._handle_mamba_radix_cache(model_arch=model_arch)
     assert server_args.attention_backend != "triton", (
         "NemotronHForCausalLM does not support triton attention backend,"
         "as the first layer might not be an attention layer"

@@ -53,7 +53,7 @@ class TestDeepseekV32(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--mem-frac=0.7",
+            "--mem-frac=0.85",
         ]
         variants = [
             # Variant: "dp" - Standard TP=8 + DP=8 with dp-attention

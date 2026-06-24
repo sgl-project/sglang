@@ -62,6 +62,7 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    only_qv=False,  # Only use QV (skip K matmul); requires qv. Used when qk rope dim is 0.
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
@@ -159,15 +160,54 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    if v_cache is None:
+        raise ValueError("v_cache must be provided")
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+    if k_cache is None:
+        if not only_qv:
+            raise ValueError("k_cache can only be None when only_qv=True")
+        if q is not None:
+            k_head_size = q.shape[-1]
+            k_dtype = q.dtype
+            k_device = q.device
+        elif k is not None:
+            k_head_size = k.shape[-1]
+            k_dtype = k.dtype
+            k_device = k.device
+        else:
+            # Fallback: only_qv kernel ignores K values, so a tiny placeholder works.
+            k_head_size = 64
+            k_dtype = v_cache.dtype
+            k_device = v_cache.device
+        k_shape = (*v_cache.shape[:-1], k_head_size)
+        # The kernel path for only_qv ignores K values, but backend API still requires k tensor.
+        k_cache = torch.empty(k_shape, dtype=k_dtype, device=k_device)
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+
+    if q is None:
+        if not only_qv:
+            raise ValueError("q can only be None when only_qv=True")
+        if qv is None:
+            raise ValueError(
+                "q must be provided unless qv is provided with only_qv=True"
+            )
+        q_shape = (*qv.shape[:-1], k_cache.shape[-1])
+        # The kernel path for only_qv ignores q values, but backend API still requires q tensor.
+        q = torch.empty(q_shape, dtype=qv.dtype, device=qv.device)
+
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
-        )
+        if only_qv:
+            if qv is None:
+                raise ValueError("only_qv=True requires qv to be provided")
+            softmax_scale = (qv.shape[-1]) ** (-0.5)
+        else:
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
+                -0.5
+            )
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
@@ -223,6 +263,8 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         sinks,
+        None,  # sparse_mask_fine
+        only_qv,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -251,6 +293,7 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
@@ -311,6 +354,8 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         sinks=sinks,
+        sparse_mask_fine=None,
+        only_qv=only_qv,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

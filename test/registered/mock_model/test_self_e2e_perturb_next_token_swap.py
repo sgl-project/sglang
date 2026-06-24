@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mock_model.perturb_e2e_base import MockModelPerturbE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=131, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):

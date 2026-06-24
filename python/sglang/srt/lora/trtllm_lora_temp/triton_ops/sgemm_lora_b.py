@@ -168,9 +168,13 @@ def sgemm_lora_b_fwd(
     assert x.shape[-1] == R
 
     if (
-        lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
-        or lora_envs.SGLANG_OPT_LORA_CUBLAS_B.get()
-    ) and S * R >= _CUBLAS_MIN_S_RANK:
+        (
+            lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
+            or lora_envs.SGLANG_OPT_LORA_CUBLAS_B.get()
+        )
+        and S * R >= _CUBLAS_MIN_S_RANK
+        and weights.shape[0] == 1
+    ):  # single-adapter fast path: only valid with one resident slot
         return _sgemm_lora_b_cublas(x, weights, batch_info, base_output)
     # Block shapes
     BLOCK_S = 16

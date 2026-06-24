@@ -46,7 +46,15 @@ class TestDeepseekV32FP4TPSpec(GSM8KMixin, DefaultServerBase):
     gsm8k_accept_length_thres = 2.7
 
     def test_z_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        args = BenchArgs(
+            port=int(self.base_url.split(":")[-1]),
+            max_new_tokens=2048,
+            prompt=(
+                "Human: Think carefully before answering. Build a fully functional FastAPI todo server. "
+                "Start with a short design plan, then output the complete Python code, then show how to run it "
+                "and test three endpoints.\n\nAssistant:"
+            ),
+        )
         acc_length, speed = send_one_prompt(args)
 
         print(f"{acc_length=:.2f} {speed=:.2f}")

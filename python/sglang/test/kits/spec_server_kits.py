@@ -574,3 +574,120 @@ class SpecFeatureKit:
             self.assertIsInstance(content, dict)
         except Exception:
             self.fail(f"parse JSON failed: {content_json}")
+
+
+class SpecHiddenStatesKit:
+    """return_hidden_states under spec V2 (regression for issue #26163).
+
+    Requires the server launched with --enable-return-hidden-states
+    (set ``enable_return_hidden_states = True`` on the fixture class).
+    """
+
+    def test_return_hidden_states(self):
+        # Two prompts of different lengths to exercise the per-req stride
+        # window: under spec V2 hidden_states is [bs * num_draft_tokens, dim],
+        # so a wrong index aliases a neighbor request's accepted rows.
+        prompts = [
+            "Repeat: the quick brown fox the quick brown fox the quick brown fox",
+            "Count down from ten: ten nine eight",
+        ]
+        res = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                "return_hidden_states": True,
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        outputs = res.json()
+
+        for out in outputs:
+            meta = out["meta_info"]
+            hs = meta["hidden_states"]
+            ct = meta["completion_tokens"]
+            # One hidden-state entry per completion token: hs[0] is the prefill
+            # block (List[List[float]]), hs[1:] are per-decode-token rows.
+            self.assertEqual(
+                len(hs),
+                ct,
+                f"len(hidden_states)={len(hs)} but completion_tokens={ct}",
+            )
+            decode_rows = hs[1:]
+            self.assertGreater(len(decode_rows), 0)
+            hidden_dim = len(decode_rows[0])
+            self.assertGreater(hidden_dim, 0)
+            for row in decode_rows:
+                self.assertIsInstance(row, list)
+                self.assertEqual(len(row), hidden_dim)
+
+
+class SpecGrammarKit:
+    """Grammar-constrained structured output under spec decoding.
+
+    Regression for spec verify accepting tokens past grammar termination: the
+    output must be valid JSON with nothing emitted after completion, and the
+    logprob count must match the (truncated) completion-token count.
+    """
+
+    # Override per config if a different schema is desired.
+    grammar_json_schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": "^[\\w]+$"},
+                "population": {"type": "integer"},
+                "country": {"type": "string", "pattern": "^[\\w ]+$"},
+                "capital": {"type": "string", "pattern": "^[\\w ]+$"},
+            },
+            "required": ["name", "population", "country", "capital"],
+        }
+    )
+
+    def _generate_grammar(self, return_logprob: bool):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Here is the information of the capital of France in the JSON format.\n",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 256,
+                    "json_schema": self.grammar_json_schema,
+                },
+                "return_logprob": return_logprob,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        out = response.json()
+        self.assertGreater(
+            out["meta_info"]["spec_verify_ct"],
+            0,
+            "expected spec decoding to run (spec_verify_ct > 0)",
+        )
+        return out
+
+    def test_grammar_structured_output_no_trailing_tokens(self):
+        """Output is valid JSON with nothing emitted past grammar completion."""
+        out = self._generate_grammar(return_logprob=False)
+        text = out["text"]
+        parsed = json.loads(text)
+        for key in ("name", "population", "country", "capital"):
+            self.assertIn(key, parsed)
+        self.assertTrue(
+            text.strip().endswith("}"), f"unexpected trailing tokens: {text!r}"
+        )
+
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        """Trimmed spec tokens keep logprob count == completion token count."""
+        out = self._generate_grammar(return_logprob=True)
+        meta = out["meta_info"]
+        completion_tokens = meta["completion_tokens"]
+        output_logprobs = meta["output_token_logprobs"]
+        self.assertEqual(
+            len(output_logprobs),
+            completion_tokens,
+            "output logprobs must align with retained (trimmed) tokens: "
+            f"got {len(output_logprobs)} logprobs vs {completion_tokens} completion tokens",
+        )
+        json.loads(out["text"])

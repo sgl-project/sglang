@@ -83,17 +83,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
         ),
     },
-    "layerwise_offload": {
-        ComponentType.VAE: ComponentSkip(
-            "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
-        ),
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "Representative transformer accuracy is already covered by zimage_image_t2i for the same source component and topology"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
-        ),
-    },
     "zimage_image_t2i_fp8": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"

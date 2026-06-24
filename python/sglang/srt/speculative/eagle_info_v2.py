@@ -37,21 +37,7 @@ class EagleDraftInputV2Mixin:
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
-            output_ids = torch.tensor(
-                [
-                    (
-                        req.output_ids[-1]
-                        if len(req.output_ids)
-                        else req.origin_input_ids[-1]
-                    )
-                    for req in batch.reqs
-                ],
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                output_ids
-            )
+            batch.cumulate_penalty_output_tokens()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         double_alloc = get_alloc_reserve_per_decode()
@@ -61,19 +47,15 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for i, r in enumerate(batch.reqs):
             cur = r.kv_allocated_len
-            # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
-            # cannot make nxt < cur and corrupt allocator state. kv_committed_len lags
-            # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
-            # switches one batch later than a seq_lens-based baseline; the 2*alloc
-            # over-allocation buffer absorbs that lag.
+            # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
+            # kv_committed_len is honest (bonus committed in resolve, not here),
+            # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
             nxt = max(cur, r.kv_committed_len + double_alloc)
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
             r.kv_allocated_len = nxt
             r.decode_batch_idx += 1
-            # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
-            r.kv_committed_len += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

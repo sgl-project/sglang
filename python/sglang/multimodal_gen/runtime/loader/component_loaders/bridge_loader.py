@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -62,7 +62,9 @@ class BridgeLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {component_model_path}")
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, component_name, precision_attr="dit_precision"
+        )
 
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",

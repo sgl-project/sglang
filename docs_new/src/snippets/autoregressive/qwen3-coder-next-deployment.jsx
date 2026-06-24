@@ -7,6 +7,7 @@ export const Qwen3CoderNextDeployment = () => {
         { id: 'h200', label: 'H200', default: true },
         { id: 'h100', label: 'H100', default: false },
         { id: 'b200', label: 'B200', default: false },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
@@ -48,6 +49,7 @@ export const Qwen3CoderNextDeployment = () => {
       h100: { bf16: { tp: 4 }, fp8: { tp: 2 } },
       h200: { bf16: { tp: 2 }, fp8: { tp: 1 } },
       b200: { bf16: { tp: 2 }, fp8: { tp: 1 } },
+      b300: { bf16: { tp: 2 }, fp8: { tp: 1 } },
       mi300x: { bf16: { tp: 2 }, fp8: { tp: 1 } },
       mi325x: { bf16: { tp: 2 }, fp8: { tp: 1 } },
       mi355x: { bf16: { tp: 2 }, fp8: { tp: 1 } },
@@ -98,6 +100,9 @@ export const Qwen3CoderNextDeployment = () => {
     // AMD GPUs require triton attention backend
     if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       cmd += ` \\\n  --attention-backend triton`;
+    }
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
     }
 
     return cmd;

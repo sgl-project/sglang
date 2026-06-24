@@ -286,3 +286,156 @@ def fused_mamba_state_scatter_with_mask(
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+@triton.jit
+def _fused_conv_window_scatter_with_mask_kernel(
+    src_ptr,
+    dst_ptr,
+    dst_indices_raw_ptr,  # [total_requests]
+    step_indices_raw_ptr,  # [total_requests], entry >= 0 means valid
+    elem_per_entry: tl.constexpr,  # dim * (K-1)
+    KM1: tl.constexpr,  # K-1 (conv window width)
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    src_dim_stride,
+    src_win_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Scatter accepted conv windows from the deduplicated sliding-window source.
+
+    Unlike ``_fused_mamba_state_scatter_with_mask_kernel`` (which flat-copies a
+    contiguous per-step state row), the source here is an *overlapping* view: the
+    deduplicated layout keeps one shared ``[dim, D+K-2]`` buffer per (layer, slot)
+    and step ``t``'s window is the slice ``shared[:, t:t+K-1]``. That window is
+    non-contiguous, so we index every ``(dim, win)`` element through the view's
+    strides (``src_step_stride`` / ``src_dim_stride`` / ``src_win_stride``). The
+    destination conv-state row stays contiguous in ``(dim, K-1)`` order.
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_block = tl.program_id(2).to(tl.int64)
+
+    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    if step_idx < 0:
+        return
+
+    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    src_idx = pid_req
+
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (src_idx < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+
+    start = pid_block * BLOCK_SIZE
+    e = start + tl.arange(0, BLOCK_SIZE)
+    mask = e < elem_per_entry
+
+    # Decode the flat (dim, K-1)-row element index into (dim, win) coordinates.
+    d = e // KM1
+    w = e % KM1
+
+    src_off = (
+        pid_layer * src_layer_stride
+        + src_idx * src_req_stride
+        + step_idx * src_step_stride
+        + d * src_dim_stride
+        + w * src_win_stride
+    )
+    # dst window is contiguous in (dim, K-1) order -> flat element index `e`.
+    dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+
+    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+    tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def fused_conv_window_scatter_with_mask(
+    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
+    src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
+    dst_indices_raw: torch.Tensor,  # [total_requests]
+    step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+):
+    """Conv-window variant of :func:`fused_mamba_state_scatter_with_mask`.
+
+    ``src`` is the deduplicated sliding-window conv-intermediate cache: an
+    overlapping ``as_strided`` view over a shared ``[..., dim, D+K-2]`` buffer,
+    so its per-step windows are intentionally non-contiguous. This kernel indexes
+    ``(dim, win)`` elements through the view's strides instead of flat-copying.
+    ``dst`` (the real conv-state pool) is the usual contiguous
+    ``[layers, cache, dim, K-1]``.
+    """
+    total_requests = step_indices_raw.shape[0]
+    if total_requests == 0:
+        return
+
+    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
+        raise ValueError(
+            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
+            f"tensors on the same device ({dst.device=}, {src.device=})."
+        )
+    if dst.ndim != 4 or src.ndim != 5:
+        raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
+    if dst.shape[0] != src.shape[0]:
+        raise ValueError(f"Layer dim mismatch: {dst.shape[0]=} vs {src.shape[0]=}")
+    if dst.shape[2:] != src.shape[3:]:
+        raise ValueError(f"Window dims mismatch: {dst.shape[2:]=} vs {src.shape[3:]=}")
+    if dst_indices_raw.ndim != 1 or step_indices_raw.ndim != 1:
+        raise ValueError(
+            f"indices must be 1D: {dst_indices_raw.shape=} {step_indices_raw.shape=}"
+        )
+    if dst_indices_raw.shape[0] != step_indices_raw.shape[0]:
+        raise ValueError(
+            f"indices length mismatch: {dst_indices_raw.shape[0]=} vs {step_indices_raw.shape[0]=}"
+        )
+
+    num_layers = dst.shape[0]
+    dim = dst.shape[2]
+    km1 = dst.shape[3]
+    elem_per_entry = dim * km1
+
+    src_req_size = src.shape[1]
+    src_step_size = src.shape[2]
+    dst_req_size = dst.shape[1]
+
+    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
+    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
+    if not dst.is_contiguous():
+        raise ValueError(
+            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
+        )
+
+    dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
+    step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+
+    BLOCK_SIZE = 1024
+    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+
+    _fused_conv_window_scatter_with_mask_kernel[grid](
+        src,
+        dst,
+        dst_indices_raw,
+        step_indices_raw,
+        elem_per_entry,
+        km1,
+        src.stride(0),
+        src.stride(1),
+        src.stride(2),
+        src.stride(3),
+        src.stride(4),
+        dst.stride(0),
+        dst.stride(1),
+        src_req_size,
+        src_step_size,
+        dst_req_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )

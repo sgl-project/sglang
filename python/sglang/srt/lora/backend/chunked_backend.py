@@ -273,6 +273,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
         )
         req_seg_indptr_cpu = self._build_req_seg_indptr(forward_batch)
+        max_num_segments = 0
+        has_unused_cuda_graph_segments = False
 
         if not use_cuda_graph:
             batch_info = LoRABatchInfo(
@@ -308,6 +310,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             batch_info.bs = bs
             batch_info.num_segments = num_segments
             batch_info.max_len = chunk_size
+            max_num_segments = batch_info.weight_indices.shape[0]
+            has_unused_cuda_graph_segments = num_segments < max_num_segments
 
         # Copy to device asynchronously
         batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
@@ -319,7 +323,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:num_segments].copy_(
             seg_weight_indices, non_blocking=True
         )
+        if has_unused_cuda_graph_segments:
+            batch_info.weight_indices[num_segments:max_num_segments].zero_()
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
+        if has_unused_cuda_graph_segments:
+            batch_info.seg_indptr[num_segments + 1 : max_num_segments + 1].fill_(
+                int(seg_indptr[-1])
+            )
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)

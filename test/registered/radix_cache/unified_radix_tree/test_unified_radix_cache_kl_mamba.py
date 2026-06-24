@@ -20,11 +20,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
+MAMBA_CHUNKED_PREFILL_SIZE = 2048
 
 
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -51,7 +52,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--tp-size",
                 "4",
                 "--chunked-prefill-size",
-                "2048",
+                str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
                 "--mamba-scheduler-strategy",
@@ -94,7 +95,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--tp-size",
                 "4",
                 "--chunked-prefill-size",
-                "2048",
+                str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
                 "--mamba-scheduler-strategy",
@@ -133,6 +134,13 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """Mamba hybrid + HiCache L3 (file backend) + UnifiedRadixCache."""
 
+    # Prompt must exceed chunked_prefill_size to exercise the multi-chunk path.
+    l3_prefetch_page_size = MAMBA_CHUNK_SIZE
+    l3_prefetch_prompt_pages = MAMBA_CHUNKED_PREFILL_SIZE // MAMBA_CHUNK_SIZE + 16
+    # Mamba state is only persisted at chunk boundaries, so up to a full
+    # chunked_prefill_size of trailing tokens may stay uncached.
+    l3_prefetch_max_uncached_tokens = MAMBA_CHUNKED_PREFILL_SIZE
+
     @classmethod
     def setUpClass(cls):
         cls.model = MAMBA_MODEL
@@ -146,7 +154,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--tp-size",
                 "4",
                 "--chunked-prefill-size",
-                "2048",
+                str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
                 "--mamba-scheduler-strategy",

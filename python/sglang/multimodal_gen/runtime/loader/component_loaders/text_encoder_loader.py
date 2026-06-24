@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
@@ -98,16 +99,26 @@ class TextEncoderLoader(ComponentLoader):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ):
         if transformers_or_diffusers != "transformers":
             return super().load_native(
-                component_model_path, server_args, transformers_or_diffusers
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
             )
 
         encoder_idx = (
-            1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            self._extract_encoder_index(component_name or "text_encoder_2")
+            if component_name
+            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
+        dtype = precision_to_dtype(
+            encoder_dtype,
+            f"text_encoder_precisions[{encoder_idx}]",
+        )
         transformers_model_class = self._resolve_transformers_text_encoder_class(
             component_model_path, server_args
         )
@@ -115,7 +126,7 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            torch_dtype=dtype,
         )
 
     @staticmethod

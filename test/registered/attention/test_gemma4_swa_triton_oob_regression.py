@@ -15,7 +15,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=107, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=160, suite="stage-b-test-2-gpu-large-amd")
 
 
 PROMPT = (

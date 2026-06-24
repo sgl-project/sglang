@@ -3,6 +3,7 @@ This unittest is introduced in #22360, preventing duplicate transformer safetens
 """
 
 import json
+import os
 import sys
 import tempfile
 import types
@@ -125,6 +126,34 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [mixed])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.snapshot_download",
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+    )
+    def test_resolve_transformer_safetensors_to_load_refreshes_empty_cached_repo(
+        self, mock_download_model, mock_snapshot_download
+    ):
+        with tempfile.TemporaryDirectory() as cached_dir:
+            repo_id = "black-forest-labs/FLUX.2-dev-NVFP4"
+            mixed = os.path.join(cached_dir, "flux2-dev-nvfp4-mixed.safetensors")
+            mock_download_model.return_value = cached_dir
+
+            def _snapshot_download(**_kwargs):
+                open(mixed, "a").close()
+                return cached_dir
+
+            mock_snapshot_download.side_effect = _snapshot_download
+
+            server_args = self._make_server_args(transformer_weights_path=repo_id)
+            resolved = resolve_transformer_safetensors_to_load(
+                server_args, "/unused/component/path"
+            )
+
+        self.assertEqual(resolved, [mixed])
+        mock_snapshot_download.assert_called_once()
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [

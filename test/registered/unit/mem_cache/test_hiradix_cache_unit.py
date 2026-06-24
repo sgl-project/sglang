@@ -37,6 +37,7 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             model_path="dummy",
             page_size=PAGE_SIZE,
             hicache_io_backend="direct",
+            hicache_mem_layout="layer_first",
             hicache_write_policy="write_through",
         )
         set_global_server_args_for_scheduler(server_args)

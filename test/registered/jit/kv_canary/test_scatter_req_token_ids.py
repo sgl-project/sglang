@@ -10,10 +10,11 @@ from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
     scatter_req_token_ids_torch_reference,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
+register_amd_ci(est_time=10, suite="jit-kernel-unit-test-amd")
 
 
 _DEVICE = torch.device("cuda")

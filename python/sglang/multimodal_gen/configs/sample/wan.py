@@ -171,7 +171,7 @@ class FastWanT2V480PConfig(WanT2V_1_3B_SamplingParams):
     # dmd_denoising_steps: list[int] | None = field(default_factory=lambda: [1000, 757, 522])
     num_inference_steps: int = 3
     num_frames: int = 61
-    height: int = 448
+    height: int = 480
     width: int = 832
     fps: int = 16
 

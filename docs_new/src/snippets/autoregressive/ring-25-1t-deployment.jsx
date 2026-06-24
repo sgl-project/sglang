@@ -2,7 +2,7 @@ export const Ring251TDeployment = () => {
   // Config mirrors sgl-cookbook src/components/autoregressive/Ring25ConfigGenerator/index.js.
   //
   // GPU requirements:
-  //   H200 / B200 / GB200 / GB300 / MI355X: single-node (tp per platform)
+  //   H200 / B200 / B300 / GB200 / GB300 / MI355X: single-node (tp per platform)
   //   MI300X / MI325X: two nodes, tp-size 8, pp-size 2 (multi-node scripts)
   const options = {
     hardware: {
@@ -11,6 +11,7 @@ export const Ring251TDeployment = () => {
       items: [
         { id: 'h200',   label: 'H200',   default: true  },
         { id: 'b200',   label: 'B200',   default: false },
+        { id: 'b300',   label: 'B300',   default: false },
         { id: 'gb200',  label: 'GB200',  default: false },
         { id: 'gb300',  label: 'GB300',  default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
@@ -39,6 +40,7 @@ export const Ring251TDeployment = () => {
   const modelConfigs = {
     h200:   { fp8: { tp: 8 } },
     b200:   { fp8: { tp: 8 } },
+    b300:   { fp8: { tp: 8 } },
     gb200:  { fp8: { tp: 4 } },
     gb300:  { fp8: { tp: 4 } },
     mi300x: { fp8: { tp: 8, pp: 2, nnodes: 2 } },
@@ -156,6 +158,9 @@ export const Ring251TDeployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
     cmd += ' \\\n  --trust-remote-code';
+    if (hardware === 'b300') {
+      cmd += ' \\\n  --attention-backend flashinfer';
+    }
 
     extraFlags.forEach((flag) => {
       cmd += ` \\\n  ${flag}`;

@@ -26,6 +26,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -72,8 +73,6 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.distributed import (
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
     get_attn_tp_group,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
@@ -100,6 +99,34 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
+    attn_backend = get_attn_backend()
+    server_args = get_global_server_args()
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    prefill_backend = (
+        getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
+    )
+    decode_backend = (
+        getattr(attn_backend, "decode_attention_backend_str", None) or decode_backend
+    )
+
+    if forward_batch.forward_mode.is_decode_or_idle():
+        backend_name = decode_backend
+    elif (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    ):
+        backend_name = (
+            decode_backend
+            if server_args.speculative_attention_mode == "decode"
+            else prefill_backend
+        )
+    else:
+        backend_name = prefill_backend
+
+    return backend_name in ("dsa", "nsa")
+
+
 if _is_cuda:
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
@@ -121,6 +148,10 @@ if _is_cuda:
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         indexer = get_tc_piecewise_forward_context().dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        assert metadata is not None, (
+            "DSA piecewise CUDA graph requires indexer metadata from the DSA "
+            "attention backend"
+        )
 
         # slice off padding from piecewise CUDA graph
         extend_num_tokens = forward_batch.extend_num_tokens
@@ -330,8 +361,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_size = get_attn_context_model_parallel_world_size()
-            self.cp_rank = get_attn_context_model_parallel_rank()
+            self.cp_size = get_parallel().attn_cp_size
+            self.cp_rank = get_parallel().attn_cp_rank
         else:
             self.cp_size = None
             self.cp_rank = None
@@ -1575,6 +1606,9 @@ class Indexer(MultiPlatformOp):
                     assert (
                         not enable_dual_stream
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
+
+                    if not _uses_dsa_attention_backend(forward_batch):
+                        return None
 
                     topk_result = torch.full(
                         (q_fp8.shape[0], self.index_topk),

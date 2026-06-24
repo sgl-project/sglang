@@ -194,11 +194,13 @@ export const KimiK26Deployment = () => {
       cmd += ' \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla';
     }
 
-    if (hardware === 'b300' || hardware === 'gb300') {
+    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
+
+    if (usesTokenspeedMla) {
       cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
-    if (isAMD) {
+    if (isAMD || usesTokenspeedMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 

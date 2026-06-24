@@ -8,6 +8,7 @@ export const FluxDeployment = () => {
         title: 'Hardware Platform',
         items: [
           { id: 'b200', label: 'B200', default: true },
+          { id: 'b300', label: 'B300', default: false },
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
           { id: 'mi355x', label: 'MI355X', default: false },

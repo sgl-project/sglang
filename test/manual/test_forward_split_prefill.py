@@ -13,7 +13,7 @@ from array import array
 import numpy as np
 import torch
 
-from sglang.bench_one_batch import TreeCacheNamespace
+from sglang.benchmark.one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

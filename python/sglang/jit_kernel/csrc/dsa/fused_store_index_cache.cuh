@@ -26,7 +26,7 @@ struct FusedStoreCacheParam {
 [[maybe_unused]]
 SGL_DEVICE float fp8_e4m3_clip(float val) {
   namespace math = device::math;
-  return math::max(math::min(val, math::FP8_E4M3_MAX), -math::FP8_E4M3_MAX);
+  return math::max(math::min(val, kFP8E4M3Max), -kFP8E4M3Max);
 }
 
 [[maybe_unused]]
@@ -63,7 +63,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
   // use normal fp32 scale
-  const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
   const auto inv_scale = 1.0f / scale;
   const int32_t page = index >> kPageBits;
   const int32_t offset = index & ((1 << kPageBits) - 1);

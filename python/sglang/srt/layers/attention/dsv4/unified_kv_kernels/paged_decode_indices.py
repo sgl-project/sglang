@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# The following kernel is imported from ATOM.
+# Source: atom/model_ops/v4_kernels/paged_decode_indices.py
+
 """V4 paged-decode index scatter — single Triton kernel writes SWA window-
 prefix paged offsets into the three ragged-packed destination buffers
 (`kv_indices_swa` / `kv_indices_csa` / `kv_indices_hca`).

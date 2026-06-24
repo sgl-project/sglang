@@ -65,6 +65,8 @@ class TestQwen35WithHiCache(CustomTestCase):
                 '{"enable_multithread_load": true,"num_threads": 64}',
                 "--hicache-mem-layout",
                 "page_first_direct",
+                "--hicache-io-backend",
+                "direct",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
                 "2",

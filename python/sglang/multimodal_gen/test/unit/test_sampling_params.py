@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan import (
+    FastWanT2V480PConfig,
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
@@ -101,6 +102,12 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+    def test_fastwan_480p_default_resolution_is_supported(self):
+        params = FastWanT2V480PConfig()
+
+        self.assertEqual((params.width, params.height), (832, 480))
+        self.assertIn((params.width, params.height), params.supported_resolutions)
 
     def test_output_file_name_supports_callable_teacache_params(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:

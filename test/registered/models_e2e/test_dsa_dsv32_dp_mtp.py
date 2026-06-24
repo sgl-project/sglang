@@ -19,7 +19,7 @@ class TestDeepseekV32DPMTP(
     DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin, SpecDecodingMixin
 ):
     model = "deepseek-ai/DeepSeek-V3.2"
-    mem_fraction_static = 0.7
+    mem_fraction_static = 0.85
     enable_dp_attention = True
     bs_1_speed_thres = 90
 

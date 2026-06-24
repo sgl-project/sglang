@@ -10,10 +10,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -26,10 +26,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -42,10 +42,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -59,10 +59,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -75,10 +75,10 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
             }

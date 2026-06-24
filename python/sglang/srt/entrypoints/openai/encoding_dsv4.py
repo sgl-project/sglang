@@ -141,7 +141,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
+        tool_call: Dict with "name" and "arguments" keys.
 
     Returns:
         DSML-formatted parameter string.
@@ -149,10 +149,14 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    arguments = (
+        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    )
+    if not isinstance(arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

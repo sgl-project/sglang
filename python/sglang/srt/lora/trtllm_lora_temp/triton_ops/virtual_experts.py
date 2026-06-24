@@ -859,12 +859,44 @@ def _merged_experts_fused_moe_lora_add_impl(
         invoke_fused_moe_kernel,
     )
 
-    assert stage in ("all", "shrink", "expand"), f"invalid stage {stage!r}"
+    assert stage in (
+        "all",
+        "shrink",
+        "expand",
+        "routing",
+    ), f"invalid stage {stage!r}"
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
     num_experts_b = lora_b.shape[1]
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
+
+    if stage == "routing":
+        # Pre-warm the routing cache on the CALLER'S (main) stream so the
+        # side-stream chain performs no allocations. Tensors allocated inside a
+        # side-stream context during cuda-graph capture can be pool-reused by
+        # later allocations on other streams with no cross-stream guard (the
+        # allocator's stream tracking is disabled while capturing), corrupting
+        # replays. Routing needs only topk_ids + token_lora_mapping, which are
+        # both ready before the side-stream fork, so it can run on main.
+        a_cfg = _get_shrink_stage_config(lora_a_virtual, token_lora_mapping.shape[0])
+        if lora_envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
+            a_cfg = {**a_cfg, "BLOCK_SIZE_M": 16}
+        _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_a,
+            experts_shared_outer_loras_a,
+            a_cfg["BLOCK_SIZE_M"],
+        )
+        _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_b,
+            experts_shared_outer_loras_b,
+            b_stage_config["BLOCK_SIZE_M"],
+        )
+        return None
 
     intermediate = intermediate_buffer
     if stage != "expand":

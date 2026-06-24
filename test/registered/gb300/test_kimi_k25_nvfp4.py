@@ -15,7 +15,8 @@ COMMON_ARGS = [
     "--reasoning-parser=kimi_k2",
     "--tool-call-parser=kimi_k2",
     "--quantization=modelopt_fp4",
-    "--attention-backend=trtllm_mla",
+    "--attention-backend=tokenspeed_mla",
+    "--kv-cache-dtype=fp8_e4m3",
     "--moe-runner-backend=flashinfer_trtllm",
     "--mem-fraction-static=0.8",
     "--enable-multimodal",
@@ -24,7 +25,7 @@ COMMON_ARGS = [
 
 
 class TestKimiK25Nvfp4(unittest.TestCase):
-    """Kimi-K2.5 NVFP4 on GB300 (4x B200 NVL4, tp=4).
+    """Kimi-K2.5 NVFP4 on GB300 (4x GB300 NVL4, tp=4).
 
     No EAGLE/MTP support for Kimi-K2.5 — only TP and TP+DP+DPA variants.
     """

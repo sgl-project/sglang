@@ -154,6 +154,24 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'bf16',     label: 'bf16',     default: false }
       ]
     },
+    mambabackend: {
+      name: 'mambabackend',
+      title: 'Mamba Backend',
+      items: [
+        { id: 'triton',     label: 'Triton',     subtitle: 'Default', default: true  },
+        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'Faster',  default: false }
+      ],
+      commandRule: (value) => value === 'flashinfer' ? '--mamba-backend flashinfer' : null
+    },
+    mambassmdtype: {
+      name: 'mambassmdtype',
+      title: 'Mamba SSM DType',
+      items: [
+        { id: 'default', label: 'Default', subtitle: 'Model config', default: true  },
+        { id: 'float16', label: 'float16', subtitle: 'Less memory',   default: false }
+      ],
+      commandRule: (value) => value === 'float16' ? '--mamba-ssm-dtype float16' : null
+    },
     thinking: {
       name: 'thinking',
       title: 'Reasoning Parser',

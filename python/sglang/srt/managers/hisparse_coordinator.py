@@ -5,6 +5,10 @@ from typing import List, NamedTuple, Union
 
 import torch
 
+from sglang.jit_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -13,19 +17,16 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import (
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-)
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,13 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def destroy(self) -> None:
+        # Drain in-flight transfers so the buffer is idle, then unregister it.
+        # See HostKVCache.destroy for why the explicit unregister matters.
+        self.write_staging_stream.synchronize()
+        self.decode_backup_stream.synchronize()
+        self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -471,13 +479,25 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            # No need to clear prior mappings: the only consumer of the mapping
-            # for past tokens is the swap-in kernel, and it goes through
-            # top_k_device_locs returned by swap_in_selected_pages -- not via
-            # mapping[old_out_cache_loc] -- so stale entries are harmless.
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
+            # ROCm: the decode remap creates a temporary hisparse device slot per
+            # new token (via the page_size==1 allocator path). Free the stale
+            # slot before pointing the mapping at the reserved device-buffer slot,
+            # otherwise the temporary slots leak and corrupt later swap-in lookups.
+            # CUDA keeps the original behavior: the swap-in kernel consumes only
+            # top_k_device_locs, so stale mapping entries are harmless there.
+            if _is_hip:
+                previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
+                    compressed_locs
+                )
+                stale_locs = previous_locs[
+                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
+                ]
+                if stale_locs.numel() > 0:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = reserved_buffer_loc

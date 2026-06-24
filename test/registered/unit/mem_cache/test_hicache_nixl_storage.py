@@ -784,7 +784,7 @@ class TestNixlFileLayout(CustomTestCase):
 
     def test_route_key_is_stable_and_bucketed(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
-            _BUCKET_HEX_CHARS,
+            BUCKET_HEX_CHARS,
             route_key,
         )
 
@@ -792,8 +792,8 @@ class TestNixlFileLayout(CustomTestCase):
         disk_idx, bucket = route_key("page-123", 4)
         self.assertGreaterEqual(disk_idx, 0)
         self.assertLess(disk_idx, 4)
-        self.assertEqual(len(bucket), _BUCKET_HEX_CHARS)
-        self.assertRegex(bucket, rf"^[0-9a-f]{{{_BUCKET_HEX_CHARS}}}$")
+        self.assertEqual(len(bucket), BUCKET_HEX_CHARS)
+        self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
     def test_route_key_rejects_empty_disk_set(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key

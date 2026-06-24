@@ -26,7 +26,6 @@ FOLDER_NAMES = [
     "sgl-kernel",
     "test/manual",
     "test/registered",
-    "test/srt",
     "test/README.md",
     "test/run_suite.py",
     "README.md",

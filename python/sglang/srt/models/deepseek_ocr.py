@@ -1295,31 +1295,34 @@ class CustomQwen2Decoder(nn.Module):
                 token_type_ids,
             ):
                 min_dtype = torch.finfo(dtype).min
-                masks = []
-                for b in range(batch_size):
-                    mask = torch.full(
-                        (sequence_length, sequence_length),
-                        fill_value=min_dtype,
-                        dtype=dtype,
-                        device=device,
-                    )
 
-                    type_ids = token_type_ids[b]
-                    image_positions = (type_ids == 0).nonzero(as_tuple=True)[0]
-                    text_positions = (type_ids == 1).nonzero(as_tuple=True)[0]
+                is_image = token_type_ids == 0  # [B, S]
+                is_text = token_type_ids == 1  # [B, S]
 
-                    if len(image_positions) > 0:
-                        mask[image_positions[:, None], image_positions] = 0.0
+                mask = torch.full(
+                    (batch_size, sequence_length, sequence_length),
+                    fill_value=min_dtype,
+                    dtype=dtype,
+                    device=device,
+                )
 
-                    for i, text_pos in enumerate(text_positions):
-                        if len(image_positions) > 0:
-                            mask[text_pos, image_positions] = 0.0
-                        mask[text_pos, text_positions[: i + 1]] = 0.0
+                img_outer = is_image.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
 
-                    masks.append(mask)
+                idx = torch.arange(sequence_length, device=device)
+                causal = idx.unsqueeze(0) <= idx.unsqueeze(1)  # [S, S]
 
-                mask = torch.stack(masks, dim=0).unsqueeze(1)
-                return mask
+                text_causal = (
+                    is_text.unsqueeze(2)  # [B, S, 1]
+                    & is_text.unsqueeze(1)  # [B, 1, S]
+                    & causal.unsqueeze(0)  # [1, S, S]
+                )  # [B, S, S]
+
+                text_to_img = is_text.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
+
+                allow = img_outer | text_causal | text_to_img  # [B, S, S]
+                mask.masked_fill_(allow, 0.0)
+
+                return mask.unsqueeze(1)  # [B, 1, S, S]
 
         return CustomQwen2ModelInner(config)
 

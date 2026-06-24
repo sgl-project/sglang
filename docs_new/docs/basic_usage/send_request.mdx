@@ -16,7 +16,7 @@ This notebook provides a quick-start guide to use SGLang in chat completions aft
 
 ```python Example
 from sglang.test.doc_patch import launch_server_cmd
-from sglang.utils import wait_for_server, print_highlight, terminate_process
+from sglang.utils import wait_for_server, terminate_process
 
 # This is equivalent to running the following command in your terminal
 # python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0
@@ -46,7 +46,7 @@ curl -s http://localhost:{port}/v1/chat/completions \
 """
 
 response = json.loads(subprocess.check_output(curl_command, shell=True))
-print_highlight(response)
+print(response)
 ```
 
 ## Using Python Requests
@@ -64,7 +64,7 @@ data = {
 }
 
 response = requests.post(url, json=data)
-print_highlight(response.json())
+print(response.json())
 ```
 
 ## Using OpenAI Python Client
@@ -84,7 +84,7 @@ response = client.chat.completions.create(
     temperature=0,
     max_tokens=64,
 )
-print_highlight(response)
+print(response)
 ```
 
 ### Streaming
@@ -133,7 +133,7 @@ response = requests.post(
     },
 )
 
-print_highlight(response.json())
+print(response.json())
 ```
 ### Streaming
 

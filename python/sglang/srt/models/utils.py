@@ -293,7 +293,12 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    ) or (
+        _is_hip
+        and not is_prefill_context_parallel_enabled()
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    )
 
 
 def create_fused_set_kv_buffer_arg(

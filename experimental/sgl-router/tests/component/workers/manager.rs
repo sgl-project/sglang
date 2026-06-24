@@ -509,3 +509,108 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
     h.await.unwrap();
     kv_index.shutdown().await;
 }
+
+/// Public-API integration for the reconcile loop: a worker that registers
+/// with empty `model_ids` (its `/server_info` was failing when discovery
+/// first reported it — the "EndpointSlice ready before the engine can
+/// answer /server_info" race) must be recovered by the manager's
+/// reconcile loop once `/server_info` starts answering. Exercised through
+/// the public `run_with_introspector_and_reconcile` entrypoint with no
+/// new discovery event after the initial `Added`.
+#[tokio::test]
+async fn reconcile_recovers_worker_with_unresolved_model_ids() {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use sgl_router::workers::WorkerIntrospector;
+    use std::sync::atomic::AtomicBool;
+
+    // Switchable fake engine: 503 on /server_info until `ready` flips
+    // true, then serves a body advertising model "m".
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_handler = ready.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let ready = ready_handler.clone();
+            async move {
+                if ready.load(Ordering::SeqCst) {
+                    Json(json!({"served_model_name": "m"})).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        }),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    let url = format!("http://127.0.0.1:{port}");
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run_with_introspector_and_reconcile(
+        rx,
+        registry.clone(),
+        None,
+        None,
+        None,
+        Arc::new(WorkerIntrospector::new(Duration::from_millis(300))),
+        Duration::from_millis(150),
+    ));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-slow",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    // Phase 1: the worker registers but stays out of the model pool while
+    // /server_info keeps failing.
+    let stuck = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(w) = registry.get(&WorkerId("w-slow".into())) {
+                if w.model_ids.is_empty() && registry.workers_for(&ModelId("m".into())).is_empty() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        stuck.is_ok(),
+        "worker should register with empty model_ids (invisible to routing) while /server_info fails",
+    );
+
+    // Engine finishes coming up.
+    ready.store(true, Ordering::SeqCst);
+
+    // Phase 2: the reconcile loop re-introspects and the worker joins the
+    // model pool — no new discovery event was sent.
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if registry.workers_for(&ModelId("m".into())).len() == 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "reconcile loop must add the worker to the model pool once /server_info recovers",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+    let _ = shutdown_tx.send(());
+}

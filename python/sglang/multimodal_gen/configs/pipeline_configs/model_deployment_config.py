@@ -6,7 +6,7 @@ ModelDeploymentConfig provides model-specific config on how to deploy a model op
 from dataclasses import dataclass
 from typing import Literal
 
-OffloadComponentName = Literal["dit", "text_encoder", "image_encoder"]
+OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
 
 
 @dataclass(frozen=True)

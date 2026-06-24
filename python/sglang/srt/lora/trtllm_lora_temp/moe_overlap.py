@@ -56,14 +56,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp8_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -127,6 +125,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            intermediate_buffer=gate_up_lora_intermediate,
         )
 
     # GEMM1-LoRA overlap: fire the gate_up LoRA on the side stream + record an event; the
@@ -134,6 +133,34 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     # permute+GEMM1 overlap the side-stream LoRA shrink/expand instead of joining before the
     # whole op.
     lora_event = torch.cuda.Event()
+
+    # Hoist every side-chain allocation onto the MAIN stream (cuda-graph
+    # allocator safety -- see the "routing" stage in virtual_experts.py):
+    # pre-warm the routing cache and pre-allocate the shrink intermediate here,
+    # so the side-stream block below launches kernels only.
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=fused_lora_routing_cache,
+        stage="routing",
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+    )
+    gate_up_lora_intermediate = hidden_states.new_empty(
+        (
+            hidden_states.shape[0],
+            topk_ids.shape[1],
+            lora_info.gate_up_lora_a_weights.shape[2],
+        )
+    )
 
     # O1 fork — gate_up shrink/expand on side stream concurrent with the main-stream
     # per-token-group FP8 quant + the trtllm op's permute+GEMM1 below.
@@ -162,7 +189,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = fused_pack_topk(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -333,14 +360,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
@@ -391,7 +416,34 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            intermediate_buffer=gate_up_lora_intermediate,
         )
+
+    # Hoist every side-chain allocation onto the MAIN stream (cuda-graph
+    # allocator safety -- see the "routing" stage in virtual_experts.py).
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=fused_lora_routing_cache,
+        stage="routing",
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+    )
+    gate_up_lora_intermediate = hidden_states.new_empty(
+        (
+            hidden_states.shape[0],
+            topk_ids.shape[1],
+            lora_info.gate_up_lora_a_weights.shape[2],
+        )
+    )
 
     # O1-fp4 fork: gate_up shrink/expand on the side stream, concurrent with the
     # FP4 op's permute + gate_up GEMM1 below. The op waits on lora_event right
@@ -407,7 +459,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+    packed_topk_ids = fused_pack_topk(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )

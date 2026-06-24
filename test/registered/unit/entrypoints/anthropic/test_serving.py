@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 from fastapi.responses import JSONResponse  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicMessage,
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
@@ -1265,6 +1266,91 @@ class TestAnthropicServing(unittest.TestCase):
         # Without the fix this collapses to ['user', 'user'] and breaks
         # strict role-alternation chat templates (qwen, llama, mistral).
         self.assertEqual(roles, ["user", "assistant", "user"])
+
+    def test_in_messages_system_role_folded_to_top_level(self):
+        """A mid-conversation ``role: "system"`` turn is folded into the
+        top-level ``system`` field by the request validator, so it does not
+        appear as a dialogue turn — matching the official Anthropic API."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        # The validator moved the system turn into the top-level system field.
+        self.assertEqual(request.system, "Reply with exactly: OK")
+        self.assertEqual([m.role for m in request.messages], ["user", "user"])
+        # And the converted OpenAI request has one leading system message.
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages], ["system", "user", "user"]
+        )
+        self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
+
+    def test_in_messages_system_role_merged_with_top_level(self):
+        """A top-level ``system`` field and a mid-conversation system turn are
+        merged; top-level text comes first."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system="You are terse.",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "One word only."},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        # Validator combines top-level system first, then the in-messages turn,
+        # joined into a single string.
+        self.assertEqual(request.system, "You are terse.\nOne word only.")
+        self.assertEqual([m.role for m in request.messages], ["user", "user"])
+
+    def test_top_level_system_only_is_unchanged(self):
+        """A request with only the top-level ``system`` field (no in-messages
+        system turn) must be unaffected by the validator: the system field is
+        preserved verbatim and the dialogue order is untouched. Guards the
+        common multi-turn path against regressions."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system="You are a helpful assistant.",
+            messages=[
+                {"role": "user", "content": "My name is Alice."},
+                {"role": "assistant", "content": "Hello Alice!"},
+                {"role": "user", "content": "What is my name?"},
+            ],
+        )
+        self.assertEqual(request.system, "You are a helpful assistant.")
+        self.assertEqual(
+            [m.role for m in request.messages], ["user", "assistant", "user"]
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(
+            chat_request.messages[0].content, "You are a helpful assistant."
+        )
+
+    def test_validator_handles_constructed_message_objects(self):
+        """The ``mode="before"`` validator must also handle requests built
+        programmatically with ``AnthropicMessage`` objects (not just raw dicts),
+        e.g. ``handle_count_tokens`` constructs the request this way."""
+        request = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=8,
+            messages=[
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="system", content="be terse"),
+                AnthropicMessage(role="user", content="go"),
+            ],
+        )
+        self.assertEqual(request.system, "be terse")
+        self.assertEqual([m.role for m in request.messages], ["user", "user"])
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""

@@ -11,8 +11,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -24,8 +22,6 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -36,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -245,11 +242,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
             if use_attn_tp_group:
-                tp_rank = get_attention_tp_rank()
-                self.tp_size = get_attention_tp_size()
+                tp_rank = get_parallel().attn_tp_rank
+                self.tp_size = get_parallel().attn_tp_size
             else:
-                tp_rank = get_tensor_model_parallel_rank()
-                self.tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_parallel().tp_rank
+                self.tp_size = get_parallel().tp_size
         else:
             assert use_attn_tp_group is False
             tp_rank = 0

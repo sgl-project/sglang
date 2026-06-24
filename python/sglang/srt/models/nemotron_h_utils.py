@@ -4,10 +4,12 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -57,7 +59,11 @@ def _build_layer_scatter_modes() -> LayerScatterModes:
 
 
 def make_layer_communicator(
-    layer_norm: RMSNorm, *, for_attn: bool, allow_reduce_scatter: bool = False
+    layer_norm: RMSNorm,
+    *,
+    for_attn: bool,
+    allow_reduce_scatter: bool = False,
+    is_last_layer: bool = False,
 ) -> LayerCommunicator:
     return LayerCommunicator(
         layer_scatter_modes=_build_layer_scatter_modes(),
@@ -65,4 +71,29 @@ def make_layer_communicator(
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
         force_layernorm_before_dp_gather=True,
         allow_reduce_scatter=allow_reduce_scatter,
+        is_last_layer=is_last_layer,
     )
+
+
+def input_norm_maybe_fuse_allreduce(
+    norm: RMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if residual is not None and getattr(
+        hidden_states, "_sglang_needs_allreduce_fusion", False
+    ):
+        if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
+            norm, "forward_with_allreduce_fusion"
+        ):
+            return norm.forward_with_allreduce_fusion(
+                hidden_states, residual, use_attn_tp_group=False
+            )
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return norm(hidden_states, residual)
+
+    if residual is None:
+        residual = hidden_states
+        hidden_states = norm(hidden_states)
+        return hidden_states, residual
+    return norm(hidden_states, residual)

@@ -24,7 +24,7 @@ WAN2_2_T2V_A14B_DIFFUSERS_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8"
 )
 
-EXTRAS_DISABLE_WARMUP = ["--server-warmup", "false"]
+EXTRAS_DISABLE_WARMUP = ["--warmup-mode", "request"]
 
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===

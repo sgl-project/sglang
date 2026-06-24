@@ -682,7 +682,7 @@ class CPUGraphRunner:
             return True
         return bool(forward_batch.encoder_lens.max() == 0)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         is_bs_supported = (
             forward_batch.batch_size in self.graphs
             if self.disable_padding
@@ -952,7 +952,7 @@ class CPUGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
         return captured_forward_batch
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
