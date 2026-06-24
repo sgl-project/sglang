@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     NPUFinalizeRouting,
-    FinalizeRoutingWrapper,                # <-- new import
+    AllGatherFinalizeRoutingWrapper,
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
     NPUMoEInitRouting_v2,
@@ -25,7 +25,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-# (no need to import tensor_model_parallel_all_gather here)
 
 
 class TorchNpuDispatchOutput(NamedTuple):
