@@ -97,7 +97,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             # Non‑DeepEP (torch_npu) path
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
                 self.activation = NPUSwigluQuant()
-            elif isinstance(kernel, NPUUnquantMoEMethodGGUF):
+            elif getattr(config, 'use_tp_all_gather_activation', False):
                 self.activation = NPUSwigluAllGather()
             else:
                 if config.activation == "npu_swiglu_oai":
