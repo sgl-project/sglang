@@ -877,7 +877,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
                 )
                 param.data_container.clear()
 
-         from sglang.srt.distributed.parallel_state import (
+        from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_world_size,
             get_tensor_model_parallel_rank,
         )
