@@ -41,3 +41,13 @@ bench:
   concurrencies: [1, 8, 16, 32, 64, 128, 256]
   num_prompts_factor: 4      # num-prompts = concurrency * factor
   random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path after the perf sweep. Mirrors the
+  # single-node registered test test/registered/amd/test_deepseek_v4_flash_fp8.py
+  # (full GSM8K, 8-shot, accuracy > 0.91). A regression here fails the nightly
+  # even when throughput looks fine ("fast but wrong").
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.91

@@ -23,7 +23,8 @@
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUSIVE    - request whole nodes (default 1); set 0 to disable
-#   TIME_LIMIT         - salloc time limit, default 01:00:00
+#   TIME_LIMIT         - salloc time limit, default 02:30:00 (covers server
+#                        load + perf sweep + full GSM8K, under the 180m step cap)
 
 set -euo pipefail
 set -x
@@ -38,7 +39,7 @@ set -x
 : "${GITHUB_WORKSPACE:?}"
 
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
-TIME_LIMIT="${TIME_LIMIT:-01:00:00}"
+TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
 
 if [[ -z "$MODEL_PATH" ]]; then
@@ -84,6 +85,11 @@ emit("DW", res.get("decode_workers", 1))
 emit("CONCS", ",".join(str(c) for c in bn["concurrencies"]))
 emit("NPF", bn["num_prompts_factor"])
 emit("RRR", bn["random_range_ratio"])
+acc = bn.get("accuracy", {}) or {}
+emit("ACC_ENABLED", 1 if acc.get("enabled") else 0)
+emit("ACC_SHOTS", acc.get("num_shots", 8))
+emit("ACC_NQ", acc.get("num_questions", 1319))
+emit("ACC_THR", acc.get("threshold", 0.91))
 PY
 )"
 if [[ -z "$RECIPE_VARS" ]]; then
@@ -105,6 +111,23 @@ WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/standalone_lb.py" "$WORKDIR/standalone_lb.py"
+
+# Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
+# shared NFS from the login node (which has internet) so the in-container eval
+# doesn't depend on compute-node connectivity; fall back to in-container
+# download if the pre-fetch fails.
+if [[ "$ACC_ENABLED" == "1" ]]; then
+    GSM8K_URL="https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+    curl -fsSL "$GSM8K_URL" -o "$WORKDIR/gsm8k_test.jsonl" 2>/dev/null \
+        && echo "gsm8k dataset staged at $WORKDIR/gsm8k_test.jsonl" \
+        || echo "WARN: gsm8k pre-stage failed; in-container download will be attempted"
+    cat > "$WORKDIR/check_acc.py" <<'PY'
+import sys
+acc, thr = float(sys.argv[1]), float(sys.argv[2])
+print(f"[gsm8k] accuracy={acc:.3f} threshold={thr}")
+sys.exit(0 if acc > thr else 1)
+PY
+fi
 
 # DSV4-Flash-FP8 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
 DSV4_ENV=(
@@ -197,6 +220,21 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       || { echo "[smoke] request failed -- PD path not serving; aborting before sweep"; exit 1; }
     python3 \$CIDIR/assert_nonempty.py < \$CIDIR/smoke_out.json \
       || { echo "[smoke] empty/invalid generation; aborting before sweep"; exit 1; }
+    # Correctness gate runs BEFORE the perf sweep: if the model is wrong there
+    # is no point spending ~15min measuring how fast it is wrong, so a failure
+    # here exits immediately and the sweep never runs.
+    if [ "$ACC_ENABLED" = "1" ]; then
+      echo "=== GSM8K accuracy gate (num_questions=$ACC_NQ shots=$ACC_SHOTS) ==="
+      DP_ARG=""
+      [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
+      python3 -m sglang.test.few_shot_gsm8k \
+        --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
+        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
+        \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
+      ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
+      [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
+      python3 \$CIDIR/check_acc.py "\$ACC" "$ACC_THR" || { echo "[gsm8k] accuracy below threshold -- failing before sweep"; exit 1; }
+    fi
     for C in ${CONCS//,/ }; do
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
