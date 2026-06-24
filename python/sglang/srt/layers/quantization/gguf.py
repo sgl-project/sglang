@@ -881,58 +881,81 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         w2_q = layer.w2_qweight
         w2_qt = layer.w2_qweight_type.weight_type
     
-        # ----- w13 (gate + up) -----
+        # ------------------------------------------------------------
+        # 1. Dequantize w13 and determine the FULL intermediate size
+        # ------------------------------------------------------------
         if w13_qt not in UNQUANTIZED_TYPES:
-            E, rows_q, cols_q = w13_q.shape
+            E, rows_q13, cols_q13 = w13_q.shape
             block_size, type_size = gguf.GGML_QUANT_SIZES[w13_qt]
-            hidden = cols_q // type_size * block_size
-            inter_full = rows_q // 2
+            hidden = cols_q13 // type_size * block_size
+            inter_full = rows_q13 // 2              # <-- authoritative full intermediate
             w13_deq = []
             for e in range(E):
                 q = w13_q[e].cpu().numpy()
                 deq_np = gguf_dequantize(q.flatten(), w13_qt)
                 deq = torch.from_numpy(deq_np).to(dtype=self.params_dtype,
                                                  device=w13_q.device)
-                deq = deq.reshape(rows_q, hidden)        # (2*inter_full, hidden)
-                deq = deq.transpose(-1, -2).contiguous() # (hidden, 2*inter_full)
+                deq = deq.reshape(rows_q13, hidden)       # (2*inter_full, hidden)
+                deq = deq.transpose(-1, -2).contiguous()  # (hidden, 2*inter_full)
                 w13_deq.append(deq)
-            w13_full = torch.stack(w13_deq, dim=0)       # (E, hidden, 2*inter_full)
+            w13_full = torch.stack(w13_deq, dim=0)        # (E, hidden, 2*inter_full)
         else:
             w13_full = w13_q.data.transpose(-1, -2).contiguous()
+            hidden = w13_full.shape[1]
+            inter_full = w13_full.shape[2] // 2
     
-        # ----- w2 (down projection) -----
+        # ------------------------------------------------------------
+        # 2. Dequantize w2 using the SAME inter_full
+        # ------------------------------------------------------------
         if w2_qt not in UNQUANTIZED_TYPES:
-            E, rows_q, cols_q = w2_q.shape
+            E2, rows_q2, cols_q2 = w2_q.shape
+            # Verify consistency – rows_q2 should equal inter_full
+            assert rows_q2 == inter_full, (
+                f"w2 weight shape mismatch: expected rows={inter_full}, got {rows_q2}"
+            )
             block_size, type_size = gguf.GGML_QUANT_SIZES[w2_qt]
-            hidden = cols_q // type_size * block_size
-            inter_full = rows_q
+            hidden2 = cols_q2 // type_size * block_size
+            assert hidden2 == hidden, "Hidden size mismatch between w13 and w2"
             w2_deq = []
-            for e in range(E):
+            for e in range(E2):
                 q = w2_q[e].cpu().numpy()
                 deq_np = gguf_dequantize(q.flatten(), w2_qt)
                 deq = torch.from_numpy(deq_np).to(dtype=self.params_dtype,
                                                  device=w2_q.device)
-                deq = deq.reshape(inter_full, hidden)    # (inter_full, hidden)
+                deq = deq.reshape(inter_full, hidden)   # (inter_full, hidden)
                 w2_deq.append(deq)
-            w2_full = torch.stack(w2_deq, dim=0)         # (E, inter_full, hidden)
+            w2_full = torch.stack(w2_deq, dim=0)        # (E, inter_full, hidden)
         else:
-            w2_full = w2_q.data                          # (E, inter_full, hidden)
+            w2_full = w2_q.data                         # assume (E, inter_full, hidden)
     
-        # ----- TP split -----
+        # ------------------------------------------------------------
+        # 3. TP split – using the EXACT same inter_per_rank
+        # ------------------------------------------------------------
         if tp_size > 1:
+            assert inter_full % tp_size == 0, f"inter_full {inter_full} not divisible by tp_size {tp_size}"
             inter_per_rank = inter_full // tp_size
-            # w13 split along dim=2
-            gate = w13_full[:, :, :inter_full]
-            up   = w13_full[:, :, inter_full:]
-            gate = gate[:, :, tp_rank*inter_per_rank:(tp_rank+1)*inter_per_rank]
-            up   = up[:, :, tp_rank*inter_per_rank:(tp_rank+1)*inter_per_rank]
-            w13_full = torch.cat([gate, up], dim=2)      # (E, hidden, 2*inter_per_rank)
-            # w2 split along dim=1
-            w2_full = w2_full[:, tp_rank*inter_per_rank:(tp_rank+1)*inter_per_rank, :]
-            # shape (E, inter_per_rank, hidden)
     
-        layer.register_buffer("w13_dequant", w13_full, persistent=False)
-        layer.register_buffer("w2_dequant", w2_full, persistent=False)
+            # w13: split the last dimension (2*inter_full) by slicing each half
+            gate = w13_full[:, :, :inter_full]                     # (E, hidden, inter_full)
+            up   = w13_full[:, :, inter_full:]                     # (E, hidden, inter_full)
+            gate = gate[:, :, tp_rank*inter_per_rank : (tp_rank+1)*inter_per_rank]
+            up   = up[:, :, tp_rank*inter_per_rank : (tp_rank+1)*inter_per_rank]
+            w13_per_rank = torch.cat([gate, up], dim=2)           # (E, hidden, 2*inter_per_rank)
+    
+            # w2: split the intermediate dimension (dim=1)
+            w2_per_rank = w2_full[:, tp_rank*inter_per_rank : (tp_rank+1)*inter_per_rank, :]
+            # shape (E, inter_per_rank, hidden)
+        else:
+            w13_per_rank = w13_full
+            w2_per_rank = w2_full
+    
+        # Debug – remove after verification
+        logger.info(f"TP rank {tp_rank}: inter_full={inter_full}, inter_per_rank={inter_per_rank}")
+        logger.info(f"w13_per_rank shape: {w13_per_rank.shape}")
+        logger.info(f"w2_per_rank shape: {w2_per_rank.shape}")
+    
+        layer.register_buffer("w13_dequant", w13_per_rank, persistent=False)
+        layer.register_buffer("w2_dequant", w2_per_rank, persistent=False)
     
         for prefix in ("w13", "w2"):
             if hasattr(layer, f"{prefix}_qweight"):
