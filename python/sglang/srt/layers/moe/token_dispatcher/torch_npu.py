@@ -80,7 +80,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         )
         if is_gguf and self.tp_size > 1:
             self.enable_all_gather = True
-        else
+        else:
             self.enable_all_gather = False
 
     def set_quant_config(self, quant_config: dict) -> None:
