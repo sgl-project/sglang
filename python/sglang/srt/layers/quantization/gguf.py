@@ -14,7 +14,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUUnquantMoEMethod,
-    NPUUnquantMoEMethodGGUF,
 )
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
@@ -35,10 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -796,6 +792,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.w13_kernel = NPUUnquantMoEMethod()
+        self.w2_kernel = NPUUnquantMoEMethod()
 
     def create_weights(
         self,
