@@ -523,7 +523,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             if hasattr(images_spatial_crop, "tolist")
             else images_spatial_crop
         )
-        logger.info(
+        logger.debug(
             "[UnlimitedOCRHFProcessor] tokenize_with_images timings: "
             "dynamic_crop=%.2f ms, global_transform=%.2f ms, "
             "local_transform=%.2f ms, stack=%.2f ms, total=%.2f ms, "

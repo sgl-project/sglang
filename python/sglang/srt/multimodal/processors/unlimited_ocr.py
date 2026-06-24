@@ -128,7 +128,7 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
         self._mix_config_into_hash(mm_items, processor_kwargs)
         hash_done = time.perf_counter()
 
-        logger.info(
+        logger.debug(
             "[UnlimitedOCRProcessor] process_mm_data_async timings: "
             "load=%.2f ms, process_combine=%.2f ms, prefix=%.2f ms, "
             "hash=%.2f ms, total=%.2f ms, mode=%s, input_tokens=%d, mm_items=%d",
