@@ -76,9 +76,7 @@ def resolve_decode_backend(
             XPUCudaGraphBackend,
         )
 
-        return XPUCudaGraphBackend(
-            cuda_graph_runner, enable_memory_saver=enable_memory_saver
-        )
+        return XPUCudaGraphBackend(cuda_graph_runner)
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(

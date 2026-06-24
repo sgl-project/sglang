@@ -13,12 +13,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.hardware_backend.xpu.eagle_draft_extend_xpu_graph_runner import (
-    EAGLEDraftExtendXpuGraphRunner,
-)
-from sglang.srt.hardware_backend.xpu.eagle_draft_xpu_graph_runner import (
-    EAGLEDraftXpuGraphRunner,
-)
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
@@ -385,7 +379,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
 
         Device2DraftCudaGraphRunner = {
-            "xpu": EAGLEDraftXpuGraphRunner,
+            "xpu": EAGLEDraftCudaGraphRunner,
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -415,7 +409,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         Device2ExtendCudaGraphRunner = {
-            "xpu": EAGLEDraftExtendXpuGraphRunner,
+            "xpu": EAGLEDraftExtendCudaGraphRunner,
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,

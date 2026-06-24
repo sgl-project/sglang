@@ -24,7 +24,14 @@ from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    print_warning_once,
+)
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -139,9 +146,9 @@ def sgl_build_tree_kernel_efficient_pytorch(
     verified_seq_len: torch.Tensor,
     tree_mask: torch.Tensor,
     positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     topk: int,
     depth: int,
     draft_token_num: int,
@@ -184,10 +191,10 @@ def sgl_build_tree_kernel_efficient_pytorch(
             if draft_token_idx == 0:
                 positions[batch_idx * draft_token_num] = seq_len
 
-                retrive_index_offset = batch_idx * draft_token_num
+                retrieve_index_offset = batch_idx * draft_token_num
                 for i in range(draft_token_num - 1, 0, -1):
-                    current_token_idx = retrive_index_offset + i
-                    retrive_index[batch_idx][i] = current_token_idx
+                    current_token_idx = retrieve_index_offset + i
+                    retrieve_index[batch_idx][i] = current_token_idx
                     parent_tb_idx = int(selected_index[batch_idx][i - 1]) // topk
                     parent_position = 0
                     found_parent = parent_tb_idx == 0
@@ -210,16 +217,16 @@ def sgl_build_tree_kernel_efficient_pytorch(
                         )
                         continue
 
-                    if retrive_next_token[batch_idx][parent_position] == -1:
-                        retrive_next_token[batch_idx][parent_position] = i
+                    if retrieve_next_token[batch_idx][parent_position] == -1:
+                        retrieve_next_token[batch_idx][parent_position] = i
                     else:
-                        origin_next_token = retrive_next_token[batch_idx][
+                        origin_next_token = retrieve_next_token[batch_idx][
                             parent_position
                         ].item()
-                        retrive_next_token[batch_idx][parent_position] = i
-                        retrive_next_sibling[batch_idx][i] = origin_next_token
+                        retrieve_next_token[batch_idx][parent_position] = i
+                        retrieve_next_sibling[batch_idx][i] = origin_next_token
 
-                retrive_index[batch_idx][0] = batch_idx * draft_token_num
+                retrieve_index[batch_idx][0] = batch_idx * draft_token_num
             else:
                 cur_position = draft_token_idx - 1
                 position = 0
@@ -352,6 +359,10 @@ def build_tree_kernel_efficient(
                 tree_mask_mode,
             )
         except (AttributeError, RuntimeError):
+            print_warning_once(
+                "XPU Triton build_tree_kernel_efficient unavailable; "
+                "falling back to the slower PyTorch implementation."
+            )
             # Reinitialize buffers to original state in case Triton partially corrupted them
             if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
                 tree_mask.fill_(True)
@@ -408,9 +419,9 @@ def verify_tree_greedy_pytorch(
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ):
     batch_size = candidates.shape[0]
@@ -418,37 +429,37 @@ def verify_tree_greedy_pytorch(
     num_draft_tokens = candidates.shape[1]
 
     for bx in range(batch_size):
-        last_accepted_retrive_idx = retrive_index[bx][0]
-        accept_index[bx][0] = last_accepted_retrive_idx
-        num_accepted_tokens = 0
+        last_accept_retrieve_idx = retrieve_index[bx][0]
+        accept_index[bx][0] = last_accept_retrieve_idx
+        num_accept_tokens = 0
         cur_index = 0
 
         for j in range(1, num_speculative_tokens):
-            cur_index = retrive_next_token[bx][cur_index]
+            cur_index = retrieve_next_token[bx][cur_index]
             while cur_index != -1:
-                draft_index = retrive_index[bx][cur_index]
-                draft_token_id = candidates[bx][cur_index]
-                target_token_id = target_predict[
-                    last_accepted_retrive_idx // num_draft_tokens
-                ][last_accepted_retrive_idx % num_draft_tokens]
+                draft_index = retrieve_index[bx][cur_index]
+                draft_token = candidates[bx][cur_index]
+                target_token = target_predict[
+                    last_accept_retrieve_idx // num_draft_tokens
+                ][last_accept_retrieve_idx % num_draft_tokens]
 
-                if draft_token_id == target_token_id:
+                if draft_token == target_token:
                     # accept token
-                    predicts[last_accepted_retrive_idx] = target_token_id
-                    num_accepted_tokens += 1
-                    accept_index[bx][num_accepted_tokens] = draft_index
-                    last_accepted_retrive_idx = draft_index
+                    predicts[last_accept_retrieve_idx] = target_token
+                    num_accept_tokens += 1
+                    accept_index[bx][num_accept_tokens] = draft_index
+                    last_accept_retrieve_idx = draft_index
                     break
                 else:
-                    cur_index = retrive_next_sibling[bx][cur_index]
+                    cur_index = retrieve_next_sibling[bx][cur_index]
 
             if cur_index == -1:
                 break
 
-        accept_token_num[bx] = num_accepted_tokens
-        predicts[last_accepted_retrive_idx] = target_predict[
-            last_accepted_retrive_idx // num_draft_tokens
-        ][last_accepted_retrive_idx % num_draft_tokens]
+        accept_token_num[bx] = num_accept_tokens
+        predicts[last_accept_retrieve_idx] = target_predict[
+            last_accept_retrieve_idx // num_draft_tokens
+        ][last_accept_retrieve_idx % num_draft_tokens]
 
 
 def sgl_build_tree_kernel_triton(
@@ -457,9 +468,9 @@ def sgl_build_tree_kernel_triton(
     verified_seq_len: torch.Tensor,
     tree_mask: torch.Tensor,
     positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     topk: int,
     depth: int,
     draft_token_num: int,
@@ -485,9 +496,9 @@ def sgl_build_tree_kernel_triton(
         seq_len_prefix_sum,
         tree_mask,
         positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
         topk=topk,
         depth=depth,
         draft_token_num=draft_token_num,
@@ -505,9 +516,9 @@ def verify_tree_greedy_triton(
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ):
     """Triton-based implementation."""
@@ -523,9 +534,9 @@ def verify_tree_greedy_triton(
         accept_index,
         accept_token_num,
         candidates,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
         target_predict,
         batch_size=batch_size,
         num_speculative_tokens=num_speculative_tokens,
@@ -581,13 +592,18 @@ def verify_tree_greedy_func(
                 accept_index=accept_index,
                 accept_token_num=accept_token_num,
                 candidates=candidates,
-                retrive_index=retrieve_index,
-                retrive_next_token=retrieve_next_token,
-                retrive_next_sibling=retrieve_next_sibling,
+                retrieve_index=retrieve_index,
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
                 target_predict=target_predict,
             )
         except (AttributeError, RuntimeError):
+            print_warning_once(
+                "XPU Triton verify_tree_greedy unavailable; "
+                "falling back to the slower PyTorch implementation."
+            )
             # Reinitialize buffers to original state in case Triton partially corrupted them
+            predicts.zero_()
             accept_index.fill_(-1)
             accept_token_num.fill_(0)
 
@@ -597,9 +613,9 @@ def verify_tree_greedy_func(
                 accept_index=accept_index,
                 accept_token_num=accept_token_num,
                 candidates=candidates,
-                retrive_index=retrieve_index,
-                retrive_next_token=retrieve_next_token,
-                retrive_next_sibling=retrieve_next_sibling,
+                retrieve_index=retrieve_index,
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
                 target_predict=target_predict,
             )
     return predicts, accept_index, accept_token_num
