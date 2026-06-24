@@ -202,13 +202,103 @@ fn py_array_to_vec_i64(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Vec<i
     buffer.to_vec(py)
 }
 
-#[pyclass]
-pub struct RustPageRadixCacheWrapper {
-    inner: PageRadixCache,
+/// Define a PyO3 wrapper `$Wrapper` around radix cache `$Inner`: a `#[pyclass]`
+/// holding `inner: $Inner` plus a `#[pymethods]` block with the delegating
+/// accessors common to every cache, followed by the per-cache `$custom` methods
+/// (constructor, `match_prefix`, `insert`).
+macro_rules! define_radix_cache_wrapper {
+    ($(#[$meta:meta])* $Wrapper:ident, $Inner:ty, { $($custom:tt)* }) => {
+        $(#[$meta])*
+        #[pyclass]
+        pub struct $Wrapper {
+            inner: $Inner,
+        }
+
+        #[pymethods]
+        impl $Wrapper {
+            fn reset(&mut self) {
+                self.inner.reset();
+            }
+
+            fn page_size(&self) -> usize {
+                self.inner.page_size()
+            }
+
+            fn active_tree_node_count(&self) -> usize {
+                self.inner.active_tree_node_count()
+            }
+
+            fn evictable_token_size(&self) -> usize {
+                self.inner.evictable_token_size()
+            }
+
+            fn protected_token_size(&self) -> usize {
+                self.inner.protected_token_size()
+            }
+
+            fn total_size(&self) -> (usize, usize) {
+                self.inner.total_size()
+            }
+
+            fn swa_evictable_token_size(&self) -> usize {
+                self.inner.swa_evictable_token_size()
+            }
+
+            fn swa_protected_token_size(&self) -> usize {
+                self.inner.swa_protected_token_size()
+            }
+
+            fn mamba_evictable_token_size(&self) -> usize {
+                self.inner.mamba_evictable_token_size()
+            }
+
+            fn mamba_protected_token_size(&self) -> usize {
+                self.inner.mamba_protected_token_size()
+            }
+
+            fn mamba_total_size(&self) -> usize {
+                self.inner.mamba_total_size()
+            }
+
+            /// Lock `node_idx` and ancestors, protecting the prefix from eviction.
+            /// Returns `(delta, swa_uuid_for_lock)`; pass the uuid back to `dec_lock_ref`.
+            fn inc_lock_ref(&mut self, node_idx: usize) -> (i64, Option<u64>) {
+                let r = self.inner.inc_lock_ref(node_idx);
+                (r.delta, r.swa_uuid_for_lock)
+            }
+
+            /// Unlock `node_idx`; pair with `inc_lock_ref` and pass back its uuid.
+            #[pyo3(signature = (node_idx, swa_uuid_for_lock = None))]
+            fn dec_lock_ref(&mut self, node_idx: usize, swa_uuid_for_lock: Option<u64>) -> i64 {
+                self.inner.dec_lock_ref(node_idx, swa_uuid_for_lock)
+            }
+
+            /// Best-effort cascade evict of up to `num_tokens[ct]` tokens per component.
+            fn evict(
+                &mut self,
+                py: Python<'_>,
+                num_tokens: [usize; NUM_COMPONENT_TYPES],
+            ) -> RustEvictResult {
+                let r = self.inner.evict(EvictRequest { num_tokens });
+                RustEvictResult::from_evict_result(py, r)
+            }
+
+            /// Write per-node SWA values back into the tree.
+            fn apply_swa_writes(
+                &mut self,
+                node_indices: Vec<usize>,
+                swa_values: Vec<PyTensor>,
+            ) -> PyResult<()> {
+                let values: Vec<tch::Tensor> = swa_values.into_iter().map(|v| v.0).collect();
+                Ok(self.inner.apply_swa_writes(node_indices, values)?)
+            }
+
+            $($custom)*
+        }
+    };
 }
 
-#[pymethods]
-impl RustPageRadixCacheWrapper {
+define_radix_cache_wrapper!(RustPageRadixCacheWrapper, PageRadixCache, {
     #[new]
     #[pyo3(signature = (device, page_size, init_node_capacity, sliding_window_size = None, mamba_cache_chunk_size = None))]
     fn new(
@@ -227,50 +317,6 @@ impl RustPageRadixCacheWrapper {
             mamba_cache_chunk_size,
         )?;
         Ok(Self { inner })
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset();
-    }
-
-    fn page_size(&self) -> usize {
-        self.inner.page_size()
-    }
-
-    fn active_tree_node_count(&self) -> usize {
-        self.inner.active_tree_node_count()
-    }
-
-    fn evictable_token_size(&self) -> usize {
-        self.inner.evictable_token_size()
-    }
-
-    fn protected_token_size(&self) -> usize {
-        self.inner.protected_token_size()
-    }
-
-    fn total_size(&self) -> (usize, usize) {
-        self.inner.total_size()
-    }
-
-    fn swa_evictable_token_size(&self) -> usize {
-        self.inner.swa_evictable_token_size()
-    }
-
-    fn swa_protected_token_size(&self) -> usize {
-        self.inner.swa_protected_token_size()
-    }
-
-    fn mamba_evictable_token_size(&self) -> usize {
-        self.inner.mamba_evictable_token_size()
-    }
-
-    fn mamba_protected_token_size(&self) -> usize {
-        self.inner.mamba_protected_token_size()
-    }
-
-    fn mamba_total_size(&self) -> usize {
-        self.inner.mamba_total_size()
     }
 
     #[pyo3(signature = (key, extra_key = None))]
@@ -312,196 +358,92 @@ impl RustPageRadixCacheWrapper {
         })?;
         Ok(RustInsertResult::from_insert_result(py, r))
     }
+});
 
-    /// Lock `node_idx` and ancestors, protecting the prefix from eviction.
-    /// Returns `(delta, swa_uuid_for_lock)`; pass the uuid back to `dec_lock_ref`.
-    fn inc_lock_ref(&mut self, node_idx: usize) -> (i64, Option<u64>) {
-        let r = self.inner.inc_lock_ref(node_idx);
-        (r.delta, r.swa_uuid_for_lock)
-    }
-    /// Unlock `node_idx`; pair with `inc_lock_ref` and pass back its uuid.
-    #[pyo3(signature = (node_idx, swa_uuid_for_lock = None))]
-    fn dec_lock_ref(&mut self, node_idx: usize, swa_uuid_for_lock: Option<u64>) -> i64 {
-        self.inner.dec_lock_ref(node_idx, swa_uuid_for_lock)
-    }
-
-    /// Best-effort cascade evict of up to `num_tokens[ct]` tokens per component.
-    fn evict(
-        &mut self,
-        py: Python<'_>,
-        num_tokens: [usize; NUM_COMPONENT_TYPES],
-    ) -> RustEvictResult {
-        let r = self.inner.evict(EvictRequest { num_tokens });
-        RustEvictResult::from_evict_result(py, r)
-    }
-
-    /// Write per-node SWA values back into the tree.
-    fn apply_swa_writes(
-        &mut self,
-        node_indices: Vec<usize>,
-        swa_values: Vec<PyTensor>,
-    ) -> PyResult<()> {
-        let values: Vec<tch::Tensor> = swa_values.into_iter().map(|v| v.0).collect();
-        Ok(self.inner.apply_swa_writes(node_indices, values)?)
-    }
-}
-
-/// Python wrapper for the EAGLE bigram radix cache (children keyed by overlap
-/// bigram pairs `(t[i], t[i+1])`). Sizes report in atom (= pair) units.
-///
-/// Callers MUST pass raw token sequences untrimmed; the cache page-aligns and
-/// trims value N -> N-1 internally.
+/// Build EAGLE overlap bigram pairs `(t[i], t[i+1])` from raw tokens.
 fn build_bigram_pairs(raw: &[i64]) -> Vec<(i64, i64)> {
     raw.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
-#[pyclass]
-pub struct RustBigramRadixCacheWrapper {
-    inner: BigramRadixCache,
-}
-
-#[pymethods]
-impl RustBigramRadixCacheWrapper {
-    #[new]
-    #[pyo3(signature = (device, page_size, init_node_capacity, sliding_window_size = None, mamba_cache_chunk_size = None))]
-    fn new(
-        device: &str,
-        page_size: usize,
-        init_node_capacity: usize,
-        sliding_window_size: Option<usize>,
-        mamba_cache_chunk_size: Option<usize>,
-    ) -> PyResult<Self> {
-        if mamba_cache_chunk_size.is_some() {
-            return Err(crate::error::RadixCacheInitError::BigramMambaNotSupported.into());
+define_radix_cache_wrapper!(
+    /// Python wrapper for the EAGLE bigram radix cache (children keyed by overlap
+    /// bigram pairs `(t[i], t[i+1])`). Sizes report in atom (= pair) units.
+    ///
+    /// Callers MUST pass raw token sequences untrimmed; the cache page-aligns and
+    /// trims value N -> N-1 internally.
+    RustBigramRadixCacheWrapper,
+    BigramRadixCache,
+    {
+        #[new]
+        #[pyo3(signature = (device, page_size, init_node_capacity, sliding_window_size = None, mamba_cache_chunk_size = None))]
+        fn new(
+            device: &str,
+            page_size: usize,
+            init_node_capacity: usize,
+            sliding_window_size: Option<usize>,
+            mamba_cache_chunk_size: Option<usize>,
+        ) -> PyResult<Self> {
+            if mamba_cache_chunk_size.is_some() {
+                return Err(crate::error::RadixCacheInitError::BigramMambaNotSupported.into());
+            }
+            let device = parse_device(device)?;
+            let inner = BigramRadixCache::new(
+                device,
+                page_size,
+                init_node_capacity,
+                sliding_window_size,
+                mamba_cache_chunk_size,
+            )?;
+            Ok(Self { inner })
         }
-        let device = parse_device(device)?;
-        let inner = BigramRadixCache::new(
-            device,
-            page_size,
-            init_node_capacity,
-            sliding_window_size,
-            mamba_cache_chunk_size,
-        )?;
-        Ok(Self { inner })
-    }
 
-    fn reset(&mut self) {
-        self.inner.reset();
-    }
+        #[pyo3(signature = (key, extra_key = None))]
+        fn match_prefix(
+            &mut self,
+            py: Python<'_>,
+            key: &Bound<'_, PyAny>,
+            extra_key: Option<String>,
+        ) -> PyResult<RustMatchResult> {
+            let key_vec = py_array_to_vec_i64(py, key)?;
+            let r = py.allow_threads(|| {
+                let pairs = build_bigram_pairs(&key_vec);
+                self.inner.match_prefix(&pairs, extra_key.as_deref())
+            })?;
+            Ok(RustMatchResult::from_match_result(r))
+        }
 
-    fn page_size(&self) -> usize {
-        self.inner.page_size()
+        #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None))]
+        #[allow(clippy::too_many_arguments)]
+        fn insert(
+            &mut self,
+            py: Python<'_>,
+            key: &Bound<'_, PyAny>,
+            value: PyTensor,
+            extra_key: Option<String>,
+            prev_prefix_len: usize,
+            swa_evicted_seqlen: usize,
+            mamba_value: Option<PyTensor>,
+        ) -> PyResult<RustInsertResult> {
+            let key_vec = py_array_to_vec_i64(py, key)?;
+            let mamba_tensor = mamba_value.map(|m| m.0);
+            let r = py.allow_threads(move || {
+                let pairs = build_bigram_pairs(&key_vec);
+                // Trim value N -> N-1 (one slot per bigram).
+                let trimmed_value = if pairs.is_empty() {
+                    value.0.shallow_clone()
+                } else {
+                    value.0.narrow(0, 0, pairs.len() as i64)
+                };
+                self.inner.insert(
+                    &pairs,
+                    &trimmed_value,
+                    extra_key.as_deref(),
+                    prev_prefix_len,
+                    swa_evicted_seqlen,
+                    mamba_tensor,
+                )
+            })?;
+            Ok(RustInsertResult::from_insert_result(py, r))
+        }
     }
-
-    fn active_tree_node_count(&self) -> usize {
-        self.inner.active_tree_node_count()
-    }
-
-    fn evictable_token_size(&self) -> usize {
-        self.inner.evictable_token_size()
-    }
-
-    fn protected_token_size(&self) -> usize {
-        self.inner.protected_token_size()
-    }
-
-    fn total_size(&self) -> (usize, usize) {
-        self.inner.total_size()
-    }
-
-    fn swa_evictable_token_size(&self) -> usize {
-        self.inner.swa_evictable_token_size()
-    }
-
-    fn swa_protected_token_size(&self) -> usize {
-        self.inner.swa_protected_token_size()
-    }
-
-    fn mamba_evictable_token_size(&self) -> usize {
-        self.inner.mamba_evictable_token_size()
-    }
-
-    fn mamba_protected_token_size(&self) -> usize {
-        self.inner.mamba_protected_token_size()
-    }
-
-    fn mamba_total_size(&self) -> usize {
-        self.inner.mamba_total_size()
-    }
-
-    #[pyo3(signature = (key, extra_key = None))]
-    fn match_prefix(
-        &mut self,
-        py: Python<'_>,
-        key: &Bound<'_, PyAny>,
-        extra_key: Option<String>,
-    ) -> PyResult<RustMatchResult> {
-        let key_vec = py_array_to_vec_i64(py, key)?;
-        let r = py.allow_threads(|| {
-            let pairs = build_bigram_pairs(&key_vec);
-            self.inner.match_prefix(&pairs, extra_key.as_deref())
-        })?;
-        Ok(RustMatchResult::from_match_result(r))
-    }
-
-    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, mamba_value = None))]
-    #[allow(clippy::too_many_arguments)]
-    fn insert(
-        &mut self,
-        py: Python<'_>,
-        key: &Bound<'_, PyAny>,
-        value: PyTensor,
-        extra_key: Option<String>,
-        prev_prefix_len: usize,
-        swa_evicted_seqlen: usize,
-        mamba_value: Option<PyTensor>,
-    ) -> PyResult<RustInsertResult> {
-        let key_vec = py_array_to_vec_i64(py, key)?;
-        let mamba_tensor = mamba_value.map(|m| m.0);
-        let r = py.allow_threads(move || {
-            let pairs = build_bigram_pairs(&key_vec);
-            // Trim value N -> N-1 (one slot per bigram).
-            let trimmed_value = if pairs.is_empty() {
-                value.0.shallow_clone()
-            } else {
-                value.0.narrow(0, 0, pairs.len() as i64)
-            };
-            self.inner.insert(
-                &pairs,
-                &trimmed_value,
-                extra_key.as_deref(),
-                prev_prefix_len,
-                swa_evicted_seqlen,
-                mamba_tensor,
-            )
-        })?;
-        Ok(RustInsertResult::from_insert_result(py, r))
-    }
-
-    fn inc_lock_ref(&mut self, node_idx: usize) -> (i64, Option<u64>) {
-        let r = self.inner.inc_lock_ref(node_idx);
-        (r.delta, r.swa_uuid_for_lock)
-    }
-    #[pyo3(signature = (node_idx, swa_uuid_for_lock = None))]
-    fn dec_lock_ref(&mut self, node_idx: usize, swa_uuid_for_lock: Option<u64>) -> i64 {
-        self.inner.dec_lock_ref(node_idx, swa_uuid_for_lock)
-    }
-
-    fn evict(
-        &mut self,
-        py: Python<'_>,
-        num_tokens: [usize; NUM_COMPONENT_TYPES],
-    ) -> RustEvictResult {
-        let r = self.inner.evict(EvictRequest { num_tokens });
-        RustEvictResult::from_evict_result(py, r)
-    }
-
-    fn apply_swa_writes(
-        &mut self,
-        node_indices: Vec<usize>,
-        swa_values: Vec<PyTensor>,
-    ) -> PyResult<()> {
-        let values: Vec<tch::Tensor> = swa_values.into_iter().map(|v| v.0).collect();
-        Ok(self.inner.apply_swa_writes(node_indices, values)?)
-    }
-}
+);
